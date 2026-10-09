@@ -282,13 +282,38 @@ impl Engine {
             // them.
             let options = self.state.options.get(root).cloned();
             let is_excluded = |path: &Path| options.as_ref().is_some_and(|o| o.is_excluded(path));
-            // The four declared surfaces plus directly-in-root dart files.
+            // The four declared surfaces; directly-in-root dart files are
+            // interned below, never queued (the walk's `read_dir` on a file
+            // is ENOTDIR and would silently drop them).
             let mut queue: Vec<PathBuf> =
                 SURFACES.iter().map(|surface| root.join(surface)).collect();
+            // Reads, counts, and interns one accepted `.dart` file — the
+            // shared tail of the root pass and the walk below.
+            let mut intern_file = |path: &Path| -> std::io::Result<()> {
+                let bytes = std::fs::read(path)?;
+                stats.loc_total += u64::from(
+                    u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
+                        .unwrap_or(u32::MAX),
+                );
+                stats.file_count += 1;
+                self.set_content(path, &bytes);
+                Ok(())
+            };
             if let Ok(entries) = std::fs::read_dir(root) {
-                queue.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-                    path.is_file() && path.extension().is_some_and(|ext| ext == "dart")
-                }));
+                for entry in entries.flatten() {
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "dart")
+                        && (file_type.is_file()
+                            || (file_type.is_symlink()
+                                && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())))
+                        && !is_excluded(&path)
+                    {
+                        intern_file(&path)?;
+                    }
+                }
             }
             while let Some(dir) = queue.pop() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -326,13 +351,7 @@ impl Engine {
                                     .is_ok_and(|meta| meta.is_file())))
                         && !is_excluded(&path)
                     {
-                        let bytes = std::fs::read(&path)?;
-                        stats.loc_total += u64::from(
-                            u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
-                                .unwrap_or(u32::MAX),
-                        );
-                        stats.file_count += 1;
-                        self.set_content(&path, &bytes);
+                        intern_file(&path)?;
                     }
                 }
             }
