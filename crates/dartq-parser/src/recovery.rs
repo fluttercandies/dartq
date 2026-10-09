@@ -77,15 +77,33 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         self.span_of(id)
     }
 
-    /// Official `ensureIdentifier` (`parser_impl.dart:4076`): consumes an
-    /// identifier-shaped token or reports + synthesizes an empty identifier.
-    /// Keywords that can legally appear here are the caller's business
-    /// (built-ins pass through `is_identifier` checks).
+    /// Official `ensureIdentifier` (`parser_impl.dart:4076`) dispatched
+    /// through the context's recovery template
+    /// (`identifier_context_impl.dart`): consumes an identifier-shaped
+    /// token; a reserved word in a keyword-tolerant context is reported
+    /// (`expectedIdentifierButGotKeyword`) and consumed as the name; any
+    /// other junk reports `missing_identifier` and inserts a synthetic
+    /// identifier without consuming the junk.
     pub(crate) fn ensure_identifier(
         &mut self,
         context: crate::listener::IdentifierContext,
     ) -> TokenSpan {
         let peek = self.cursor.peek();
+        // Keyword names go through the context's official recovery template
+        // first: class/mixin/extension names reject built-in identifiers
+        // (`builtInIdentifierInDeclaration`), keyword-tolerant contexts
+        // report `expectedIdentifierButGotKeyword` for reserved words and
+        // consume them as the name; whatever the template rejects falls
+        // through to the generic synthetic path.
+        if matches!(peek.kind, TokenKind::Keyword(_))
+            && let Some(message) = keyword_as_name_message(context, &peek, &self.cursor)
+        {
+            self.report(message, peek.span);
+            let id = self.cursor.advance();
+            let span = self.span_of(id);
+            self.listener.handle_identifier(span, context);
+            return span;
+        }
         if is_identifier(peek.kind) {
             let id = self.cursor.advance();
             let span = self.span_of(id);
@@ -165,26 +183,15 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     }
 
     /// Official `ensureIdentifierPotentiallyRecovered` (recovered-names
-    /// flavor): consumes any keyword/identifier-shaped token as the name
-    /// (the caller has already decided the reserved word must serve as the
-    /// name), otherwise reports + synthesizes like `ensure_identifier`.
+    /// flavor, `identifier_context_impl.dart:1491`): for every context this
+    /// crate reaches it with, the recovered flavor consumes the keyword with
+    /// the same report as the normal template, so it shares
+    /// [`Self::ensure_identifier`].
     pub(crate) fn ensure_identifier_recovered(
         &mut self,
         context: crate::listener::IdentifierContext,
     ) -> TokenSpan {
-        let peek = self.cursor.peek();
-        if matches!(peek.kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
-            let id = self.cursor.advance();
-            let span = self.span_of(id);
-            self.listener.handle_identifier(span, context);
-            return span;
-        }
-        self.report(msg::missing_identifier(), peek.span);
-        let id = self
-            .cursor
-            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
-        self.cursor.advance();
-        self.span_of(id)
+        self.ensure_identifier(context)
     }
 
     /// Official `ensureSemicolon`: consumes `;` or reports
@@ -288,5 +295,58 @@ pub(crate) fn is_identifier(kind: TokenKind) -> bool {
         TokenKind::Identifier => true,
         TokenKind::Keyword(kw) => kw.style() != dartq_scanner::KeywordStyle::Reserved,
         _ => false,
+    }
+}
+
+/// Contexts whose official recovery template keeps the identifier-position
+/// keyword sequence intact: a reserved word is reported
+/// (`expectedIdentifierButGotKeyword`) and consumed as the name. The
+/// exceptions (`identifier_context_impl.dart`) are the expression contexts
+/// (their own `as`/`is`/`EOF`-sensitive template), the type-reference
+/// contexts (`expectedType` family), `catchParameter` (`catchSyntax`
+/// template) and `fieldInitializer` (always `expectedIdentifier`).
+fn context_tolerates_keyword_as_name(context: crate::listener::IdentifierContext) -> bool {
+    !matches!(
+        context,
+        crate::listener::IdentifierContext::Expression
+            | crate::listener::IdentifierContext::ExpressionContinuation
+            | crate::listener::IdentifierContext::TypeReference
+            | crate::listener::IdentifierContext::PrefixedTypeReference
+            | crate::listener::IdentifierContext::TypeReferenceContinuation
+            | crate::listener::IdentifierContext::CatchParameter
+            | crate::listener::IdentifierContext::FieldInitializer
+    )
+}
+
+/// The report (if any) for consuming `view` as an identifier in `context`,
+/// mirroring the official context templates: class/mixin/extension names
+/// reject built-in identifiers (`builtInIdentifierInDeclaration`);
+/// keyword-tolerant contexts report `expectedIdentifierButGotKeyword` for
+/// reserved words; everything else falls back to the generic
+/// `missing_identifier` path.
+fn keyword_as_name_message(
+    context: crate::listener::IdentifierContext,
+    view: &crate::cursor::TokenView,
+    cursor: &crate::cursor::TokenCursor<'_, '_>,
+) -> Option<crate::message::Message> {
+    let TokenKind::Keyword(kw) = view.kind else {
+        return None;
+    };
+    let lexeme = cursor.lexeme(view.span.id);
+    match kw.style() {
+        dartq_scanner::KeywordStyle::Reserved => {
+            if context_tolerates_keyword_as_name(context) {
+                Some(msg::expected_identifier_but_got_keyword(lexeme))
+            } else {
+                None
+            }
+        }
+        dartq_scanner::KeywordStyle::BuiltIn
+            if context
+                == crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration =>
+        {
+            Some(msg::built_in_identifier_in_declaration(lexeme))
+        }
+        _ => None,
     }
 }

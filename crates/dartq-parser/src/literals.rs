@@ -852,7 +852,10 @@ mod tests {
     fn symbol_operator_membership_is_user_definable_operator() {
         // F11 (official `parseLiteralSymbol` :9244-9269): `~` is a member
         // (count 1); keywords `is`/`as` are not — they take the identifier
-        // path and report missing_identifier exactly like the oracle.
+        // path in the keyword-tolerant literalSymbol context, so a reserved
+        // word reports `expected_identifier_but_got_keyword` and is
+        // consumed (identifier_context_impl.dart recovery templates;
+        // official `symbols.dart.expect` messages).
         let p = parse_symbol("#~");
         assert_eq!(p.listener.symbol_ends, vec![1]);
         assert!(p.listener.events.contains(&"operator".to_owned()));
@@ -862,7 +865,10 @@ mod tests {
         let p = parse_symbol("#is");
         assert_eq!(p.listener.symbol_ends, vec![1]);
         assert!(!p.listener.events.contains(&"operator".to_owned()));
-        assert_eq!(p.listener.errors, vec!["missing_identifier".to_string()]);
+        assert_eq!(
+            p.listener.errors,
+            vec!["expected_identifier_but_got_keyword".to_string()]
+        );
     }
 
     #[test]

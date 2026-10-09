@@ -18,6 +18,7 @@ use crate::parser::Parser;
 use crate::recovery::is_identifier;
 use crate::token_id::TokenSpan;
 use crate::type_args::TypeParamOrArg;
+use crate::types::TypeInfo;
 
 impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseFormalParametersRequiredOpt`: a required `(...)` group;
@@ -332,8 +333,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             var_final_or_const,
         );
 
-        // Type (required in function types, optional otherwise).
-        let type_info = self.compute_type(in_function_type, false);
+        // Type (required in function types, optional otherwise); the formal
+        // flavor lets `TYPE <reserved word>` read as type + keyword name
+        // (official acceptKeywordForSimpleType, parser_impl.dart:2158).
+        let type_info = self.compute_type_formal(in_function_type);
         let mut this_keyword: Option<TokenSpan> = None;
         let mut super_keyword: Option<TokenSpan> = None;
         let mut period_after_this_or_super: Option<TokenSpan> = None;
@@ -391,7 +394,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
 
         // Inline function-typed parameter detection: `name` followed by
-        // `<...>` `(` or directly `(`.
+        // `<...>` `(` or directly `(` (official checks the follower of the
+        // type+name, `parser_impl.dart:2221-2264` — a committed type never
+        // reaches the bare-`(` arm, so record-type parameters like
+        // `((Enum, Enum) r)` parse as type + name).
         let mut before_inline_function_type: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
         if self.peek_kind() == TokenKind::Lt {
@@ -407,7 +413,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     before_inline_function_type = Some(self.peek_span());
                 }
             }
-        } else if self.peek_kind() == TokenKind::OpenParen && this_keyword.is_none() {
+        } else if self.peek_kind() == TokenKind::OpenParen
+            && this_keyword.is_none()
+            && matches!(type_info, TypeInfo::NoType)
+        {
             if let Some(t) = var_final_or_const
                 && member_kind != MemberKind::PrimaryConstructor
             {

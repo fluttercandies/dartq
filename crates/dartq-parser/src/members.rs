@@ -83,7 +83,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
-        let type_info = self.compute_type(false, true);
+        let mut type_info = self.compute_type(false, true);
         type_info.skip_type_raw(self);
 
         // `get`/`set` introducer before the name.
@@ -98,13 +98,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
 
         let mut name_is_recovered = false;
-        // Recovery: `<return type>? <reserved word> <method-or-field token>`.
+        // Recovery: `<return type>? <reserved word> <method-or-field token>`
+        // (official `parseTopLevelMemberImpl` :4304-4320 — the reserved check
+        // reads `next.next`, two past the un-consumed type start). The
+        // recomputed required type flows into the member parse so no
+        // `missing_const_final_var_or_type` rider fires.
         if matches!(type_info, TypeInfo::NoType)
             && mods.var_final_or_const.is_none()
-            && self.peek_is_reserved()
-            && self.indicates_method_or_field_at(1)
+            && self.peek_is_reserved_at(1)
+            && self.indicates_method_or_field_at(2)
         {
-            let type_info = self.compute_type(true, true);
+            type_info = self.compute_type(true, true);
             type_info.skip_type_raw(self);
             name_is_recovered = true;
         }
@@ -411,7 +415,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
-        let type_info = self.compute_type(false, true);
+        let mut type_info = self.compute_type(false, true);
         type_info.skip_type_raw(self);
         let mut after_type = self.cursor.mark();
 
@@ -557,7 +561,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     return;
                 }
             } else if self.peek_is_reserved_at(1) && self.indicates_method_or_field_at(2) {
-                let type_info = self.compute_type(true, true);
+                // Recovery: use the reserved keyword as the name (official
+                // :5651-5668); the recomputed required type must flow into
+                // the member parse, or a `missing_const_final_var_or_type`
+                // rider fires on every keyword-named member.
+                type_info = self.compute_type(true, true);
                 type_info.skip_type_raw(self);
                 after_type = self.cursor.mark();
                 name_is_recovered = true;
@@ -872,6 +880,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             if (gs.id as usize) > self.cursor.real_pos() {
                 self.cursor.jump_to(gs.id);
             }
+            self.cursor.advance();
+        } else if is_operator {
+            // The return-type re-parse rewound to `operator`; skip the
+            // introducer and the operator token consumed above (grammar
+            // guarantees adjacency, official parseMethod keeps `token` on
+            // the name throughout).
+            self.cursor.jump_to(name.id);
             self.cursor.advance();
         }
 
@@ -1783,44 +1798,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// `isUserDefinableOperator` on a kind.
     fn is_user_definable_operator(kind: TokenKind) -> bool {
-        matches!(
-            kind,
-            TokenKind::EqEq
-                | TokenKind::BangEq
-                | TokenKind::Tilde
-                | TokenKind::TildeSlash
-                | TokenKind::EqEqEq
-                | TokenKind::BangEqEq
-                | TokenKind::Lt
-                | TokenKind::Gt
-                | TokenKind::LtEq
-                | TokenKind::GtEq
-                | TokenKind::LtLt
-                | TokenKind::GtGt
-                | TokenKind::GtGtGt
-                | TokenKind::Plus
-                | TokenKind::Minus
-                | TokenKind::Star
-                | TokenKind::Slash
-                | TokenKind::Percent
-                | TokenKind::Bar
-                | TokenKind::Caret
-                | TokenKind::Ampersand
-                | TokenKind::LtLtEq
-                | TokenKind::GtGtEq
-                | TokenKind::GtGtGtEq
-                | TokenKind::PlusEq
-                | TokenKind::MinusEq
-                | TokenKind::StarEq
-                | TokenKind::SlashEq
-                | TokenKind::PercentEq
-                | TokenKind::TildeSlashEq
-                | TokenKind::BarEq
-                | TokenKind::CaretEq
-                | TokenKind::AmpersandEq
-                | TokenKind::Index
-                | TokenKind::IndexEq
-        )
+        is_user_definable_operator_kind(kind)
     }
 
     /// `token.isOperator` (any operator token).
@@ -1830,10 +1808,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 kind,
                 TokenKind::Eq | TokenKind::Bang | TokenKind::Comma | TokenKind::Question
             )
-    }
-
-    fn peek_is_reserved(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved)
     }
 
     fn peek_is_reserved_at(&self, n: usize) -> bool {
@@ -2033,4 +2007,47 @@ pub(crate) fn is_modifier_kind(kind: TokenKind) -> bool {
 /// `isKeywordOrIdentifier` (any keyword or identifier).
 pub(crate) fn is_keyword_or_identifier(kind: TokenKind) -> bool {
     is_identifier(kind) || matches!(kind, TokenKind::Keyword(_))
+}
+
+/// `isUserDefinableOperator` on a kind (shared with the record-type
+/// follower check).
+pub(crate) fn is_user_definable_operator_kind(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Tilde
+            | TokenKind::TildeSlash
+            | TokenKind::EqEqEq
+            | TokenKind::BangEqEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::LtEq
+            | TokenKind::GtEq
+            | TokenKind::LtLt
+            | TokenKind::GtGt
+            | TokenKind::GtGtGt
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Bar
+            | TokenKind::Caret
+            | TokenKind::Ampersand
+            | TokenKind::LtLtEq
+            | TokenKind::GtGtEq
+            | TokenKind::GtGtGtEq
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::TildeSlashEq
+            | TokenKind::BarEq
+            | TokenKind::CaretEq
+            | TokenKind::AmpersandEq
+            | TokenKind::Index
+            | TokenKind::IndexEq
+    )
 }

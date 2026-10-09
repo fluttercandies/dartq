@@ -233,6 +233,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `computeType` at the cursor. Precondition: clean cursor
     /// (nothing queued).
     pub(crate) fn compute_type(&mut self, required: bool, in_declaration: bool) -> TypeInfo {
+        self.compute_type_impl(required, in_declaration, false)
+    }
+
+    /// `computeType(..., acceptKeywordForSimpleType = true)` — the formal
+    /// parameter flavor (`parser_impl.dart:2156-2159`): `TYPE <reserved word>`
+    /// before an ok-next token reads as type + keyword name.
+    pub(crate) fn compute_type_formal(&mut self, required: bool) -> TypeInfo {
+        self.compute_type_impl(required, false, true)
+    }
+
+    fn compute_type_impl(
+        &mut self,
+        required: bool,
+        in_declaration: bool,
+        accept_keyword: bool,
+    ) -> TypeInfo {
         let next = self.peek_kind();
         let next_next = self.cursor.peek_kind_ahead(1);
         if !is_valid_non_record_type_reference(next, next_next)
@@ -354,8 +370,28 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
         } else if required || self.looks_like_name_at(1) {
             return TypeInfo::Simple;
+        } else if accept_keyword
+            && crate::members::is_keyword_or_identifier(next_next)
+            && Self::is_ok_next_value_in_formal(self.cursor.peek_kind_ahead(2))
+        {
+            // `TYPE <reserved word> <ok-next>` (type_info.dart:376-382 with
+            // acceptKeywordForSimpleType): the keyword serves as the name.
+            return TypeInfo::Simple;
         }
         TypeInfo::NoType
+    }
+
+    /// `isOkNextValueInFormalParameter` (`identifier_context.dart:421-427`).
+    fn is_ok_next_value_in_formal(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Eq
+                | TokenKind::Colon
+                | TokenKind::Comma
+                | TokenKind::CloseParen
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+        )
     }
 
     /// The `(...)` branch of `computeType` (type_info.dart:239-261).
@@ -372,15 +408,108 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if complex.gft_has_return_type.is_none() {
                 // Not a GFT after all: it is a plain record type.
                 let mut complex = self.complex_from_here(TypeParamOrArg::None);
+                if !required && !self.optional_record_type_follower_ok(group_end) {
+                    return TypeInfo::NoType;
+                }
                 complex.compute_record_type(self, required);
                 return TypeInfo::Complex(complex);
             }
             complex.gft_return_type_has_record_type = true;
             return TypeInfo::Complex(complex);
         }
+        if !required && !self.optional_record_type_follower_ok(group_end) {
+            // computeRecordType's optional-shape veto (type_info_impl.dart
+            // :771-860): `(` groups that are not followed by a declaration
+            // name stay expressions (e.g. `(v = 0) ?? 0;`).
+            return TypeInfo::NoType;
+        }
         let mut complex = self.complex_from_here(TypeParamOrArg::None);
         complex.compute_record_type(self, required);
         TypeInfo::Complex(complex)
+    }
+
+    /// `computeRecordType`'s `!required` follower validation
+    /// (type_info_impl.dart:771-860): after the group (and an optional `?`)
+    /// the shape only reads as a record type when a declaration continues —
+    /// a name before a boundary (with get/set/operator allowances), a
+    /// `this.`/`super.` receiver, or a type-argument context.
+    fn optional_record_type_follower_ok(&self, group_end: crate::token_id::TokenId) -> bool {
+        use crate::recovery::is_identifier;
+        let mut next = self.offset_of(group_end) + 1;
+        if self.kind_at(next) == TokenKind::Question {
+            next += 1;
+        }
+        let mut get_or_set = false;
+        if matches!(
+            self.kind_at(next),
+            TokenKind::Keyword(Keyword::Get | Keyword::Set)
+        ) && is_identifier(self.kind_at(next + 1))
+        {
+            get_or_set = true;
+            next += 1;
+        }
+        let kind = self.kind_at(next);
+        if is_identifier(kind) {
+            let after = self.kind_at(next + 1);
+            if matches!(
+                after,
+                TokenKind::Semicolon
+                    | TokenKind::Eq
+                    | TokenKind::Lt
+                    | TokenKind::OpenParen
+                    | TokenKind::Comma
+                    | TokenKind::CloseParen
+                    | TokenKind::Keyword(Keyword::In)
+                    | TokenKind::CloseCurly
+                    | TokenKind::Colon
+                    | TokenKind::CloseSquare
+                    | TokenKind::Eof
+            ) {
+                return true;
+            }
+            if get_or_set
+                && matches!(
+                    after,
+                    TokenKind::Function
+                        | TokenKind::OpenCurly
+                        | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
+                        | TokenKind::Eof
+                )
+            {
+                return true;
+            }
+            if kind == TokenKind::Keyword(Keyword::Operator)
+                && super::members::is_user_definable_operator_kind(after)
+            {
+                return true;
+            }
+            return false;
+        }
+        if matches!(kind, TokenKind::Keyword(Keyword::This | Keyword::Super))
+            && self.kind_at(next + 1) == TokenKind::Period
+        {
+            return true;
+        }
+        // Type-argument context (`List<(int, int)>`, official :838-859):
+        // `if (recovered || !isFollower) return noType` — a recovered shape
+        // (the parens are not really a record type) is rejected outright.
+        let recovered = !crate::type_args::RecordProbe {
+            open: self.offset_of(self.peek_id()),
+        }
+        .looks_like_record_type(self, self.offset_of(group_end));
+        if recovered {
+            return false;
+        }
+        matches!(
+            kind,
+            TokenKind::Comma
+                | TokenKind::Gt
+                | TokenKind::GtGt
+                | TokenKind::GtGtEq
+                | TokenKind::GtGtGt
+                | TokenKind::GtGtGtEq
+                | TokenKind::Eof
+        )
     }
 
     /// The `id.` branch of `computeType` (type_info.dart:307-353).
