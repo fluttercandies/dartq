@@ -1499,6 +1499,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let mut count = 0usize;
         let mut last_end = begin;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal` in literals.rs).
+                break;
+            }
             last_end = self.parse_initializer(last_end);
             count += 1;
             if self.peek_kind() != TokenKind::Comma {

@@ -1479,6 +1479,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal` in literals.rs).
+                end = self.peek_span();
+                break;
+            }
             if self.peek_kind() == TokenKind::CloseParen {
                 end = self.peek_span();
                 self.cursor.advance();
@@ -1740,6 +1746,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if self.peek_kind() != TokenKind::CloseCurly {
             self.may_parse_function_expressions = false;
             loop {
+                if self.is_bailed() {
+                    // Terminal bailout: unwind without consumption (see
+                    // `parse_list_literal` in literals.rs).
+                    break;
+                }
                 self.listener.begin_switch_expression_case();
                 let begin_token = self.peek_span();
                 if self.peek_kind() == TokenKind::Keyword(Keyword::Default) {

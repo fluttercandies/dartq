@@ -512,6 +512,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal`); the per-element no-progress guard
+                // alone cannot stop the missing-comma arm from spinning on
+                // queued synthetics.
+                end = self.peek_span();
+                break;
+            }
             let kind = self.peek_kind();
             if kind == TokenKind::CloseSquare {
                 end = self.peek_span();
@@ -549,6 +557,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     if looks_like_literal_entry(self, self.cursor.real_pos()) {
                         self.report(msg::expected_but_got(","), self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
+                        // Official list-suffix recovery
+                        // (`rewriteAndRecover` + `token = next`): step onto
+                        // the inserted comma so the next element parses the
+                        // real token.
+                        self.cursor.advance();
                         continue;
                     }
                     end = self.group_end_or_here(begin, "]");
@@ -568,6 +581,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal`).
+                end = self.peek_span();
+                break;
+            }
             let kind = self.peek_kind();
             if kind == TokenKind::CloseCurly {
                 end = self.peek_span();
@@ -608,6 +627,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     if looks_like_literal_entry(self, self.cursor.real_pos()) {
                         self.report(msg::expected_but_got(","), self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
+                        // Official recovery shape: step onto the inserted
+                        // comma (see the list-pattern arm).
+                        self.cursor.advance();
                         continue;
                     }
                     end = self.group_end_or_here(left, "}");
@@ -700,6 +722,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut argument_count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal`).
+                end = self.peek_span();
+                break;
+            }
             let kind = self.peek_kind();
             if kind == TokenKind::CloseParen {
                 end = self.peek_span();
@@ -743,6 +771,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     if looks_like_expression_start(self, self.cursor.real_pos()) {
                         self.report(msg::expected_but_got(","), self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
+                        // Official recovery shape: step onto the inserted
+                        // comma (see the list-pattern arm).
+                        self.cursor.advance();
                         continue;
                     }
                     let close = self.ensure_close_paren(begin);

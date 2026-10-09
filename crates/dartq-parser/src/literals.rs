@@ -221,6 +221,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                // The terminal bailout stops all consumption (the official
+                // stack-overflow recovery syncs forward instead); the
+                // enclosing frames unwind without touching the stream.
+                end = self.peek_span();
+                break;
+            }
             if self.peek_kind() == TokenKind::CloseSquare {
                 end = self.peek_span();
                 self.cursor.advance();
@@ -258,6 +265,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         };
                         self.report(message, self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
+                        // Official `rewriteAndRecover` + `token = next`
+                        // (:8553-8559): the loop steps onto the inserted
+                        // comma so the next element parses the real token.
+                        self.cursor.advance();
                         continue;
                     }
                     if let Some(close) = self.current_matching_end_for_open(left) {
@@ -317,6 +328,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.may_parse_function_expressions = true;
         let end;
         loop {
+            if self.is_bailed() {
+                // Terminal bailout: unwind without consumption (see
+                // `parse_list_literal`).
+                end = self.peek_span();
+                break;
+            }
             if self.peek_kind() == TokenKind::CloseCurly {
                 end = self.peek_span();
                 self.cursor.advance();
@@ -353,6 +370,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         };
                         self.report(message, self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
+                        // Official `rewriteAndRecover` + `token = next`
+                        // (:8055-8060): step onto the inserted comma.
+                        self.cursor.advance();
                         continue;
                     }
                     self.report(msg::expected_but_got("}"), self.peek_span());
