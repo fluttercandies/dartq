@@ -388,7 +388,10 @@ pub(crate) struct EngineState {
     /// globs, the lint face reads the rule names.
     pub options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
 
-    /// Memoized facts of previous contents (bounded, `FACTS_CACHE_CAP`).
+    /// Memoized pure per-file facts of previous contents — pre-resolution,
+    /// so a cross-batch hit re-runs the per-file attribution and URI
+    /// resolution at the hit site (l1 `derive_facts`; the [`FactsKey`] triple
+    /// is path-free by contract, PRD §5.3). Bounded, `FACTS_CACHE_CAP`.
     facts_cache: FxHashMap<FactsKey, Arc<UnitFacts>>,
     facts_order: VecDeque<FactsKey>,
     /// Dead-content tally since the last store sweep — the amortization

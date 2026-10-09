@@ -186,11 +186,12 @@ pub(crate) fn apply(
 /// facts cache skips the fan-out entirely (`ast_cache_hit`). Batch members
 /// sharing a key — identical bytes at the same feature set — compute once:
 /// the fan-out runs for the first member only and the rest derive from it
-/// (also reported as `ast_cache_hit`, no scan/parse ran). The derivation
-/// re-runs only the per-file steps: diagnostics are re-attributed to the
-/// member's own file, and its directives re-resolve against its own path —
-/// a relative `import 'u.dart'` resolves differently per directory, so the
-/// shared part is exactly the pure `(content, feature set)` computation.
+/// (also reported as `ast_cache_hit`, no scan/parse ran). Cross-batch hits
+/// derive from the cached face the same way. The derivation re-runs only
+/// the per-file steps: diagnostics are re-attributed to the member's own
+/// file, and its directives re-resolve against its own path — a relative
+/// `import 'u.dart'` resolves differently per directory, so the cache holds
+/// exactly the pure `(content, feature set)` face, pre-resolution.
 /// Changed files parse **twice** at M1 — once for recovery diagnostics
 /// through the engine's listener, once inside `dartq_semantic::collect`,
 /// which hardcodes its own listener. The waste is bounded to changed files
@@ -218,6 +219,10 @@ fn recompute_facts(
     // Batch slots deriving from an earlier slot's computation (same key),
     // grouped by their template slot.
     let mut siblings: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    // Cross-batch facts-cache hits (#303): faces computed for another
+    // batch's files. Derivation is deferred to the resolution pass below —
+    // it must re-run the per-file steps under the one sequential resolver.
+    let mut hits: Vec<(usize, Arc<UnitFacts>)> = Vec::new();
     for (index, (_, content, _)) in changed.iter().enumerate() {
         let key = FactsKey {
             content: *content,
@@ -225,7 +230,7 @@ fn recompute_facts(
             semantic_version: FACTS_SEMANTIC_VERSION,
         };
         if let Some(facts) = state.cached_facts(key) {
-            slots[index] = Some((facts, true));
+            hits.push((index, facts));
         } else if let Some(&template) = first_miss.get(&key) {
             siblings.entry(template).or_default().push(index);
         } else {
@@ -271,18 +276,26 @@ fn recompute_facts(
     );
     let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
     for (index, key, mut facts) in computed {
+        // The cache holds the pure face, pre-resolution: resolution is a
+        // per-file step, so caching its results would serve one file's
+        // targets (and URI diagnostics) to every same-content successor.
+        to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
         for sibling in siblings.remove(&index).unwrap_or_default() {
-            let mut derived = facts.clone();
-            for diagnostic in &mut derived.diagnostics {
-                diagnostic.file = changed[sibling].0;
-            }
-            resolve_unit(&mut derived, changed[sibling].0, &mut resolver);
+            let derived = derive_facts(&facts, changed[sibling].0, &mut resolver);
             slots[sibling] = Some((Arc::new(derived), true));
         }
         resolve_unit(&mut facts, changed[index].0, &mut resolver);
-        let facts = Arc::new(facts);
-        to_cache.push((key, Arc::clone(&facts)));
-        slots[index] = Some((facts, false));
+        slots[index] = Some((Arc::new(facts), false));
+    }
+    // Cross-batch hits (#303): the served face was computed for another
+    // file's identity — its diagnostics point there and its directives
+    // resolved against that file's path. Re-run the per-file derivation
+    // (same helper as the batch siblings) so the hit lands fully
+    // re-attributed: the AstKey triple is path-free by contract (PRD §5.3),
+    // making this a hit-site duty.
+    for (index, facts) in hits {
+        let derived = derive_facts(&facts, changed[index].0, &mut resolver);
+        slots[index] = Some((Arc::new(derived), true));
     }
     drop(resolver);
     for (key, facts) in to_cache {
@@ -297,6 +310,21 @@ fn recompute_facts(
             (*file, facts, cache_hit)
         })
         .collect()
+}
+
+/// The per-file derivation over a pure (content, feature set) face, shared
+/// by batch siblings (#272) and cross-batch facts-cache hits (#303): clone
+/// the template and re-run the two file-specific steps — diagnostics
+/// re-attributed to `file`, directives re-resolved against its own path.
+/// The template must be pre-resolution (one URI diagnostic per coded
+/// directive; resolving twice would double them).
+fn derive_facts(template: &UnitFacts, file: FileId, resolver: &mut UriResolver<'_>) -> UnitFacts {
+    let mut derived = UnitFacts::clone(template);
+    for diagnostic in &mut derived.diagnostics {
+        diagnostic.file = file;
+    }
+    resolve_unit(&mut derived, file, resolver);
+    derived
 }
 
 /// The per-file language version: the owning package's version, or the

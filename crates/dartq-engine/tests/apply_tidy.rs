@@ -1,7 +1,8 @@
 //! Apply-path tidy pins (goal #272): a batch computes identical-content
 //! members once (with per-file attribution and resolution preserved), and
 //! create/retire churn reuses retired `LibraryId`s instead of growing the
-//! arena.
+//! arena. Goal #303 pins the cross-batch face: a facts-cache hit re-runs
+//! the same per-file derivation (attribution + URI resolution).
 
 mod common;
 
@@ -93,6 +94,104 @@ fn batch_of_identical_files_computes_once_and_attributes_per_file() {
             }
         )],
         "same content in a later batch must hit the facts cache"
+    );
+}
+
+#[test]
+fn cross_batch_facts_cache_hit_reattributes_per_file() {
+    // Two identical-content twins per face, in different directories:
+    // the first twin of each pair computes and caches in batch 1, the
+    // second hits the cache in batch 2 — the served face must re-derive
+    // for the hit's own file (attribution + relative-URI resolution).
+    const IMPORTER: &str = "import 'anchor.dart';\n";
+    const LEAKER: &str = "import 'missing.dart';\n";
+    const ANCHOR: &str = "// the resolution anchor: exists next to a, not b\n";
+    let fixture = Fixture::new(&[
+        ("lib/anchor.dart", ANCHOR),
+        ("lib/a.dart", IMPORTER),
+        ("lib/src/b.dart", IMPORTER),
+        ("lib/c.dart", LEAKER),
+        ("lib/src/d.dart", LEAKER),
+    ]);
+    let mut engine = fixture.engine();
+    let mut sink = |_: EngineEvent| {};
+
+    // Batch 1: the anchor plus both cache templates. `a` resolves its
+    // relative import against lib/ (target resident, no diagnostic); `c`
+    // caches a failing resolution with its diagnostic attributed to itself.
+    engine.set_content(&fixture.path("lib/a.dart"), IMPORTER.as_bytes());
+    engine.set_content(&fixture.path("lib/c.dart"), LEAKER.as_bytes());
+    engine.set_content(&fixture.path("lib/anchor.dart"), ANCHOR.as_bytes());
+    let mut first = EventLog::default();
+    engine.apply_pending(&mut first.sink());
+    assert_eq!(
+        first
+            .revalidated
+            .iter()
+            .filter(|(_, gate)| matches!(
+                gate,
+                RevalidateGate::Parsed {
+                    ast_cache_hit: false
+                }
+            ))
+            .count(),
+        3,
+        "batch 1 computes every member fresh: {:?}",
+        first.revalidated
+    );
+    engine
+        .analyze(&[], &mut sink, &CancellationToken::default())
+        .expect("batch 1 analyze succeeds");
+
+    // Batch 2: the twins. Both must ride the facts cache.
+    let b = engine.set_content(&fixture.path("lib/src/b.dart"), IMPORTER.as_bytes());
+    let d = engine.set_content(&fixture.path("lib/src/d.dart"), LEAKER.as_bytes());
+    let mut second = EventLog::default();
+    engine.apply_pending(&mut second.sink());
+    assert_eq!(
+        second.revalidated,
+        vec![
+            (
+                b,
+                RevalidateGate::Parsed {
+                    ast_cache_hit: true
+                }
+            ),
+            (
+                d,
+                RevalidateGate::Parsed {
+                    ast_cache_hit: true
+                }
+            ),
+        ],
+        "both twins must hit the facts cache (FileIds ascend): {:?}",
+        second.revalidated
+    );
+
+    // The hits land fully re-attributed: `b` re-resolves against lib/src/
+    // (no anchor there — its own uri_does_not_exist), and `d`'s served
+    // diagnostics are its own copy, not `c`'s FileId.
+    let diagnostics = engine
+        .analyze(&[], &mut second.sink(), &CancellationToken::default())
+        .expect("batch 2 analyze succeeds");
+    let mut per_path: BTreeMap<String, usize> = BTreeMap::new();
+    for diagnostic in &diagnostics {
+        assert_eq!(diagnostic.code.name, "uri_does_not_exist");
+        let path = engine
+            .file_table()
+            .path(diagnostic.file)
+            .expect("attributed file is interned")
+            .to_string_lossy()
+            .into_owned();
+        *per_path.entry(path).or_default() += 1;
+    }
+    let expected: BTreeMap<String, usize> = ["lib/src/b.dart", "lib/c.dart", "lib/src/d.dart"]
+        .into_iter()
+        .map(|path| (fixture.path(path).to_string_lossy().into_owned(), 1))
+        .collect();
+    assert_eq!(
+        per_path, expected,
+        "each hit must carry exactly its own diagnostic: {per_path:?}"
     );
 }
 
