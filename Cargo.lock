@@ -157,6 +157,13 @@ dependencies = [
 [[package]]
 name = "dartiq-resolution"
 version = "0.1.0"
+dependencies = [
+ "dartiq-pub",
+ "dartiq-sdk",
+ "dartiq-source",
+ "rustc-hash",
+ "thiserror",
+]
 
 [[package]]
 name = "dartiq-scanner"

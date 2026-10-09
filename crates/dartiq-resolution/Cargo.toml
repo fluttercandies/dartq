@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+dartiq-pub = { path = "../dartiq-pub" }
+dartiq-sdk = { path = "../dartiq-sdk" }
+dartiq-source = { path = "../dartiq-source" }
+rustc-hash = { workspace = true }
+thiserror = "2"
+
 [lints]
 workspace = true

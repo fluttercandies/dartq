@@ -1,0 +1,1558 @@
+//! Directive URI parsing, classification, and resolution to interned file
+//! targets (`docs/facts/resolution-design-spec.md` §4.1/§5 module 1).
+//!
+//! The pipeline mirrors the analyzer's: parse the directive URI string with
+//! Dart `Uri.parse` validity rules, resolve relative strings against the
+//! containing file's canonical URI (`file_state.dart:766-796`), then dispatch
+//! the absolute URI by scheme — `dart:` through the SDK's `libraries.json`
+//! table, `package:` through the `package_config` (package name → lib dir),
+//! `file:` to a path, everything else unresolvable (`file_state.dart:1458-
+//! 1497`). Resolution is infallible: every failure mode is a classification
+//! ([`ResolvedUri::Unresolved`]) plus the §4.2 diagnostic code the oracle
+//! would emit for it.
+//!
+//! One oracle subtlety is load-bearing here: the containing file's canonical
+//! URI is `package:<pkg>/<rel>` for files under a package's lib dir and
+//! `file:` otherwise (`PackageMapUriResolver.pathToUri`), so relative
+//! composition from a package file happens in package-URI space —
+//! `../x.dart` from `package:p/a/b.dart` selects `package:p/x.dart`, i.e.
+//! `lib/x.dart`, not `root/x.dart`.
+
+use std::path::{Path, PathBuf};
+
+use dartiq_pub::{PackageConfig, PubError};
+use dartiq_sdk::SdkSnapshot;
+use dartiq_source::{FileId, FileTable};
+use rustc_hash::FxHashMap;
+
+use crate::codes::ResolutionCode;
+
+/// How a directive URI resolved (§5 core types).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedUri {
+    /// A `dart:` URI mapped through the SDK library table.
+    Dart {
+        /// Library name (`core` for `dart:core`, `core` again for
+        /// `dart:core/bool.dart`).
+        library: Box<str>,
+        /// The SDK source file path (need not exist on disk).
+        file: PathBuf,
+    },
+    /// A `package:` URI mapped through the package config.
+    Package {
+        /// Package name.
+        package: Box<str>,
+        /// The lib-relative path, decoded.
+        rel: PathBuf,
+        /// The resolved filesystem path (lib dir + rel).
+        file: PathBuf,
+    },
+    /// A `file:` or relative URI mapped to a filesystem path.
+    File(PathBuf),
+    /// Unresolvable; see [`UnresolvedKind`].
+    Unresolved(UnresolvedKind),
+}
+
+/// Why a directive URI has no target (§5 core types).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnresolvedKind {
+    /// The URI string does not parse (`Uri.parse` `FormatException`), or the
+    /// directive URI is a string interpolation and carries no string at all;
+    /// reported as `invalid_uri` / `uri_with_interpolation`.
+    BadUri,
+    /// Parses but maps to no file: unknown package, unknown `dart:` library,
+    /// unrecognized scheme (`data:`, `http:`, …); reported as
+    /// `uri_does_not_exist`.
+    NotExist,
+    /// The target is a generated-file path never produced on disk; reported
+    /// as `uri_has_not_been_generated` (the URI layer carries this in
+    /// [`UriResolution::code`] while keeping the [`ResolvedUri::Package`]/[
+    /// `ResolvedUri::File`] shape, so this variant is for upper layers).
+    Generated,
+    /// The target file exists but is a part file — decided by the
+    /// library-graph layer, which alone knows file roles; reported as
+    /// `import_of_non_library` / `export_of_non_library`.
+    NotLibrary,
+    /// The selected URI is `dart-ext:`; reported as
+    /// `use_of_native_extension` (additive to the spec draft, which has no
+    /// carrier for the §4.2 row).
+    DartExt,
+}
+
+/// Engine-facing projection of a [`ResolvedUri`] (§5, engine-api-spec §1):
+/// `Dart` → [`ResolvedTarget::External`] (SDK content, outside the analysis
+/// set), `Package`/`File` → [`ResolvedTarget::Resolved`] (a file target, even
+/// when the file is missing — the missing-ness rides on
+/// [`UriResolution::code`]), `Unresolved` → [`ResolvedTarget::Missing`] (no
+/// reverse edge, no content identity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedTarget {
+    /// The interned file target of the directive.
+    Resolved(FileId),
+    /// An external (SDK) library.
+    External,
+    /// No target: no reverse edge is built.
+    Missing,
+}
+
+/// The outcome of resolving one directive URI string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UriResolution {
+    /// The classification of the URI.
+    pub uri: ResolvedUri,
+    /// The engine-facing projection.
+    pub target: ResolvedTarget,
+    /// The §4.2 diagnostic code the oracle emits for this outcome, or `None`
+    /// when the target is fine.
+    pub code: Option<ResolutionCode>,
+}
+
+/// Failure of [`PackageTable::new`]: one `rootUri` in the package config
+/// cannot be turned into a filesystem path.
+#[derive(Debug, thiserror::Error)]
+#[error("package `{package}`: {source}")]
+pub struct PackageTableError {
+    /// The offending package name.
+    pub package: String,
+    /// The underlying `dartiq-pub` error.
+    #[source]
+    pub source: PubError,
+}
+
+/// The `package:` resolution face of a parsed package config: package name →
+/// lib dir (§5 interface table, `dartiq-pub` row).
+///
+/// Built once per analysis context; lookups are [`FxHashMap`] hits on the
+/// per-directive hot path. Also owns the generated-file face the analyzer
+/// layers onto `package:` targets (`.dart_tool/build/generated`).
+#[derive(Debug)]
+pub struct PackageTable {
+    lib_dirs: FxHashMap<Box<str>, PathBuf>,
+    /// Directory holding `.dart_tool/` — the base of the generated-file
+    /// fallback.
+    workspace_root: PathBuf,
+    /// Lib dirs sorted longest-first, for longest-prefix canonicalization.
+    longest_lib_dirs: Vec<(PathBuf, Box<str>)>,
+}
+
+impl PackageTable {
+    /// Indexes `config` whose `rootUri`s resolve against `config_dir`, the
+    /// directory holding the `package_config.json` (normally `.dart_tool/`).
+    ///
+    /// # Errors
+    ///
+    /// [`PackageTableError`] when any entry's `rootUri` is not a resolvable
+    /// `file:` URI or relative path — a broken config, reported loudly.
+    pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PackageTableError> {
+        let mut lib_dirs: FxHashMap<Box<str>, PathBuf> = FxHashMap::default();
+        for entry in &config.packages {
+            let root = entry
+                .resolve_root(config_dir)
+                .map_err(|source| PackageTableError {
+                    package: entry.name.clone(),
+                    source,
+                })?;
+            let root = normalize_lexical(&root);
+            let lib_dir = normalize_lexical(&root.join(&entry.package_uri));
+            lib_dirs.insert(Box::from(entry.name.as_str()), lib_dir);
+        }
+        let mut longest_lib_dirs: Vec<_> = lib_dirs
+            .iter()
+            .map(|(name, dir)| (dir.clone(), name.clone()))
+            .collect();
+        longest_lib_dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.as_os_str().len()));
+        let workspace_root = config_dir
+            .parent()
+            .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
+        Ok(Self {
+            lib_dirs,
+            workspace_root,
+            longest_lib_dirs,
+        })
+    }
+
+    /// The lib dir of package `name`, or `None` for an unknown package.
+    #[must_use]
+    pub fn lib_dir(&self, name: &str) -> Option<&Path> {
+        self.lib_dirs.get(name).map(PathBuf::as_path)
+    }
+}
+
+/// The resolution context: package table, SDK snapshot with its target
+/// segment, and the [`FileTable`] targets are interned into.
+///
+/// The containing file's canonical base URI is memoized per [`FileId`], so
+/// each file pays one package scan and every directive afterwards is hash
+/// lookups plus string work.
+pub struct UriResolver<'a> {
+    packages: &'a PackageTable,
+    sdk: &'a SdkSnapshot,
+    target: Box<str>,
+    files: &'a mut FileTable,
+    bases: FxHashMap<FileId, BaseUri>,
+}
+
+/// The canonical URI space a containing file resolves relatives against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BaseUri {
+    /// `package:<package>/<path>` — the container is under a package lib dir.
+    Package { package: Box<str>, path: Box<str> },
+    /// `file://<path>` — the container is anywhere else.
+    File(Box<str>),
+}
+
+/// An absolute URI after composition, ready to be landed on a target.
+enum Composed {
+    Package {
+        package: Box<str>,
+        rel: Box<str>,
+    },
+    File(Box<str>),
+    Dart(Box<str>),
+    DartExt,
+    /// Any other absolute scheme (`data:`, `http:`, …): parses, resolves to
+    /// nothing.
+    Other,
+}
+
+impl<'a> UriResolver<'a> {
+    /// Creates a resolver over `packages` and `sdk`, dispatching `dart:` URIs
+    /// against the SDK target segment `target` (e.g. `"vm"`) and interning
+    /// file targets into `files`.
+    pub fn new(
+        packages: &'a PackageTable,
+        sdk: &'a SdkSnapshot,
+        target: &str,
+        files: &'a mut FileTable,
+    ) -> Self {
+        Self {
+            packages,
+            sdk,
+            target: Box::from(target),
+            files,
+            bases: FxHashMap::default(),
+        }
+    }
+
+    /// The [`FileTable`] targets were interned into.
+    #[must_use]
+    pub const fn file_table(&self) -> &FileTable {
+        self.files
+    }
+
+    /// Resolves one directive URI string against `container`'s canonical URI.
+    ///
+    /// `uri_str` is `None` when the directive's URI literal is a string
+    /// interpolation (the parser sees no resolvable string) — the oracle's
+    /// `DirectiveUriWithoutString` face, reported as
+    /// `uri_with_interpolation`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `container` is not interned in this resolver's
+    /// [`FileTable`] — a caller bug (ids only come from that table).
+    pub fn resolve(&mut self, container: FileId, uri_str: Option<&str>) -> UriResolution {
+        let Some(uri_str) = uri_str else {
+            return UriResolution {
+                uri: ResolvedUri::Unresolved(UnresolvedKind::BadUri),
+                target: ResolvedTarget::Missing,
+                code: Some(ResolutionCode::UriWithInterpolation),
+            };
+        };
+        let Ok(raw) = parse_directive_uri(uri_str) else {
+            return UriResolution {
+                uri: ResolvedUri::Unresolved(UnresolvedKind::BadUri),
+                target: ResolvedTarget::Missing,
+                code: Some(ResolutionCode::InvalidUri),
+            };
+        };
+        if !raw.scheme.is_empty() {
+            return self.land(compose_absolute(&raw));
+        }
+        // Field-disjoint borrows: read the memoized base while mutating
+        // `files` inside `land`.
+        if !self.bases.contains_key(&container) {
+            let base = self.canonical_base(container);
+            self.bases.insert(container, base);
+        }
+        let composed = compose_relative(&self.bases[&container], &raw);
+        self.land(composed)
+    }
+
+    /// The canonical URI of `path` (`pathToUri` face): `package:` inside a
+    /// package lib dir (longest match wins), `file://` otherwise. This is the
+    /// library-identity string the library-graph layer keys on.
+    #[must_use]
+    pub fn canonical_uri(&self, path: &Path) -> Box<str> {
+        if let Some((package, rel)) = self.package_of(path) {
+            return Box::from(format!("package:{package}/{}", encode_uri_path(&rel)));
+        }
+        let text = path.to_string_lossy();
+        let encoded = encode_uri_path(&text);
+        let with_slash = if encoded.starts_with('/') {
+            encoded
+        } else {
+            format!("/{encoded}")
+        };
+        Box::from(format!("file://{with_slash}"))
+    }
+
+    /// The canonical base URI space of `container` (memoized per file).
+    fn canonical_base(&self, container: FileId) -> BaseUri {
+        let path = self
+            .files
+            .path(container)
+            .expect("container FileId interned in this resolver's FileTable");
+        if let Some((package, rel)) = self.package_of(path) {
+            return BaseUri::Package {
+                package: Box::from(package),
+                path: Box::from(encode_uri_path(&rel)),
+            };
+        }
+        let text = path.to_string_lossy();
+        let encoded = encode_uri_path(&text);
+        let with_slash = if encoded.starts_with('/') {
+            encoded
+        } else {
+            format!("/{encoded}")
+        };
+        BaseUri::File(Box::from(with_slash))
+    }
+
+    /// The package whose lib dir (longest match) contains `path`, with the
+    /// lib-relative path.
+    fn package_of(&self, path: &Path) -> Option<(&str, String)> {
+        let text = path.to_string_lossy();
+        for (dir, package) in &self.packages.longest_lib_dirs {
+            let dir_text = dir.to_string_lossy();
+            let rest = if text.len() > dir_text.len()
+                && text.starts_with(dir_text.as_ref())
+                && text.as_bytes()[dir_text.len()] == b'/'
+            {
+                &text[dir_text.len() + 1..]
+            } else {
+                continue;
+            };
+            return Some((package, rest.to_owned()));
+        }
+        None
+    }
+
+    /// Lands a composed absolute URI on a target: scheme dispatch, existence,
+    /// generated-file fallback, interning, and the §4.2 code.
+    fn land(&mut self, composed: Composed) -> UriResolution {
+        match composed {
+            Composed::DartExt => UriResolution {
+                uri: ResolvedUri::Unresolved(UnresolvedKind::DartExt),
+                target: ResolvedTarget::Missing,
+                code: Some(ResolutionCode::UseOfNativeExtension),
+            },
+            Composed::Dart(dart_uri) => match self.sdk.uri_to_path(&self.target, &dart_uri) {
+                Ok(file) => {
+                    let library = dart_uri
+                        .strip_prefix("dart:")
+                        .and_then(|rest| rest.split('/').next())
+                        .unwrap_or_default();
+                    UriResolution {
+                        uri: ResolvedUri::Dart {
+                            library: Box::from(library),
+                            file,
+                        },
+                        target: ResolvedTarget::External,
+                        code: None,
+                    }
+                }
+                // Unknown dart: library (or target): source is null —
+                // `uri_does_not_exist` per §4.2.
+                Err(_) => UriResolution {
+                    uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                    target: ResolvedTarget::Missing,
+                    code: Some(ResolutionCode::UriDoesNotExist),
+                },
+            },
+            Composed::Other => UriResolution {
+                uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                target: ResolvedTarget::Missing,
+                code: Some(ResolutionCode::UriDoesNotExist),
+            },
+            Composed::File(path) => {
+                let Some(text) = decode_uri_path(&path) else {
+                    return UriResolution {
+                        uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                        target: ResolvedTarget::Missing,
+                        code: Some(ResolutionCode::UriDoesNotExist),
+                    };
+                };
+                let path = normalize_lexical(Path::new(&text));
+                let code = (!path.exists()).then(|| missing_file_code(&path));
+                let id = self.files.intern(&path);
+                UriResolution {
+                    uri: ResolvedUri::File(path),
+                    target: ResolvedTarget::Resolved(id),
+                    code,
+                }
+            }
+            Composed::Package { package, rel } => self.land_package(package, &rel),
+        }
+    }
+
+    /// Lands a `package:` target: lib-dir lookup, the generated-file
+    /// fallback, and the missing-file code.
+    fn land_package(&mut self, package: Box<str>, rel: &str) -> UriResolution {
+        let unresolvable = || UriResolution {
+            uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+            target: ResolvedTarget::Missing,
+            code: Some(ResolutionCode::UriDoesNotExist),
+        };
+        let Some(lib_dir) = self.packages.lib_dir(&package).map(Path::to_path_buf) else {
+            return unresolvable();
+        };
+        let Some(decoded) = decode_uri_path(rel) else {
+            return unresolvable();
+        };
+        let file = normalize_lexical(&join_rel(&lib_dir, &decoded));
+        if !file.exists() {
+            // Generated-file face: `.dart_tool/build/generated/<pkg>/lib/`
+            // + the raw (undecoded) rel path, verbatim from the resolver
+            // chain; used only when present.
+            let built = join_rel(
+                &self
+                    .packages
+                    .workspace_root
+                    .join(".dart_tool/build/generated")
+                    .join(package.as_ref())
+                    .join("lib"),
+                rel,
+            );
+            if built.exists() {
+                let id = self.files.intern(&built);
+                return UriResolution {
+                    uri: ResolvedUri::Package {
+                        package,
+                        rel: PathBuf::from(&decoded),
+                        file: built,
+                    },
+                    target: ResolvedTarget::Resolved(id),
+                    code: None,
+                };
+            }
+            let code = missing_file_code(&file);
+            let id = self.files.intern(&file);
+            return UriResolution {
+                uri: ResolvedUri::Package {
+                    package,
+                    rel: PathBuf::from(&decoded),
+                    file,
+                },
+                target: ResolvedTarget::Resolved(id),
+                code: Some(code),
+            };
+        }
+        let id = self.files.intern(&file);
+        UriResolution {
+            uri: ResolvedUri::Package {
+                package,
+                rel: PathBuf::from(&decoded),
+                file,
+            },
+            target: ResolvedTarget::Resolved(id),
+            code: None,
+        }
+    }
+}
+
+/// The §4.2 code for a known-path-but-missing file: generated-suffix paths
+/// report `uri_has_not_been_generated`, everything else `uri_does_not_exist`
+/// (`library_analyzer.dart:694-700`).
+fn missing_file_code(path: &Path) -> ResolutionCode {
+    const GENERATED_SUFFIXES: [&str; 6] = [
+        ".g.dart",
+        ".pb.dart",
+        ".pbenum.dart",
+        ".pbserver.dart",
+        ".pbjson.dart",
+        ".template.dart",
+    ];
+    let text = path.to_string_lossy();
+    if GENERATED_SUFFIXES
+        .iter()
+        .any(|suffix| text.ends_with(suffix))
+    {
+        ResolutionCode::UriHasNotBeenGenerated
+    } else {
+        ResolutionCode::UriDoesNotExist
+    }
+}
+
+/// A directive URI string failed Dart `Uri.parse` validity rules — the
+/// `invalid_uri` face. Carries no detail by design: the only information is
+/// failure itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidUriSyntax;
+
+/// A directive URI string parsed under Dart `Uri.parse` validity rules
+/// (`sdk/lib/core/uri.dart` character tables). Query and fragment are
+/// validated but dropped: they never participate in file-target resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawUri {
+    /// Lowercased scheme, empty for relative URIs.
+    pub scheme: Box<str>,
+    /// Raw authority text (between `//` and the next `/`, `?`, `#`), `Some("")`
+    /// for an empty authority as in `file:///x`.
+    pub authority: Option<Box<str>>,
+    /// Raw path as written (percent-escapes intact).
+    pub path: Box<str>,
+}
+
+/// Parses `uri` with Dart `Uri.tryParse` fidelity for the forms directive
+/// strings take: scheme syntax, authority shape, per-component character
+/// tables, and percent-escape well-formedness. Non-ASCII characters are
+/// accepted (Dart normalizes them to escapes; targets are decoded paths).
+///
+/// # Errors
+///
+/// [`InvalidUriSyntax`] where Dart throws `FormatException` — reported as
+/// `invalid_uri`.
+pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
+    let bytes = uri.as_bytes();
+
+    // Scheme: `:` after a run of scheme characters; must start alphabetic
+    // ("Invalid empty scheme" / "Scheme not starting with alphabetic
+    // character" / "Illegal scheme character").
+    let mut scheme_end = 0;
+    while scheme_end < bytes.len() && is_scheme_char(bytes[scheme_end]) {
+        scheme_end += 1;
+    }
+    let (scheme, mut index) = if scheme_end < bytes.len() && bytes[scheme_end] == b':' {
+        if scheme_end == 0 || !bytes[0].is_ascii_alphabetic() {
+            return Err(InvalidUriSyntax);
+        }
+        (
+            uri[..scheme_end].to_ascii_lowercase().into_boxed_str(),
+            scheme_end + 1,
+        )
+    } else {
+        (Box::from(""), 0)
+    };
+
+    // Authority: everything after `//` up to the next path/query/fragment
+    // delimiter.
+    let mut authority = None;
+    if bytes.len() >= index + 2 && bytes[index] == b'/' && bytes[index + 1] == b'/' {
+        let start = index + 2;
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .map_or(bytes.len(), |offset| start + offset);
+        validate_authority(&uri[start..end])?;
+        authority = Some(Box::from(&uri[start..end]));
+        index = end;
+    }
+
+    // Path, then query, then fragment — each validated with its own table.
+    let path_end = bytes[index..]
+        .iter()
+        .position(|&b| matches!(b, b'?' | b'#'))
+        .map_or(bytes.len(), |offset| index + offset);
+    validate_component(&uri[index..path_end], PathOrQuery::Path)?;
+    let mut rest = path_end;
+    if rest < bytes.len() && bytes[rest] == b'?' {
+        rest += 1;
+        let query_end = bytes[rest..]
+            .iter()
+            .position(|&b| b == b'#')
+            .map_or(bytes.len(), |offset| rest + offset);
+        validate_component(&uri[rest..query_end], PathOrQuery::Query)?;
+        rest = query_end;
+    }
+    if rest < bytes.len() {
+        validate_component(&uri[rest + 1..], PathOrQuery::Query)?;
+    }
+
+    Ok(RawUri {
+        scheme,
+        authority,
+        path: Box::from(&uri[index..path_end]),
+    })
+}
+
+/// Path vs query/fragment character tables (`_pathCharOrSlashMask` vs
+/// `_queryCharMask`): the query table adds `?`, and fragments share it.
+#[derive(Clone, Copy)]
+enum PathOrQuery {
+    Path,
+    Query,
+}
+
+fn is_scheme_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+}
+
+fn validate_component(text: &str, component: PathOrQuery) -> Result<(), InvalidUriSyntax> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let b = bytes[index];
+        match b {
+            b'%' => {
+                let hex = bytes.get(index + 1..index + 3).ok_or(InvalidUriSyntax)?;
+                if !hex.iter().all(u8::is_ascii_hexdigit) {
+                    return Err(InvalidUriSyntax);
+                }
+                index += 3;
+            }
+            _ if b < 0x80 => {
+                let allowed = match component {
+                    PathOrQuery::Path => {
+                        matches!(
+                            b,
+                            b'/' | b':'
+                                | b'@'
+                                | b'-'
+                                | b'.'
+                                | b'_'
+                                | b'~'
+                                | b'!'
+                                | b'$'
+                                | b'&'
+                                | b'\''
+                                | b'('
+                                | b')'
+                                | b'*'
+                                | b'+'
+                                | b','
+                                | b';'
+                                | b'='
+                        ) || b.is_ascii_alphanumeric()
+                    }
+                    PathOrQuery::Query => {
+                        matches!(b, b'/' | b'?')
+                            || matches!(
+                                b,
+                                b':' | b'@'
+                                    | b'-'
+                                    | b'.'
+                                    | b'_'
+                                    | b'~'
+                                    | b'!'
+                                    | b'$'
+                                    | b'&'
+                                    | b'\''
+                                    | b'('
+                                    | b')'
+                                    | b'*'
+                                    | b'+'
+                                    | b','
+                                    | b';'
+                                    | b'='
+                            )
+                            || b.is_ascii_alphanumeric()
+                    }
+                };
+                if !allowed {
+                    return Err(InvalidUriSyntax);
+                }
+                index += 1;
+            }
+            // Non-ASCII: accepted, as in Dart (normalized to escapes there).
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Authority shape: optional IPv6 `[...]` host (with optional `:port`), else
+/// reg-name/userinfo characters (`_regNameMask`/`_userinfoMask` plus the `@`
+/// and port `:` delimiters).
+fn validate_authority(text: &str) -> Result<(), InvalidUriSyntax> {
+    let bytes = text.as_bytes();
+    if bytes.first() == Some(&b'[') {
+        let close = bytes
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or(InvalidUriSyntax)?;
+        if !bytes[1..close]
+            .iter()
+            .all(|&b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return Err(InvalidUriSyntax);
+        }
+        let rest = &bytes[close + 1..];
+        if !rest.is_empty() && (rest[0] != b':' || !rest[1..].iter().all(u8::is_ascii_digit)) {
+            return Err(InvalidUriSyntax);
+        }
+        return Ok(());
+    }
+    bytes.iter().try_for_each(|&b| {
+        let allowed = b >= 0x80
+            || b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'%'
+            );
+        if allowed {
+            Ok(())
+        } else {
+            Err(InvalidUriSyntax)
+        }
+    })
+}
+
+/// Classifies an absolute (scheme-carrying) [`RawUri`] for landing.
+fn compose_absolute(raw: &RawUri) -> Composed {
+    match (raw.scheme.as_ref(), raw.authority.as_deref()) {
+        ("dart-ext", _) => Composed::DartExt,
+        ("dart", _) => {
+            let authority = raw.authority.as_deref().filter(|a| !a.is_empty());
+            Composed::Dart(Box::from(match authority {
+                Some(a) => format!("dart://{a}{}", raw.path),
+                None => format!("dart:{}", raw.path),
+            }))
+        }
+        ("package", _) => {
+            // A leading `/` (any authority, or `package:///x`) or a missing
+            // `/` (no package name) leaves the resolver without a package —
+            // `slash < 1` → null in the oracle.
+            if raw.path.starts_with('/') || !raw.path.contains('/') {
+                Composed::Other
+            } else {
+                let (package, rel) = raw.path.split_once('/').unwrap_or(("", ""));
+                Composed::Package {
+                    package: Box::from(package),
+                    rel: Box::from(rel),
+                }
+            }
+        }
+        ("file", _) => {
+            // `fromUri` throws for a non-empty authority or a relative path —
+            // resolver null → `uri_does_not_exist`.
+            if raw.authority.as_ref().is_some_and(|a| !a.is_empty()) || !raw.path.starts_with('/') {
+                Composed::Other
+            } else {
+                Composed::File(raw.path.clone())
+            }
+        }
+        _ => Composed::Other,
+    }
+}
+
+/// Resolves a relative [`RawUri`] against the container's canonical base
+/// (`Uri.resolveUri` for `file:`/`package:` bases). Query/fragment were
+/// already dropped by the parser.
+fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
+    // An empty reference is the base itself (`resolveUri` empty-path rule) —
+    // `import ''` imports the containing file, as in the oracle.
+    if reference.path.is_empty() {
+        return match base {
+            BaseUri::Package { package, path } => Composed::Package {
+                package: package.clone(),
+                rel: path.clone(),
+            },
+            BaseUri::File(path) => Composed::File(path.clone()),
+        };
+    }
+    // A reference with its own authority keeps it under the base scheme; on a
+    // package base any authority leaves a leading `/` in the path, which the
+    // package resolver rejects (`slash < 1`).
+    if let Some(authority) = &reference.authority {
+        return match base {
+            BaseUri::File(_) => compose_absolute(&RawUri {
+                scheme: Box::from("file"),
+                authority: Some(authority.clone()),
+                path: reference.path.clone(),
+            }),
+            BaseUri::Package { .. } => Composed::Other,
+        };
+    }
+    // An absolute-path reference replaces the base path wholesale, keeping
+    // its leading `/`: on a package base the result (`package:/x`) parses no
+    // package name → unresolvable.
+    if reference.path.starts_with('/') {
+        return match base {
+            BaseUri::File(_) => Composed::File(reference.path.clone()),
+            BaseUri::Package { .. } => Composed::Other,
+        };
+    }
+    match base {
+        BaseUri::Package { package, path } => {
+            let merged = remove_dot_segments(&merge_paths(path, &reference.path));
+            if merged.starts_with("..") {
+                // Escaped the package root (`../../…`): no package URI can
+                // express it; the oracle's pathSegments then start at `..`.
+                Composed::Other
+            } else {
+                Composed::Package {
+                    package: package.clone(),
+                    rel: Box::from(merged),
+                }
+            }
+        }
+        BaseUri::File(path) => Composed::File(Box::from(remove_dot_segments(&merge_paths(
+            path,
+            &reference.path,
+        )))),
+    }
+}
+
+/// RFC 3986 §5.2.3 merge (Dart `_mergePaths`): the base path up to and
+/// including its final `/`, plus the reference path.
+fn merge_paths(base: &str, reference: &str) -> String {
+    let base_end = base.rfind('/').map_or(0, |index| index + 1);
+    format!("{}{reference}", &base[..base_end])
+}
+
+/// RFC 3986 §5.2.4 remove-dot-segments on the percent-encoded path (escapes
+/// contain no raw `/`, so segment operations are safe). `..` past the root of
+/// an absolute path clamps at the root; on a relative path leading `..`
+/// segments survive.
+fn remove_dot_segments(path: &str) -> String {
+    if !path.contains('.') {
+        return path.to_owned();
+    }
+    let absolute = path.starts_with('/');
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len() - 1;
+    let mut output: Vec<&str> = Vec::new();
+    let mut trailing = false;
+    for (index, segment) in segments.iter().enumerate() {
+        match *segment {
+            "." => trailing = index == last,
+            ".." => {
+                if absolute {
+                    // Segment 0 is the root marker `""`; never pop it.
+                    if output.len() > 1 {
+                        output.pop();
+                    }
+                } else if output.last().copied().is_some_and(|s| s != "..") {
+                    output.pop();
+                } else {
+                    output.push("..");
+                }
+                trailing = index == last;
+            }
+            other => output.push(other),
+        }
+    }
+    let mut joined = output.join("/");
+    if trailing && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    joined
+}
+
+/// Percent-decodes a URI path into UTF-8 text, or `None` when an escape does
+/// not decode to valid UTF-8 (`fromUri` throws → resolver null).
+fn decode_uri_path(text: &str) -> Option<String> {
+    if !text.contains('%') {
+        return Some(text.to_owned());
+    }
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes.get(index + 1..index + 3)?;
+            let high = (hex[0] as char).to_digit(16)?;
+            let low = (hex[1] as char).to_digit(16)?;
+            decoded.push(u8::try_from(high * 16 + low).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Percent-encodes a filesystem path into a URI path: everything outside the
+/// pchar set (and `/`) becomes uppercase `%XX` over UTF-8 bytes.
+#[must_use]
+pub fn encode_uri_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    for &b in bytes {
+        let plain = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            );
+        if plain {
+            encoded.push(b as char);
+        } else {
+            encoded.push('%');
+            encoded.push(
+                char::from_digit(u32::from(b >> 4), 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase(),
+            );
+            encoded.push(
+                char::from_digit(u32::from(b & 0xF), 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    encoded
+}
+
+/// Joins a lib-dir path with a `/`-separated decoded relative path.
+fn join_rel(dir: &Path, rel: &str) -> PathBuf {
+    let mut joined = dir.to_path_buf();
+    for segment in rel.split('/') {
+        joined.push(segment);
+    }
+    joined
+}
+
+/// Lexical path normalization (`path.Context.normalize`): collapses `.`,
+/// `..`, and empty segments; absoluteness is preserved. No symlink
+/// resolution — the [`FileTable`] owns canonical identity on intern.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let absolute = text.starts_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                let poppable = if absolute {
+                    !segments.is_empty()
+                } else {
+                    segments.last().is_some_and(|last| *last != "..")
+                };
+                if poppable {
+                    segments.pop();
+                } else if !absolute {
+                    segments.push("..");
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    let joined = segments.join("/");
+    if absolute {
+        PathBuf::from(format!("/{joined}"))
+    } else {
+        PathBuf::from(joined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ---- parse: Dart Uri.parse validity, per sdk/lib/core/uri.dart ----
+
+    #[test]
+    fn parses_directive_uri_shapes() {
+        let relative = parse_directive_uri("src/a.dart").expect("relative");
+        assert_eq!(relative.scheme.as_ref(), "");
+        assert_eq!(relative.authority, None);
+        assert_eq!(relative.path.as_ref(), "src/a.dart");
+
+        let package = parse_directive_uri("package:p/a/b.dart").expect("package");
+        assert_eq!(package.scheme.as_ref(), "package");
+        assert_eq!(package.path.as_ref(), "p/a/b.dart");
+
+        let dart = parse_directive_uri("dart:core/bool.dart").expect("dart");
+        assert_eq!(dart.scheme.as_ref(), "dart");
+
+        let file = parse_directive_uri("file:///tmp/x.dart").expect("file");
+        assert_eq!(file.authority.as_deref(), Some(""));
+        assert_eq!(file.path.as_ref(), "/tmp/x.dart");
+
+        let data = parse_directive_uri("data:text/plain,main(){}").expect("data");
+        assert_eq!(data.scheme.as_ref(), "data");
+
+        let ext = parse_directive_uri("dart-ext:native.so").expect("dart-ext");
+        assert_eq!(ext.scheme.as_ref(), "dart-ext");
+
+        // Scheme case is lowered; escapes and query/fragment split correctly.
+        let upper = parse_directive_uri("PACKAGE:p/a.dart").expect("upper");
+        assert_eq!(upper.scheme.as_ref(), "package");
+        let query = parse_directive_uri("a.dart?x=1#frag").expect("query");
+        assert_eq!(query.path.as_ref(), "a.dart");
+        let escaped = parse_directive_uri("my%20lib/a.dart").expect("escaped");
+        assert_eq!(escaped.path.as_ref(), "my%20lib/a.dart");
+    }
+
+    #[test]
+    fn rejects_uri_syntax_dart_rejects() {
+        // Empty scheme / non-alphabetic scheme start / illegal scheme char.
+        assert!(parse_directive_uri("::x").is_err());
+        assert!(parse_directive_uri("1a:b").is_err());
+        assert!(parse_directive_uri("a b:c").is_err());
+        // Space and general delimiters are not path characters.
+        assert!(parse_directive_uri("a b.dart").is_err());
+        assert!(parse_directive_uri("a<b.dart").is_err());
+        assert!(parse_directive_uri("a\\b.dart").is_err());
+        assert!(parse_directive_uri("a^b.dart").is_err());
+        assert!(parse_directive_uri("a`b.dart").is_err());
+        assert!(parse_directive_uri("a{b}.dart").is_err());
+        assert!(parse_directive_uri("a[b].dart").is_err());
+        // Broken percent escapes.
+        assert!(parse_directive_uri("a%zz.dart").is_err());
+        assert!(parse_directive_uri("a%.dart").is_err());
+        assert!(parse_directive_uri("a%2").is_err());
+        // Authority shapes.
+        assert!(parse_directive_uri("file://ho[st]/x.dart").is_err());
+        assert!(parse_directive_uri("package://[::1/x.dart").is_err());
+    }
+
+    #[test]
+    fn host_and_empty_authority_are_kept_for_dispatch() {
+        let hosted = parse_directive_uri("package://host/a.dart").expect("hosted");
+        assert_eq!(hosted.authority.as_deref(), Some("host"));
+        assert_eq!(hosted.path.as_ref(), "/a.dart");
+        let empty = parse_directive_uri("package:///a.dart").expect("empty");
+        assert_eq!(empty.authority.as_deref(), Some(""));
+        assert_eq!(empty.path.as_ref(), "/a.dart");
+    }
+
+    // ---- resolve: fixture workspace + synthetic SDK ----
+
+    const LIBRARIES_JSON: &str = r#"{
+      "vm": {
+        "libraries": {
+          "core": {"uri": "core/core.dart"},
+          "io": {"uri": "io/io.dart"}
+        }
+      }
+    }"#;
+    const ALLOWED_EXPERIMENTS_JSON: &str = r#"{
+      "version": 1,
+      "experimentSets": {"sdkExperiments": []},
+      "sdk": {"default": {"experimentSet": "sdkExperiments"}},
+      "packages": {}
+    }"#;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A throwaway workspace: `app/` holds `.dart_tool` + the config, `pkg_a`
+    /// is a workspace package, `hosted` a pub-cache package.
+    struct Workspace {
+        root: PathBuf,
+    }
+
+    impl Workspace {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dartiq-resolution-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let write = |relative: &str, content: &str| {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                fs::write(&path, content).expect("file");
+            };
+            write("pkg_a/lib/a.dart", "// fixture\n");
+            write("pkg_a/lib/sub/b.dart", "// fixture\n");
+            write("pkg_a/lib/c.dart", "// fixture\n");
+            write("app/lib/main.dart", "// fixture\n");
+            write("app/lib/util.dart", "// fixture\n");
+            write("app/bin/tool.dart", "// fixture\n");
+            write("hosted/lib/h.dart", "// fixture\n");
+            write(
+                "app/.dart_tool/package_config.json",
+                &format!(
+                    r#"{{
+                      "configVersion": 2,
+                      "packages": [
+                        {{"name": "pkg_a", "rootUri": "../pkg_a"}},
+                        {{"name": "hosted", "rootUri": "file://{}"}}
+                      ]
+                    }}"#,
+                    encode_uri_path(&root.join("hosted").to_string_lossy()),
+                ),
+            );
+            Self { root }
+        }
+
+        fn config_dir(&self) -> PathBuf {
+            self.root.join("app/.dart_tool")
+        }
+
+        fn packages(&self) -> PackageTable {
+            let json =
+                fs::read_to_string(self.config_dir().join("package_config.json")).expect("config");
+            let config = PackageConfig::parse(&json).expect("valid config");
+            PackageTable::new(&config, &self.config_dir()).expect("indexable config")
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A synthetic dart SDK exposing `dart:core`/`dart:io` on segment `vm`.
+    struct SdkFixture {
+        root: PathBuf,
+    }
+
+    impl SdkFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dartiq-resolution-sdk-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let write = |relative: &str, content: &str| {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                fs::write(&path, content).expect("file");
+            };
+            write("version", "3.13.1\n");
+            write("lib/libraries.json", LIBRARIES_JSON);
+            write(
+                "lib/_internal/allowed_experiments.json",
+                ALLOWED_EXPERIMENTS_JSON,
+            );
+            write("lib/core/core.dart", "library core;");
+            write("lib/io/io.dart", "library io;");
+            Self { root }
+        }
+
+        fn load(&self) -> SdkSnapshot {
+            SdkSnapshot::load(&self.root, None).expect("synthetic SDK loads")
+        }
+    }
+
+    impl Drop for SdkFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Shared context of one fixture workspace + synthetic SDK.
+    struct Fixture {
+        workspace: Workspace,
+        sdk: SdkFixture,
+        packages: PackageTable,
+        snapshot: SdkSnapshot,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let workspace = Workspace::new();
+            let sdk = SdkFixture::new();
+            let packages = workspace.packages();
+            let snapshot = sdk.load();
+            Self {
+                workspace,
+                sdk,
+                packages,
+                snapshot,
+            }
+        }
+    }
+
+    /// Builds a resolver over the fixture, interning into `files` (kept by the
+    /// test so fixture reads stay possible while the resolver is alive).
+    fn resolver<'a>(fixture: &'a Fixture, files: &'a mut FileTable) -> UriResolver<'a> {
+        UriResolver::new(&fixture.packages, &fixture.snapshot, "vm", files)
+    }
+
+    /// Interns a fixture-relative path as a container file.
+    fn container(fixture: &Fixture, files: &mut FileTable, relative: &str) -> FileId {
+        files.intern(&fixture.workspace.root.join(relative))
+    }
+
+    fn code_of(resolution: &UriResolution) -> ResolutionCode {
+        resolution.code.expect("resolution carries a code")
+    }
+
+    #[test]
+    fn relative_hit_round_trips_through_file_table() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let resolution = resolver(&fixture, &mut files).resolve(container, Some("util.dart"));
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+        assert_eq!(resolution.code, None);
+        let ResolvedTarget::Resolved(id) = resolution.target else {
+            panic!("expected a file target");
+        };
+        assert_eq!(
+            files.path(id),
+            Some(fixture.workspace.root.join("app/lib/util.dart").as_path())
+        );
+        // The same file reached through a different spelling shares one id.
+        let via_dot = resolver(&fixture, &mut files).resolve(container, Some("./util.dart"));
+        assert_eq!(via_dot.target, resolution.target);
+        // And through a percent escape decoding to the same name.
+        let via_escape = resolver(&fixture, &mut files).resolve(container, Some("uti%6C.dart"));
+        assert_eq!(via_escape.target, resolution.target);
+    }
+
+    #[test]
+    fn relative_composition_against_file_base() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let resolution =
+            resolver(&fixture, &mut files).resolve(container, Some("../bin/tool.dart"));
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/bin/tool.dart"))
+        );
+        assert_eq!(resolution.code, None);
+        // Dot segments collapse lexically before existence is consulted.
+        let dotdot = resolver(&fixture, &mut files).resolve(container, Some("sub/../util.dart"));
+        assert_eq!(
+            dotdot.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+    }
+
+    /// The oracle pin: a container under a package lib dir composes relatives
+    /// in package-URI space, so `../c.dart` from `lib/sub/b.dart` selects
+    /// `package:pkg_a/c.dart` — `lib/c.dart`, not `pkg_a/c.dart`.
+    #[test]
+    fn relative_composition_from_package_file_stays_in_lib_space() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "pkg_a/lib/sub/b.dart");
+        let resolution = resolver(&fixture, &mut files).resolve(container, Some("../c.dart"));
+        let ResolvedUri::Package { package, rel, file } = resolution.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "pkg_a");
+        assert_eq!(rel, PathBuf::from("c.dart"));
+        assert_eq!(file, fixture.workspace.root.join("pkg_a/lib/c.dart"));
+        assert_eq!(resolution.code, None);
+
+        // Escaping past the package root is not expressible as a package URI
+        // → unresolvable.
+        let escape = resolver(&fixture, &mut files).resolve(container, Some("../../../x.dart"));
+        assert_eq!(
+            escape.uri,
+            ResolvedUri::Unresolved(UnresolvedKind::NotExist)
+        );
+        assert_eq!(code_of(&escape), ResolutionCode::UriDoesNotExist);
+        assert_eq!(escape.target, ResolvedTarget::Missing);
+    }
+
+    /// `import ''` resolves to the containing file itself (`resolveUri`
+    /// empty-reference rule), interning to the container's own id.
+    #[test]
+    fn empty_uri_self_import() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let resolution = resolver(&fixture, &mut files).resolve(container, Some(""));
+        assert_eq!(resolution.target, ResolvedTarget::Resolved(container));
+        assert_eq!(resolution.code, None);
+    }
+
+    #[test]
+    fn package_targets_map_through_lib_dirs() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut files = FileTable::new();
+        let mut resolver = resolver(&fixture, &mut files);
+
+        let hit = resolver.resolve(container, Some("package:pkg_a/a.dart"));
+        assert_eq!(
+            hit.uri,
+            ResolvedUri::Package {
+                package: "pkg_a".into(),
+                rel: PathBuf::from("a.dart"),
+                file: fixture.workspace.root.join("pkg_a/lib/a.dart"),
+            }
+        );
+        assert_eq!(hit.code, None);
+
+        let sub = resolver.resolve(container, Some("package:pkg_a/sub/b.dart"));
+        assert_eq!(
+            sub.uri,
+            ResolvedUri::Package {
+                package: "pkg_a".into(),
+                rel: PathBuf::from("sub/b.dart"),
+                file: fixture.workspace.root.join("pkg_a/lib/sub/b.dart"),
+            }
+        );
+
+        // A package from an absolute hosted rootUri resolves identically.
+        let hosted = resolver.resolve(container, Some("package:hosted/h.dart"));
+        assert_eq!(
+            hosted.uri,
+            ResolvedUri::Package {
+                package: "hosted".into(),
+                rel: PathBuf::from("h.dart"),
+                file: fixture.workspace.root.join("hosted/lib/h.dart"),
+            }
+        );
+
+        // One target through both faces shares one FileId: relative
+        // `../../pkg_a/lib/a.dart` and `package:pkg_a/a.dart`.
+        let via_relative = resolver.resolve(container, Some("../../pkg_a/lib/a.dart"));
+        assert_eq!(via_relative.target, hit.target);
+    }
+
+    #[test]
+    fn package_failures_carry_oracle_codes() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut files = FileTable::new();
+        let mut resolver = resolver(&fixture, &mut files);
+
+        // Unknown package: no target at all.
+        let unknown = resolver.resolve(container, Some("package:missing/a.dart"));
+        assert_eq!(
+            unknown.uri,
+            ResolvedUri::Unresolved(UnresolvedKind::NotExist)
+        );
+        assert_eq!(code_of(&unknown), ResolutionCode::UriDoesNotExist);
+        assert_eq!(unknown.target, ResolvedTarget::Missing);
+
+        // No package name (`package:x`, `package:`).
+        for uri in ["package:pkg_a", "package:"] {
+            let none = resolver.resolve(container, Some(uri));
+            assert_eq!(
+                none.uri,
+                ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                "{uri}"
+            );
+            assert_eq!(code_of(&none), ResolutionCode::UriDoesNotExist, "{uri}");
+        }
+
+        // Authority form: the path starts with `/`, no package parseable.
+        let hosted = resolver.resolve(container, Some("package://host/a.dart"));
+        assert_eq!(
+            hosted.uri,
+            ResolvedUri::Unresolved(UnresolvedKind::NotExist)
+        );
+
+        // Known package, missing file: target exists (the lib path), the
+        // code carries the missing-ness.
+        let missing = resolver.resolve(container, Some("package:pkg_a/gone.dart"));
+        assert!(matches!(missing.uri, ResolvedUri::Package { .. }));
+        assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
+        assert_eq!(code_of(&missing), ResolutionCode::UriDoesNotExist);
+
+        // Missing with a generated suffix: hasn't-been-generated instead.
+        let generated = resolver.resolve(container, Some("package:pkg_a/made.g.dart"));
+        assert!(matches!(generated.uri, ResolvedUri::Package { .. }));
+        assert_eq!(code_of(&generated), ResolutionCode::UriHasNotBeenGenerated);
+    }
+
+    /// The generated-file face: a missing lib target falls back to
+    /// `.dart_tool/build/generated/<pkg>/lib/<raw rel>` when that exists.
+    #[test]
+    fn package_generated_fallback_used_when_present() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let built = fixture
+            .workspace
+            .root
+            .join("app/.dart_tool/build/generated/pkg_a/lib/gen.g.dart");
+        fs::create_dir_all(built.parent().expect("parent")).expect("built dir");
+        fs::write(&built, "// generated\n").expect("built file");
+
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let resolution =
+            resolver(&fixture, &mut files).resolve(container, Some("package:pkg_a/gen.g.dart"));
+        let ResolvedUri::Package { file, .. } = resolution.uri else {
+            panic!("expected a package target");
+        };
+        assert_eq!(file, built);
+        assert_eq!(resolution.code, None);
+    }
+
+    #[test]
+    fn dart_targets_map_through_sdk_table() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut files = FileTable::new();
+        let mut resolver = resolver(&fixture, &mut files);
+
+        let core = resolver.resolve(container, Some("dart:core"));
+        assert_eq!(
+            core.uri,
+            ResolvedUri::Dart {
+                library: "core".into(),
+                file: fixture.sdk.root.join("lib/core/core.dart"),
+            }
+        );
+        assert_eq!(core.target, ResolvedTarget::External);
+        assert_eq!(core.code, None);
+
+        // `dart:core/bool.dart` keeps the library name and joins the part.
+        let part = resolver.resolve(container, Some("dart:core/bool.dart"));
+        let ResolvedUri::Dart { library, file } = part.uri else {
+            panic!("expected a dart target");
+        };
+        assert_eq!(library.as_ref(), "core");
+        assert_eq!(file, fixture.sdk.root.join("lib/core/bool.dart"));
+        assert_eq!(part.target, ResolvedTarget::External);
+
+        // Unknown dart library (and unknown on this target): source null.
+        let unknown = resolver.resolve(container, Some("dart:mirrors"));
+        assert_eq!(
+            unknown.uri,
+            ResolvedUri::Unresolved(UnresolvedKind::NotExist)
+        );
+        assert_eq!(code_of(&unknown), ResolutionCode::UriDoesNotExist);
+        assert_eq!(unknown.target, ResolvedTarget::Missing);
+    }
+
+    #[test]
+    fn file_scheme_and_unsupported_schemes() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut resolver = resolver(&fixture, &mut files);
+
+        let file = resolver.resolve(
+            container,
+            Some(&format!(
+                "file://{}",
+                encode_uri_path(
+                    &fixture
+                        .workspace
+                        .root
+                        .join("app/lib/util.dart")
+                        .to_string_lossy()
+                )
+            )),
+        );
+        assert_eq!(
+            file.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+        assert_eq!(file.code, None);
+
+        // A missing file: URI target with the does-not-exist code.
+        let missing = resolver.resolve(container, Some("file:///definitely/not/there.dart"));
+        assert!(matches!(missing.uri, ResolvedUri::File(_)));
+        assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
+        assert_eq!(code_of(&missing), ResolutionCode::UriDoesNotExist);
+
+        // Hosted file: URI and unsupported schemes (data:, http:) parse but
+        // resolve to nothing.
+        for uri in [
+            "file://host/x.dart",
+            "data:text/plain,main(){}",
+            "http://x/y.dart",
+        ] {
+            let none = resolver.resolve(container, Some(uri));
+            assert_eq!(
+                none.uri,
+                ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                "{uri}"
+            );
+            assert_eq!(code_of(&none), ResolutionCode::UriDoesNotExist, "{uri}");
+            assert_eq!(none.target, ResolvedTarget::Missing, "{uri}");
+        }
+
+        // dart-ext: carries its own frozen code.
+        let ext = resolver.resolve(container, Some("dart-ext:native.so"));
+        assert_eq!(ext.uri, ResolvedUri::Unresolved(UnresolvedKind::DartExt));
+        assert_eq!(code_of(&ext), ResolutionCode::UseOfNativeExtension);
+    }
+
+    #[test]
+    fn no_string_and_bad_syntax_report_their_frozen_codes() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut files = FileTable::new();
+        let mut resolver = resolver(&fixture, &mut files);
+
+        // Interpolation: the parser saw no string to resolve.
+        let interpolated = resolver.resolve(container, None);
+        assert_eq!(
+            interpolated.uri,
+            ResolvedUri::Unresolved(UnresolvedKind::BadUri)
+        );
+        assert_eq!(code_of(&interpolated), ResolutionCode::UriWithInterpolation);
+        assert_eq!(interpolated.target, ResolvedTarget::Missing);
+
+        // Unparseable syntax.
+        let bad = resolver.resolve(container, Some("a b:c"));
+        assert_eq!(bad.uri, ResolvedUri::Unresolved(UnresolvedKind::BadUri));
+        assert_eq!(code_of(&bad), ResolutionCode::InvalidUri);
+        assert_eq!(bad.target, ResolvedTarget::Missing);
+    }
+
+    #[test]
+    fn canonical_uri_prefers_package_space() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let resolver = resolver(&fixture, &mut files);
+
+        assert_eq!(
+            resolver.canonical_uri(&fixture.workspace.root.join("pkg_a/lib/sub/b.dart")),
+            Box::from("package:pkg_a/sub/b.dart")
+        );
+        assert_eq!(
+            resolver.canonical_uri(&fixture.workspace.root.join("app/lib/main.dart")),
+            Box::from(format!(
+                "file://{}",
+                encode_uri_path(
+                    &fixture
+                        .workspace
+                        .root
+                        .join("app/lib/main.dart")
+                        .to_string_lossy()
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn broken_root_uri_fails_loudly() {
+        let config = PackageConfig::parse(
+            r#"{"configVersion": 2, "packages": [{"name": "a", "rootUri": "http://x/y"}]}"#,
+        )
+        .expect("parses");
+        let error = PackageTable::new(&config, Path::new("/p/.dart_tool"))
+            .expect_err("unsupported scheme is a hard error");
+        assert_eq!(error.package, "a");
+    }
+}
