@@ -5,5 +5,27 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+dartiq-diagnostics = { path = "../dartiq-diagnostics" }
+dartiq-language = { path = "../dartiq-language" }
+dartiq-package = { path = "../dartiq-package" }
+dartiq-parser = { path = "../dartiq-parser" }
+dartiq-pub = { path = "../dartiq-pub" }
+dartiq-resolution = { path = "../dartiq-resolution" }
+dartiq-scanner = { path = "../dartiq-scanner" }
+dartiq-semantic = { path = "../dartiq-semantic" }
+dartiq-sdk = { path = "../dartiq-sdk" }
+dartiq-source = { path = "../dartiq-source" }
+rustc-hash = { workspace = true }
+thiserror = "2"
+
+[[bench]]
+name = "cold_analysis"
+harness = false
+
+[[bench]]
+name = "incremental_p95"
+harness = false
+
 [lints]
 workspace = true
