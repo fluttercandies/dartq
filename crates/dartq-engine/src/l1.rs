@@ -10,13 +10,9 @@ use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Seve
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
-use dartq_resolution::{
-    CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver,
-};
+use dartq_resolution::{CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver};
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
-use dartq_source::{
-    ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of,
-};
+use dartq_source::{ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -915,10 +911,10 @@ fn reform_and_close(state: &mut EngineState) -> Vec<LibraryId> {
 
 /// Rebuilds `libraries`, `library_of_file`, and `importers` from residency.
 ///
-/// Formation: defining files (no `part of`) in `FileId` order each own a
-/// library keyed on their canonical URI; their `part` targets that are
-/// themselves part files join in directive order (first claim wins on
-/// conflicts — `duplicate_part` is a diagnostic ticket's business). Part
+/// Formation: defining files (no `part of`) each own a library keyed on
+/// their canonical URI; their `part` targets that are themselves part files
+/// join in directive order (first claim wins on conflicts, precedence by
+/// canonical URI — `duplicate_part` is a diagnostic ticket's business). Part
 /// files claimed by nobody become singleton libraries. Every resident file
 /// belongs to exactly one library (engine-api-spec §1.2).
 fn reform_libraries(state: &mut EngineState) {
@@ -937,7 +933,11 @@ fn reform_libraries(state: &mut EngineState) {
         }
     }
 
-    // Pass A: defining libraries (FileId order fixes claim precedence).
+    // Pass A: defining libraries. Claim precedence is the canonical-URI byte
+    // order (the oracle picks the path-smallest claiming library,
+    // file_state.dart:2176-2192): `FileId` interning order differs between
+    // the incremental and full arms when files are created mid-sequence, so
+    // it would fork the winner when two libraries include the same part.
     let mut defining: Vec<(FileId, LibraryId)> = Vec::new();
     let mut is_part: FxHashSet<FileId> = FxHashSet::default();
     for file in &resident {
@@ -948,6 +948,7 @@ fn reform_libraries(state: &mut EngineState) {
             defining.push((*file, id));
         }
     }
+    defining.sort_unstable_by(|a, b| state.canonical_uris[&a.0].cmp(&state.canonical_uris[&b.0]));
 
     // Pass B: attach parts (directive order, first claim wins). Belonging
     // follows the part-of form (analyzer file_state.dart:2087-2266): a
@@ -1041,7 +1042,11 @@ fn reform_libraries(state: &mut EngineState) {
                 if directive.kind == DirectiveKind::Part
                     && let ResolvedTarget::Resolved(target) = directive.target
                     && state.residency.contains_key(&target)
-                    && !members.contains(&target)
+                    // O(1) membership: the defining file itself and every
+                    // target this library claimed are members; any other
+                    // resident target is an unclaimed part target.
+                    && target != *file
+                    && claims.get(&target).copied() != Some(*lib)
                 {
                     part_targets.push(target);
                 }
@@ -1105,24 +1110,31 @@ fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
 }
 
 /// Whether `defining_file`'s `part` directive may claim the part file
-/// `target`: a URI-form part file belongs to its includer outright, while a
-/// name-form part file requires the includer's declared library name to
-/// equal the part-of name and both files to live in the same package (the
-/// analyzer matches names globally over sibling-directory discovery; the M1
-/// engine bounds the scan to one package, incremental-l1-spec §7.1).
+/// `target`, mirroring the oracle's per-kind `isPartOf`:
+///
+/// * Name form — the includer's declared library name equals the part-of
+///   name and both files live in the same package (analyzer
+///   `PartOfNameFileKind::isPartOf`, file_state.dart:2222-2225; the analyzer
+///   matches names globally over sibling-directory discovery, the M1 engine
+///   bounds the scan to one package, incremental-l1-spec §7.1).
+/// * URI form — the part file's own `part of` URI must resolve back to the
+///   claiming defining file (`PartOfUriKnownFileKind::isPartOf`,
+///   file_state.dart:2262-2265); the include alone is no proof. An
+///   unresolvable URI (`PartOfUriUnknownFileKind`, file_state.dart:2283-2291)
+///   or a shapeless one (interpolated — no resolvable string) stays
+///   unclaimed.
 fn may_claim(
     state: &EngineState,
     defining_file: FileId,
     library_name: Option<&str>,
     target: FileId,
 ) -> bool {
-    let Some(part_of_name) = state.residency[&target]
+    state.residency[&target]
         .part_of()
-        .and_then(|directive| directive.name.as_deref())
-    else {
-        return true; // URI-form (or shapeless): the resolved include is the proof.
-    };
-    library_name == Some(part_of_name) && same_package(state, defining_file, target)
+        .is_some_and(|part_of| match part_of.name.as_deref() {
+            Some(name) => library_name == Some(name) && same_package(state, defining_file, target),
+            None => part_of.target == ResolvedTarget::Resolved(defining_file),
+        })
 }
 
 /// Whether both files carry the same package identity (or both none — the

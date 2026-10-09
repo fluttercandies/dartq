@@ -115,18 +115,33 @@ impl UnitFacts {
         self.content
     }
 
-    /// The first `part of` directive, if the unit is a part file.
+    /// The unit's `part of` directive, if the unit is a part file. When both
+    /// part-of forms are present the name form wins regardless of source
+    /// order — the oracle's `_updateKind` priority (file_state.dart:933-949):
+    /// partOfName over partOfUri.
     #[must_use]
     pub fn part_of(&self) -> Option<&DirectiveFacts> {
         self.directives
             .iter()
-            .find(|directive| directive.kind == DirectiveKind::PartOf)
+            .find(|directive| directive.kind == DirectiveKind::PartOf && directive.name.is_some())
+            .or_else(|| {
+                self.directives
+                    .iter()
+                    .find(|directive| directive.kind == DirectiveKind::PartOf)
+            })
     }
 
-    /// Whether the unit carries a `part of` directive (a part file).
+    /// Whether the unit is a part file: a `part of` directive and no
+    /// `library` directive — the oracle classifies a file carrying a
+    /// `library` directive as a library regardless of any `part of`
+    /// (`_updateKind`, file_state.dart:937-939).
     #[must_use]
     pub fn is_part(&self) -> bool {
-        self.part_of().is_some()
+        !self
+            .directives
+            .iter()
+            .any(|directive| directive.kind == DirectiveKind::Library)
+            && self.part_of().is_some()
     }
 }
 

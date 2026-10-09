@@ -271,7 +271,11 @@ fn name_form_part_bounded_name_scan() {
         .analyze(&[], &mut |_| {}, &Default::default())
         .expect("cold");
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    assert_eq!(engine.libraries().len(), 2, "n plus the pn orphan singleton");
+    assert_eq!(
+        engine.libraries().len(),
+        2,
+        "n plus the pn orphan singleton"
+    );
     assert_ne!(
         engine.library_of(n),
         engine.library_of(pn),
@@ -323,5 +327,106 @@ fn name_form_part_bounded_name_scan() {
     let orphan = engine.library_of(pn).expect("live");
     assert_eq!(log.cascades.len(), 1, "one cascade");
     assert_eq!(log.cascades[0].len(), 2, "n and the fresh singleton dirty");
-    assert!(log.cascades[0].contains(&orphan), "the new singleton dirties");
+    assert!(
+        log.cascades[0].contains(&orphan),
+        "the new singleton dirties"
+    );
+}
+
+/// Interpolated `part` include (#251 pin): an includer whose `part`
+/// directive carries no resolvable string (`'${x}.dart'` — the
+/// `uri_with_interpolation` face) claims nothing; the part file it names
+/// stays an orphan singleton even though its own `part of` URI resolves
+/// back to the includer. The claim needs both halves — the resolved include
+/// and the resolved back-reference (`PartOfUriKnownFileKind::isPartOf`,
+/// file_state.dart:2262-2265).
+#[test]
+fn interpolated_part_include_claims_nothing() {
+    const A: &str = "part '${x}.dart';\nint f() => 1;\n";
+    const P: &str = "part of 'a.dart';\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/a.dart", A), ("lib/p.dart", P)]);
+    let a_path = fixture.path("lib/a.dart");
+    let p_path = fixture.path("lib/p.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&a_path, A.as_bytes());
+    engine.set_content(&p_path, P.as_bytes());
+    let a = engine.file_table().try_file_id(&a_path).expect("interned");
+    let p = engine.file_table().try_file_id(&p_path).expect("interned");
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("cold");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.file == a
+                && diagnostic.code.name == "uri_with_interpolation"),
+        "the interpolated include bakes the interpolation face: {diagnostics:?}"
+    );
+    assert_eq!(engine.libraries().len(), 2, "a plus the p orphan singleton");
+    assert_ne!(
+        engine.library_of(a),
+        engine.library_of(p),
+        "the unresolved include claims no member"
+    );
+    let lib_a = engine.library_of(a).expect("live");
+    assert_eq!(
+        engine
+            .libraries()
+            .into_iter()
+            .find(|(id, _)| *id == lib_a)
+            .map(|(_, members)| members)
+            .expect("live"),
+        vec![a],
+        "a's library has no parts"
+    );
+    assert_eq!(
+        engine.library_defining_file(engine.library_of(p).expect("live")),
+        Some(p),
+        "p is its own orphan singleton"
+    );
+}
+
+/// Interpolated `part of` (#251 pin): a part file whose `part of` carries no
+/// resolvable string (`part of '${x}.dart';` — shapeless, no URI and no
+/// name) bakes the `uri_with_interpolation` face and stays an orphan
+/// singleton; the includer's resolvable `part 'p.dart';` alone claims
+/// nothing, mirroring `PartOfUriUnknownFileKind`
+/// (file_state.dart:2283-2291).
+#[test]
+fn interpolated_part_of_is_an_orphan_singleton() {
+    const A: &str = "part 'p.dart';\nint f() => 1;\n";
+    const P: &str = "part of '${x}.dart';\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/a.dart", A), ("lib/p.dart", P)]);
+    let a_path = fixture.path("lib/a.dart");
+    let p_path = fixture.path("lib/p.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&a_path, A.as_bytes());
+    engine.set_content(&p_path, P.as_bytes());
+    let a = engine.file_table().try_file_id(&a_path).expect("interned");
+    let p = engine.file_table().try_file_id(&p_path).expect("interned");
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("cold");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.file == p
+                && diagnostic.code.name == "uri_with_interpolation"),
+        "the shapeless part of bakes the interpolation face: {diagnostics:?}"
+    );
+    assert_eq!(engine.libraries().len(), 2, "a plus the p orphan singleton");
+    assert_ne!(
+        engine.library_of(a),
+        engine.library_of(p),
+        "the include alone claims no shapeless part"
+    );
+    assert_eq!(
+        engine.library_defining_file(engine.library_of(p).expect("live")),
+        Some(p),
+        "p is its own orphan singleton"
+    );
 }
