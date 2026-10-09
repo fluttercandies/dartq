@@ -73,10 +73,13 @@ pub fn message_template(name: &str) -> Option<&'static str> {
 }
 
 // A code's [`DiagnosticType`] is the machine format's TYPE value. Generated
-// rows are SYNTACTIC_ERROR (parser/scanner class types) except the
-// language-version family, which is WarningCode-class STATIC_WARNING. Codes
-// the oracle routes by hand to COMPILE_TIME_ERROR at emit time (facts §2
-// pseudoSharedCode routing) are emit-site decisions, not registry facts.
+// rows are SYNTACTIC_ERROR (parser/scanner class types), except the
+// language-version family typed by registry class: invalid_language_version_
+// override is WarningCode-class STATIC_WARNING, while illegal/inconsistent_
+// language_version_override are CompileTimeErrorCode-class COMPILE_TIME_ERROR
+// (analyzer-8.4.1 codes.g.dart). Codes the oracle routes by hand to
+// COMPILE_TIME_ERROR at emit time (facts §2 pseudoSharedCode routing) are
+// emit-site decisions, not registry facts.
 
 // --- M0-measured codes outside the generated syntax table ---
 // hasPublishedDocs values captured from the generated registries
@@ -264,11 +267,14 @@ mod tests {
     }
 
     /// Audit F7: every `SYNTACTIC_ERROR` code carries oracle severity ERROR
-    /// (so emitters must emit severity `Error`), and the oracle-WARNING row
-    /// is the static-warning family. The language-version ERROR rows are
-    /// STATIC_WARNING-typed by class (facts §2/§3: class-level TYPE with
-    /// per-code severity override), so severity ⇒ family holds only in the
-    /// WARNING direction.
+    /// (so emitters must emit severity `Error`), the oracle-WARNING row is
+    /// the static-warning family, and ERROR rows never carry a warning
+    /// family. TYPE follows the oracle registry class, not per-row severity:
+    /// `illegal/inconsistent_language_version_override` are CompileTime-
+    /// ErrorCode entries (codes.g.dart:3136/:3368, ERROR +
+    /// COMPILE_TIME_ERROR) while `invalid_language_version_override` is
+    /// WarningCode (codes.g.dart:11530+, WARNING + STATIC_WARNING) — severity
+    /// alone does not decide the family.
     #[test]
     fn dtype_matches_oracle_severity() {
         let registry = CodeRegistry::builtin();
@@ -278,7 +284,13 @@ mod tests {
                 "WARNING" => {
                     assert_eq!(code.dtype, DiagnosticType::StaticWarning, "{name}");
                 }
-                "ERROR" => {}
+                "ERROR" => {
+                    assert_ne!(
+                        code.dtype,
+                        DiagnosticType::StaticWarning,
+                        "{name}: ERROR rows are never STATIC_WARNING-typed"
+                    );
+                }
                 other => panic!("{name}: unknown oracle SEV {other:?}"),
             }
             if code.dtype == DiagnosticType::SyntacticError {
@@ -288,6 +300,25 @@ mod tests {
                 );
             }
         }
+        // Audit #170 F1/F2 pin: the two ERROR-level language-version rows are
+        // CompileTimeErrorCode (COMPILE_TIME_ERROR), not WarningCode.
+        for name in [
+            "illegal_language_version_override",
+            "inconsistent_language_version_override",
+        ] {
+            assert_eq!(
+                registry.get(name).expect(name).dtype,
+                DiagnosticType::CompileTimeError,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry
+                .get("invalid_language_version_override")
+                .expect("present")
+                .dtype,
+            DiagnosticType::StaticWarning
+        );
     }
 
     /// Message templates: placeholders are consecutive from `{0}` and never

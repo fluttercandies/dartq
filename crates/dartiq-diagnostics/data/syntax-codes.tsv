@@ -1,12 +1,33 @@
 # dartiq official syntax diagnostic codes — authoritative data table.
 # Source: docs/facts/syntax-codes.md section 9 (goal #25 forensic capture).
-# Oracle lock: dart 3.13.1 stable (analyzer-8.4.1 + _fe_analyzer_shared-91.0.0).
+# Oracle lock: dart 3.13.1 stable. This table is a PINNED SNAPSHOT of
+#   analyzer-8.4.1 (lib/src/dart/error/syntactic_errors.g.dart +
+#   lib/src/error/codes.g.dart) and _fe_analyzer_shared-91.0.0
+#   (lib/src/scanner/errors.g.dart); the emitted machine TYPE set follows
+#   dartdev's emitMachineFormat (pkg/dartdev analyze.dart, stdout, uppercase).
+#   Do not refresh rows from other analyzer/SDK versions without redoing the
+#   full capture: 3.15 main already moved templates and recast classes (#189).
 # Captured: 2026-10-08. Regeneration: edit this table, then cargo build.
 # Columns: <name> TAB <MACHINE> TAB <SEV> TAB <source> TAB <message template> TAB <hasPublishedDocs>.
+# `source` = oracle registry class + same-name const count; it decides the
+#   machine TYPE (build.rs dtype_of): `P`/`S`/`P+S`/`P+P+…` = ParserErrorCode/
+#   ScannerErrorCode consts -> SYNTACTIC_ERROR; `W<n>` = WarningCode consts ->
+#   STATIC_WARNING; `C<n>` = CompileTimeErrorCode consts -> COMPILE_TIME_ERROR.
+#   illegal/inconsistent_language_version_override are CompileTimeErrorCode
+#   (codes.g.dart), not WarningCode; only invalid_language_version_override is
+#   WarningCode.
+# Shared-name families (expected_body x9, expected_named_type x4,
+#   invalid_language_version_override x9) keep one representative variant's
+#   template here; the name column is the user-visible shared code.
+# The parser crate also maintains out-of-table local codes
+#   (crates/dartiq-parser/src/message.rs `local_code`): registry-gap or
+#   uniqueName-shaped codes deliberately absent from this table — audits must
+#   not re-derive them into it.
 # hasPublishedDocs (captured 2026-10-09): mirrors the generated registry —
 # analyzer-8.4.1 syntactic_errors.g.dart, _fe_analyzer_shared-91.0.0
-# scanner/errors.g.dart, analyzer-8.4.1 error/codes.g.dart (the 3 W rows; all
-# 9 INVALID_LANGUAGE_VERSION_OVERRIDE variants are true, ILLEGAL_ is false).
+# scanner/errors.g.dart, analyzer-8.4.1 error/codes.g.dart (the
+# language-version family; all 9 INVALID_LANGUAGE_VERSION_OVERRIDE variants
+# are true, ILLEGAL_ is false).
 # The oracle emits the JSON `documentation` URL only when this is true
 # (`_fe_analyzer_shared` errors.dart `url` getter).
 abstract_class_member	ABSTRACT_CLASS_MEMBER	ERROR	P	Members of classes can't be declared to be 'abstract'.	false
@@ -271,6 +292,6 @@ with_before_extends	WITH_BEFORE_EXTENDS	ERROR	P	The extends clause must be befor
 wrong_number_of_parameters_for_setter	WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER	ERROR	P	Setters must declare exactly one required positional parameter.	true
 wrong_separator_for_positional_parameter	WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER	ERROR	P	The default value of a positional parameter should be preceded by '='.	false
 wrong_terminator_for_parameter_group	WRONG_TERMINATOR_FOR_PARAMETER_GROUP	ERROR	P	Expected '{0}' to close parameter group.	false
-illegal_language_version_override	ILLEGAL_LANGUAGE_VERSION_OVERRIDE	ERROR	W1	The language version must be {0}.	false
-inconsistent_language_version_override	INCONSISTENT_LANGUAGE_VERSION_OVERRIDE	ERROR	W1	Parts must have exactly the same language version override as the library.	true
+illegal_language_version_override	ILLEGAL_LANGUAGE_VERSION_OVERRIDE	ERROR	C1	The language version must be {0}.	false
+inconsistent_language_version_override	INCONSISTENT_LANGUAGE_VERSION_OVERRIDE	ERROR	C1	Parts must have exactly the same language version override as the library.	true
 invalid_language_version_override	INVALID_LANGUAGE_VERSION_OVERRIDE	WARNING	W9	The Dart language version override number must begin with '@dart'.	true

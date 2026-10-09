@@ -107,6 +107,13 @@ fn validate(rows: &[Row]) {
             sev == "ERROR" || sev == "WARNING",
             "data/syntax-codes.tsv:{line}: SEV must be ERROR or WARNING, got {sev:?}"
         );
+        // `source` = oracle registry class + same-name const count; the first
+        // char picks the machine TYPE in `dtype_of`. An unknown class must be
+        // a build error, not a silent SYNTACTIC_ERROR fallback.
+        assert!(
+            matches!(source.as_bytes().first(), Some(b'P' | b'S' | b'W' | b'C')),
+            "data/syntax-codes.tsv:{line}: source {source:?} must start with P, S, W or C"
+        );
         assert!(
             machine == &name.to_uppercase(),
             "data/syntax-codes.tsv:{line}: MACHINE {machine:?} is not the uppercase of {name:?}"
@@ -163,17 +170,27 @@ fn placeholders(message: &str) -> Vec<(u32, usize)> {
     out
 }
 
-/// The [`crate::model::DiagnosticType`] variant name for a row.
+/// The [`crate::model::DiagnosticType`] variant name for a row, from its
+/// oracle registry class (TSV `source` column).
 ///
-/// - WarningCode-sourced rows (language-version family, `W*` sources):
-///   class type is `STATIC_WARNING` (facts §2), regardless of per-row
-///   severity.
+/// - `C*` sources: `CompileTimeErrorCode` consts (the ERROR-level
+///   language-version rows) — class type `COMPILE_TIME_ERROR`
+///   (analyzer-8.4.1 codes.g.dart: `illegalLanguageVersionOverride`
+///   CompileTimeErrorTemplate, `inconsistentLanguageVersionOverride`
+///   CompileTimeErrorWithoutArguments).
+/// - `W*` sources: `WarningCode` consts (`invalid_language_version_override`)
+///   — class type `STATIC_WARNING`.
 /// - Everything else: parser/scanner class type `SYNTACTIC_ERROR`.
 ///
-/// `COMPILE_TIME_ERROR` routing (facts §2 pseudoSharedCode) is an emit-site
-/// decision per parse route and is not a property of the table.
+/// Per-row severity overrides the class severity (facts §2/§3); the emitted
+/// SEVERITY comes from the diagnostics, the TYPE from this mapping.
+/// `COMPILE_TIME_ERROR` routing of pseudoSharedCode parser errors (facts §2)
+/// is an emit-site decision per parse route and is not a property of the
+/// table.
 fn dtype_of(source: &str) -> &'static str {
-    if source.starts_with('W') {
+    if source.starts_with('C') {
+        "CompileTimeError"
+    } else if source.starts_with('W') {
         "StaticWarning"
     } else {
         "SyntacticError"
