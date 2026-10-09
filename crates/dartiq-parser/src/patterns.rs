@@ -70,7 +70,10 @@ pub(crate) fn looks_like_pattern_start(
 
 /// `looksLikeLiteralEntry` (`literal_entry_info.dart:79`) reduced to the
 /// shapes the list/map pattern recovery loops need.
-fn looks_like_literal_entry(parser: &Parser<'_, '_, impl ParserListener>, offset: usize) -> bool {
+pub(crate) fn looks_like_literal_entry(
+    parser: &Parser<'_, '_, impl ParserListener>,
+    offset: usize,
+) -> bool {
     looks_like_expression_start(parser, offset)
         || matches!(
             parser.kind_at(offset),
@@ -137,11 +140,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     pub(crate) fn parse_pattern(&mut self, context: PatternContext) -> TokenSpan {
         if !self.features.patterns_enabled {
             let at = self.peek_span();
-            self.listener.handle_experiment_not_enabled(
-                crate::listener::ExperimentalFlag::Patterns,
-                at,
-                at,
-            );
+            if self.admit_diagnostic() {
+                self.listener.handle_experiment_not_enabled(
+                    crate::listener::ExperimentalFlag::Patterns,
+                    at,
+                    at,
+                );
+            }
             return at;
         }
         self.parse_pattern_at(context, 1)
@@ -232,30 +237,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // a combined closer (`>>`/`>=`) splits on consume, so the follower
         // is the split remainder, not the token after the combined lexeme.
         let type_param = if self.peek_kind() == TokenKind::Lt {
-            self.compute_type_param_or_arg_on_lt(false)
+            self.compute_type_param_or_arg_on_lt(true)
         } else {
             crate::types::TypeParamOrArg::None
         };
         let follower = if matches!(type_param, crate::types::TypeParamOrArg::None) {
             self.peek_kind()
         } else {
-            let lt = self.cursor.real_pos();
-            match &type_param {
-                crate::types::TypeParamOrArg::Simple1 { closer } => match closer {
-                    crate::types::SimpleCloser::Gt => self.kind_at(lt + 3),
-                    // `<id>=` / `<id>>`: the remainder token follows the group.
-                    crate::types::SimpleCloser::GtEq => TokenKind::Eq,
-                    crate::types::SimpleCloser::GtGt => TokenKind::Gt,
-                },
-                crate::types::TypeParamOrArg::Complex(g) => {
-                    let end = self.offset_of(g.end);
-                    match crate::cursor::split_remainders(self.kind_at(end)).first() {
-                        Some((kind, _)) => *kind,
-                        None => self.kind_at(end + 1),
-                    }
-                }
-                crate::types::TypeParamOrArg::None => unreachable!(),
-            }
+            self.type_arg_follower(&type_param, self.cursor.real_pos())
         };
         match follower {
             TokenKind::OpenSquare | TokenKind::Index => {
@@ -562,8 +551,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
                         continue;
                     }
-                    self.report(msg::expected_but_got("]"), self.peek_span());
-                    end = self.group_end_or_here(begin);
+                    end = self.group_end_or_here(begin, "]");
                     break;
                 }
             }
@@ -622,8 +610,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
                         continue;
                     }
-                    self.report(msg::expected_but_got("}"), self.peek_span());
-                    end = self.group_end_or_here(left);
+                    end = self.group_end_or_here(left, "}");
                     break;
                 }
             }
@@ -656,7 +643,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if kind == TokenKind::Colon {
                 was_record = true;
                 was_valid_record = true;
-                self.listener.handle_no_name(self.peek_span());
+                // Official `handleNoName(token)` (:12198): the payload is the
+                // token BEFORE the colon, not the colon itself.
+                let before = self.span_of(self.peek_id() - 1);
+                self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();
             } else if kind != TokenKind::OpenParen
@@ -665,6 +655,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 was_record = true;
                 let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
                 colon = Some(name);
+                // Consume the colon: the sub-pattern parses after it
+                // (official `ensureIdentifier(...).next!`, :12205-12213).
+                self.cursor.advance();
                 was_valid_record = true;
             }
             let before = self.cursor.progress();
@@ -719,7 +712,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             let mut colon: Option<TokenSpan> = None;
             if kind == TokenKind::Colon {
-                self.listener.handle_no_name(self.peek_span());
+                // Official `handleNoName(token)` (:12270): the token BEFORE
+                // the colon.
+                let before = self.span_of(self.peek_id() - 1);
+                self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();
             } else if self.cursor.peek_kind_ahead(1) == TokenKind::Colon {
@@ -760,16 +756,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         end
     }
 
-    /// Jump to the scanner-paired group end for recovery, or stay.
-    fn group_end_or_here(&mut self, begin: TokenSpan) -> TokenSpan {
+    /// Jump to the scanner-paired group end for recovery, or stay. The jump
+    /// is silent when the closer is scanner-synthesized — the scanner already
+    /// reported the unclosed group (official `moveSynthetic` path,
+    /// `parser_impl.dart:12051-12064`); a real but distant closer reports
+    /// `expectedButGot`.
+    fn group_end_or_here(&mut self, begin: TokenSpan, expected: &str) -> TokenSpan {
         match self.cursor.table_matching_end(begin.id) {
             Some(end) => {
+                let (_, synthetic) = self.cursor.resolve(end);
+                if !synthetic {
+                    self.report(msg::expected_but_got(expected), self.peek_span());
+                }
                 self.skip_to_token(end);
                 let span = self.peek_span();
                 self.cursor.advance();
                 span
             }
-            None => self.peek_span(),
+            None => {
+                self.report(msg::expected_but_got(expected), self.peek_span());
+                self.peek_span()
+            }
         }
     }
 }
@@ -784,4 +791,77 @@ fn is_relational_or_equality(kind: TokenKind) -> bool {
             | TokenKind::EqEq
             | TokenKind::BangEq
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr_const::test_support::{Log, parser};
+    use crate::listener::Token;
+    use crate::message::Message;
+
+    #[test]
+    fn record_pattern_named_field_advances_past_colon() {
+        // F1: `(x: 1)` parses the sub-pattern after the colon
+        // (official :12205-12213), with no recovery noise.
+        let mut p = parser("(x: 1)", Log::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        p.listener.assert_events(&[("handle", "record_pattern")]);
+        assert!(p.listener.errors_empty());
+    }
+
+    #[test]
+    fn list_pattern_missing_comma_splits_elements() {
+        // F10 (official :8549-8556 / pattern analog): `[1 2]` becomes two
+        // elements with exactly one expected-`,` report.
+        let mut p = parser("[1 2]", Log::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        p.listener.assert_events(&[("handle", "list_pattern")]);
+        assert_eq!(p.listener.error_codes(), ["expected_token"]);
+    }
+
+    #[test]
+    fn typed_list_pattern_smoke() {
+        // F13: the leading `<...>` probe runs in declaration mode
+        // (official :11066-11068, inDeclaration = true).
+        for source in ["<int>[1, 2]", "<List<int>>[1]"] {
+            let mut p = parser(source, Log::default());
+            let _ = p.parse_pattern_entry(PatternContext::Matching);
+            p.listener.assert_events(&[("handle", "list_pattern")]);
+            assert!(p.listener.errors_empty(), "{source}");
+        }
+    }
+
+    /// Local listener capturing `handleNoName` payloads (span offset/length).
+    #[derive(Default)]
+    struct NoNameLog {
+        errors: Vec<String>,
+        no_names: Vec<(u32, u32)>,
+    }
+
+    impl crate::listener::ParserListener for NoNameLog {
+        fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+            self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_no_name(&mut self, token: Token) {
+            self.no_names.push((token.range.offset, token.range.length));
+        }
+    }
+
+    #[test]
+    fn no_name_payload_is_the_token_before_the_colon() {
+        // F14 (official :12198 record / :12270 object): `handleNoName`
+        // receives the token before the colon — `(` at offset 0 here.
+        let mut p = parser("(: 1, 2)", NoNameLog::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        assert_eq!(p.listener.no_names, vec![(0, 1)]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        let mut p = parser("Foo(: 1)", NoNameLog::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        // The token before the `:` is the object pattern's `(` at offset 3.
+        assert_eq!(p.listener.no_names, vec![(3, 1)]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
 }

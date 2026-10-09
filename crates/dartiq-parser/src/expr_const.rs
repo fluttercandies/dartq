@@ -68,6 +68,76 @@ pub(crate) fn binary_level(kind: TokenKind) -> Option<u8> {
     })
 }
 
+/// Official `isUserDefinableOperator` (`token.dart:1705+`): the operators
+/// that may follow `#` in a symbol literal. Deliberately NOT
+/// `binary_level` — keywords (`is`/`as`) are not operators and `~`/`[]`
+/// are not binary levels.
+pub(crate) fn is_user_definable_operator(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Ampersand
+            | TokenKind::Bar
+            | TokenKind::Caret
+            | TokenKind::EqEq
+            | TokenKind::Gt
+            | TokenKind::GtEq
+            | TokenKind::GtGt
+            | TokenKind::GtGtGt
+            | TokenKind::Index
+            | TokenKind::IndexEq
+            | TokenKind::Lt
+            | TokenKind::LtEq
+            | TokenKind::LtLt
+            | TokenKind::Minus
+            | TokenKind::Percent
+            | TokenKind::Plus
+            | TokenKind::Slash
+            | TokenKind::Star
+            | TokenKind::Tilde
+            | TokenKind::TildeSlash
+    )
+}
+
+// —— registry-backed messages ——————————————————————————————————————————
+// The shared `msg` module lives in message.rs (another lane's file); these
+// templates follow the same `_fe_analyzer_shared` texts against the same
+// build-generated registry constants.
+
+fn invalid_constant_pattern_unary(operator: &str) -> crate::message::Message {
+    crate::message::Message::new(
+        dartiq_diagnostics::INVALID_CONSTANT_PATTERN_UNARY,
+        format!("The unary operator {operator} is not supported as a constant pattern."),
+    )
+}
+
+fn invalid_constant_pattern_negation() -> crate::message::Message {
+    crate::message::Message::new(
+        dartiq_diagnostics::INVALID_CONSTANT_PATTERN_NEGATION,
+        "Only negation of a numeric literal is supported as a constant pattern.",
+    )
+}
+
+fn invalid_constant_pattern_generic() -> crate::message::Message {
+    crate::message::Message::new(
+        dartiq_diagnostics::INVALID_CONSTANT_PATTERN_GENERIC,
+        "This expression is not supported as a constant pattern.",
+    )
+}
+
+fn invalid_constant_pattern_duplicate_const() -> crate::message::Message {
+    crate::message::Message::new(
+        dartiq_diagnostics::INVALID_CONSTANT_PATTERN_DUPLICATE_CONST,
+        "Duplicate 'const' keyword in constant expression.",
+    )
+}
+
+fn literal_with_class(class: &str, prefix: &str) -> crate::message::Message {
+    crate::message::Message::new(
+        dartiq_diagnostics::LITERAL_WITH_CLASS,
+        format!("A {class} literal can't be prefixed by '{prefix}'."),
+    )
+}
+
 impl<L: ParserListener> Parser<'_, '_, L> {
     /// Parses a constant-pattern/default-value/annotation operand at the
     /// cursor (the reduced `parsePrecedenceExpression` at
@@ -87,10 +157,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// The precedence loop over binary operators (reduced
     /// `_parsePrecedenceExpressionLoop`, `parser_impl.dart:7203`).
+    ///
+    /// Depth-guarded: operands recurse back here through send arguments and
+    /// parenthesized/grouped expressions, so a deeply nested constant is
+    /// unbounded recursion without the guard (official
+    /// `recoverFromStackOverflow`).
     fn parse_precedence(&mut self, precedence: u8, context: ConstantPatternContext) -> TokenSpan {
+        if !self.enter_depth() {
+            return self.peek_span();
+        }
         let mut context = context;
         let mut left = self.parse_unary(context);
-        let mut saw_comparison = false;
+        // `lastBinaryExpressionLevel` (`parser_impl.dart:7263`): the level of
+        // the previous plain binary at the equality/relational tiers, used to
+        // reject `a == b == c` chains. Only the plain-binary arm reads or
+        // writes it — `is`/`as`/conditional never touch it.
+        let mut last_binary_level: Option<u8> = None;
         loop {
             let kind = self.peek_kind();
             // Constant-pattern exits (parser_impl.dart:7215-7232): a postfix
@@ -120,15 +202,6 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
                 context = ConstantPatternContext::None;
             }
-            // `==`/`!=` and relational operators do not chain.
-            if level == EQUALITY_PRECEDENCE || level == RELATIONAL_PRECEDENCE {
-                if saw_comparison {
-                    self.report(msg::equality_cannot_be_equality_operand(), self.peek_span());
-                }
-                saw_comparison = true;
-            } else {
-                saw_comparison = false;
-            }
 
             let operator = self.peek_span();
             self.cursor.advance();
@@ -154,6 +227,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.listener.handle_as_operator(operator);
                 }
                 _ => {
+                    // Plain binary (official :7386-7393): only here do
+                    // equality/relational chains get rejected — `x is int == y`
+                    // and `x as int as double` are legal.
+                    if level == EQUALITY_PRECEDENCE || level == RELATIONAL_PRECEDENCE {
+                        if last_binary_level == Some(level) {
+                            self.report(
+                                msg::equality_cannot_be_equality_operand(),
+                                self.peek_span(),
+                            );
+                        } else {
+                            last_binary_level = Some(level);
+                        }
+                    }
                     self.listener.begin_binary_expression(operator);
                     // Left associative: recurse one level up.
                     let right = self.parse_precedence(level + 1, ConstantPatternContext::None);
@@ -162,17 +248,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
         }
+        self.leave_depth();
         left
     }
 
     /// Prefix/unary position (reduced `parseUnaryExpression` :7881).
+    ///
+    /// Constant-pattern context handling mirrors the official arms: `!`/`~`
+    /// report `invalidConstantPatternUnary` and reset the context, `-`
+    /// reports `invalidConstantPatternConstPrefix` when explicit and
+    /// otherwise switches to numeric-literal-only, and `++`/`--` reset the
+    /// context (`parser_impl.dart:7892-7958`).
     fn parse_unary(&mut self, context: ConstantPatternContext) -> TokenSpan {
         match self.peek_kind() {
             TokenKind::Plus => {
                 // Official `unsupportedPrefixPlus` (:7904-7916): report +
                 // synthetic identifier, then keep parsing — the synthetic
                 // becomes the operand and `+` falls through to the binary
-                // loop (analyzer code `missing_identifier`).
+                // loop. The CFE code is pseudo-shared with the analyzer's
+                // missing_identifier (error_converter.dart), which is what
+                // the oracle surfaces, so we report missing_identifier
+                // directly.
                 let plus = self.peek_span();
                 self.report(msg::missing_identifier(), plus);
                 let synthetic = self.synthetic(TokenKind::Identifier, plus.range.offset);
@@ -180,15 +276,39 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     .handle_identifier(synthetic, IdentifierContext::Expression);
                 self.parse_unary(context)
             }
-            TokenKind::Minus
-            | TokenKind::Bang
-            | TokenKind::Tilde
-            | TokenKind::PlusPlus
-            | TokenKind::MinusMinus => {
+            TokenKind::Bang | TokenKind::Tilde => {
+                let operator = self.peek_span();
+                if context != ConstantPatternContext::None {
+                    self.report(
+                        invalid_constant_pattern_unary(self.cursor.lexeme(operator.id)),
+                        operator,
+                    );
+                }
+                self.cursor.advance();
+                self.listener.handle_unary_prefix_expression(operator);
+                self.parse_unary(ConstantPatternContext::None)
+            }
+            TokenKind::Minus => {
+                let operator = self.peek_span();
+                let mut operand_context = context;
+                if operand_context == ConstantPatternContext::Explicit {
+                    self.report(msg::invalid_constant_const_prefix(), operator);
+                    operand_context = ConstantPatternContext::None;
+                }
+                // Negation only supports numeric literals: the operand parses
+                // with the negation checks of `parsePrimary` active.
+                if operand_context != ConstantPatternContext::None {
+                    operand_context = ConstantPatternContext::NumericLiteralOnly;
+                }
+                self.cursor.advance();
+                self.listener.handle_unary_prefix_expression(operator);
+                self.parse_unary(operand_context)
+            }
+            TokenKind::PlusPlus | TokenKind::MinusMinus => {
                 let operator = self.peek_span();
                 self.cursor.advance();
                 self.listener.handle_unary_prefix_expression(operator);
-                self.parse_unary(context)
+                self.parse_unary(ConstantPatternContext::None)
             }
             TokenKind::Keyword(Keyword::Await) => {
                 let begin = self.peek_span();
@@ -209,6 +329,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
     }
 
+    /// Primary checks of official `parsePrimary` for non-numeric literals
+    /// (`parser_impl.dart:7440-7523`): an explicit `const` prefix reports
+    /// `invalidConstantPatternConstPrefix`, negation of a non-numeric literal
+    /// reports `invalidConstantPatternNegation`.
+    fn check_constant_pattern_literal(&mut self, context: ConstantPatternContext, at: TokenSpan) {
+        match context {
+            ConstantPatternContext::Explicit => {
+                self.report(msg::invalid_constant_const_prefix(), at);
+            }
+            ConstantPatternContext::NumericLiteralOnly => {
+                self.report(invalid_constant_pattern_negation(), at);
+            }
+            ConstantPatternContext::None | ConstantPatternContext::Implicit => {}
+        }
+    }
+
     /// Primary position (reduced `parsePrimary` :8103 + literal/send
     /// productions C13-C31).
     #[allow(clippy::too_many_lines)] // mirrors the official branch structure
@@ -216,61 +352,80 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         match self.peek_kind() {
             TokenKind::Int | TokenKind::Hexadecimal => {
                 let token = self.peek_span();
+                if context == ConstantPatternContext::Explicit {
+                    self.report(msg::invalid_constant_const_prefix(), token);
+                }
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
                     self.listener.handle_literal_int_with_separators(token);
                 } else {
                     self.listener.handle_literal_int(token);
                 }
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
             TokenKind::Double => {
                 let token = self.peek_span();
+                if context == ConstantPatternContext::Explicit {
+                    self.report(msg::invalid_constant_const_prefix(), token);
+                }
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
                     self.listener.handle_literal_double_with_separators(token);
                 } else {
                     self.listener.handle_literal_double(token);
                 }
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
-            TokenKind::String => self.parse_literal_string(),
+            TokenKind::String => {
+                self.check_constant_pattern_literal(context, self.peek_span());
+                let end = self.parse_literal_string();
+                self.parse_selector_chain(end, context)
+            }
             TokenKind::Keyword(Keyword::True | Keyword::False) => {
                 let token = self.peek_span();
+                self.check_constant_pattern_literal(context, token);
                 self.cursor.advance();
                 self.listener.handle_literal_bool(token);
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
             TokenKind::Keyword(Keyword::Null) => {
                 let token = self.peek_span();
+                self.check_constant_pattern_literal(context, token);
                 self.cursor.advance();
                 self.listener.handle_literal_null(token);
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
             TokenKind::Hash => {
                 let hash = self.peek_span();
+                self.check_constant_pattern_literal(context, hash);
                 self.cursor.advance();
                 self.listener.begin_literal_symbol(hash);
                 let end = self.parse_symbol_rest(hash);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::Keyword(Keyword::This) => {
                 let token = self.peek_span();
                 self.cursor.advance();
                 self.listener
                     .handle_this_expression(token, IdentifierContext::Expression);
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
             TokenKind::Keyword(Keyword::Super) => {
                 let token = self.peek_span();
                 self.cursor.advance();
                 self.listener
                     .handle_super_expression(token, IdentifierContext::Expression);
-                self.parse_selector_chain(token)
+                self.parse_selector_chain(token, context)
             }
             TokenKind::Keyword(Keyword::Const) => {
+                let const_keyword = self.peek_span();
+                if context == ConstantPatternContext::Explicit {
+                    // `const const [...]` (official parsePrimary, duplicate
+                    // `const` in a constant pattern).
+                    self.report(invalid_constant_pattern_duplicate_const(), const_keyword);
+                }
                 let end = self.parse_const_expression();
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::Keyword(Keyword::New) => {
                 let token = self.peek_span();
@@ -279,33 +434,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.parse_constructor_reference(ConstructorReferenceContext::New);
                 let end = self.parse_arguments_opt();
                 self.listener.end_new_expression(end);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::OpenParen => {
                 let end = self.parse_parenthesized_or_record_literal(None);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::OpenSquare | TokenKind::Index => {
                 let end = self.parse_list_literal(None);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::OpenCurly => {
                 let end = self.parse_set_or_map_literal(None);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             TokenKind::Lt => {
                 // `<T>[...]` / `<T>{...}` literal with type arguments.
                 let type_param = self.compute_type_param_or_arg_on_lt(false);
                 let _ = type_param.parse_arguments(self);
-                match self.peek_kind() {
-                    TokenKind::OpenSquare | TokenKind::Index => {
-                        let end = self.parse_list_literal(None);
-                        self.parse_selector_chain(end)
-                    }
-                    TokenKind::OpenCurly => {
-                        let end = self.parse_set_or_map_literal(None);
-                        self.parse_selector_chain(end)
-                    }
+                let end = match self.peek_kind() {
+                    TokenKind::OpenSquare | TokenKind::Index => self.parse_list_literal(None),
+                    TokenKind::OpenCurly => self.parse_set_or_map_literal(None),
                     _ => {
                         // Reduced engine does not parse function literals
                         // (milestone #20): report and stop.
@@ -313,12 +462,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.report(msg::expected_but_got("["), at);
                         at
                     }
-                }
+                };
+                self.parse_selector_chain(end, context)
             }
             kind if crate::recovery::is_identifier(kind) => {
                 let begin = self.peek_span();
+                if context == ConstantPatternContext::NumericLiteralOnly {
+                    // Negated identifier is not a constant pattern
+                    // (official parsePrimary identifier arm).
+                    self.report(invalid_constant_pattern_negation(), begin);
+                }
                 let end = self.parse_send(begin, context);
-                self.parse_selector_chain(end)
+                self.parse_selector_chain(end, context)
             }
             _ => {
                 // No primary here; report and stay (the caller's loop
@@ -331,8 +486,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     /// Postfix selector loop (`.`/`?.`/`(`/`[`/`!`) — the reduced
-    /// `parseArgumentOrIndexStar` (:8004).
-    fn parse_selector_chain(&mut self, head: TokenSpan) -> TokenSpan {
+    /// `parseArgumentOrIndexStar` (:8004). `context` is the live
+    /// constant-pattern context: a `.`-access with method type arguments not
+    /// followed by `(` reports `invalidConstantPatternGeneric`
+    /// (`parser_impl.dart:6776-6791`).
+    fn parse_selector_chain(
+        &mut self,
+        head: TokenSpan,
+        context: ConstantPatternContext,
+    ) -> TokenSpan {
         let mut end = head;
         loop {
             match self.peek_kind() {
@@ -342,6 +504,30 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let name = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
                     self.listener.handle_dot_access(name, name, is_null_aware);
                     end = name;
+                    // Method type arguments after the name, optionally behind
+                    // a `!` (`e.f!<T>(c)`); a lone `!` stays for the postfix
+                    // arm below.
+                    if self.peek_kind() == TokenKind::Bang
+                        && self.cursor.peek_kind_ahead(1) == TokenKind::Lt
+                    {
+                        let bang = self.peek_span();
+                        self.listener.handle_non_null_assert_expression(bang);
+                        self.cursor.advance();
+                    }
+                    if self.peek_kind() == TokenKind::Lt {
+                        let lt = self.peek_span();
+                        let type_param = self.compute_type_param_or_arg_on_lt(false);
+                        if !matches!(type_param, crate::types::TypeParamOrArg::None) {
+                            type_param.parse_arguments(self);
+                            if self.peek_kind() != TokenKind::OpenParen {
+                                if context != ConstantPatternContext::None {
+                                    self.report(invalid_constant_pattern_generic(), lt);
+                                }
+                                self.listener.handle_type_argument_application(lt);
+                                end = self.span_of(self.peek_id() - 1);
+                            }
+                        }
+                    }
                 }
                 TokenKind::OpenParen => {
                     end = self.parse_arguments();
@@ -509,6 +695,34 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         end
     }
 
+    /// Token following the `<...>` type-argument group starting at table
+    /// offset `lt_offset` (official `typeArg.skip(token).next!`). With
+    /// [`crate::types::TypeParamOrArg::None`] there is no group, so the token
+    /// at `lt_offset` (the `<` itself) follows. Combined closers
+    /// (`>>`/`>=`) split on consume, so the follower is the split remainder.
+    pub(crate) fn type_arg_follower(
+        &self,
+        type_param: &crate::types::TypeParamOrArg,
+        lt_offset: usize,
+    ) -> TokenKind {
+        match type_param {
+            crate::types::TypeParamOrArg::None => self.kind_at(lt_offset),
+            crate::types::TypeParamOrArg::Simple1 { closer } => match closer {
+                crate::types::SimpleCloser::Gt => self.kind_at(lt_offset + 3),
+                // `<id>=` / `<id>>`: the remainder token follows the group.
+                crate::types::SimpleCloser::GtEq => TokenKind::Eq,
+                crate::types::SimpleCloser::GtGt => TokenKind::Gt,
+            },
+            crate::types::TypeParamOrArg::Complex(g) => {
+                let end = self.offset_of(g.end);
+                match crate::cursor::split_remainders(self.kind_at(end)).first() {
+                    Some((kind, _)) => *kind,
+                    None => self.kind_at(end + 1),
+                }
+            }
+        }
+    }
+
     /// `const` expression (official `parseConstExpression` :9043, List/Set
     /// special-case recovery reduced).
     pub(crate) fn parse_const_expression(&mut self) -> TokenSpan {
@@ -556,6 +770,68 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 end
             }
             _ => {
+                // Special-case recovery (official :8418-8490): `const
+                // Map<...>{...}`, `const Set<...>{...}` and `const
+                // List<...>[...]` are collection literals with a bogus class
+                // prefix. Report `literalWithClass`, drop the prefix, and
+                // parse the literal.
+                let class = match self.cursor.lexeme(self.peek_id()) {
+                    "Map" => Some("map"),
+                    "Set" => Some("set"),
+                    "List" => Some("list"),
+                    _ => None,
+                };
+                if let Some(class) = class
+                    && self.cursor.peek_kind_ahead(1) != TokenKind::Period
+                {
+                    // The token after the (optional) type-argument group must
+                    // open the collection.
+                    let type_param = self.compute_type_param_or_arg_at(1, false);
+                    let follower = self.type_arg_follower(&type_param, self.cursor.real_pos() + 1);
+                    let opens = match class {
+                        "list" => matches!(follower, TokenKind::OpenSquare | TokenKind::Index),
+                        _ => follower == TokenKind::OpenCurly,
+                    };
+                    if opens {
+                        self.report(
+                            literal_with_class(class, self.cursor.lexeme(self.peek_id())),
+                            self.peek_span(),
+                        );
+                        let end = if matches!(type_param, crate::types::TypeParamOrArg::None) {
+                            // `const Map{...}`: no group; the opener follows
+                            // the class name directly.
+                            self.cursor.advance();
+                            self.listener.begin_const_literal(self.peek_span());
+                            self.listener.handle_no_type_arguments(self.peek_span());
+                            match class {
+                                "list" => self.parse_list_literal(Some(const_keyword)),
+                                _ => self.parse_set_or_map_literal(Some(const_keyword)),
+                            }
+                        } else {
+                            // `const Map<...>{...}`: type args then the
+                            // collection (reduced `parseLiteralListSetMapOrFunction`).
+                            self.cursor.advance();
+                            self.listener.begin_const_literal(self.peek_span());
+                            let _ = type_param.parse_arguments(self);
+                            let end = match self.peek_kind() {
+                                TokenKind::OpenSquare | TokenKind::Index => {
+                                    self.parse_list_literal(Some(const_keyword))
+                                }
+                                TokenKind::OpenCurly => {
+                                    self.parse_set_or_map_literal(Some(const_keyword))
+                                }
+                                _ => {
+                                    let at = self.peek_span();
+                                    self.report(msg::expected_but_got("["), at);
+                                    at
+                                }
+                            };
+                            end
+                        };
+                        self.listener.end_const_literal(end);
+                        return end;
+                    }
+                }
                 // `const Foo.bar<int>(...)`.
                 self.listener.begin_const_expression(const_keyword);
                 self.parse_constructor_reference(ConstructorReferenceContext::Const);
@@ -563,6 +839,234 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener.end_const_expression(end);
                 end
             }
+        }
+    }
+}
+
+/// Shared support for the inline per-area test modules: the crate's main
+/// `tests::collector` module is private to the `tests` subtree, which these
+/// inline modules are not part of.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::listener::ParserListener;
+    use crate::message::Message;
+    use crate::token_id::TokenSpan;
+
+    /// Scans `source` and asserts no scanner diagnostics; leaked lifetimes
+    /// keep parser signatures simple (same shape as `tests::collector`).
+    pub(crate) fn scanned(
+        source: &'static str,
+    ) -> (&'static dartiq_scanner::TokenTable, &'static str) {
+        let config = dartiq_scanner::ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        };
+        let mut files = dartiq_source::FileTable::new();
+        let file = files.intern(std::path::Path::new("test.dart"));
+        let result = dartiq_scanner::scan(source, config, file);
+        assert!(
+            result.diagnostics.is_empty(),
+            "scanner diagnostics in {source:?}: {:?}",
+            result.diagnostics
+        );
+        let table: &'static dartiq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+        let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+        (table, text)
+    }
+
+    /// Latest-version feature set (patterns on).
+    pub(crate) fn features() -> crate::ParserFeatures {
+        crate::ParserFeatures::from_feature_set(dartiq_language::FeatureSet::for_language_version(
+            dartiq_language::LanguageVersion::new(3, 15),
+        ))
+    }
+
+    /// Builds a parser over `source` with a fresh `L`.
+    pub(crate) fn parser<L: ParserListener>(
+        source: &'static str,
+        listener: L,
+    ) -> crate::Parser<'static, 'static, L> {
+        let (table, text) = scanned(source);
+        crate::Parser::new(text, table, features(), listener)
+    }
+
+    /// Error-code + event log covering the events the inline modules assert.
+    #[derive(Default)]
+    pub(crate) struct Log {
+        errors: Vec<String>,
+        events: Vec<(&'static str, &'static str)>,
+    }
+
+    impl Log {
+        pub(crate) fn error_codes(&self) -> &[String] {
+            &self.errors
+        }
+
+        pub(crate) fn errors_empty(&self) -> bool {
+            self.errors.is_empty()
+        }
+
+        pub(crate) fn assert_events(&self, expected: &[(&'static str, &'static str)]) {
+            let mut it = self.events.iter();
+            for want in expected {
+                assert!(
+                    it.any(|got| got == want),
+                    "expected {want:?} in order; events: {:?} (errors: {:?})",
+                    self.events,
+                    self.errors
+                );
+            }
+        }
+    }
+
+    impl ParserListener for Log {
+        fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+            self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_list_pattern(&mut self, _: usize, _: TokenSpan, _: TokenSpan) {
+            self.events.push(("handle", "list_pattern"));
+        }
+
+        fn handle_map_pattern(&mut self, _: usize, _: TokenSpan, _: TokenSpan) {
+            self.events.push(("handle", "map_pattern"));
+        }
+
+        fn handle_record_pattern(&mut self, _: TokenSpan, _: usize) {
+            self.events.push(("handle", "record_pattern"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Log, parser};
+    use crate::listener::PatternContext;
+
+    fn pattern_errors(source: &'static str) -> Vec<String> {
+        let mut p = parser(source, Log::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        p.listener.error_codes().to_vec()
+    }
+
+    fn expression_errors(source: &'static str) -> Vec<String> {
+        let mut p = parser(source, Log::default());
+        let _ = p.parse_precedence_floor(crate::expr_const::EQUALITY_PRECEDENCE);
+        p.listener.error_codes().to_vec()
+    }
+
+    #[test]
+    fn is_then_equality_does_not_report_comparison_chain() {
+        // F2: the equality-chain check lives in the plain-binary arm only
+        // (official :7386-7393) — `x is int == y` is clean outside constant
+        // patterns (a pattern context legitimately reports the `is`
+        // over-collection like the oracle).
+        assert!(expression_errors("x is int == y").is_empty());
+    }
+
+    #[test]
+    fn as_chain_does_not_report_comparison_chain() {
+        // F2: `as` never touches the chain flag; driven with no
+        // constant-pattern context so `as` takes the relational arm
+        // (a pattern context would exit at `as` for the cast pattern).
+        assert!(expression_errors("x as int as double").is_empty());
+    }
+
+    #[test]
+    fn equality_still_cannot_chain() {
+        // F2 keeps the official report for plain chains (`a == b == c`),
+        // exactly once.
+        assert_eq!(
+            expression_errors("a == b == c"),
+            vec!["equality_cannot_be_equality_operand".to_string()]
+        );
+    }
+
+    #[test]
+    fn negation_accepts_numeric_literals_only() {
+        // F6 (official :7941-7958 + parsePrimary :8110-8167): implicit `-`
+        // switches to numeric-literal-only.
+        assert!(pattern_errors("-1").is_empty());
+        assert_eq!(
+            pattern_errors("-x"),
+            vec!["invalid_constant_pattern_negation".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("-\"s\""),
+            vec!["invalid_constant_pattern_negation".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("-true"),
+            vec!["invalid_constant_pattern_negation".to_string()]
+        );
+    }
+
+    #[test]
+    fn bang_and_tilde_report_invalid_constant_pattern_unary() {
+        // F6 (official :7928-7939).
+        assert_eq!(
+            pattern_errors("!x"),
+            vec!["invalid_constant_pattern_unary".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("~x"),
+            vec!["invalid_constant_pattern_unary".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_const_prefix_reports() {
+        // F6: explicit `const` over a primary literal reports
+        // invalid_constant_const_prefix (official parsePrimary numeric/string
+        // arms); a nested `const` reports the duplicate-const code.
+        assert_eq!(
+            pattern_errors("const -1"),
+            vec!["invalid_constant_const_prefix".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("const \"s\""),
+            vec!["invalid_constant_const_prefix".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("const 1"),
+            vec!["invalid_constant_const_prefix".to_string()]
+        );
+        assert_eq!(
+            pattern_errors("const const []"),
+            vec!["invalid_constant_pattern_duplicate_const".to_string()]
+        );
+    }
+
+    #[test]
+    fn selector_type_args_not_followed_by_paren_report_generic() {
+        // F7 (official :6776-6791): `e.f<T>` without `(` under a
+        // constant-pattern context reports invalid_constant_pattern_generic;
+        // without the context it stays silent.
+        assert_eq!(
+            pattern_errors("Foo.bar<int>"),
+            vec!["invalid_constant_pattern_generic".to_string()]
+        );
+        assert!(expression_errors("Foo.bar<int>").is_empty());
+    }
+
+    #[test]
+    fn const_map_or_list_class_prefix_reports_literal_with_class() {
+        // F8 (official :8418-8490): `const Map<...>{...}` and
+        // `const List<...>[...]` report literalWithClass and parse as
+        // literals; constructor references stay silent.
+        for source in [
+            "const Map<int, String>{}",
+            "const List<int>[1]",
+            "const Set{}",
+        ] {
+            let mut p = parser(source, Log::default());
+            let _ = p.parse_const_expression();
+            assert_eq!(p.listener.error_codes(), ["literal_with_class"], "{source}");
+        }
+        for source in ["const Foo<int>(1)", "const Map.new()"] {
+            let mut p = parser(source, Log::default());
+            let _ = p.parse_const_expression();
+            assert!(p.listener.errors_empty(), "{source}");
         }
     }
 }
