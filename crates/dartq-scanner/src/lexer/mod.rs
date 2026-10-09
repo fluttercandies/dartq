@@ -29,6 +29,12 @@ pub(crate) enum Flow {
     Eof,
     /// `}` closed a `${`: return to string body scanning (equivalent of the official `$STX` signal).
     CloseInterp,
+    /// A string literal starts at `start` (`raw`: the `r` prefix is already
+    /// consumed). The caller enters string-body scanning instead of calling
+    /// `scan_string` right here — the recursive shape (body → interpolation →
+    /// `code_step` → body) grew the native call stack with the interpolation
+    /// nesting level and overflowed it on deeply nested input.
+    BeginString { start: usize, raw: bool },
 }
 
 /// Per-file diagnostics cap, parser parity (`MAX_DIAGNOSTICS` in
@@ -89,8 +95,21 @@ impl<'s> Lexer<'s> {
     pub(crate) fn run(mut self) -> ScanResult {
         let source_len = self.src.len();
         self.scan_header();
-        // CloseInterp is only consumed inside string interpolation scanning; it never reaches the top level.
-        while self.code_step() == Flow::Next {}
+        loop {
+            match self.code_step() {
+                Flow::Next => {}
+                // A top-level string literal: `scan_string` runs it to
+                // completion, including every interpolation nested inside it.
+                Flow::BeginString { start, raw } => {
+                    if self.scan_string(start, raw) == Flow::Eof {
+                        break;
+                    }
+                }
+                // CloseInterp is only consumed inside string interpolation scanning; it never reaches the top level.
+                // Eof ends the main loop.
+                Flow::Eof | Flow::CloseInterp => break,
+            }
+        }
         self.close_unclosed_groups();
         self.emit(TokenKind::Eof, source_len, 0);
         let tokens = std::mem::take(&mut self.tokens);
@@ -516,7 +535,7 @@ impl<'s> Lexer<'s> {
         match c {
             'a'..='z' | 'A'..='Z' | '_' | '$' => self.scan_identifier_or_raw(start),
             '0'..='9' => self.scan_number(),
-            '"' | '\'' => self.scan_string(start, false),
+            '"' | '\'' => Flow::BeginString { start, raw: false },
             '(' => {
                 self.bump();
                 self.begin_group(TokenKind::OpenParen, start);
@@ -712,7 +731,7 @@ impl<'s> Lexer<'s> {
     fn scan_identifier_or_raw(&mut self, start: usize) -> Flow {
         if self.peek() == Some('r') && matches!(self.peek2(), Some('"' | '\'')) {
             self.bump(); // 'r'
-            return self.scan_string(start, true);
+            return Flow::BeginString { start, raw: true };
         }
         while matches!(
             self.peek(),

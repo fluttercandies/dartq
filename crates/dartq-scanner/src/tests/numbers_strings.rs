@@ -1,6 +1,6 @@
 //! Number form matrix and the full string form matrix (raw/triple-quoted/nested interpolation/escapes/unterminated).
 
-use super::{assert_codes, assert_kinds, scan_src};
+use super::{assert_codes, assert_kinds, codes, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
 
@@ -429,4 +429,94 @@ fn adjacent_strings_inside_interpolation() {
         ],
     );
     assert!(r.diagnostics.is_empty());
+}
+
+#[test]
+fn nested_unterminated_diagnostic_order() {
+    // Two-level unterminated nesting locks the recovery ORDER (the recursive
+    // shape emitted it as its Eof propagated out): the inner `"` string's
+    // unterminated recovery first, then the outer `'` string's, then the
+    // synthetic `}` closers inner-first (all four pin to EOF, and same-start
+    // diagnostics keep emission order — diag::finish).
+    let src = "'a${\"b${c";
+    let r = scan_src(src);
+    assert_codes(
+        &r,
+        &[
+            "unterminated_string_literal", // inner `"b${c`
+            "unterminated_string_literal", // outer `'a${…`
+            "expected_token",              // inner ${ → synthetic }
+            "expected_token",              // outer ${ → synthetic }
+        ],
+    );
+    // Both string pins sit one unit before EOF (the last character `c`).
+    for d in &r.diagnostics[..2] {
+        assert_eq!(d.range.offset, 8);
+        assert_eq!(d.range.length, 1);
+    }
+    // The openers differ, so the message order identifies the levels: the
+    // inner `"` string is reported before the outer `'` string.
+    assert!(
+        r.diagnostics[0].message.contains("starting with \""),
+        "{}",
+        r.diagnostics[0].message
+    );
+    assert!(
+        r.diagnostics[1].message.contains("starting with '"),
+        "{}",
+        r.diagnostics[1].message
+    );
+    // Both expected_token pins sit AT the eof position (zero-width).
+    for d in &r.diagnostics[2..] {
+        assert_eq!(d.range.offset, 9);
+        assert_eq!(d.range.length, 0);
+        assert!(d.message.contains("'}'"), "{}", d.message);
+    }
+    // Token tail: the two unterminated synthetics, then the closers LIFO
+    // (inner SII → the first `}`), then Eof.
+    let slice = r.tokens.as_slice();
+    let n = slice.len();
+    assert_eq!(slice[n - 3].kind, K::CloseCurly);
+    assert!(slice[n - 3].is_synthetic());
+    assert_eq!(slice[n - 2].kind, K::CloseCurly);
+    assert!(slice[n - 2].is_synthetic());
+    assert_eq!(slice[n - 1].kind, K::Eof);
+    assert_eq!(r.tokens.matching_end(3), Some(n - 3)); // inner ${ → inner }
+    assert_eq!(r.tokens.matching_end(1), Some(n - 2)); // outer ${ → outer }
+}
+
+#[test]
+fn deep_nested_unterminated_interpolation() {
+    // 50_000 levels of `"a${` hitting EOF: the interpolation frames live on
+    // the heap, so the scan completes where a native-stack-recursive scanner
+    // would overflow (SIGSEGV). Diagnostic recording is capped.
+    let src = "\"a${".repeat(50_000);
+    let r = scan_src(&src);
+    assert_eq!(r.diagnostics.len(), 10_000);
+    // The cap fills with the unwound string recoveries; the synthetic group
+    // closers come after and overflow it.
+    assert!(codes(&r).iter().all(|c| *c == "unterminated_string_literal"));
+    let eof = r.tokens.get(r.tokens.len() - 1).unwrap();
+    assert_eq!(eof.kind, K::Eof);
+}
+
+#[test]
+fn deep_nested_wellformed_interpolation() {
+    // 1_000 balanced levels: `"a${` ×1000 + `a` + `}"` ×1000 — zero
+    // diagnostics, flat token stream, Eof sentinel last.
+    let mut src = "\"a${".repeat(1_000);
+    src.push('a');
+    src.push_str(&"}\"".repeat(1_000));
+    let r = scan_src(&src);
+    assert!(r.diagnostics.is_empty());
+    let slice = r.tokens.as_slice();
+    // Per level: prefix STRING + `${` + `}` + suffix STRING; plus the
+    // innermost identifier and Eof.
+    assert_eq!(slice.len(), 1_000 * 4 + 2);
+    assert_eq!(slice.last().unwrap().kind, K::Eof);
+    // The outermost `${` closes at the last `}` (followed only by the
+    // outermost suffix segment and Eof).
+    assert_eq!(slice[slice.len() - 2].kind, K::String);
+    assert_eq!(slice[slice.len() - 3].kind, K::CloseCurly);
+    assert_eq!(r.tokens.matching_end(1), Some(slice.len() - 3));
 }
