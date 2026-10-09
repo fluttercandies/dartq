@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use dartq_diagnostics::Diagnostic;
 use dartq_resolution::{
-    ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, ResolvedTarget,
+    ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, ResolutionCode, ResolvedTarget,
 };
 use dartq_semantic::MicroKind;
 use dartq_source::FileId;
@@ -142,7 +142,8 @@ pub(crate) fn analyze(
 }
 
 /// Diagnoses one library: the member files' syntax + URI-layer diagnostics,
-/// then the semantic seam when configured (#120/#121 plug point).
+/// the overlay-corrected URI staleness (removals the baked set cannot
+/// express), then the semantic seam when configured (#120/#121 plug point).
 fn diagnose_library(
     state: &EngineState,
     resolved: &ResolvedGraph,
@@ -153,7 +154,28 @@ fn diagnose_library(
     let members = member_files(info);
     let mut out = Vec::new();
     for file in &members {
-        out.extend(state.residency[file].diagnostics.iter().cloned());
+        let facts = &state.residency[file];
+        out.extend(facts.diagnostics.iter().cloned());
+        // A directive that resolved to a file which has since left residency
+        // points outside the analyzed world (the graph layer already treats
+        // it as edgeless); the baked diagnostic cannot see the removal — it
+        // is a function of the file's own content and predates it. Targets
+        // the resolver already coded (absent on disk at parse time) carry
+        // their diagnostic in the baked set, so only the uncoded gap is
+        // emitted here — never a duplicate.
+        for directive in &facts.directives {
+            if let ResolvedTarget::Resolved(target) = directive.target
+                && directive.code.is_none()
+                && !state.residency.contains_key(&target)
+            {
+                out.push(l1::uri_diagnostic(
+                    ResolutionCode::UriDoesNotExist,
+                    directive.uri.as_deref().unwrap_or_default(),
+                    directive.uri_span,
+                    *file,
+                ));
+            }
+        }
     }
     if let Some(seam) = semdiag {
         let view = LibraryView {

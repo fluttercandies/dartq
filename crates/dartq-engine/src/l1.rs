@@ -116,8 +116,14 @@ pub(crate) fn apply(
     }
 
     // Steps 4–5: library reformation, reverse-edge rebuild, dirty seeds,
-    // importer closure.
+    // importer closure. The closure joins the phase-2 work queue (state.rs:
+    // "post-closure dirty set of the last apply; consumed by analyze") — a
+    // cancelled earlier run may have left unfinished libraries queued, so
+    // this is a union, kept sorted and deduplicated like `close`'s output.
     let invalidated = reform_and_close(state);
+    state.invalidated.extend(invalidated.iter().copied());
+    state.invalidated.sort_unstable();
+    state.invalidated.dedup();
     on_event(EngineEvent::CascadeInvalidated {
         libraries: invalidated.clone(),
     });
@@ -316,7 +322,7 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
 /// frozen table carries one, and `COMPILE_TIME_ERROR` for the remaining
 /// URI-layer codes (they are all `CompileTimeErrorCode` rows in the
 /// analyzer registry — an emit-layer decision on the unpinned rows).
-fn uri_diagnostic(
+pub(crate) fn uri_diagnostic(
     code: dartq_resolution::ResolutionCode,
     uri: &str,
     range: SourceRange,
