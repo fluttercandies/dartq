@@ -293,3 +293,104 @@ fn core() -> (TypeDeclId, TypeDeclId, TypeDeclId) {
         TypeDeclId::from_raw(3),
     )
 }
+
+#[test]
+fn sealed_and_enum_facts_round_trip() {
+    // The M2 exhaustiveness inputs: the sealed bit, the enum constant
+    // count, and the direct-subclass edges restricted to sealed/enum
+    // targets (types/sealed.dart `_createSubtypes`).
+    let table = TypeTable::new();
+    let (object, future, function, shape, circle, square, color) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+        TypeDeclId::from_raw(5),
+        TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
+    );
+    let object_none = itf(&table, object, &[]);
+    let shape_ty = itf(&table, shape, &[]);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(shape, Vec::new())
+    .decl(circle, Vec::new())
+    .decl(square, Vec::new())
+    .decl(color, Vec::new())
+    .supertype(shape, object_none)
+    .supertype(circle, shape_ty)
+    .supertype(square, shape_ty)
+    .supertype(color, object_none)
+    .sealed(shape)
+    .enumeration(color, 3)
+    .build(&table)
+    .expect("valid hierarchy");
+
+    assert!(hierarchy.is_sealed(shape));
+    assert!(!hierarchy.is_sealed(circle));
+    assert_eq!(hierarchy.enum_constant_count(color), Some(3));
+    assert_eq!(hierarchy.enum_constant_count(shape), None);
+    // Direct subclasses list only sealed/enum targets, in insertion order.
+    assert_eq!(
+        hierarchy.direct_subclasses(shape),
+        Some(&[circle, square][..])
+    );
+    assert_eq!(hierarchy.direct_subclasses(object), None);
+}
+
+#[test]
+fn sealed_declaration_must_exist() {
+    let table = TypeTable::new();
+    let (object, future, function, ghost) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+    );
+    let error = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .sealed(ghost)
+    .build(&table)
+    .expect_err("undeclared sealed class must be rejected");
+    assert!(matches!(error, dartq_types::TypeError::UndeclaredDecl(d) if d == ghost));
+}
+
+#[test]
+fn duplicate_enum_declaration_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function, color) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+    );
+    let error = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(color, Vec::new())
+    .enumeration(color, 2)
+    .enumeration(color, 3)
+    .build(&table)
+    .expect_err("duplicate enum declaration must be rejected");
+    assert!(matches!(error, dartq_types::TypeError::DuplicateDecl(d) if d == color));
+}

@@ -4,8 +4,28 @@
 mod common;
 
 use common::{Fixture, fixture};
+
+/// Interface instantiation against a bare table (usable before the
+/// `TypeSystem` exists, e.g. for supertype edges in the builder).
+fn sys_table_intern_interface(table: &TypeTable, decl: TypeDeclId, nullable: bool) -> TypeId {
+    table.intern(
+        UninternedType::Interface {
+            decl,
+            args: Vec::new(),
+        },
+        nullable,
+    )
+}
+
+fn named(name: &str, ty: TypeId, required: bool) -> NamedMember {
+    NamedMember {
+        name: name.to_string(),
+        ty,
+        required,
+    }
+}
 use dartq_types::{
-    CoreDecls, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeSystem, TypeTable,
+    CoreDecls, NamedMember, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeSystem, TypeTable,
     UninternedRecord, UninternedType,
 };
 
@@ -402,6 +422,148 @@ fn lub_and_subtype_draw_on_one_shared_depth_budget() {
 }
 
 #[test]
+fn record_record_merges_fields_pairwise() {
+    // `_recordType` (least_upper_bound.dart:852-885): equal arities merge
+    // positionals pairwise and named fields by name. Needs the `Record`
+    // class for non-mergeable fallbacks; declared here.
+    let table = TypeTable::new();
+    let (object, future, function, num, int, double, string, record) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+        TypeDeclId::from_raw(5),
+        TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
+        TypeDeclId::from_raw(8),
+    );
+    let param = TypeParamId::from_raw(1);
+    let itf = |decl: TypeDeclId, nullable: bool| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            nullable,
+        )
+    };
+    let object_none = itf(object, false);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: Some(record),
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![param])
+    .decl(function, Vec::new())
+    .decl(num, Vec::new())
+    .decl(int, Vec::new())
+    .decl(double, Vec::new())
+    .decl(string, Vec::new())
+    .decl(record, Vec::new())
+    .supertype(num, object_none)
+    .supertype(int, itf(num, false))
+    .supertype(double, itf(num, false))
+    .supertype(string, object_none)
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = TypeSystem::new(&table, &hierarchy);
+    let (int_ty, double_ty, num_ty, _string_ty) = (
+        itf(int, false),
+        itf(double, false),
+        itf(num, false),
+        itf(string, false),
+    );
+
+    let mk = |positional: Vec<TypeId>, named: Vec<NamedMember>| {
+        sys.table()
+            .intern_record(UninternedRecord { positional, named }, false)
+            .expect("valid fixture record")
+    };
+
+    // Positional pairwise: UP(int, double) = num (both subtype `num`).
+    let left = mk(vec![int_ty, double_ty], Vec::new());
+    let right = mk(vec![int_ty, int_ty], Vec::new());
+    assert_eq!(
+        sys.least_upper_bound(left, right),
+        mk(vec![int_ty, num_ty], Vec::new())
+    );
+
+    // Named fields merge by name.
+    let named_left = mk(
+        vec![],
+        vec![named("a", int_ty, false), named("b", double_ty, false)],
+    );
+    let named_right = mk(
+        vec![],
+        vec![named("a", int_ty, false), named("b", int_ty, false)],
+    );
+    assert_eq!(
+        sys.least_upper_bound(named_left, named_right),
+        mk(
+            vec![],
+            vec![named("a", int_ty, false), named("b", num_ty, false)]
+        )
+    );
+}
+
+#[test]
+fn record_record_arity_or_name_mismatch_falls_back_to_record_class() {
+    let table = TypeTable::new();
+    let (object, future, function, int, record) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+        TypeDeclId::from_raw(5),
+    );
+    let itf = |decl: TypeDeclId, nullable: bool| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            nullable,
+        )
+    };
+    let object_none = itf(object, false);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: Some(record),
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(int, Vec::new())
+    .decl(record, Vec::new())
+    .supertype(int, object_none)
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = TypeSystem::new(&table, &hierarchy);
+    let record_class = itf(record, false);
+    let int_ty = itf(int, false);
+    let mk = |positional: Vec<TypeId>, named: Vec<NamedMember>| {
+        sys.table()
+            .intern_record(UninternedRecord { positional, named }, false)
+            .expect("valid fixture record")
+    };
+
+    // Positional arity mismatch -> the `Record` class
+    // (least_upper_bound.dart:873-876).
+    let pair = mk(vec![int_ty, int_ty], Vec::new());
+    let single = mk(vec![int_ty], Vec::new());
+    assert_eq!(sys.least_upper_bound(pair, single), record_class);
+
+    // Named name mismatch -> the `Record` class (:877-881).
+    let a = mk(vec![], vec![named("a", int_ty, false)]);
+    let b = mk(vec![], vec![named("b", int_ty, false)]);
+    assert_eq!(sys.least_upper_bound(a, b), record_class);
+}
+
+#[test]
 fn records_fall_back_to_object() {
     let fx = fixture();
     let sys = fx.system();
@@ -418,14 +580,16 @@ fn record_vs_record_class_returns_the_record_class() {
     // `Record` class declared in the snapshot; the shared fixture has
     // `record: None` (the fallback test above pins that path).
     let table = TypeTable::new();
-    let (object, future, function, int, string, record) = (
+    let (object, future, function, num, int, string, record) = (
         TypeDeclId::from_raw(1),
         TypeDeclId::from_raw(2),
         TypeDeclId::from_raw(3),
         TypeDeclId::from_raw(4),
         TypeDeclId::from_raw(5),
         TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
     );
+    let object_none = sys_table_intern_interface(&table, object, false);
     let hierarchy = TypeHierarchy::builder(CoreDecls {
         object,
         future,
@@ -435,9 +599,13 @@ fn record_vs_record_class_returns_the_record_class() {
     .decl(object, Vec::new())
     .decl(future, vec![TypeParamId::from_raw(1)])
     .decl(function, Vec::new())
+    .decl(num, Vec::new())
     .decl(int, Vec::new())
     .decl(string, Vec::new())
     .decl(record, Vec::new())
+    .supertype(num, object_none)
+    .supertype(int, sys_table_intern_interface(&table, num, false))
+    .supertype(string, object_none)
     .build(&table)
     .expect("fixture hierarchy is valid");
     let sys = TypeSystem::new(&table, &hierarchy);
@@ -484,8 +652,9 @@ fn record_vs_record_class_returns_the_record_class() {
         )
         .expect("valid fixture record");
     assert_eq!(sys.least_upper_bound(pair, other), record_class);
-    // Same arity, mergeable fields: field-wise merge stays M2 (spec §5), so
-    // the `Record` class is the documented M1 answer.
+    // Same arity, mergeable fields: `_recordType` merges field-wise
+    // (least_upper_bound.dart:865-884) — UP(int, int) = int,
+    // UP(int, string) = `Object` (the pair's only common supertype).
     let mergeable = sys
         .table()
         .intern_record(
@@ -496,7 +665,17 @@ fn record_vs_record_class_returns_the_record_class() {
             false,
         )
         .expect("valid fixture record");
-    assert_eq!(sys.least_upper_bound(pair, mergeable), record_class);
+    let merged = sys
+        .table()
+        .intern_record(
+            UninternedRecord {
+                positional: vec![int_ty, bare_object],
+                named: Vec::new(),
+            },
+            false,
+        )
+        .expect("valid fixture record");
+    assert_eq!(sys.least_upper_bound(pair, mergeable), merged);
 
     // Record vs an unrelated class never sees the Record-class rules: the
     // official record-vs-other fallback `UP(Object, T2)`

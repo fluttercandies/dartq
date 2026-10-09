@@ -80,6 +80,7 @@
 //! revisits parallelism.
 
 mod error;
+mod exhaustive;
 mod hierarchy;
 mod ids;
 mod lub;
@@ -89,6 +90,10 @@ mod table;
 mod ty;
 
 pub use error::TypeError;
+pub use exhaustive::{
+    BaseTy, Case, Exhaustiveness, ExhaustivenessWorld, Key, Report, Single, Space, TypedModel,
+    TypedNames, TypedTy, Witness, compute,
+};
 pub use hierarchy::{CoreDecls, DeclInfo, TypeHierarchy, TypeHierarchyBuilder};
 pub use ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
 pub use suffix::NullabilitySuffix;

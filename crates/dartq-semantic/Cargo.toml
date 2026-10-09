@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 dartq-diagnostics = { path = "../dartq-diagnostics" }
+dartq-types = { path = "../dartq-types" }
 dartq-parser = { path = "../dartq-parser" }
 dartq-resolution = { path = "../dartq-resolution" }
 dartq-scanner = { path = "../dartq-scanner" }

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::error::TypeError;
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
@@ -74,6 +74,21 @@ pub struct TypeHierarchy {
     /// the oracle's uncapped `computeLongestInheritancePathToObject` on
     /// chains of any depth.
     depths: FxHashMap<TypeDeclId, u32>,
+    /// Declarations marked `sealed` (`ClassElementImpl.isSealed`): their
+    /// subclass set is closed, which is the exhaustiveness checker's
+    /// `isSealed` fact (static_type.dart:44-66). Enums are sealed
+    /// independently of this set (their constants close the type).
+    sealed: FxHashSet<TypeDeclId>,
+    /// Enum declarations → their constant count. The exhaustiveness
+    /// checker's `EnumStaticType` splits an enum over its constants
+    /// (types/enum.dart:69-73).
+    enum_constants: FxHashMap<TypeDeclId, u16>,
+    /// Direct subclasses — the reversed final edge list — of every sealed
+    /// or enum declaration with at least one edge, in edge-insertion order
+    /// (the oracle's `directSubclassesOfSealed` covers extends, implements,
+    /// and mixin faces alike, `AnalyzerSealedClassOperations`
+    /// `.directSubtypesOfSealed`).
+    subclasses: FxHashMap<TypeDeclId, Vec<TypeDeclId>>,
 }
 
 impl TypeHierarchy {
@@ -84,6 +99,8 @@ impl TypeHierarchy {
             core,
             decls: Vec::new(),
             edges: Vec::new(),
+            sealed: Vec::new(),
+            enums: Vec::new(),
         }
     }
 
@@ -121,6 +138,27 @@ impl TypeHierarchy {
     pub(crate) const fn sentinels(&self) -> &Sentinels {
         &self.sentinels
     }
+
+    /// Whether `decl` carries the `sealed` modifier.
+    #[must_use]
+    pub fn is_sealed(&self, decl: TypeDeclId) -> bool {
+        self.sealed.contains(&decl)
+    }
+
+    /// The constant count of an enum declaration, or `None` when `decl` is
+    /// not an enum.
+    #[must_use]
+    pub fn enum_constant_count(&self, decl: TypeDeclId) -> Option<u16> {
+        self.enum_constants.get(&decl).copied()
+    }
+
+    /// Direct subclasses (extends/implements/mixin faces) of a sealed class,
+    /// in declaration order, or `None` when `decl` is neither sealed nor an
+    /// enum with edges.
+    #[must_use]
+    pub fn direct_subclasses(&self, decl: TypeDeclId) -> Option<&[TypeDeclId]> {
+        self.subclasses.get(&decl).map(Vec::as_slice)
+    }
 }
 
 /// Builder for [`TypeHierarchy`]; validates every edge before the snapshot
@@ -130,6 +168,8 @@ pub struct TypeHierarchyBuilder {
     core: CoreDecls,
     decls: Vec<(TypeDeclId, Vec<TypeParamId>)>,
     edges: Vec<(TypeDeclId, TypeId)>,
+    sealed: Vec<TypeDeclId>,
+    enums: Vec<(TypeDeclId, u16)>,
 }
 
 impl TypeHierarchyBuilder {
@@ -148,6 +188,21 @@ impl TypeHierarchyBuilder {
         self
     }
 
+    /// Marks a class declaration `sealed` (`ClassElementImpl.isSealed`).
+    #[must_use]
+    pub fn sealed(mut self, decl: TypeDeclId) -> Self {
+        self.sealed.push(decl);
+        self
+    }
+
+    /// Registers an enum declaration with its constant count (the
+    /// exhaustiveness checker splits the enum over its constants).
+    #[must_use]
+    pub fn enumeration(mut self, decl: TypeDeclId, constants: u16) -> Self {
+        self.enums.push((decl, constants));
+        self
+    }
+
     /// Validates the graph and freezes the snapshot.
     ///
     /// Every declared class except `Object` implicitly receives an
@@ -161,9 +216,24 @@ impl TypeHierarchyBuilder {
     /// [`TypeError::ForeignTypeParameter`], [`TypeError::CyclicHierarchy`].
     pub fn build(self, table: &TypeTable) -> Result<TypeHierarchy, TypeError> {
         let core = self.core;
+        let sealed = self.sealed;
         let mut decls: FxHashMap<TypeDeclId, Vec<TypeParamId>> = FxHashMap::default();
         for (decl, params) in self.decls {
             if decls.insert(decl, params).is_some() {
+                return Err(TypeError::DuplicateDecl(decl));
+            }
+        }
+        for decl in &sealed {
+            if !decls.contains_key(decl) {
+                return Err(TypeError::UndeclaredDecl(*decl));
+            }
+        }
+        let mut enum_constants: FxHashMap<TypeDeclId, u16> = FxHashMap::default();
+        for (decl, constants) in self.enums {
+            if !decls.contains_key(&decl) {
+                return Err(TypeError::UndeclaredDecl(decl));
+            }
+            if enum_constants.insert(decl, constants).is_some() {
                 return Err(TypeError::DuplicateDecl(decl));
             }
         }
@@ -260,6 +330,16 @@ impl TypeHierarchyBuilder {
             true,
         );
         let null = table.intern(UninternedType::Null, false);
+        // Direct subclasses: the reversed final edge list, kept for the
+        // declarations whose subclass set is closed (sealed classes, enums)
+        // — the exhaustiveness checker's expansion roots. Insertion order is
+        // declaration order of the edges, which is the witness-choice order.
+        let mut subclasses: FxHashMap<TypeDeclId, Vec<TypeDeclId>> = FxHashMap::default();
+        for &(owner, target, _) in &edges {
+            if sealed.contains(&target) || enum_constants.contains_key(&target) {
+                subclasses.entry(target).or_default().push(owner);
+            }
+        }
         Ok(TypeHierarchy {
             core,
             decls: infos,
@@ -269,6 +349,9 @@ impl TypeHierarchyBuilder {
                 null,
             },
             depths,
+            sealed: sealed.into_iter().collect(),
+            enum_constants,
+            subclasses,
         })
     }
 }

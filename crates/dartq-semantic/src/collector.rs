@@ -95,6 +95,12 @@ struct OpenContainer {
     superclass: Option<StringId>,
     members: FxHashMap<StringId, MemberEntry>,
     type_params: u16,
+    /// The `sealed` modifier was present on the class header.
+    sealed: bool,
+    /// The header's `with`/`implements` type names, in written order.
+    interfaces: Vec<StringId>,
+    /// The enum's constants in declaration order.
+    enum_constants: Vec<StringId>,
 }
 
 /// A class member executable between `begin_method` and `end_method`.
@@ -130,6 +136,11 @@ struct Builder<'src, 'tab> {
     strings: &'src StringTable,
     file: FileElements,
     containers: Vec<OpenContainer>,
+    /// A class-family header is open (`with`/`implements` type names route
+    /// to [`Builder::header_interfaces`]).
+    in_class_header: bool,
+    /// The buffered `with`/`implements` type names of the open header.
+    header_interfaces: Vec<StringId>,
     /// The current field group's static bit (`None` = no group open).
     field_static: Option<bool>,
     pending_member: Option<PendingMember>,
@@ -179,6 +190,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             strings,
             file: FileElements::default(),
             containers: Vec::new(),
+            in_class_header: false,
+            header_interfaces: Vec::new(),
             field_static: None,
             pending_member: None,
             pending_top: None,
@@ -267,12 +280,19 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // The header's type variables closed before this open (official
         // event order); they belong to this container.
         let header_type_params = std::mem::take(&mut self.header_type_params);
+        // Only class-family headers carry `with`/`implements` lists; the
+        // window ends at `handle_class_header` (the `{` or `;`).
+        self.in_class_header = matches!(kind, ContainerKind::Class);
+        self.header_interfaces.clear();
         self.containers.push(OpenContainer {
             name,
             kind,
             superclass: None,
             members: FxHashMap::default(),
             type_params: header_type_params,
+            sealed: false,
+            interfaces: Vec::new(),
+            enum_constants: Vec::new(),
         });
         self.header_super_open = true;
         self.super_candidate = None;
@@ -281,6 +301,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn close_container(&mut self) {
         self.header_super_open = false;
         self.super_candidate = None;
+        self.in_class_header = false;
+        self.header_interfaces.clear();
         let Some(open) = self.containers.pop() else {
             return;
         };
@@ -300,16 +322,66 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             }
         }
         if let Some((name, _range)) = open.name {
+            self.file.container_order.push(name);
             self.file.containers.entry(name).or_insert(Container {
                 kind: open.kind,
                 superclass: open.superclass,
                 members,
                 type_params: open.type_params,
+                sealed: open.sealed,
+                interfaces: open.interfaces,
+                enum_constants: open.enum_constants,
             });
         } else {
             for (name, entry) in members {
                 self.file.extension_members.entry(name).or_insert(entry);
             }
+        }
+    }
+
+    /// Marks the open container `sealed` (the `sealed` modifier event).
+    fn mark_sealed(&mut self) {
+        if let Some(open) = self.containers.last_mut() {
+            open.sealed = true;
+        }
+    }
+
+    /// Ends the class-header window (`handle_class_header`): the buffered
+    /// `with`/`implements` names join the open container.
+    fn end_class_header(&mut self) {
+        self.in_class_header = false;
+        let buffered = std::mem::take(&mut self.header_interfaces);
+        if let Some(open) = self.containers.last_mut() {
+            open.interfaces.extend(buffered);
+        }
+    }
+
+    /// Buffers one header `with`/`implements` type name (declarations.rs
+    /// :1129-1172): subclass-edge sources toward sealed supertypes.
+    fn buffer_header_interface(&mut self, name: Option<StringId>) {
+        if let Some(name) = name {
+            self.header_interfaces.push(name);
+        }
+    }
+
+    /// Routes a class-header type reference: the `extends` head latches the
+    /// superclass candidate (a qualified `p.S` through the continuation),
+    /// and past it the `with`/`implements` names buffer toward the
+    /// container's interface edges.
+    fn note_header_reference(&mut self, context: IdentifierContext, name: Option<StringId>) {
+        match context {
+            IdentifierContext::TypeReference => {
+                if self.header_super_open && self.super_candidate.is_none() {
+                    self.super_candidate = name;
+                } else if self.in_class_header {
+                    self.buffer_header_interface(name);
+                }
+            }
+            IdentifierContext::TypeReferenceContinuation if self.header_super_open => {
+                // Qualified `p.S`: the continuation names the type.
+                self.super_candidate = name;
+            }
+            _ => {}
         }
     }
 
@@ -507,9 +579,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _mixin_kw: Option<Token>,
         name: Token,
     ) {
+        let sealed = _sealed_kw.is_some();
         let builder = &mut *self.builder.borrow_mut();
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
+        if sealed {
+            builder.mark_sealed();
+        }
+    }
+
+    fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
+        self.builder.borrow_mut().end_class_header();
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
@@ -667,21 +747,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let name_with_range = builder.capture_name(token);
         let name = name_with_range.map(|(name, _)| name);
         match context {
-            IdentifierContext::TypeReference => {
-                if builder.header_super_open && builder.super_candidate.is_none() {
-                    builder.super_candidate = name;
-                }
-            }
-            IdentifierContext::TypeReferenceContinuation => {
-                if builder.header_super_open {
-                    // Qualified `p.S`: the continuation names the type.
-                    builder.super_candidate = name;
-                }
+            IdentifierContext::TypeReference | IdentifierContext::TypeReferenceContinuation => {
+                builder.note_header_reference(context, name);
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the
                 // name; the armed type is it.
-                let armed = builder.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+                let armed = builder.take_armed();
                 if let Some(pending) = &mut builder.pending_top {
                     pending.name = name_with_range;
                     pending.return_ty = armed;
@@ -691,7 +763,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // The return type parsed between the begin event and the
                 // name; the armed type is it. Operators never re-fire
                 // their name here — their return types stay unknown.
-                let armed = builder.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+                let armed = builder.take_armed();
                 if let Some(pending) = &mut builder.pending_member {
                     pending.return_ty = armed;
                 }
@@ -745,6 +817,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 {
                     // Enum constants are static fields; a collision is a
                     // same-bit duplicate.
+                    open.enum_constants.push(name);
                     match open.members.entry(name) {
                         std::collections::hash_map::Entry::Vacant(slot) => {
                             slot.insert(MemberEntry {

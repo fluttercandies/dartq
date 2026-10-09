@@ -163,8 +163,23 @@ pub enum SemanticCode {
     /// per-host message (`uniqueName` `..._FROM_FUNCTION`/`_FROM_METHOD`).
     ReturnOfInvalidType(ExecKind),
     /// `The receiver can't be null, so the null-aware operator '{0}' is
-    /// unnecessary.` (`STATIC_WARNING` — the only non-error row here)
+    /// unnecessary.` (`STATIC_WARNING`)
     InvalidNullAwareOperator,
+    /// `The type '{0}' isn't exhaustively matched by the switch cases since
+    /// it doesn't match the pattern '{1}'.` — switch statements
+    /// (`COMPILE_TIME_ERROR`, at the `switch` keyword; emitted only when no
+    /// `default` is present and the scrutinee's static type is always
+    /// exhaustive, `constant_verifier.dart:1017-1140` +
+    /// `type_system.dart:846-887`). `{2}` is the suggested correction
+    /// pattern (the witness's `asCorrection` text).
+    NonExhaustiveSwitchStatement,
+    /// The same template for switch expressions, which are always
+    /// mustBeExhaustive (`constant_verifier.dart:1136-1140`).
+    NonExhaustiveSwitchExpression,
+    /// `This case is covered by the previous cases.` (`STATIC_WARNING`, at
+    /// the `case` keyword of a statement case / the `=>` of an expression
+    /// case, `constant_verifier.dart:1080-1088`).
+    UnreachableSwitchCase,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -284,12 +299,23 @@ impl SemanticCode {
             Self::InvalidNullAwareOperator => {
                 ("invalid_null_aware_operator", "INVALID_NULL_AWARE_OPERATOR")
             }
+            Self::NonExhaustiveSwitchStatement => (
+                "non_exhaustive_switch_statement",
+                "NON_EXHAUSTIVE_SWITCH_STATEMENT",
+            ),
+            Self::NonExhaustiveSwitchExpression => (
+                "non_exhaustive_switch_expression",
+                "NON_EXHAUSTIVE_SWITCH_EXPRESSION",
+            ),
+            Self::UnreachableSwitchCase => ("unreachable_switch_case", "UNREACHABLE_SWITCH_CASE"),
         };
         // Tier: the setter row is a parser error in the oracle; the
         // null-aware row is the frozen set's only static warning.
         let dtype = match self {
             Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
-            Self::InvalidNullAwareOperator => DiagnosticType::StaticWarning,
+            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => {
+                DiagnosticType::StaticWarning
+            }
             _ => DiagnosticType::CompileTimeError,
         };
         // The function variant is the one wrong-number template without a
@@ -303,7 +329,9 @@ impl SemanticCode {
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {
-            Self::InvalidNullAwareOperator => Severity::Warning,
+            // `DiagnosticType.STATIC_WARNING` rows (diagnostic.g.dart
+            // :17726, unreachable_switch_case).
+            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -375,6 +403,7 @@ impl SemanticCode {
             }
             // One- and two-argument rows reused through `message3`.
             Self::WrongNumberOfParametersForOperatorMinus => self.message3(a0, "", ""),
+            Self::UnreachableSwitchCase => self.message3("", "", ""),
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
@@ -385,7 +414,9 @@ impl SemanticCode {
             Self::WrongNumberOfParametersForOperator
             | Self::WrongNumberOfTypeArguments
             | Self::WrongNumberOfTypeArgumentsExtension
-            | Self::WrongNumberOfTypeArgumentsFunction => self.message3(a0, a1, ""),
+            | Self::WrongNumberOfTypeArgumentsFunction
+            | Self::NonExhaustiveSwitchStatement
+            | Self::NonExhaustiveSwitchExpression => self.message3(a0, a1, ""),
             // The four-placeholder `_element` row routes through `message4`
             // (the kind word leads); real emissions go through `emit4`.
             Self::WrongNumberOfTypeArgumentsElement(kind) => self.message4(kind.word(), a0, a1, ""),
@@ -449,6 +480,16 @@ impl SemanticCode {
                 format!(
                     "The receiver can't be null, so the null-aware operator '{a0}' is unnecessary."
                 )
+            }
+            // The switch exhaustiveness template (diagnostic.g.dart
+            // :13016-13018 / :13069-13071); `{2}` carries the correction
+            // pattern (the witness `asCorrection` text).
+            Self::NonExhaustiveSwitchStatement | Self::NonExhaustiveSwitchExpression => format!(
+                "The type '{a0}' isn't exhaustively matched by the switch cases since it doesn't match the pattern '{a1}'."
+            ),
+            // No-argument row (diagnostic.g.dart:17721).
+            Self::UnreachableSwitchCase => {
+                "This case is covered by the previous cases.".to_string()
             }
             _ => unreachable!("two-placeholder rows route through `message`"),
         }

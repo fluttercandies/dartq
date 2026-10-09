@@ -5,8 +5,8 @@ mod common;
 
 use common::{Fixture, fixture, named};
 use dartq_types::{
-    CoreDecls, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeTable, UninternedFunction,
-    UninternedType,
+    CoreDecls, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeSystem, TypeTable,
+    UninternedFunction, UninternedRecord, UninternedType,
 };
 
 #[test]
@@ -316,26 +316,115 @@ fn rule13_function_type_vs_bare_function() {
 }
 
 #[test]
-fn rule14_record_pairs_beyond_reflexivity_are_false() {
+fn rule14_record_shape_equality_beyond_reflexivity() {
+    // Rule 14 (subtype.dart:227-259): record <: record is arity equality
+    // plus pairwise covariant fields; canonically interned shapes make
+    // structural equality observable through any distinct pair.
     let fx = fixture();
     let sys = fx.system();
     let r = fx.record(&[fx.int(), fx.string()], &[]);
-    // Rule 0a reflexivity is the only `true` record/record answer in M1.
-    assert!(sys.is_subtype(r, r));
-    // Rule 14 (subtype.dart:512-519) is deferred to M2: the vendored oracle
-    // dispatches record/record to a fully implemented `_isRecordSubtypeOf`,
-    // but M1 answers `false` for every non-identical pair, even related
-    // shapes.
-    assert!(!sys.is_subtype(r, fx.record(&[fx.num(), fx.string()], &[])));
+    // Identical shape, distinct internings of the same structure (the pair
+    // is structurally equal, so interning returns one type — reflexivity).
+    let same = fx.record(&[fx.int(), fx.string()], &[]);
+    assert!(sys.is_subtype(r, same));
+    // Covariant positional fields.
+    assert!(sys.is_subtype(r, fx.record(&[fx.num(), fx.string()], &[])));
+    assert!(sys.is_subtype(r, fx.record(&[fx.int(), fx.string_question()], &[])));
+    // The inverse direction is not covariant.
+    assert!(!sys.is_subtype(fx.record(&[fx.num(), fx.string()], &[]), r));
+}
+
+#[test]
+fn rule14_record_arity_mismatch_is_false() {
+    let fx = fixture();
+    let sys = fx.system();
+    let r = fx.record(&[fx.int(), fx.string()], &[]);
+    // Positional arity (subtype.dart:241-247).
     assert!(!sys.is_subtype(r, fx.record(&[fx.int()], &[])));
+    assert!(!sys.is_subtype(fx.record(&[fx.int()], &[]), r));
+    // Named arity: adding a named field to the target breaks it
+    // (subtype.dart:248-258).
     assert!(!sys.is_subtype(
         r,
         fx.record(&[fx.int(), fx.string()], &[named("x", fx.num(), false)])
     ));
-    // Records subtype no class either: record-vs-`Function` falls through to
-    // rule 14 (`Object` targets are consumed by rule 4, where records pass
-    // like any other class).
+}
+
+#[test]
+fn rule14_record_named_fields_pair_by_name() {
+    let fx = fixture();
+    let sys = fx.system();
+    let r = fx.record(&[fx.int()], &[named("x", fx.int(), false)]);
+    // Covariant named field.
+    assert!(sys.is_subtype(r, fx.record(&[fx.int()], &[named("x", fx.num(), false)])));
+    // Name mismatch is false even with related types.
+    assert!(!sys.is_subtype(r, fx.record(&[fx.int()], &[named("y", fx.num(), false)])));
+    // Named order is canonical (interning sorts), so the reordered pair is
+    // the same type.
+    let reordered = fx.record(&[fx.int()], &[named("x", fx.int(), false)]);
+    assert!(sys.is_subtype(r, reordered));
+}
+
+#[test]
+fn rule14_record_subtypes_only_object_like_targets() {
+    let fx = fixture();
+    let sys = fx.system();
+    let r = fx.record(&[fx.int()], &[]);
+    // Records subtype no class: record-vs-`Function` falls through rule 14
+    // (subtype.dart:512-519); `Object` targets are consumed by rule 4.
     assert!(!sys.is_subtype(r, fx.itf(fx.d.function, &[], false)));
+    assert!(sys.is_subtype(r, fx.itf(fx.d.object, &[], false)));
+}
+
+#[test]
+fn rule14_record_subtypes_the_record_class() {
+    // `record <: Record` is the shortcut arm (subtype.dart:230-233); it
+    // needs the `Record` class declared, which the shared fixture omits.
+    let table = TypeTable::new();
+    let (object, future, function, record) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+    );
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: Some(record),
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(record, Vec::new())
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = TypeSystem::new(&table, &hierarchy);
+    let record_class = sys.table().intern(
+        UninternedType::Interface {
+            decl: record,
+            args: Vec::new(),
+        },
+        false,
+    );
+    let r = sys
+        .table()
+        .intern_record(
+            UninternedRecord {
+                positional: vec![sys.table().intern(
+                    UninternedType::Interface {
+                        decl: object,
+                        args: Vec::new(),
+                    },
+                    false,
+                )],
+                named: Vec::new(),
+            },
+            false,
+        )
+        .expect("valid fixture record");
+    assert!(sys.is_subtype(r, record_class));
+    assert!(!sys.is_subtype(record_class, r));
 }
 
 #[test]

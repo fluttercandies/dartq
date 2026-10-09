@@ -275,6 +275,15 @@ pub struct Container {
     /// The container's own type-parameter count (`class C<T, U>`); 0 when
     /// non-generic. The wrong-number-of-type-arguments decisions read it.
     pub type_params: u16,
+    /// The `sealed` modifier was present (the exhaustiveness splitter,
+    /// `types/sealed.dart`).
+    pub sealed: bool,
+    /// The `with`/`implements` type names as written (subclass-edge sources
+    /// toward sealed supertypes).
+    pub interfaces: Vec<StringId>,
+    /// An enum's constants in declaration order (the exhaustiveness
+    /// witness order follows it, `types/enum.dart`); empty elsewhere.
+    pub enum_constants: Vec<StringId>,
 }
 
 /// One top-level declaration.
@@ -369,6 +378,7 @@ pub struct DuplicateDecl {
 pub struct FileElements {
     pub(crate) decls: FxHashMap<StringId, TopDecl>,
     pub(crate) containers: FxHashMap<StringId, Container>,
+    pub(crate) container_order: Vec<StringId>,
     pub(crate) extension_members: FxHashMap<StringId, MemberEntry>,
     pub(crate) duplicates: Vec<DuplicateDecl>,
     pub(crate) arity_violations: Vec<ArityDecl>,
@@ -386,6 +396,14 @@ impl FileElements {
     #[must_use]
     pub fn container(&self, name: StringId) -> Option<&Container> {
         self.containers.get(&name)
+    }
+
+    /// The container names in declaration order (`containers` itself is a
+    /// hash map; the exhaustiveness face needs the source order for the
+    /// sealed-split witness order).
+    #[must_use]
+    pub fn container_order(&self) -> &[StringId] {
+        &self.container_order
     }
 
     /// The extension-instance member pool entry under `name`: the merged

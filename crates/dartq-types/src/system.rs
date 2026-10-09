@@ -619,8 +619,63 @@ impl<'a> TypeSystem<'a> {
             }
         }
 
-        // Rule 14 Record/Record (subtype.dart:512-519): M2 (spec §5).
+        // Rule 14 Record (subtype.dart:512-519): `T0` is a record type —
+        // `T1` = `Record` answers `true` (the Record Type/Record rule,
+        // subtype.dart:513-515), `T1` a record type answers
+        // [`Self::record_subtype`] (subtype.dart:516-518).
+        if let TypeKind::Record { shape } = a.kind() {
+            if self.is_core_record(b) {
+                return true;
+            }
+            if let TypeKind::Record { shape: other } = b.kind() {
+                return self.record_subtype(shape, other);
+            }
+        }
         false
+    }
+
+    /// Whether `t` is the core `Record` class (`T1.isDartCoreRecord`,
+    /// subtype.dart:513). Snapshots without a `Record` declaration answer
+    /// `false` — the class cannot be named there.
+    fn is_core_record(&self, t: Type) -> bool {
+        matches!(t.kind(), TypeKind::Interface { decl, .. } if Some(decl) == self.core().record)
+    }
+
+    /// `_isRecordSubtypeOf` (subtype.dart:227-259): equal positional and
+    /// named arities, positional fields pairwise covariant, named fields
+    /// pairwise covariant under equal names. Both named lists are in the
+    /// interner's canonical (name-sorted) order, so the index zip is exactly
+    /// the oracle's name-matched pairing.
+    fn record_subtype(
+        &self,
+        sub: crate::ids::RecordShapeId,
+        sup: crate::ids::RecordShapeId,
+    ) -> bool {
+        let sub = self.table.record_shape(sub);
+        let sup = self.table.record_shape(sup);
+        if sub.positional.len() != sup.positional.len() || sub.named.len() != sup.named.len() {
+            return false;
+        }
+        for i in 0..sub.positional.len() {
+            if !self.is_subtype(
+                self.table.arg(sub.positional.offset() + i),
+                self.table.arg(sup.positional.offset() + i),
+            ) {
+                return false;
+            }
+        }
+        for i in 0..sub.named.len() {
+            let (si, ti) = (sub.named.offset() + i, sup.named.offset() + i);
+            // Name equality rides the canonical order: two sorted lists of
+            // equal length match pairwise iff every position's name does.
+            if self.table.named_names_cmp(si, ti) != Ordering::Equal {
+                return false;
+            }
+            if !self.is_subtype(self.table.named_ty(si), self.table.named_ty(ti)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The `base` of `t` when `t` is a non-`?` `FutureOr`.

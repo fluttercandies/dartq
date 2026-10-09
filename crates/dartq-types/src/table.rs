@@ -252,6 +252,16 @@ impl TypeTable {
         self.state.borrow().named[index].ty
     }
 
+    /// The named member's name at a pool index (cloned: the borrow guard
+    /// must not escape; the record-LUB merge is a cold path).
+    ///
+    /// # Panics
+    /// Panics when the index is out of range.
+    #[must_use]
+    pub(crate) fn named_name(&self, index: usize) -> String {
+        self.state.borrow().named[index].name.clone()
+    }
+
     /// The named member's `required` flag at a pool index.
     ///
     /// # Panics

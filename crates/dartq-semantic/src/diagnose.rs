@@ -182,7 +182,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
 use crate::model::{
-    ArityViolation, ContainerKind, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+    ArityViolation, Container, ContainerKind, FileElements, Formals, MemberEntry, MemberKind,
+    MicroKind, TopDecl, Ty,
+};
+use dartq_types::{
+    Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Witness as EngineWitness,
+    compute,
 };
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
@@ -530,6 +535,25 @@ struct Engine<'a> {
     /// The row-stack mark where the current function body's expression
     /// began (the arrow-body return check reads it).
     body_mark: Option<usize>,
+    /// Open switch contexts (statements and expressions): the scrutinee's
+    /// push-time type, the cases completed so far, and the anchors the
+    /// diagnostics attach to.
+    switches: Vec<SwitchCtx>,
+    /// The open pattern-nesting stack (`begin_pattern`/`end_pattern`
+    /// brackets); each frame collects the leaf restrictions it spans.
+    pattern_stack: Vec<PatternFrame>,
+    /// The number of currently open patterns.
+    pattern_depth: usize,
+    /// Completed root restrictions per open case (switch cases only).
+    pattern_roots: Vec<Restriction>,
+    /// The in-flight constant pattern's classification, armed by the
+    /// literal/identifier events inside it.
+    pending_const: Option<Restriction>,
+    /// The `switch` keyword of the open switch statement/expression (the
+    /// non-exhaustive anchor; the block events only carry the `{`).
+    switch_kw_latch: Option<SourceRange>,
+    /// The pending object-pattern type name (the first identifier).
+    pending_object_ty: Option<StringId>,
     /// The row-stack mark where the current variable initializer's
     /// expression began (the initializer check reads it).
     init_mark: Option<usize>,
@@ -604,6 +628,13 @@ impl<'a> Engine<'a> {
             body_mark: None,
             init_mark: None,
             return_mark: None,
+            switches: Vec::new(),
+            pattern_stack: Vec::new(),
+            pattern_depth: 0,
+            pattern_roots: Vec::new(),
+            pending_const: None,
+            switch_kw_latch: None,
+            pending_object_ty: None,
             in_cascade: false,
             invokes: Vec::new(),
             pending_send: None,
@@ -727,6 +758,35 @@ impl<'a> Engine<'a> {
         self.frames
             .iter()
             .any(|f| matches!(f.kind, FrameKind::Executable { .. }))
+    }
+
+    /// Binds a local's declared type in the innermost frame (the
+    /// declared-variable-pattern binding face).
+    fn bind_var_type(&mut self, name: StringId, ty: Ty) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.var_types.insert(name, ty);
+        }
+    }
+
+    /// Classifies a constant pattern whose events left no literal: a
+    /// qualified `E.c` tail (enum container + member row) becomes the
+    /// enum-value leaf; everything else is unrepresentable.
+    fn classify_constant_tail(&self) -> Restriction {
+        // The member push replaces the qualifier row, so the `E` of `E.c`
+        // survives only as the member row's container receiver.
+        let Some(last) = self.rows.last() else {
+            return Restriction::Unknown;
+        };
+        let RowShape::Member { recv } = &last.shape else {
+            return Restriction::Unknown;
+        };
+        match recv {
+            Receiver::Container {
+                name,
+                kind: ContainerKind::Enum,
+            } => Restriction::EnumValue(*name, last.name),
+            _ => Restriction::Unknown,
+        }
     }
 
     fn add_local(&mut self, name: StringId) {
@@ -2011,7 +2071,120 @@ impl<'a> Engine<'a> {
         self.in_enum_element = None;
     }
 
-    /// The display text of an M1 type (`int?`, `Null`, `dynamic`).
+    // —— pattern/switch machinery (M2 face) ————————————————————————
+
+    /// Appends a leaf to the innermost open pattern frame; outside any
+    /// pattern (pattern-assignment RHS, if-case roots) the leaf is dropped
+    /// — only switch exhaustiveness consumes case spaces.
+    fn pattern_leaf(&mut self, leaf: Restriction) {
+        if let Some(frame) = self.pattern_stack.last_mut() {
+            frame.leaves.push(leaf);
+        }
+    }
+
+    /// Collapses one frame's leaves into the restriction it covers
+    /// (`||` unions, `&&` intersects, a bare leaf passes through, a
+    /// type-free pattern covers its context).
+    fn collapse(leaves: Vec<Restriction>, or_ops: usize) -> Restriction {
+        if leaves.is_empty() {
+            // A type-free variable/wildcard: the context full space. The
+            // context is substituted when the case closes.
+            return Restriction::NamedContext;
+        }
+        if or_ops > 0 {
+            return Restriction::Union(leaves);
+        }
+        // `&&` joins (or a bare single leaf) intersect at name level.
+        leaves
+            .into_iter()
+            .reduce(Restriction::and)
+            .unwrap_or(Restriction::Unknown)
+    }
+
+    /// Opens a switch context; the scrutinee's push-time row is the last
+    /// one on the row stack when the block opens.
+    fn open_switch(&mut self, is_expression: bool, kw: SourceRange) {
+        let scrutinee = self.rows.last().map_or(Ty::Unknown, |row| row.ty);
+        self.switches.push(SwitchCtx {
+            is_expression,
+            switch_kw: kw,
+            scrutinee,
+            cases: Vec::new(),
+            default_seen: false,
+            pending_guarded: false,
+        });
+    }
+
+    /// Computes the exhaustiveness verdict and emits the switch
+    /// diagnostics (per-case reachability, then the covering gap).
+    fn report_switch(&mut self) {
+        let Some(ctx) = self.switches.pop() else {
+            return;
+        };
+        let world = NameWorld {
+            index: self.index,
+            file: self.file,
+            strings: self.strings,
+            unknowns: std::cell::Cell::new(0),
+        };
+        let value = NameTy::from_semantic(ctx.scrutinee);
+        let cases: Vec<Case<NameTy>> = ctx
+            .cases
+            .iter()
+            .map(|c| Case {
+                space: case_space(&world, &c.space, value),
+                guarded: c.guarded,
+            })
+            .collect();
+        let report = compute(&world, &value, &cases);
+        let unreachable: Vec<SourceRange> = report
+            .unreachable
+            .iter()
+            .filter_map(|index| ctx.cases.get(*index).map(|c| c.anchor))
+            .collect();
+        let (ty_text, unmatched, suggested) = match &report.exhaustiveness {
+            Exhaustiveness::NonExhaustive(witnesses) => {
+                let first = witnesses.first();
+                (
+                    self.ty_display(ctx.scrutinee),
+                    first.map_or(String::new(), |w: &EngineWitness<NameTy>| {
+                        w.as_witness(&world)
+                    }),
+                    first.map_or(String::new(), |w| w.as_correction(&world)),
+                )
+            }
+            Exhaustiveness::Exhaustive => (String::new(), String::new(), String::new()),
+        };
+        // The oracle reports reachability per case first
+        // (constant_verifier.dart:1080-1088), then the covering gap
+        // (:1122-1140) at the `switch` keyword.
+        for anchor in unreachable {
+            self.emit(SemanticCode::UnreachableSwitchCase, anchor, "", "");
+        }
+        if let Exhaustiveness::NonExhaustive(_) = report.exhaustiveness {
+            let must_be_exhaustive = ctx.is_expression || Self::is_always_exhaustive(&world, value);
+            if must_be_exhaustive && !ctx.default_seen {
+                let code = if ctx.is_expression {
+                    SemanticCode::NonExhaustiveSwitchExpression
+                } else {
+                    SemanticCode::NonExhaustiveSwitchStatement
+                };
+                self.emit3(code, ctx.switch_kw, &ty_text, &unmatched, &suggested);
+            }
+        }
+    }
+
+    /// `isAlwaysExhaustive` (type_system.dart:846-887) at name level:
+    /// `bool`, `Null`, enums, and sealed classes split completely; nothing
+    /// else does (nullable types and `dynamic` need the null case).
+    fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
+        match ty {
+            NameTy::Null => true,
+            NameTy::Named(name, false) => world.is_sealed_name(name),
+            _ => false,
+        }
+    }
+
     fn ty_display(&self, ty: Ty) -> String {
         match ty {
             Ty::Unknown => String::new(),
@@ -3429,6 +3602,321 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
+    // —— patterns & switch exhaustiveness (M2 face) ——————————————————————
+
+    fn begin_pattern(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.pattern_depth += 1;
+        engine.pattern_stack.push(PatternFrame {
+            leaves: Vec::new(),
+            or_ops: 0,
+        });
+    }
+
+    fn end_pattern(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.pattern_depth = engine.pattern_depth.saturating_sub(1);
+        let Some(frame) = engine.pattern_stack.pop() else {
+            return;
+        };
+        let merged = Engine::collapse(frame.leaves, frame.or_ops);
+        if engine.pattern_stack.is_empty() {
+            // A root pattern: only switch cases consume it.
+            engine.pattern_roots.push(merged);
+        } else if let Some(parent) = engine.pattern_stack.last_mut() {
+            parent.leaves.push(merged);
+        }
+    }
+
+    fn begin_binary_pattern(&mut self, operator: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let is_or = engine.text_of(operator) == Some("||");
+        if is_or && let Some(frame) = engine.pattern_stack.last_mut() {
+            frame.or_ops += 1;
+        }
+    }
+
+    fn end_binary_pattern(&mut self, _operator: Token) {}
+
+    fn handle_cast_pattern(&mut self, _operator: Token) {
+        let mut engine = self.engine.borrow_mut();
+        // `p as X` covers X's values (official `castPatternToSpace`).
+        let leaf = match engine.armed_ty.take() {
+            Some(Ty::Named { name, nullable }) => Restriction::Named(name, nullable),
+            _ => Restriction::Unknown,
+        };
+        engine.pattern_leaf(leaf);
+    }
+
+    fn handle_null_assert_pattern(&mut self, _bang: Token) {
+        // `p!` covers the non-null side of the context.
+        let mut engine = self.engine.borrow_mut();
+        let leaf = match NameTy::from_semantic(
+            engine.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
+        ) {
+            NameTy::Named(name, _) => Restriction::Named(name, false),
+            _ => Restriction::Unknown,
+        };
+        engine.pattern_leaf(leaf);
+    }
+
+    fn handle_null_check_pattern(&mut self, _question: Token) {
+        // `p?` covers the context values plus `null` (`nullCheckToSpace`):
+        // a nullable context already covers null; a non-null context
+        // unions with it.
+        let mut engine = self.engine.borrow_mut();
+        let leaf = match NameTy::from_semantic(
+            engine.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
+        ) {
+            NameTy::Named(name, true) => Restriction::Named(name, true),
+            NameTy::Named(name, false) => {
+                Restriction::Union(vec![Restriction::Named(name, false), Restriction::Null])
+            }
+            _ => Restriction::Unknown,
+        };
+        engine.pattern_leaf(leaf);
+    }
+
+    fn handle_relational_pattern(&mut self, _operator: Token) {
+        // Value comparisons are not representable at name level.
+        self.engine.borrow_mut().pattern_leaf(Restriction::Unknown);
+    }
+
+    fn handle_list_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+        // The list face arrives through keysOfInterest/additional properties
+        // — not modeled at name level (documented under-report).
+        self.engine.borrow_mut().pattern_leaf(Restriction::Unknown);
+    }
+
+    fn handle_map_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+        self.engine.borrow_mut().pattern_leaf(Restriction::Unknown);
+    }
+
+    fn handle_record_pattern(&mut self, _left_paren: Token, _count: usize) {
+        // Record shapes live in the interned lattice (`dartq-types`); the
+        // name level has no record type, so the row is unknown-shaped and
+        // the engine under-reports.
+        self.engine.borrow_mut().pattern_leaf(Restriction::Unknown);
+    }
+
+    fn begin_constant_pattern(&mut self, _const_keyword: Option<Token>) {
+        self.engine.borrow_mut().pending_const = None;
+    }
+
+    fn end_constant_pattern(&mut self, _const_keyword: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        let leaf = engine
+            .pending_const
+            .take()
+            .unwrap_or_else(|| engine.classify_constant_tail());
+        engine.pattern_leaf(leaf);
+    }
+
+    fn handle_object_pattern(
+        &mut self,
+        first_identifier: Token,
+        dot: Option<Token>,
+        _second_identifier: Option<Token>,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        // `Type(...)` shapes: the first identifier is the type when no dot
+        // follows; the `Type.field`/`:field` shorthands stay unmodeled.
+        engine.pending_object_ty = if dot.is_none() {
+            engine.name_of(first_identifier)
+        } else {
+            None
+        };
+    }
+
+    fn handle_object_pattern_fields(&mut self, _count: usize, _begin: Token, _end: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let leaf = engine
+            .pending_object_ty
+            .take()
+            .map_or(Restriction::Unknown, |name| Restriction::Named(name, false));
+        engine.pattern_leaf(leaf);
+    }
+
+    fn handle_declared_variable_pattern(
+        &mut self,
+        _keyword: Option<Token>,
+        variable: Token,
+        _in_assignment_pattern: bool,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        // The bound variable joins the enclosing scope (the flat M1 frame;
+        // the oracle's pattern scoping is finer, and a wider binding can
+        // only under-report undefined-name, never false-positive).
+        if let Some(name) = engine.name_of(variable) {
+            engine.add_local(name);
+            match engine.armed_ty.take() {
+                Some(Ty::Named {
+                    name: ty_name,
+                    nullable,
+                }) => {
+                    engine.bind_var_type(
+                        name,
+                        Ty::Named {
+                            name: ty_name,
+                            nullable,
+                        },
+                    );
+                    engine.pattern_leaf(Restriction::Named(ty_name, nullable));
+                }
+                ty => {
+                    if let Some(ty) = ty {
+                        engine.bind_var_type(name, ty);
+                    }
+                    // A type-free variable covers its context: no leaf.
+                }
+            }
+        } else {
+            engine.armed_ty = None;
+        }
+    }
+
+    fn handle_wildcard_pattern(&mut self, _keyword: Option<Token>, _wildcard: Token) {
+        // `_` covers the context: no leaf.
+        self.engine.borrow_mut().armed_ty = None;
+    }
+
+    // —— switch statements ————————————————————————————————————————————
+
+    fn begin_switch_block(&mut self, token: Token) {
+        let kw = self
+            .engine
+            .borrow_mut()
+            .switch_kw_latch
+            .take()
+            .unwrap_or(token.range);
+        self.engine.borrow_mut().open_switch(false, kw);
+    }
+
+    /// Latches the `switch` keyword: the non-exhaustive anchor (the block
+    /// event that follows only carries the `{`).
+    fn begin_switch_statement(&mut self, token: Token) {
+        self.engine.borrow_mut().switch_kw_latch = Some(token.range);
+    }
+
+    fn end_switch_block(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.engine.borrow_mut().report_switch();
+    }
+
+    fn begin_switch_case_when_clause(&mut self, _token: Token) {
+        if let Some(ctx) = self.engine.borrow_mut().switches.last_mut() {
+            ctx.pending_guarded = true;
+        }
+    }
+
+    fn end_switch_case(
+        &mut self,
+        _label_count: usize,
+        _expression_count: usize,
+        default_kw: Option<Token>,
+        _colon_after_default: Option<Token>,
+        _statement_count: usize,
+        begin: Token,
+        _end: Token,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        if default_kw.is_some() {
+            if let Some(ctx) = engine.switches.last_mut() {
+                ctx.default_seen = true;
+            }
+            engine.pattern_roots.clear();
+            return;
+        }
+        // Old-style expression cases (`case 1 + 2:`) carry no pattern
+        // events; their constant coverage is the unknown space at name
+        // level (under-report, matching the unrepresentable-constant rule).
+        if engine.pattern_roots.is_empty() {
+            engine.pattern_roots.push(Restriction::Unknown);
+        }
+        let space = engine.pattern_roots.pop().unwrap_or(Restriction::Unknown);
+        if let Some(ctx) = engine.switches.last_mut() {
+            let mut space = space;
+            if space == Restriction::NamedContext {
+                space = match NameTy::from_semantic(ctx.scrutinee) {
+                    NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
+                    _ => Restriction::Unknown,
+                };
+            }
+            let guarded = ctx.pending_guarded;
+            ctx.pending_guarded = false;
+            ctx.cases.push(NameCase {
+                space,
+                guarded,
+                anchor: begin.range,
+            });
+        }
+    }
+
+    // —— switch expressions ————————————————————————————————————————————
+
+    fn begin_switch_expression_block(&mut self, token: Token) {
+        let kw = self
+            .engine
+            .borrow_mut()
+            .switch_kw_latch
+            .take()
+            .unwrap_or(token.range);
+        self.engine.borrow_mut().open_switch(true, kw);
+    }
+
+    /// Latches the `switch` keyword of a switch expression.
+    fn begin_switch_expression(&mut self, token: Token) {
+        self.engine.borrow_mut().switch_kw_latch = Some(token.range);
+    }
+
+    fn end_switch_expression_case(
+        &mut self,
+        _begin: Token,
+        when: Option<Token>,
+        arrow: Token,
+        _end: Token,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        if engine.pattern_roots.is_empty() {
+            engine.pattern_roots.push(Restriction::Unknown);
+        }
+        let space = engine.pattern_roots.pop().unwrap_or(Restriction::Unknown);
+        if let Some(ctx) = engine.switches.last_mut() {
+            let mut space = space;
+            if space == Restriction::NamedContext {
+                space = match NameTy::from_semantic(ctx.scrutinee) {
+                    NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
+                    _ => Restriction::Unknown,
+                };
+            }
+            ctx.cases.push(NameCase {
+                space,
+                guarded: when.is_some(),
+                anchor: arrow.range,
+            });
+        }
+    }
+
+    fn end_switch_expression_block(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.engine.borrow_mut().report_switch();
+    }
+
+    // —— if-case ————————————————————————————————————————————————————————
+
+    fn handle_parenthesized_condition(
+        &mut self,
+        _begin: Token,
+        case_kw: Option<Token>,
+        _when: Option<Token>,
+    ) {
+        // An if-case's pattern events follow; the binding face works
+        // through `handle_declared_variable_pattern`, and the condition
+        // itself carries no exhaustiveness question.
+        if case_kw.is_some() {
+            // The pattern's root will be dropped at `end_pattern` (no
+            // switch context consumes roots outside switches).
+        }
+    }
+
     fn handle_enum_element(&mut self, _begin: Token, _augment: Option<Token>) {
         self.engine.borrow_mut().enter_enum_element();
     }
@@ -3479,11 +3967,20 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        let mut engine = self.engine.borrow_mut();
+        if engine.pattern_depth > 0 {
+            let is_true = engine.text_of(token) == Some("true");
+            engine.pending_const = Some(Restriction::BoolValue(is_true));
+        }
+        engine.push_value_row(token);
     }
 
     fn handle_literal_null(&mut self, token: Token) {
-        self.engine.borrow_mut().push_null_row(token);
+        let mut engine = self.engine.borrow_mut();
+        if engine.pattern_depth > 0 {
+            engine.pending_const = Some(Restriction::Null);
+        }
+        engine.push_null_row(token);
     }
 
     fn end_literal_string(&mut self, _interpolation_count: usize, end: Token) {
@@ -3534,6 +4031,402 @@ fn use_kind_of(intent: &Intent) -> NameUse {
         Intent::Invoke => NameUse::Invoke,
         Intent::Write | Intent::ReadWrite => NameUse::Write,
         _ => NameUse::Read,
+    }
+}
+
+// —— records/patterns/exhaustiveness (M2 face) ————————————————————————————
+
+/// The static type the semantic-level exhaustiveness walk uses: the M1
+/// [`Ty`] lattice plus the restriction leaves the case patterns produce
+/// (enum constants, `bool` values). Names resolve through the unit's
+/// element model — cross-unit sealed hierarchies under-report (documented
+/// M2 blind spot).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum NameTy {
+    Never,
+    Null,
+    /// `dynamic` — the nullable top.
+    TopNullable,
+    TopNonNullable,
+    /// A named type as written, with the syntactic `?`. The nullable
+    /// projection doubles as the engine's `Nullable` variant.
+    Named(StringId, bool),
+    /// An enum constant: the enum's name and the constant's.
+    EnumValue(StringId, StringId),
+    BoolValue(bool),
+    /// A unique unknown (relational patterns, unrepresentable constants):
+    /// matched by nothing.
+    Unknown(u64),
+}
+
+/// One completed case: its coverage restriction, the guard flag, and the
+/// token the diagnostics anchor to (`case` for statement cases, `=>` for
+/// expression cases).
+struct NameCase {
+    space: Restriction,
+    guarded: bool,
+    anchor: SourceRange,
+}
+
+/// The open switch (statement or expression): the scrutinee's push-time
+/// type, its keyword anchor, and the cases completed so far.
+struct SwitchCtx {
+    is_expression: bool,
+    switch_kw: SourceRange,
+    scrutinee: Ty,
+    cases: Vec<NameCase>,
+    default_seen: bool,
+    /// The in-flight case carries a `when` guard.
+    pending_guarded: bool,
+}
+
+/// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
+/// collected inside it and whether `||` joined any of them (an `||` union
+/// keeps its alternatives apart; everything else intersects).
+struct PatternFrame {
+    leaves: Vec<Restriction>,
+    or_ops: usize,
+}
+
+/// The name-level coverage a pattern leaf contributes (the space-building
+/// face of `PatternConverter`, constant_verifier.dart:1031-1050).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Restriction {
+    /// A type test as written (`X`, `X?`): cast patterns, typed variable
+    /// patterns, object patterns.
+    Named(StringId, bool),
+    /// The `null` constant (the only value-precise constant at name level).
+    Null,
+    /// `true`/`false`.
+    BoolValue(bool),
+    /// A qualified enum constant `E.c`.
+    EnumValue(StringId, StringId),
+    /// Alternatives (`a || b`).
+    Union(Vec<Restriction>),
+    /// The type-free coverage (`var x`, `_`): substituted with the
+    /// scrutinee's context type when the case closes.
+    NamedContext,
+    /// The unknown space: relational patterns, list/map patterns, and
+    /// constants the name level cannot represent. Never must-matches, so
+    /// the engine under-reports instead of mis-answering.
+    Unknown,
+}
+
+impl Restriction {
+    /// `&&`-conjunction at name level: the single side when both spell the
+    /// same test, unknown otherwise (an incomparable conjunction's
+    /// coverage is not one row type). By value because
+    /// `reduce(Restriction::and)` consumes the frame's leaves.
+    #[allow(clippy::needless_pass_by_value)]
+    fn and(self, other: Restriction) -> Restriction {
+        if self == Restriction::Unknown || other == Restriction::Unknown {
+            return Restriction::Unknown;
+        }
+        if self == other {
+            return self;
+        }
+        Restriction::Unknown
+    }
+}
+
+/// Builds one case's engine space from its restriction over `world`.
+fn case_space(world: &NameWorld<'_>, space: &Restriction, context: NameTy) -> Space<NameTy> {
+    let mut singles = Vec::new();
+    collect_singles(world, space, context, &mut singles);
+    Space::from_singles(world, Vec::new(), singles)
+}
+
+/// Flattens a restriction into the union's single spaces.
+fn collect_singles(
+    world: &NameWorld<'_>,
+    space: &Restriction,
+    context: NameTy,
+    out: &mut Vec<Single<NameTy>>,
+) {
+    match space {
+        Restriction::Union(parts) => {
+            for part in parts {
+                collect_singles(world, part, context, out);
+            }
+        }
+        Restriction::Unknown => {
+            out.push(Single::full(world.unknown()));
+        }
+        Restriction::Null => out.push(Single::full(NameTy::Null)),
+        // Typed leaves (`X`, `X?`, `E.c`, `true`/`false`): one type-test
+        // single (official `convertTypePattern`/`convertConstantPattern`).
+        Restriction::Named(name, nullable) => {
+            out.push(Single::full(NameTy::Named(*name, *nullable)));
+        }
+        Restriction::BoolValue(value) => out.push(Single::full(NameTy::BoolValue(*value))),
+        Restriction::EnumValue(enum_name, constant) => {
+            out.push(Single::full(NameTy::EnumValue(*enum_name, *constant)));
+        }
+        // Substituted before the case is recorded; unreachable here.
+        Restriction::NamedContext => out.push(Single::full(context)),
+    }
+}
+
+/// The name-level [`ExhaustivenessWorld`]: sealed/enum facts come from the
+/// unit's element model, subtype edges from the superclass and
+/// `with`/`implements` names of the unit's containers, plus the fixed core
+/// chain (`int`/`double` <: `num` <: `Object`) the nullability codes
+/// already assume.
+struct NameWorld<'a> {
+    index: &'a ElementIndex,
+    file: FileId,
+    strings: &'a StringTable,
+    unknowns: std::cell::Cell<u64>,
+}
+
+/// The two core edges every unit sees without a declaration (`num` has no
+/// container; the nullability face already treats these names specially).
+const CORE_SUPERTYPES: [(&str, &str); 3] = [("int", "num"), ("double", "num"), ("num", "Object")];
+
+impl NameTy {
+    fn from_semantic(ty: Ty) -> Self {
+        match ty {
+            Ty::Unknown | Ty::Dynamic | Ty::Void => NameTy::TopNullable,
+            Ty::Null => NameTy::Null,
+            Ty::Named { name, nullable } => NameTy::Named(name, nullable),
+        }
+    }
+}
+
+impl ExhaustivenessWorld for NameWorld<'_> {
+    type Ty = NameTy;
+
+    fn object_nullable(&self) -> NameTy {
+        NameTy::TopNullable
+    }
+
+    fn never(&self) -> NameTy {
+        NameTy::Never
+    }
+
+    fn null(&self) -> NameTy {
+        NameTy::Null
+    }
+
+    fn unknown(&self) -> NameTy {
+        let next = self.unknowns.get();
+        self.unknowns.set(next.wrapping_add(1));
+        NameTy::Unknown(next)
+    }
+
+    fn nullable(&self, ty: &NameTy) -> NameTy {
+        match ty {
+            // The nullable projection of a name or of an enum constant's
+            // enum (constants are non-null, `constant_verifier.dart:1043`).
+            NameTy::Named(name, _) | NameTy::EnumValue(name, _) => NameTy::Named(*name, true),
+            NameTy::TopNonNullable => NameTy::TopNullable,
+            other => *other,
+        }
+    }
+
+    // A type lattice: several arms legitimately answer plain `true`.
+    #[allow(clippy::match_same_arms)]
+    fn is_subtype_of(&self, sub: &NameTy, sup: &NameTy) -> bool {
+        if sub == sup {
+            return true;
+        }
+        match (sub, sup) {
+            // Everything subtypes the nullable top (static_type.dart:166);
+            // `Never` subtypes everything; `Null <: T?`.
+            (_, NameTy::TopNullable)
+            | (NameTy::Never, _)
+            | (NameTy::Null, NameTy::Named(_, true)) => true,
+            // `S <: T?` iff `S <: T` (static_type.dart:365-372); `S? <: T?`
+            // likewise; `S? <: T` never (null matches no plain T).
+            (NameTy::Named(sn, s), NameTy::Named(tn, t)) => (!*s || *t) && self.named_sub(*sn, *tn),
+            // A constant's type is its enum, non-null.
+            (NameTy::EnumValue(en, _), sup) => self.is_subtype_of(&NameTy::Named(*en, false), sup),
+            (NameTy::BoolValue(_), sup) => {
+                let bool_name = self.strings.intern("bool");
+                self.is_subtype_of(&NameTy::Named(bool_name, false), sup)
+            }
+            (NameTy::TopNonNullable, NameTy::TopNonNullable) => true,
+            _ => false,
+        }
+    }
+
+    fn is_sealed(&self, ty: &NameTy) -> bool {
+        match ty {
+            // Nullable projections split (static_type.dart:356).
+            NameTy::Named(_, true) | NameTy::TopNullable => true,
+            NameTy::Named(name, false) => self.is_sealed_name(*name),
+            _ => false,
+        }
+    }
+
+    fn subtypes(&self, ty: &NameTy) -> Vec<NameTy> {
+        match ty {
+            NameTy::Named(name, true) => vec![NameTy::Named(*name, false), NameTy::Null],
+            NameTy::TopNullable => vec![NameTy::TopNonNullable, NameTy::Null],
+            NameTy::Named(name, false) => self.name_subtypes(*name),
+            _ => Vec::new(),
+        }
+    }
+
+    fn property_type(&self, _ty: &NameTy, _key: &Key) -> Option<NameTy> {
+        // Records are not modeled at name level: record-pattern columns
+        // fall back to the nullable object (exhaustive.dart:396-406).
+        None
+    }
+
+    fn is_bottom(&self, ty: &NameTy) -> bool {
+        matches!(ty, NameTy::Never)
+    }
+
+    fn is_null(&self, ty: &NameTy) -> bool {
+        matches!(ty, NameTy::Null)
+    }
+
+    fn witness_text(&self, ty: &NameTy, fields: &[(Key, String)]) -> String {
+        if fields.is_empty() {
+            return self.ty_text(ty);
+        }
+        let inner = fields
+            .iter()
+            .map(|(key, text)| match key {
+                Key::RecordIndex(index) => format!("${}:{text}", index + 1),
+                Key::RecordName(name) | Key::Name(name) => format!("{name}: {text}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({inner})", self.ty_text(ty))
+    }
+
+    fn display(&self, ty: &NameTy) -> String {
+        self.ty_text(ty)
+    }
+}
+
+impl NameWorld<'_> {
+    /// The unit's container record for `name`.
+    fn container(&self, name: StringId) -> Option<&Container> {
+        self.index.get(self.file).and_then(|f| f.container(name))
+    }
+
+    /// The unit's container names in declaration order.
+    fn container_order(&self) -> &[StringId] {
+        self.index
+            .get(self.file)
+            .map_or(&[], FileElements::container_order)
+    }
+
+    /// The witness/diagnostic text for a static type.
+    fn ty_text(&self, ty: &NameTy) -> String {
+        match ty {
+            NameTy::Never => "Never".to_string(),
+            NameTy::Null => "null".to_string(),
+            NameTy::TopNullable => "_".to_string(),
+            NameTy::TopNonNullable => "Object".to_string(),
+            NameTy::Named(name, nullable) => {
+                let text = self.strings.resolve(*name);
+                if *nullable {
+                    format!("{text}?")
+                } else {
+                    text.to_string()
+                }
+            }
+            NameTy::EnumValue(enum_name, constant) => {
+                format!(
+                    "{}.{}",
+                    self.strings.resolve(*enum_name),
+                    self.strings.resolve(*constant)
+                )
+            }
+            NameTy::BoolValue(value) => value.to_string(),
+            NameTy::Unknown(_) => "?".to_string(),
+        }
+    }
+
+    /// Whether `sub`'s supertype chain reaches `sup`: the unit's declared
+    /// superclass and `with`/`implements` edges plus the fixed core chain.
+    fn named_sub(&self, sub: StringId, sup: StringId) -> bool {
+        if sub == sup {
+            return true;
+        }
+        let mut queue = std::collections::VecDeque::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        queue.push_back(sub);
+        seen.insert(sub);
+        while let Some(name) = queue.pop_front() {
+            for edge in self.direct_edges(name) {
+                if edge == sup {
+                    return true;
+                }
+                if seen.insert(edge) {
+                    queue.push_back(edge);
+                }
+            }
+            for (base, parent) in CORE_SUPERTYPES {
+                if self.strings.resolve(name) == base {
+                    let parent_id = self.strings.intern(parent);
+                    if parent_id == sup {
+                        return true;
+                    }
+                    if seen.insert(parent_id) {
+                        queue.push_back(parent_id);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The declared direct edges out of `name` (superclass + interfaces).
+    fn direct_edges(&self, name: StringId) -> Vec<StringId> {
+        let Some(container) = self.container(name) else {
+            return Vec::new();
+        };
+        let mut edges = Vec::new();
+        if let Some(superclass) = container.superclass {
+            edges.push(superclass);
+        }
+        edges.extend(container.interfaces.iter().copied());
+        edges
+    }
+
+    fn is_sealed_name(&self, name: StringId) -> bool {
+        if self.strings.resolve(name) == "bool" {
+            return true;
+        }
+        self.container(name)
+            .is_some_and(|c| c.sealed || c.kind == ContainerKind::Enum)
+    }
+
+    /// The closed subtype set of a sealed class or enum, in declaration
+    /// order (types/sealed.dart, types/enum.dart).
+    fn name_subtypes(&self, name: StringId) -> Vec<NameTy> {
+        if self.strings.resolve(name) == "bool" {
+            return vec![NameTy::BoolValue(true), NameTy::BoolValue(false)];
+        }
+        let Some(container) = self.container(name) else {
+            return Vec::new();
+        };
+        if container.kind == ContainerKind::Enum {
+            return container
+                .enum_constants
+                .iter()
+                .map(|constant| NameTy::EnumValue(name, *constant))
+                .collect();
+        }
+        if !container.sealed {
+            return Vec::new();
+        }
+        let mut subtypes = Vec::new();
+        for &decl in self.container_order() {
+            let Some(declared) = self.container(decl) else {
+                continue;
+            };
+            let edge = declared.superclass == Some(name) || declared.interfaces.contains(&name);
+            if edge {
+                subtypes.push(NameTy::Named(decl, false));
+            }
+        }
+        subtypes
     }
 }
 
@@ -4910,5 +5803,245 @@ mod tests {
             report.diagnostics[1].message,
             "The setter 'g' isn't defined for the type 'C'."
         );
+    }
+
+    // —— records/patterns/exhaustiveness (M2 face) ————————————————————————
+
+    /// A statement switch over an enum with every constant covered is
+    /// exhaustive: no diagnostics.
+    ///
+    /// Hand-trace: the scrutinee row carries `Color` (formal type); each
+    /// `case Color.red:` classifies through the constant-tail walk (the
+    /// `.red` member row over the bare `Color` row of an enum container)
+    /// into `EnumValue`; the engine's covering search finds no gap.
+    #[test]
+    fn enum_switch_all_constants_is_exhaustive() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A missing enum constant reports `non_exhaustive_switch_statement`
+    /// at the `switch` keyword, with the oracle's verbatim text and the
+    /// first missing constant as the suggested correction pattern.
+    ///
+    /// Hand-trace: `blue` never covers → `NonExhaustive([Color.blue])`;
+    /// the statement is mustBeExhaustive (enums are always exhaustive,
+    /// type_system.dart:846-887) and no `default` is present.
+    #[test]
+    fn enum_switch_missing_constant_reports_correction() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["non_exhaustive_switch_statement"],
+            "{:?}",
+            code_names(&report)
+        );
+        let d = &report.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
+        );
+        assert_eq!(d.severity, Severity::Error);
+        let switch_at =
+            u32::try_from("enum Color { red, green, blue } void f(Color c) { ".len()).unwrap();
+        assert_eq!(d.range.offset, switch_at);
+    }
+
+    /// A `default` case suppresses the non-exhaustive report even when
+    /// constants are missing (the oracle's `reportNonExhaustive` gate,
+    /// constant_verifier.dart:1122-1140).
+    #[test]
+    fn default_case_suppresses_non_exhaustive() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; default: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0);
+    }
+
+    /// A duplicate constant after total coverage is
+    /// `unreachable_switch_case` (`STATIC_WARNING`) at the repeated case's
+    /// keyword — reported per case before the covering check, matching the
+    /// oracle's decision order (constant_verifier.dart:1080-1088).
+    #[test]
+    fn duplicate_constant_case_is_unreachable() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; case Color.red: break; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["unreachable_switch_case"],
+            "{:?}",
+            code_names(&report)
+        );
+        let d = &report.diagnostics[0];
+        assert_eq!(d.message, "This case is covered by the previous cases.");
+        assert_eq!(d.severity, Severity::Warning);
+        let repeat_at = u32::try_from(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; ".len(),
+        )
+        .unwrap();
+        assert_eq!(d.range.offset, repeat_at);
+    }
+
+    /// A `when`-guarded case never covers: the guarded case is excluded
+    /// from the covering search (`constant_verifier.dart` guarded rows) and
+    /// the missing constant still reports.
+    #[test]
+    fn guarded_case_does_not_cover() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue when true: break; } }",
+        );
+        assert_eq!(code_names(&report), ["non_exhaustive_switch_statement"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
+        );
+    }
+
+    /// Switch expressions are always mustBeExhaustive: a missing constant
+    /// reports `non_exhaustive_switch_expression` even though a statement
+    /// over the same cases would stay silent only without the seal — and
+    /// the same shape over a *statement* is the T2 report, not this code.
+    #[test]
+    fn switch_expression_requires_all_constants() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.green => 2 }; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["non_exhaustive_switch_expression"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
+        );
+    }
+
+    /// A switch expression over a sealed class missing one subclass reports
+    /// the subclass name as the witness; covering every declared subclass
+    /// is exhaustive.
+    ///
+    /// Hand-trace: `S` is sealed; `subtypes` walks the unit's containers in
+    /// declaration order over superclass edges → `[A, B]`; `case A a:`
+    /// leaves `B` uncovered.
+    #[test]
+    fn sealed_class_switch_reports_missing_subclass() {
+        let missing = report(
+            "sealed class S {} class A extends S {} class B extends S {} void f(S s) { var x = switch (s) { A a => 1 }; }",
+        );
+        assert_eq!(
+            code_names(&missing),
+            ["non_exhaustive_switch_expression"],
+            "{:?}",
+            code_names(&missing)
+        );
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'B'."
+        );
+
+        let covered = report(
+            "sealed class S {} class A extends S {} class B extends S {} void f(S s) { var x = switch (s) { A a => 1, B b => 2 }; }",
+        );
+        assert_eq!(covered.diagnostics.len(), 0);
+    }
+
+    /// A switch expression over a nullable enum needs the `null` case: the
+    /// nullable projection splits into `[Color, null]` and the constants
+    /// alone leave the null half uncovered.
+    #[test]
+    fn nullable_enum_switch_needs_null_case() {
+        let missing = report(
+            "enum Color { red, green, blue } void f(Color? c) { var x = switch (c) { Color.red => 1, Color.green => 2, Color.blue => 3 }; }",
+        );
+        assert_eq!(code_names(&missing), ["non_exhaustive_switch_expression"]);
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "The type 'Color?' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'null'."
+        );
+
+        let with_null = report(
+            "enum Color { red, green, blue } void f(Color? c) { var x = switch (c) { Color.red => 1, Color.green => 2, Color.blue => 3, null => 4 }; }",
+        );
+        assert_eq!(with_null.diagnostics.len(), 0);
+    }
+
+    /// A single non-sealed type case covers the whole (non-nullable)
+    /// scrutinee: exhaustiveness does not require a seal.
+    ///
+    /// Hand-trace: `case C v:` is a type-free-variable frame whose context
+    /// substitutes to `Named(C, false)` — the full space of the scrutinee.
+    #[test]
+    fn single_type_case_covers_non_sealed_scrutinee() {
+        let report = report("class C {} void f(C c) { var x = switch (c) { C v => 1 }; }");
+        assert_eq!(report.diagnostics.len(), 0);
+    }
+
+    /// A switch expression's duplicate case is `unreachable_switch_case`
+    /// anchored at the repeated case's `=>` (the expression-case anchor,
+    /// constant_verifier.dart:1080-1088).
+    #[test]
+    fn switch_expression_duplicate_case_is_unreachable_at_arrow() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.red => 2, Color.green => 3, Color.blue => 4 }; }",
+        );
+        assert_eq!(code_names(&report), ["unreachable_switch_case"]);
+        // The repeated case's `=>` (the expression-case anchor).
+        let arrow_at = u32::try_from(
+            "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.red ".len(),
+        )
+        .unwrap();
+        assert_eq!(report.diagnostics[0].range.offset, arrow_at);
+    }
+
+    /// A typed variable pattern binds its local for the body: the bound
+    /// name reads cleanly, and the case narrows to the pattern's type.
+    ///
+    /// Hand-trace: `handle_declared_variable_pattern` adds `other` to the
+    /// flat local frame with the armed `Color` type — `other;` resolves
+    /// through locals, so no `undefined_identifier`.
+    #[test]
+    fn typed_pattern_binds_local() {
+        let report = report(
+            "enum Color { red } void f(Color c) { switch (c) { case Color other: other; break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// An if-case binds the same way: `if (o case Type x)` declares `x`
+    /// for the then-block.
+    #[test]
+    fn if_case_binds_local() {
+        let report =
+            report("enum Color { red } void f(Color c) { if (c case Color other) { other; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A type-free `var` pattern binds without a type and covers its
+    /// context (substituted with the scrutinee's type at case close).
+    #[test]
+    fn untyped_pattern_binds_and_covers() {
+        let report = report("class C {} void f(C c) { switch (c) { case var y: y; break; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// Record patterns destructuring by shape: the fields bind as typed
+    /// locals and the name level emits no shape diagnostic (record shape
+    /// checking is the types-crate face — the documented M2 name-level
+    /// blind spot).
+    ///
+    /// Hand-trace: the record pattern bracket pushes the unknown-space leaf
+    /// (never a false must-match); the field patterns bind `a`/`b` through
+    /// their declared-variable events, so both reads resolve.
+    #[test]
+    fn record_pattern_binds_fields_without_shape_diagnostic() {
+        let report = report("class C {} void f(C c) { if (c case (C a, C b)) { a; b; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
     }
 }

@@ -4,20 +4,21 @@
 //! Port of `LeastUpperBoundHelper._computeLeastUpperBound`
 //! (`least_upper_bound.dart:391-672`) with the documented M1 fallbacks:
 //! function/function yields bare `Function` (the official fallback when
-//! correlation fails, least_upper_bound.dart:684-686), and record/record
-//! pairs yield the declared `Record` class — the oracle's answer for
-//! non-mergeable shapes (`_recordType`, least_upper_bound.dart:855-863);
-//! the field-wise merge (:865-884) is M2, so mergeable shapes use the same
-//! class as their closest sound answer. Only record-vs-OTHER (and snapshots
-//! without a `Record` class — the semantic layer must supply one; Dart
-//! always has it) take the official fallback `UP(Object, T2)`
-//! (least_upper_bound.dart:652-659).
+//! correlation fails, least_upper_bound.dart:684-686). Record/record pairs
+//! run the official field-wise merge (`_recordType`,
+//! least_upper_bound.dart:852-885): arity or field-name mismatch answers the
+//! declared `Record` class, mergeable shapes merge field-wise. Only
+//! record-vs-OTHER (and snapshots without a `Record` class — the semantic
+//! layer must supply one; Dart always has it) take the official fallback
+//! `UP(Object, T2)` (least_upper_bound.dart:652-659).
+
+use std::cmp::Ordering;
 
 use rustc_hash::FxHashSet;
 
 use crate::ids::TypeId;
 use crate::system::{DepthLimitExceeded, TypeSystem, WalkScratch};
-use crate::ty::{Type, TypeKind, UninternedType};
+use crate::ty::{NamedMember, Type, TypeKind, UninternedRecord, UninternedType};
 
 impl TypeSystem<'_> {
     /// The least upper bound of two types; the static type of `c ? a : b`
@@ -159,14 +160,11 @@ impl TypeSystem<'_> {
         // `_recordType` (least_upper_bound.dart:648-650, :852-885), which
         // answers the bare `Record` class for non-mergeable shapes
         // (positional/named arity mismatch, :855-863; field-name mismatch,
-        // :873-876) and field-merges otherwise (:865-884) — the merge is M2,
-        // so both-record pairs answer the `Record` class itself here (exact
-        // for the non-mergeable shapes; a sound upper bound for the
-        // mergeable ones). Only record-vs-OTHER falls through to the
-        // official fallback `UP(RecordType, T2) = UP(Object, T2)` /
-        // `UP(T1, RecordType) = UP(T1, Object)`
-        // (least_upper_bound.dart:652-659); snapshots without a `Record`
-        // class use it for every record pair too.
+        // :873-876) and field-merges otherwise (:865-884). Only
+        // record-vs-OTHER falls through to the official fallback
+        // `UP(RecordType, T2) = UP(Object, T2)` / `UP(T1, RecordType) =
+        // UP(T1, Object)` (least_upper_bound.dart:652-659); snapshots
+        // without a `Record` class use it for every record pair too.
         if matches!(t1.kind(), TypeKind::Record { .. })
             || matches!(t2.kind(), TypeKind::Record { .. })
         {
@@ -183,13 +181,7 @@ impl TypeSystem<'_> {
                 if matches!(t1.kind(), TypeKind::Record { .. })
                     && matches!(t2.kind(), TypeKind::Record { .. })
                 {
-                    return Ok(self.table().intern(
-                        UninternedType::Interface {
-                            decl: record,
-                            args: Vec::new(),
-                        },
-                        false,
-                    ));
+                    return self.record_merge(a, b, record);
                 }
             }
             return Ok(if matches!(t1.kind(), TypeKind::Record { .. }) {
@@ -216,6 +208,63 @@ impl TypeSystem<'_> {
         } else {
             self.make_nullable(other)
         }
+    }
+
+    /// `_recordType` (least_upper_bound.dart:852-885): field-wise merge of
+    /// two record types — positional fields pairwise LUB in order, named
+    /// fields pairwise LUB under equal names. An arity mismatch or a
+    /// name mismatch answers the bare `Record` class (the source's
+    /// `typeProvider.recordType` fallback, least_upper_bound.dart:855-863,
+    /// :873-876). Both named lists are canonically name-sorted, so the index
+    /// zip is exactly the oracle's name-paired loop.
+    fn record_merge(
+        &self,
+        a: TypeId,
+        b: TypeId,
+        record_decl: crate::ids::TypeDeclId,
+    ) -> Result<TypeId, DepthLimitExceeded> {
+        let record_class = || {
+            self.table().intern(
+                UninternedType::Interface {
+                    decl: record_decl,
+                    args: Vec::new(),
+                },
+                false,
+            )
+        };
+        let TypeKind::Record { shape: sa } = self.table().get(a).kind() else {
+            unreachable!("caller checked the Record kind");
+        };
+        let TypeKind::Record { shape: sb } = self.table().get(b).kind() else {
+            unreachable!("caller checked the Record kind");
+        };
+        let (sa, sb) = (self.table().record_shape(sa), self.table().record_shape(sb));
+        if sa.positional.len() != sb.positional.len() || sa.named.len() != sb.named.len() {
+            return Ok(record_class());
+        }
+        let mut positional = Vec::with_capacity(sa.positional.len());
+        for i in 0..sa.positional.len() {
+            positional.push(self.lub_step(
+                self.table().arg(sa.positional.offset() + i),
+                self.table().arg(sb.positional.offset() + i),
+            )?);
+        }
+        let mut named = Vec::with_capacity(sa.named.len());
+        for i in 0..sa.named.len() {
+            let (ai, bi) = (sa.named.offset() + i, sb.named.offset() + i);
+            if self.table().named_names_cmp(ai, bi) != Ordering::Equal {
+                return Ok(record_class());
+            }
+            named.push(NamedMember {
+                name: self.table().named_name(ai),
+                ty: self.lub_step(self.table().named_ty(ai), self.table().named_ty(bi))?,
+                required: false,
+            });
+        }
+        Ok(self
+            .table()
+            .intern_record(UninternedRecord { positional, named }, false)
+            .expect("merging well-formed records preserves well-formedness"))
     }
 
     /// UP(Object, T2) resolved inline (least_upper_bound.dart:541-549).
