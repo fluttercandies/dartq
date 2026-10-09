@@ -28,6 +28,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// official `invalid_language_version_override` STATIC_WARNING and analyzes
 /// at the package/default version instead of adopting the override (#245) —
 /// v2-cached entries for such files carry neither.
+///
+/// Version discipline: cached facts carry the baked
+/// [`UnitFacts::api_signature`], so any bump of
+/// `dartq_semantic::SIGNATURE_VERSION` (the element-face composition) must
+/// bump this too, or stale-signature comparisons survive a facts-cache hit.
 pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 3;
 
 /// The SDK target segment M1 resolves `dart:` URIs against. Context-level
@@ -110,6 +115,11 @@ pub struct DirectiveFacts {
 pub struct UnitFacts {
     /// The content the facts were computed from.
     pub(crate) content: ContentId,
+    /// The file's API signature (PRD §11.3, #282): the canonical hash of the
+    /// element face (`dartq_semantic::FileElements::api_signature`) folded
+    /// with the directive-region lexemes. The L2 gate compares it against the
+    /// previous residency to decide whether the library cascade propagates.
+    pub(crate) api_signature: dartq_semantic::ApiSignature,
     /// Directives in source order.
     pub directives: Vec<DirectiveFacts>,
     /// The semantic element model (dartq-semantic `collect`).

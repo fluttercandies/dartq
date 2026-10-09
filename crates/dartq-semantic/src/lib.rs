@@ -18,6 +18,9 @@
 //!   (#117): the public scope face ([`library::LibraryScopes`]), the
 //!   in-library scoped lookup ([`library::lookup_scoped`]), and the
 //!   superclass-aware member walk ([`library::member_lookup`]).
+//! * [`signature`] — the per-file API signature ([`ApiSignature`], #282):
+//!   the canonical blake3 hash of the element face the L2 strong-incremental
+//!   gate compares ([`FileElements::api_signature`], PRD §11.3).
 //! * [`codes`] — the M1 semantic code table: the frozen families with tier
 //!   and verbatim oracle message.
 //! * [`diagnose`] — the M1 diagnosis engine (#120 batch 1 + #121 batch 2):
@@ -99,6 +102,7 @@ pub mod collector;
 pub mod diagnose;
 pub mod library;
 pub mod model;
+pub mod signature;
 
 pub use collector::collect;
 pub use diagnose::{FileReport, NameRow, NameUse, diagnose};
@@ -109,3 +113,4 @@ pub use model::{
     Container, ContainerKind, DuplicateDecl, FileElements, MemberEntry, MemberKind, MicroKind,
     TopDecl,
 };
+pub use signature::{ApiSignature, SIGNATURE_VERSION};

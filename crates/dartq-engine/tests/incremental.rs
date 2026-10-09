@@ -84,11 +84,12 @@ fn single_edit_recomputes_only_its_cascade() {
         .analyze(&[], &mut |_| {}, &Default::default())
         .expect("cold");
 
-    // Change one file: only it revalidates; the cascade reaches its
-    // importer (L1 is content-driven — §3.2, no signature refinement).
+    // Change one file: only it revalidates; the L2 signature gate (PRD
+    // §11.3) stops the cascade there — the edit keeps greet's element face,
+    // so the importer keeps its result.
     engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_1.as_bytes());
 
-    // The untouched library rides along as the AnalyzeFile target: targets
+    // The untouched libraries ride along as the AnalyzeFile targets: targets
     // drive only the amplification events, and a clean targeted library
     // reports a cache hit (engine-api-spec §1.3).
     let target = engine
@@ -110,16 +111,16 @@ fn single_edit_recomputes_only_its_cascade() {
             ast_cache_hit: false
         }
     )));
-    // Cascade: the edited library plus its importer, never more.
+    // Cascade: the signature gate keeps it at the edited library.
     let cascade = log.cascades.into_iter().next().expect("one cascade event");
-    assert_eq!(cascade.len(), 2, "edited library + downstream importer");
+    assert_eq!(cascade.len(), 1, "the edit keeps greet's face: no cascade");
     assert_eq!(
         log.analyzed
             .iter()
             .filter(|(_, from_cache)| !*from_cache)
             .count(),
-        2,
-        "exactly the cascade recomputed"
+        1,
+        "exactly the edited library recomputed"
     );
     assert!(
         log.analyzed.iter().any(|(_, from_cache)| *from_cache),
@@ -133,6 +134,57 @@ fn single_edit_recomputes_only_its_cascade() {
         .analyze(&[], &mut again.sink(), &Default::default())
         .expect("settle");
     assert!(again.revalidated.is_empty() && again.analyzed.iter().all(|(_, hit)| *hit));
+}
+
+/// The directive face rides the API signature (PRD §11.3, #282): flipping
+/// an export combinator changes the file's contribution to its importers'
+/// namespaces while its element face stands, so the signature gate must
+/// still seed the cascade — without the directive face in the hash, b would
+/// keep a stale namespace and silently miss the `undefined_function`.
+#[test]
+fn reexport_combinator_change_reaches_importers() {
+    const X: &str = "int x() => 1;\n";
+    const A_SHOW: &str = "export 'x.dart' show x;\n";
+    const A_HIDE: &str = "export 'x.dart' hide x;\n";
+    const B: &str = "import 'a.dart';\nint g() => x();\n";
+
+    let fixture = Fixture::new(&[("lib/x.dart", X), ("lib/a.dart", A_SHOW), ("lib/b.dart", B)]);
+    let a_path = fixture.path("lib/a.dart");
+    let b_path = fixture.path("lib/b.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&fixture.path("lib/x.dart"), X.as_bytes());
+    engine.set_content(&a_path, A_SHOW.as_bytes());
+    engine.set_content(&b_path, B.as_bytes());
+    let cold = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("cold");
+    assert!(cold.is_empty(), "{cold:?}");
+
+    // `show x` → `hide x`: a's element face is unchanged; only its
+    // directive face moved — exactly the face the signature folds.
+    engine.set_content(&a_path, A_HIDE.as_bytes());
+    let mut log = EventLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &Default::default())
+        .expect("flip");
+    let b = engine.file_table().try_file_id(&b_path).expect("interned");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.file == b && d.code.name == "undefined_function"),
+        "b must see x() vanish: {diagnostics:?}"
+    );
+    assert_eq!(log.cascades.len(), 1, "one cascade");
+    assert_eq!(log.cascades[0].len(), 2, "a and its importer b recompute");
+
+    // The revert heals b the same way.
+    engine.set_content(&a_path, A_SHOW.as_bytes());
+    let mut log = EventLog::default();
+    let healed = engine
+        .analyze(&[], &mut log.sink(), &Default::default())
+        .expect("revert");
+    assert!(healed.is_empty(), "{healed:?}");
+    assert_eq!(log.cascades[0].len(), 2, "a and b recompute again");
 }
 
 #[test]

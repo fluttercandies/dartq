@@ -15,6 +15,10 @@
 //! C8's name-form halves are engine-green and its pins hold end to end; C1,
 //! C3 and C5's semantic halves light through the wired `SemanticDiagnoser`
 //! (#236: the default `semdiag::Diagnoser`, the graph-level dart:core face).
+//! Since #282 (L2 signature gate, PRD §11.3) the cascade is
+//! signature-gated: body/comment edits with a stable element face stop at
+//! the edited file (C1.1/C2.1/C4.1/C6.1/C8.1 narrow), while a
+//! signature-changing edit seeds the unconditional transitive closure (C9).
 //! Two cases stay red on pre-existing gaps the working seam exposed, none
 //! of them seam defects: C5's
 //! overlay-only part file interns under a different FileTable spelling than
@@ -87,6 +91,10 @@ const C8_N1: &str = "library p9;\npart 'pn.dart';\nint f() => 1;\n";
 const C8_PN0: &str = "part of p8;\nint g() => 1;\nint g() => 2;\n";
 const C8_PN1: &str = "part of p8;\nint g() => 3;\n";
 
+// C9 reuses C1_A0/C1_B0 for a and b; c closes the chain.
+const C9_C: &str = "import 'b.dart';\nint h() => g();\n";
+const C9_A_RENAMED: &str = "int f2() => 1;\n";
+
 /// One manifest batch entry: `Some(bytes)` = `set_content`, `None` =
 /// `remove_file` (incremental-oracle-cases §1.1).
 type Batch = &'static [(&'static str, Option<&'static str>)];
@@ -122,13 +130,15 @@ struct Case {
     order_pin: Option<usize>,
 }
 
-/// C1 — body change, gate no-op, closure direction (l1-spec ①). Step 3's b
-/// content `int g() => f() + 0;` drops the `import 'a.dart';` line, so `f`
-/// is genuinely undefined there — the identical no-import shape C3 steps 0/2
-/// pin. Adjudicated #288 against the oracle probe
-/// (docs/facts/oracle-probes/c1/, dart analyze 3.13.1): the case doc's ∅
-/// delta was the case defect; the A3 table asserts `undefined_function` on b
-/// at step 3 (∅ through steps 0-2, where b still carries the import).
+/// C1 — body change, gate no-op, closure direction (l1-spec ①). The edit
+/// keeps f's element face (`int f()`), so the L2 signature gate stops the
+/// cascade at a (step 1); step 3's b content `int g() => f() + 0;` drops the
+/// `import 'a.dart';` line, so `f` is genuinely undefined there — the
+/// identical no-import shape C3 steps 0/2 pin. Adjudicated #288 against the
+/// oracle probe (docs/facts/oracle-probes/c1/, dart analyze 3.13.1): the
+/// case doc's ∅ delta was the case defect; the A3 table asserts
+/// `undefined_function` on b at step 3 (∅ through steps 0-2, where b still
+/// carries the import).
 static CASE_C1: Case = Case {
     id: "C1",
     initial: &[("lib/a.dart", C1_A0), ("lib/b.dart", C1_B0)],
@@ -137,7 +147,8 @@ static CASE_C1: Case = Case {
             batch: &[("lib/a.dart", Some(C1_A1))],
             changed: &["lib/a.dart"],
             removed: &[],
-            invalidated: &["lib/a.dart", "lib/b.dart"],
+            // L2: a's signature is unchanged, so b keeps its result.
+            invalidated: &["lib/a.dart"],
         },
         Step {
             batch: &[("lib/a.dart", Some(C1_A1))],
@@ -165,8 +176,9 @@ static CASE_C1: Case = Case {
     order_pin: None,
 };
 
-/// C2 — comment-only change; output invariance under the edit (L2 boundary
-/// golden: at L2 `invalidated` narrows to [a] — flip then, not before).
+/// C2 — comment-only change; output invariance under the edit, and the L2
+/// signature gate keeps the cascade at a: b's semantic products are not
+/// invalidated (the A4 golden pins b's cache-hit analysis).
 static CASE_C2: Case = Case {
     id: "C2",
     initial: &[("lib/a.dart", C2_A0), ("lib/b.dart", C1_B0)],
@@ -174,7 +186,7 @@ static CASE_C2: Case = Case {
         batch: &[("lib/a.dart", Some(C2_A1))],
         changed: &["lib/a.dart"],
         removed: &[],
-        invalidated: &["lib/a.dart", "lib/b.dart"],
+        invalidated: &["lib/a.dart"],
     }],
     absolute: Absolute::Empty,
     stable_bytes: &[1],
@@ -182,8 +194,9 @@ static CASE_C2: Case = Case {
     order_pin: None,
 };
 
-/// C4 — part content change, URI form: the belonging edge drags the owning
-/// library and its importers into the closure.
+/// C4 — part content change, URI form: p's edit keeps its element face, so
+/// the L2 gate stops the cascade at the owning library a — a recomputes
+/// (its content identity includes p's bytes), b keeps its result.
 static CASE_C4: Case = Case {
     id: "C4",
     initial: &[
@@ -195,7 +208,7 @@ static CASE_C4: Case = Case {
         batch: &[("lib/p.dart", Some(C4_P1))],
         changed: &["lib/p.dart"],
         removed: &[],
-        invalidated: &["lib/a.dart", "lib/b.dart"],
+        invalidated: &["lib/a.dart"],
     }],
     absolute: Absolute::Empty,
     stable_bytes: &[],
@@ -204,6 +217,8 @@ static CASE_C4: Case = Case {
 };
 
 /// C6 — transitive importer closure + the dual-order golden (syntax-only).
+/// Step 1 is a body edit with a stable face, so the L2 gate stops the chain
+/// at z; step 2's suffix comment keeps m alone.
 static CASE_C6: Case = Case {
     id: "C6",
     initial: &[
@@ -217,7 +232,7 @@ static CASE_C6: Case = Case {
             batch: &[("lib/z.dart", Some(C6_Z1))],
             changed: &["lib/z.dart"],
             removed: &[],
-            invalidated: &["lib/b.dart", "lib/m.dart", "lib/z.dart"],
+            invalidated: &["lib/z.dart"],
         },
         Step {
             batch: &[("lib/m.dart", Some(C6_M1))],
@@ -399,7 +414,10 @@ static CASE_C7: Case = Case {
 /// resolution, the §7.1 bounded same-package name scan claims pn, the
 /// capture-time duplicate log bakes step 0's `duplicate_definition`, and the
 /// wired semantic diagnoser reports m's `g()` loss after the rename orphan
-/// leaves n's scope (#236).
+/// leaves n's scope (#236). Step 1's pn edit removes the duplicate and
+/// changes pn's body under a stable face — the L2 gate keeps m clean (its
+/// view of g() is untouched) while n recomputes (its content identity
+/// includes pn's bytes) and the duplicate diagnostic clears.
 static CASE_C8: Case = Case {
     id: "C8",
     initial: &[
@@ -412,7 +430,7 @@ static CASE_C8: Case = Case {
             batch: &[("lib/pn.dart", Some(C8_PN1))],
             changed: &["lib/pn.dart"],
             removed: &[],
-            invalidated: &["lib/m.dart", "lib/n.dart"],
+            invalidated: &["lib/n.dart"],
         },
         Step {
             batch: &[("lib/n.dart", Some(C8_N1))],
@@ -620,8 +638,34 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
                 from_cache: true,
             },
         ]),
-        // C6.1: work-order analyses (z, b, m) then the clean target (w) —
-        // while the byte output is path-sorted (b, m, w, z).
+        // C2.1: the L2 zero-cascade win — a recomputes (its bytes moved), b's
+        // semantic products stay cached (signature unchanged).
+        ("C2", 1) => Some(vec![
+            GoldenEvent::Overlay {
+                changed: vec!["lib/a.dart".into()],
+                removed: vec![],
+            },
+            GoldenEvent::Revalidated {
+                path: "lib/a.dart".into(),
+                gate: RevalidateGate::Parsed {
+                    ast_cache_hit: false,
+                },
+            },
+            GoldenEvent::Cascade {
+                libraries: vec!["lib/a.dart".into()],
+            },
+            GoldenEvent::Analyzed {
+                defining: "lib/a.dart".into(),
+                from_cache: false,
+            },
+            GoldenEvent::Analyzed {
+                defining: "lib/b.dart".into(),
+                from_cache: true,
+            },
+        ]),
+        // C6.1: the signature gate stops the cascade at z — z recomputes,
+        // the b/m/w chain rides from cache — while the byte output stays
+        // path-sorted (b, m, w, z).
         ("C6", 1) => Some(vec![
             GoldenEvent::Overlay {
                 changed: vec!["lib/z.dart".into()],
@@ -634,11 +678,7 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
                 },
             },
             GoldenEvent::Cascade {
-                libraries: vec![
-                    "lib/b.dart".into(),
-                    "lib/m.dart".into(),
-                    "lib/z.dart".into(),
-                ],
+                libraries: vec!["lib/z.dart".into()],
             },
             GoldenEvent::Analyzed {
                 defining: "lib/z.dart".into(),
@@ -646,22 +686,20 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
             },
             GoldenEvent::Analyzed {
                 defining: "lib/b.dart".into(),
-                from_cache: false,
+                from_cache: true,
             },
             GoldenEvent::Analyzed {
                 defining: "lib/m.dart".into(),
-                from_cache: false,
+                from_cache: true,
             },
             GoldenEvent::Analyzed {
                 defining: "lib/w.dart".into(),
                 from_cache: true,
             },
         ]),
-        // C8.1: intended-world golden — with the name-form edge, pn is a
-        // member of library n, so the cascade dirties n and its importer m
-        // (id order: m interned first) and both reanalyze in topological
-        // order (n before m). Unreachable while CASE_C8's A3/A2 gaps stand;
-        // written to the §3 contract so the pin activates with the fix.
+        // C8.1: pn's duplicate collapse keeps its face stable, so the L2
+        // gate dirties only n (pn's bytes sit in n's content identity); m
+        // keeps its result — its view of g() is untouched.
         ("C8", 1) => Some(vec![
             GoldenEvent::Overlay {
                 changed: vec!["lib/pn.dart".into()],
@@ -674,7 +712,7 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
                 },
             },
             GoldenEvent::Cascade {
-                libraries: vec!["lib/m.dart".into(), "lib/n.dart".into()],
+                libraries: vec!["lib/n.dart".into()],
             },
             GoldenEvent::Analyzed {
                 defining: "lib/n.dart".into(),
@@ -682,7 +720,7 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
             },
             GoldenEvent::Analyzed {
                 defining: "lib/m.dart".into(),
-                from_cache: false,
+                from_cache: true,
             },
         ]),
         _ => None,
@@ -1030,6 +1068,52 @@ fn c7_delete_file_edge_cleanup_orphan_part() {
 #[test]
 fn c8_name_form_part_rename_orphan() {
     run_case(&CASE_C8);
+}
+
+/// C9 — signature-changing edit, transitive cascade through clean middles
+/// (the L2 acceptance arm, PRD §11.3): renaming a.dart's `f` flips its API
+/// signature, seeding the closure; the chain a←b←c propagates **through** b
+/// even though b and c are identity-clean (their own faces never moved) —
+/// the unconditional-closure adjudication. Step 2 reverts the rename: the
+/// diagnostics heal, and the invalidated set stays the full chain, proving
+/// the closure is signature-driven rather than diagnostic-driven.
+static CASE_C9: Case = Case {
+    id: "C9",
+    initial: &[
+        ("lib/a.dart", C1_A0),
+        ("lib/b.dart", C1_B0),
+        ("lib/c.dart", C9_C),
+    ],
+    steps: &[
+        Step {
+            batch: &[("lib/a.dart", Some(C9_A_RENAMED))],
+            changed: &["lib/a.dart"],
+            removed: &[],
+            invalidated: &["lib/a.dart", "lib/b.dart", "lib/c.dart"],
+        },
+        Step {
+            batch: &[("lib/a.dart", Some(C1_A0))],
+            changed: &["lib/a.dart"],
+            removed: &[],
+            invalidated: &["lib/a.dart", "lib/b.dart", "lib/c.dart"],
+        },
+    ],
+    absolute: Absolute::Explicit(&[
+        // Step 0: the chain resolves cleanly.
+        &[],
+        // Step 1: b's `f()` went undefined; c still sees b's `g()`.
+        &[("undefined_function", "lib/b.dart")],
+        // Step 2: the revert heals b.
+        &[],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+#[test]
+fn c9_signature_rename_cascades_through_clean_middles() {
+    run_case(&CASE_C9);
 }
 
 /// `part 'b.dart';` whose target is a plain library: the target belongs to
