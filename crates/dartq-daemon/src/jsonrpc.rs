@@ -14,6 +14,9 @@ pub mod codes {
     pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
     pub const SERVER_NOT_INITIALIZED: i64 = -32002;
+    /// LSP's `RequestCancelled`: the server dropped the request before
+    /// producing a result (its enqueue epoch was superseded).
+    pub const REQUEST_CANCELLED: i64 = -32800;
 }
 
 /// A request id: integer or string (JSON-RPC 2.0); fractional numbers are
@@ -25,7 +28,9 @@ pub enum RequestId {
 }
 
 impl RequestId {
-    fn from_value(value: &Value) -> Option<Self> {
+    /// Decodes an `id` field value (`$/cancelRequest` params carry one).
+    #[must_use]
+    pub fn from_value(value: &Value) -> Option<Self> {
         match value {
             Value::Number(number) => number.as_i64().map(Self::Num),
             Value::String(text) => Some(Self::Str(text.clone())),

@@ -2,15 +2,26 @@
 //! decodes frames; the main loop (the caller's thread) owns the output, the
 //! lifecycle state machine, and the [`Session`], so neither the engine nor
 //! the writer ever needs a lock.
+//!
+//! # Turn shape
+//!
+//! One turn = block on the next frame, then drain everything already queued
+//! into one batch (the rust-analyzer main-loop posture): N overlay edits and
+//! M requests staged by the batch execute at a single
+//! [`Session::service`] drain, in the scheduler's writer-priority order —
+//! every write applies before any read analyzes. The snapshot debounce is
+//! checked at the same turn boundary: its window elapses across the blocking
+//! receive, so the loop stays timer-free.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
 use crate::codec::{self, FrameError};
-use crate::jsonrpc::{Message, Notification, Request, Response, codes};
+use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::lsp::{self, PublishDiagnosticsParams};
 use crate::session::{Publish, Session, SessionError};
 
@@ -34,16 +45,6 @@ enum Incoming {
     Desynced(String),
     /// Clean end of stream.
     Eof,
-}
-
-/// What one notification leaves the main loop to do.
-enum Outcome {
-    /// `exit` — end the session with this process exit code.
-    Exit(u8),
-    /// Push these diagnostics.
-    Publish(Vec<Publish>),
-    /// Nothing to do.
-    Nothing,
 }
 
 /// Runs one LSP session to its end and returns the process exit code.
@@ -73,44 +74,79 @@ where
     let mut exit_code: Option<u8> = None;
 
     // Ends when the reader thread disconnects or a notification breaks out.
-    while let Ok(incoming) = receiver.recv() {
-        match incoming {
-            Incoming::Message(Message::Request(request)) => {
-                let response = handle_request(&mut lifecycle, &mut session, request);
-                write_message(&mut output, &Message::Response(response))?;
-            }
-            Incoming::Message(Message::Notification(notification)) => {
-                match handle_notification(&mut lifecycle, &mut session, &notification) {
-                    Outcome::Exit(code) => {
+    while let Ok(first) = receiver.recv() {
+        // Turn start: the snapshot debounce window elapses across the
+        // blocking receive above, so the flush check happens before intake.
+        // (Only tests read the attempt outcome.)
+        let _ = session.flush_if_due(Instant::now());
+
+        // The batch window: every frame already queued joins this turn's
+        // single drain (PRD §16.5 writer priority).
+        let mut batch = vec![first];
+        while let Ok(incoming) = receiver.try_recv() {
+            batch.push(incoming);
+        }
+
+        let mut end = false;
+        for incoming in batch {
+            match incoming {
+                Incoming::Message(Message::Request(request)) => {
+                    if let Some(response) = handle_request(&mut lifecycle, &mut session, request) {
+                        write_message(&mut output, &Message::Response(response))?;
+                    }
+                }
+                Incoming::Message(Message::Notification(notification)) => {
+                    if let Some(code) =
+                        handle_notification(&mut lifecycle, &mut session, &notification)
+                    {
                         exit_code = Some(code);
+                        end = true;
                         break;
                     }
-                    Outcome::Publish(publishes) => {
-                        for publish in publishes {
-                            send_publish(&mut output, publish)?;
-                        }
-                    }
-                    Outcome::Nothing => {}
+                }
+                Incoming::Message(Message::Response(_)) => {} // clients never send these
+                Incoming::Unparsable { code, message } => {
+                    write_message(
+                        &mut output,
+                        &Message::Response(Response::error(None, code, message)),
+                    )?;
+                }
+                Incoming::Desynced(message) => {
+                    eprintln!("dartq-daemon: {message}; ending session");
+                    write_message(
+                        &mut output,
+                        &Message::Response(Response::error(None, codes::PARSE_ERROR, message)),
+                    )?;
+                    end = true;
+                    break;
+                }
+                Incoming::Eof => {
+                    end = true;
+                    break;
                 }
             }
-            Incoming::Message(Message::Response(_)) => {} // clients never send these
-            Incoming::Unparsable { code, message } => {
-                write_message(
-                    &mut output,
-                    &Message::Response(Response::error(None, code, message)),
-                )?;
-            }
-            Incoming::Desynced(message) => {
-                eprintln!("dartq-daemon: {message}; ending session");
-                write_message(
-                    &mut output,
-                    &Message::Response(Response::error(None, codes::PARSE_ERROR, message)),
-                )?;
-                break;
-            }
-            Incoming::Eof => break,
+        }
+        if end {
+            break;
+        }
+
+        // The drain: staged writes apply, the coalesced read analyzes, and
+        // stale (cancelled) requests answer without a result.
+        let turn = session.service();
+        for publish in turn.publishes {
+            send_publish(&mut output, publish)?;
+        }
+        for (id, answer) in turn.answers {
+            let response = match answer {
+                Ok(entries) => Response::ok(id, json!({ "diagnostics": entries })),
+                Err(error) => answer_error(id, &error),
+            };
+            write_message(&mut output, &Message::Response(response))?;
         }
     }
+
+    // #306: the clean-shutdown write, window or no window.
+    session.flush_snapshot();
 
     if reader.is_finished() {
         let _ = reader.join();
@@ -169,48 +205,56 @@ enum Lifecycle {
     ShutDown,
 }
 
-fn handle_request(lifecycle: &mut Lifecycle, session: &mut Session, request: Request) -> Response {
+/// Answers a request, or `None` when the request queued onto the session's
+/// scheduler and is answered by the turn's drain instead.
+fn handle_request(
+    lifecycle: &mut Lifecycle,
+    session: &mut Session,
+    request: Request,
+) -> Option<Response> {
     let id = request.id;
     match (*lifecycle, request.method.as_str()) {
         (Lifecycle::Uninitialized, "initialize") => {
             *lifecycle = Lifecycle::Ready;
-            initialize_response(id)
+            Some(initialize_response(id))
         }
         // A second `initialize` is a client bug (LSP: initialize must be the
         // first request).
-        (Lifecycle::Ready, "initialize") => Response::error(
+        (Lifecycle::Ready, "initialize") => Some(Response::error(
             Some(id),
             codes::INVALID_REQUEST,
             "server is already initialized",
-        ),
+        )),
         (Lifecycle::Ready, "shutdown") => {
             *lifecycle = Lifecycle::ShutDown;
-            Response::ok(id, Value::Null)
+            Some(Response::ok(id, Value::Null))
         }
-        (Lifecycle::Ready, "dartq/analyze") => match session.analyze_report() {
-            Ok(entries) => Response::ok(id, json!({ "diagnostics": entries })),
-            Err(error) => Response::error(Some(id), codes::INTERNAL_ERROR, error.to_string()),
-        },
-        (Lifecycle::Uninitialized, _) => Response::error(
+        (Lifecycle::Ready, "dartq/analyze") => {
+            session.queue_analyze(id);
+            None
+        }
+        (Lifecycle::Uninitialized, _) => Some(Response::error(
             Some(id),
             codes::SERVER_NOT_INITIALIZED,
             "server is not initialized",
-        ),
-        (Lifecycle::Ready, method) => Response::error(
+        )),
+        (Lifecycle::Ready, method) => Some(Response::error(
             Some(id),
             codes::METHOD_NOT_FOUND,
             format!("method not found: {method}"),
-        ),
+        )),
         // Requests during shutdown are rejected above the state machine
         // (LSP §lifeCycleMessages); nothing else lands here.
-        (Lifecycle::ShutDown, _) => {
-            Response::error(Some(id), codes::INVALID_REQUEST, "server is shutting down")
-        }
+        (Lifecycle::ShutDown, _) => Some(Response::error(
+            Some(id),
+            codes::INVALID_REQUEST,
+            "server is shutting down",
+        )),
     }
 }
 
 /// Answers `initialize` with the negotiated capability set.
-fn initialize_response(id: crate::jsonrpc::RequestId) -> Response {
+fn initialize_response(id: jsonrpc::RequestId) -> Response {
     Response::ok(
         id,
         json!({
@@ -226,13 +270,14 @@ fn initialize_response(id: crate::jsonrpc::RequestId) -> Response {
     )
 }
 
+/// Handles one notification; `Some` is the `exit` process code.
 fn handle_notification(
     lifecycle: &mut Lifecycle,
     session: &mut Session,
     notification: &Notification,
-) -> Outcome {
+) -> Option<u8> {
     if notification.method == "exit" {
-        return Outcome::Exit(if *lifecycle == Lifecycle::ShutDown {
+        return Some(if *lifecycle == Lifecycle::ShutDown {
             EXIT_CLEAN
         } else {
             EXIT_WITHOUT_SHUTDOWN
@@ -241,79 +286,82 @@ fn handle_notification(
     // Notifications before `initialize` and after `shutdown` are dropped
     // (LSP: only `exit` is honored in either state).
     if *lifecycle != Lifecycle::Ready {
-        return Outcome::Nothing;
+        return None;
     }
     let params = notification.params.clone().unwrap_or(Value::Null);
     match notification.method.as_str() {
-        "initialized" => match session.sweep() {
-            Ok(publishes) => Outcome::Publish(publishes),
-            Err(error) => failed(&notification.method, &error),
-        },
-        "textDocument/didOpen" => match serde_json::from_value::<lsp::DidOpenParams>(params) {
-            Ok(open) => {
+        "initialized" => {
+            if let Err(error) = session.sweep() {
+                failed(&notification.method, &error);
+            }
+        }
+        "textDocument/didOpen" => {
+            if let Ok(open) = serde_json::from_value::<lsp::DidOpenParams>(params) {
                 let document = open.text_document;
-                match session.open(&document.uri, &document.text, document.version) {
-                    Ok(Some(publishes)) => Outcome::Publish(publishes),
-                    Ok(None) => Outcome::Nothing,
-                    Err(error) => failed(&notification.method, &error),
-                }
+                session.queue_edit(&document.uri, &document.text, document.version);
+            } else {
+                eprintln!("dartq-daemon: dropping malformed didOpen");
             }
-            Err(error) => {
-                eprintln!("dartq-daemon: dropping malformed didOpen: {error}");
-                Outcome::Nothing
-            }
-        },
+        }
         "textDocument/didChange" => match serde_json::from_value::<lsp::DidChangeParams>(params) {
-            Ok(change) => {
-                // Full sync: events arrive in order, each carrying the whole
-                // document; the last well-formed one wins. A `range` marks a
-                // full-sync violation and cannot be applied.
-                let Some(text) = change
-                    .content_changes
-                    .into_iter()
-                    .rev()
-                    .find(|event| event.range.is_none())
-                    .map(|event| event.text)
-                else {
-                    eprintln!(
-                        "dartq-daemon: dropping didChange without a full-text event (ranged \
-                         edits need incremental sync)"
+            // Full sync: events arrive in order, each carrying the whole
+            // document; the last well-formed one wins. A `range` marks a
+            // full-sync violation and cannot be applied.
+            Ok(change) => match change
+                .content_changes
+                .into_iter()
+                .rev()
+                .find(|event| event.range.is_none())
+            {
+                Some(event) => {
+                    session.queue_edit(
+                        &change.text_document.uri,
+                        &event.text,
+                        change.text_document.version,
                     );
-                    return Outcome::Nothing;
-                };
-                let uri = change.text_document.uri;
-                let version = change.text_document.version;
-                match session.change(&uri, &text, version) {
-                    Ok(Some(publishes)) => Outcome::Publish(publishes),
-                    Ok(None) => Outcome::Nothing,
-                    Err(error) => failed(&notification.method, &error),
                 }
-            }
-            Err(error) => {
-                eprintln!("dartq-daemon: dropping malformed didChange: {error}");
-                Outcome::Nothing
-            }
+                None => eprintln!(
+                    "dartq-daemon: dropping didChange without a full-text event (ranged edits \
+                     need incremental sync)"
+                ),
+            },
+            Err(error) => eprintln!("dartq-daemon: dropping malformed didChange: {error}"),
         },
         "textDocument/didClose" => match serde_json::from_value::<lsp::DidCloseParams>(params) {
-            Ok(close) => match session.close(&close.text_document.uri) {
-                Ok(Some(publishes)) => Outcome::Publish(publishes),
-                Ok(None) => Outcome::Nothing,
-                Err(error) => failed(&notification.method, &error),
-            },
-            Err(error) => {
-                eprintln!("dartq-daemon: dropping malformed didClose: {error}");
-                Outcome::Nothing
+            Ok(close) => {
+                if let Err(error) = session.queue_close(&close.text_document.uri) {
+                    failed(&notification.method, &error.into());
+                }
             }
+            Err(error) => eprintln!("dartq-daemon: dropping malformed didClose: {error}"),
+        },
+        "$/cancelRequest" => match params.get("id").and_then(jsonrpc::RequestId::from_value) {
+            Some(id) => session.cancel_request(&id),
+            None => eprintln!("dartq-daemon: dropping cancelRequest without an id"),
         },
         // Unknown notifications are ignored (LSP §messageHandling).
-        _ => Outcome::Nothing,
+        _ => {}
+    }
+    None
+}
+
+/// Maps a turn answer's failure to its response: a stale (cancelled) read
+/// answers LSP's `RequestCancelled`; anything else is surfaced as
+/// `InternalError`.
+fn answer_error(id: jsonrpc::RequestId, error: &SessionError) -> Response {
+    match error {
+        SessionError::Cancelled => Response::error(
+            Some(id),
+            codes::REQUEST_CANCELLED,
+            "request cancelled before execution",
+        ),
+        SessionError::Io(io) => Response::error(Some(id), codes::INTERNAL_ERROR, io.to_string()),
     }
 }
 
-/// Notes a failed analysis for an unanswerable notification.
-fn failed(method: &str, error: &SessionError) -> Outcome {
-    eprintln!("dartq-daemon: {method} analysis failed: {error}");
-    Outcome::Nothing
+/// Notes a failed session call for an unanswerable notification.
+fn failed(method: &str, error: &SessionError) {
+    eprintln!("dartq-daemon: {method} failed: {error}");
 }
 
 fn send_publish(output: &mut impl Write, publish: Publish) -> io::Result<()> {

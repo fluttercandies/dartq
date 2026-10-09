@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 dartq-diagnostics = { path = "../dartq-diagnostics" }
 dartq-engine = { path = "../dartq-engine" }
+dartq-snapshot = { path = "../dartq-snapshot" }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
