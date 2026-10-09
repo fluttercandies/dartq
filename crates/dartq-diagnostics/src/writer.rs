@@ -76,11 +76,14 @@ pub fn write_machine(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
 /// Propagates any I/O error surfaced by `out`.
 pub fn write_json(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::Result<()> {
     out.write_all(b"{\"version\":1,\"diagnostics\":[")?;
+    // Reused across diagnostics: the one buffer `documentation_url` builds its
+    // URL in, so published codes cost no per-diagnostic allocation.
+    let mut url = String::new();
     for (i, d) in output.diagnostics.iter().enumerate() {
         if i > 0 {
             out.write_all(b",")?;
         }
-        out.write_all(&json_diagnostic_bytes(output, d)?)?;
+        write_json_diagnostic(out, output, d, &mut url)?;
     }
     out.write_all(b"]}\n")
 }
@@ -99,7 +102,7 @@ struct JsonDiagnostic<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     correction_message: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    documentation: Option<String>,
+    documentation: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -121,10 +124,15 @@ struct JsonPosition {
     column: u32,
 }
 
-fn json_diagnostic_bytes(
+/// Streams one diagnostic's JSON object straight to `out` (`to_writer` — no
+/// intermediate `Vec`, byte-identical to `serde_json::to_vec`). `url` is the
+/// caller's reused buffer [`documentation_url`] builds into.
+fn write_json_diagnostic(
+    out: &mut impl Write,
     output: &AnalysisOutput<'_>,
     d: &Diagnostic,
-) -> serde_json::Result<Vec<u8>> {
+    url: &mut String,
+) -> serde_json::Result<()> {
     let (start_line, start_column) = output.files.line_col(d.file, d.range.offset);
     let (end_line, end_column) = output.files.line_col(d.file, d.range.end());
     let file = output.files.file_path(d.file).to_string_lossy();
@@ -149,19 +157,23 @@ fn json_diagnostic_bytes(
         },
         problem_message: &d.message,
         correction_message: d.correction.as_deref(),
-        documentation: documentation_url(d.code),
+        documentation: documentation_url(d.code, url),
     };
-    serde_json::to_vec(&diagnostic)
+    serde_json::to_writer(out, &diagnostic)
 }
 
 /// The oracle emits `documentation` only for codes its registry marks
 /// `hasPublishedDocs: true` (`errors.dart` `url` getter: published →
 /// `https://dart.dev/diagnostics/<name>`, else `null`); `dartq/`-namespace
 /// codes are never published (pinned by the registry tests in `code.rs`), so
-/// the flag alone decides.
-fn documentation_url(code: CodeInfo) -> Option<String> {
+/// the flag alone decides. The URL is built in the caller's reused buffer and
+/// returned borrowed.
+fn documentation_url<'a>(code: CodeInfo, buf: &'a mut String) -> Option<&'a str> {
     if code.has_published_docs {
-        Some(format!("https://dart.dev/diagnostics/{}", code.name))
+        buf.clear();
+        buf.push_str("https://dart.dev/diagnostics/");
+        buf.push_str(code.name);
+        Some(buf.as_str())
     } else {
         None
     }

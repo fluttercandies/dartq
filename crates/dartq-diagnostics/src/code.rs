@@ -61,9 +61,21 @@ mod generated {
 
 pub use generated::*;
 
+// The `invalid_language_version_override` row keeps the vintage registry's
+// representative variant template (AT_SIGN — "The Dart language version
+// override number must begin with '@dart'."). dartq's production emission is
+// the GREATER variant, whose text is pinned at its emit sites
+// (dartq-engine/dartq-cli); both variant texts are in analyzer-8.4.1
+// `error/codes.g.dart` — AT_SIGN 11527-11540, GREATER 11560-11571.
+
 /// Message template of an official code, by exact name (TSV column 5; `{0}`/
 /// `{1}` are substitution placeholders). Official codes only — dartq-own
 /// codes carry their messages at the emit site.
+///
+/// Test-only: emit sites carry their message texts locally, so the template
+/// payload would otherwise ship dead in release binaries. Wiring the emitters
+/// to the registry as the single message source is a recorded follow-up.
+#[cfg(test)]
 #[must_use]
 pub fn message_template(name: &str) -> Option<&'static str> {
     OFFICIAL_CODE_DATA
@@ -522,5 +534,41 @@ mod tests {
             assert_eq!(constant.name, info.name, "{}", constant.machine);
             assert_eq!(constant.machine, info.machine, "{}", constant.name);
         }
+    }
+
+    /// The resolution family (dartq-resolution `ResolutionCode`, frozen at
+    /// resolution-design-spec §4.2) shares official codes with this registry,
+    /// but dartq-resolution is not a dependency of this crate, so the 15
+    /// name/machine pairs are pinned as string literals transcribed from its
+    /// `ResolutionCode::info` — a spelling change on either side must update
+    /// both and fails here until it does. The pair that also lives above as a
+    /// hand-written constant is tied to it.
+    #[test]
+    fn resolution_codes_match_literal_table() {
+        const RESOLUTION_PAIRS: [(&str, &str); 15] = [
+            ("uri_does_not_exist", "URI_DOES_NOT_EXIST"),
+            (
+                "uri_does_not_exist_in_doc_import",
+                "URI_DOES_NOT_EXIST_IN_DOC_IMPORT",
+            ),
+            ("uri_has_not_been_generated", "URI_HAS_NOT_BEEN_GENERATED"),
+            ("invalid_uri", "INVALID_URI"),
+            ("uri_with_interpolation", "URI_WITH_INTERPOLATION"),
+            ("use_of_native_extension", "USE_OF_NATIVE_EXTENSION"),
+            ("import_of_non_library", "IMPORT_OF_NON_LIBRARY"),
+            ("export_of_non_library", "EXPORT_OF_NON_LIBRARY"),
+            ("part_of_non_part", "PART_OF_NON_PART"),
+            ("part_of_different_library", "PART_OF_DIFFERENT_LIBRARY"),
+            ("part_of_unnamed_library", "PART_OF_UNNAMED_LIBRARY"),
+            ("duplicate_part", "DUPLICATE_PART"),
+            ("ambiguous_import", "AMBIGUOUS_IMPORT"),
+            ("ambiguous_export", "AMBIGUOUS_EXPORT"),
+            ("shared_deferred_prefix", "SHARED_DEFERRED_PREFIX"),
+        ];
+        for (name, machine) in RESOLUTION_PAIRS {
+            assert_eq!(machine, name.to_uppercase(), "{name}: name/machine drift");
+        }
+        assert_eq!(URI_DOES_NOT_EXIST.name, "uri_does_not_exist");
+        assert_eq!(URI_DOES_NOT_EXIST.machine, "URI_DOES_NOT_EXIST");
     }
 }

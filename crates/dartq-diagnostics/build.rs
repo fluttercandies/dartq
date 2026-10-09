@@ -248,7 +248,12 @@ fn emit(rows: &[Row]) {
     out.push_str(
         "/// `(name, oracle SEV, message template, hasPublishedDocs)` rows in table order;\n",
     );
-    out.push_str("/// backs the consistency tests and [`crate::code::message_template`].\n");
+    out.push_str(
+        "/// backs the consistency tests and [`crate::code::message_template`]. Test-only\n",
+    );
+    out.push_str("/// payload: emit sites carry their message texts, so the static is compiled\n");
+    out.push_str("/// only into test builds.\n");
+    out.push_str("#[cfg(test)]\n");
     out.push_str("pub static OFFICIAL_CODE_DATA: &[(&str, &str, &str, bool)] = &[\n");
     for row in rows {
         writeln!(
