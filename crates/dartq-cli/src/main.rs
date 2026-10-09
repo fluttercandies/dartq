@@ -92,7 +92,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
-        // Bare `dartq`, `dartq version`, and `--version` all land here.
+        // Bare `dartq` and `dartq version` land here; `--version` short-
+        // circuits in `try_parse_from` as a DisplayVersion error (routed to
+        // stdout + exit 0 by the arm below).
         Ok(Cli { command: _ }) => {
             println!("dartq {}", env!("CARGO_PKG_VERSION"));
             exit::CLEAN
@@ -109,6 +111,7 @@ fn run(args: &[String]) -> u8 {
 }
 
 #[derive(clap::Parser)]
+#[command(name = "dartq", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -1883,8 +1886,8 @@ mod tests {
             "--format=json",
             "--sdk",
             "/sdk",
-            "/pkg",
             "Foo",
+            "/pkg",
         ])
         .expect("parse")
         .expect("subcommand");
