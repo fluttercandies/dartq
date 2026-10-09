@@ -111,9 +111,11 @@ impl SyntaxTable {
             .map(|off| (i + 1 + off) as u32)
     }
 
-    /// The node's shared-pool payload words (empty for span-only kinds). The
-    /// per-field layout of each kind is owned by the parser lanes that write
-    /// it; the run length is [`payload_len`] of the kind.
+    /// The node's shared-pool payload words (empty for span-only and
+    /// token-leaf kinds — a token leaf's token is its span head,
+    /// [`Self::token_range`] `.start`). The per-field layout of each kind is
+    /// owned by the parser lanes that write it; the run length is
+    /// [`payload_len`] of the kind.
     #[must_use]
     pub fn payload(&self, id: u32) -> &[u32] {
         let h = &self.nodes[id as usize];

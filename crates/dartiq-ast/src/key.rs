@@ -31,8 +31,11 @@ impl FeatureSetId {
 pub struct ParserVersion(u32);
 
 impl ParserVersion {
-    /// The current parser version.
-    pub const CURRENT: Self = Self(1);
+    /// The current parser version. 2: #151 payload-layout semantics changed
+    /// (token-leaf words eliminated into `first_token`, explicit
+    /// `Option`-word encoding, ParenthesizedCondition/Send/
+    /// ExpressionStatement widths) — v1 tables must not be reused as v2.
+    pub const CURRENT: Self = Self(2);
 
     /// The underlying number.
     #[must_use]

@@ -282,11 +282,18 @@ pub(crate) mod flags {
 }
 
 /// Number of shared-pool `u32` words the kind's payload occupies (zero for
-/// span-only nodes — the span token pair lives in the header, layout spec
-/// §1.3). Per-variant fields are the collapse map §3 payload columns minus
-/// the span words; the widest kind is [`NodeKind::FormalParameter`] at 7
-/// words, the single tolerated outlier of the ≤30 B/node average (layout
-/// spec §1.5).
+/// span-only and token-leaf kinds — the span token pair lives in the header,
+/// and a token leaf's token *is* its span head, so both store no payload
+/// word; layout spec §1.3, #151). Per-variant fields are the collapse map §3
+/// payload columns minus the span words and minus span-head words dropped as
+/// derivable; the widest kind is [`NodeKind::FormalParameter`] at 7 words,
+/// the single tolerated outlier of the ≤30 B/node average (layout spec
+/// §1.5).
+///
+/// Width 0 by shape: every kind whose map payload had no fields, plus the
+/// former width-1 kinds whose single word was the span-head token (~64 of
+/// them — literals, keyword/sentinel leaves, and head-token containers), plus
+/// `Send`/`ExpressionStatement` whose two words were the span endpoints.
 ///
 /// Exhaustive over the enum on purpose: adding a variant without declaring
 /// its payload width is a compile error (R4 tables-lockstep guard).
@@ -306,7 +313,6 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | Fields
         | PrimaryConstructor
         | PrimaryConstructorBody
-        | ParenthesizedCondition
         | SwitchCase
         | CatchClause
         | Break
@@ -319,16 +325,16 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | ObjectPattern
         | ForControlFlow
         | SkippedBody => 3,
+        // ParenthesizedCondition: case_/when only — the former span-head
+        // `token` word is derivable from `header.first_token` (#151).
         LibraryAugmentation
         | PartOf
         | Import
         | EnumElement
         | TopLevelFields
         | VariablesDeclaration
-        | ExpressionStatement
         | YieldStatement
         | InvalidYieldStatement
-        | Send
         | Conditional
         | CascadeAccess
         | DotAccess
@@ -349,99 +355,44 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | UnescapeError
         | SwitchExpressionCase
         | CaseExpression
-        | TryStatement => 2,
+        | TryStatement
+        | ParenthesizedCondition => 2,
+        // Kinds whose single field is real data: bool / Option / k:u8 / a
+        // non-head token (colon-like). All Fielded — built via begin/patch/end.
         LibraryName
         | RecoverImport
-        | Show
-        | Hide
-        | ScriptTag
-        | DottedName
         | NoPrimaryConstructor
         | RecoverDeclarationHeader
-        | FormalParameters
-        | OptionalFormalParameters
-        | NoFormalParameters
-        | ImplicitFormalParameters
         | FunctionTypedFormalParameter
-        | InitializedIdentifier
         | FieldInitializer
-        | VariableInitializer
         | Metadata
-        | Label
         | IfStatement
-        | SwitchStatement
-        | SwitchCaseWhenClause
-        | SwitchExpression
-        | ReturnStatement
-        | EmptyStatement
         | PatternAssignment
-        | Arguments
         | NamedArgument
         | TypeApplication
         | BinaryExpression
         | Assignment
-        | UnaryPrefix
-        | UnaryPostfix
-        | NonNullAssert
-        | ConstExpression
-        | ConstLiteral
-        | NewExpression
-        | NewAsIdentifier
-        | AwaitExpression
-        | Cascade
-        | DotShorthandHead
-        | ConstDotShorthand
-        | ThrowExpression
-        | ParenthesizedExpression
         | RecordLiteral
-        | LiteralBool
-        | LiteralInt
-        | LiteralDouble
-        | LiteralNull
         | ListLiteral
-        | SymbolLiteral
         | SymbolVoid
         | AsExpression
         | IsExpression
         | ImplicitCreation
-        | NoCtorRefContinuation
-        | NoTypeNameInCtorRef
         | FunctionName
-        | FunctionExpression
         | Qualified
-        | SuperExpression
-        | ThisExpression
-        | Operator
-        | Spread
-        | NullAwareElement
-        | IfControlFlow
-        | ThenControlFlow
-        | ElseControlFlow
-        | PatternGuard
         | BinaryPattern
         | ConstantPattern
         | CastPattern
-        | RecordPattern
-        | ParenthesizedPattern
         | MapPatternEntry
-        | RelationalPattern
-        | AssignedVariablePattern
         | PatternField
         | NamedRecordField
-        | NullAssertPattern
-        | NullCheckPattern
-        | NoType
-        | VoidType
-        | RecordTypeNamedFields
-        | TypeArguments
-        | InvalidTypeArguments
-        | NoTypeArguments
-        | TypeVariables
-        | NoTypeVariables
-        | NativeClause
-        | EmptyBody
-        | NoBody
         | ExperimentNotEnabled => 1,
+        // Span-only and token-leaf kinds: no payload words. The first block
+        // is the original fieldless set; the second is the #151
+        // derivable-word0 elimination — former `token: T` width-1 kinds whose
+        // word was the span head (read it from `header.first_token`), and
+        // `Send`/`ExpressionStatement` whose two words were the span
+        // endpoints.
         CompilationUnit
         | TopLevelDeclaration
         | Part
@@ -478,7 +429,165 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | InvalidFunctionBody
         | InvalidTypeReference
         | RecoverableError
-        | ErrorToken => 0,
+        | ErrorToken
+        | Show
+        | Hide
+        | ScriptTag
+        | DottedName
+        | FormalParameters
+        | OptionalFormalParameters
+        | NoFormalParameters
+        | ImplicitFormalParameters
+        | InitializedIdentifier
+        | VariableInitializer
+        | Label
+        | SwitchStatement
+        | SwitchCaseWhenClause
+        | SwitchExpression
+        | ReturnStatement
+        | EmptyStatement
+        | Arguments
+        | UnaryPrefix
+        | UnaryPostfix
+        | NonNullAssert
+        | ConstExpression
+        | ConstLiteral
+        | NewExpression
+        | NewAsIdentifier
+        | AwaitExpression
+        | Cascade
+        | DotShorthandHead
+        | ConstDotShorthand
+        | ThrowExpression
+        | ParenthesizedExpression
+        | LiteralBool
+        | LiteralInt
+        | LiteralDouble
+        | LiteralNull
+        | SymbolLiteral
+        | NoCtorRefContinuation
+        | NoTypeNameInCtorRef
+        | FunctionExpression
+        | SuperExpression
+        | ThisExpression
+        | Operator
+        | Spread
+        | NullAwareElement
+        | IfControlFlow
+        | ThenControlFlow
+        | ElseControlFlow
+        | PatternGuard
+        | RecordPattern
+        | ParenthesizedPattern
+        | RelationalPattern
+        | AssignedVariablePattern
+        | NullAssertPattern
+        | NullCheckPattern
+        | NoType
+        | VoidType
+        | RecordTypeNamedFields
+        | TypeArguments
+        | InvalidTypeArguments
+        | NoTypeArguments
+        | TypeVariables
+        | NoTypeVariables
+        | NativeClause
+        | EmptyBody
+        | NoBody
+        | Send
+        | ExpressionStatement => 0,
+    }
+}
+
+/// The payload-construction class of a kind (#151 contract): how the parser
+/// must materialize it in the arena. Every kind is exactly one of the three,
+/// and the class fully determines the legal builder entry point.
+///
+/// The classification is payload-based; whether a kind takes children is the
+/// parser's responsibility (a leaf event creates a childless node, so only
+/// childless kinds may go through [`crate::AstBuilder::leaf`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LeafShape {
+    /// No payload words; the span may cover any token range. Childless
+    /// instances go through `leaf`/`leaf_span`; width-0 containers go through
+    /// `begin`/`end` (with nothing to patch).
+    SpanOnly,
+    /// The node *is* one token: its token identity is `header.first_token`
+    /// (the former `token: T` payload word was eliminated as derivable,
+    /// #151) and the span must be exactly `[token, token + 1)`. Built with
+    /// `leaf` only.
+    TokenLeaf,
+    /// Carries real payload words (bool / Option / count / k:u8 / non-head
+    /// token fields). Built only through `begin`/`patch`/`end` — `patch`
+    /// reaches open nodes, so a leaf-emitted Fielded kind could never fill
+    /// its slot. The pattern (every word written explicitly; zero-fill is
+    /// never a value):
+    ///
+    /// ```
+    /// use dartiq_ast::{AstBuilder, NodeKind};
+    ///
+    /// // Identifier { token, ctx } — token == span head, ctx is word 1.
+    /// let mut b = AstBuilder::new();
+    /// b.begin(NodeKind::CompilationUnit, 0);
+    /// b.begin(NodeKind::Identifier, 7);
+    /// b.patch(0, 7); // word 0: the token (explicit, even when == first_token)
+    /// b.patch(1, 3); // word 1: IdentifierContext discriminant
+    /// b.end(NodeKind::Identifier, 8);
+    /// b.end(NodeKind::CompilationUnit, 8);
+    /// let ast = b.finish();
+    /// assert_eq!(ast.payload(0), &[7, 3]);
+    /// ```
+    Fielded,
+}
+
+/// The kind's [`LeafShape`]. Derived, not a third parallel table: width > 0
+/// is exactly [`LeafShape::Fielded`], the token-leaf set is enumerated, and
+/// every remaining width-0 kind is [`LeafShape::SpanOnly`].
+#[must_use]
+pub fn leaf_shape(kind: NodeKind) -> LeafShape {
+    use NodeKind::*;
+    if payload_len(kind) > 0 {
+        return LeafShape::Fielded;
+    }
+    // Single-token nodes: the whole node is one token, so the eliminated
+    // `token: T` word is exactly `header.first_token` and the span is forced
+    // to `[token, token + 1)`.
+    match kind {
+        ScriptTag
+        | NoFormalParameters
+        | ImplicitFormalParameters
+        | Label
+        | EmptyStatement
+        | NewAsIdentifier
+        | DotShorthandHead
+        | ConstDotShorthand
+        | NoCtorRefContinuation
+        | NoTypeNameInCtorRef
+        | LiteralBool
+        | LiteralInt
+        | LiteralDouble
+        | LiteralNull
+        | SuperExpression
+        | ThisExpression
+        | Operator
+        | UnaryPrefix
+        | UnaryPostfix
+        | NonNullAssert
+        | Spread
+        | NullAwareElement
+        | ThenControlFlow
+        | ElseControlFlow
+        | AssignedVariablePattern
+        | NullAssertPattern
+        | NullCheckPattern
+        | NoType
+        | VoidType
+        | InvalidTypeArguments
+        | NoTypeArguments
+        | NoTypeVariables
+        | EmptyBody
+        | NoBody => LeafShape::TokenLeaf,
+        _ => LeafShape::SpanOnly,
     }
 }
 
@@ -487,6 +596,12 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
 /// §2, 13 groups). All groups collapse to same-kind pairing except the five
 /// whose begin cannot decide the end shape up front (shared-begin ends);
 /// every other `end` accepts only a node opened as the same kind.
+///
+/// The shared-begin groups always open as the *canonical* (widest) kind of
+/// the group — the payload slot is reserved at `begin` and must fit every
+/// end the node may seal as. For #12/#13 that canonical kind is
+/// `RecordLiteral` (width 1) since #151 dropped `ParenthesizedExpression` to
+/// width 0.
 ///
 /// The builder debug-asserts this on every `end` event (R4).
 #[must_use]
@@ -498,7 +613,9 @@ pub(crate) fn accepts_begin(end: NodeKind, open: NodeKind) -> bool {
         | (ForIn, ForStatement | ForIn)
         | (InvalidAwaitExpression, AwaitExpression | InvalidAwaitExpression)
         | (InvalidYieldStatement, YieldStatement | InvalidYieldStatement)
-        | (RecordLiteral, ParenthesizedExpression | RecordLiteral) => true,
+        // #12/#13: canonical open flipped to the wider RecordLiteral (#151).
+        | (ParenthesizedExpression, RecordLiteral)
+        | (RecordLiteral, RecordLiteral) => true,
         (end, open) => end == open,
     }
 }

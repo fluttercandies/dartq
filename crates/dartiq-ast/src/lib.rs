@@ -42,7 +42,7 @@ mod tests;
 
 pub use builder::{AstBuilder, Marker};
 pub use key::{AstKey, FeatureSetId, ParserVersion};
-pub use kind::NodeKind;
+pub use kind::{LeafShape, NodeKind, leaf_shape};
 pub use span::{byte_span, utf16_span};
 pub use table::SyntaxTable;
 
@@ -55,7 +55,19 @@ pub type NodeId = u32;
 /// ids; parser-inserted tokens are materialized and appended at parse end,
 /// so the AST sees one contiguous table (layout spec §2). Same space as the
 /// parser's `TokenId`.
+///
+/// The index space is `u32` — a unit's token table is contract-bound below
+/// 2³² entries (about 4.3 billion tokens per file; overflow is a
+/// scanner/parser contract violation, not a runtime case).
 pub type TokenRef = u32;
+
+/// Payload-word sentinel for an absent optional token — the
+/// `Option<TokenRef>` encoding (collapse map §1 notation, #151). Every
+/// optional word is written explicitly (`patch`ed with a real token or
+/// [`TOKEN_NONE`]); zero-fill is never `None` because 0 is a valid token
+/// index. Same bit pattern as the pool's internal `DATA_NONE` (different
+/// role: absent field vs empty slot).
+pub const TOKEN_NONE: TokenRef = u32::MAX;
 
 const _: () = assert!(
     core::mem::size_of::<table::NodeHeader>() == 24,

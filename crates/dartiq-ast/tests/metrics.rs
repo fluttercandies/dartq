@@ -14,6 +14,15 @@
 //! The node/token ratio is the one soft number in the model; the parser
 //! milestones re-validate it against real ASTs, while this test pins the
 //! data layer's per-node cost.
+//!
+//! Density history (#151 payload-contract change): the pre-#151 model (token
+//! leaves stored their token as payload word 0) measured **27.86 B/node** and
+//! **1.251 MB/MB** on this corpus. The #151 contract stores no payload word
+//! for token leaves (token = `header.first_token`) or span-only kinds; the
+//! model below cycles 0/2/0/2/0/0/0/1 pool words over its 9-node chunks, so
+//! the arithmetic expectation is 24 + 4×5/9 ≈ **26.2 B/node** steady-state
+//! and ≈ 0.40 × 26.2 / 8.0 ≈ **1.18 MB/MB** at the budget's definition point
+//! — to be confirmed by the serial-phase metrics run.
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 #![allow(clippy::cast_precision_loss)] // measurement math only
@@ -53,19 +62,12 @@ fn collect_dart_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Builds the model AST for one file: chunks of one span-only container plus
-/// 8 leaves whose widths cycle over 1/1/1/1/2/2/0/1 pool words — 9 words per
-/// 9 nodes, matching the spec's ~1 extra pool word per node amortization.
+/// 8 leaf-slot events whose payload widths cycle 0/2/0/2/0/0/0/1 — 5 words
+/// per 9 nodes. Post-#151: token leaves (LiteralInt/Bool/Null) and
+/// span-only kinds (StringLiteral, Send) store no payload word; the words
+/// that remain are real fields (Identifier ctx, Conditional question/colon,
+/// Arguments lparen), built via begin/patch/end.
 fn model_ast(tokens: &TokenTable) -> dartiq_ast::SyntaxTable {
-    const CHUNK: [NodeKind; 8] = [
-        NodeKind::LiteralInt,
-        NodeKind::LiteralBool,
-        NodeKind::LiteralNull,
-        NodeKind::LiteralInt,
-        NodeKind::Identifier,
-        NodeKind::Conditional,
-        NodeKind::StringLiteral,
-        NodeKind::Arguments,
-    ];
     let token_count = tokens.len() as u32;
     #[allow(clippy::cast_sign_loss)] // the model count is positive by construction
     let chunks = ((tokens.len() as f64) * NODES_PER_TOKEN / 9.0) as usize;
@@ -74,10 +76,38 @@ fn model_ast(tokens: &TokenTable) -> dartiq_ast::SyntaxTable {
     let mut token = 0u32;
     for _ in 0..chunks {
         b.begin(NodeKind::Block, token);
-        for &kind in &CHUNK {
-            b.leaf(kind, token);
-            token = (token + 1) % token_count.max(1);
-        }
+        // TokenLeaf: 0 words.
+        b.leaf(NodeKind::LiteralInt, token);
+        token = (token + 1) % token_count.max(1);
+        // Fielded Identifier { token, ctx }: 2 words, begin/patch/end.
+        b.begin(NodeKind::Identifier, token);
+        b.patch(0, token);
+        b.patch(1, 0);
+        b.end(NodeKind::Identifier, token + 1);
+        token = (token + 1) % token_count.max(1);
+        // TokenLeaf: 0 words.
+        b.leaf(NodeKind::LiteralBool, token);
+        token = (token + 1) % token_count.max(1);
+        // Fielded Conditional { question, colon }: 2 words.
+        b.begin(NodeKind::Conditional, token);
+        b.patch(0, token);
+        b.patch(1, token);
+        b.end(NodeKind::Conditional, token + 1);
+        token = (token + 1) % token_count.max(1);
+        // TokenLeaf: 0 words.
+        b.leaf(NodeKind::LiteralNull, token);
+        token = (token + 1) % token_count.max(1);
+        // SpanOnly: 0 words.
+        b.leaf(NodeKind::StringLiteral, token);
+        token = (token + 1) % token_count.max(1);
+        // SpanOnly leaf_span: 0 words.
+        b.leaf_span(NodeKind::Send, token, token + 1);
+        token = (token + 1) % token_count.max(1);
+        // Fielded Arguments { lparen }: 1 word.
+        b.begin(NodeKind::Arguments, token);
+        b.patch(0, token);
+        b.end(NodeKind::Arguments, token + 1);
+        token = (token + 1) % token_count.max(1);
         b.end(NodeKind::Block, token);
     }
     b.end(NodeKind::CompilationUnit, token_count);

@@ -7,14 +7,17 @@
 //! push on every `end`, so child ranges are contiguous; begin/end pairs
 //! checked against the collapse-map pairing table; payload slots reserved at
 //! `begin` and back-filled by member events (the official class-like builder
-//! pattern); the compilation unit root sealed last.
+//! pattern); the compilation unit root sealed last (events after the root
+//! seal are refused in debug builds). Leaf construction follows the
+//! [`LeafShape`] contract: `leaf`/`leaf_span` carry no payload words —
+//! Fielded kinds build via `begin`/`patch`/`end`.
 //!
 //! This crate never depends on the parser: `dartiq-parser` implements its
 //! `ParserListener` trait over these event families (layout spec §1.3 end).
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 
-use crate::kind::{NodeKind, accepts_begin, flags, payload_len};
+use crate::kind::{LeafShape, NodeKind, accepts_begin, flags, leaf_shape, payload_len};
 use crate::table::{DATA_NONE, NodeHeader, SyntaxTable};
 
 /// One open (begun, not yet sealed) container. Its payload slot is already
@@ -51,6 +54,11 @@ pub struct AstBuilder {
     /// Open-stack indices whose `errored` bit was flipped false→true, in
     /// order — the undo log that makes error propagation rollback-safe.
     error_log: Vec<usize>,
+    /// Whether the root was already sealed (the open stack drained on an
+    /// `end`). Anything begun or leaf-emitted afterwards would land *behind*
+    /// the root and corrupt [`SyntaxTable::root`], so every event entry
+    /// point debug-refuses it; `rollback` recomputes it.
+    root_sealed: bool,
 }
 
 impl AstBuilder {
@@ -68,6 +76,7 @@ impl AstBuilder {
     /// five groups — the wider kind is the canonical open). `end` enforces
     /// this with a debug assertion.
     pub fn begin(&mut self, kind: NodeKind, first_token: u32) {
+        debug_assert!(!self.root_sealed, "begin after the root was sealed");
         let payload_start = self.pool.len() as u32;
         self.pool
             .resize(self.pool.len() + payload_len(kind) as usize, 0);
@@ -88,15 +97,21 @@ impl AstBuilder {
     /// # Panics
     ///
     /// Panics when no node is open (parser bug, surfaces in any build).
-    /// Debug builds additionally assert that `end_kind` accepts the open
-    /// kind (pairing table) and that the sealed kind's payload fits the slot
-    /// reserved at `begin`; release builds trust the parser.
+    /// Debug builds additionally assert that `end_token` is not before the
+    /// node's `first_token`, that `end_kind` accepts the open kind (pairing
+    /// table), and that the sealed kind's payload fits the slot reserved at
+    /// `begin`; release builds trust the parser.
     pub fn end(&mut self, end_kind: NodeKind, end_token: u32) {
         let node = self.open.pop().expect("end without a matching begin");
         debug_assert!(
             accepts_begin(end_kind, node.kind),
             "end {end_kind:?} does not pair with open {:?}",
             node.kind
+        );
+        debug_assert!(
+            end_token >= node.first_token,
+            "end {end_kind:?}: end_token {end_token} precedes first_token {}",
+            node.first_token
         );
         let width = payload_len(end_kind);
         debug_assert!(
@@ -107,6 +122,7 @@ impl AstBuilder {
         if errored {
             self.propagate_error();
         }
+        self.root_sealed = self.open.is_empty();
         self.nodes.push(NodeHeader {
             kind: end_kind,
             flags: if errored { flags::ERROR } else { 0 },
@@ -122,29 +138,45 @@ impl AstBuilder {
         });
     }
 
-    /// Emits a single-token leaf (a collapsed Handle with substantive
-    /// content, e.g. `LiteralInt`). When the kind carries payload, word 0 is
-    /// the token itself (all 1-width leaves store exactly their token) and
-    /// the rest zero-fill for later `patch` calls.
+    /// Emits a childless single-token leaf: the [`LeafShape::TokenLeaf`]
+    /// kinds (a collapsed Handle whose whole content is one token, e.g.
+    /// `LiteralInt`) and single-token [`LeafShape::SpanOnly`] kinds. The node
+    /// carries **no** payload word — a token leaf's token is
+    /// `header.first_token` (the former `token: T` word was eliminated as
+    /// derivable, #151) and the span is exactly `[token, token + 1)`.
+    ///
+    /// [`LeafShape::Fielded`] kinds must not come through here: their slot is
+    /// reserved by [`Self::begin`] and back-filled with [`Self::patch`]
+    /// before [`Self::end`] (see [`LeafShape::Fielded`] for the pattern).
+    /// Debug builds assert the shape.
     pub fn leaf(&mut self, kind: NodeKind, token: u32) {
-        self.leaf_span(kind, token, token + 1);
+        debug_assert!(
+            matches!(leaf_shape(kind), LeafShape::TokenLeaf | LeafShape::SpanOnly),
+            "leaf {kind:?}: Fielded kinds build via begin/patch/end"
+        );
+        debug_assert!(!self.root_sealed, "leaf after the root was sealed");
+        self.pool_done(kind, token, token + 1);
     }
 
-    /// Emits a leaf over an explicit half-open token range (leaves that
-    /// carry a multi-token span, e.g. `Send`, `SkippedBody`).
+    /// Emits a childless leaf over an explicit half-open token range — the
+    /// multi-token [`LeafShape::SpanOnly`] kinds (e.g. `StringLiteral`,
+    /// `Send`, `ExpressionStatement`). Token-leaf kinds use [`Self::leaf`]
+    /// (their span is forced to one token); Fielded kinds use
+    /// `begin`/`patch`/`end`.
     pub fn leaf_span(&mut self, kind: NodeKind, first_token: u32, end_token: u32) {
-        let width = payload_len(kind);
-        let payload_start = self.pool.len() as u32;
-        if width == 0 {
-            self.pool_done(DATA_NONE, kind, first_token, end_token);
-        } else {
-            self.pool.push(first_token);
-            self.pool.resize(self.pool.len() + width as usize - 1, 0);
-            self.pool_done(payload_start, kind, first_token, end_token);
-        }
+        debug_assert!(
+            leaf_shape(kind) == LeafShape::SpanOnly,
+            "leaf_span {kind:?}: TokenLeaf kinds use leaf(), Fielded kinds use begin/patch/end"
+        );
+        debug_assert!(
+            end_token >= first_token,
+            "leaf_span {kind:?}: end_token {end_token} precedes first_token {first_token}"
+        );
+        debug_assert!(!self.root_sealed, "leaf_span after the root was sealed");
+        self.pool_done(kind, first_token, end_token);
     }
 
-    fn pool_done(&mut self, data: u32, kind: NodeKind, first_token: u32, end_token: u32) {
+    fn pool_done(&mut self, kind: NodeKind, first_token: u32, end_token: u32) {
         self.nodes.push(NodeHeader {
             kind,
             flags: 0,
@@ -152,7 +184,7 @@ impl AstBuilder {
             end_token,
             first_child: self.nodes.len() as u32,
             end_child: self.nodes.len() as u32,
-            data,
+            data: DATA_NONE,
         });
     }
 
@@ -179,6 +211,11 @@ impl AstBuilder {
     /// every ancestor as nodes seal (layout spec §3). Diagnostics themselves
     /// never enter the AST — they flow through the listener to the
     /// diagnostics channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no node is open (the stack index underflows) — parser
+    /// bug, surfaces in any build.
     pub fn mark_error(&mut self) {
         let top = self.open.len() - 1;
         self.set_errored(top);
@@ -224,6 +261,9 @@ impl AstBuilder {
         self.open.truncate(marker.open);
         self.nodes.truncate(marker.nodes);
         self.pool.truncate(marker.pool);
+        // Restore the flag to its state at mark time: the root was already
+        // sealed then iff nothing was open and the arena was non-empty.
+        self.root_sealed = marker.open == 0 && marker.nodes > 0;
     }
 
     /// Consumes the builder into the immutable table.

@@ -11,8 +11,10 @@ use std::path::Path;
 use dartiq_scanner::{ScanConfig, scan};
 use dartiq_source::FileTable;
 
-use super::kind::{accepts_begin, payload_len};
-use crate::{AstBuilder, Marker, NodeKind, SyntaxTable, byte_span, utf16_span};
+use super::kind::{accepts_begin, leaf_shape, payload_len};
+use crate::{
+    AstBuilder, LeafShape, Marker, NodeKind, SyntaxTable, TOKEN_NONE, byte_span, utf16_span,
+};
 
 const CONFIG: ScanConfig = ScanConfig {
     enable_triple_shift: true,
@@ -83,29 +85,64 @@ fn payload_slot_patch_and_read() {
 }
 
 #[test]
-fn leaf_writes_token_into_payload() {
+fn token_leaf_carries_no_payload() {
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    b.leaf(NodeKind::Identifier, 0);
-    b.end(NodeKind::CompilationUnit, 1);
+    b.leaf(NodeKind::LiteralInt, 3);
+    b.end(NodeKind::CompilationUnit, 5);
     let ast = b.finish();
-    // Identifier: (token, ctx); leaf auto-fills word 0 with the token.
-    assert_eq!(ast.payload(0), &[0, 0]);
+    // TokenLeaf (#151): no payload word — the token is header.first_token,
+    // the span exactly [token, token + 1).
+    assert!(ast.payload(0).is_empty());
+    assert_eq!(ast.token_range(0), 3..4);
+}
+
+#[test]
+fn fielded_leaf_patterns() {
+    // Fielded kinds never go through leaf(): begin reserves the slot, patch
+    // fills every word explicitly, end seals (#151).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // Identifier { token, ctx } — token == span head, patched explicitly
+    // (zero-fill is never a value).
+    b.begin(NodeKind::Identifier, 1);
+    b.patch(0, 1);
+    b.patch(1, 2);
+    b.end(NodeKind::Identifier, 2);
+    // CascadeAccess { token, null_aware } — bool bit set.
+    b.begin(NodeKind::CascadeAccess, 2);
+    b.patch(0, 2);
+    b.patch(1, 1);
+    b.end(NodeKind::CascadeAccess, 3);
+    b.end(NodeKind::CompilationUnit, 3);
+    let ast = b.finish();
+    assert_eq!(ast.payload(0), &[1, 2]);
+    assert_eq!(ast.payload(1), &[2, 1]);
 }
 
 #[test]
 fn shared_begin_pairs() {
-    // A `(`-opened structure can seal as either shape (collapse map §2 #12/#13).
+    // A `(`-opened structure seals as either shape (collapse map §2 #12/#13).
+    // The canonical open is the wider RecordLiteral (#151 flip): it reserves
+    // the const slot; ParenthesizedExpression narrow-seals under it.
     let mut b = AstBuilder::new();
-    b.begin(NodeKind::ParenthesizedExpression, 0);
+    b.begin(NodeKind::RecordLiteral, 0);
+    b.patch(0, TOKEN_NONE); // no `const`
     b.leaf(NodeKind::LiteralInt, 1);
     b.end(NodeKind::RecordLiteral, 2);
+    let mut b2 = AstBuilder::new();
+    b2.begin(NodeKind::RecordLiteral, 0);
+    b2.leaf(NodeKind::LiteralInt, 1);
+    b2.end(NodeKind::ParenthesizedExpression, 2);
     let ast = b.finish();
     assert_eq!(ast.kind(1), NodeKind::RecordLiteral);
     assert_eq!(
         ast.payload(1).len(),
         usize::from(payload_len(NodeKind::RecordLiteral))
     );
+    let ast2 = b2.finish();
+    assert_eq!(ast2.kind(1), NodeKind::ParenthesizedExpression);
+    assert!(ast2.payload(1).is_empty(), "narrow seal to the width-0 end");
 }
 
 #[test]
@@ -134,7 +171,15 @@ fn pairing_table_shape() {
     assert!(accepts_begin(ForIn, ForStatement));
     assert!(accepts_begin(InvalidAwaitExpression, AwaitExpression));
     assert!(accepts_begin(InvalidYieldStatement, YieldStatement));
-    assert!(accepts_begin(RecordLiteral, ParenthesizedExpression));
+    assert!(accepts_begin(RecordLiteral, RecordLiteral));
+    assert!(
+        accepts_begin(ParenthesizedExpression, RecordLiteral),
+        "#12/#13: canonical open is the wider RecordLiteral (#151)"
+    );
+    assert!(
+        !accepts_begin(RecordLiteral, ParenthesizedExpression),
+        "pairing is directional: the width-0 kind cannot reserve the slot"
+    );
     assert!(
         !accepts_begin(ForStatement, ForIn),
         "pairing is directional"
@@ -160,7 +205,7 @@ fn canonical_of(end: NodeKind) -> NodeKind {
         ForIn => ForStatement,
         InvalidAwaitExpression => AwaitExpression,
         InvalidYieldStatement => YieldStatement,
-        RecordLiteral => ParenthesizedExpression,
+        ParenthesizedExpression | RecordLiteral => RecordLiteral,
         other => other,
     }
 }
@@ -175,7 +220,8 @@ fn canonical_begin_is_never_narrower_than_its_ends() {
         &[NodeKind::ForStatement, NodeKind::ForIn],
         &[NodeKind::AwaitExpression, NodeKind::InvalidAwaitExpression],
         &[NodeKind::YieldStatement, NodeKind::InvalidYieldStatement],
-        &[NodeKind::ParenthesizedExpression, NodeKind::RecordLiteral],
+        // Canonical first — the wider kind reserves the slot (#151 flip).
+        &[NodeKind::RecordLiteral, NodeKind::ParenthesizedExpression],
     ];
     for group in groups {
         let wide = payload_len(group[0]);
@@ -196,6 +242,168 @@ fn payload_width_ceiling() {
     }
     assert_eq!(max, 7);
     assert_eq!(payload_len(FormalParameter), 7);
+}
+
+#[test]
+fn leaf_shape_width_lockstep() {
+    // Fielded is exactly "has payload words"; TokenLeaf kinds are width 0
+    // (their token lives in header.first_token); SpanOnly covers the rest of
+    // the width-0 set (#151).
+    for raw in 0..NodeKind::KIND_COUNT {
+        let kind = NodeKind::from_raw(raw);
+        let shape = leaf_shape(kind);
+        let width = payload_len(kind);
+        assert_eq!(
+            shape == LeafShape::Fielded,
+            width > 0,
+            "{kind:?}: shape/width disagree"
+        );
+        if shape == LeafShape::TokenLeaf {
+            assert_eq!(width, 0, "{kind:?}");
+        }
+    }
+    // Spot checks across the three shapes.
+    use NodeKind::*;
+    assert_eq!(leaf_shape(LiteralInt), LeafShape::TokenLeaf);
+    assert_eq!(leaf_shape(ThisExpression), LeafShape::TokenLeaf);
+    assert_eq!(leaf_shape(StringLiteral), LeafShape::SpanOnly);
+    assert_eq!(leaf_shape(Send), LeafShape::SpanOnly);
+    assert_eq!(leaf_shape(Identifier), LeafShape::Fielded);
+    assert_eq!(leaf_shape(ParenthesizedCondition), LeafShape::Fielded);
+}
+
+#[test]
+fn narrow_seal_paths() {
+    // Shared-begin groups open as the canonical (widest) kind and may seal
+    // as a narrower end — including the width-0 ends (#151).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // Fields (3 words: ModSet + kind) → TopLevelFields (2 words: ModSet).
+    b.begin(NodeKind::Fields, 0);
+    b.patch(0, 1);
+    b.patch(1, 9);
+    b.patch(2, 0);
+    b.leaf(NodeKind::LiteralInt, 1);
+    b.end(NodeKind::TopLevelFields, 2);
+    // AwaitExpression (width 0) → InvalidAwaitExpression (width 0): the
+    // width-0 flip needs no patching at all.
+    b.begin(NodeKind::AwaitExpression, 2);
+    b.leaf(NodeKind::LiteralInt, 3);
+    b.end(NodeKind::InvalidAwaitExpression, 4);
+    b.end(NodeKind::CompilationUnit, 4);
+    let ast = b.finish();
+    // Post-order: [leaf, TopLevelFields, leaf, InvalidAwaitExpression, unit].
+    assert_eq!(ast.kind(1), NodeKind::TopLevelFields);
+    assert_eq!(ast.payload(1).len(), 2, "slot narrowed to the sealed width");
+    assert_eq!(ast.kind(3), NodeKind::InvalidAwaitExpression);
+    assert!(ast.payload(3).is_empty());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn root_sealed_last() {
+    // The compilation unit is sealed last; every event after the seal is a
+    // parser bug and must fail loudly in debug builds.
+    let build_after_root = |emit: fn(&mut AstBuilder)| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.end(NodeKind::CompilationUnit, 1);
+        emit(&mut b);
+    };
+    let result = std::panic::catch_unwind(|| {
+        build_after_root(|b| b.leaf(NodeKind::LiteralInt, 0));
+    });
+    assert!(result.is_err(), "leaf after the root must fail");
+    let result = std::panic::catch_unwind(|| {
+        build_after_root(|b| b.begin(NodeKind::Block, 0));
+    });
+    assert!(result.is_err(), "begin after the root must fail");
+    // Sealing with nothing open fails as well (pre-existing guard).
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.end(NodeKind::CompilationUnit, 0);
+    });
+    assert!(result.is_err(), "end without a begin must fail");
+}
+
+#[test]
+fn payload_bearing_constructions() {
+    // Representative Fielded kinds across domains: every word written
+    // explicitly; absent Options read back TOKEN_NONE, never zero (#151).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // ForParts { for, lparen, left_sep, right_sep, update_count }.
+    b.begin(NodeKind::ForParts, 1);
+    b.patch(0, 1);
+    b.patch(1, 2);
+    b.patch(2, 4);
+    b.patch(3, 6);
+    b.patch(4, 2);
+    b.leaf(NodeKind::LiteralInt, 3);
+    b.leaf(NodeKind::LiteralInt, 5);
+    b.end(NodeKind::ForParts, 7);
+    // SwitchCase { default: O, colon: O, expression_count } — both absent.
+    b.begin(NodeKind::SwitchCase, 7);
+    b.patch(0, TOKEN_NONE);
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, 1);
+    b.leaf(NodeKind::LiteralInt, 7);
+    b.end(NodeKind::SwitchCase, 8);
+    // Break { has_target, break, end } — unlabeled.
+    b.begin(NodeKind::Break, 8);
+    b.patch(0, 0);
+    b.patch(1, 8);
+    b.patch(2, 9);
+    b.end(NodeKind::Break, 9);
+    // Continue { has_target, continue, end } — labeled.
+    b.begin(NodeKind::Continue, 9);
+    b.patch(0, 1);
+    b.patch(1, 9);
+    b.patch(2, 10);
+    b.end(NodeKind::Continue, 10);
+    // CatchClause { on: O, catch: O, comma: O } — `on` present.
+    b.begin(NodeKind::CatchClause, 10);
+    b.patch(0, 10);
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, TOKEN_NONE);
+    b.end(NodeKind::CatchClause, 11);
+    // TryStatement { try: T, finally: O } — finally absent.
+    b.begin(NodeKind::TryStatement, 12);
+    b.patch(0, 12);
+    b.patch(1, TOKEN_NONE);
+    b.end(NodeKind::TryStatement, 13);
+    // Conditional { question: T, colon: T }.
+    b.begin(NodeKind::Conditional, 13);
+    b.patch(0, 13);
+    b.patch(1, 14);
+    b.leaf(NodeKind::LiteralInt, 13);
+    b.leaf(NodeKind::LiteralInt, 14);
+    b.leaf(NodeKind::LiteralInt, 15);
+    b.end(NodeKind::Conditional, 16);
+    // Assert { assert: T, kind, lparen: T, comma: O } — comma absent.
+    b.begin(NodeKind::Assert, 16);
+    b.patch(0, 16);
+    b.patch(1, 2); // AssertKind discriminant
+    b.patch(2, 17);
+    b.patch(3, TOKEN_NONE);
+    b.end(NodeKind::Assert, 18);
+    b.end(NodeKind::CompilationUnit, 18);
+    let ast = b.finish();
+
+    // Post-order ids: ForParts 2, SwitchCase 4, Break 5, Continue 6,
+    // CatchClause 7, TryStatement 8, Conditional 12, Assert 13.
+    assert_eq!(ast.payload(2), &[1, 2, 4, 6, 2]);
+    assert_eq!(
+        ast.payload(4),
+        &[u32::MAX, u32::MAX, 1],
+        "absent Options read as TOKEN_NONE, not zero"
+    );
+    assert_eq!(ast.payload(5), &[0, 8, 9]);
+    assert_eq!(ast.payload(6), &[1, 9, 10]);
+    assert_eq!(ast.payload(7), &[10, u32::MAX, u32::MAX]);
+    assert_eq!(ast.payload(8), &[12, u32::MAX]);
+    assert_eq!(ast.payload(12), &[13, 14]);
+    assert_eq!(ast.payload(13), &[16, 2, 17, u32::MAX]);
 }
 
 #[test]
@@ -250,8 +458,8 @@ fn rollback_truncates_nodes_pool_and_error_bits() {
     assert!(ast.payload(2).is_empty(), "block is span-only");
     assert_eq!(
         ast.memory_footprint(),
-        4 * 24 + 2 * 4,
-        "arena and pool fully truncated to the committed prefix"
+        4 * 24,
+        "arena and pool fully truncated to the committed prefix (token leaves store no pool word)"
     );
 }
 
@@ -263,7 +471,11 @@ fn spans_derive_from_token_table() {
 
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    b.leaf(NodeKind::Identifier, 0); // f
+    // Fielded Identifier: the begin/patch/end pattern (#151 contract).
+    b.begin(NodeKind::Identifier, 0);
+    b.patch(0, 0);
+    b.patch(1, 0);
+    b.end(NodeKind::Identifier, 1);
     b.end(NodeKind::CompilationUnit, result.tokens.len() as u32);
     let ast = b.finish();
 
@@ -313,7 +525,7 @@ fn ast_key_equality() {
     assert_eq!(a, key(b"x", &latest));
     assert_ne!(a, key(b"y", &latest));
     assert_ne!(a, key(b"x", &dart3), "feature fingerprint participates");
-    assert_eq!(a.parser_version.raw(), 1);
+    assert_eq!(a.parser_version.raw(), 2);
     assert_eq!(
         a.feature_set.raw(),
         latest.fingerprint(),
