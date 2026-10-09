@@ -107,6 +107,19 @@ pub struct UriResolution {
     pub code: Option<ResolutionCode>,
 }
 
+/// Which directive face a URI resolves for (`library_analyzer.dart:699-719`
+/// `state.isDocImport`). The target lookup is kind-independent; only the
+/// missing-target diagnostic differs — an `@docImport` reports the
+/// `uri_does_not_exist_in_doc_import` static warning where an import/export
+/// reports `uri_does_not_exist` or `uri_has_not_been_generated`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectiveKind {
+    /// An `import` or `export` directive.
+    ImportExport,
+    /// A documentation `@docImport` directive.
+    DocImport,
+}
+
 /// Failure of [`PackageTable::new`]: one `rootUri` in the package config
 /// cannot be turned into a filesystem path.
 #[derive(Debug, thiserror::Error)]
@@ -247,11 +260,36 @@ impl<'a> UriResolver<'a> {
     /// `DirectiveUriWithoutString` face, reported as
     /// `uri_with_interpolation`.
     ///
+    /// `kind` only shapes the diagnostic face of a missing target
+    /// ([`DirectiveKind`]); the target lookup itself is identical for both.
+    ///
     /// # Panics
     ///
     /// Panics when `container` is not interned in this resolver's
     /// [`FileTable`] — a caller bug (ids only come from that table).
-    pub fn resolve(&mut self, container: FileId, uri_str: Option<&str>) -> UriResolution {
+    pub fn resolve(
+        &mut self,
+        container: FileId,
+        uri_str: Option<&str>,
+        kind: DirectiveKind,
+    ) -> UriResolution {
+        let resolution = self.resolve_uri(container, uri_str);
+        match kind {
+            DirectiveKind::ImportExport => resolution,
+            DirectiveKind::DocImport => UriResolution {
+                code: resolution.code.map(|code| match code {
+                    ResolutionCode::UriDoesNotExist | ResolutionCode::UriHasNotBeenGenerated => {
+                        ResolutionCode::UriDoesNotExistInDocImport
+                    }
+                    other => other,
+                }),
+                ..resolution
+            },
+        }
+    }
+
+    /// The kind-independent target lookup behind [`Self::resolve`].
+    fn resolve_uri(&mut self, container: FileId, uri_str: Option<&str>) -> UriResolution {
         let Some(uri_str) = uri_str else {
             return UriResolution {
                 uri: ResolvedUri::Unresolved(UnresolvedKind::BadUri),
@@ -1205,7 +1243,11 @@ mod tests {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
         let container = container(&fixture, &mut files, "app/lib/main.dart");
-        let resolution = resolver(&fixture, &mut files).resolve(container, Some("util.dart"));
+        let resolution = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("util.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             resolution.uri,
             ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
@@ -1219,10 +1261,18 @@ mod tests {
             Some(fixture.workspace.root.join("app/lib/util.dart").as_path())
         );
         // The same file reached through a different spelling shares one id.
-        let via_dot = resolver(&fixture, &mut files).resolve(container, Some("./util.dart"));
+        let via_dot = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("./util.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(via_dot.target, resolution.target);
         // And through a percent escape decoding to the same name.
-        let via_escape = resolver(&fixture, &mut files).resolve(container, Some("uti%6C.dart"));
+        let via_escape = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("uti%6C.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(via_escape.target, resolution.target);
     }
 
@@ -1231,15 +1281,22 @@ mod tests {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
         let container = container(&fixture, &mut files, "app/lib/main.dart");
-        let resolution =
-            resolver(&fixture, &mut files).resolve(container, Some("../bin/tool.dart"));
+        let resolution = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("../bin/tool.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             resolution.uri,
             ResolvedUri::File(fixture.workspace.root.join("app/bin/tool.dart"))
         );
         assert_eq!(resolution.code, None);
         // Dot segments collapse lexically before existence is consulted.
-        let dotdot = resolver(&fixture, &mut files).resolve(container, Some("sub/../util.dart"));
+        let dotdot = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("sub/../util.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             dotdot.uri,
             ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
@@ -1254,7 +1311,11 @@ mod tests {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
         let container = container(&fixture, &mut files, "pkg_a/lib/sub/b.dart");
-        let resolution = resolver(&fixture, &mut files).resolve(container, Some("../c.dart"));
+        let resolution = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("../c.dart"),
+            DirectiveKind::ImportExport,
+        );
         let ResolvedUri::Package { package, rel, file } = resolution.uri.clone() else {
             panic!("expected a package target");
         };
@@ -1265,7 +1326,11 @@ mod tests {
 
         // Escaping past the package root is not expressible as a package URI
         // → unresolvable.
-        let escape = resolver(&fixture, &mut files).resolve(container, Some("../../../x.dart"));
+        let escape = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("../../../x.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             escape.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -1281,7 +1346,11 @@ mod tests {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
         let container = container(&fixture, &mut files, "app/lib/main.dart");
-        let resolution = resolver(&fixture, &mut files).resolve(container, Some(""));
+        let resolution = resolver(&fixture, &mut files).resolve(
+            container,
+            Some(""),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(resolution.target, ResolvedTarget::Resolved(container));
         assert_eq!(resolution.code, None);
     }
@@ -1294,7 +1363,11 @@ mod tests {
         let mut files = FileTable::new();
         let mut resolver = resolver(&fixture, &mut files);
 
-        let hit = resolver.resolve(container, Some("package:pkg_a/a.dart"));
+        let hit = resolver.resolve(
+            container,
+            Some("package:pkg_a/a.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             hit.uri,
             ResolvedUri::Package {
@@ -1305,7 +1378,11 @@ mod tests {
         );
         assert_eq!(hit.code, None);
 
-        let sub = resolver.resolve(container, Some("package:pkg_a/sub/b.dart"));
+        let sub = resolver.resolve(
+            container,
+            Some("package:pkg_a/sub/b.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             sub.uri,
             ResolvedUri::Package {
@@ -1316,7 +1393,11 @@ mod tests {
         );
 
         // A package from an absolute hosted rootUri resolves identically.
-        let hosted = resolver.resolve(container, Some("package:hosted/h.dart"));
+        let hosted = resolver.resolve(
+            container,
+            Some("package:hosted/h.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             hosted.uri,
             ResolvedUri::Package {
@@ -1328,7 +1409,11 @@ mod tests {
 
         // One target through both faces shares one FileId: relative
         // `../../pkg_a/lib/a.dart` and `package:pkg_a/a.dart`.
-        let via_relative = resolver.resolve(container, Some("../../pkg_a/lib/a.dart"));
+        let via_relative = resolver.resolve(
+            container,
+            Some("../../pkg_a/lib/a.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(via_relative.target, hit.target);
     }
 
@@ -1341,7 +1426,11 @@ mod tests {
         let mut resolver = resolver(&fixture, &mut files);
 
         // Unknown package: no target at all.
-        let unknown = resolver.resolve(container, Some("package:missing/a.dart"));
+        let unknown = resolver.resolve(
+            container,
+            Some("package:missing/a.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             unknown.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -1351,7 +1440,7 @@ mod tests {
 
         // No package name (`package:x`, `package:`).
         for uri in ["package:pkg_a", "package:"] {
-            let none = resolver.resolve(container, Some(uri));
+            let none = resolver.resolve(container, Some(uri), DirectiveKind::ImportExport);
             assert_eq!(
                 none.uri,
                 ResolvedUri::Unresolved(UnresolvedKind::NotExist),
@@ -1361,7 +1450,11 @@ mod tests {
         }
 
         // Authority form: the path starts with `/`, no package parseable.
-        let hosted = resolver.resolve(container, Some("package://host/a.dart"));
+        let hosted = resolver.resolve(
+            container,
+            Some("package://host/a.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(
             hosted.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -1369,13 +1462,21 @@ mod tests {
 
         // Known package, missing file: target exists (the lib path), the
         // code carries the missing-ness.
-        let missing = resolver.resolve(container, Some("package:pkg_a/gone.dart"));
+        let missing = resolver.resolve(
+            container,
+            Some("package:pkg_a/gone.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert!(matches!(missing.uri, ResolvedUri::Package { .. }));
         assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
         assert_eq!(code_of(&missing), ResolutionCode::UriDoesNotExist);
 
         // Missing with a generated suffix: hasn't-been-generated instead.
-        let generated = resolver.resolve(container, Some("package:pkg_a/made.g.dart"));
+        let generated = resolver.resolve(
+            container,
+            Some("package:pkg_a/made.g.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert!(matches!(generated.uri, ResolvedUri::Package { .. }));
         assert_eq!(code_of(&generated), ResolutionCode::UriHasNotBeenGenerated);
     }
@@ -1394,8 +1495,11 @@ mod tests {
         fs::write(&built, "// generated\n").expect("built file");
 
         let container = container(&fixture, &mut files, "app/lib/main.dart");
-        let resolution =
-            resolver(&fixture, &mut files).resolve(container, Some("package:pkg_a/gen.g.dart"));
+        let resolution = resolver(&fixture, &mut files).resolve(
+            container,
+            Some("package:pkg_a/gen.g.dart"),
+            DirectiveKind::ImportExport,
+        );
         let ResolvedUri::Package { file, .. } = resolution.uri else {
             panic!("expected a package target");
         };
@@ -1411,7 +1515,7 @@ mod tests {
         let mut files = FileTable::new();
         let mut resolver = resolver(&fixture, &mut files);
 
-        let core = resolver.resolve(container, Some("dart:core"));
+        let core = resolver.resolve(container, Some("dart:core"), DirectiveKind::ImportExport);
         assert_eq!(
             core.uri,
             ResolvedUri::Dart {
@@ -1423,7 +1527,11 @@ mod tests {
         assert_eq!(core.code, None);
 
         // `dart:core/bool.dart` keeps the library name and joins the part.
-        let part = resolver.resolve(container, Some("dart:core/bool.dart"));
+        let part = resolver.resolve(
+            container,
+            Some("dart:core/bool.dart"),
+            DirectiveKind::ImportExport,
+        );
         let ResolvedUri::Dart { library, file } = part.uri else {
             panic!("expected a dart target");
         };
@@ -1432,7 +1540,8 @@ mod tests {
         assert_eq!(part.target, ResolvedTarget::External);
 
         // Unknown dart library (and unknown on this target): source null.
-        let unknown = resolver.resolve(container, Some("dart:mirrors"));
+        let unknown =
+            resolver.resolve(container, Some("dart:mirrors"), DirectiveKind::ImportExport);
         assert_eq!(
             unknown.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -1460,6 +1569,7 @@ mod tests {
                         .to_string_lossy()
                 )
             )),
+            DirectiveKind::ImportExport,
         );
         assert_eq!(
             file.uri,
@@ -1468,7 +1578,11 @@ mod tests {
         assert_eq!(file.code, None);
 
         // A missing file: URI target with the does-not-exist code.
-        let missing = resolver.resolve(container, Some("file:///definitely/not/there.dart"));
+        let missing = resolver.resolve(
+            container,
+            Some("file:///definitely/not/there.dart"),
+            DirectiveKind::ImportExport,
+        );
         assert!(matches!(missing.uri, ResolvedUri::File(_)));
         assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
         assert_eq!(code_of(&missing), ResolutionCode::UriDoesNotExist);
@@ -1480,7 +1594,7 @@ mod tests {
             "data:text/plain,main(){}",
             "http://x/y.dart",
         ] {
-            let none = resolver.resolve(container, Some(uri));
+            let none = resolver.resolve(container, Some(uri), DirectiveKind::ImportExport);
             assert_eq!(
                 none.uri,
                 ResolvedUri::Unresolved(UnresolvedKind::NotExist),
@@ -1491,7 +1605,11 @@ mod tests {
         }
 
         // dart-ext: carries its own frozen code.
-        let ext = resolver.resolve(container, Some("dart-ext:native.so"));
+        let ext = resolver.resolve(
+            container,
+            Some("dart-ext:native.so"),
+            DirectiveKind::ImportExport,
+        );
         assert_eq!(ext.uri, ResolvedUri::Unresolved(UnresolvedKind::DartExt));
         assert_eq!(code_of(&ext), ResolutionCode::UseOfNativeExtension);
     }
@@ -1505,7 +1623,7 @@ mod tests {
         let mut resolver = resolver(&fixture, &mut files);
 
         // Interpolation: the parser saw no string to resolve.
-        let interpolated = resolver.resolve(container, None);
+        let interpolated = resolver.resolve(container, None, DirectiveKind::ImportExport);
         assert_eq!(
             interpolated.uri,
             ResolvedUri::Unresolved(UnresolvedKind::BadUri)
@@ -1514,10 +1632,80 @@ mod tests {
         assert_eq!(interpolated.target, ResolvedTarget::Missing);
 
         // Unparseable syntax.
-        let bad = resolver.resolve(container, Some("a b:c"));
+        let bad = resolver.resolve(container, Some("a b:c"), DirectiveKind::ImportExport);
         assert_eq!(bad.uri, ResolvedUri::Unresolved(UnresolvedKind::BadUri));
         assert_eq!(code_of(&bad), ResolutionCode::InvalidUri);
         assert_eq!(bad.target, ResolvedTarget::Missing);
+    }
+
+    /// The `@docImport` diagnostic face (library_analyzer.dart:699-719): every
+    /// missing-target outcome — unresolvable, plain missing, generated-suffix
+    /// missing — reports `uri_does_not_exist_in_doc_import` where an
+    /// import/export reports the compile-time codes; hits and directive-shape
+    /// errors keep their codes.
+    #[test]
+    fn doc_import_swaps_missing_target_codes() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut resolver = resolver(&fixture, &mut files);
+
+        // Known package, missing file: the target stays (the lib path), the
+        // code carries the missing-ness in the doc-import voice.
+        let missing = resolver.resolve(
+            container,
+            Some("package:pkg_a/gone.dart"),
+            DirectiveKind::DocImport,
+        );
+        assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
+        assert_eq!(
+            code_of(&missing),
+            ResolutionCode::UriDoesNotExistInDocImport
+        );
+
+        // The generated-suffix face collapses into the warning too (the
+        // oracle's second isDocImport branch, library_analyzer.dart:711-719).
+        let generated = resolver.resolve(
+            container,
+            Some("package:pkg_a/made.g.dart"),
+            DirectiveKind::DocImport,
+        );
+        assert_eq!(
+            code_of(&generated),
+            ResolutionCode::UriDoesNotExistInDocImport
+        );
+
+        // Unresolvable package: importedSource == null in the oracle — same
+        // swap, and no target at all.
+        let unknown = resolver.resolve(
+            container,
+            Some("package:missing/a.dart"),
+            DirectiveKind::DocImport,
+        );
+        assert_eq!(unknown.target, ResolvedTarget::Missing);
+        assert_eq!(
+            code_of(&unknown),
+            ResolutionCode::UriDoesNotExistInDocImport
+        );
+
+        // A hit stays clean, and dart-ext: keeps its own frozen code.
+        let hit = resolver.resolve(
+            container,
+            Some("package:pkg_a/a.dart"),
+            DirectiveKind::DocImport,
+        );
+        assert_eq!(hit.code, None);
+        let ext = resolver.resolve(
+            container,
+            Some("dart-ext:native.so"),
+            DirectiveKind::DocImport,
+        );
+        assert_eq!(code_of(&ext), ResolutionCode::UseOfNativeExtension);
+
+        // Directive-shape errors are kind-independent (the parser reports
+        // them before any target lookup).
+        let interpolated = resolver.resolve(container, None, DirectiveKind::DocImport);
+        assert_eq!(code_of(&interpolated), ResolutionCode::UriWithInterpolation);
     }
 
     #[test]

@@ -21,17 +21,37 @@ use std::collections::BTreeMap;
 
 /// One `if (name == 'value') 'uri'` clause of a configurable directive.
 ///
-/// `value` is `None` when the source wrote `if (name)` with no `=` value;
-/// evaluation then compares against `"true"`.
+/// `value` is `None` for a bare `if (name)` — and for a written
+/// `if (name == '')`: the oracle stores an absent `=` value as the empty
+/// string (`file_state.dart:1110`) and `valueOrTrue` reads `''` back as
+/// `'true'` (`unlinked_data.dart:327-333`), so [`Configuration::new`]
+/// normalizes the written `''` into the bare form and evaluation compares
+/// against `"true"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Configuration {
     /// The condition's dotted name, as written (no `dart.library` derivation,
     /// no normalization — matching is exact).
     pub dotted_name: Box<str>,
-    /// The `=` value of the condition, or `None` for a bare `if (name)`.
+    /// The `=` value of the condition; `None` for the bare form (a written
+    /// `''` normalizes to `None` too — see the type's docs).
     pub value: Option<Box<str>>,
     /// The URI string selected when this configuration matches.
     pub uri: Box<str>,
+}
+
+impl Configuration {
+    /// Builds one configuration, folding a written empty `=` value
+    /// (`if (x == '')`) into the bare form: the oracle's `valueOrTrue`
+    /// treats `''` and an absent value identically (`unlinked_data.dart
+    /// :327-333`, fed by `file_state.dart:1110` storing absent as `''`).
+    #[must_use]
+    pub fn new(dotted_name: &str, value: Option<&str>, uri: &str) -> Self {
+        Self {
+            dotted_name: Box::from(dotted_name),
+            value: value.filter(|value| !value.is_empty()).map(Box::from),
+            uri: Box::from(uri),
+        }
+    }
 }
 
 /// The declared-variables environment of URI selection (§2.2): an exact
@@ -101,19 +121,11 @@ pub fn select_configured_uri(configs: &[Configuration], env: &ConditionalEnv) ->
 mod tests {
     use super::*;
 
-    fn config(name: &str, value: Option<&str>, uri: &str) -> Configuration {
-        Configuration {
-            dotted_name: Box::from(name),
-            value: value.map(Box::from),
-            uri: Box::from(uri),
-        }
-    }
-
     /// §2.2: an empty declared-variables table (the analyzer default) selects
     /// the primary URI — the analyzer never seeds `dart.library.*`.
     #[test]
     fn empty_env_selects_primary() {
-        let configs = [config("dart.library.io", None, "io.dart")];
+        let configs = [Configuration::new("dart.library.io", None, "io.dart")];
         assert_eq!(
             select_configured_uri(&configs, &ConditionalEnv::new()),
             SelectedUri::Primary
@@ -129,9 +141,9 @@ mod tests {
     #[test]
     fn first_match_wins() {
         let configs = [
-            config("a", Some("1"), "first.dart"),
-            config("a", Some("1"), "second.dart"),
-            config("b", None, "third.dart"),
+            Configuration::new("a", Some("1"), "first.dart"),
+            Configuration::new("a", Some("1"), "second.dart"),
+            Configuration::new("b", None, "third.dart"),
         ];
         let mut env = ConditionalEnv::new();
         env.declare("a", "1");
@@ -145,7 +157,7 @@ mod tests {
     /// `if (x)` is `x == "true"` exactly (valueOrTrue, no bool parsing).
     #[test]
     fn bare_condition_compares_against_true() {
-        let configs = [config("flutter", None, "fl.dart")];
+        let configs = [Configuration::new("flutter", None, "fl.dart")];
         let mut env = ConditionalEnv::new();
         env.declare("flutter", "true");
         assert_eq!(
@@ -164,7 +176,7 @@ mod tests {
     /// No trimming, no numeric coercion: the comparison is plain equality.
     #[test]
     fn comparison_is_exact_string_equality() {
-        let configs = [config("a", Some(" 1"), "x.dart")];
+        let configs = [Configuration::new("a", Some(" 1"), "x.dart")];
         let mut env = ConditionalEnv::new();
         env.declare("a", "1");
         assert_eq!(select_configured_uri(&configs, &env), SelectedUri::Primary);
@@ -181,14 +193,41 @@ mod tests {
     #[test]
     fn later_configuration_matches_when_earlier_misses() {
         let configs = [
-            config("a", Some("1"), "a1.dart"),
-            config("b", Some("2"), "b2.dart"),
+            Configuration::new("a", Some("1"), "a1.dart"),
+            Configuration::new("b", Some("2"), "b2.dart"),
         ];
         let mut env = ConditionalEnv::new();
         env.declare("b", "2");
         assert_eq!(
             select_configured_uri(&configs, &env),
             SelectedUri::Configuration(1)
+        );
+    }
+
+    /// A written `= ''` is the absent test: the oracle stores an absent value
+    /// as `''` (file_state.dart:1110) and `valueOrTrue` reads `''` back as
+    /// `'true'` (unlinked_data.dart:327-333) — normalized at construction,
+    /// not at selection.
+    #[test]
+    fn written_empty_value_is_the_absent_test() {
+        assert_eq!(
+            Configuration::new("x", Some(""), "cfg.dart").value,
+            None,
+            "`= ''` folds into the bare form"
+        );
+        let configs = [Configuration::new("x", Some(""), "cfg.dart")];
+        let mut env = ConditionalEnv::new();
+        env.declare("x", "");
+        assert_eq!(
+            select_configured_uri(&configs, &env),
+            SelectedUri::Primary,
+            "the comparison is against \"true\", not the written empty string"
+        );
+        env.declare("x", "true");
+        assert_eq!(
+            select_configured_uri(&configs, &env),
+            SelectedUri::Configuration(0),
+            "as with a bare `if (x)`, the declared \"true\" matches"
         );
     }
 }

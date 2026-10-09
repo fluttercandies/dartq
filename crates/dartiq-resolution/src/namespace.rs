@@ -14,15 +14,17 @@
 //!   .createImportNamespaceForDirective` + `_applyCombinators`,
 //!   scope.dart:159-170/227-244), and
 //! - one **prefix table** per distinct `as` prefix, merged across all
-//!   imports sharing it (CFE `PrefixBuilder` reuse,
-//!   `source_compilation_unit.dart:1507-1540`); the prefix name itself is a
-//!   marker entry in the import namespace (the prefix is injected into the
-//!   import scope as a name, `import.dart:69-79`), so `p.x` is two hash
-//!   lookups — the analyzer's `PrefixedNamespace` lookup-time composition
-//!   (scope.dart:287-328) with interned ids instead of string splicing.
+//!   imports sharing it, keyed by prefix name — the analyzer's
+//!   `_prefixElements` map (`LibraryFragmentScope._`,
+//!   scope.dart:348-358). Prefixes live *outside* the combined import
+//!   namespace: `_lookupCombined` consults `_prefixElements` first and
+//!   returns the prefix unconditionally, before the import namespace
+//!   (scope.dart:455-471), and `p.x` always goes through the prefix's
+//!   table (`PrefixScope`, scope.dart:352-357) — a prefix name never
+//!   merges into, or conflicts with, imported names.
 //!
-//! Lookup is therefore pure `FxHashMap` hits on `u32` keys: no string work,
-//! no allocation.
+//! Lookup is therefore pure `FxHashMap` hits on interned keys: no string
+//! work, no allocation.
 //!
 //! # Ambiguity
 //!
@@ -32,13 +34,12 @@
 //! one name make the entry ambiguous with all candidates kept — the
 //! diagnosis surfaces at the use point (`ambiguous_import`), never at build
 //! time, and this layer only exposes it through [`Lookup::Ambiguous`].
-//! A prefix marker conflicting with an imported top-level name is the same
-//! kind of ambiguity.
 //!
-//! Lookup order is the M1 form of the `front_end` scope chain (spec §1): local
-//! declarations first (they shadow imports), then the import namespace. The
-//! deeper chain (type-parameter scopes, part-local scopes) is the semantic
-//! layer's.
+//! Lookup order is the oracle's scope chain (`LibraryFragmentScope.lookup`,
+//! scope.dart:418-432): local declarations first (they shadow imports),
+//! then prefixes (the `_prefixElements` branch of `_lookupCombined`), then
+//! the merged import namespace. The deeper chain (type-parameter scopes,
+//! part-local scopes) is the semantic layer's.
 //!
 //! # Deviations from the spec sketch (§5), pinned here
 //!
@@ -71,8 +72,10 @@ pub enum NamespaceEntry {
     /// declaration's name, and a file belongs to one library, so the pair is
     /// the declaration's identity — see [`crate::library_graph::ExportEntry`]).
     Decl(FileId),
-    /// An import prefix: the index into the owning library's prefix tables.
-    Prefix(PrefixId),
+    /// An import prefix: its merged table is the owning library's prefix
+    /// entry under the looked-up name itself (the oracle's
+    /// `_prefixElements[id]`, scope.dart:458-460).
+    Prefix,
 }
 
 /// A namespace entry under one name: a single target, or the full candidate
@@ -85,19 +88,6 @@ pub enum NameEntry {
     /// Two or more distinct targets; all candidates, in arrival (import
     /// source) order.
     Ambiguous(Box<[NamespaceEntry]>),
-}
-
-/// An import prefix of one library: the index into that library's prefix
-/// tables (built by [`Namespaces::build`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PrefixId(u32);
-
-impl PrefixId {
-    /// The underlying integer, meaningful within the owning library.
-    #[must_use]
-    pub const fn index(self) -> u32 {
-        self.0
-    }
 }
 
 /// The outcome of a namespace lookup — the shape the semantic layer's
@@ -114,7 +104,7 @@ pub enum Lookup<'a> {
 }
 
 /// The namespaces of a graph's libraries: per library, the merged import
-/// namespace and one table per distinct import prefix.
+/// namespace and the prefix tables keyed by prefix name.
 #[derive(Debug)]
 pub struct Namespaces {
     libs: Vec<LibraryNamespaces>,
@@ -122,18 +112,20 @@ pub struct Namespaces {
 
 #[derive(Debug)]
 struct LibraryNamespaces {
-    /// Bare-name entries (un-prefixed imports, plus prefix markers).
+    /// Bare-name entries of the merged import namespace (un-prefixed
+    /// imports). Prefixes are deliberately not here — the oracle keeps them
+    /// in a separate `_prefixElements` map (scope.dart:348-358).
     names: FxHashMap<StringId, NameEntry>,
-    /// One table per distinct prefix name, merged across the imports
-    /// sharing it; indexed by [`PrefixId`].
-    prefixes: Vec<FxHashMap<StringId, NameEntry>>,
+    /// Prefix name → its merged table (across all imports sharing the
+    /// prefix), the [`Prefix`] face of [`NamespaceEntry`].
+    prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>>,
 }
 
 impl Namespaces {
     /// Builds the namespaces of every library in `graph`: imports merged in
     /// directive source order, combinators applied per import, prefixes
-    /// merged across imports and registered as markers. Sized entirely by
-    /// the graph; nothing grows afterwards.
+    /// merged across imports into per-name tables. Sized entirely by the
+    /// graph; nothing grows afterwards.
     #[must_use]
     pub fn build(graph: &LibraryGraph) -> Self {
         let libs = (0..graph.len())
@@ -142,10 +134,12 @@ impl Namespaces {
         Self { libs }
     }
 
-    /// Bare-name lookup in `lib`'s scope chain: local declarations first
-    /// (they shadow imports — `front_end` `CompilationUnitScope` consults the
-    /// library namespace before the import namespace, spec §1), then the
-    /// merged import namespace.
+    /// Bare-name lookup in `lib`'s scope chain (`LibraryFragmentScope.lookup`,
+    /// scope.dart:418-432): local declarations first (they shadow imports),
+    /// then a registered prefix — the `_prefixElements` branch of
+    /// `_lookupCombined` returns the prefix unconditionally, before the
+    /// import namespace (scope.dart:455-471) — then the merged import
+    /// namespace.
     ///
     /// # Panics
     ///
@@ -156,16 +150,21 @@ impl Namespaces {
         if let Some(file) = graph.local(lib, name) {
             return Lookup::Found(NamespaceEntry::Decl(file));
         }
-        to_lookup(self.libs[lib.index() as usize].names.get(&name))
+        let lib_ns = &self.libs[lib.index() as usize];
+        if lib_ns.prefixes.contains_key(&name) {
+            return Lookup::Found(NamespaceEntry::Prefix);
+        }
+        to_lookup(lib_ns.names.get(&name))
     }
 
-    /// `prefix.name` lookup in `lib`: resolves `prefix` through the import
-    /// namespace's marker entry, then the prefix's merged table.
+    /// `prefix.name` lookup in `lib`: the prefix's merged table, whenever the
+    /// prefix is registered — independent of any same-named imported
+    /// declaration (`p.x` goes through `PrefixScope`, scope.dart:352-357,
+    /// regardless of bare-name collisions).
     ///
-    /// Returns [`Lookup::NotFound`] when `prefix` is not unambiguously a
-    /// prefix of `lib` — unknown, or a name shared with an imported top-level
-    /// declaration (the ambiguity is visible through
-    /// [`Self::lookup`]; `p.x` through a non-prefix is not a resolution hit).
+    /// Returns [`Lookup::NotFound`] when `prefix` is not a registered prefix
+    /// of `lib`, or registers no `name` (a `p.x` through a non-prefix is not
+    /// a resolution hit; the misuse is the semantic layer's diagnosis).
     ///
     /// # Panics
     ///
@@ -173,12 +172,12 @@ impl Namespaces {
     #[must_use]
     pub fn lookup_prefixed(&self, lib: LibraryId, prefix: StringId, name: StringId) -> Lookup<'_> {
         let lib_ns = &self.libs[lib.index() as usize];
-        match lib_ns.names.get(&prefix) {
-            Some(NameEntry::Single(NamespaceEntry::Prefix(id))) => {
-                to_lookup(lib_ns.prefixes[id.index() as usize].get(&name))
-            }
-            _ => Lookup::NotFound,
-        }
+        to_lookup(
+            lib_ns
+                .prefixes
+                .get(&prefix)
+                .and_then(|table| table.get(&name)),
+        )
     }
 }
 
@@ -186,32 +185,23 @@ impl Namespaces {
 /// merge in directive source order; combinator filtering is build-time).
 fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
     let mut names: FxHashMap<StringId, NameEntry> = FxHashMap::default();
-    let mut prefixes: Vec<FxHashMap<StringId, NameEntry>> = Vec::new();
-    let mut prefix_ids: FxHashMap<StringId, PrefixId> = FxHashMap::default();
+    let mut prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>> = FxHashMap::default();
     for edge in graph.import_edges(lib) {
         let Some(target) = edge.target else {
             continue; // external/missing/non-library: contributes nothing
         };
-        let mut table: Option<usize> = None;
-        if let Some(prefix) = edge.prefix {
-            let id = if let Some(&id) = prefix_ids.get(&prefix) {
-                id
-            } else {
-                let id = PrefixId(u32::try_from(prefixes.len()).expect("prefix count fits u32"));
-                prefixes.push(FxHashMap::default());
-                prefix_ids.insert(prefix, id);
-                id
-            };
-            merge(&mut names, prefix, NamespaceEntry::Prefix(id));
-            table = Some(id.index() as usize);
-        }
+        // `Option<&mut _>` is not `Copy`: reborrow through `as_deref_mut` so
+        // the table survives every iteration of the name loop.
+        let mut table: Option<&mut FxHashMap<StringId, NameEntry>> = edge
+            .prefix
+            .map(|prefix| prefixes.entry(prefix).or_default());
         for (name, entry) in graph.export_scope(target) {
             if !edge.combinators.allows(name) {
                 continue;
             }
             let entry = NamespaceEntry::Decl(entry.file);
-            match table {
-                Some(index) => merge(&mut prefixes[index], name, entry),
+            match table.as_deref_mut() {
+                Some(table) => merge(table, name, entry),
                 None => merge(&mut names, name, entry),
             }
         }
@@ -447,10 +437,10 @@ mod tests {
         );
     }
 
-    /// `import as p` registers the prefix as a marker in the import
-    /// namespace, and same-prefix imports merge into one table (CFE
-    /// `PrefixBuilder` reuse, source_compilation_unit.dart:1507-1540;
-    /// `PrefixedNamespace` composition, scope.dart:287-328).
+    /// `import as p` registers the prefix in its own name-keyed table, and
+    /// same-prefix imports merge into one table (the oracle's
+    /// `_prefixElements`, scope.dart:348-358; `p.x` through `PrefixScope`,
+    /// scope.dart:352-357).
     #[test]
     fn prefixes_merge_across_imports() {
         let mut rig = Rig::new();
@@ -467,8 +457,8 @@ mod tests {
 
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("p")),
-            Lookup::Found(NamespaceEntry::Prefix(PrefixId(0))),
-            "one marker for both same-prefix imports"
+            Lookup::Found(NamespaceEntry::Prefix),
+            "one prefix entry for both same-prefix imports"
         );
         assert_eq!(
             namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("alpha")),
@@ -484,33 +474,44 @@ mod tests {
         );
     }
 
-    /// A prefix name shared with an imported top-level declaration is
-    /// ambiguous (the prefix is injected into the import namespace as a name,
-    /// import.dart:69-79; merge rules per spec §1), and `p.x` through it is
-    /// no resolution hit.
+    /// A prefix never merges into the combined import namespace: the oracle
+    /// keeps prefixes in the separate `_prefixElements` map, which
+    /// `_lookupCombined` consults first and hits unconditionally
+    /// (scope.dart:455-471). So bare `p` resolves to the prefix even when an
+    /// import also brings a top-level `p`, and `p.x` resolves through the
+    /// prefix's table (`PrefixScope`, scope.dart:352-357) regardless.
     #[test]
-    fn prefix_marker_conflicting_with_imported_name_is_ambiguous() {
+    fn prefix_wins_over_imported_top_level_name() {
         let mut rig = Rig::new();
         let l1 = rig.builder.intern("package:l1/l1.dart");
-        let t2 = rig.builder.intern("package:t2/t2.dart");
+        let l2 = rig.builder.intern("package:l2/l2.dart");
         let consumer = rig.builder.intern("package:c/c.dart");
         let f1 = rig.file("l1.dart");
+        let f2 = rig.file("l2.dart");
         rig.declare(l1, "p", f1);
+        rig.declare(l2, "x", f2);
         rig.import(consumer, Some(l1), None, Combinators::unfiltered());
-        rig.import(consumer, Some(t2), Some("p"), Combinators::unfiltered());
+        rig.import(consumer, Some(l2), Some("p"), Combinators::unfiltered());
         let (strings, graph, namespaces) = rig.settle();
 
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("p")),
-            Lookup::Ambiguous(&[
-                NamespaceEntry::Decl(f1),
-                NamespaceEntry::Prefix(PrefixId(0))
-            ]),
+            Lookup::Found(NamespaceEntry::Prefix),
+            "the prefix wins unconditionally, no Decl/Prefix ambiguity"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("x")),
+            Lookup::NotFound,
+            "l2 is imported only `as p`: `x` is not in the bare namespace"
         );
         assert_eq!(
             namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),
-            Lookup::NotFound,
-            "`p` is not unambiguously a prefix"
+            Lookup::Found(NamespaceEntry::Decl(f2)),
+            "`p.x` resolves through the prefix table"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("y")),
+            Lookup::NotFound
         );
     }
 
@@ -532,7 +533,7 @@ mod tests {
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("p")),
             Lookup::NotFound,
-            "no prefix marker without a target"
+            "no prefix entry without a target"
         );
         assert_eq!(
             namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),

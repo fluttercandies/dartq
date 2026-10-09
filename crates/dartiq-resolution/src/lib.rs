@@ -34,8 +34,8 @@ pub use library_graph::{
     CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
     LibraryGraphBuilder, LibraryId,
 };
-pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces, PrefixId};
+pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces};
 pub use uri::{
-    PackageTable, RawUri, ResolvedTarget, ResolvedUri, UnresolvedKind, UriResolution, UriResolver,
-    parse_directive_uri,
+    DirectiveKind, PackageTable, RawUri, ResolvedTarget, ResolvedUri, UnresolvedKind,
+    UriResolution, UriResolver, parse_directive_uri,
 };

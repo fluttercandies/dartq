@@ -57,7 +57,10 @@ pub enum ResolutionCode {
     /// (diagnostic.g.dart:4667).
     DuplicatePart,
     /// An ambiguous name was used at a use point (resolver-side, not a
-    /// namespace-build-time diagnostic) (diagnostic.g.dart:396).
+    /// namespace-build-time diagnostic) (analyzer-8.4.1
+    /// `error/codes.g.dart:136-138` — `{0}` name, `{1}` full library list;
+    /// Dart 3.15 main later kind-parameterized it to
+    /// `diagnostic.g.dart:397`'s 3-slot form).
     AmbiguousImport,
     /// Export-side twin of [`ResolutionCode::AmbiguousImport`]
     /// (diagnostic.g.dart:317).
@@ -155,7 +158,7 @@ impl ResolutionCode {
             Self::AmbiguousImport => ResolutionCodeInfo {
                 name: "ambiguous_import",
                 machine: "AMBIGUOUS_IMPORT",
-                message: "The {0} '{1}' is defined in the libraries {2}.",
+                message: "The name '{0}' is defined in the libraries {1}.",
             },
             Self::AmbiguousExport => ResolutionCodeInfo {
                 name: "ambiguous_export",
