@@ -5,5 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+blake3 = { workspace = true }
+dartq-index = { path = "../dartq-index" }
+dartq-source = { path = "../dartq-source" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

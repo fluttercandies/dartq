@@ -21,6 +21,10 @@
 //! * **CSR exports** ([`csr`]): the import graph and the reference graph as
 //!   flat `&[u32]` offsets/edges arrays (the GPU posture directive — future
 //!   compute backends read views, never restructure the store).
+//! * **Test graph** ([`TestGraph`]): the inverted `test_of` edges from test
+//!   files to the libraries they test (PRD §15.4) — the AffectedTests join
+//!   of the impact query, in the same CSR posture over the caller's library
+//!   id space.
 //!
 //! # Identity and the migration seams
 //!
@@ -57,10 +61,12 @@ use dartq_source::{FileId, StringId};
 mod capture;
 mod csr;
 mod library;
+mod test_graph;
 
 pub use capture::{DeclKind, DeclRow, FileCapture, FileIndex, SuperEdge, capture};
 pub use csr::{ImportCsr, ReferenceCsr};
 pub use library::{LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, TargetRef};
+pub use test_graph::TestGraph;
 
 /// One declaration hit of a workspace-wide by-name query.
 #[derive(Clone, Copy, Debug)]

@@ -71,6 +71,8 @@ mod exit {
     pub const USAGE: u8 = 64;
 }
 
+mod impact;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ExitCode::from(run(&args))
@@ -89,6 +91,9 @@ fn run(args: &[String]) -> u8 {
         }) => match query_args.face {
             QueryFace::Symbol(symbol_args) => query_symbol(&symbol_args),
         },
+        Ok(Cli {
+            command: Some(Command::Impact(impact_args)),
+        }) => impact::run_entry(&impact_args),
         Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
@@ -127,6 +132,8 @@ enum Command {
     /// Serve the LSP daemon over stdin/stdout (one client; overlay + full
     /// diagnostics, PRD §16.3).
     Daemon(DaemonArgs),
+    /// Assess what a change to one file would affect (PRD §15.4).
+    Impact(impact::ImpactArgs),
     /// Query the analyzed workspace's symbol index (PRD §20.3).
     Query(QueryArgs),
     /// Print the version.

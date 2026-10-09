@@ -14,9 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+dartq-ai = { path = "../dartq-ai" }
 dartq-daemon = { path = "../dartq-daemon" }
 dartq-diagnostics = { path = "../dartq-diagnostics" }
 dartq-engine = { path = "../dartq-engine" }
+dartq-index = { path = "../dartq-index" }
 dartq-language = { path = "../dartq-language" }
 dartq-package = { path = "../dartq-package" }
 dartq-parser = { path = "../dartq-parser" }
