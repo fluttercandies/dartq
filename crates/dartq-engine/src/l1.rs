@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
+use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, Severity};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
@@ -403,14 +403,17 @@ pub(crate) fn scan_unit(
     let mut warnings = Vec::new();
     if let Some(over) = scanned.language_version_override {
         if over.is_above_latest() {
-            let code = CodeRegistry::builtin()
-                .get("invalid_language_version_override")
-                .expect("official registry pins invalid_language_version_override");
+            // The generated table's const row (audit #269 F2): a per-emit
+            // `CodeRegistry::builtin()` build would reconstruct a ~270-entry
+            // map for one known code. The GREATER-variant message text stays
+            // at this emit site (the generated row keeps the AT_SIGN
+            // template — dartq-diagnostics code.rs preamble).
+            let code = dartq_diagnostics::INVALID_LANGUAGE_VERSION_OVERRIDE;
             let span = scanned
                 .language_version_override_span
                 .expect("scanner records the comment span with every override");
             warnings.push(Diagnostic::new(
-                Severity::Warning,
+                severity_of(code.dtype),
                 code,
                 format!(
                     "The language version override can't specify a version greater than \
@@ -488,10 +491,46 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
     }
 }
 
-/// One URI-layer diagnostic. Severity: the spec-pinned levels where the
-/// frozen table carries one, and `COMPILE_TIME_ERROR` for the remaining
-/// URI-layer codes (they are all `CompileTimeErrorCode` rows in the
-/// analyzer registry — an emit-layer decision on the unpinned rows).
+/// Severity from a registry-true family (the `dtype_matches_oracle_severity`
+/// invariant: `COMPILE_TIME_ERROR` rows are oracle-ERROR, `STATIC_WARNING`
+/// rows oracle-WARNING).
+fn severity_of(dtype: DiagnosticType) -> Severity {
+    match dtype {
+        DiagnosticType::StaticWarning => Severity::Warning,
+        _ => Severity::Error,
+    }
+}
+
+/// Whether `template` carries any `{N}` placeholder with `N` above zero —
+/// the single-argument `replace("{0}", …)` emit would leave such a template
+/// partially literal (audit #269 F5).
+fn has_placeholder_above_zero(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let digits = bytes[i + 1..]
+                .iter()
+                .take_while(|&&b| b.is_ascii_digit())
+                .count();
+            if digits > 0 && bytes.get(i + 1 + digits) == Some(&b'}') {
+                if digits > 1 || bytes[i + 1] != b'0' {
+                    return true;
+                }
+                i += digits + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// One URI-layer diagnostic, built entirely from the resolution registry's
+/// descriptor: the family decides TYPE and severity (severity derives from
+/// the dtype — no separate severity map), the published flag rides into the
+/// code info (JSON `documentation`), and the verbatim correction is carried
+/// through (`uri_does_not_exist` family rows have one).
 pub(crate) fn uri_diagnostic(
     code: dartq_resolution::ResolutionCode,
     uri: &str,
@@ -499,22 +538,18 @@ pub(crate) fn uri_diagnostic(
     file: FileId,
 ) -> Diagnostic {
     let info = code.info();
-    let severity = match code.pinned_severity() {
-        Some("STATIC_WARNING") => Severity::Warning,
-        _ => Severity::Error,
-    };
+    debug_assert!(
+        !has_placeholder_above_zero(info.message),
+        "{}: template carries placeholders beyond {{0}}",
+        info.name
+    );
     Diagnostic::new(
-        severity,
-        CodeInfo::new(
-            info.name,
-            info.machine,
-            DiagnosticType::CompileTimeError,
-            false,
-        ),
+        severity_of(info.dtype),
+        CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
         info.message.replace("{0}", uri),
         file,
         range,
-        None,
+        info.correction.map(str::to_owned),
     )
 }
 

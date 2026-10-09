@@ -6,10 +6,13 @@
 
 mod common;
 
+use std::path::Path;
+
 use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0};
-use dartq_diagnostics::Severity;
-use dartq_engine::{EngineError, RevalidateGate};
+use dartq_diagnostics::{AnalysisOutput, FileLayoutProvider, Severity, write_json};
+use dartq_engine::{CancellationToken, EngineError, RevalidateGate};
 use dartq_language::DEFAULT_LANGUAGE_VERSION;
+use dartq_source::FileId;
 
 #[test]
 fn two_file_fixture_runs_the_full_pipeline() {
@@ -102,6 +105,121 @@ fn unresolved_import_emits_uri_diagnostic() {
         "one uri_does_not_exist, got {diagnostics:?}"
     );
     assert_eq!(diagnostics[0].code.name, "uri_does_not_exist");
+}
+
+/// Read-side file layout over the engine (the test twin of the CLI's
+/// `FileLayoutProvider` backing).
+struct Layout<'a>(&'a dartq_engine::Engine);
+
+impl FileLayoutProvider for Layout<'_> {
+    fn file_path(&self, file: FileId) -> &Path {
+        self.0
+            .file_table()
+            .path(file)
+            .expect("diagnosed file is resident")
+    }
+
+    fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
+        let source = self.0.content(file).expect("diagnosed file is resident");
+        let index = self.0.line_index(file).expect("diagnosed file is resident");
+        index.line_col_utf16(
+            std::str::from_utf8(source).unwrap_or_default(),
+            utf16_offset,
+        )
+    }
+}
+
+/// The registry-true JSON face of the URI layer's flagship code (audit #269
+/// F1): `uri_does_not_exist` renders the oracle's full key set — including
+/// `correctionMessage` (registry row diagnostic.g.dart:18171-18173) and
+/// `documentation` (`hasPublishedDocs: true`, :18174) — with the
+/// registry-true TYPE and the verbatim problem/correction texts. The key
+/// set, order, and null-skipping mirror the oracle emitter (dartdev
+/// `analyze.dart` `emitJsonFormat`: `correctionMessage`/`documentation` are
+/// null-aware entries; no `contextMessages` here). Keys compare in sorted
+/// order (`serde_json`'s map), the byte order is the writer's struct order.
+#[test]
+fn uri_does_not_exist_json_matches_oracle_key_set() {
+    let fixture = Fixture::new(&[(
+        "lib/main.dart",
+        "import 'missing.dart';\n\nvoid main() {}\n",
+    )]);
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("analyze");
+    assert_eq!(diagnostics.len(), 1, "one unresolved import");
+
+    let mut json = Vec::new();
+    write_json(
+        &mut json,
+        &AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &Layout(&engine),
+        },
+    )
+    .expect("in-memory write");
+    assert!(
+        json.starts_with(b"{\"version\":1,\"diagnostics\":["),
+        "envelope shape: {}",
+        String::from_utf8_lossy(&json)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&json).expect("valid JSON");
+    let entries = output["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(entries.len(), 1);
+    let d = &entries[0];
+
+    let keys: Vec<&str> = d
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "code",
+            "correctionMessage",
+            "documentation",
+            "location",
+            "problemMessage",
+            "severity",
+            "type"
+        ]
+    );
+    assert_eq!(d["code"], "uri_does_not_exist");
+    assert_eq!(d["severity"], "ERROR");
+    assert_eq!(d["type"], "COMPILE_TIME_ERROR");
+    assert_eq!(
+        d["problemMessage"],
+        "Target of URI doesn't exist: 'missing.dart'."
+    );
+    assert_eq!(
+        d["correctionMessage"],
+        "Try creating the file referenced by the URI, or try using a URI for a file \
+         that does exist."
+    );
+    assert_eq!(
+        d["documentation"],
+        "https://dart.dev/diagnostics/uri_does_not_exist"
+    );
+    // Location: the `'missing.dart'` lexeme — offset 7..21 on line 1, UTF-16
+    // with 1-based lines/columns (the oracle's rendering).
+    assert!(
+        d["location"]["file"]
+            .as_str()
+            .expect("file path")
+            .ends_with("lib/main.dart")
+    );
+    assert_eq!(
+        d["location"]["range"]["start"],
+        serde_json::json!({ "offset": 7, "line": 1, "column": 8 })
+    );
+    assert_eq!(
+        d["location"]["range"]["end"],
+        serde_json::json!({ "offset": 21, "line": 1, "column": 22 })
+    );
 }
 
 #[test]

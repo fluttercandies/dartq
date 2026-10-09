@@ -263,6 +263,7 @@ dependencies = [
  "dartq-source",
  "rayon",
  "rustc-hash",
+ "serde_json",
  "serde_yaml",
  "thiserror",
 ]
@@ -362,6 +363,7 @@ dependencies = [
 name = "dartq-resolution"
 version = "0.1.0"
 dependencies = [
+ "dartq-diagnostics",
  "dartq-pub",
  "dartq-sdk",
  "dartq-source",
