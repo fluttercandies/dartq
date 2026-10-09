@@ -6,7 +6,7 @@
 //! enforced here, matching pub's parse-time errors (unknown `resolution`
 //! values, the `>=3.5` gate on `workspace`/`resolution`, `dart` as an
 //! environment key, `packageNameRegExp` + reserved-word checks on `name`,
-//! and `packageNameRegExp` on every dependency name). The
+//! and `packageNameRegExp` + self-rejection on every dependency name). The
 //! discovery-critical `workspace`/`resolution` keys and the whole
 //! `dependency_overrides` section are honored via
 //! [`Pubspec::parse_with_overrides`] — the overrides file wins where its key
@@ -222,16 +222,19 @@ impl Pubspec {
         };
 
         let dep = |key: &str| -> Result<BTreeMap<String, DependencySpec>, PubError> {
-            parse_dependency_map(root.get(key), key, &invalid)
+            parse_dependency_map(root.get(key), key, &name, &invalid)
         };
         let dependencies = dep("dependencies")?;
         let dev_dependencies = dep("dev_dependencies")?;
         // The overrides file's `dependency_overrides` replaces the pubspec's
         // entirely when present (pubspec.dart:169-193), and the root's
         // effective map is what `validateWorkspace` and the graph see
-        // (package.dart:531-555).
+        // (package.dart:531-555). Both origins are checked against the
+        // pubspec's own name (pubspec.dart:179, 190).
         let dependency_overrides = match overrides.and_then(|map| map.get("dependency_overrides")) {
-            Some(node) => parse_dependency_map(Some(node), "dependency_overrides", &invalid)?,
+            Some(node) => {
+                parse_dependency_map(Some(node), "dependency_overrides", &name, &invalid)?
+            }
             None => dep("dependency_overrides")?,
         };
 
@@ -460,6 +463,7 @@ const RESERVED_WORDS: [&str; 57] = [
 fn parse_dependency_map(
     value: Option<&serde_yaml::Value>,
     section: &str,
+    package_name: &str,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<BTreeMap<String, DependencySpec>, PubError> {
     let Some(value) = value else {
@@ -479,6 +483,19 @@ fn parse_dependency_map(
         // that check applies to the `name:` field only (utils.dart:795-808).
         if !is_valid_package_name(name) {
             return Err(invalid("Not a valid package name.".into()));
+        }
+        // pubspec.dart:599-602: a package may not list itself as a
+        // dependency — checked per entry against the containing pubspec's
+        // own `name` (`_packageName`, pubspec.dart:45). pub reads
+        // `fields['name']` lazily but before any spec parsing;
+        // `parse_mapping` likewise reads `name` before the dependency
+        // sections, so the ordering matches. pub's `packageName != null`
+        // guard covers nameless pubspecs, which our parser rejects up
+        // front — the check always runs here.
+        if name == package_name {
+            return Err(invalid(
+                "A package may not list itself as a dependency.".into(),
+            ));
         }
         let parsed = parse_dependency_spec(spec, invalid)?;
         deps.insert(name.to_owned(), parsed);
@@ -947,6 +964,53 @@ dev_dependencies:
             err.to_string().contains("Not a valid package name."),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_self_dependency_in_every_section() {
+        // pubspec.dart:599-602 via `_packageName` (pubspec.dart:45): the
+        // check passes the pubspec's own name into all three sections
+        // (pubspec.dart:142, 155, 179, 190), including `dependency_overrides`
+        // served from pubspec_overrides.yaml.
+        let message = "A package may not list itself as a dependency.";
+        for section in ["dependencies", "dev_dependencies", "dependency_overrides"] {
+            let yaml = format!("name: a\n{section}:\n  a: ^1.0.0\n");
+            let err = Pubspec::parse(&yaml).expect_err(section);
+            assert!(err.to_string().contains(message), "unexpected error: {err}");
+        }
+        let err = Pubspec::parse_with_overrides(
+            "name: m\n",
+            Some("dependency_overrides:\n  m: ^1.0.0\n"),
+        )
+        .expect_err("overrides self");
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
+
+        // The self check precedes spec parsing (pubspec.dart:599 precedes
+        // the source dispatch), so an unparsable source form on the self
+        // entry reports the self-dependency message.
+        let err = Pubspec::parse("name: a\ndependencies:\n  a:\n    cvs: whatever\n")
+            .expect_err("self before spec");
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn allows_non_self_dependency_names() {
+        // pubspec.dart:600 compares exact string equality, so `a.b` and
+        // `ab` do not conflict with `a`.
+        let yaml = "\
+name: a
+dependencies:
+  a.b: ^1.0.0
+  ab: ^2.0.0
+dev_dependencies:
+  b: ^1.0.0
+dependency_overrides:
+  c: ^1.0.0
+";
+        let spec = Pubspec::parse(yaml).expect("ok");
+        assert_eq!(spec.dependencies.len(), 2);
+        assert_eq!(spec.dev_dependencies.len(), 1);
+        assert_eq!(spec.dependency_overrides.len(), 1);
     }
 
     #[test]
