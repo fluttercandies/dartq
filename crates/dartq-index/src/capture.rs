@@ -17,10 +17,15 @@
 //!   their row index; members commit with the stack top as their container
 //!   anchor. Dart has no nested type declarations, so the chain is at most
 //!   one hop. Unnamed extensions keep capturing: their members surface with
-//!   no container anchor.
+//!   no container anchor and the [`DeclRow::unnamed_extension_member`] bit
+//!   set, which keeps them out of the library faces.
 //! * Superclass name edges (`extends S`, a named mixin application's head
 //!   type; `p.S` keeps `S`) are recorded as [`SuperEdge`]s against the
-//!   open container and resolved at library-build time.
+//!   open container and resolved at library-build time. Type events
+//!   buffer the clause's candidate names and the completion event commits
+//!   the clause's first one — under comma recovery (`extends B, D`) the
+//!   official keeps the first type — and a container commits at most one
+//!   edge; an extension type's recovery `extends` commits none.
 //! * Constructors, factories, and named formals are **not** declaration
 //!   rows: the kind set has no constructor kind and the formals table is
 //!   #119's (`undefined_named_parameter` consumes it there). Operators
@@ -36,11 +41,12 @@
 //! in place, all sound (parser-decided, no lookahead heuristics):
 //!
 //! * `handle_send` marks an invocation — unless it ends on the very token
-//!   `handle_no_arguments` fired for (official `parseSend` covers both the
-//!   `f(...)` and the bare-identifier shape; only the former invokes, and
-//!   the bare shape's send ends on exactly the no-arguments token, so the
-//!   unpaired firings — enum constants, bare annotations, const patterns —
-//!   never poison a later send);
+//!   the bare-send marker armed for (`handle_no_arguments` under dartq's
+//!   emission, `handle_send_without_arguments` under the official one;
+//!   official `parseSend` covers both the `f(...)` and the bare-identifier
+//!   shape; only the former invokes, and the bare shape's send ends on
+//!   exactly the marker's token, so the unpaired firings — enum constants,
+//!   bare annotations, const patterns — never poison a later send);
 //! * `end_constructor_reference` marks `new C(...)`/`const C(...)`/
 //!   implicit-creation heads (which do not travel through `handle_send`);
 //! * `handle_assignment_expression` marks the identifier nearest before the
@@ -114,6 +120,11 @@ pub struct DeclRow {
     pub name: StringId,
     /// The declaration family.
     pub kind: DeclKind,
+    /// The row is a member of an unnamed extension: it carries no container
+    /// anchor (the extension has no row to point at) and — unlike other
+    /// `container == NONE` rows — is not a library face. Fits in the `kind`
+    /// field's padding: the row stays its 20-byte size.
+    pub unnamed_extension_member: bool,
     /// The name token's span (UTF-16 — the engine's external convention,
     /// carried verbatim from `TokenSpan.range`).
     pub range: dartq_source::SourceRange,
@@ -125,6 +136,17 @@ pub struct DeclRow {
 impl DeclRow {
     /// The `container` value of a row with no enclosing container.
     pub const NONE: u32 = u32::MAX;
+
+    /// Whether the row is a library-scope name: a top-level row that is
+    /// neither a type parameter nor an unnamed-extension member. Members
+    /// and type parameters are not scope names — the filter the graph
+    /// declarer and the bare-name resolver's local hop share.
+    #[must_use]
+    pub fn is_library_face(&self) -> bool {
+        self.container == DeclRow::NONE
+            && self.kind != DeclKind::TypeParam
+            && !self.unnamed_extension_member
+    }
 }
 
 /// A direct superclass **name** edge from the parse (`extends S`, a named
@@ -165,15 +187,14 @@ impl FileIndex {
     }
 
     /// Whether the file declares `name` at library scope: a top-level row
-    /// that is not a type parameter. Members and type parameters are not
+    /// that is neither a type parameter nor an unnamed-extension member
+    /// ([`DeclRow::is_library_face`]). Members and type parameters are not
     /// library faces — the filter the graph declarer and the bare-name
     /// resolver's local hop share.
     #[must_use]
     pub fn has_library_face(&self, name: StringId) -> bool {
-        self.by_name(name).is_some_and(|rows| {
-            rows.iter()
-                .any(|row| row.container == DeclRow::NONE && row.kind != DeclKind::TypeParam)
-        })
+        self.by_name(name)
+            .is_some_and(|rows| rows.iter().any(DeclRow::is_library_face))
     }
 
     /// The row at `index` (container anchors point here).
@@ -298,13 +319,16 @@ struct Builder<'src, 'tab> {
     file: FileId,
     decls: Vec<DeclRow>,
     /// Open containers: their decl row ([`DeclRow::NONE`] for unnamed
-    /// extensions).
-    containers: Vec<u32>,
+    /// extensions), their kind, and whether a supertype edge already
+    /// committed for them.
+    containers: Vec<Container>,
     supers: Vec<SuperEdge>,
-    /// The supertype name the type events last stored: the name travels
-    /// with the events that carry it, and the clause completion events
-    /// commit it (see [`Builder::commit_superclass`]).
-    super_pending: Option<StringId>,
+    /// Depth-0 type-name candidates since the last commit/reset: each
+    /// supertype parse appends its name, and the clause completion events
+    /// commit one of them (see [`Builder::commit_superclass`]). The buffer
+    /// holds the whole clause, so a multiple-extends recovery can commit
+    /// the clause's first type the way the official listener pops to.
+    super_candidates: Vec<StringId>,
     /// Token id of the last prefixed type-reference identifier. A qualified
     /// type's trailing `handle_type` carries that same token (the parser
     /// passes the head, not the tail), and the stored continuation name
@@ -318,10 +342,12 @@ struct Builder<'src, 'tab> {
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTop>,
     sites: RawSites,
-    /// The token `handle_no_arguments` last fired for. A send is the bare
-    /// identifier shape only when it ends on that same token; unpaired
-    /// firings (enum constants, bare annotations, const patterns) are never
-    /// followed by a matching send, so they cannot poison later ones.
+    /// The token the bare-send marker last armed for (`handle_no_arguments`
+    /// under dartq's emission, `handle_send_without_arguments` under the
+    /// official one). A send is the bare identifier shape only when it ends
+    /// on that same token; unpaired firings (enum constants, bare
+    /// annotations, const patterns) are never followed by a matching send,
+    /// so they cannot poison later ones.
     no_args_at: Option<u32>,
     /// Open type-argument lists: `handle_type` events inside them name type
     /// arguments (`extends B<int>` must not store `int`), never the
@@ -330,6 +356,16 @@ struct Builder<'src, 'tab> {
     /// Furthest end so far of a bracket/cascade access chain; assignment
     /// candidates ending before it are inside the chain, not write targets.
     access_chain_end: u32,
+}
+
+/// An open container: its decl row ([`DeclRow::NONE`] for unnamed
+/// extensions), its family, and whether a supertype edge already committed
+/// for it (duplicate-extends recovery fires the clause event again — the
+/// container commits one edge).
+struct Container {
+    row: u32,
+    kind: DeclKind,
+    super_committed: bool,
 }
 
 struct PendingMember {
@@ -356,7 +392,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             decls: Vec::new(),
             containers: Vec::new(),
             supers: Vec::new(),
-            super_pending: None,
+            super_candidates: Vec::new(),
             prefixed_type: None,
             super_head_armed: false,
             pending_member: None,
@@ -391,15 +427,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// The open container's decl row, `NONE` inside an unnamed extension.
     fn container(&self) -> u32 {
-        self.containers.last().copied().unwrap_or(DeclRow::NONE)
+        self.containers.last().map_or(DeclRow::NONE, |c| c.row)
     }
 
-    /// Commits a declaration row anchored to the open container.
+    /// Commits a declaration row anchored to the open container. A row
+    /// inside an unnamed extension (a container whose row is `NONE` while
+    /// the stack is non-empty) carries the unnamed-extension-member bit:
+    /// the crate's contract keeps members out of the library faces, and
+    /// without the anchor there is nothing else distinguishing it from a
+    /// top-level row.
     fn commit(&mut self, name: StringId, kind: DeclKind, range: dartq_source::SourceRange) {
         let container = self.container();
+        let unnamed_extension_member = container == DeclRow::NONE && !self.containers.is_empty();
         self.decls.push(DeclRow {
             name,
             kind,
+            unnamed_extension_member,
             range,
             container,
         });
@@ -415,24 +458,34 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.decls.push(DeclRow {
                 name,
                 kind,
+                unnamed_extension_member: false,
                 range,
                 container: DeclRow::NONE,
             });
             crate::narrow(self.decls.len() - 1)
         });
-        self.containers.push(row);
-        self.super_pending = None;
+        self.containers.push(Container {
+            row,
+            kind,
+            super_committed: false,
+        });
+        self.super_candidates.clear();
         self.super_head_armed = false;
     }
 
     fn close_container(&mut self) {
-        self.super_pending = None;
+        self.super_candidates.clear();
         self.super_head_armed = false;
         self.containers.pop();
     }
 
-    /// Consumes the pending supertype name into an edge for the open
-    /// container.
+    /// Consumes the supertype candidates into one edge for the open
+    /// container: `from_end` names which candidate survives, counting from
+    /// the buffer's end — `1` (the last) for the shapes the parser commits
+    /// right after a single type parse, and the clause's type count for
+    /// `handle_class_extends`, whose comma-recovery parses several types
+    /// before the event arrives (the official listener pops `typeCount - 1`
+    /// and keeps the first).
     ///
     /// The name is stored where the parser hands it over — `handle_type`
     /// for a plain name, the `TypeReferenceContinuation` identifier for a
@@ -444,11 +497,32 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// (`parse_mixin_application_rest` parses the mixin list before its own
     /// completion event, so the list's first event is the head's commit
     /// point).
-    fn commit_superclass(&mut self) {
-        if let (Some(name), container) = (self.super_pending.take(), self.container())
-            && container != DeclRow::NONE
+    ///
+    /// Nothing commits for an extension type (its `extends` is a
+    /// representation-adjacent recovery error, not a supertype), for a
+    /// container that already committed (duplicate-extends recovery must
+    /// not yield a second edge), or for an unnamed container (no row to
+    /// anchor the edge to). The buffer clears either way — the clause is
+    /// over.
+    fn commit_superclass(&mut self, from_end: usize) {
+        let index = self.super_candidates.len().saturating_sub(from_end);
+        let name = self.super_candidates.get(index).copied();
+        self.super_candidates.clear();
+        let Some(container) = self.containers.last_mut() else {
+            return;
+        };
+        if container.kind == DeclKind::ExtensionType
+            || container.super_committed
+            || container.row == DeclRow::NONE
         {
-            self.supers.push(SuperEdge { container, name });
+            return;
+        }
+        if let Some(name) = name {
+            self.supers.push(SuperEdge {
+                container: container.row,
+                name,
+            });
+            container.super_committed = true;
         }
     }
 
@@ -707,25 +781,28 @@ impl ParserListener for Capturer<'_, '_> {
         self.builder.borrow_mut().close_container();
     }
 
-    fn handle_class_extends(&mut self, extends: Option<Token>, _count: usize) {
+    fn handle_class_extends(&mut self, extends: Option<Token>, count: usize) {
         // The event follows the supertype parse (`parse_class_extends_seen`
-        // parses the type first), so whatever the type events stored is the
-        // supertype's name.
+        // parses the clause's comma-separated types first), and `count` is
+        // how many it parsed: under comma recovery (`class C extends B, D`)
+        // the clause's first type sits `count - 1` candidates deep, and the
+        // official keeps the first (`ast_builder.dart` handleClassExtends
+        // pops `typeCount - 1`).
         if extends.is_some() {
-            self.builder.borrow_mut().commit_superclass();
+            self.builder.borrow_mut().commit_superclass(count);
         }
     }
 
     fn begin_type_list(&mut self, _token: Token) {
         // First event of a `,`-separated type list. Only role here: the
         // named mixin application's with list opens right after the head
-        // type — commit the armed head before the mixin names write over
-        // the pending name. Every other type list (class with-clauses,
-        // enum with-clauses, recovery) arrives disarmed.
+        // type — commit the armed head before the mixin names join the
+        // candidates. Every other type list (class with-clauses, enum
+        // with-clauses, recovery) arrives disarmed.
         let mut builder = self.builder.borrow_mut();
         if builder.super_head_armed {
             builder.super_head_armed = false;
-            builder.commit_superclass();
+            builder.commit_superclass(1);
         }
     }
 
@@ -745,8 +822,11 @@ impl ParserListener for Capturer<'_, '_> {
         // Type arguments never name the supertype; a qualified type's
         // trailing event carries the prefix token, not the tail already
         // stored by the continuation identifier.
-        if builder.type_arg_depth == 0 && builder.prefixed_type != Some(name.id) {
-            builder.super_pending = builder.name_of(name);
+        if builder.type_arg_depth == 0
+            && builder.prefixed_type != Some(name.id)
+            && let Some(name) = builder.name_of(name)
+        {
+            builder.super_candidates.push(name);
         }
     }
 
@@ -780,7 +860,11 @@ impl ParserListener for Capturer<'_, '_> {
             // type's trailing `handle_type` so it cannot overwrite the
             // tail.
             match context {
-                C::TypeReferenceContinuation => builder.super_pending = builder.name_of(token),
+                C::TypeReferenceContinuation => {
+                    if let Some(name) = builder.name_of(token) {
+                        builder.super_candidates.push(name);
+                    }
+                }
                 C::PrefixedTypeReference => builder.prefixed_type = Some(token.id),
                 _ => {}
             }
@@ -903,12 +987,24 @@ impl ParserListener for Capturer<'_, '_> {
         self.builder.borrow_mut().no_args_at = Some(token.id);
     }
 
+    fn handle_send_without_arguments(&mut self, _begin: Token, end: Token, _next: Token) {
+        // The official bare-send arm: fired for exactly the bare shape, and
+        // the official parser emits no `handle_no_arguments` for it
+        // (`listener.dart` handleSendWithoutArguments). Arming the same
+        // marker the no-arguments event arms keeps the refinement correct
+        // under either emission contract — a paired `handle_send` ending on
+        // this token classifies bare through the marker, and an unpaired
+        // firing (dartq's const-pattern path, the official parseSend)
+        // leaves the read site untouched.
+        self.builder.borrow_mut().no_args_at = Some(end.id);
+    }
+
     fn handle_send(&mut self, begin: Token, end: Token) {
         let mut builder = self.builder.borrow_mut();
-        // Bare shape: the send ends exactly on the no-arguments token (the
-        // official parseArgumentsOpt peeks it and the send returns it). The
-        // unpaired firings — enum constants, bare annotations, const
-        // patterns — carry other tokens and never match a later end.
+        // Bare shape: the send ends exactly on the bare-send marker's token
+        // (the official parseArgumentsOpt peeks it and the send returns
+        // it). The unpaired firings — enum constants, bare annotations,
+        // const patterns — carry other tokens and never match a later end.
         let bare = builder.no_args_at.take() == Some(end.id);
         if !bare {
             builder.mark_invoked(begin);
@@ -1016,6 +1112,25 @@ mod tests {
         strings.intern(name)
     }
 
+    /// The supertype name of `name`'s first row, if an edge anchors to it.
+    fn super_edge_for(index: &FileIndex, strings: &StringTable, name: &str) -> Option<StringId> {
+        let row = index
+            .decls()
+            .iter()
+            .find(|row| row.name == id(strings, name))
+            .unwrap_or_else(|| panic!("{name} row"));
+        let position = index
+            .decls()
+            .iter()
+            .position(|candidate| candidate == row)
+            .expect("row position");
+        index
+            .supers()
+            .iter()
+            .find(|edge| edge.container as usize == position)
+            .map(|edge| edge.name)
+    }
+
     /// Declaration rows across the full surface: kinds, name spans, and
     /// the container anchor (members point at their container's row;
     /// duplicates keep both rows in one run; setters live under `name=`
@@ -1092,6 +1207,54 @@ mod tests {
             .find(|edge| edge.container as usize == d_position)
             .expect("D extends edge");
         assert_eq!(supertype.name, id(&strings, "B"));
+    }
+
+    /// A member of an unnamed extension carries the
+    /// [`DeclRow::unnamed_extension_member`] bit: with no container anchor
+    /// it would otherwise be indistinguishable from a top-level row and be
+    /// admitted as a library face. A same-named top-level row stays a face,
+    /// and a named extension's member keeps its anchor.
+    #[test]
+    fn unnamed_extension_members_are_not_library_faces() {
+        let strings = StringTable::new();
+        let source = "extension on String { int get ue => 1; } \
+             extension Named on String { int get ne => 1; } \
+             int ue = 0;";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let rows = |name: &str| index.by_name(id(&strings, name)).expect(name);
+        let ue_rows = rows("ue");
+        assert_eq!(
+            ue_rows.len(),
+            2,
+            "the member and the top-level share a name"
+        );
+        let member = ue_rows
+            .iter()
+            .find(|row| row.kind == DeclKind::Getter)
+            .expect("member row");
+        assert!(member.unnamed_extension_member);
+        assert_eq!(member.container, DeclRow::NONE, "no row to anchor to");
+        let top = ue_rows
+            .iter()
+            .find(|row| row.kind == DeclKind::TopLevelVar)
+            .expect("top-level row");
+        assert!(!top.unnamed_extension_member);
+        // The mixed run: the top-level row admits the name, the member does
+        // not flip the verdict either way.
+        assert!(index.has_library_face(id(&strings, "ue")));
+        // A named extension's member keeps its anchor and never was a face.
+        let ne = rows("ne")[0];
+        assert_ne!(ne.container, DeclRow::NONE);
+        assert!(!ne.unnamed_extension_member);
+        assert!(!index.has_library_face(id(&strings, "ne")));
+
+        // Without the same-named top-level, the unnamed member alone must
+        // not satisfy the face probe — the regression the bit exists for.
+        let strings = StringTable::new();
+        let captured = build("extension on String { int get ue => 1; }", &strings);
+        assert!(captured.index.by_name(id(&strings, "ue")).is_some());
+        assert!(!captured.index.has_library_face(id(&strings, "ue")));
     }
 
     /// Reference-site capture with the parser-marked refinements: sends
@@ -1205,10 +1368,89 @@ mod tests {
             Some(id(&strings, "G")),
             "generic: the type argument is not the edge"
         );
-        assert_eq!(edge_for("C4"), Some(id(&strings, "H")), "mixin application head");
+        assert_eq!(
+            edge_for("C4"),
+            Some(id(&strings, "H")),
+            "mixin application head"
+        );
         assert_eq!(edge_for("C5"), None, "no extends clause, no edge");
-        assert_eq!(edge_for("E"), None, "an enum's with-list is not a supertype");
+        assert_eq!(
+            edge_for("E"),
+            None,
+            "an enum's with-list is not a supertype"
+        );
         assert_eq!(index.supers().len(), 4, "no edges beyond the four shapes");
+    }
+
+    /// Comma recovery in an extends clause (the parser reports
+    /// `multiple_extends` and parses every type): the clause's FIRST type
+    /// commits — the official listener pops `typeCount - 1` and keeps the
+    /// first (`ast_builder.dart` handleClassExtends) — across plain,
+    /// qualified, and generic heads.
+    #[test]
+    fn multiple_extends_keeps_the_first_supertype() {
+        let strings = StringTable::new();
+        let source = "class B {} class D {} class R {} class G {} \
+             class C1 extends B, D {} \
+             class C2 extends B, D, R {} \
+             class C3 extends p.B, D {} \
+             class C4 extends G<int>, D {}";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        assert_eq!(
+            super_edge_for(index, &strings, "C1"),
+            Some(id(&strings, "B")),
+            "two types: the first commits"
+        );
+        assert_eq!(
+            super_edge_for(index, &strings, "C2"),
+            Some(id(&strings, "B")),
+            "three types: the first commits"
+        );
+        assert_eq!(
+            super_edge_for(index, &strings, "C3"),
+            Some(id(&strings, "B")),
+            "qualified first type: the continuation tail commits"
+        );
+        assert_eq!(
+            super_edge_for(index, &strings, "C4"),
+            Some(id(&strings, "G")),
+            "generic first type: the head commits, not the argument"
+        );
+        assert_eq!(index.supers().len(), 4, "one edge per clause");
+    }
+
+    /// Duplicate-extends recovery fires the clause completion twice for one
+    /// container; the container commits at most one edge, and the first
+    /// clause's type survives.
+    #[test]
+    fn duplicate_extends_commits_one_edge() {
+        let strings = StringTable::new();
+        let source = "class B {} class D {} class C extends B extends D {}";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        assert_eq!(
+            super_edge_for(index, &strings, "C"),
+            Some(id(&strings, "B")),
+            "the first clause's type wins"
+        );
+        assert_eq!(index.supers().len(), 1, "one container, one edge");
+    }
+
+    /// An extension type's recovery `extends` (the parser reports
+    /// `extension_type_extends`) is not a supertype: the extension type
+    /// commits no edge.
+    #[test]
+    fn extension_type_extends_commits_no_edge() {
+        let strings = StringTable::new();
+        let source = "class Foo {} extension type E(int x) extends Foo {}";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        assert!(
+            index.by_name(id(&strings, "E")).is_some(),
+            "the extension type row is captured"
+        );
+        assert!(index.supers().is_empty(), "no edge for the extension type");
     }
 
     /// Unpaired `handle_no_arguments` firings — enum constants and bare
@@ -1242,7 +1484,72 @@ mod tests {
             RefKind::Invoked,
             "f() after two unpaired firings still invokes"
         );
-        assert_eq!(kind_of("g"), RefKind::Read, "a genuine bare send stays a read");
+        assert_eq!(
+            kind_of("g"),
+            RefKind::Read,
+            "a genuine bare send stays a read"
+        );
+    }
+
+    /// `handle_send_without_arguments` arms the same bare-send marker the
+    /// no-arguments event arms: a send paired with it stays a read, so the
+    /// refinement holds under the official emission contract too (the
+    /// official fires the event for exactly the bare shape and no
+    /// `handle_no_arguments`). The control send — no marker — still
+    /// invokes.
+    #[test]
+    fn send_without_arguments_arms_the_bare_marker() {
+        let strings = StringTable::new();
+        let source = "y x";
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("test.dart"));
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        let span_of = |lexeme: &str| {
+            let i = (0..result.tokens.len())
+                .find(|&i| result.tokens.lexeme(source, i) == lexeme)
+                .unwrap_or_else(|| panic!("token {lexeme}"));
+            let token = result.tokens.get(i).expect("in range");
+            Token {
+                id: u32::try_from(i).expect("token index fits u32"),
+                range: dartq_source::SourceRange {
+                    offset: token.utf16_offset,
+                    length: token.byte_len,
+                },
+            }
+        };
+        let builder = Rc::new(RefCell::new(Builder::new(
+            file,
+            source,
+            &result.tokens,
+            &strings,
+        )));
+        let mut capturer = Capturer {
+            builder: Rc::clone(&builder),
+        };
+        let (y, x) = (span_of("y"), span_of("x"));
+        capturer.handle_identifier(y, IdentifierContext::Expression);
+        capturer.handle_send_without_arguments(y, y, x);
+        capturer.handle_send(y, y);
+        capturer.handle_identifier(x, IdentifierContext::Expression);
+        capturer.handle_send(x, x);
+        drop(capturer);
+        let sites = Rc::into_inner(builder)
+            .expect("the listener released the builder")
+            .into_inner()
+            .sites;
+        assert_eq!(sites.kind(0), RefKind::Read, "the armed send stays a read");
+        assert_eq!(
+            sites.kind(1),
+            RefKind::Invoked,
+            "the unmarked control invokes"
+        );
     }
 
     /// A bailed parse still surfaces what was captured (under-report bias),

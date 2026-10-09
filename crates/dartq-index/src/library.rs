@@ -287,7 +287,7 @@ impl<'a> LibraryBuilder<'a> {
                             qualified: false,
                         }),
                     }
-                },
+                }
                 Family::Continuation => {
                     let hit = armed
                         .take()
@@ -757,7 +757,9 @@ pub(crate) mod tests {
         assert_eq!(fa.len(), 1);
         assert_eq!(fa[0].kind, RefKind::Invoked);
         assert!(
-            surface.references_of(file_m, strings.intern("fa")).is_none(),
+            surface
+                .references_of(file_m, strings.intern("fa"))
+                .is_none(),
             "the member row must not shadow the import"
         );
 
@@ -770,14 +772,71 @@ pub(crate) mod tests {
         // `Q? f;`: a type parameter is not a library face — the use falls
         // through to the namespace, misses, and lands in the names table.
         assert!(
-            surface
-                .references_of(file_m, strings.intern("Q"))
-                .is_none(),
+            surface.references_of(file_m, strings.intern("Q")).is_none(),
             "a type parameter must not satisfy the local hop"
         );
         let q = surface.unresolved(strings.intern("Q")).collect::<Vec<_>>();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].kind, RefKind::Referenced);
+    }
+
+    /// A member of an unnamed extension is not a library face (the
+    /// `unnamed_extension_member` bit): a same-named import wins the bare
+    /// use instead of the file-local hop shadowing it.
+    #[test]
+    fn unnamed_extension_member_loses_to_import() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep = capture_one(strings, &mut files, "d.dart", "void fa() {}\n");
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart';\nextension on String {\n  int get fa => 1;\n}\nvoid main() {\n  fa;\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        let lib_d = builder.intern("package:t/d.dart");
+        let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)] {
+            for row in cap.decls() {
+                if row.is_library_face() {
+                    builder.declare(lib, row.name, file);
+                }
+            }
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_d),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        builder.add_file(&dep);
+        let surface = builder.finish();
+
+        // The bare use falls through the local hop (the member row is not a
+        // face) and resolves through the namespace to d.dart.
+        let fa = surface
+            .references_of(file_d, strings.intern("fa"))
+            .expect("the import wins the bare use");
+        assert_eq!(fa.len(), 1);
+        assert_eq!(fa[0].kind, RefKind::Read);
+        assert!(
+            surface
+                .references_of(file_m, strings.intern("fa"))
+                .is_none(),
+            "the unnamed-extension member must not shadow the import"
+        );
     }
 
     /// A prefix arms only the continuation immediately following it: an
@@ -805,8 +864,7 @@ pub(crate) mod tests {
         let lib_d = builder.intern("package:t/d.dart");
         let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
         let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
-        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)]
-        {
+        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)] {
             for row in cap.decls() {
                 if row.kind == DeclKind::TypeParam || row.container != crate::capture::DeclRow::NONE
                 {
