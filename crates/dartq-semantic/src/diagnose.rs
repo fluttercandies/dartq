@@ -59,18 +59,44 @@
 //! only to single-row expressions (one pushed row) so compound operands
 //! never lend their type to the whole expression.
 //!
-//! # The batch-1 gate (#131 first-batch ruling)
+//! # The frozen-family emit matrix (batch 1 #120, batch 2 #197)
 //!
-//! Batch 1 emits exactly four codes: `undefined_identifier`,
-//! `undefined_class`, `undefined_function`, and `duplicate_definition` (plus
-//! `undefined_function` on the prefixed-invoke path, which is that family's
-//! qualified trigger). Every other frozen `undefined_*` trigger — the member
-//! family (`undefined_getter`/`undefined_method`/`undefined_setter`/
-//! `undefined_operator` and their extension/`super`/enum-constant variants),
-//! `undefined_prefixed_name`, `undefined_identifier_await`,
-//! `undefined_named_parameter` — is recorded into the §8 names table without
-//! emitting: under-reporting is the M1 contract, and a wrong code is worse
-//! than no code. Batch 2 lights these up at the same call sites.
+//! The batch-1 core (bare names, type positions, prefixed invocations,
+//! `duplicate_definition`) plus the batch-2 member family cover the frozen
+//! set's live triggers. Every member emission keys off the access intent and
+//! the receiver domain, mirroring the oracle's single-point dispatch
+//! (`.third/dart-sdk` `lookup_failure_reporter.dart`, domains × read/write ×
+//! read-syntax):
+//!
+//! * instance receivers (`c.m` on a `C c`, `this.m`) report
+//!   `undefined_method` / `undefined_getter` / `undefined_setter`
+//!   (`InstanceLookupDomain`); a write survives when any same-named
+//!   declaration exists (the oracle's assignment-to-* family) or a setter
+//!   spelling (`name=`) defines it;
+//! * the static face (`C.m`, `E.x`, `Ext.g`) reports the same interface
+//!   trio — the type-literal invocation shape shares the `undefined_method`
+//!   registry name and message — plus `undefined_enum_constant` on enum
+//!   reads, and the extension trio on the extension face
+//!   (`StaticLookupDomain`);
+//! * `super.member` reports `undefined_super_member` with the per-shape
+//!   message (`SuperLookupDomain`; one analyzerCode, four texts);
+//! * prefixed reads and writes report `undefined_prefixed_name`
+//!   (`PrefixedLookupDomain`);
+//! * a bare invocation miss inside a class or enum instance member reports
+//!   `undefined_method` naming `this`'s type (`UnqualifiedLookupDomain`);
+//! * a named argument label on a resolved callee reports
+//!   `undefined_named_parameter` (`type_analyzer.dart:5820` — an unresolved
+//!   callee stays silent, its own invocation code reports);
+//! * `await` in a sync body reports `undefined_identifier_await`;
+//! * user-definable operators report `undefined_operator` at the operator
+//!   token (index accesses at the bracket pair) when the receiver's
+//!   declared type — direct (`c + d`, `c[i]`) or a member result
+//!   (`c.j + 1`, `c.j[i] = v`) — genuinely lacks the read/write spelling.
+//!
+//! Under-reported by adjudication (each emits no code): operator intents on
+//! static faces and prefix receivers, index chains through unknown
+//! receivers (`f()[i]`), and `this[i]`-style accesses inside extension and
+//! mixin bodies, whose `on` faces the model cannot see.
 //!
 //! # The names table seam (index-design-spec §8)
 //!
@@ -155,9 +181,11 @@ use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::codes::{ExecKind, SemanticCode};
+use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
-use crate::model::{ArityViolation, ContainerKind, Formals, MemberKind, MicroKind, TopDecl, Ty};
+use crate::model::{
+    ArityViolation, ContainerKind, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+};
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
 /// the M1 walk can reach (the superclass chain ends at an unindexed root).
@@ -290,8 +318,19 @@ enum BareInfo {
     /// Defined, but not a receiver face; `ty` is the declared type when the
     /// model captured one (the static-nullability checks read it).
     Plain { ty: Ty },
-    /// Not defined (the row's intent decides the emitted code).
-    Missing,
+    /// Not defined (the row's intent decides the emitted code). The scope
+    /// context is snapshotted at push time — pass 2 runs after the frames
+    /// tear down:
+    Missing {
+        /// `this`'s type when the miss sits inside a class or enum instance
+        /// member — the `undefined_method` host of a bare invocation miss.
+        this_type: Option<StringId>,
+        /// The miss sits inside some executable body (the `await` trigger).
+        in_exec: bool,
+        /// The enclosing container's face cannot answer `on`-constraint
+        /// members (mixin/extension bodies): a bare miss may be defined.
+        on_opaque: bool,
+    },
 }
 
 /// Per-row access intent, finalized by the send/assignment/operator events.
@@ -303,8 +342,10 @@ enum Intent {
     Write,
     ReadWrite,
     Invoke,
-    /// Operator-shaped access (`a + b`, `a[i]`, `-a`): the operator spelling.
-    Operator(StringId),
+    /// Operator-shaped access (`a + b`, `a[i]`): the operator spelling and
+    /// the report span (the binary operator token, or the bracket pair for
+    /// index accesses — the oracle's `undefined_operator` anchors).
+    Operator(StringId, SourceRange),
 }
 
 /// The write form an assignment applied to an operator row (`a[i] = v`).
@@ -790,19 +831,6 @@ impl<'a> Engine<'a> {
         formals.is_some_and(|f| f.named.iter().any(|formal| formal.name == name))
     }
 
-    /// The named formals of a resolved top-level callee, for the
-    /// named-argument membership test.
-    fn top_level_named_formal(&self, name: StringId, formal: StringId) -> bool {
-        self.top_level_decl(name)
-            .is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), formal))
-    }
-
-    /// The named formals of a resolved member callee, walked from `recv`.
-    fn member_has_named_formal(&self, recv: &Receiver, name: StringId, formal: StringId) -> bool {
-        self.member_formals_full(recv, name)
-            .is_some_and(|f| f.named.iter().any(|entry| entry.name == formal))
-    }
-
     /// The resolved top-level declaration under `name` (`None` = no check).
     fn top_level_decl(&self, name: StringId) -> Option<&TopDecl> {
         match lookup_scoped(
@@ -905,7 +933,25 @@ impl<'a> Engine<'a> {
             ScopedHit::Local(decl) => bare_info_of(name, decl),
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
             ScopedHit::Ambiguous(_) => BareInfo::Plain { ty: Ty::UNKNOWN },
-            ScopedHit::NotFound => BareInfo::Missing,
+            ScopedHit::NotFound => self.missing_info(),
+        }
+    }
+
+    /// The push-time context snapshot of a bare miss (pass 2 runs after the
+    /// frames tear down — see [`BareInfo::Missing`]).
+    fn missing_info(&self) -> BareInfo {
+        let context = self
+            .instance_context()
+            .then(|| self.container_context())
+            .flatten();
+        BareInfo::Missing {
+            this_type: context
+                .filter(|(_, kind)| matches!(kind, ContainerKind::Class | ContainerKind::Enum))
+                .map(|(name, _)| name),
+            in_exec: self.in_executable(),
+            on_opaque: context.is_some_and(|(_, kind)| {
+                matches!(kind, ContainerKind::Mixin | ContainerKind::Extension)
+            }),
         }
     }
 
@@ -1080,7 +1126,7 @@ impl<'a> Engine<'a> {
                 if self.is_reserved(name, &BUILTIN_TYPES) {
                     return;
                 }
-                if !matches!(self.resolve_bare(name), BareInfo::Missing) {
+                if !matches!(self.resolve_bare(name), BareInfo::Missing { .. }) {
                     return;
                 }
                 self.push_row(Row {
@@ -1120,7 +1166,7 @@ impl<'a> Engine<'a> {
     /// Arms the type-prefix slot for a `PrefixedTypeReference` head; a miss
     /// also pushes the head's own report row.
     fn arm_type_prefix(&mut self, name: StringId, range: SourceRange) {
-        let live = !matches!(self.resolve_bare(name), BareInfo::Missing);
+        let live = !matches!(self.resolve_bare(name), BareInfo::Missing { .. });
         self.type_prefix = Some(TypePrefix { prefix: name, live });
         if !live {
             self.push_row(Row {
@@ -1664,7 +1710,7 @@ impl<'a> Engine<'a> {
             },
             // The receiver itself is undefined; its own row reports, so the
             // member access must not.
-            BareInfo::Missing => Receiver::Unknown,
+            BareInfo::Missing { .. } => Receiver::Unknown,
         }
     }
 
@@ -1695,8 +1741,9 @@ impl<'a> Engine<'a> {
     }
 
     /// Marks the assignment target: the closest row wholly before the
-    /// operator. Bare/member rows upgrade their intent; index-operator rows
-    /// record the write form.
+    /// operator, skipping folded value rows (index results, groups). Bare and
+    /// member rows upgrade their intent; index-operator rows record the write
+    /// form (`c[i] = v` writes through `[]=`, never the index argument).
     fn mark_assignment(&mut self, operator: Token) {
         let Some(op_text) = self.text_of(operator) else {
             return;
@@ -1708,6 +1755,9 @@ impl<'a> Engine<'a> {
             if row.range.end() > limit {
                 continue;
             }
+            if matches!(row.shape, RowShape::Value) {
+                continue;
+            }
             match &row.intent {
                 Intent::Read => {
                     row.intent = if compound {
@@ -1716,7 +1766,7 @@ impl<'a> Engine<'a> {
                         Intent::Write
                     };
                 }
-                Intent::Operator(op) if *op == index_op => {
+                Intent::Operator(op, _) if *op == index_op => {
                     row.write_op = Some(if compound {
                         OpWrite::Compound
                     } else {
@@ -1730,17 +1780,19 @@ impl<'a> Engine<'a> {
     }
 
     /// Marks an operator operand: the closest row wholly before `op`, when it
-    /// is a bare identifier or a typed receiver (`a + b`, `this + b`); member
-    /// rows are skipped (the operator applies to the getter result).
-    fn mark_operator(&mut self, op: StringId, limit: u32) {
+    /// is a bare identifier, a typed receiver, or a member access (`a + b`,
+    /// `this + b`, `a.b + c` — the operator applies to the member result).
+    fn mark_operator(&mut self, op: StringId, range: SourceRange) {
         for row in self.rows.iter_mut().rev() {
-            if row.range.end() > limit {
+            if row.range.end() > range.offset {
                 continue;
             }
-            if matches!(row.shape, RowShape::Bare(_) | RowShape::Receiver(_))
-                && row.intent == Intent::Read
+            if matches!(
+                row.shape,
+                RowShape::Bare(_) | RowShape::Receiver(_) | RowShape::Member { .. }
+            ) && row.intent == Intent::Read
             {
-                row.intent = Intent::Operator(op);
+                row.intent = Intent::Operator(op, range);
             }
             return;
         }
@@ -1806,18 +1858,23 @@ impl<'a> Engine<'a> {
             return;
         }
         let limit = operator.range.offset;
-        // The target: the closest row wholly before the operator (the same
-        // scan `mark_assignment` runs).
+        // The target: the closest row wholly before the operator, skipping
+        // folded value rows (the same scan `mark_assignment` runs).
         let Some(target) = self
             .rows
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, row)| row.range.end() <= limit)
+            .find(|(_, row)| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
             .map(|(index, _)| index)
         else {
             return;
         };
+        // `c[i] = e` writes through the `[]=` operator: the target's own
+        // declared type is not the assignment's destination type.
+        if matches!(self.rows[target].intent, Intent::Operator(..)) {
+            return;
+        }
         // The right-hand side: exactly one row strictly after the operator.
         let rhs: Vec<usize> = (target + 1..self.rows.len())
             .filter(|index| self.rows[*index].range.offset > limit)
@@ -1933,28 +1990,45 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The named argument membership test against the active callee.
+    /// The named argument membership test against the active callee
+    /// (`type_analyzer.dart:5820`): a resolved callee whose formal table
+    /// lacks the label reports `undefined_named_parameter` at the label; an
+    /// unresolved callee stays silent (its own invocation code reports) and
+    /// only feeds the §8 table.
     fn check_named_argument(&mut self, name: StringId, range: SourceRange) {
-        let Some(callee) = self
-            .invokes
-            .last()
-            .and_then(|slot| *slot)
-            .and_then(|index| self.rows.get(index))
-        else {
+        let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
         };
-        let defined = match &callee.shape {
-            RowShape::Bare(_) => self.top_level_named_formal(callee.name, name),
-            RowShape::Member { recv } => self.member_has_named_formal(recv, callee.name, name),
+        let (shape, callee_name) = match self.rows.get(callee) {
+            Some(row) => (row.shape.clone(), row.name),
+            None => return,
+        };
+        let (resolved, defined) = match &shape {
+            RowShape::Bare(_) => {
+                let decl = self.top_level_decl(callee_name);
+                (
+                    decl.is_some(),
+                    decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name)),
+                )
+            }
+            RowShape::Member { recv } => {
+                let formals = self.member_formals_full(recv, callee_name);
+                (
+                    formals.is_some(),
+                    formals.is_some_and(|f| f.named.iter().any(|entry| entry.name == name)),
+                )
+            }
             _ => return,
         };
-        if defined {
-            return;
+        if resolved && !defined {
+            let text = self.strings.resolve(name).to_string();
+            self.emit(SemanticCode::UndefinedNamedParameter, range, &text, "");
         }
-        // `undefined_named_parameter` is a batch-2 emission; batch 1 records
-        // the miss (the membership test itself is live — the §8 table only
-        // carries real misses).
-        self.record_miss(name, range, false, NameUse::NamedArgument);
+        if !defined {
+            // The §8 table carries every real miss (the membership test
+            // itself is live).
+            self.record_miss(name, range, false, NameUse::NamedArgument);
+        }
     }
 
     // —— pass 2 ———————————————————————————————————————————————————————
@@ -1966,8 +2040,139 @@ impl<'a> Engine<'a> {
             match &row.shape {
                 RowShape::Bare(info) => self.resolve_bare_row(row, *info),
                 RowShape::Member { recv } => self.resolve_member_row(row, *recv),
+                RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
                 RowShape::TypeUse(..) => self.resolve_type_row(row),
-                RowShape::Receiver(_) | RowShape::Value => {}
+                RowShape::Value => {}
+            }
+        }
+    }
+
+    /// A surviving typed-keyword receiver (`this + b`, `super[i]`): only
+    /// operator intents carry checks — member merges consumed every other
+    /// shape at the dot event.
+    fn resolve_receiver_row(&mut self, row: &Row, recv: Receiver) {
+        if !matches!(row.intent, Intent::Operator(..)) {
+            return;
+        }
+        let (read, write) = self.operator_spellings(row);
+        match recv {
+            Receiver::This { container, .. } => {
+                let mut missing: Vec<String> = Vec::new();
+                for spelling in [read, write].into_iter().flatten() {
+                    if matches!(self.walk_members(container, spelling), Walk::Missing) {
+                        missing.push(self.strings.resolve(spelling).to_string());
+                    }
+                }
+                if missing.is_empty() {
+                    return;
+                }
+                let type_text = self.strings.resolve(container).to_string();
+                for text in missing {
+                    self.emit(
+                        SemanticCode::UndefinedOperator,
+                        row.range,
+                        &text,
+                        &type_text,
+                    );
+                }
+            }
+            Receiver::Super { container, .. } => {
+                let mut missing: Vec<String> = Vec::new();
+                for spelling in [read, write].into_iter().flatten() {
+                    if matches!(self.walk_super(container, spelling), Walk::Missing) {
+                        missing.push(self.strings.resolve(spelling).to_string());
+                    }
+                }
+                if missing.is_empty() {
+                    return;
+                }
+                let type_text = self.strings.resolve(container).to_string();
+                for text in missing {
+                    self.emit(
+                        SemanticCode::UndefinedSuperMember(SuperShape::Operator),
+                        row.range,
+                        &text,
+                        &type_text,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_bare_row(&mut self, row: &Row, info: BareInfo) {
+        let name_text = self.strings.resolve(row.name);
+        match info {
+            // A prefix used bare: invoking a prefix is an error the oracle
+            // names with an unfrozen code — record only.
+            BareInfo::Container { .. } | BareInfo::Prefix { .. } => {}
+            BareInfo::Plain { ty } => {
+                // A direct operator application on a declared-typed receiver
+                // (`c + d`, `c[i] = v`).
+                if matches!(row.intent, Intent::Operator(..)) {
+                    self.check_operator_expr(ty, row);
+                }
+            }
+            BareInfo::Missing {
+                this_type,
+                in_exec,
+                on_opaque,
+            } => {
+                // Mixin `on` constraints and extension `on` types are
+                // invisible to the model: inside their instance members a
+                // bare miss may be a constraint member — record only.
+                if on_opaque {
+                    self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
+                    return;
+                }
+                match row.intent {
+                    Intent::Invoke => {
+                        // UnqualifiedLookupDomain: inside a class or enum
+                        // instance member the invocation miss names `this`'s
+                        // type (`undefined_method`); everywhere else it is
+                        // `undefined_function`.
+                        if let Some(container) = this_type {
+                            let type_text = self.strings.resolve(container).to_string();
+                            if !self.guard.ignore(None, row.name) {
+                                self.emit(
+                                    SemanticCode::UndefinedMethod,
+                                    row.range,
+                                    name_text,
+                                    &type_text,
+                                );
+                            }
+                        } else if !self.guard.ignore(None, row.name) {
+                            self.emit(SemanticCode::UndefinedFunction, row.range, name_text, "");
+                        }
+                        self.record_miss(row.name, row.range, false, NameUse::Invoke);
+                    }
+                    Intent::Read if row.name == self.intern("await") && in_exec => {
+                        // `await` in a sync body is never a lookup miss: the
+                        // frozen code names the missing async marker.
+                        if !self.guard.ignore(None, row.name) {
+                            self.emit(SemanticCode::UndefinedIdentifierAwait, row.range, "", "");
+                        }
+                        self.record_miss(row.name, row.range, false, NameUse::Read);
+                    }
+                    Intent::Read | Intent::Write | Intent::ReadWrite => {
+                        // A write to a defined getter-only name is under-reported
+                        // (the oracle's setter code needs a receiver type); a
+                        // fully missing name reports.
+                        if !self.guard.ignore(None, row.name) {
+                            self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                        }
+                        let use_kind = match row.intent {
+                            Intent::Write | Intent::ReadWrite => NameUse::Write,
+                            _ => NameUse::Read,
+                        };
+                        self.record_miss(row.name, row.range, false, use_kind);
+                    }
+                    Intent::Operator(..) => {
+                        // The undefined receiver itself reports above all; the
+                        // operator on an invalid type never cascades.
+                        self.record_miss(row.name, row.range, false, NameUse::Read);
+                    }
+                }
             }
         }
     }
@@ -2000,43 +2205,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn resolve_bare_row(&mut self, row: &Row, info: BareInfo) {
-        let name_text = self.strings.resolve(row.name);
-        match info {
-            // A prefix used bare: invoking a prefix is an error the oracle
-            // names with an unfrozen code — record only.
-            BareInfo::Container { .. } | BareInfo::Plain { .. } | BareInfo::Prefix { .. } => {}
-            BareInfo::Missing => match row.intent {
-                Intent::Invoke => {
-                    if !self.guard.ignore(None, row.name) {
-                        self.emit(SemanticCode::UndefinedFunction, row.range, name_text, "");
-                        self.record_miss(row.name, row.range, false, NameUse::Invoke);
-                    }
-                }
-                Intent::Read if row.name == self.intern("await") && self.in_executable() => {
-                    // `undefined_identifier_await` is a batch-2 emission;
-                    // batch 1 records (emitting plain `undefined_identifier`
-                    // here would contaminate the oracle diff).
-                    self.record_miss(row.name, row.range, false, NameUse::Read);
-                }
-                Intent::Read | Intent::Write | Intent::ReadWrite => {
-                    // A write to a defined getter-only name is under-reported
-                    // (the oracle's setter code needs a receiver type); a
-                    // fully missing name reports.
-                    if !self.guard.ignore(None, row.name) {
-                        self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
-                    }
-                    let use_kind = match row.intent {
-                        Intent::Write | Intent::ReadWrite => NameUse::Write,
-                        _ => NameUse::Read,
-                    };
-                    self.record_miss(row.name, row.range, false, use_kind);
-                }
-                Intent::Operator(_) => {}
-            },
-        }
-    }
-
     fn resolve_member_row(&mut self, row: &Row, recv: Receiver) {
         let name_text = self.strings.resolve(row.name);
         match recv {
@@ -2048,20 +2216,29 @@ impl<'a> Engine<'a> {
                 }
                 match row.intent {
                     // Verified: a prefixed *invocation* miss is
-                    // `undefined_function` (batch 1); the property path's
-                    // `undefined_prefixed_name` is batch 2 — record only.
+                    // `undefined_function`; the property path reports
+                    // `undefined_prefixed_name` (PrefixedLookupDomain).
                     Intent::Invoke => {
                         self.emit(SemanticCode::UndefinedFunction, row.range, name_text, "");
                         self.record_miss(row.name, row.range, true, NameUse::Invoke);
                     }
                     Intent::Read | Intent::Write | Intent::ReadWrite => {
+                        let type_text = self.strings.resolve(prefix).to_string();
+                        self.emit(
+                            SemanticCode::UndefinedPrefixedName,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
                         let use_kind = match row.intent {
                             Intent::Write | Intent::ReadWrite => NameUse::Write,
                             _ => NameUse::Read,
                         };
                         self.record_miss(row.name, row.range, true, use_kind);
                     }
-                    Intent::Operator(_) => {}
+                    Intent::Operator(..) => {
+                        self.record_miss(row.name, row.range, true, NameUse::Read);
+                    }
                 }
             }
             Receiver::Container { name, kind } => {
@@ -2084,10 +2261,13 @@ impl<'a> Engine<'a> {
     }
 
     /// Static/enum/extension access on a container name (`C.m`, `E.x`,
-    /// `Ext.g`). External containers suppress (kind unknown). The member
-    /// family's codes (`undefined_getter`/`undefined_method`/
-    /// `undefined_enum_constant`/…) are batch-2 emissions: batch 1 records
-    /// the miss.
+    /// `Ext.g`) — the oracle's `StaticLookupDomain`
+    /// (`lookup_failure_reporter.dart`): the interface face reports
+    /// `undefined_method` (the type-literal shape shares the registry name
+    /// and message), `undefined_getter`, `undefined_enum_constant` on enum
+    /// reads, and `undefined_setter` on writes; the extension face reports
+    /// its dedicated trio. Operator intents have no static-face shape the
+    /// M1 model can name — record only. External containers suppress.
     fn check_container_member(&mut self, row: &Row, container: StringId, kind: ContainerKind) {
         let Some((resolved, _)) = resolve_container(
             self.graph,
@@ -2099,18 +2279,62 @@ impl<'a> Engine<'a> {
         ) else {
             return;
         };
-        if resolved.members.contains_key(&row.name) {
+        let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        let mut defined = resolved.members.contains_key(&row.name);
+        if !defined && write {
+            defined = resolved
+                .members
+                .contains_key(&self.setter_spelling(row.name));
+        }
+        if defined {
             return;
         }
-        if kind != ContainerKind::Enum || matches!(row.intent, Intent::Read | Intent::Invoke) {
-            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+        let name_text = self.strings.resolve(row.name);
+        let type_text = self.strings.resolve(container).to_string();
+        // A compound write checks both faces (the oracle resolves the read
+        // first): the read-face text, then the setter text.
+        let read_face_missing = !resolved.members.contains_key(&row.name);
+        let (invoke_code, read_code, write_code) = match kind {
+            ContainerKind::Extension => (
+                SemanticCode::UndefinedExtensionMethod,
+                SemanticCode::UndefinedExtensionGetter,
+                SemanticCode::UndefinedExtensionSetter,
+            ),
+            _ => (
+                SemanticCode::UndefinedMethod,
+                if kind == ContainerKind::Enum {
+                    SemanticCode::UndefinedEnumConstant
+                } else {
+                    SemanticCode::UndefinedGetter
+                },
+                SemanticCode::UndefinedSetter,
+            ),
+        };
+        match row.intent {
+            Intent::Invoke => self.emit(invoke_code, row.range, name_text, &type_text),
+            Intent::Read => self.emit(read_code, row.range, name_text, &type_text),
+            Intent::Write => self.emit(write_code, row.range, name_text, &type_text),
+            Intent::ReadWrite => {
+                if read_face_missing {
+                    self.emit(read_code, row.range, name_text, &type_text);
+                }
+                self.emit(write_code, row.range, name_text, &type_text);
+            }
+            Intent::Operator(..) => {}
         }
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
     /// Instance access through a declaration-typed receiver (`this.m`, `c.m`
-    /// on a `C c`): a clean walk that misses records; a broken chain, the
-    /// extension pool, enum synthesized members, and `Object` members
-    /// suppress. The member family's codes are batch-2 emissions.
+    /// on a `C c`). A clean walk that misses reports the member family
+    /// (`undefined_method`/`_getter`/`_setter` by access intent); a broken
+    /// chain, the extension pool, enum synthesized members, and `Object`
+    /// members suppress. Operator intents are the member-result shape
+    /// (`c.j + 1`, `c.j[i]`): the member itself is the operator's receiver —
+    /// a found member hands the operator check to its result type, a clean
+    /// miss reports the getter read (the operator's invalid type never
+    /// cascades). Mixin `on` constraints and extension `on` types are
+    /// invisible to the model, so bodies of those containers record only.
     fn check_instance_member(&mut self, row: &Row, recv: Receiver) {
         let (Receiver::This { container, .. }
         | Receiver::Typed {
@@ -2120,8 +2344,32 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        let (op_read, op_write) = self.operator_spellings(row);
-        if self.member_defined(container, row.name, false, op_read, op_write) {
+        if let Intent::Operator(..) = row.intent {
+            match self.walk_members(container, row.name) {
+                Walk::Found(entry) => {
+                    let ty = Self::member_result_ty(entry);
+                    self.check_operator_expr(ty, row);
+                    return;
+                }
+                Walk::ChainBroken => return,
+                Walk::Missing => {
+                    let name_text = self.strings.resolve(row.name);
+                    let type_text = self.strings.resolve(container).to_string();
+                    self.emit(
+                        SemanticCode::UndefinedGetter,
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                    self.record_miss(row.name, row.range, true, NameUse::Read);
+                    return;
+                }
+            }
+        }
+        if self.member_defined(container, row, false) {
+            return;
+        }
+        if matches!(self.walk_members(container, row.name), Walk::ChainBroken) {
             return;
         }
         let Some(kind) = self.container_kind_of(container) else {
@@ -2130,29 +2378,130 @@ impl<'a> Engine<'a> {
         if kind == ContainerKind::Enum && self.is_reserved(row.name, &ENUM_SYNTH_MEMBERS) {
             return;
         }
-        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-    }
-
-    /// `super.member` misses: `undefined_super_member` (one code name, four
-    /// per-shape messages) is a batch-2 emission; batch 1 records.
-    fn check_super_member(&mut self, row: &Row, container: StringId) {
-        let (op_read, op_write) = self.operator_spellings(row);
-        if self.member_defined(container, row.name, true, op_read, op_write) {
+        if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
+            // The `on` face is invisible: a miss may be a constraint member.
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
+        }
+        let name_text = self.strings.resolve(row.name);
+        let type_text = self.strings.resolve(container).to_string();
+        match row.intent {
+            Intent::Invoke => {
+                self.emit(
+                    SemanticCode::UndefinedMethod,
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            Intent::Write | Intent::ReadWrite => {
+                // A compound write checks the read face first (the oracle
+                // resolves the getter before the setter).
+                if row.intent == Intent::ReadWrite
+                    && matches!(self.walk_members(container, row.name), Walk::Missing)
+                {
+                    self.emit(
+                        SemanticCode::UndefinedGetter,
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                }
+                self.emit(
+                    SemanticCode::UndefinedSetter,
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            Intent::Read => {
+                self.emit(
+                    SemanticCode::UndefinedGetter,
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            Intent::Operator(..) => unreachable!("operator intents returned above"),
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
-    /// The read and write operator spellings of an operator row (`[]` / `[]=`);
-    /// `(None, None)` for non-operator rows.
+    /// `super.member` — the oracle's `SuperLookupDomain`: one analyzerCode
+    /// (`undefined_super_member`) with a per-access-shape message, reported
+    /// against the enclosing container's name. Operator intents follow the
+    /// member-result shape (the direct `super + b` form lives on the
+    /// receiver rows in [`Engine::resolve_receiver_row`], which reports the
+    /// operator shape). A broken super chain (mixins: `on` constraints are
+    /// not edges) suppresses.
+    fn check_super_member(&mut self, row: &Row, container: StringId) {
+        if let Intent::Operator(..) = row.intent {
+            match self.walk_super(container, row.name) {
+                Walk::Found(entry) => {
+                    let ty = Self::member_result_ty(entry);
+                    self.check_operator_expr(ty, row);
+                }
+                Walk::ChainBroken => {}
+                Walk::Missing => {
+                    let name_text = self.strings.resolve(row.name);
+                    let type_text = self.strings.resolve(container).to_string();
+                    self.emit(
+                        SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                    self.record_miss(row.name, row.range, true, NameUse::Read);
+                }
+            }
+            return;
+        }
+        if self.member_defined(container, row, true) {
+            return;
+        }
+        if matches!(self.walk_super(container, row.name), Walk::ChainBroken) {
+            return;
+        }
+        let shape = match row.intent {
+            Intent::Invoke => SuperShape::Method,
+            Intent::Write | Intent::ReadWrite => SuperShape::Setter,
+            Intent::Read => SuperShape::Getter,
+            Intent::Operator(..) => unreachable!("operator intents returned above"),
+        };
+        let name_text = self.strings.resolve(row.name);
+        let type_text = self.strings.resolve(container).to_string();
+        // A compound write checks the read face first (the oracle resolves
+        // the getter before the setter).
+        if row.intent == Intent::ReadWrite
+            && matches!(self.walk_super(container, row.name), Walk::Missing)
+        {
+            self.emit(
+                SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+                row.range,
+                name_text,
+                &type_text,
+            );
+        }
+        self.emit(
+            SemanticCode::UndefinedSuperMember(shape),
+            row.range,
+            name_text,
+            &type_text,
+        );
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// The read and write operator spellings an access needs (`[]` / `[]=`
+    /// for index rows by their write form; the plain spelling for binary
+    /// operators); `(None, None)` for non-operator rows.
     fn operator_spellings(&self, row: &Row) -> (Option<StringId>, Option<StringId>) {
-        let Intent::Operator(op) = &row.intent else {
+        let Intent::Operator(op, _) = &row.intent else {
             return (None, None);
         };
         if *op == self.intern("[]") {
             match row.write_op {
-                Some(OpWrite::Assign) => (None, Some(*op)),
-                Some(OpWrite::Compound) => (Some(*op), Some(*op)),
+                Some(OpWrite::Assign) => (None, Some(self.intern("[]="))),
+                Some(OpWrite::Compound) => (Some(*op), Some(self.intern("[]="))),
                 None => (Some(*op), None),
             }
         } else {
@@ -2160,18 +2509,71 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `name=` lookup spelling of a write target.
+    fn setter_spelling(&self, name: StringId) -> StringId {
+        let text = self.strings.resolve(name);
+        let setter = format!("{text}=");
+        self.strings.intern(&setter)
+    }
+
+    /// A member's result type as far as M1 knows it: the declared field type
+    /// or getter return type; methods (function-typed tear-offs) and setters
+    /// stay [`Ty::Unknown`] — every check on them suppresses.
+    fn member_result_ty(entry: &MemberEntry) -> Ty {
+        match entry.kind {
+            MemberKind::Field => entry.var_ty,
+            MemberKind::Getter => entry.return_ty,
+            MemberKind::Method | MemberKind::Setter => Ty::UNKNOWN,
+        }
+    }
+
+    /// The operator application on a known receiver type (`c + d`, `c[i]`,
+    /// `c.j + 1` against the member result): each read/write spelling that
+    /// the type's container genuinely lacks reports `undefined_operator` at
+    /// the operator's anchor span. Unresolved or external types (`Unknown`,
+    /// broken chains) suppress — an invalid receiver type never cascades.
+    fn check_operator_expr(&mut self, ty: Ty, row: &Row) {
+        let Intent::Operator(_, op_range) = row.intent else {
+            return;
+        };
+        let (read, write) = self.operator_spellings(row);
+        let Ty::Named { name, .. } = ty else {
+            return;
+        };
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )
+        .is_none()
+        {
+            return;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for spelling in [read, write].into_iter().flatten() {
+            if matches!(self.walk_members(name, spelling), Walk::Missing) {
+                missing.push(self.strings.resolve(spelling).to_string());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let type_text = self.strings.resolve(name).to_string();
+        for text in missing {
+            self.emit(SemanticCode::UndefinedOperator, op_range, &text, &type_text);
+        }
+    }
+
     /// Runs the walk(s) an access needs and applies the shared suppressions
-    /// (broken chain, extension pool, `Object` members). Operator rows walk
-    /// their read/write operator spellings.
-    #[allow(clippy::too_many_arguments)]
-    fn member_defined(
-        &self,
-        container: StringId,
-        name: StringId,
-        super_walk: bool,
-        op_read: Option<StringId>,
-        op_write: Option<StringId>,
-    ) -> bool {
+    /// (broken chain, extension pool, `Object` members). A write also
+    /// accepts the setter spelling (`name=`): a same-named getter, field, or
+    /// method suppresses with the oracle's assignment-to-* codes, a setter
+    /// defines the write.
+    fn member_defined(&self, container: StringId, row: &Row, super_walk: bool) -> bool {
+        let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
         let walk = |member: StringId| {
             let walk = if super_walk {
                 self.walk_super(container, member)
@@ -2180,20 +2582,19 @@ impl<'a> Engine<'a> {
             };
             matches!(walk, Walk::Found(_))
         };
-        let found = match (op_read, op_write) {
-            (Some(read), Some(_)) => walk(read) || walk(self.intern("[]=")),
-            (Some(single), None) | (None, Some(single)) => walk(single),
-            (None, None) => walk(name),
-        };
+        let mut found = walk(row.name);
+        if !found && write {
+            found = walk(self.setter_spelling(row.name));
+        }
         if found {
             return true;
         }
-        if name == self.intern("==") || self.is_reserved(name, &OBJECT_MEMBERS) {
+        if row.name == self.intern("==") || self.is_reserved(row.name, &OBJECT_MEMBERS) {
             return true;
         }
         self.index
             .get(self.file)
-            .is_some_and(|f| f.extension_member(name).is_some())
+            .is_some_and(|f| f.extension_member(row.name).is_some())
     }
 
     fn container_kind_of(&self, container: StringId) -> Option<ContainerKind> {
@@ -2818,7 +3219,7 @@ impl ParserListener for DiagnoseListener<'_> {
         };
         if USER_OPERATORS.contains(&text) {
             let op = engine.intern(text);
-            engine.mark_operator(op, operator.range.offset);
+            engine.mark_operator(op, operator.range);
         }
     }
 
@@ -2926,31 +3327,44 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().in_cascade = false;
     }
 
-    fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, _close: Token) {
-        if question.is_none() {
-            return;
-        }
+    fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
         let mut engine = self.engine.borrow_mut();
+        // The oracle anchors index-access reports on the bracket pair
+        // (`property_element_resolver.dart`, `_reportUnresolvedIndex`).
+        let bracket = SourceRange {
+            offset: open.range.offset,
+            length: close.range.end() - open.range.offset,
+        };
         // The receiver: the closest row wholly before the `[`.
-        let Some((_, row)) = engine
+        let Some(pos) = engine
             .rows
             .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, row)| row.range.end() <= open.range.offset)
+            .rposition(|row| row.range.end() <= open.range.offset)
         else {
             return;
         };
-        let row = row.clone();
-        let ty = Engine::receiver_row_ty(&row);
-        if ty.is_strictly_non_nullable() {
-            engine.emit3(
-                SemanticCode::InvalidNullAwareOperator,
-                row.range,
-                "?[",
-                "[",
-                "",
-            );
+        if question.is_some() {
+            let ty = Engine::receiver_row_ty(&engine.rows[pos]);
+            if ty.is_strictly_non_nullable() {
+                let range = engine.rows[pos].range;
+                engine.emit3(SemanticCode::InvalidNullAwareOperator, range, "?[", "[", "");
+            }
+        }
+        // Fold (`a[i]`, `c.j[i] = v`): the index arguments leave the stack —
+        // the receiver row carries the `[]` access with the bracket span, and
+        // a value row stands for the result so compound-expression detection
+        // (argument types, initializer checks) still sees one opaque row. A
+        // receiver whose own resolution left no name row (call results,
+        // groups) stays unfolded — its operator checks suppress anyway.
+        if matches!(
+            engine.rows[pos].shape,
+            RowShape::Bare(_) | RowShape::Member { .. } | RowShape::Receiver(_)
+        ) && engine.rows[pos].intent == Intent::Read
+        {
+            let index_op = engine.intern("[]");
+            engine.rows.truncate(pos + 1);
+            engine.rows[pos].intent = Intent::Operator(index_op, bracket);
+            engine.push_value_row(close);
         }
     }
 
@@ -3058,7 +3472,12 @@ fn bare_info_of(name: StringId, decl: &TopDecl) -> BareInfo {
         // Type parameters are declaration-scoped: the per-unit tag is stale
         // outside its declaration, and in-scope uses were answered by the
         // engine's type-parameter stack.
-        MicroKind::TypeParam => BareInfo::Missing,
+        MicroKind::TypeParam => BareInfo::Missing {
+            // Stale out-of-scope type-parameter references carry no context.
+            this_type: None,
+            in_exec: false,
+            on_opaque: false,
+        },
         MicroKind::Class => BareInfo::Container {
             name,
             kind: ContainerKind::Class,
@@ -3402,30 +3821,57 @@ mod tests {
     }
 
     /// Named arguments are membership-tested against the callee's formals:
-    /// a real miss lands in the §8 table without a batch-1 diagnostic.
+    /// a resolved callee with a missing label reports
+    /// `undefined_named_parameter` at the label; an unresolved callee stays
+    /// silent for the label (its own invocation code reports).
     ///
     /// Hand-trace: `g`'s group is open while the labels fire, so
-    /// `top_level_formals` sees `[n]`; `n` is contained (silent), `bad` is
-    /// recorded (`undefined_named_parameter` is batch 2).
+    /// `top_level_decl(g)` resolves and its named formals are `["n"]`; `n`
+    /// is contained (silent), `bad` misses a concrete formal table → emit +
+    /// record. `nos` misses `top_level_decl` (unresolved) → `bad2` records
+    /// only, and the invocation itself is `undefined_function`.
     #[test]
-    fn named_argument_miss_is_recorded_not_emitted() {
-        let report = report("void g({var n}) {} void f() { g(n: 1, bad: 2); }");
-        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
-        assert_eq!(report.names.len(), 1);
-        assert_eq!(report.names[0].use_kind, NameUse::NamedArgument);
+    fn named_argument_miss_reports_on_resolved_callee() {
+        let report = report("void g({var n}) {} void f() { g(n: 1, bad: 2); nos(bad2: 3); }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_named_parameter", "undefined_function"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The named parameter 'bad' isn't defined."
+        );
+        let named: Vec<_> = report
+            .names
+            .iter()
+            .filter(|row| row.use_kind == NameUse::NamedArgument)
+            .collect();
+        assert_eq!(named.len(), 2, "both labels feed the §8 table");
     }
 
-    /// `await` in a sync body is the `undefined_identifier_await` trigger —
-    /// batch 2's emission; batch 1 records without emitting.
+    /// `await` in a sync body is `undefined_identifier_await` (no
+    /// arguments); in an async body the parser reads `await` as a real
+    /// await-expression and nothing fires.
     ///
-    /// Hand-trace: the parser reads `await` as a plain identifier in a sync
-    /// body; `in_executable` holds (the Executable frame is open), so the
-    /// row records and only `x` emits.
+    /// Hand-trace: the parser reads `await` as a plain identifier in `f`'s
+    /// sync body; `in_executable` holds and the guard passes → the
+    /// no-argument emit; `x` still reports `undefined_identifier`. In `g`
+    /// the async modifier makes `await` an expression — no identifier event.
     #[test]
-    fn await_in_sync_body_is_recorded_not_emitted() {
-        let report = report("void f() { await x; }");
-        assert_eq!(code_names(&report), ["undefined_identifier"]);
-        assert_eq!(report.names.len(), 2);
+    fn await_in_sync_body_reports_await_code() {
+        let report = report("void f() { await x; } void g() async { await f; }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_identifier_await", "undefined_identifier"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Undefined name 'await' in function body not marked with 'async'."
+        );
     }
 
     /// Defined names never report: a top-level function as a value, and a
@@ -3773,11 +4219,10 @@ mod tests {
     ///
     /// Hand-trace: `c`'s declared type is `C` (no `?`) → strictly
     /// non-nullable → the warning at the merge; `c2`'s type is `C?` →
-    /// suppress. `m` is genuinely absent from `C` — the member miss records
-    /// without a batch-2 diagnostic.
+    /// suppress. `m` is declared, so the member walk resolves both accesses.
     #[test]
     fn null_aware_on_non_nullable_reports_static_warning() {
-        let report = report("class C {} void f(C c, C? c2) { c?.m(); c2?.m(); }");
+        let report = report("class C { void m() {} } void f(C c, C? c2) { c?.m(); c2?.m(); }");
         assert_eq!(code_names(&report), ["invalid_null_aware_operator"]);
         let d = &report.diagnostics[0];
         assert_eq!(
@@ -3853,5 +4298,495 @@ mod tests {
     fn unresolved_creation_head_suppresses_arity() {
         let report = report("class A {} void f() { Missing<A>(); }");
         assert_eq!(code_names(&report), ["undefined_class"]);
+    }
+
+    // —— batch 2 (#197): the member family ————————————————————————————
+
+    /// Instance member misses report `undefined_method` /
+    /// `undefined_getter` / `undefined_setter` by access intent
+    /// (`InstanceLookupDomain`); a write survives on any same-named
+    /// declaration (getter-only: the oracle's assignment-to-final family)
+    /// or on a setter spelling; a setter-only name still reads as a
+    /// getter miss.
+    ///
+    /// Hand-trace: `c.h` walks `C` (no `h`, no superclass) → clean miss →
+    /// `undefined_getter`; `c.g` finds the getter (silent); `c.s = 1`
+    /// misses `s` and `s=` → `undefined_setter`; `c.g = 1` finds the
+    /// getter `g` (write survives, unfrozen assignment-to-final);
+    /// `c.p` on the setter-only `p=` misses the read → `undefined_getter`.
+    #[test]
+    fn instance_member_family_reports_by_intent() {
+        let report = report(
+            "class C { int get g => 1; set p(int v) {} } \
+             void f(C c) { c.h; c.s = 1; c.g = 2; c.p; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter", "undefined_setter", "undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'h' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The setter 's' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[0].range.offset,
+            u32::try_from("class C { int get g => 1; set p(int v) {} } void f(C c) { c.".len())
+                .unwrap()
+        );
+    }
+
+    /// A declared method invoked through an instance receiver reports
+    /// `undefined_method` (`ReadSyntax.invocation`).
+    ///
+    /// Hand-trace: `c.m()`'s send marks the member row invoke; the walk on
+    /// `C` clean-misses `m` → the method code, not the getter code.
+    #[test]
+    fn instance_invocation_miss_reports_undefined_method() {
+        let report = report("class C {} void f(C c) { c.m(); }");
+        assert_eq!(code_names(&report), ["undefined_method"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'm' isn't defined for the type 'C'."
+        );
+    }
+
+    /// The static face (`StaticLookupDomain`): interface shapes report the
+    /// `undefined_method`/`_getter`/`_setter` trio (the type-literal
+    /// invocation row shares the registry name and message), enum reads
+    /// report `undefined_enum_constant`, and enum writes report
+    /// `undefined_setter`.
+    ///
+    /// Hand-trace: every `X.member` merges to a `Container` receiver whose
+    /// face is the declaration's own member map; `E.x` reads fall to the
+    /// enum-constant text, `E.z = 1` writes to the uniform setter arm.
+    #[test]
+    fn static_face_reports_interface_trio_and_enum_constant() {
+        let report = report(
+            "class C {} enum E { a } \
+             void f() { C.missing(); C.g; C.s = 1; E.a; E.x; E.y(); E.z = 1; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_method",
+                "undefined_getter",
+                "undefined_setter",
+                "undefined_enum_constant",
+                "undefined_method",
+                "undefined_setter",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'missing' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[3].message,
+            "There's no constant named 'x' in 'E'."
+        );
+    }
+
+    /// The extension face reports its dedicated trio
+    /// (`StaticLookupDomain._extensionReadFailure` / the setter arm).
+    ///
+    /// Hand-trace: `X` resolves as an `Extension` container; the member map
+    /// misses each name → the extension texts with the extension name.
+    #[test]
+    fn extension_static_face_reports_extension_trio() {
+        let report = report(
+            "class int {} extension X on int {} \
+             void f() { X.g; X.m(); X.s = 1; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_extension_getter",
+                "undefined_extension_method",
+                "undefined_extension_setter",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'g' isn't defined for the extension 'X'."
+        );
+    }
+
+    /// `super.member` reports `undefined_super_member` with the
+    /// per-shape message against the enclosing container (`SuperLookupDomain`);
+    /// members found through the superclass edge stay silent.
+    ///
+    /// Hand-trace: `super.g/m/s` resolve in `B` (walk starts at B) — silent;
+    /// the `q*` misses walk B cleanly → getter/method/setter texts.
+    #[test]
+    fn super_member_family_reports_by_shape() {
+        let report = report(
+            "class B { int get g => 1; void m() {} set s(int v) {} } \
+             class C extends B { void f() { super.g; super.m(); super.s = 1; super.q; super.q2(); super.q3 = 2; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_super_member",
+                "undefined_super_member",
+                "undefined_super_member",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'q' isn't defined in a superclass of 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The method 'q2' isn't defined in a superclass of 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The setter 'q3' isn't defined in a superclass of 'C'."
+        );
+    }
+
+    /// Prefixed property reads and writes report `undefined_prefixed_name`
+    /// (`PrefixedLookupDomain`); the resolved name stays silent.
+    ///
+    /// Hand-trace: `p.real` hits the prefix table (silent); `p.gone` and the
+    /// `p.gone2 = 1` write miss it and pass the guard → the two-part text.
+    #[test]
+    fn prefixed_property_miss_reports_undefined_prefixed_name() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        let source_a = "void real() {}";
+        let source_m = "import 'a.dart' as p; void f() { p.real; p.gone; p.gone2 = 1; }";
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned_a = dartq_scanner::scan(
+            source_a,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_a,
+        );
+        let scanned_m = dartq_scanner::scan(
+            source_m,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_m,
+        );
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:t/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, _) in elements_a.declarations() {
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: Some(strings.intern("p")),
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let report = diagnose(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_prefixed_name", "undefined_prefixed_name"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The name 'gone' is being referenced through the prefix 'p', but it isn't defined \
+             in any of the libraries imported using that prefix."
+        );
+    }
+
+    /// A bare invocation miss inside a class or enum instance member names
+    /// `this`'s type (`UnqualifiedLookupDomain` invocation arm); static and
+    /// top-level bodies keep `undefined_function`.
+    ///
+    /// Hand-trace: `missing()` in `C.f` — the container walk clean-misses
+    /// (no `this` member, no extension pool, no library scope) and the
+    /// instance context maps the row to `undefined_method(C)`; `C.g`'s
+    /// static body and the enum's instance body pick their own domains.
+    #[test]
+    fn bare_invoke_in_instance_reports_undefined_method() {
+        let report = report(
+            "class C { void f() { missing(); } static void g() { missing2(); } } \
+             enum E { a; void f() { missing3(); } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_method", "undefined_function", "undefined_method"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'missing' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The function 'missing2' isn't defined."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The method 'missing3' isn't defined for the type 'E'."
+        );
+    }
+
+    /// Mixin `on` constraints and extension `on` types are invisible to the
+    /// model: bare names and `this.member` accesses inside their instance
+    /// bodies record only — the miss may be a constraint member.
+    ///
+    /// Hand-trace: `real`/`real2` resolve against `C` in the oracle (the
+    /// `on` face), so emitting would false-positive; the walk on `M`/`X`
+    /// clean-misses but the container-kind gate suppresses.
+    #[test]
+    fn mixin_and_extension_bodies_suppress_member_misses() {
+        let report = report(
+            "class C { void real() {} } \
+             mixin M on C { void f() { real(); this.real2(); } } \
+             extension X on C { void g() { real3(); this.real4(); } }",
+        );
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+    }
+
+    // —— batch 2 (#197): undefined_operator (#120 residual 2) ————————————
+    // (index tests below double as residual 4's subscript-intent evidence)
+
+    /// A binary operator on a declared-typed receiver reports
+    /// `undefined_operator` at the operator token
+    /// (`binary_expression_resolver.dart`); a declared operator and
+    /// `this`-receiver hits stay silent; `super.operator` reports the super
+    /// operator shape.
+    ///
+    /// Hand-trace: `c + d` — `c`'s row carries `Operator('+', token)`;
+    /// `C` declares `+` (silent). `d + d2` — `D` lacks `+` → the operator
+    /// token anchors `undefined_operator('+', D)`. `this - o` walks `E`'s
+    /// face; `super * this` walks `B` and reports the super text.
+    #[test]
+    fn binary_operator_misses_report_undefined_operator() {
+        let report = report(
+            "class C { C operator +(C o) => this; } class D {} \
+             void f(C c, D d, D d2) { c + d; d + d2; } \
+             class E { void g(E o) { this - o; } } \
+             class B {} class S extends B { void h() { super * this; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_operator",
+                "undefined_operator",
+                "undefined_super_member",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The operator '+' isn't defined for the type 'D'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The operator '-' isn't defined for the type 'E'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The operator '*' isn't defined in a superclass of 'S'."
+        );
+        assert_eq!(
+            report.diagnostics[0].range.offset,
+            u32::try_from(
+                "class C { C operator +(C o) => this; } class D {} void f(C c, D d, D d2) { c "
+                    .len()
+            )
+            .unwrap()
+        );
+    }
+
+    /// A binary operator on a member result applies to the member's
+    /// declared type (`c.j + r` checks `+` on the field's type); a missing
+    /// member reports the getter read instead — the operator's invalid
+    /// type never cascades.
+    ///
+    /// Hand-trace: `j`'s row carries `Operator('+')`; the walk finds the
+    /// field `j: R` → the operator check runs on `R` → `undefined_operator`.
+    /// `c.k + r` clean-misses `k` → `undefined_getter` only.
+    #[test]
+    fn member_result_operator_checks_the_result_type() {
+        let report = report(
+            "class R {} class C { R j; R2 k; } class R2 {} \
+             void f(C c, R r, R2 r2) { c.j + r; c.k + r2; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_operator", "undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The operator '+' isn't defined for the type 'R'."
+        );
+    }
+
+    // —— batch 2 (#197): index intents (#120 residual 4) —————————————————
+
+    /// Index reads and writes check `[]` / `[]=` independently, anchored on
+    /// the bracket pair (`property_element_resolver.dart`); compound writes
+    /// check both; declared operators stay silent — and the index argument
+    /// never takes the assignment's write intent.
+    ///
+    /// Hand-trace: `d[0]` folds `d`'s row to `Operator('[]', brackets)` →
+    /// the read spelling misses on `D`. `d[0] = 1` records the write form →
+    /// only `[]=` is checked. `d[0] += 1` checks both. The declared pair on
+    /// `C` resolves both forms of `c[0] = c[1]` silently, and `c[0] = null`
+    /// does NOT read `c`'s own type as the destination.
+    #[test]
+    fn index_read_write_and_compound_check_spellings() {
+        let index_report = report(
+            "class int {} class D {} \
+             void f(D d, int i) { d[i]; d[i] = 1; d[i] += 1; }",
+        );
+        assert_eq!(
+            code_names(&index_report),
+            [
+                "undefined_operator",
+                "undefined_operator",
+                "undefined_operator",
+                "undefined_operator",
+            ],
+            "{:?}",
+            code_names(&index_report)
+        );
+        assert_eq!(
+            index_report.diagnostics[0].message,
+            "The operator '[]' isn't defined for the type 'D'."
+        );
+        assert_eq!(
+            index_report.diagnostics[1].message,
+            "The operator '[]=' isn't defined for the type 'D'."
+        );
+        assert_eq!(
+            index_report.diagnostics[2].message,
+            "The operator '[]' isn't defined for the type 'D'."
+        );
+        assert_eq!(
+            index_report.diagnostics[3].message,
+            "The operator '[]=' isn't defined for the type 'D'."
+        );
+        let defined_report = report(
+            "class int {} class C { C operator [](int i) => this; C operator []=(int i, C v) {} } \
+             void f(C c, int i) { c[i] = c[i]; c[i] = null; }",
+        );
+        assert!(
+            defined_report.diagnostics.is_empty(),
+            "{:?}",
+            code_names(&defined_report)
+        );
+    }
+
+    /// The `c.j[i] = v` subscript intent (#120 residual 4): the write goes
+    /// through `[]=` on the member's result type; the index argument keeps
+    /// its read; no setter code touches `j`; a missing `j` reports the
+    /// getter read and suppresses the operator.
+    ///
+    /// Hand-trace: the fold at `[` marks `j`'s member row
+    /// `Operator('[]', brackets)` and consumes `i`'s row; the assignment
+    /// records the `[]=` write form; the walk finds getter `j: V` → the
+    /// operator check runs on `V` → one `undefined_operator('[]=', V)`. In
+    /// the second statement `k` clean-misses → `undefined_getter(k)`, no
+    /// cascade.
+    #[test]
+    fn subscript_write_targets_the_member_result_type() {
+        let report = report(
+            "class int {} class V {} class C { V get j => V(); } \
+             void f(C c, int i, V v) { c.j[i] = v; c.k[i] = v; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_operator", "undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The operator '[]=' isn't defined for the type 'V'."
+        );
+        assert_eq!(
+            report.diagnostics[0].range.offset,
+            u32::try_from(
+                "class int {} class V {} class C { V get j => V(); } void f(C c, int i, V v) { c.j"
+                    .len()
+            )
+            .unwrap()
+        );
+    }
+
+    /// A compound member write checks both faces (`c.g += 1` needs the
+    /// getter read and the setter write) — the getter error first, matching
+    /// the oracle's resolution order.
+    ///
+    /// Hand-trace: `g`'s row upgrades to `ReadWrite`; the getter walk
+    /// clean-misses → `undefined_getter`; the write walk misses `g` and
+    /// `g=` → `undefined_setter`.
+    #[test]
+    fn compound_member_write_reports_both_faces() {
+        let report = report("class C {} void f(C c) { c.g += 1; }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter", "undefined_setter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'g' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The setter 'g' isn't defined for the type 'C'."
+        );
     }
 }

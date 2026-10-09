@@ -5,7 +5,11 @@
 //! One variant per implemented frozen row. Every row was transcribed from
 //! the analyzer-8.4.1 registry (`lib/src/error/codes.g.dart`,
 //! `lib/src/dart/error/syntactic_errors.g.dart`, `DiagnosticCode.name` form;
-//! line anchors in the per-variant doc comments). Tier split:
+//! line anchors in the per-variant doc comments) and re-verified verbatim
+//! against the pinned live registry (`.third/dart-sdk`
+//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.13.1 — the
+//! 8.4.1 `codes.g.dart` does not exist in the pinned checkout; #121). Tier
+//! split:
 //!
 //! * the `undefined_*` family, `duplicate_definition`, and the
 //!   `wrong_number_of_type_arguments*` / `..._parameters_for_operator`
