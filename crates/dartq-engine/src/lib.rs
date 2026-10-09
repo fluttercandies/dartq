@@ -212,7 +212,12 @@ impl Engine {
     /// PRD §17.2 discovery face: package roots (from the identity table)
     /// plus `lib`/`bin`/`test`/`tool` per root and root-level `*.dart`
     /// files; never a blind tree walk (hidden dirs and
-    /// `.git`/`build`/`node_modules`/`.dart_tool` always excluded). Interns
+    /// `.git`/`build`/`node_modules`/`.dart_tool` always excluded).
+    /// Symlink rule, both halves: a symlinked `.dart` file is included when
+    /// its target stats as a regular file (dangling links are skipped — the
+    /// oracle analyzes linked files too, so skipping them would flood the
+    /// differential gate with phantom oracle-only entries), while a
+    /// symlinked directory is never descended into (cycle safety). Interns
     /// paths, enqueues the bytes as a `set_content` batch, and reports the
     /// file/LOC counts the metrics hook needs (one pass; LOC counts lines).
     ///
@@ -258,7 +263,22 @@ impl Engine {
                             continue;
                         }
                         queue.push(path);
-                    } else if path.extension().is_some_and(|ext| ext == "dart") {
+                    } else if path.extension().is_some_and(|ext| ext == "dart")
+                        // `entry.file_type()` reports link-host facts (it does
+                        // not follow symlinks): a symlinked `.dart` file is
+                        // neither `is_dir` nor `is_file` there, yet the
+                        // oracle analyzes it — stat the target
+                        // (`fs::metadata` follows the link) and accept
+                        // regular files; a dangling link has no target and
+                        // is skipped. Symlinked directories are still never
+                        // descended (the `is_dir` arm never queues them).
+                        // Regular files take the cached-type path without a
+                        // syscall.
+                        && (file_type.is_file()
+                            || (file_type.is_symlink()
+                                && std::fs::metadata(&path)
+                                    .is_ok_and(|meta| meta.is_file())))
+                    {
                         let bytes = std::fs::read(&path)?;
                         stats.loc_total += u64::from(
                             u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
