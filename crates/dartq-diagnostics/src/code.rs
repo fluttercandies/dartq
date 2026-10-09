@@ -78,14 +78,14 @@ pub fn message_template(name: &str) -> Option<&'static str> {
 // override is WarningCode-class STATIC_WARNING, while illegal/inconsistent_
 // language_version_override are CompileTimeErrorCode-class COMPILE_TIME_ERROR
 // (analyzer-8.4.1 codes.g.dart; re-verified in the pinned live registry —
-// diagnostic.g.dart:7356-7365 and :7946-7956 vs :9184-9330, dart 3.13.1).
+// diagnostic.g.dart:7356-7365 and :7946-7956 vs :9184-9330, dart 3.15 main).
 // Codes the oracle routes by hand to COMPILE_TIME_ERROR at emit time (facts
 // §2 pseudoSharedCode routing) are emit-site decisions, not registry facts.
 
 // --- M0-measured codes outside the generated syntax table ---
 // hasPublishedDocs values captured from the generated registries
 // (analyzer-8.4.1 error/codes.g.dart; re-verified in the pinned live
-// registry, diagnostic.g.dart, dart 3.13.1); lints are never published
+// registry, diagnostic.g.dart, dart 3.15 main); lints are never published
 // (`LintCode.url` is overridden to `null`), and dartq-own codes never are.
 
 // --- Compile-time errors ---

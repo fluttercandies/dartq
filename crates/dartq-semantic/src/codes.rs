@@ -5,7 +5,8 @@
 //! One variant per implemented frozen row. Every row was transcribed from
 //! the analyzer-8.4.1 registry and re-verified verbatim against the pinned
 //! live registry (`.third/dart-sdk`
-//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.13.1) — that
+//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.15 main,
+//! analyzer 14.6.0-dev) — that
 //! unified registry is also the line-anchor source for the per-variant doc
 //! comments and the tier split below: the 8.4.1 `codes.g.dart` /
 //! `syntactic_errors.g.dart` files do not exist in the pinned checkout, and
@@ -79,7 +80,13 @@ use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
 pub enum SemanticCode {
     /// `The name '{0}' is already defined.`
     DuplicateDefinition,
-    /// `Undefined name '{0}' used as an annotation.`
+    /// `Undefined name '{0}' used as an annotation.` — no emit site fires:
+    /// dartq has no annotation resolution yet, and upstream removed the
+    /// diagnostic in 3.14 (`removedIn: "3.14"` — absent from the pinned
+    /// 3.15-main registry, only `messages.yaml` retains the text). The row
+    /// stays for the 3.13.1 measurement oracle, which still emits it and
+    /// freezes it in `tests/harness/m1_codes.txt` — under-report, never
+    /// false-positive.
     UndefinedAnnotation,
     /// `Undefined class '{0}'.`
     UndefinedClass,
