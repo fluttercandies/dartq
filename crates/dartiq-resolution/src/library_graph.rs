@@ -41,21 +41,25 @@
 //! - Cycles converge to the same least fixed point regardless of order
 //!   because insertion is monotone (entries are never removed or replaced);
 //!   order only decides which target wins a genuine re-export race. dartiq
-//!   pins that order deterministically: flows in (library description order,
-//!   directive source order), names in scope insertion order, FIFO queue.
+//!   pins the oracle's order exactly: the initial pass sweeps exported
+//!   libraries in registration (discovery) order, then the newly-added-name
+//!   worklist drains LIFO (`link.dart:167-206`).
 //!
 //! ## Deviation from the spec sketch (§5), oracle wins
 //!
 //! The spec sketch orders the fixpoint as Tarjan SCC condensation plus a
-//! per-SCC iteration. The pinned oracle is a **newly-added-name worklist**
-//! (`summary2/link.dart:144-218` `_buildExportScopes`), which is the
-//! equivalent: both compute the same least fixed point of a monotone
-//! operator. The worklist is implemented here because it is the pinned
-//! behavior and its termination invariant is exact — a name enters any scope
-//! at most once, so each (flow, name) pair is enqueued exactly once and total
-//! work is `O(Σ_flow |final scope of flow.from|)` hash operations, with no
-//! SCC pass, no rounds counter, and no visited-set bookkeeping beyond the
-//! insert itself.
+//! per-SCC iteration. The pinned oracle (`summary2/link.dart:144-218`
+//! `_buildExportScopes`) applies every exported library's whole scope through
+//! its export records directly — exported builders visited in `builders`
+//! registration order — and then runs a **newly-added-name worklist** drained
+//! LIFO (`additionalExportData.removeLast()`); both compute the same least
+//! fixed point of a monotone operator. The oracle shape is implemented here
+//! verbatim because the visit order is observable in first-come-wins races,
+//! and its termination invariant is exact — a name enters any scope at most
+//! once, so each (flow, name) pair is applied at most once per pass and
+//! enqueued at most once, for total work `O(Σ_flow |final scope of
+//! flow.from|)` hash operations, with no SCC pass, no rounds counter, and no
+//! visited-set bookkeeping beyond the insert itself.
 //!
 //! # Contracts
 //!
@@ -66,8 +70,6 @@
 //!   by its declaring file alone (the name is the map key).
 //! - The graph is sized entirely by its input (libraries × names × edges);
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
-
-use std::collections::VecDeque;
 
 use dartiq_source::{FileId, StringId, StringTable};
 use rustc_hash::FxHashMap;
@@ -301,7 +303,9 @@ impl<'t> LibraryGraphBuilder<'t> {
     }
 
     /// Freezes the graph: seeds every export scope with its local public
-    /// declarations, then runs the export-scope worklist fixpoint (see the
+    /// declarations, then resolves the export scopes in the oracle's pinned
+    /// order — a direct initial pass over flows grouped by exported-library
+    /// registration order, then the LIFO newly-added-name worklist (see the
     /// module docs for the pinned behavior and the termination invariant).
     ///
     /// # Panics
@@ -326,10 +330,13 @@ impl<'t> LibraryGraphBuilder<'t> {
             })
             .collect();
 
-        // Flows: one per export edge with an in-graph target, indexed by
-        // source library for the on-insert enqueue.
+        // Flows: one per export edge with an in-graph target, grouped by
+        // source library; within a source, (exporter registration order,
+        // directive source order) — the oracle's Export records on the
+        // exported builder (`addExporters` runs in `builders.values` order).
         let mut flows: Vec<Flow> = Vec::new();
         let mut flows_from: Vec<Vec<u32>> = vec![Vec::new(); self.nodes.len()];
+        let mut is_exporter: Vec<bool> = vec![false; self.nodes.len()];
         for (lib_index, node) in self.nodes.iter().enumerate() {
             let to = LibraryId::from_index(lib_index);
             for (dir_index, edge) in node.exports.iter().enumerate() {
@@ -342,56 +349,65 @@ impl<'t> LibraryGraphBuilder<'t> {
                     combinators: (lib_index, dir_index),
                 });
                 flows_from[target.index() as usize].push(flow_index);
+                is_exporter[lib_index] = true;
             }
         }
+        let nodes = self.nodes;
 
-        // Initial pass: every flow carries the whole seeded scope of its
-        // source (`link.dart:159-166`); FxHashMap iteration order is
-        // deterministic for a fixed insertion sequence, and seeds insert in
-        // declaration order.
-        let mut queue: VecDeque<(u32, StringId)> = VecDeque::new();
-        for (flow_index, flow) in flows.iter().enumerate() {
-            let flow_index = u32::try_from(flow_index).expect("flow count fits u32");
-            for &name in scopes[flow.from.index() as usize].keys() {
-                queue.push_back((flow_index, name));
-            }
-        }
-
-        // Fixpoint: each (flow, name) is enqueued exactly once — the initial
-        // pass covers the seeded scopes, and an insert (which happens at most
-        // once per name per scope) enqueues the consumer's outflows. Total
-        // work is bounded by the final scope sizes; the queue drains.
-        while let Some((flow_index, name)) = queue.pop_front() {
-            let flow = &flows[flow_index as usize];
-            let (combinators_lib, combinators_dir) = flow.combinators;
-            if !self.nodes[combinators_lib].exports[combinators_dir]
-                .combinators
-                .allows(name)
-            {
+        // Initial pass: every flow carries the whole scope of its source as
+        // of its slot, applied directly — exported libraries swept in
+        // registration (intern) order, flows within a source in (exporter,
+        // directive) order (`link.dart:167-179`). This order is the
+        // first-come-wins tiebreak in genuine races.
+        for source in 0..nodes.len() {
+            if flows_from[source].is_empty() {
                 continue;
             }
-            let file = scopes[flow.from.index() as usize]
-                .get(&name)
-                .expect("flow source scope holds the name")
-                .file;
-            let target = &mut scopes[flow.to.index() as usize];
-            if target.contains_key(&name) {
-                continue; // first-come-wins: locals and earlier flows stay
-            }
-            target.insert(
-                name,
-                ExportEntry {
-                    file,
-                    is_local: false,
-                },
-            );
-            for &next in &flows_from[flow.to.index() as usize] {
-                queue.push_back((next, name));
+            let names: Vec<StringId> = scopes[source].keys().copied().collect();
+            for &flow_index in &flows_from[source] {
+                let flow = &flows[flow_index as usize];
+                for &name in &names {
+                    apply_flow(flow, name, &nodes, &mut scopes);
+                }
             }
         }
 
-        let nodes = self
-            .nodes
+        // Both pass: libraries that carry export flows and are themselves
+        // flow targets re-apply their grown scopes — the oracle's `both` set
+        // (`link.dart:181-190`) — enqueuing each newly added name for
+        // further propagation.
+        let mut pending: Vec<(u32, StringId)> = Vec::new();
+        for source in 0..nodes.len() {
+            if flows_from[source].is_empty() || !is_exporter[source] {
+                continue;
+            }
+            let names: Vec<StringId> = scopes[source].keys().copied().collect();
+            for &flow_index in &flows_from[source] {
+                let flow = &flows[flow_index as usize];
+                for &name in &names {
+                    if apply_flow(flow, name, &nodes, &mut scopes) {
+                        pending.push((flow.to.index(), name));
+                    }
+                }
+            }
+        }
+
+        // Drain LIFO (`additionalExportData.removeLast()`,
+        // `link.dart:196-206`): a newly added name propagates through the
+        // gaining library's own outflows, and each further insert re-enqueues.
+        // Fixpoint: each (flow, name) is applied at most once successfully —
+        // an insert happens at most once per name per scope — so the stack
+        // drains.
+        while let Some((source, name)) = pending.pop() {
+            for &flow_index in &flows_from[source as usize] {
+                let flow = &flows[flow_index as usize];
+                if apply_flow(flow, name, &nodes, &mut scopes) {
+                    pending.push((flow.to.index(), name));
+                }
+            }
+        }
+
+        let nodes = nodes
             .into_iter()
             .zip(scopes)
             .map(|(node, export_scope)| LibraryNode {
@@ -401,18 +417,48 @@ impl<'t> LibraryGraphBuilder<'t> {
                 export_scope,
             })
             .collect();
-        LibraryGraph {
-            nodes,
-            by_uri: self.by_uri,
-        }
+        LibraryGraph { nodes }
     }
 }
 
+/// Applies one flow for `name`: combinator filter, then a first-come-wins
+/// insert of the source's current entry into the target scope
+/// (`export.dart:22-28` `addToExportScope` wrapping `ExportScope.export`'s
+/// absent-only insert). Returns whether the name was newly added — the
+/// oracle's enqueue signal.
+fn apply_flow(
+    flow: &Flow,
+    name: StringId,
+    nodes: &[NodeBuilder],
+    scopes: &mut [FxHashMap<StringId, ExportEntry>],
+) -> bool {
+    let (lib, dir) = flow.combinators;
+    if !nodes[lib].exports[dir].combinators.allows(name) {
+        return false;
+    }
+    let file = scopes[flow.from.index() as usize]
+        .get(&name)
+        .expect("flow source scope holds the name")
+        .file;
+    let target = &mut scopes[flow.to.index() as usize];
+    if target.contains_key(&name) {
+        return false; // first-come-wins: locals and earlier flows stay
+    }
+    target.insert(
+        name,
+        ExportEntry {
+            file,
+            is_local: false,
+        },
+    );
+    true
+}
+
 /// The frozen library graph: interned nodes with directive edges and computed
-/// export scopes.
+/// export scopes. Each node's `uri` is the single owner of the canonical
+/// identity string (the builder's interning map is discarded here).
 pub struct LibraryGraph {
     nodes: Vec<LibraryNode>,
-    by_uri: FxHashMap<Box<str>, LibraryId>,
 }
 
 struct LibraryNode {
@@ -433,12 +479,6 @@ impl LibraryGraph {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
-    }
-
-    /// The library registered under `canonical_uri`, if any.
-    #[must_use]
-    pub fn library(&self, canonical_uri: &str) -> Option<LibraryId> {
-        self.by_uri.get(canonical_uri).copied()
     }
 
     /// The canonical identity string of `lib`.
@@ -740,6 +780,95 @@ mod tests {
         let graph = builder.finish();
         let entry = graph.exported(top, strings.intern("dup")).expect("present");
         assert_eq!(entry.file, f1, "the first directive's target wins");
+    }
+
+    /// Registration order beats directive order in a genuine race: with s2
+    /// interned before s1 and `top` exporting s1 first, the oracle's initial
+    /// pass sweeps exported builders in registration order
+    /// (`link.dart:167-179` `for (var exported in exportedBuilders)`), so
+    /// s2's declaration reaches `top` first and s1's loses — even though
+    /// s1's export directive comes first.
+    #[test]
+    fn conflicting_reexports_follow_registration_order() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let s2 = builder.intern("package:s2/s2.dart"); // registered first
+        let s1 = builder.intern("package:s1/s1.dart");
+        let top = builder.intern("package:t/t.dart");
+        let f2 = files.intern(Path::new("s2.dart"));
+        let f1 = files.intern(Path::new("s1.dart"));
+        builder.declare(s2, strings.intern("dup"), f2);
+        builder.declare(s1, strings.intern("dup"), f1);
+        builder.export(
+            top,
+            ExportEdge {
+                target: Some(s1),
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        builder.export(
+            top,
+            ExportEdge {
+                target: Some(s2),
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let entry = graph.exported(top, strings.intern("dup")).expect("present");
+        assert_eq!(
+            entry.file, f2,
+            "the registered-first source wins over the first directive"
+        );
+    }
+
+    /// The propagation worklist drains LIFO
+    /// (`additionalExportData.removeLast()`, `link.dart:196-206`): with every
+    /// consumer registered before its source, the initial pass finds the mid
+    /// scopes empty and both inserts happen in the `both` pass, enqueued as
+    /// (z1, dup) then (z2, dup) in registration order. LIFO processing takes
+    /// (z2, dup) first, so s2's declaration wins at `w`; FIFO would hand the
+    /// race to s1.
+    ///
+    /// Chain: s1/s2 declare `dup`; x1 exports s1, x2 exports s2; z1 exports
+    /// x1, z2 exports x2; w exports z1 then z2.
+    #[test]
+    fn propagation_worklist_drains_lifo() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let w = builder.intern("package:w/w.dart");
+        let z1 = builder.intern("package:z1/z1.dart");
+        let z2 = builder.intern("package:z2/z2.dart");
+        let x1 = builder.intern("package:x1/x1.dart");
+        let x2 = builder.intern("package:x2/x2.dart");
+        let s1 = builder.intern("package:s1/s1.dart");
+        let s2 = builder.intern("package:s2/s2.dart");
+        let f1 = files.intern(Path::new("s1.dart"));
+        let f2 = files.intern(Path::new("s2.dart"));
+        builder.declare(s1, strings.intern("dup"), f1);
+        builder.declare(s2, strings.intern("dup"), f2);
+        for (from, target) in [(x1, s1), (x2, s2), (z1, x1), (z2, x2), (w, z1), (w, z2)] {
+            builder.export(
+                from,
+                ExportEdge {
+                    target: Some(target),
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph = builder.finish();
+
+        let entry = graph.exported(w, strings.intern("dup")).expect("present");
+        assert_eq!(
+            entry.file, f2,
+            "the LIFO head — z2, registered later — wins"
+        );
+        // The losing flow still filled its own mid scope.
+        assert_eq!(
+            graph.exported(x1, strings.intern("dup")).expect("mid").file,
+            f1
+        );
     }
 
     /// The same declaration arriving through two paths is one entry, not a

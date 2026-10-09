@@ -67,10 +67,11 @@ pub enum ResolutionCode {
     AmbiguousExport,
     /// The same prefix is imported deferred in one place and non-deferred in
     /// another (CFE `source_compilation_unit.dart:1526`; no analyzer g.dart
-    /// row — dartiq emits it for the CFE-aligned face).
+    /// row — dartiq emits it for the CFE-aligned face). Message text
+    /// unverified against pinned sources.
     DeferredPrefixDuplicated,
     /// CFE-facing `dart-ext:` import (`fragment_factory_impl.dart:935`; no
-    /// analyzer g.dart row).
+    /// analyzer g.dart row). Message text unverified against pinned sources.
     UnsupportedDartExt,
 }
 
