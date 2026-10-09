@@ -206,6 +206,91 @@ fn substitute_reaches_a_parameter_that_appears_only_in_a_return_type() {
 }
 
 #[test]
+fn substitute_unites_type_parameter_and_replacement_nullabilities() {
+    let fx = fixture();
+    let t = fx.d.iterable_t;
+    let t_question = fx
+        .table
+        .intern(UninternedType::TypeParameter { parameter: t }, true);
+
+    // The official substitutor unites the node's suffix with the
+    // replacement's (type_algebra.dart:97-106, `visitTypeParameterType`:
+    // 592-602): nullable when either side is.
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fx.int())]),
+        fx.int_question()
+    );
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fx.int_question())]),
+        fx.int_question()
+    );
+    assert_eq!(
+        fx.table.substitute(fx.type_param(t), &[(t, fx.int())]),
+        fx.int()
+    );
+    assert_eq!(
+        fx.table
+            .substitute(fx.type_param(t), &[(t, fx.int_question())]),
+        fx.int_question()
+    );
+
+    // Unit-kind normalization still applies to the united result:
+    // `T?=Never` is `Null` (type.dart:1207-1209), and `dynamic`/`Null`
+    // never grow a `?` twin.
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fx.never())]),
+        fx.null()
+    );
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fx.dynamic())]),
+        fx.dynamic()
+    );
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fx.null())]),
+        fx.null()
+    );
+
+    // Compound replacements re-intern with the promoted suffix.
+    let fn_type = UninternedFunction {
+        return_type: fx.void_(),
+        type_parameters: Vec::new(),
+        positional: vec![fx.int()],
+        named: Vec::new(),
+        required_positional: 1,
+    };
+    let fn_none = fx
+        .table
+        .intern_function(fn_type.clone(), false)
+        .expect("valid");
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, fn_none)]),
+        fx.table.intern_function(fn_type, true).expect("valid")
+    );
+    assert_eq!(
+        fx.table
+            .substitute(t_question, &[(t, fx.future_or_of(fx.int(), false))]),
+        fx.future_or_of(fx.int(), true)
+    );
+    let rec = UninternedRecord {
+        positional: vec![fx.int()],
+        named: Vec::new(),
+    };
+    let rec_none = fx.table.intern_record(rec.clone(), false).expect("valid");
+    assert_eq!(
+        fx.table.substitute(t_question, &[(t, rec_none)]),
+        fx.table.intern_record(rec, true).expect("valid")
+    );
+
+    // The promotion registers as a change for compound parents:
+    // `List<T?>` with `T=int` becomes `List<int?>`, not `List<int>`.
+    let list_of_t_question = fx.list_of(t_question, false);
+    assert_eq!(
+        fx.table.substitute(list_of_t_question, &[(t, fx.int())]),
+        fx.list_of(fx.int_question(), false)
+    );
+}
+
+#[test]
 fn function_type_identity_includes_its_own_type_parameters() {
     let fx = fixture();
     // Alpha-equivalent but distinct declarations are distinct types, matching

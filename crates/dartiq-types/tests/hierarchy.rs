@@ -2,8 +2,8 @@
 //! [`TypeHierarchyBuilder::build`] (spec §6, R5).
 
 use dartiq_types::{
-    CoreDecls, TypeDeclId, TypeError, TypeHierarchy, TypeId, TypeKind, TypeParamId, TypeTable,
-    UninternedType,
+    CoreDecls, TypeDeclId, TypeError, TypeHierarchy, TypeId, TypeKind, TypeParamId, TypeSystem,
+    TypeTable, UninternedType,
 };
 
 fn itf(table: &TypeTable, decl: TypeDeclId, args: &[TypeId]) -> TypeId {
@@ -234,6 +234,57 @@ fn nullable_supertype_edge_is_rejected() {
     .build(&table)
     .expect_err("nullable supertype edge");
     assert_eq!(err, TypeError::NullableSupertype(a));
+}
+
+#[test]
+fn instantiation_unites_the_supertype_template_nullability() {
+    // `class A<T> implements Iterable<T?>`: the edge's argument node is
+    // nullable, and instantiation unites nullabilities
+    // (type_algebra.dart:97-106) — `A<num>` is a subtype of
+    // `Iterable<num?>`, not of `Iterable<num>`.
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (num, a, iterable) = (
+        TypeDeclId::from_raw(10),
+        TypeDeclId::from_raw(11),
+        TypeDeclId::from_raw(12),
+    );
+    let (a_t, iterable_t) = (TypeParamId::from_raw(3), TypeParamId::from_raw(4));
+    let t_question = table.intern(UninternedType::TypeParameter { parameter: a_t }, true);
+    let object_none = itf(&table, object, &[]);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(num, Vec::new())
+    .decl(a, vec![a_t])
+    .decl(iterable, vec![iterable_t])
+    .supertype(num, object_none)
+    .supertype(iterable, object_none)
+    .supertype(a, itf(&table, iterable, &[t_question]))
+    .build(&table)
+    .expect("valid hierarchy");
+    let system = TypeSystem::new(&table, &hierarchy);
+    let num_none = itf(&table, num, &[]);
+    let num_question = table.intern(
+        UninternedType::Interface {
+            decl: num,
+            args: Vec::new(),
+        },
+        true,
+    );
+    let a_of_num = itf(&table, a, &[num_none]);
+
+    // The instantiated edge is `Iterable<num?>`: `num? <: num` is false, so
+    // the `Iterable<num>` query must fail. Without the union this edge
+    // collapses to `Iterable<num>` and both answers flip.
+    assert!(!system.is_subtype(a_of_num, itf(&table, iterable, &[num_none])));
+    assert!(system.is_subtype(a_of_num, itf(&table, iterable, &[num_question])));
 }
 
 fn core() -> (TypeDeclId, TypeDeclId, TypeDeclId) {

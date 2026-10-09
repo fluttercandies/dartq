@@ -215,7 +215,9 @@ impl TypeTable {
 
     /// Substitutes type parameters throughout `ty`, interning the result.
     ///
-    /// `map` entries replace [`TypeKind::TypeParameter`] references.
+    /// `map` entries replace [`TypeKind::TypeParameter`] references. A mapped
+    /// replacement unites nullabilities with the node's own `?`: `T?=X!` is
+    /// `X?` (type_algebra.dart:97-106, `visitTypeParameterType`:592-602).
     /// Function-declared type parameters are never substituted: ids are
     /// globally unique per declaration, so a binder's parameters cannot
     /// appear as map keys (no capture-avoidance needed).
@@ -550,10 +552,26 @@ impl TableState {
         }
         let t = self.types[ty.raw() as usize];
         match t.kind() {
-            TypeKind::TypeParameter { parameter } => map
-                .iter()
-                .find(|(p, _)| *p == parameter)
-                .map_or(ty, |&(_, replacement)| replacement),
+            TypeKind::TypeParameter { parameter } => {
+                match map.iter().find(|(p, _)| *p == parameter) {
+                    None => ty,
+                    Some(&(_, replacement)) => {
+                        // The official substitutor unites nullabilities
+                        // (type_algebra.dart:97-106): `T?=X!` is `X?`.
+                        // Unit-kind normalization still applies to the
+                        // promoted result (`T?=Never` is `Null`,
+                        // type.dart:1207-1209; `dynamic`/`Null` keep their
+                        // no-suffix projection).
+                        let replacement_nullable =
+                            self.types[replacement.raw() as usize].is_nullable();
+                        if replacement_nullable || !t.is_nullable() {
+                            replacement
+                        } else {
+                            self.intern_nullable(replacement)
+                        }
+                    }
+                }
+            }
             TypeKind::Interface { decl, args } => match self.substitute_args(args, map) {
                 None => ty,
                 Some(args) => {
@@ -628,6 +646,65 @@ impl TableState {
             | TypeKind::Void
             | TypeKind::Invalid
             | TypeKind::Null => ty,
+        }
+    }
+
+    /// Re-interns an interned type with the `?` projection for the
+    /// nullability union in the [`TypeKind::TypeParameter`] branch.
+    /// Unit-kind normalization still applies: `Never?` collapses to `Null`
+    /// (type.dart:1207-1209) and `dynamic`/`Null` stay no-suffix, so those
+    /// return their existing ids.
+    fn intern_nullable(&mut self, id: TypeId) -> TypeId {
+        let ty = self.types[id.raw() as usize];
+        match ty.kind() {
+            TypeKind::Interface { decl, args } => {
+                let args = self.args[args.offset()..args.offset() + args.len()].to_vec();
+                self.intern_kind(UninternedType::Interface { decl, args }, true)
+            }
+            TypeKind::Function { signature } => {
+                let sig = self.signatures[signature.raw() as usize];
+                let type_parameters = self.fn_type_parameters[sig.type_parameters.offset()
+                    ..sig.type_parameters.offset() + sig.type_parameters.len()]
+                    .to_vec();
+                let positional = self.args
+                    [sig.positional.offset()..sig.positional.offset() + sig.positional.len()]
+                    .to_vec();
+                let named =
+                    self.named[sig.named.offset()..sig.named.offset() + sig.named.len()].to_vec();
+                self.intern_function(
+                    UninternedFunction {
+                        return_type: sig.return_type,
+                        type_parameters,
+                        positional,
+                        named,
+                        required_positional: sig.required_positional,
+                    },
+                    true,
+                )
+                .expect("re-interning an interned signature cannot fail")
+            }
+            TypeKind::Record { shape } => {
+                let shape = self.shapes[shape.raw() as usize];
+                let positional = self.args
+                    [shape.positional.offset()..shape.positional.offset() + shape.positional.len()]
+                    .to_vec();
+                let named = self.named
+                    [shape.named.offset()..shape.named.offset() + shape.named.len()]
+                    .to_vec();
+                self.intern_record(UninternedRecord { positional, named }, true)
+                    .expect("re-interning an interned shape cannot fail")
+            }
+            TypeKind::TypeParameter { parameter } => {
+                self.intern_kind(UninternedType::TypeParameter { parameter }, true)
+            }
+            TypeKind::FutureOr { base } => {
+                self.intern_kind(UninternedType::FutureOr { base }, true)
+            }
+            TypeKind::Never => self.intern_kind(UninternedType::Never, true),
+            TypeKind::Dynamic => self.intern_kind(UninternedType::Dynamic, true),
+            TypeKind::Void => self.intern_kind(UninternedType::Void, true),
+            TypeKind::Invalid => self.intern_kind(UninternedType::Invalid, true),
+            TypeKind::Null => self.intern_kind(UninternedType::Null, true),
         }
     }
 
