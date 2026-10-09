@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+# Explicit member list: `crates/dartiq-plugin-host` is a Dart package (no
+# Cargo.toml) and cargo 1.96 errors on glob-matched directories without one.
+members = [
+    "crates/dartiq-source",
+    "crates/dartiq-language",
+    "crates/dartiq-scanner",
+    "crates/dartiq-parser",
+    "crates/dartiq-ast",
+    "crates/dartiq-sdk",
+    "crates/dartiq-package",
+    "crates/dartiq-pub",
+    "crates/dartiq-resolution",
+    "crates/dartiq-semantic",
+    "crates/dartiq-types",
+    "crates/dartiq-flow",
+    "crates/dartiq-index",
+    "crates/dartiq-incremental",
+    "crates/dartiq-diagnostics",
+    "crates/dartiq-lints",
+    "crates/dartiq-snapshot",
+    "crates/dartiq-cache",
+    "crates/dartiq-plugin",
+    "crates/dartiq-engine",
+    "crates/dartiq-ai",
+    "crates/dartiq-cli",
+    "crates/dartiq-schema",
+    "tests/harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.96"
+
+[workspace.dependencies]
+rustc-hash = "2.1.3"
+
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

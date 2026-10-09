@@ -1,0 +1,19 @@
+{
+  "case": "002_operators_compound",
+  "origin": "pkg/front_end/test/scanner_test.dart:93-752 (_assertToken matrix, rearranged; >>> shapes need triple_shift=true)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["AmpersandAmpersand", 0, 2, "&&"], ["BarBar", 3, 2, "||"], ["QuestionQuestion", 6, 2, "??"],
+    ["QuestionPeriod", 9, 2, "?."], ["PeriodPeriod", 12, 2, ".."], ["PeriodPeriodPeriod", 15, 3, "..."],
+    ["Function", 19, 2, "=>"], ["QuestionQuestionEq", 22, 3, "??="], ["AmpersandAmpersandEq", 26, 3, "&&="],
+    ["BarBarEq", 30, 3, "||="], ["AmpersandEq", 34, 2, "&="], ["BarEq", 37, 2, "|="],
+    ["CaretEq", 40, 2, "^="], ["PlusEq", 43, 2, "+="], ["MinusEq", 46, 2, "-="],
+    ["StarEq", 49, 2, "*="], ["SlashEq", 52, 2, "/="], ["PercentEq", 55, 2, "%="],
+    ["LtLtEq", 58, 3, "<<="], ["GtGtEq", 62, 3, ">>="], ["TildeSlash", 66, 2, "~/"],
+    ["TildeSlashEq", 69, 3, "~/="], ["EqEq", 73, 2, "=="], ["BangEq", 76, 2, "!="],
+    ["LtLt", 79, 2, "<<"], ["GtGt", 82, 2, ">>"], ["GtGtGt", 85, 3, ">>>"], ["GtGtGtEq", 89, 4, ">>>="]
+  ],
+  "diagnostics": [],
+  "notes": "trailing <<= / >>>= leave an Lt begin group open at EOF; official appendEofToken discards open Lt silently (abstract_scanner.dart:530 discardOpenLt)"
+}

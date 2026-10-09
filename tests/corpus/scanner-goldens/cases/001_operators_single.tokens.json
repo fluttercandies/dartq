@@ -1,0 +1,16 @@
+{
+  "case": "001_operators_single",
+  "origin": "pkg/front_end/test/scanner_test.dart:89-192 (_assertToken matrix, rearranged into one balanced line)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Ampersand", 0, 1, "&"], ["Bar", 2, 1, "|"], ["Caret", 4, 1, "^"], ["Tilde", 6, 1, "~"],
+    ["Plus", 8, 1, "+"], ["Minus", 10, 1, "-"], ["Star", 12, 1, "*"], ["Slash", 14, 1, "/"],
+    ["Percent", 16, 1, "%"], ["Lt", 18, 1, "<"], ["Gt", 20, 1, ">"], ["Eq", 22, 1, "="],
+    ["Bang", 24, 1, "!"], ["Question", 26, 1, "?"], ["Period", 28, 1, "."], ["Comma", 30, 1, ","],
+    ["Colon", 32, 1, ":"], ["Semicolon", 34, 1, ";"], ["Hash", 36, 1, "#"], ["At", 38, 1, "@"],
+    ["OpenParen", 40, 1, "("], ["CloseParen", 42, 1, ")"], ["OpenBracket", 44, 1, "["],
+    ["CloseBracket", 46, 1, "]"], ["OpenCurly", 48, 1, "{"], ["CloseCurly", 50, 1, "}"]
+  ],
+  "diagnostics": []
+}

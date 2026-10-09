@@ -1,0 +1,4 @@
+name: corpus_m0_syntax
+description: M0 syntax-broken corpus. Read-only assembled snapshot; see docs/facts/corpus-baseline.md.
+environment:
+  sdk: ^3.13.0

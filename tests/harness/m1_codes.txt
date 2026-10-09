@@ -1,0 +1,55 @@
+# M1 frozen diagnostic gate codes (PRD section 20.3, M1 row): the frozen set
+# the M1 milestone gates on -- uri_does_not_exist, the undefined_* family,
+# duplicate_definition, the wrong_number_of_* family, and the static-
+# nullability four (invalid_assignment / argument_type_not_assignable /
+# return_of_invalid_type / invalid_null_aware_operator, docs/facts/
+# types-nullability-spec.md sections 3.1-3.4). The wildcard families are
+# expanded mechanically over the official analyzer diagnostic registries:
+# analyzer-8.4.1 (pub-cache, lib/src/error/codes.g.dart + lib/src/dart/error/
+# syntactic_errors.g.dart, DiagnosticCode.name form) unioned with the Dart SDK
+# main unified registry (.third/dart-sdk pkg/analyzer lib/src/diagnostic/
+# diagnostic.g.dart, name: form). undefined_lint is excluded: it is an
+# analysis-options code (analyzer-8.4.1 lib/src/analysis_options/error/
+# option_codes.g.dart), not a Dart-language diagnostic. Trigger conditions:
+# docs/facts/resolution-design-spec.md section 4.2. Same format as
+# tests/corpus/syntax-codes.txt: one code per line, # comments, case- and
+# TSV-tolerant on the harness side. wrong_number_of_parameters_for_setter
+# overlaps the M0 syntax gate (tests/corpus/syntax-codes.txt) by PRD wording:
+# the M1 list is not scoped to semantic-only codes.
+argument_type_not_assignable
+duplicate_definition
+invalid_assignment
+invalid_null_aware_operator
+return_of_invalid_type
+undefined_annotation
+undefined_class
+undefined_constructor_in_initializer
+undefined_enum_constant
+undefined_enum_constructor
+undefined_extension_getter
+undefined_extension_method
+undefined_extension_operator
+undefined_extension_setter
+undefined_function
+undefined_getter
+undefined_hidden_name
+undefined_identifier
+undefined_identifier_await
+undefined_method
+undefined_named_parameter
+undefined_operator
+undefined_prefixed_name
+undefined_referenced_parameter
+undefined_setter
+undefined_shown_name
+undefined_super_member
+uri_does_not_exist
+wrong_number_of_parameters_for_operator
+wrong_number_of_parameters_for_setter
+wrong_number_of_type_arguments
+wrong_number_of_type_arguments_constructor
+wrong_number_of_type_arguments_element
+wrong_number_of_type_arguments_enum
+wrong_number_of_type_arguments_extension
+wrong_number_of_type_arguments_function
+wrong_number_of_type_arguments_method

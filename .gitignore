@@ -1,0 +1,21 @@
+# goal ledger (hive store, never commit)
+/.goal/
+
+# IDE
+.idea/
+
+# Dart / Flutter build artifacts
+/.dart_tool/
+# pub-get artifacts inside test corpora (machine-specific absolute paths)
+tests/corpus/*/.dart_tool/
+build/
+*.iml
+
+# Melos
+.melos_tool/
+
+# macOS
+.DS_Store
+
+# Rust build artifacts
+/target

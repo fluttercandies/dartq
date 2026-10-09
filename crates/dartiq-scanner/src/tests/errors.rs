@@ -1,0 +1,602 @@
+//! Recovery strategies, diagnostic pinning, the @dart window, BOM/CRLF, dual-offset consistency.
+
+use super::{assert_codes, assert_kinds, scan_src};
+use crate::{Keyword, TokenKind as K};
+use dartiq_source::byte_offset_to_utf16;
+
+#[test]
+fn nested_block_comments() {
+    let r = scan_src("a /* /* nested */ still */ b");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+    assert!(r.diagnostics.is_empty());
+    // Nesting depth > 2.
+    assert_kinds(&scan_src("/* 1 /* 2 /* 3 */ 2 */ 1 */ x"), &[K::Identifier]);
+}
+
+#[test]
+fn unterminated_block_comment() {
+    let r = scan_src("a /* oops");
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["unterminated_multi_line_comment"]);
+    // Pinned to the last character (EOF-1).
+    let src = "a /* oops";
+    assert_eq!(r.diagnostics[0].range.offset as usize, src.len() - 1);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+}
+
+#[test]
+fn line_comments_skipped() {
+    let r = scan_src("a // rest of line\nb // another");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+    assert!(r.diagnostics.is_empty());
+    // `///` and `/**` doc comments also produce no tokens (official precedingComments shape).
+    assert_kinds(
+        &scan_src("/// doc\nvoid f() {}"),
+        &[
+            K::Keyword(Keyword::Void),
+            K::Identifier,
+            K::OpenParen,
+            K::CloseParen,
+            K::OpenCurly,
+            K::CloseCurly,
+        ],
+    );
+    assert_kinds(&scan_src("/** doc */ x"), &[K::Identifier]);
+}
+
+#[test]
+fn bom_skipped() {
+    let src = "\u{FEFF}var x;";
+    let r = scan_src(src);
+    assert_kinds(&r, &[K::Keyword(Keyword::Var), K::Identifier, K::Semicolon]);
+    // After the BOM, `#!` is still a script tag (the official UTF-8 decoder drops the BOM).
+    let r = scan_src("\u{FEFF}#!/bin/dart");
+    assert_kinds(&r, &[K::ScriptTag]);
+}
+
+#[test]
+fn crlf_and_lone_cr() {
+    // CRLF and LF both terminate line scanning; a lone CR acts as whitespace (official bigSwitch).
+    for sep in ["\r\n", "\n", "\r"] {
+        let r = scan_src(&format!("a{sep}b"));
+        assert_kinds(&r, &[K::Identifier, K::Identifier]);
+        assert!(r.diagnostics.is_empty());
+    }
+    // CR ends a line comment.
+    let r = scan_src("a // c\rb");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+}
+
+#[test]
+fn line_index_authority() {
+    let src = "var a;\nvar b;\n";
+    let r = scan_src(src);
+    assert_eq!(r.line_index.line_count(), 3); // trailing newline → final empty line
+    let (line, _col) = r.line_index.byte_to_line_col(7);
+    assert_eq!(line, 2);
+}
+
+#[test]
+fn illegal_control_character() {
+    let r = scan_src("a \u{1} b");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+    assert_codes(&r, &["illegal_character"]);
+    assert_eq!(r.diagnostics[0].range.offset, 2);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+}
+
+#[test]
+fn illegal_non_ascii_identifier_recovery() {
+    // `var 한글`: one illegal_character per non-ASCII character; official recovery
+    // merges the consecutive illegal characters with the adjacent identifier into
+    // a **single** Identifier (NonAsciiIdentifierToken recovery: when the tail is
+    // an adjacent IDENTIFIER it is folded in and rebuilt).
+    let src = "var 한글;";
+    let r = scan_src(src);
+    assert_kinds(
+        &r,
+        &[
+            K::Keyword(Keyword::Var),
+            K::Identifier, // the non-ASCII chars (merged recovery)
+            K::Semicolon,
+        ],
+    );
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    let t = &r.tokens;
+    assert_eq!(t.lexeme(src, 1), "한글");
+    assert_eq!(t.get(1).unwrap().byte_range(), 4..10); // 3B + 3B
+}
+
+#[test]
+fn illegal_char_merges_with_adjacent_identifier() {
+    // Official recovery shape: the illegal character merges with the **preceding adjacent** identifier into a single token.
+    let src = "ab¢cd";
+    let r = scan_src(src);
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["illegal_character"]);
+    let t = r.tokens.first();
+    assert_eq!(t.byte_range(), 0..src.len());
+    // Dual-offset consistency: utf16 of byte 5 (start of 'd') = 4 (¢ takes 2 bytes / 1 unit).
+    assert_eq!(t.utf16_offset, 0);
+    assert_eq!(byte_offset_to_utf16(src, 5), 4);
+}
+
+#[test]
+fn illegal_astral_char_double_emission() {
+    // An astral illegal character is reported **once per UTF-16 surrogate**
+    // (official UTF-16 scanners see each code unit separately): oracle
+    // `dart analyze --format=json` on `var x = 1;\n😀\n` yields
+    // illegal_character @11 len1 char 55357 and @12 len1 char 56832 —
+    // the two surrogate code points, one unit each.
+    let src = "var x = 1;\n😀\n"; // emoji bytes 11..15, utf16 units 11..13
+    let r = scan_src(src);
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    let d0 = &r.diagnostics[0];
+    let d1 = &r.diagnostics[1];
+    assert_eq!(d0.range.offset, 11); // high surrogate
+    assert_eq!(d0.range.length, 1);
+    assert!(d0.message.contains("55357"), "{}", d0.message);
+    assert_eq!(d1.range.offset, 12); // low surrogate
+    assert_eq!(d1.range.length, 1);
+    assert!(d1.message.contains("56832"), "{}", d1.message);
+    // Mid-file form (oracle `var x = 1;\n😀\nvar y = 2;\n`): same two pins,
+    // nothing else from the scanner.
+    let r = scan_src("var x = 1;\n😀\nvar y = 2;\n");
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    assert_eq!(r.diagnostics[0].range.offset, 11);
+    assert_eq!(r.diagnostics[1].range.offset, 12);
+    // The character itself still merges into one identifier token (recovery
+    // shape unchanged — only the diagnostic count differs).
+    let r = scan_src("x😀y");
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+}
+
+#[test]
+fn unicode_whitespace_skipped() {
+    // Non-ASCII whitespace like U+00A0: illegal_character + skip (official NonAsciiWhitespace).
+    let r = scan_src("a\u{00A0}b");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+    assert_codes(&r, &["illegal_character"]);
+}
+
+#[test]
+fn dual_offset_consistency_non_ascii() {
+    // Non-BMP character: utf16_offset correctly derived from byte_offset (emoji takes 4 bytes / 2 units).
+    let src = "'😀' x"; // ' + 4byte emoji + ' = 6 bytes, then space, x
+    let r = scan_src(src);
+    let x = r
+        .tokens
+        .as_slice()
+        .iter()
+        .find(|t| t.kind == K::Identifier)
+        .unwrap();
+    assert_eq!(x.byte_offset, 7);
+    assert_eq!(x.utf16_offset, 5); // 2(quotes) + 2(surrogate pair) + 1(space)
+    assert_eq!(byte_offset_to_utf16(src, 7), 5);
+    // Full-file utf16 length conversion.
+    assert_eq!(byte_offset_to_utf16(src, src.len()), 6);
+}
+
+#[test]
+fn diag_ranges_utf16_with_non_ascii() {
+    // With a non-ASCII prefix, diagnostic ranges are still UTF-16.
+    let src = "'😀' 'abc"; // 8 bytes prefix, unterminated string starts at byte 7
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_string_literal"]);
+    // Pinned to the last character `c`: byte 10 → utf16 8 (😀 takes 4 bytes / 2 units).
+    assert_eq!(r.diagnostics[0].range.offset, 8);
+}
+
+#[test]
+fn unclosed_groups_at_eof() {
+    // `f({` → two synthetic close tokens: the stack top (inner `{`) pops first →
+    // `}` before `)` (official unmatchedBeginGroup linear order: syn_inner … syn_outer).
+    let r = scan_src("f({");
+    assert_codes(&r, &["expected_token", "expected_token"]);
+    let slice = r.tokens.as_slice();
+    let n = slice.len();
+    assert_eq!(slice[n - 3].kind, K::CloseCurly);
+    assert!(slice[n - 3].is_synthetic());
+    assert_eq!(slice[n - 2].kind, K::CloseParen);
+    assert!(slice[n - 2].is_synthetic());
+    // begin → synthetic close token pairing (official endGroup semantics).
+    assert_eq!(r.tokens.matching_end(2), Some(n - 3)); // `{` → `}`
+    assert_eq!(r.tokens.matching_end(1), Some(n - 2)); // `(` → `)`
+    // Pinned AT the eof position (oracle `dart analyze --format=json` on
+    // `f({`: both expected_token @3 len1 = the eof offset itself, one past
+    // the last char — the analyzer's synthetic closer + `charOffset--` land
+    // on the eof position, not eof-1). A byte range cannot address the
+    // unit after the source, so the encoded range is zero-width at eof.
+    assert_eq!(r.diagnostics[0].range.offset, 3);
+    assert_eq!(r.diagnostics[0].range.length, 0);
+    assert_eq!(r.diagnostics[1].range.offset, 3);
+    assert_eq!(r.diagnostics[1].range.length, 0);
+}
+
+#[test]
+fn unclosed_interpolation_at_eof() {
+    // `'a${b` → unclosed `${`: expected_token + unterminated_string_literal.
+    let r = scan_src("'a${b");
+    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
+    // The unterminated-string pin keeps the `endOffset - 1` law (last
+    // character `b` → [4,5)); the expected_token pins AT the eof position
+    // (oracle json: unterminated_string_literal @12 len1, expected_token
+    // '}' @13 len1 = the eof offset — two different laws).
+    assert_eq!(r.diagnostics[0].range.offset, 4);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[1].range.offset, 5);
+    assert_eq!(r.diagnostics[1].range.length, 0);
+}
+
+#[test]
+fn stray_close_brace_no_scanner_diag() {
+    // Extra/mismatched close tokens: the scanner does not report (parser's job, official appendEndGroupInternal).
+    let r = scan_src("foo())");
+    assert!(r.diagnostics.is_empty());
+    let r = scan_src("a } b");
+    assert!(r.diagnostics.is_empty());
+    assert_kinds(&r, &[K::Identifier, K::CloseCurly, K::Identifier]);
+}
+
+#[test]
+fn deeper_match_reports_intermediate_at_closer() {
+    // `{[}`: `}` matches `{` deep in the stack; the `[` above it is closed by
+    // a synthetic `]` and reported **at the mismatching closer** (official
+    // insertSyntheticClosers + `begin.endToken.charOffset` translation).
+    // Oracle `dart analyze --format=json` on `{[}\n`: expected_token
+    // "Expected to find ']'." @2 len1 — the `}` position, not eof-1.
+    let r = scan_src("{[}");
+    assert_codes(&r, &["expected_token"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 2); // the `}`
+    assert_eq!(d.range.length, 1);
+    assert!(d.message.contains("']'"), "{}", d.message);
+    let t = &r.tokens;
+    // 0 {, 1 [, 2 synthetic ], 3 }: `[` → synthetic, `{` → the real `}`.
+    assert_eq!(t.matching_end(0), Some(3));
+    assert_eq!(t.matching_end(1), Some(2));
+    assert!(t.get(2).unwrap().is_synthetic());
+}
+
+#[test]
+fn unmatched_paren_reported_at_mismatching_close() {
+    // `main() { f(} }`: the `(` above the deep `{` is reported at the first
+    // `}` (oracle json: expected_token ')' @11 len1 = the first `}`); the
+    // `{` itself closes with that `}`; the stray second `}` is silent.
+    let src = "main() { f(} }";
+    let r = scan_src(src);
+    assert_codes(&r, &["expected_token"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 11);
+    assert_eq!(d.range.length, 1);
+    assert!(d.message.contains("')'"), "{}", d.message);
+    let t = &r.tokens;
+    // 0 main, 1 (, 2 ), 3 {, 4 f, 5 (, 6 synthetic ), 7 }, 8 }
+    assert_eq!(t.matching_end(3), Some(7)); // `{` closed by the first `}`
+    assert_eq!(t.matching_end(5), Some(6)); // `(` → synthetic
+    assert!(t.get(6).unwrap().is_synthetic());
+}
+
+#[test]
+fn curly_without_match_closes_head_at_closer() {
+    // `f(}`: a `}` with no `{` anywhere still closes off the stack head at
+    // the closer: oracle json on `f(}\n` and `f(}\nhello\n` both show
+    // expected_token ')' @2 len1 (the `}`) and **nothing** at eof.
+    let r = scan_src("f(}");
+    assert_codes(&r, &["expected_token"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 2); // the `}`, not eof-1
+    assert_eq!(d.range.length, 1);
+    assert!(d.message.contains("')'"), "{}", d.message);
+    let t = &r.tokens;
+    // 0 f, 1 (, 2 synthetic ), 3 }
+    assert_eq!(t.matching_end(1), Some(2));
+    assert!(t.get(2).unwrap().is_synthetic());
+    // Content after the mismatch does not move or duplicate the report.
+    let r = scan_src("f(}\nhello\n");
+    assert_codes(&r, &["expected_token"]);
+    assert_eq!(r.diagnostics[0].range.offset, 2);
+}
+
+#[test]
+fn paren_bracket_without_match_silent() {
+    // `)`/`]` with no matching opener anywhere are silent (official
+    // appendEndGroupInternal leaves the stack alone): oracle json on
+    // `{a);}\n` and `main() { a]; }\n` → no scanner expected_token at all;
+    // the later `}` closes `{` normally.
+    let r = scan_src("{a);}");
+    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.tokens.matching_end(0), Some(4));
+    let r = scan_src("main() { a]; }");
+    assert!(r.diagnostics.is_empty());
+}
+
+#[test]
+fn gt_closes_lt_silently() {
+    // Generic closing does not error; `>>` records endGroup only for the outermost `<` (official appendGtGt).
+    let r = scan_src("List<List<int>> x");
+    assert!(r.diagnostics.is_empty());
+    let t = &r.tokens;
+    // 0 List, 1 <, 2 List, 3 <, 4 int, 5 >>, 6 x
+    assert_eq!(t.matching_end(1), Some(5));
+    assert_eq!(t.matching_end(3), None); // inner one unrecorded (official semantics)
+    assert_eq!(t.matching_end(1), Some(5));
+}
+
+#[test]
+fn single_gt_closes_inner_lt() {
+    // A single `>` closes one level: the `>` of `Map<String, int>` is recorded for the `<`.
+    let r = scan_src("Map<String, int> m");
+    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.tokens.matching_end(1), Some(5));
+}
+
+#[test]
+fn discard_open_lt_on_semicolon_brace() {
+    // `;` / `{` / `[` / `${` / `=` silently discard an unclosed `<` (official discardOpenLt).
+    let r = scan_src("if (a < b) {}");
+    assert!(r.diagnostics.is_empty());
+    // By the time `{` appears, the `<` has been silently popped → the `{` begin closes normally.
+    let t = &r.tokens;
+    let open_curly = t
+        .as_slice()
+        .iter()
+        .position(|x| x.kind == K::OpenCurly)
+        .unwrap();
+    assert!(t.matching_end(open_curly).is_some());
+}
+
+#[test]
+fn dart_version_comment_in_window() {
+    let r = scan_src("// @dart = 2.19\nvar x;");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 19))
+    );
+}
+
+#[test]
+fn dart_version_comment_formats() {
+    // No-space form.
+    let r = scan_src("//@dart=2.12\nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 12))
+    );
+    // Multi-space form.
+    let r = scan_src("//   @dart   =   3.15  \nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(3, 15))
+    );
+    // Comments following other comments are still inside the window.
+    let r = scan_src("// lead\n// @dart = 2.19\n// trail\nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 19))
+    );
+    // A version comment after a script tag is still inside the window.
+    let r = scan_src("#!/usr/bin/env dart\n// @dart = 2.19\nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 19))
+    );
+    // Multiple matches: the first one wins (official registerExplicitLanguageVersion:
+    // `_languageVersion.isExplicit → return`, source_compilation_unit.dart:486).
+    let r = scan_src("// @dart = 2.1\n// @dart = 2.19\nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 1))
+    );
+}
+
+#[test]
+fn dart_version_comment_invalid_forms() {
+    // `///` is not a version comment.
+    let r = scan_src("/// @dart = 2.19\nx");
+    assert_eq!(r.language_version_override, None);
+    // Tab indentation does not match the syntax (the official scanner only eats spaces).
+    let r = scan_src("//\t@dart = 2.19\nx");
+    assert_eq!(r.language_version_override, None);
+    // Trailing garbage.
+    let r = scan_src("// @dart = 2.19 nope\nx");
+    assert_eq!(r.language_version_override, None);
+    // Missing minor.
+    let r = scan_src("// @dart = 2\nx");
+    assert_eq!(r.language_version_override, None);
+    // Outside the window (a real token already emitted).
+    let r = scan_src("var x; // @dart = 2.19");
+    assert_eq!(r.language_version_override, None);
+    // Block comments do not trigger recognition.
+    let r = scan_src("/* @dart = 2.19 */\nx");
+    assert_eq!(r.language_version_override, None);
+}
+
+#[test]
+fn eof_after_version_comment_only() {
+    let r = scan_src("// @dart = 2.19");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 19))
+    );
+    assert_eq!(r.tokens.len(), 1);
+}
+
+#[test]
+fn del_merges_into_identifier() {
+    // DEL (0x7F) takes the official default arm (error_token.dart:17-47 →
+    // NonAsciiIdentifierToken): merges with the adjacent identifier, message
+    // worded as a non-ASCII character (the pre-fix ASCII-skip arm contradicted it).
+    let src = "ab\u{7F}cd";
+    let r = scan_src(src);
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["illegal_character"]);
+    assert_eq!(r.tokens.first().byte_range(), 0..src.len());
+    // DEL adjacent to a preceding identifier folds into it.
+    let r = scan_src("ab\u{7F}");
+    assert_kinds(&r, &[K::Identifier]);
+    assert_eq!(r.tokens.first().byte_range(), 0..3);
+}
+
+#[test]
+fn replacement_char_is_encoding_error_skipped() {
+    // U+FFFD: official EncodingErrorToken — `encoding` diagnostic and skip,
+    // never merged into an identifier (error_token.dart:25-26,
+    // translate_error_token.dart:33-35).
+    let r = scan_src("a\u{FFFD}b");
+    assert_kinds(&r, &[K::Identifier, K::Identifier]);
+    assert_codes(&r, &["encoding"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 1);
+    assert_eq!(d.range.length, 1);
+    // Consecutive U+FFFD: one diagnostic each, no token merging.
+    let r = scan_src("\u{FFFD}\u{FFFD}x");
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["encoding", "encoding"]);
+}
+
+#[test]
+fn unterminated_comment_multibyte_last_char() {
+    // F6: the diagnostic pins to the last character (analyzer endOffset-1) —
+    // the UTF-16 range stays a single unit even when that character is
+    // multi-byte (`a /* 你好` → the range covers 好, utf16 [6,7)).
+    let src = "a /* 你好";
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_multi_line_comment"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 6);
+    assert_eq!(d.range.length, 1);
+}
+
+#[test]
+fn unterminated_string_astral_last_char() {
+    // The analyzer pin is `endOffset - 1` in UTF-16 units — for an astral
+    // final character that is its LOW surrogate, a single unit (oracle
+    // `dart analyze` on `'abc 😀`: offset eof-1, length 1), not the
+    // character start with length 2.
+    let src = "'abc 😀"; // utf16: ' 0, a 1, b 2, c 3, sp 4, emoji 5-6, eof 7
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 6);
+    assert_eq!(d.range.length, 1);
+    // Newline-terminated form: one unit before the newline (same rule).
+    let r = scan_src("'abc 😀\n");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 6);
+    assert_eq!(d.range.length, 1);
+    // CRLF: the CR is the stop position; one unit before it.
+    let r = scan_src("'abc 😀\r\n");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 6);
+    assert_eq!(d.range.length, 1);
+    // Raw form: same pin rule (oracle `r'abc 😀`: eof-1).
+    let r = scan_src("r'abc 😀"); // utf16: r 0, ' 1, a 2..sp 5, emoji 6-7, eof 8
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 7);
+    assert_eq!(d.range.length, 1);
+    // Multiline form with inner line break: pin = eof-1 (oracle `'''abc\r\n😀`).
+    let r = scan_src("'''abc\r\n😀"); // utf16: ''' 0-2, abc 3-5, \r 6, \n 7, emoji 8-9, eof 10
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 9);
+    assert_eq!(d.range.length, 1);
+}
+
+#[test]
+fn unterminated_comment_astral_last_char() {
+    // Same rule as strings: the pin is the last UTF-16 unit — the emoji's
+    // low surrogate — not the character start (oracle `a /* 😀`: eof-1).
+    let src = "a /* 😀"; // utf16: a 0, sp 1, / 2, * 3, sp 4, emoji 5-6, eof 7
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_multi_line_comment"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 6);
+    assert_eq!(d.range.length, 1);
+}
+
+#[test]
+fn eof_expected_token_astral_last_char() {
+    // The synthetic-close `expected_token` at EOF pins the eof POSITION
+    // itself (oracle json on `f(😀`: expected_token ')' @4 len1 = the utf16
+    // eof offset — one unit past the emoji's low surrogate), regardless of
+    // the final character's width.
+    let r = scan_src("f(😀"); // utf16: f 0, ( 1, emoji 2-3, eof 4
+    assert_codes(
+        &r,
+        &["illegal_character", "illegal_character", "expected_token"],
+    );
+    let d = &r.diagnostics[2];
+    assert_eq!(d.range.offset, 4);
+    assert_eq!(d.range.length, 0);
+}
+
+#[test]
+fn dollar_missing_identifier_astral_char() {
+    // `$` + astral char: missing_identifier pins the character itself — a
+    // single UTF-16 unit at the character start (oracle `'$😀`: high
+    // surrogate, length 1), not the whole surrogate pair.
+    let src = "'$😀"; // utf16: ' 0, $ 1, emoji 2-3, eof 4
+    let r = scan_src(src);
+    assert_codes(&r, &["missing_identifier", "unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 2);
+    assert_eq!(d.range.length, 1);
+    // The string's own unterminated pin is the low surrogate (eof-1).
+    let d = &r.diagnostics[1];
+    assert_eq!(d.range.offset, 3);
+    assert_eq!(d.range.length, 1);
+}
+
+#[test]
+fn empty_block_comment_is_not_unterminated() {
+    // `/**/` scans as a plain comment (regression: the block-comment entry
+    // used to re-bump and swallow one content character, mis-scanning `/**/`).
+    let r = scan_src("/**/x");
+    assert_kinds(&r, &[K::Identifier]);
+    assert!(r.diagnostics.is_empty());
+    let r = scan_src("/***/x");
+    assert_kinds(&r, &[K::Identifier]);
+    assert!(r.diagnostics.is_empty());
+}
+
+#[test]
+fn bom_offsets_recorded_convention() {
+    // Recorded dartiq convention (crate docs "Known divergences"): the BOM
+    // counts as 1 UTF-16 unit; all offsets stay internally consistent.
+    let src = "\u{FEFF}var x;";
+    let r = scan_src(src);
+    let t = r.tokens.first();
+    assert_eq!(t.byte_offset, 3);
+    assert_eq!(t.utf16_offset, 1);
+    assert_eq!(byte_offset_to_utf16(src, 3), 1);
+}
+
+#[test]
+fn this_discards_open_lt() {
+    // `this` discards an open `<` group (official appendKeywordToken: type
+    // parameters cannot contain 'this') → the later `>` closes nothing.
+    let r = scan_src("x < y ? this : z > w");
+    assert!(r.diagnostics.is_empty());
+    let t = &r.tokens;
+    let lt = t
+        .as_slice()
+        .iter()
+        .position(|tok| tok.kind == K::Lt)
+        .unwrap();
+    assert_eq!(t.matching_end(lt), None);
+    // Same inside interpolation: `'$this'` (keyword arm of the SII path).
+    let r = scan_src("'${a < b ? this : c}'");
+    assert!(r.diagnostics.is_empty());
+    let t = &r.tokens;
+    let lt = t
+        .as_slice()
+        .iter()
+        .position(|tok| tok.kind == K::Lt)
+        .unwrap();
+    assert_eq!(t.matching_end(lt), None);
+}

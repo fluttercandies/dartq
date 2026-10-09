@@ -1,0 +1,13 @@
+name: corpus_m1_semantic
+description: >-
+  M1 semantic-diagnostic targeted corpus (goal #125): one fixture per frozen
+  gate code in tests/harness/m1_codes.txt, dart-verify caliber,
+  implementation-independent. See docs/facts/resolution-design-spec.md 4.2 for
+  trigger conditions.
+environment:
+  sdk: ^3.13.0
+dependencies:
+  # undefined_referenced_parameter is only emitted on meta's
+  # @UseResult.unless(parameterDefined:) annotations (analyzer 8.x
+  # annotation_verifier); the honest trigger needs this one dependency.
+  meta: ^1.16.0

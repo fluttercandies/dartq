@@ -1,0 +1,10 @@
+{
+  "case": "057_unterminated_raw_multi",
+  "origin": "pkg/front_end/test/scanner_test.dart:1118 (synthetic STRING lexeme r'''string''' offset 0 length 10; diagnostic at 9)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 10, "r'''string'''", 1]
+  ],
+  "diagnostics": [["unterminated_string_literal", 9]]
+}

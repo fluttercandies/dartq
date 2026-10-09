@@ -1,0 +1,10 @@
+{
+  "case": "020_int_forms",
+  "origin": "pkg/front_end/test/scanner_test.dart:448 test_int + :460 test_int_initialZero (leading zero stays INT, no diagnostic)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Int", 0, 3, "123"], ["Int", 4, 4, "0123"]
+  ],
+  "diagnostics": []
+}

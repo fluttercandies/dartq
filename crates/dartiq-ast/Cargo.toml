@@ -1,0 +1,14 @@
+[package]
+name = "dartiq-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dartiq-language = { path = "../dartiq-language" }
+dartiq-scanner = { path = "../dartiq-scanner" }
+dartiq-source = { path = "../dartiq-source" }
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+# Pin the style edition to match the workspace edition (2024 in
+# [workspace.package]). Without this, rustfmt formats with its built-in
+# default style edition, which disagrees with the StyleEdition 2024
+# conventions the code already follows (use-tree sorting, line breaking),
+# causing spurious `cargo fmt --check` drift. Keep this in sync when the
+# workspace edition is bumped.
+style_edition = "2024"
+
+max_width = 100

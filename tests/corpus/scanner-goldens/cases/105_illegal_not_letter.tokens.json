@@ -1,0 +1,8 @@
+{
+  "case": "105_illegal_not_letter",
+  "origin": "pkg/front_end/test/scanner_test.dart:412 (U+0312 combining mark, not identifier-start-like -> illegalCharacter@0 args[0x312], skipped)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [],
+  "diagnostics": [["illegal_character", 0, [786]]]
+}

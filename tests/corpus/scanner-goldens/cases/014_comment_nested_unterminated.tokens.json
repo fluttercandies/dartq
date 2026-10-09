@@ -1,0 +1,10 @@
+{
+  "case": "014_comment_nested_unterminated",
+  "origin": "derived from pkg/front_end/test/scanner_test.dart:234 + :238 (inner /* closes, outer /* stays open to EOF; diagnostic pins last char per dartiq lib.rs:53 contract and official comment-recovery path)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Keyword", 0, 3, "int"], ["Identifier", 4, 1, "x"], ["Semicolon", 5, 1, ";"]
+  ],
+  "diagnostics": [["unterminated_multi_line_comment", 14]]
+}

@@ -1,0 +1,90 @@
+{
+  "comment:0": "NOTE: THIS FILE IS GENERATED. DO NOT EDIT.",
+  "comment:1": "Instead modify 'sdk/lib/libraries.yaml' and follow the instructions therein.",
+  "none": {
+    "libraries": {}
+  },
+  "vm_common": {
+    "libraries": {
+      "_internal": {
+        "uri": "internal/internal.dart",
+        "patches": [
+          "_internal/vm/lib/internal_patch.dart",
+          "_internal/vm_shared/lib/check_valid_weak_target_patch.dart"
+        ]
+      },
+      "async": {
+        "uri": "async/async.dart",
+        "patches": [
+          "_internal/vm/lib/async_patch.dart"
+        ]
+      },
+      "core": {
+        "uri": "core/core.dart",
+        "patches": [
+          "_internal/vm/lib/array_patch.dart",
+          "_internal/vm/lib/core_patch.dart",
+          "_internal/vm_shared/lib/bigint_patch.dart",
+          "_internal/vm/lib/bigint_patch_patch.dart",
+          "_internal/vm_shared/lib/bool_patch.dart",
+          "_internal/vm_shared/lib/date_patch.dart",
+          "_internal/vm_shared/lib/integers_patch.dart",
+          "_internal/vm_shared/lib/map_patch.dart",
+          "_internal/vm_shared/lib/null_patch.dart",
+          "_internal/vm_shared/lib/string_buffer_patch.dart",
+          "_internal/vm_shared/lib/uri_encode_patch.dart"
+        ]
+      },
+      "io": {
+        "uri": "io/io.dart",
+        "patches": [
+          "_internal/vm/bin/common_patch.dart"
+        ]
+      },
+      "math": {
+        "uri": "math/math.dart",
+        "patches": "_internal/vm/lib/math_patch.dart"
+      }
+    }
+  },
+  "vm": {
+    "include": [
+      {
+        "target": "vm_common"
+      }
+    ],
+    "libraries": {
+      "cli": {
+        "uri": "cli/cli.dart"
+      }
+    }
+  },
+  "_dart2js_common": {
+    "libraries": {
+      "core": {
+        "uri": "core/core.dart",
+        "patches": [
+          "_internal/js_shared/lib/date_time_patch.dart",
+          "_internal/js_runtime/lib/core_patch.dart"
+        ]
+      },
+      "io": {
+        "uri": "io/io.dart",
+        "patches": "_internal/js_runtime/lib/io_patch.dart",
+        "support_conditional_import": false
+      }
+    }
+  },
+  "dart2js": {
+    "include": [
+      {
+        "target": "_dart2js_common"
+      }
+    ],
+    "libraries": {
+      "html": {
+        "uri": "html/dart2js/html_dart2js.dart"
+      }
+    }
+  }
+}

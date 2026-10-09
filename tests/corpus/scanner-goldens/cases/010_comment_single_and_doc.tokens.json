@@ -1,0 +1,10 @@
+{
+  "case": "010_comment_single_and_doc",
+  "origin": "pkg/front_end/test/scanner_test.dart:245 test_comment_single (comments attach to precedingComments chain, never enter the token stream)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Keyword", 32, 3, "int"], ["Identifier", 36, 1, "x"], ["Semicolon", 37, 1, ";"]
+  ],
+  "diagnostics": []
+}

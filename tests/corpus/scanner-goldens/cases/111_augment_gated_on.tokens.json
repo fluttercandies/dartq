@@ -1,0 +1,10 @@
+{
+  "case": "111_augment_gated_on",
+  "origin": "pkg/front_end/test/scanner_test.dart:480 test_keyword_augment (enable_augmentations=true -> Keyword)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Keyword", 0, 7, "augment"]
+  ],
+  "diagnostics": []
+}

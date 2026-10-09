@@ -1,0 +1,11 @@
+{
+  "case": "060_unterminated_interp_multi_block",
+  "origin": "pkg/front_end/test/scanner_test.dart:1069 (offsets verbatim; unterminatedStringLiteral@8 then expectedToken['}']@9)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 3, "'''"], ["StringInterpolationExpression", 3, 2, "${"], ["Identifier", 5, 4, "name"],
+    ["CloseCurly", 9, 1, "}", 1], ["String", 9, 0, "'''", 1]
+  ],
+  "diagnostics": [["unterminated_string_literal", 8], ["expected_token", 9, ["}"]]]
+}

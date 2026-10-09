@@ -1,0 +1,10 @@
+{
+  "case": "011_comment_block",
+  "origin": "pkg/front_end/test/scanner_test.dart:194 test_comment_multi",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Keyword", 20, 3, "int"], ["Identifier", 24, 1, "x"], ["Semicolon", 25, 1, ";"]
+  ],
+  "diagnostics": []
+}

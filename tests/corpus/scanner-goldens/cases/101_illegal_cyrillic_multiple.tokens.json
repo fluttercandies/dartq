@@ -1,0 +1,11 @@
+{
+  "case": "101_illegal_cyrillic_multiple",
+  "origin": "pkg/front_end/test/scanner_test.dart:371 (two diagnostics, one merged identifier ShcheгlovЩx)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Identifier", 0, 1, "a"], ["Eq", 2, 1, "="], ["Identifier", 4, 11, "ShcheгlovЩx"],
+    ["Semicolon", 15, 1, ";"]
+  ],
+  "diagnostics": [["illegal_character", 9, [1075]], ["illegal_character", 13, [1065]]]
+}

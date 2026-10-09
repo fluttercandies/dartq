@@ -1,0 +1,10 @@
+{
+  "case": "055_unterminated_raw_eof",
+  "origin": "pkg/front_end/test/scanner_test.dart:1141 (synthetic STRING r'string' offset 0 length 8; diagnostic at 7)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 8, "r'string'", 1]
+  ],
+  "diagnostics": [["unterminated_string_literal", 7]]
+}

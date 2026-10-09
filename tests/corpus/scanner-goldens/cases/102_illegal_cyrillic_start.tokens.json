@@ -1,0 +1,10 @@
+{
+  "case": "102_illegal_cyrillic_start",
+  "origin": "pkg/front_end/test/scanner_test.dart:389 (illegalCharacter@0 args[0x429], recovers to identifier)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Identifier", 0, 1, "Щ"]
+  ],
+  "diagnostics": [["illegal_character", 0, [1065]]]
+}

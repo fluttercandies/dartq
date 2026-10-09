@@ -1,0 +1,10 @@
+{
+  "case": "113_async_sync_star",
+  "origin": "pkg/front_end/test/scanner_test.dart:120 + :1352 (pseudo-keyword + STAR, two tokens each)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Keyword", 0, 5, "async"], ["Star", 5, 1, "*"], ["Keyword", 7, 4, "sync"], ["Star", 11, 1, "*"]
+  ],
+  "diagnostics": []
+}

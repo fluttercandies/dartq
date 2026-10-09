@@ -1,0 +1,24 @@
+{
+ "case": "022_hex_forms",
+ "origin": "pkg/front_end/test/scanner_test.dart:329 + :333",
+ "config": {
+  "triple_shift": true,
+  "augment": true
+ },
+ "language_version": null,
+ "tokens": [
+  [
+   "Hexadecimal",
+   0,
+   8,
+   "0x1A2B3C"
+  ],
+  [
+   "HexadecimalWithSeparators",
+   9,
+   10,
+   "0x1A_2B_3C"
+  ]
+ ],
+ "diagnostics": []
+}

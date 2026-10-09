@@ -1,0 +1,10 @@
+{
+  "case": "041_string_raw_forms",
+  "origin": "pkg/front_end/test/scanner_test.dart:1133 + :1137 (r keyword consumed into the STRING token)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 9, "r'string'"], ["String", 10, 9, "r\"string\""]
+  ],
+  "diagnostics": []
+}

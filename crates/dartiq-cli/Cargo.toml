@@ -1,0 +1,22 @@
+[package]
+name = "dartiq-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The published command face is `dartiq check` (engine-api-spec §4.1); ship
+# the binary under that name rather than the package name.
+[[bin]]
+name = "dartiq"
+path = "src/main.rs"
+
+[dependencies]
+dartiq-diagnostics = { path = "../dartiq-diagnostics" }
+dartiq-language = { path = "../dartiq-language" }
+dartiq-parser = { path = "../dartiq-parser" }
+dartiq-scanner = { path = "../dartiq-scanner" }
+dartiq-source = { path = "../dartiq-source" }
+
+[lints]
+workspace = true

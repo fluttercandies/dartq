@@ -1,0 +1,38 @@
+//! dartiq's diagnostic data model and oracle-exact output writers.
+//!
+//! This crate is the single source of truth for the shape and serialization of
+//! dartiq diagnostics (PRD §13). Its output must match `dart analyze`'s
+//! machine formats field-for-field, so every layout decision here is pinned to
+//! the measured oracle facts (`docs/facts/oracle-machine-format.md`).
+//!
+//! - [`Severity`] and [`DiagnosticType`]: the severity and type layering
+//!   measured from `dart analyze --format=machine` (`TYPE` value set:
+//!   `SYNTACTIC_ERROR` / `COMPILE_TIME_ERROR` / `STATIC_WARNING` / `LINT`,
+//!   plus dartiq's own `TOOL` for the `dartiq/` namespace).
+//! - [`CodeInfo`] and [`CodeRegistry`]: stable official code names
+//!   (`snake_case`, one-to-one with the analyzer's codes, PRD §13.2) and
+//!   dartiq-own `dartiq/`-prefixed codes. The official table is generated at
+//!   build time from `data/syntax-codes.tsv` (dart 3.13.1 oracle lock).
+//! - [`Diagnostic`]: one diagnostic located by a [`FileId`] plus a
+//!   UTF-16-unit [`SourceRange`] (PRD §13.1).
+//! - [`write_machine`] / [`write_json`]: byte-exact oracle output writers.
+//!   Both consume an [`AnalysisOutput`], pairing the diagnostics with a
+//!   [`FileLayoutProvider`] the caller implements on top of the engine's line
+//!   index; this crate never depends on the scanner.
+//!
+//! [`FileId`] and [`SourceRange`] are re-exported from `dartiq-source`, the
+//! single source of truth for file identity and the UTF-16 position
+//! convention (PRD §6/§7/§10.4).
+
+mod code;
+mod model;
+mod writer;
+
+// Everything in `code` is public API: the per-code constants span the
+// build-generated official table (data/syntax-codes.tsv) plus the
+// M0-measured and dartiq-own namespaces.
+pub use code::*;
+pub use model::{
+    AnalysisOutput, Diagnostic, DiagnosticType, FileId, FileLayoutProvider, Severity, SourceRange,
+};
+pub use writer::{write_json, write_machine};

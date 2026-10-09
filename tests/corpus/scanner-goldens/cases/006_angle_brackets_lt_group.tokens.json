@@ -1,0 +1,11 @@
+{
+  "case": "006_angle_brackets_lt_group",
+  "origin": "pkg/front_end/test/scanner_test.dart:107 test_angle_brackets",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Lt", 0, 1, "<"], ["Identifier", 1, 6, "String"], ["Gt", 7, 1, ">"]
+  ],
+  "diagnostics": [],
+  "notes": "official additionally asserts Lt is a BeginToken with endGroup == the Gt token; golden encodes flat stream only"
+}

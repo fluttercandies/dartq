@@ -1,0 +1,13 @@
+{
+  "case": "048_interp_block_nested_map",
+  "origin": "pkg/front_end/test/scanner_test.dart:1201 (offsets verbatim; first } closes the inner {, second } closes ${)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 3, "'a "], ["StringInterpolationExpression", 3, 2, "${"], ["Identifier", 5, 1, "f"],
+    ["OpenParen", 6, 1, "("], ["OpenCurly", 7, 1, "{"], ["String", 8, 3, "'b'"], ["Colon", 12, 1, ":"],
+    ["String", 14, 3, "'c'"], ["CloseCurly", 17, 1, "}"], ["CloseParen", 18, 1, ")"],
+    ["CloseCurly", 19, 1, "}"], ["String", 20, 3, " d'"]
+  ],
+  "diagnostics": []
+}

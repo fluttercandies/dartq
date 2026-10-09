@@ -1,0 +1,12 @@
+{
+  "case": "047_interp_first_and_last",
+  "origin": "pkg/front_end/test/scanner_test.dart:1218 (offsets transcribed verbatim)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 1, "'"], ["StringInterpolationIdentifier", 1, 1, "$"], ["Identifier", 2, 8, "greeting"],
+    ["String", 10, 1, " "], ["StringInterpolationIdentifier", 11, 1, "$"], ["Identifier", 12, 4, "name"],
+    ["String", 16, 1, "'"]
+  ],
+  "diagnostics": []
+}

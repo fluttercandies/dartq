@@ -1,0 +1,10 @@
+{
+  "case":  "043_string_escaped_dollar",
+  "origin": "pkg/front_end/test/scanner_test.dart:1175 (escaped dollar does NOT start interpolation; single STRING token)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 6, "'a\\$b'"]
+  ],
+  "diagnostics": []
+}

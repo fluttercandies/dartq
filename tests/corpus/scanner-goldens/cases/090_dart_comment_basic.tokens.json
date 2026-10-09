@@ -1,0 +1,51 @@
+{
+ "case": "090_dart_comment_basic",
+ "origin": "pkg/analyzer/test/generated/scanner_test.dart:138 ('// @dart = 2.0' recognized; here 2.9) + abstract_scanner.dart:1009 (strict grammar: // SP* @dart SP* = SP* digits . digits)",
+ "config": {
+  "triple_shift": true,
+  "augment": true
+ },
+ "language_version": {
+  "major": 2,
+  "minor": 9
+ },
+ "tokens": [
+  [
+   "Keyword",
+   15,
+   4,
+   "void"
+  ],
+  [
+   "Identifier",
+   20,
+   1,
+   "f"
+  ],
+  [
+   "OpenParen",
+   21,
+   1,
+   "("
+  ],
+  [
+   "CloseParen",
+   22,
+   1,
+   ")"
+  ],
+  [
+   "OpenCurly",
+   24,
+   1,
+   "{"
+  ],
+  [
+   "CloseCurly",
+   25,
+   1,
+   "}"
+  ]
+ ],
+ "diagnostics": []
+}

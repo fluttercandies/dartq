@@ -1,0 +1,4 @@
+# Byte-exact test fixtures: never translate line endings or encoding.
+# Scanner goldens and corpus files are hashed/compared at the byte level
+# (CRLF fixtures, line-start offsets), so any EOL normalization corrupts them.
+tests/corpus/** -text

@@ -1,0 +1,11 @@
+{
+  "case": "059_unterminated_interp_identifier",
+  "origin": "pkg/front_end/test/scanner_test.dart:1334 (offsets verbatim; synthetic empty STRING@6; diagnostic at 5)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 1, "'"], ["StringInterpolationIdentifier", 1, 1, "$"], ["Identifier", 2, 4, "name"],
+    ["String", 6, 0, "'", 1]
+  ],
+  "diagnostics": [["unterminated_string_literal", 5]]
+}

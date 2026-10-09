@@ -1,0 +1,9 @@
+{
+  "case": "121_line_info_multiline_comment",
+  "origin": "pkg/analyzer/test/generated/scanner_test.dart:24 (offset 5 -> line 2 col 2, offset 10 -> line 3 col 3; encoded as line_starts [0,4,8])",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "line_starts": [0, 4, 8],
+  "tokens": [],
+  "diagnostics": []
+}

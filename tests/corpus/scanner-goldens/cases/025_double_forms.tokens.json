@@ -1,0 +1,12 @@
+{
+  "case": "025_double_forms",
+  "origin": "pkg/front_end/test/scanner_test.dart:265/269/273/281/285/249/253",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Double", 0, 4, ".123"], ["Double", 5, 6, ".123E4"], ["Double", 12, 6, ".123e4"],
+    ["Double", 19, 4, "12E4"], ["Double", 24, 4, "12e4"], ["Double", 29, 7, "0.123E4"],
+    ["Double", 37, 7, "0.123e4"]
+  ],
+  "diagnostics": []
+}

@@ -1,0 +1,51 @@
+{
+ "case": "071_mismatched_closer_bracket_paren",
+ "origin": "pkg/front_end/test/scanner_test.dart:821 (scanner picks strategy 1: synthetic ')' inserted for '(', real ']' closes '[', trailing ')' plain; one expectedToken[')']@2)",
+ "config": {
+  "triple_shift": true,
+  "augment": true
+ },
+ "language_version": null,
+ "tokens": [
+  [
+   "OpenBracket",
+   0,
+   1,
+   "["
+  ],
+  [
+   "OpenParen",
+   1,
+   1,
+   "("
+  ],
+  [
+   "CloseParen",
+   2,
+   1,
+   ")",
+   1
+  ],
+  [
+   "CloseBracket",
+   2,
+   1,
+   "]"
+  ],
+  [
+   "CloseParen",
+   3,
+   1,
+   ")"
+  ]
+ ],
+ "diagnostics": [
+  [
+   "expected_token",
+   2,
+   [
+    ")"
+   ]
+  ]
+ ]
+}

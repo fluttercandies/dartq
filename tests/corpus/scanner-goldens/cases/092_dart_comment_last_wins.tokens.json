@@ -1,0 +1,11 @@
+{
+  "case": "092_dart_comment_last_wins",
+  "origin": "abstract_scanner.dart:972 _scanHeaderLookingForLanguageVersion (header loop keeps scanning while tail unchanged; tokenizeLanguageVersionOrSingleLineComment callback overwrites -> last wins; mirrored dartiq lib.rs:37)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": {"major": 3, "minor": 0},
+  "tokens": [
+    ["Keyword", 30, 3, "var"], ["Identifier", 34, 1, "y"], ["Eq", 36, 1, "="],
+    ["Int", 38, 1, "2"], ["Semicolon", 39, 1, ";"]
+  ],
+  "diagnostics": []
+}

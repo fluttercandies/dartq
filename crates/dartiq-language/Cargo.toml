@@ -1,0 +1,16 @@
+[package]
+name = "dartiq-language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[lints]
+workspace = true

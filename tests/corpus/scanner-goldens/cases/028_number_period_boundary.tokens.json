@@ -1,0 +1,13 @@
+{
+  "case": "028_number_period_boundary",
+  "origin": "pkg/front_end/test/scanner_test.dart:927 + :937 (trailing . not part of INT; .. stays PERIOD_PERIOD)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["Int", 0, 2, "42"], ["Period", 2, 1, "."], ["Identifier", 3, 6, "isEven"],
+    ["OpenParen", 9, 1, "("], ["CloseParen", 10, 1, ")"],
+    ["Int", 12, 2, "42"], ["PeriodPeriod", 14, 2, ".."], ["Identifier", 16, 6, "isEven"],
+    ["OpenParen", 22, 1, "("], ["CloseParen", 23, 1, ")"]
+  ],
+  "diagnostics": []
+}

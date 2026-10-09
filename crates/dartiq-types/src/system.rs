@@ -1,0 +1,834 @@
+//! The subtype relation, assignability, and nullability predicates.
+//!
+//! Direct port of the analyzer's rule table
+//! (`pkg/analyzer/lib/src/dart/element/subtype.dart:262-523`): the rule order
+//! below is the source order, and short-circuiting matches it exactly.
+//! M1 omissions (spec §5) are marked inline: no promoted bounds, no declared
+//! bounds on type parameters, no variance annotations (class parameters are
+//! covariant, `element.dart:11560-11561`), no extension types, no
+//! `UnknownInferredType`.
+
+use std::cell::RefCell;
+use std::cmp::Ordering;
+
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::hierarchy::{CoreDecls, DeclInfo, TypeHierarchy};
+use crate::ids::{FunctionSigId, TypeDeclId, TypeId};
+use crate::table::TypeTable;
+use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
+
+/// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
+/// mechanism with the same limit (`type_system.dart:85`); exceeding it makes
+/// `is_subtype` return `false` (`subtype.dart:37-41`).
+const DEPTH_LIMIT: u32 = 100;
+
+/// Visited set over interned ids: an epoch-stamp vector instead of a hash
+/// set. Ids are dense `u32` pool indexes, so membership is a direct slot
+/// compare, and [`StampSet::clear`] only bumps the epoch — reuse across
+/// walks never rewrites old entries, and stamps are grown lazily as the
+/// walk interns new ids.
+#[derive(Clone)]
+pub(crate) struct StampSet {
+    epoch: u32,
+    stamps: Vec<u32>,
+}
+
+impl Default for StampSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StampSet {
+    fn new() -> Self {
+        Self {
+            epoch: 1,
+            stamps: Vec::new(),
+        }
+    }
+
+    /// Whether `id` was unseen this epoch (and marks it seen).
+    fn insert(&mut self, id: TypeId) -> bool {
+        let index = id.raw() as usize;
+        if index >= self.stamps.len() {
+            self.stamps.resize(index + 1, 0);
+        }
+        let stamp = &mut self.stamps[index];
+        if *stamp == self.epoch {
+            return false;
+        }
+        *stamp = self.epoch;
+        true
+    }
+
+    fn clear(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamps.fill(0);
+            self.epoch = 1;
+        }
+    }
+}
+
+/// Reusable subtype-walk buffers: the interface walk's visited set and LIFO
+/// frontier, plus the LUB supertype-closure sets and their intersection.
+/// Cleared (not reallocated) at the start of every use, so steady-state
+/// queries allocate nothing.
+#[derive(Clone, Default)]
+pub(crate) struct WalkScratch {
+    pub(crate) visited: StampSet,
+    pub(crate) frontier: Vec<TypeId>,
+    pub(crate) set_a: FxHashSet<TypeId>,
+    pub(crate) set_b: FxHashSet<TypeId>,
+    pub(crate) candidates: Vec<TypeId>,
+}
+
+/// Facade over a [`TypeTable`] plus a [`TypeHierarchy`] snapshot. All queries
+/// take `&self`: interning synthesized types (`Future<S>`, `Object?`, stripped
+/// projections) goes through the table's interior mutability, so the table
+/// grows but ids never change.
+///
+/// The system owns two non-reentrant scratch cells:
+///
+/// - `walk`: the subtype-walk and LUB-closure buffers. A walk claims the
+///   cell for its whole duration; a *re-entrant* query (rule 12 reached
+///   again through an argument check while an outer interface walk is in
+///   flight) cannot claim it and transparently falls back to fresh local
+///   containers. Claim detection is `try_borrow_mut`, so no nesting depth
+///   bookkeeping is needed.
+/// - `future_memo`: `Future<S>` synthesis keyed by the argument id. It is
+///   only ever held across a single lookup/insert, never across a recursive
+///   query, so re-entrancy cannot arise.
+///
+/// Both are single-threaded, matching [`TypeTable`]'s interior `RefCell`.
+#[derive(Clone)]
+pub struct TypeSystem<'a> {
+    table: &'a TypeTable,
+    hierarchy: &'a TypeHierarchy,
+    pub(crate) walk: RefCell<WalkScratch>,
+    future_memo: RefCell<FxHashMap<TypeId, TypeId>>,
+}
+
+impl<'a> TypeSystem<'a> {
+    /// Binds the table and hierarchy snapshot.
+    #[must_use]
+    pub fn new(table: &'a TypeTable, hierarchy: &'a TypeHierarchy) -> Self {
+        Self {
+            table,
+            hierarchy,
+            walk: RefCell::default(),
+            future_memo: RefCell::default(),
+        }
+    }
+
+    /// The underlying table (for interning the types being queried).
+    #[must_use]
+    pub const fn table(&self) -> &TypeTable {
+        self.table
+    }
+
+    /// The hierarchy snapshot.
+    #[must_use]
+    pub const fn hierarchy(&self) -> &TypeHierarchy {
+        self.hierarchy
+    }
+
+    /// Semantic nullability: `true` for `dynamic`, `Invalid`, `void`, `Null`,
+    /// any `?` type, and `FutureOr<T>` with nullable `T`
+    /// (`type_system.dart:1216-1233`).
+    #[must_use]
+    pub fn is_nullable(&self, t: TypeId) -> bool {
+        let ty = self.table.get(t);
+        if ty.is_nullable() {
+            return true;
+        }
+        match ty.kind() {
+            TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => true,
+            TypeKind::FutureOr { base } => self.is_nullable(base),
+            _ => false,
+        }
+    }
+
+    /// `isNonNullable` (`type_system.dart:1883-1912`).
+    #[must_use]
+    pub fn is_non_nullable(&self, t: TypeId) -> bool {
+        let ty = self.table.get(t);
+        if ty.is_nullable() {
+            return false;
+        }
+        match ty.kind() {
+            // M1 has no declared bounds; the official unbound case is `false`
+            // as well (type_system.dart:1910).
+            TypeKind::Dynamic
+            | TypeKind::Void
+            | TypeKind::Invalid
+            | TypeKind::Null
+            | TypeKind::TypeParameter { .. } => false,
+            TypeKind::FutureOr { base } => self.is_non_nullable(base),
+            _ => true,
+        }
+    }
+
+    /// The top-type predicate `{dynamic, Invalid, void, Object?}` plus
+    /// `FutureOr<T>` with top `T` (`type_system.dart:1277-1311`).
+    #[must_use]
+    pub fn is_top(&self, t: TypeId) -> bool {
+        let ty = self.table.get(t);
+        match ty.kind() {
+            TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid => true,
+            TypeKind::FutureOr { base } if !ty.is_nullable() => self.is_top(base),
+            _ if ty.is_nullable() => {
+                // TOP(T?) iff TOP(T) or OBJECT(T) (type_system.dart:1294-1298).
+                let stripped = self.strip(t);
+                self.is_top(stripped) || self.is_object(stripped)
+            }
+            _ => false,
+        }
+    }
+
+    /// The bottom type: `Never` with the no-suffix projection
+    /// (`type.dart:1204`; `Never?` is interned as `Null`, so it is not bottom).
+    #[must_use]
+    pub fn is_bottom(&self, t: TypeId) -> bool {
+        self.table.get(t).kind() == TypeKind::Never
+    }
+
+    /// Membership in the equivalence class of `Null` (`type_system.dart:1195-1213`).
+    /// `Never?` counts because it is interned as `Null` (type.dart:1207-1209).
+    #[must_use]
+    pub fn is_null(&self, t: TypeId) -> bool {
+        self.table.get(t).kind() == TypeKind::Null
+    }
+
+    /// Membership in the equivalence class of `Object` with no suffix
+    /// (`type_system.dart:1236-1254`).
+    #[must_use]
+    pub fn is_object(&self, t: TypeId) -> bool {
+        let ty = self.table.get(t);
+        if ty.is_nullable() {
+            return false;
+        }
+        match ty.kind() {
+            TypeKind::Interface { decl, .. } => decl == self.core().object,
+            TypeKind::FutureOr { base } => self.is_object(base),
+            _ => false,
+        }
+    }
+
+    /// `isStrictlyNonNullable` (`type_system.dart:1921-1951`): the receiver
+    /// test of `invalid_null_aware_operator`. Stricter than
+    /// [`TypeSystem::is_non_nullable`]: `Null` itself does not count as
+    /// strictly non-nullable. M1 deviation: type parameters return `false`
+    /// because declared bounds are not modeled.
+    #[must_use]
+    pub fn is_strictly_non_nullable(&self, t: TypeId) -> bool {
+        let ty = self.table.get(t);
+        if ty.is_nullable() {
+            return false;
+        }
+        match ty.kind() {
+            TypeKind::Dynamic
+            | TypeKind::Void
+            | TypeKind::Invalid
+            | TypeKind::Null
+            | TypeKind::TypeParameter { .. } => false,
+            TypeKind::FutureOr { base } => self.is_strictly_non_nullable(base),
+            _ => true,
+        }
+    }
+
+    /// `isSubtypeOf` (`subtype.dart:33`): the relation behind all four M1
+    /// diagnostics.
+    #[must_use]
+    pub fn is_subtype(&self, t0: TypeId, t1: TypeId) -> bool {
+        self.subtype_impl(t0, t1, 0)
+    }
+
+    /// `isAssignableTo` (`type_system.dart:891-925`), minus implicit `call`
+    /// tear-offs (no tear-off inference in M1).
+    #[must_use]
+    pub fn is_assignable(&self, from: TypeId, to: TypeId, strict_casts: bool) -> bool {
+        if self.is_subtype(from, to) {
+            return true;
+        }
+        // An already-reported error: accept and suppress (type_system.dart:901-904).
+        if self.table.get(from).kind() == TypeKind::Invalid {
+            return true;
+        }
+        // `strict-casts: true` disables all downcasts, including `dynamic`
+        // (type_system.dart:919-921).
+        if strict_casts {
+            return false;
+        }
+        self.table.get(from).kind() == TypeKind::Dynamic
+    }
+
+    /// Total order on top types (`isMoreTop`, `type_system.dart:1124-1189`).
+    #[must_use]
+    pub fn is_more_top(&self, t: TypeId, s: TypeId) -> bool {
+        let ty = self.table.get(t);
+        let sy = self.table.get(s);
+        if ty.kind() == TypeKind::Void {
+            return true;
+        }
+        if sy.kind() == TypeKind::Void {
+            return false;
+        }
+        if matches!(ty.kind(), TypeKind::Dynamic | TypeKind::Invalid) {
+            return true;
+        }
+        if matches!(sy.kind(), TypeKind::Dynamic | TypeKind::Invalid) {
+            return false;
+        }
+        if !ty.is_nullable() && self.is_object_declaration(ty) {
+            return true;
+        }
+        if !sy.is_nullable() && self.is_object_declaration(sy) {
+            return false;
+        }
+        if ty.is_nullable() && sy.is_nullable() {
+            return self.is_more_top(self.strip(t), self.strip(s));
+        }
+        if sy.is_nullable() {
+            return true;
+        }
+        if ty.is_nullable() {
+            return false;
+        }
+        if let (TypeKind::FutureOr { base: tb }, TypeKind::FutureOr { base: sb }) =
+            (ty.kind(), sy.kind())
+        {
+            return self.is_more_top(tb, sb);
+        }
+        false
+    }
+
+    // ---- internals ----
+
+    const fn core(&self) -> CoreDecls {
+        self.hierarchy.core()
+    }
+
+    fn object_none(&self) -> TypeId {
+        self.hierarchy.sentinels().object_none
+    }
+
+    pub(crate) fn object_question(&self) -> TypeId {
+        self.hierarchy.sentinels().object_question
+    }
+
+    /// Whether `t` is the bare `Function` interface type.
+    pub(crate) fn is_bare_function_id(&self, t: TypeId) -> bool {
+        matches!(
+            self.table.get(t).kind(),
+            TypeKind::Interface { decl, .. } if decl == self.core().function
+        )
+    }
+
+    fn null_type(&self) -> TypeId {
+        self.hierarchy.sentinels().null
+    }
+
+    pub(crate) fn core_object_none(&self) -> TypeId {
+        self.object_none()
+    }
+
+    /// Interns the bare `Function` interface type.
+    pub(crate) fn intern_bare_function(&self) -> TypeId {
+        self.table.intern(
+            UninternedType::Interface {
+                decl: self.core().function,
+                args: Vec::new(),
+            },
+            false,
+        )
+    }
+
+    /// Re-interns `t` with the given projection. Unit kinds keep their fixed
+    /// nullability (the table normalizes; `dynamic` returns itself,
+    /// type.dart:90-92) and `Never?` collapses to `Null` (type.dart:1207).
+    pub(crate) fn with_nullability(&self, t: TypeId, nullable: bool) -> TypeId {
+        let ty = self.table.get(t);
+        if ty.is_nullable() == nullable {
+            return t;
+        }
+        match ty.kind() {
+            TypeKind::Interface { decl, args } => {
+                let rebuilt = UninternedType::Interface {
+                    decl,
+                    args: self.table.args(args),
+                };
+                self.table.intern(rebuilt, nullable)
+            }
+            TypeKind::Function { signature } => self
+                .table
+                .intern_function(self.unintern_function(signature), nullable)
+                .expect("re-interning an interned signature cannot fail"),
+            TypeKind::Record { shape } => self
+                .table
+                .intern_record(self.unintern_record(shape), nullable)
+                .expect("re-interning an interned shape cannot fail"),
+            other => self.table.intern(unintern(other), nullable),
+        }
+    }
+
+    pub(crate) fn strip(&self, t: TypeId) -> TypeId {
+        self.with_nullability(t, false)
+    }
+
+    pub(crate) fn make_nullable(&self, t: TypeId) -> TypeId {
+        self.with_nullability(t, true)
+    }
+
+    fn unintern_function(&self, id: FunctionSigId) -> UninternedFunction {
+        let sig = self.table.signature(id);
+        UninternedFunction {
+            return_type: sig.return_type,
+            type_parameters: self.table.function_type_parameters(sig.type_parameters),
+            positional: self.table.args(sig.positional),
+            named: self.table.named_members(sig.named),
+            required_positional: sig.required_positional,
+        }
+    }
+
+    fn unintern_record(&self, id: crate::ids::RecordShapeId) -> UninternedRecord {
+        let shape = self.table.record_shape(id);
+        UninternedRecord {
+            positional: self.table.args(shape.positional),
+            named: self.table.named_members(shape.named),
+        }
+    }
+
+    /// Synthesizes `Future<S>` for the `FutureOr` rules
+    /// (`subtype.dart:378-382`, `424-427`). Memoized by the argument id:
+    /// interning is canonical, so the synthesized id is stable for the
+    /// table's lifetime and the cache stays valid as the table grows. The
+    /// map is bounded by the number of distinct bases queried.
+    pub(crate) fn intern_future(&self, base: TypeId) -> TypeId {
+        if let Some(&future) = self.future_memo.borrow().get(&base) {
+            return future;
+        }
+        let future = self.table.intern(
+            UninternedType::Interface {
+                decl: self.core().future,
+                args: vec![base],
+            },
+            false,
+        );
+        self.future_memo.borrow_mut().insert(base, future);
+        future
+    }
+
+    /// Interns `FutureOr<T>` with the no-suffix projection.
+    pub(crate) fn intern_future_or(&self, base: TypeId) -> TypeId {
+        self.table.intern(UninternedType::FutureOr { base }, false)
+    }
+
+    /// The core subtype walk; `depth` guards runaway instantiation chains.
+    fn subtype_impl(&self, t0: TypeId, t1: TypeId, depth: u32) -> bool {
+        // 0a Reflexivity (subtype.dart:264-266). Interned ids make this a
+        // structural comparison in O(1).
+        if t0 == t1 {
+            return true;
+        }
+        if depth >= DEPTH_LIMIT {
+            return false;
+        }
+        let a = self.table.get(t0);
+        let b = self.table.get(t1);
+
+        // 0c InvalidType: suppress error avalanches (subtype.dart:274-276).
+        if a.kind() == TypeKind::Invalid || b.kind() == TypeKind::Invalid {
+            return true;
+        }
+
+        // Rule 1 Right Top (subtype.dart:283-288). `Object?` is the only
+        // nullable type here — rule 4 below relies on that.
+        if b.kind() == TypeKind::Dynamic
+            || b.kind() == TypeKind::Void
+            || (b.is_nullable() && self.is_object_declaration(b))
+        {
+            return true;
+        }
+
+        // Rule 2 Left Top (subtype.dart:292-296); falls through on failure.
+        if (a.kind() == TypeKind::Dynamic || a.kind() == TypeKind::Void)
+            && self.subtype_impl(self.object_question(), t1, depth + 1)
+        {
+            return true;
+        }
+
+        // Rule 3 Left Bottom (subtype.dart:299-301). `Never?` never reaches
+        // here — it is interned as `Null`.
+        if a.kind() == TypeKind::Never {
+            return true;
+        }
+
+        // Rule 4 Right Object (subtype.dart:304-346). `b` is non-`?` here:
+        // `Object?` was consumed by rule 1.
+        if self.is_object_declaration(b) {
+            if let TypeKind::TypeParameter { .. } = a.kind() {
+                // Bound-based (subtype.dart:309-318); M1 has no bounds, and
+                // the official unbound default `Object?` is not a subtype of
+                // `Object`, so `false` either way.
+                return false;
+            }
+            if let Some(base) = Self::non_null_future_or_base(a) {
+                // `FutureOr<S> <: Object` iff `S <: Object` (subtype.dart:321-325);
+                // a nullable `FutureOr` falls to the `S?` case below.
+                return self.subtype_impl(base, t1, depth + 1);
+            }
+            return !(a.kind() == TypeKind::Null
+                || a.kind() == TypeKind::Dynamic
+                || a.kind() == TypeKind::Void
+                || a.is_nullable());
+        }
+
+        // Rule 5 Left Null (subtype.dart:349-369).
+        if a.kind() == TypeKind::Null {
+            if matches!(b.kind(), TypeKind::FutureOr { .. }) {
+                // `Null <: FutureOr<S>` iff `Null <: S` (subtype.dart:352-357);
+                // nullable `FutureOr<S>` is `S?` and accepts `Null`.
+                if !b.is_nullable() {
+                    let s1 = Self::future_or_base(b);
+                    return self.subtype_impl(self.null_type(), s1, depth + 1);
+                }
+                return true;
+            }
+            return b.kind() == TypeKind::Null || b.is_nullable();
+        }
+
+        // Rule 6 Left FutureOr (subtype.dart:372-385).
+        if let Some(s0) = Self::non_null_future_or_base(a) {
+            if !self.subtype_impl(s0, t1, depth + 1) {
+                return false;
+            }
+            let future_s0 = self.intern_future(s0);
+            return self.subtype_impl(future_s0, t1, depth + 1);
+        }
+
+        // Rule 7 Left Nullable (subtype.dart:389-392).
+        if a.is_nullable() {
+            let s0 = self.strip(t0);
+            return self.subtype_impl(s0, t1, depth + 1)
+                && self.subtype_impl(self.null_type(), t1, depth + 1);
+        }
+
+        // Rules 8-9 (subtype.dart:397-415): promoted-bound reflexivity and
+        // promotion — M1 has no promoted bounds, and unpromoted type-variable
+        // reflexivity is subsumed by rule 0a.
+
+        // Rule 10 Right FutureOr (subtype.dart:418-449).
+        if let Some(s1) = Self::non_null_future_or_base(b) {
+            let future_s1 = self.intern_future(s1);
+            if self.subtype_impl(t0, future_s1, depth + 1) {
+                return true;
+            }
+            if self.subtype_impl(t0, s1, depth + 1) {
+                return true;
+            }
+            // Type-variable bound paths (subtype.dart:437-446): M1 has no
+            // declared bounds.
+            return false;
+        }
+
+        // Rule 11 Right Nullable (subtype.dart:452-477).
+        if b.is_nullable() {
+            let s1 = self.strip(t1);
+            if self.subtype_impl(t0, s1, depth + 1) {
+                return true;
+            }
+            if self.subtype_impl(t0, self.null_type(), depth + 1) {
+                return true;
+            }
+            return false;
+        }
+
+        // Rule 12 Interface/Interface (subtype.dart:482-484).
+        if let (
+            TypeKind::Interface { decl: d0, args: a0 },
+            TypeKind::Interface { decl: d1, args: a1 },
+        ) = (a.kind(), b.kind())
+        {
+            return self.interface_subtype(d0, a0, d1, a1, depth);
+        }
+
+        // Left Type Variable Bound (subtype.dart:490-500): M1 has no bounds.
+
+        // Rule 13 Function (subtype.dart:502-510).
+        if let TypeKind::Function { signature: f } = a.kind() {
+            if self.is_bare_function(b) {
+                return true;
+            }
+            if let TypeKind::Function { signature: g } = b.kind() {
+                return self.function_subtype(f, g, depth);
+            }
+        }
+
+        // Rule 14 Record/Record (subtype.dart:512-519): M2 (spec §5).
+        false
+    }
+
+    /// The `base` of `t` when `t` is a non-`?` `FutureOr`.
+    fn non_null_future_or_base(t: Type) -> Option<TypeId> {
+        match t.kind() {
+            TypeKind::FutureOr { base } if !t.is_nullable() => Some(base),
+            _ => None,
+        }
+    }
+
+    fn future_or_base(t: Type) -> TypeId {
+        match t.kind() {
+            TypeKind::FutureOr { base } => base,
+            _ => unreachable!("caller checked the FutureOr kind"),
+        }
+    }
+
+    fn is_object_declaration(&self, t: Type) -> bool {
+        matches!(t.kind(), TypeKind::Interface { decl, .. } if decl == self.core().object)
+    }
+
+    fn is_bare_function(&self, t: Type) -> bool {
+        matches!(t.kind(), TypeKind::Interface { decl, .. } if decl == self.core().function)
+    }
+
+    /// `_isInterfaceSubtypeOf` (subtype.dart:184-224).
+    fn interface_subtype(
+        &self,
+        d0: TypeDeclId,
+        a0: PoolRange,
+        d1: TypeDeclId,
+        a1: PoolRange,
+        depth: u32,
+    ) -> bool {
+        let core = self.core();
+        // Rule-order note: `superType.isDartCoreObject → true`
+        // (subtype.dart:191-193) is unreachable under the ordering (rule 4
+        // consumes `Object` first) but is kept in the source's position;
+        // `Object` subtypes nothing but itself (subtype.dart:196-198).
+        if d1 == core.object {
+            return true;
+        }
+        if d0 == core.object {
+            return false;
+        }
+        if d0 == d1 {
+            return self.arguments_subtype(a0, a1, depth);
+        }
+        // Class types cannot subtype `Function` or vice versa
+        // (subtype.dart:206-209).
+        if d0 == core.function || d1 == core.function {
+            return false;
+        }
+        // Depth-first walk over instantiated supertypes, the counterpart of
+        // `allSupertypes` + substitution (subtype.dart:211-221). Canonical
+        // interning makes `TypeId` a sound visited-set key. The reusable
+        // scratch is claimed for the whole walk; a re-entrant walk (rule 12
+        // reached through an argument check of an outer walk) falls back to
+        // fresh local containers — see the `TypeSystem` scratch docs.
+        if let Ok(mut scratch) = self.walk.try_borrow_mut() {
+            scratch.visited.clear();
+            scratch.frontier.clear();
+            self.seed_frontier(d0, a0, &mut scratch.frontier);
+            let WalkScratch {
+                visited, frontier, ..
+            } = &mut *scratch;
+            self.interface_walk(d1, a1, depth, visited, frontier)
+        } else {
+            // Re-entrant walk (rule 12 reached through an argument check of
+            // an outer walk that owns the scratch): fresh local containers.
+            let mut visited = StampSet::new();
+            let mut frontier = Vec::new();
+            self.seed_frontier(d0, a0, &mut frontier);
+            self.interface_walk(d1, a1, depth, &mut visited, &mut frontier)
+        }
+    }
+
+    /// Pushes the instantiated supertypes of `d0` — the walk's starting
+    /// frontier, in declaration order (subtype.dart:211-214).
+    fn seed_frontier(&self, d0: TypeDeclId, a0: PoolRange, frontier: &mut Vec<TypeId>) {
+        let info = self.hierarchy.decl(d0).expect("declared owner");
+        for &edge in &info.supertypes {
+            frontier.push(self.instantiate(edge, info, a0));
+        }
+    }
+
+    /// The frontier loop of the interface walk
+    /// (subtype.dart:215-221). Traversal order — LIFO pops over
+    /// declaration-order supertype pushes — is part of the observable
+    /// answer: the first frontier entry whose declaration matches `d1`
+    /// decides via `arguments_subtype`.
+    fn interface_walk(
+        &self,
+        d1: TypeDeclId,
+        a1: PoolRange,
+        depth: u32,
+        visited: &mut StampSet,
+        frontier: &mut Vec<TypeId>,
+    ) -> bool {
+        let core = self.core();
+        while let Some(current) = frontier.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let TypeKind::Interface { decl, args } = self.table.get(current).kind() else {
+                continue;
+            };
+            if decl == d1 {
+                return self.arguments_subtype(args, a1, depth);
+            }
+            if decl == core.function {
+                continue;
+            }
+            let info = self.hierarchy.decl(decl).expect("declared owner");
+            for &edge in &info.supertypes {
+                frontier.push(self.instantiate(edge, info, args));
+            }
+        }
+        false
+    }
+
+    /// Instantiates a supertype template of `owner` with the concrete
+    /// arguments `args` (the `Substitution.fromInterfaceType` step,
+    /// subtype.dart:213-214). `owner` is the declaration info of the
+    /// supertype template's owning class, already resolved by the caller.
+    fn instantiate(&self, edge: TypeId, owner: &DeclInfo, args: PoolRange) -> TypeId {
+        let params = &owner.type_parameters;
+        if params.is_empty() {
+            return edge;
+        }
+        let map: Vec<_> = params.iter().copied().zip(self.table.args(args)).collect();
+        self.table.substitute(edge, &map)
+    }
+
+    /// `_interfaceArguments` (subtype.dart:44-83) with the M1 variance
+    /// model: class type parameters are covariant
+    /// (`element.dart:11560-11561`); variance annotations are M2.
+    fn arguments_subtype(&self, sub: PoolRange, sup: PoolRange, depth: u32) -> bool {
+        assert_eq!(
+            sub.len(),
+            sup.len(),
+            "interface arity mismatch: resolution must validate argument counts"
+        );
+        for i in 0..sup.len() {
+            if !self.subtype_impl(
+                self.table.arg(sub.offset() + i),
+                self.table.arg(sup.offset() + i),
+                depth + 1,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `_isFunctionSubtypeOf` (subtype.dart:86-182). Type-parameter
+    /// correlation is positional (`relateTypeParameters`, subtype.dart:87-96);
+    /// bound compatibility is M2.
+    fn function_subtype(&self, f_id: FunctionSigId, g_id: FunctionSigId, depth: u32) -> bool {
+        let f = self.table.signature(f_id);
+        let g = self.table.signature(g_id);
+        let f_params = self.table.function_type_parameters(f.type_parameters);
+        let g_params = self.table.function_type_parameters(g.type_parameters);
+        if f_params.len() != g_params.len() {
+            return false;
+        }
+        // Universally quantified correlation: rename f's parameters to g's.
+        let map: Vec<_> = f_params
+            .iter()
+            .copied()
+            .zip(g_params.iter().copied())
+            .map(|(fp, gp)| {
+                (
+                    fp,
+                    self.table
+                        .intern(UninternedType::TypeParameter { parameter: gp }, false),
+                )
+            })
+            .collect();
+        // Return type is covariant (subtype.dart:98-100).
+        if !self.subtype_impl(
+            self.table.substitute(f.return_type, &map),
+            g.return_type,
+            depth + 1,
+        ) {
+            return false;
+        }
+        // Positional parameters are contravariant (subtype.dart:107-131).
+        // f must accept every call g accepts: no fewer positional slots and
+        // no stronger required prefix.
+        if f.positional.len() < g.positional.len() {
+            return false;
+        }
+        if f.required_positional > g.required_positional {
+            return false;
+        }
+        for i in 0..g.positional.len() {
+            let fp = self
+                .table
+                .substitute(self.table.arg(f.positional.offset() + i), &map);
+            let gp = self.table.arg(g.positional.offset() + i);
+            if !self.subtype_impl(gp, fp, depth + 1) {
+                return false;
+            }
+        }
+        // Named parameters match by name in canonical (sorted) order
+        // (subtype.dart:132-179).
+        let (f_named, g_named) = (f.named, g.named);
+        let (mut fi, mut gi) = (f_named.offset(), g_named.offset());
+        let (f_end, g_end) = (
+            f_named.offset() + f_named.len(),
+            g_named.offset() + g_named.len(),
+        );
+        while fi < f_end && gi < g_end {
+            let fm = self.table.named_member(fi);
+            let gm = self.table.named_member(gi);
+            match fm.name.as_str().cmp(gm.name.as_str()) {
+                Ordering::Less => {
+                    if fm.required {
+                        return false;
+                    }
+                    fi += 1;
+                }
+                Ordering::Greater => return false,
+                Ordering::Equal => {
+                    if fm.required && !gm.required {
+                        return false;
+                    }
+                    let ft = self.table.substitute(fm.ty, &map);
+                    if !self.subtype_impl(gm.ty, ft, depth + 1) {
+                        return false;
+                    }
+                    fi += 1;
+                    gi += 1;
+                }
+            }
+        }
+        // Remaining f parameters must not be required (subtype.dart:168-173).
+        while fi < f_end {
+            if self.table.named_member(fi).required {
+                return false;
+            }
+            fi += 1;
+        }
+        // g must not have parameters f lacks (subtype.dart:176-179).
+        gi >= g_end
+    }
+}
+
+/// Rebuilds the uninterned form of a kind with no pooled payload.
+fn unintern(kind: TypeKind) -> UninternedType {
+    match kind {
+        TypeKind::Never => UninternedType::Never,
+        TypeKind::Dynamic => UninternedType::Dynamic,
+        TypeKind::Void => UninternedType::Void,
+        TypeKind::Invalid => UninternedType::Invalid,
+        TypeKind::Null => UninternedType::Null,
+        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
+        TypeKind::FutureOr { base } => UninternedType::FutureOr { base },
+        TypeKind::Interface { .. } | TypeKind::Function { .. } | TypeKind::Record { .. } => {
+            unreachable!("compound kinds are rebuilt by `TypeSystem::with_nullability`")
+        }
+    }
+}

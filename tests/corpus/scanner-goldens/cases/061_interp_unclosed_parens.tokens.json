@@ -1,0 +1,13 @@
+{
+  "case": "061_interp_unclosed_parens",
+  "origin": "pkg/front_end/test/scanner_test.dart:875 (asserts grouping only: first } closes the {, second } closes ${, parens endGroup null, NO listener diagnostics)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["String", 0, 1, "\""], ["StringInterpolationExpression", 1, 2, "${"],
+    ["OpenParen", 3, 1, "("], ["OpenCurly", 4, 1, "{"], ["OpenParen", 5, 1, "("],
+    ["CloseCurly", 6, 1, "}"], ["CloseCurly", 7, 1, "}"], ["String", 8, 1, "\""]
+  ],
+  "diagnostics": [],
+  "notes": "official inserts synthetic ')' closers for the unmatched parens into the stream (not asserted by the official test); dartiq reports expected_token diagnostics for EOF-unmatched groups per lib.rs:49 - representation delta documented in docs/facts/scanner-test-corpus.md"
+}

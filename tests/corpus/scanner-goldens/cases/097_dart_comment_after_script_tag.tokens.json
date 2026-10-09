@@ -1,0 +1,51 @@
+{
+ "case": "097_dart_comment_after_script_tag",
+ "origin": "abstract_scanner.dart:977-981 (if tail.kind == SCRIPT_TOKEN, scan a second header round)",
+ "config": {
+  "triple_shift": true,
+  "augment": true
+ },
+ "language_version": {
+  "major": 2,
+  "minor": 9
+ },
+ "tokens": [
+  [
+   "ScriptTag",
+   0,
+   11,
+   "#!/bin/dart"
+  ],
+  [
+   "Keyword",
+   27,
+   3,
+   "var"
+  ],
+  [
+   "Identifier",
+   31,
+   1,
+   "c"
+  ],
+  [
+   "Eq",
+   33,
+   1,
+   "="
+  ],
+  [
+   "Int",
+   35,
+   1,
+   "3"
+  ],
+  [
+   "Semicolon",
+   36,
+   1,
+   ";"
+  ]
+ ],
+ "diagnostics": []
+}

@@ -1,0 +1,10 @@
+{
+  "case": "082_script_tag_args",
+  "origin": "pkg/front_end/test/scanner_test.dart:975 (script tag runs to end of line, args included)",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [
+    ["ScriptTag", 0, 18, "#!/bin/dart -debug"]
+  ],
+  "diagnostics": []
+}

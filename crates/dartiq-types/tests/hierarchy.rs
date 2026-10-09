@@ -1,0 +1,190 @@
+//! Hierarchy snapshot validation: one test per [`TypeError`] path raised by
+//! [`TypeHierarchyBuilder::build`] (spec §6, R5).
+
+use dartiq_types::{
+    CoreDecls, TypeDeclId, TypeError, TypeHierarchy, TypeId, TypeKind, TypeParamId, TypeTable,
+    UninternedType,
+};
+
+fn itf(table: &TypeTable, decl: TypeDeclId, args: &[TypeId]) -> TypeId {
+    table.intern(
+        UninternedType::Interface {
+            decl,
+            args: args.to_vec(),
+        },
+        false,
+    )
+}
+
+#[test]
+fn duplicate_decl_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(object, Vec::new())
+    .build(&table)
+    .expect_err("duplicate declaration");
+    assert_eq!(err, TypeError::DuplicateDecl(object));
+}
+
+#[test]
+fn undeclared_supertype_target_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (a, missing) = (TypeDeclId::from_raw(10), TypeDeclId::from_raw(11));
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .supertype(a, itf(&table, missing, &[]))
+    .build(&table)
+    .expect_err("undeclared supertype target");
+    assert_eq!(err, TypeError::UndeclaredDecl(missing));
+}
+
+#[test]
+fn supertype_must_be_an_interface() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let a = TypeDeclId::from_raw(10);
+    let dynamic = table.intern(UninternedType::Dynamic, false);
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .supertype(a, dynamic)
+    .build(&table)
+    .expect_err("non-interface supertype");
+    assert_eq!(
+        err,
+        TypeError::SupertypeNotInterface {
+            decl: a,
+            actual: TypeKind::Dynamic,
+        }
+    );
+}
+
+#[test]
+fn supertype_arity_is_validated() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (a, iterable) = (TypeDeclId::from_raw(10), TypeDeclId::from_raw(11));
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .decl(iterable, vec![TypeParamId::from_raw(2)])
+    .supertype(a, itf(&table, iterable, &[]))
+    .build(&table)
+    .expect_err("wrong supertype arity");
+    assert_eq!(
+        err,
+        TypeError::ArityMismatch {
+            decl: iterable,
+            expected: 1,
+            actual: 0,
+        }
+    );
+}
+
+#[test]
+fn foreign_type_parameter_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (a, iterable) = (TypeDeclId::from_raw(10), TypeDeclId::from_raw(11));
+    // `iterable`'s own parameter, referenced from `a`'s edge: `a` does not
+    // own it, so instantiation at query time could not bind it.
+    let iterable_t = TypeParamId::from_raw(2);
+    let iterable_of_t = table.intern(
+        UninternedType::TypeParameter {
+            parameter: iterable_t,
+        },
+        false,
+    );
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .decl(iterable, vec![iterable_t])
+    .supertype(a, itf(&table, iterable, &[iterable_of_t]))
+    .build(&table)
+    .expect_err("supertype references a foreign type parameter");
+    assert_eq!(
+        err,
+        TypeError::ForeignTypeParameter {
+            decl: a,
+            param: iterable_t,
+        }
+    );
+}
+
+#[test]
+fn cyclic_hierarchy_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (a, b) = (TypeDeclId::from_raw(10), TypeDeclId::from_raw(11));
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .decl(b, Vec::new())
+    .supertype(a, itf(&table, b, &[]))
+    .supertype(b, itf(&table, a, &[]))
+    .build(&table)
+    .expect_err("supertype cycle");
+    let TypeError::CyclicHierarchy(cycle) = err else {
+        panic!("expected CyclicHierarchy, got {err:?}");
+    };
+    // The reported path closes the cycle (first == last); which end the DFS
+    // enters from follows `HashMap` iteration order, so only the set is
+    // pinned here.
+    assert_eq!(cycle.len(), 3);
+    assert_eq!(cycle[0], cycle[2]);
+    assert!(cycle.contains(&a) && cycle.contains(&b));
+}
+
+fn core() -> (TypeDeclId, TypeDeclId, TypeDeclId) {
+    (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+    )
+}

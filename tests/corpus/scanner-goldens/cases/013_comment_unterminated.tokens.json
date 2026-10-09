@@ -1,0 +1,8 @@
+{
+  "case": "013_comment_unterminated",
+  "origin": "pkg/front_end/test/scanner_test.dart:234 _assertError(unterminatedMultiLineComment, 3, \"/* x\")",
+  "config": {"triple_shift": true, "augment": true},
+  "language_version": null,
+  "tokens": [],
+  "diagnostics": [["unterminated_multi_line_comment", 3]]
+}
