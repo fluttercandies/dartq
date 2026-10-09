@@ -6,11 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-thiserror = "2"
+thiserror = { workspace = true }
 
 [build-dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 
 [lints]
 workspace = true

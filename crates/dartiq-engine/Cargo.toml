@@ -16,9 +16,9 @@ dartiq-scanner = { path = "../dartiq-scanner" }
 dartiq-semantic = { path = "../dartiq-semantic" }
 dartiq-sdk = { path = "../dartiq-sdk" }
 dartiq-source = { path = "../dartiq-source" }
-rayon = "1"
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
-thiserror = "2"
+thiserror = { workspace = true }
 
 [[bench]]
 name = "cold_analysis"

@@ -10,7 +10,7 @@ dartiq-pub = { path = "../dartiq-pub" }
 dartiq-sdk = { path = "../dartiq-sdk" }
 dartiq-source = { path = "../dartiq-source" }
 rustc-hash = { workspace = true }
-thiserror = "2"
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

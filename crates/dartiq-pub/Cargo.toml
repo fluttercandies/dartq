@@ -8,15 +8,15 @@ rust-version.workspace = true
 [dependencies]
 dartiq-language = { path = "../dartiq-language" }
 dartiq-source = { path = "../dartiq-source" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-thiserror = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Directly pinning file mtimes; std cannot set them and the freshness rules
 # are stated in terms of strict mtime ordering (equal counts as stale).
-filetime = "0.2"
+filetime = { workspace = true }
 
 [lints]
 workspace = true

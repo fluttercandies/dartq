@@ -9,7 +9,7 @@ rust-version.workspace = true
 dartiq-pub = { path = "../dartiq-pub" }
 dartiq-source = { path = "../dartiq-source" }
 rustc-hash = { workspace = true }
-thiserror = "2"
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
