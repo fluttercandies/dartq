@@ -1,7 +1,7 @@
 //! Literal collection/string/symbol parsing (official
 //! `parseLiteralListSuffix` :8520 / `parseLiteralSetOrMapSuffix` :7893 /
 //! `parseParenthesizedExpressionOrRecordLiteral` :7628 / string
-//! interpolation :8732 / symbols :8932), plus the collection control-flow
+//! interpolation :8732 / symbols :9244), plus the collection control-flow
 //! element machinery (`literal_entry_info.dart` +
 //! `literal_entry_info_impl.dart`: if/else, for/for-in, spread, null-aware
 //! elements). Elements parse full expressions through the #20 engine
@@ -554,7 +554,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         begin
     }
 
-    /// Symbol body (official `parseLiteralSymbol` :8932-8956): a
+    /// Symbol body (official `parseLiteralSymbol` :9244-9269): a
     /// user-definable operator, `void`, or `(id .)* id`. Operator membership
     /// is `isUserDefinableOperator` — not the binary-level table — so `#is`
     /// / `#as` are rejected while `#~` / `#[]` are accepted.
@@ -562,10 +562,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if is_user_definable_operator(self.peek_kind()) {
             let op = self.peek_span();
             self.cursor.advance();
-            // Official emits `handleOperator`; the listener trait has no
-            // operator event yet, so it surfaces as an identifier event.
-            self.listener
-                .handle_identifier(op, IdentifierContext::Expression);
+            self.listener.handle_operator(op);
             self.listener.end_literal_symbol(hash, 1);
             return op;
         }
@@ -576,11 +573,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return void_tok;
         }
         let mut count = 1usize;
-        let first = self.ensure_identifier(IdentifierContext::Expression);
+        let first = self.ensure_identifier(IdentifierContext::LiteralSymbol);
         let mut end = first;
         while self.peek_kind() == TokenKind::Period {
             self.cursor.advance();
-            end = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+            end = self.ensure_identifier(IdentifierContext::LiteralSymbolContinuation);
             count += 1;
         }
         self.listener.end_literal_symbol(hash, count);
@@ -793,11 +790,14 @@ mod tests {
         );
     }
 
-    /// Local listener capturing symbol membership and identifier events.
+    /// Local listener capturing the ordered symbol event sequence,
+    /// identifier contexts, and error codes (the shared Collector does not
+    /// log these events).
     #[derive(Default)]
     struct SymbolLog {
         errors: Vec<String>,
-        identifiers: usize,
+        events: Vec<String>,
+        contexts: Vec<IdentifierContext>,
         dot_access: usize,
         symbol_ends: Vec<usize>,
     }
@@ -807,8 +807,21 @@ mod tests {
             self.errors.push(message.code.name.to_owned());
         }
 
-        fn handle_identifier(&mut self, _: TokenSpan, _: IdentifierContext) {
-            self.identifiers += 1;
+        fn begin_literal_symbol(&mut self, _: TokenSpan) {
+            self.events.push("begin".to_owned());
+        }
+
+        fn handle_operator(&mut self, _: TokenSpan) {
+            self.events.push("operator".to_owned());
+        }
+
+        fn handle_symbol_void(&mut self, _: TokenSpan) {
+            self.events.push("symbol_void".to_owned());
+        }
+
+        fn handle_identifier(&mut self, _: TokenSpan, context: IdentifierContext) {
+            self.events.push("identifier".to_owned());
+            self.contexts.push(context);
         }
 
         fn handle_dot_access(&mut self, _: TokenSpan, _: TokenSpan, _: bool) {
@@ -816,6 +829,7 @@ mod tests {
         }
 
         fn end_literal_symbol(&mut self, _: TokenSpan, identifier_count: usize) {
+            self.events.push(format!("end:{identifier_count}"));
             self.symbol_ends.push(identifier_count);
         }
     }
@@ -836,15 +850,18 @@ mod tests {
 
     #[test]
     fn symbol_operator_membership_is_user_definable_operator() {
-        // F11 (official :8932-8956): `~` is a member (count 1); keywords
-        // `is`/`as` are not — they take the identifier path and report
-        // missing_identifier exactly like the oracle.
+        // F11 (official `parseLiteralSymbol` :9244-9269): `~` is a member
+        // (count 1); keywords `is`/`as` are not — they take the identifier
+        // path and report missing_identifier exactly like the oracle.
         let p = parse_symbol("#~");
         assert_eq!(p.listener.symbol_ends, vec![1]);
+        assert!(p.listener.events.contains(&"operator".to_owned()));
+        assert!(!p.listener.events.contains(&"identifier".to_owned()));
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
 
         let p = parse_symbol("#is");
         assert_eq!(p.listener.symbol_ends, vec![1]);
+        assert!(!p.listener.events.contains(&"operator".to_owned()));
         assert_eq!(p.listener.errors, vec!["missing_identifier".to_string()]);
     }
 
@@ -852,9 +869,49 @@ mod tests {
     fn symbol_identifier_chain_counts_dots() {
         let p = parse_symbol("#a.b");
         assert_eq!(p.listener.symbol_ends, vec![2]);
+        assert_eq!(
+            p.listener.contexts,
+            vec![
+                IdentifierContext::LiteralSymbol,
+                IdentifierContext::LiteralSymbolContinuation
+            ]
+        );
         // No dot-access event between symbol segments (official emits
         // nothing but the identifiers).
         assert_eq!(p.listener.dot_access, 0);
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn symbol_event_sequence_matches_official_parse_literal_symbol() {
+        // Operator body (`parser_impl.dart:9251-9254`): handleOperator then
+        // endLiteralSymbol(hash, 1).
+        let p = parse_symbol("#~");
+        assert_eq!(p.listener.events, vec!["begin", "operator", "end:1"]);
+
+        // `#void` (`:9255-9257`): handleSymbolVoid then end(hash, 1).
+        let p = parse_symbol("#void");
+        assert_eq!(p.listener.events, vec!["begin", "symbol_void", "end:1"]);
+
+        // Dotted chain (`:9258-9268`): first identifier in the
+        // literalSymbol context, every `.`-followed one in
+        // literalSymbolContinuation, then end(hash, count).
+        let p = parse_symbol("#a");
+        assert_eq!(p.listener.events, vec!["begin", "identifier", "end:1"]);
+        assert_eq!(p.listener.contexts, vec![IdentifierContext::LiteralSymbol]);
+
+        let p = parse_symbol("#a.b.c");
+        assert_eq!(
+            p.listener.events,
+            vec!["begin", "identifier", "identifier", "identifier", "end:3"]
+        );
+        assert_eq!(
+            p.listener.contexts,
+            vec![
+                IdentifierContext::LiteralSymbol,
+                IdentifierContext::LiteralSymbolContinuation,
+                IdentifierContext::LiteralSymbolContinuation,
+            ]
+        );
     }
 }

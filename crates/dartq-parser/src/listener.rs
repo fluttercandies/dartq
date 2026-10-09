@@ -228,6 +228,12 @@ pub enum IdentifierContext {
     NamedArgumentReference,
     /// `localVariableDeclaration`.
     LocalVariableDeclaration,
+    /// `literalSymbol`: the first identifier of a literal symbol's dotted
+    /// chain (`foo` in `#foo.bar`).
+    LiteralSymbol,
+    /// `literalSymbolContinuation`: an identifier of a literal symbol that
+    /// follows a `.` (`bar` in `#foo.bar`).
+    LiteralSymbolContinuation,
     /// `expression`.
     Expression,
     /// `expressionContinuation`.
@@ -362,6 +368,11 @@ pub trait ParserListener {
     fn begin_literal_symbol(&mut self, token: Token) {}
     fn handle_symbol_void(&mut self, token: Token) {}
     fn end_literal_symbol(&mut self, hash: Token, identifier_count: usize) {}
+    /// `handleOperator` (listener.dart:2122): a bare operator token. In
+    /// `parseLiteralSymbol` this carries the body of an operator symbol
+    /// (`~` in `#~`), followed by `end_literal_symbol(hash, 1)`
+    /// (parser_impl.dart:9252-9254).
+    fn handle_operator(&mut self, token: Token) {}
     fn handle_this_expression(&mut self, token: Token, context: IdentifierContext) {}
     fn handle_super_expression(&mut self, token: Token, context: IdentifierContext) {}
     fn handle_unary_prefix_expression(&mut self, operator: Token) {}
