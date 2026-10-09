@@ -5,7 +5,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::thread;
 
 use dartiq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, Severity};
 use dartiq_language::{
@@ -17,6 +16,7 @@ use dartiq_resolution::{
 };
 use dartiq_scanner::{Keyword, KeywordStyle, ScanConfig, TokenKind, TokenTable, scan};
 use dartiq_source::{ContentId, FileId, SourceRange, StringTable, utf16_len_of};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::event::{EngineEvent, RevalidateGate};
@@ -37,42 +37,6 @@ impl ApplyOutcome {
     fn empty() -> Self {
         Self::default()
     }
-}
-
-/// Runs `f` over `items` on plain scoped threads, chunked to core count,
-/// preserving input order.
-///
-/// This is the file/library recompute fan-out. The perf charter names rayon
-/// work-stealing as the end state; the registry proxy was unreachable at
-/// implementation time, so this is the deliberate interim: batch-scoped
-/// threads, no persistent workers, no queue — a shape with none of the
-/// hand-rolled-pool failure modes, and the two call sites are the only
-/// swap-in points.
-pub(crate) fn fanout<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
-where
-    T: Sync,
-    R: Send,
-{
-    if items.len() < 2 {
-        return items.iter().map(f).collect();
-    }
-    let threads =
-        usize::from(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
-    if threads <= 1 {
-        return items.iter().map(f).collect();
-    }
-    let width = threads.min(items.len());
-    let chunk_size = items.len().div_ceil(width);
-    thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .chunks(chunk_size)
-            .map(|chunk| scope.spawn(|| chunk.iter().map(&f).collect::<Vec<R>>()))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("fanout worker panicked"))
-            .collect()
-    })
 }
 
 /// Drains the pending overlay and runs the L1 cascade.
@@ -210,16 +174,19 @@ fn recompute_facts(
     // the pure fan-out: no shared mutable state but the StringTable's
     // interning lock.
     let sources: Vec<&str> = changed.iter().map(|(_, _, text)| text.as_str()).collect();
-    let computed: Vec<(usize, FactsKey, UnitFacts)> = fanout(&misses, |(index, key)| {
-        let facts = compute_unit(
-            changed[*index].0,
-            changed[*index].1,
-            sources[*index],
-            versions[*index],
-            &state.strings,
-        );
-        (*index, *key, facts)
-    });
+    let computed: Vec<(usize, FactsKey, UnitFacts)> = misses
+        .par_iter()
+        .map(|(index, key)| {
+            let facts = compute_unit(
+                changed[*index].0,
+                changed[*index].1,
+                sources[*index],
+                versions[*index],
+                &state.strings,
+            );
+            (*index, *key, facts)
+        })
+        .collect();
 
     // Sequential URI resolution over the shared FileTable, then cache insert.
     let mut resolver = state.uri_resolver();

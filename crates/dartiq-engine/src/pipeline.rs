@@ -13,11 +13,12 @@ use dartiq_resolution::{
 };
 use dartiq_semantic::MicroKind;
 use dartiq_source::FileId;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cancel::{CancellationToken, Cancelled};
 use crate::event::EngineEvent;
-use crate::l1::{self, fanout};
+use crate::l1;
 use crate::state::{DirectiveKind, EngineState, LibraryId, LibraryInfo, LibraryResult};
 use crate::{CsrGraph, LibraryView, SemanticDiagnoser};
 
@@ -56,23 +57,28 @@ pub(crate) fn analyze(
 
     // Parallel recompute: per-library diagnosis is a pure function of the
     // (already fresh) facts and the resolution graph, so the dirty set runs
-    // in one fan-out; ordering matters only for event delivery.
+    // in one fan-out; ordering matters only for event delivery. The token
+    // checkpoint stays per library: a fired token turns the remaining items
+    // into no-ops, completed libraries keep their results.
     let cancelled = AtomicBool::new(false);
     let resolved = graph.as_ref();
-    let computed: Vec<Option<(Duration, Vec<Diagnostic>)>> = fanout(&order, |library| {
-        if cancel.check().is_err() {
-            cancelled.store(true, Ordering::Relaxed);
-            return None;
-        }
-        let start = Instant::now();
-        let diagnostics = diagnose_library(
-            state,
-            resolved.expect("graph exists when libraries exist"),
-            semdiag,
-            *library,
-        );
-        Some((start.elapsed(), diagnostics))
-    });
+    let computed: Vec<Option<(Duration, Vec<Diagnostic>)>> = order
+        .par_iter()
+        .map(|library| {
+            if cancel.check().is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+                return None;
+            }
+            let start = Instant::now();
+            let diagnostics = diagnose_library(
+                state,
+                resolved.expect("graph exists when libraries exist"),
+                semdiag,
+                *library,
+            );
+            Some((start.elapsed(), diagnostics))
+        })
+        .collect();
 
     // Store completed results and emit their events in work order.
     let mut completed: FxHashSet<LibraryId> = FxHashSet::default();

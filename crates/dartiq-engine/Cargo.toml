@@ -16,6 +16,7 @@ dartiq-scanner = { path = "../dartiq-scanner" }
 dartiq-semantic = { path = "../dartiq-semantic" }
 dartiq-sdk = { path = "../dartiq-sdk" }
 dartiq-source = { path = "../dartiq-source" }
+rayon = "1"
 rustc-hash = { workspace = true }
 thiserror = "2"
 
