@@ -1,5 +1,6 @@
 //! dartq CLI — `dartq check` (the M0 differential face), `dartq analyze`
-//! (the M1 engine face), and `dartq version`.
+//! (the M1 engine face), `dartq query symbol` (the index face), and
+//! `dartq version`.
 //!
 //! `check` drives the M0 pipeline (engine-api-spec §2.1): bytes → scan →
 //! `@dart` override rescan → parse, with all diagnostics written through
@@ -10,6 +11,11 @@
 //! pub faces → [`Engine::new`] → [`Engine::discover_workspace`] →
 //! [`Engine::analyze`], printed through the same oracle-exact writers.
 //!
+//! `query symbol` drives the same workspace assembly and answers from the
+//! symbol index over the analyzed state (PRD §20.3): the queried name's
+//! declaration rows plus resolved reference rows. A new output face, not a
+//! diagnostics face — rows sort by file, then position.
+//!
 //! Published contract (engine-api-spec §4.2, oracle-machine-format §3):
 //! - diagnostic lines go to stdout only; usage/internal failures report on
 //!   stderr and keep stdout empty;
@@ -18,7 +24,9 @@
 //!   dartdev.dart:209–210 `EX_USAGE`): 0 clean or info-only · 1 fatal infos ·
 //!   2 fatal warnings · 3 errors · 4 internal failure · 64 usage error. The
 //!   differential harness treats {0,1,2,3} as a valid diagnostic set
-//!   (Jaccard input); 4/64 are harness-own failures.
+//!   (Jaccard input); 4/64 are harness-own failures. The query face uses
+//!   the same tiers: 0 on success (zero results included), 64 usage, 4
+//!   internal.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,7 +46,8 @@ use dartq_diagnostics::{
     write_json, write_machine,
 };
 use dartq_engine::{
-    CancellationToken, Cancelled, Engine, EngineConfig, EngineEvent, memory_store,
+    CancellationToken, Cancelled, DeclHit, DeclKind, Engine, EngineConfig, EngineEvent, RefHit,
+    RefKind, SymbolAnswer, memory_store,
 };
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
@@ -74,6 +83,11 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Analyze(analyze_args)),
         }) => analyze(&analyze_args),
+        Ok(Cli {
+            command: Some(Command::Query(query_args)),
+        }) => match query_args.face {
+            QueryFace::Symbol(symbol_args) => query_symbol(&symbol_args),
+        },
         // Bare `dartq`, `dartq version`, and `--version` all land here.
         Ok(Cli { command: _ }) => {
             println!("dartq {}", env!("CARGO_PKG_VERSION"));
@@ -103,6 +117,8 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Scan + parse only (the M0 differential face, engine-api-spec §4.1).
     Check(CheckArgs),
+    /// Query the analyzed workspace's symbol index (PRD §20.3).
+    Query(QueryArgs),
     /// Print the version.
     Version,
 }
@@ -160,6 +176,43 @@ enum AnalyzeFormat {
     Machine,
     /// Human-readable, grouped by file, severity-sorted.
     Human,
+}
+
+#[derive(Args)]
+struct QueryArgs {
+    #[command(subcommand)]
+    face: QueryFace,
+}
+
+#[derive(Subcommand)]
+enum QueryFace {
+    /// Declarations of one symbol name and resolved references to them.
+    Symbol(SymbolArgs),
+}
+
+#[derive(Args)]
+struct SymbolArgs {
+    /// The symbol name to look up.
+    name: String,
+    /// Package directory holding pubspec.yaml and
+    /// `.dart_tool/package_config.json`; defaults to the current directory.
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    #[arg(long, value_enum, default_value_t = QueryFormat::Machine)]
+    format: QueryFormat,
+    /// Dart SDK root; defaults to `$DART_SDK`.
+    #[arg(long)]
+    sdk: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum QueryFormat {
+    /// One row per line with a stable field order — `DECL` declaration rows
+    /// and `REF` reference rows (a symbol listing, not the diagnostics
+    /// machine face).
+    Machine,
+    /// Single-line JSON object.
+    Json,
 }
 
 /// Severity arithmetic (engine-api-spec §4.2): the highest fatal tier present.
@@ -389,31 +442,28 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
     }
 }
 
-/// One analyze run over a real package directory: pub faces → engine →
-/// oracle-format output on `out`, metrics JSON at exit.
-fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
-    let started = Instant::now();
-
-    // Usage tier: nothing below may run without these faces.
-    let sdk_root = args
-        .sdk
-        .clone()
+/// The usage-tier workspace assembly shared by `analyze` and `query
+/// symbol`: SDK root resolution, canonicalized package directory (printed
+/// paths are symlink-resolved, the oracle convention), the three pub faces,
+/// package tables, SDK snapshot, and the engine context. Usage failures
+/// print on stderr and return the usage tier (64); stdout stays empty. The
+/// canonical directory comes back for the caller's discovery phase.
+fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), u8> {
+    let sdk_root = sdk
+        .map(Path::to_path_buf)
         .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
     let Some(sdk_root) = sdk_root else {
         eprintln!("error: no Dart SDK root (pass --sdk PATH or set DART_SDK)");
-        return exit::USAGE;
+        return Err(exit::USAGE);
     };
     // Canonicalize up front so the printed paths are symlink-resolved (the
     // oracle convention) and package roots derived from `config_dir` inherit
     // the canonical form.
-    let dir = match args.dir.canonicalize() {
+    let dir = match dir.canonicalize() {
         Ok(dir) => dir,
         Err(_) => {
-            eprintln!(
-                "error: Directory or file doesn't exist: {}",
-                args.dir.display()
-            );
-            return exit::USAGE;
+            eprintln!("error: Directory or file doesn't exist: {}", dir.display());
+            return Err(exit::USAGE);
         }
     };
     let config_dir = dir.join(".dart_tool");
@@ -421,7 +471,7 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Ok(faces) => faces,
         Err(message) => {
             eprintln!("error: {message}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
     let graph = match build_graph(
@@ -435,30 +485,30 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Ok(graph) => graph,
         Err(error) => {
             eprintln!("error: {error}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
     let packages = match PackageTable::build(&config, &graph, &config_dir) {
         Ok(packages) => packages,
         Err(error) => {
             eprintln!("error: {error}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
-    let sdk = match SdkSnapshot::load(&sdk_root, None) {
+    let sdk_snapshot = match SdkSnapshot::load(&sdk_root, None) {
         Ok(sdk) => sdk,
         Err(error) => {
             eprintln!(
                 "error: Dart SDK at {} unusable: {error}",
                 sdk_root.display()
             );
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
 
-    let mut engine = match Engine::new(EngineConfig {
+    let engine = match Engine::new(EngineConfig {
         store: memory_store(),
-        sdk,
+        sdk: sdk_snapshot,
         packages,
         pub_config: config,
         config_dir,
@@ -467,8 +517,19 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("error: engine context unusable: {error}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
+    };
+    Ok((engine, dir))
+}
+
+/// One analyze run over a real package directory: pub faces → engine →
+/// oracle-format output on `out`, metrics JSON at exit.
+fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
+    let started = Instant::now();
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(code) => return code,
     };
 
     let discovery_at = Instant::now();
@@ -632,6 +693,195 @@ fn write_human(
         0 => writeln!(out, "No issues found."),
         1 => writeln!(out, "1 issue found."),
         n => writeln!(out, "{n} issues found."),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dartq query symbol — the index face (PRD §20.3)
+// ---------------------------------------------------------------------------
+
+/// `dartq query symbol` — crash tier like [`analyze`]: a panic aborts with
+/// exit 4 and stdout kept empty, because [`query_symbol_run`] writes only
+/// after the query fully succeeded.
+fn query_symbol(args: &SymbolArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_symbol_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One query run: the analyze workspace assembly, one analyze pass (the
+/// read-after-write — the query reflects and never re-drives it), then the
+/// engine's symbol answer on `out`. Exit 0 on success, zero results
+/// included.
+fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(code) => return code,
+    };
+    if let Err(error) = engine.discover_workspace() {
+        eprintln!("dartq: internal error: discovery failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    // The read-after-write: diagnostics are not part of this face, but the
+    // analyze pass is what builds the resolution stage the reference
+    // surface resolves through.
+    let mut on_event = |_: EngineEvent| {};
+    if let Err(Cancelled) = engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
+        eprintln!("dartq: internal error: analysis cancelled");
+        return exit::INTERNAL_ERROR;
+    }
+    let layout = EngineLayout { engine: &engine };
+    let SymbolAnswer { mut decls, mut refs } = engine.query_symbols(&args.name);
+
+    // Output determinism: file path byte order, then position. The engine
+    // returns id-ordered rows; path order is the printed contract.
+    decls.sort_by(|a, b| {
+        path_key(layout.file_path(a.file))
+            .cmp(path_key(layout.file_path(b.file)))
+            .then_with(|| a.range.offset.cmp(&b.range.offset))
+    });
+    refs.sort_by(|a, b| {
+        path_key(layout.file_path(a.target_file))
+            .cmp(path_key(layout.file_path(b.target_file)))
+            .then_with(|| a.range.offset.cmp(&b.range.offset))
+    });
+
+    let written = match args.format {
+        QueryFormat::Machine => write_query_machine(out, &layout, &decls, &refs),
+        QueryFormat::Json => write_query_json(out, &layout, &args.name, &decls, &refs),
+    };
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing query results failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
+/// Machine format: one row per line with a stable field order — the query
+/// face's own grammar (a symbol listing, deliberately not the diagnostics
+/// 8-field face):
+///
+/// ```text
+/// DECL|file|container|kind|name|line|column|length   (container `-` when
+///                                                     top-level; 1-based)
+/// REF|target-file|kind|qualified|offset|length       (the use site's
+///                                                     UTF-16 offset)
+/// ```
+fn write_query_machine(
+    out: &mut impl Write,
+    layout: &dyn FileLayoutProvider,
+    decls: &[DeclHit<'_>],
+    refs: &[RefHit],
+) -> io::Result<()> {
+    for decl in decls {
+        let (line, column) = layout.line_col(decl.file, decl.range.offset);
+        writeln!(
+            out,
+            "DECL|{}|{}|{}|{}|{line}|{column}|{}",
+            layout.file_path(decl.file).display(),
+            decl.container.unwrap_or("-"),
+            decl_kind_name(decl.kind),
+            decl.name,
+            decl.range.length,
+        )?;
+    }
+    for reference in refs {
+        writeln!(
+            out,
+            "REF|{}|{}|{}|{}|{}",
+            layout.file_path(reference.target_file).display(),
+            ref_kind_name(reference.kind),
+            reference.qualified,
+            reference.range.offset,
+            reference.range.length,
+        )?;
+    }
+    Ok(())
+}
+
+/// JSON format: one single-line object — `name` plus `declarations` and
+/// `references` arrays carrying the machine rows' fields (snake_case, the
+/// metrics-JSON convention). Zero results print empty arrays.
+fn write_query_json(
+    out: &mut impl Write,
+    layout: &dyn FileLayoutProvider,
+    name: &str,
+    decls: &[DeclHit<'_>],
+    refs: &[RefHit],
+) -> io::Result<()> {
+    let declarations: Vec<serde_json::Value> = decls
+        .iter()
+        .map(|decl| {
+            let (line, column) = layout.line_col(decl.file, decl.range.offset);
+            serde_json::json!({
+                "file": layout.file_path(decl.file).display().to_string(),
+                "container": decl.container,
+                "kind": decl_kind_name(decl.kind),
+                "name": decl.name,
+                "line": line,
+                "column": column,
+                "length": decl.range.length,
+            })
+        })
+        .collect();
+    let references: Vec<serde_json::Value> = refs
+        .iter()
+        .map(|reference| {
+            serde_json::json!({
+                "target_file": layout.file_path(reference.target_file).display().to_string(),
+                "kind": ref_kind_name(reference.kind),
+                "qualified": reference.qualified,
+                "offset": reference.range.offset,
+                "length": reference.range.length,
+            })
+        })
+        .collect();
+    writeln!(
+        out,
+        "{}",
+        serde_json::json!({
+            "name": name,
+            "declarations": declarations,
+            "references": references,
+        })
+    )
+}
+
+/// Stable machine spelling of a declaration family (the query face's own
+/// grammar — not a diagnostics code).
+fn decl_kind_name(kind: DeclKind) -> &'static str {
+    match kind {
+        DeclKind::Class => "class",
+        DeclKind::Enum => "enum",
+        DeclKind::Mixin => "mixin",
+        DeclKind::Extension => "extension",
+        DeclKind::ExtensionType => "extension-type",
+        DeclKind::TypeAlias => "type-alias",
+        DeclKind::TopLevelFn => "function",
+        DeclKind::TopLevelVar => "variable",
+        DeclKind::TypeParam => "type-param",
+        DeclKind::Method => "method",
+        DeclKind::Getter => "getter",
+        DeclKind::Setter => "setter",
+        DeclKind::Field => "field",
+    }
+}
+
+/// Stable machine spelling of a reference relation.
+fn ref_kind_name(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::Referenced => "reference",
+        RefKind::Read => "read",
+        RefKind::Invoked => "invoked",
+        RefKind::Written => "written",
+        RefKind::ReadWritten => "read-written",
     }
 }
 
@@ -893,6 +1143,9 @@ mod tests {
             &["analyze", "--format", "json", "/p"][..],
             &["analyze", "--metrics-json"][..],
             &["check", "--metrics-json"][..],
+            &["query"][..],
+            &["query", "symbol"][..],
+            &["query", "bogus"][..],
         ] {
             assert!(parse_args_of(args).is_err(), "must reject {args:?}");
         }
@@ -1403,5 +1656,137 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&no_config).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // dartq query symbol
+    // -----------------------------------------------------------------------
+
+    /// The query command face: name positional, default dir, flag
+    /// spellings. Malformed spellings are covered by `usage_errors`.
+    #[test]
+    fn query_args_parse() {
+        let parsed = parse_args_of(&["query", "symbol", "Foo"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        // Single-variant face: an irrefutable destructure.
+        let QueryFace::Symbol(symbol) = args.face;
+        assert_eq!(symbol.name, "Foo");
+        assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
+        assert!(matches!(symbol.format, QueryFormat::Machine));
+        assert!(symbol.sdk.is_none());
+
+        let parsed = parse_args_of(&[
+            "query",
+            "symbol",
+            "--format=json",
+            "--sdk",
+            "/sdk",
+            "/pkg",
+            "Foo",
+        ])
+        .expect("parse")
+        .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::Symbol(symbol) = args.face;
+        assert!(matches!(symbol.format, QueryFormat::Json));
+        assert_eq!(symbol.sdk, Some(PathBuf::from("/sdk")));
+        assert_eq!(symbol.dir, PathBuf::from("/pkg"));
+        assert_eq!(symbol.name, "Foo");
+    }
+
+    fn symbol_args(root: &Path, format: QueryFormat, name: &str) -> SymbolArgs {
+        SymbolArgs {
+            name: name.to_string(),
+            dir: root.to_path_buf(),
+            format,
+            sdk: Some(root.join("sdk")),
+        }
+    }
+
+    /// End to end over a real temp workspace: the class plus its two bare
+    /// cross-file uses in machine bytes (target file, then offset order), a
+    /// member hit with its container name, the JSON face, the empty-result
+    /// edge (exit 0, no rows), and the usage tier.
+    #[test]
+    fn query_symbol_end_to_end() {
+        let root = analyze_fixture(
+            "query",
+            &[
+                (
+                    "lib/a.dart",
+                    "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n",
+                ),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  foo();\n}\n",
+                ),
+            ],
+        );
+        let a = root.canonicalize().expect("root").join("lib/a.dart");
+
+        // `Foo? f` types a reference; `Foo()` is an implicit-creation
+        // invocation; both target a.dart unqualified.
+        let mut out: Vec<u8> = Vec::new();
+        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!(
+                "DECL|{}|-|class|Foo|1|7|3\n\
+                 REF|{}|reference|false|33|3\n\
+                 REF|{}|invoked|false|42|3\n",
+                a.display(),
+                a.display(),
+                a.display()
+            )
+        );
+
+        // A member hit: the container name surfaces; no uses → no REF rows,
+        // still exit 0.
+        let mut out: Vec<u8> = Vec::new();
+        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "meth"), &mut out);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!("DECL|{}|Foo|method|meth|2|8|4\n", a.display())
+        );
+
+        // JSON face: one object, snake_case fields mirroring the rows.
+        let mut out: Vec<u8> = Vec::new();
+        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Json, "Foo"), &mut out);
+        assert_eq!(code, exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert_eq!(json["name"], "Foo");
+        assert_eq!(json["declarations"][0]["kind"], "class");
+        assert_eq!(json["declarations"][0]["name"], "Foo");
+        assert!(json["declarations"][0]["container"].is_null());
+        assert_eq!(json["declarations"][0]["line"], 1);
+        assert_eq!(json["declarations"][0]["column"], 7);
+        assert_eq!(json["references"].as_array().expect("array").len(), 2);
+        assert_eq!(json["references"][0]["kind"], "reference");
+        assert_eq!(json["references"][0]["target_file"], a.display().to_string());
+        assert_eq!(json["references"][0]["qualified"], false);
+        assert_eq!(json["references"][0]["offset"], 33);
+        assert_eq!(json["references"][1]["kind"], "invoked");
+        assert_eq!(json["references"][1]["offset"], 42);
+
+        // Zero results: exit 0, machine prints the empty set.
+        let mut out: Vec<u8> = Vec::new();
+        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Nope"), &mut out);
+        assert_eq!(code, exit::CLEAN);
+        assert!(out.is_empty(), "no rows for a miss");
+
+        // Usage tier: missing directory.
+        let missing = symbol_args(&root.join("nope"), QueryFormat::Machine, "Foo");
+        assert_eq!(query_symbol_run(&missing, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
     }
 }

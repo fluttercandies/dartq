@@ -21,7 +21,8 @@
 //! # Module layout (§1.6)
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
-//! (analyze), `event`, `cancel`.
+//! (analyze), `event`, `cancel`, `query` (the `query symbol` face, PRD
+//! §20.3).
 //!
 //! # The semantic diagnostics seam (#120/#121)
 //!
@@ -39,6 +40,7 @@ pub mod cancel;
 pub mod event;
 pub mod l1;
 pub mod pipeline;
+pub mod query;
 pub mod state;
 
 use std::path::{Path, PathBuf};
@@ -54,6 +56,7 @@ use thiserror::Error;
 
 pub use cancel::{CancellationToken, Cancelled};
 pub use event::{EngineEvent, RevalidateGate};
+pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
 pub use state::{DirectiveFacts, DirectiveKind, LibraryId, UnitFacts};
 
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
@@ -207,6 +210,23 @@ impl Engine {
             on_event,
             cancel,
         )
+    }
+
+    /// The `query symbol` face (PRD §20.3): every declaration of `name`
+    /// across the workspace plus every resolved reference to those
+    /// declarations, answered through the dartq-index query faces
+    /// (#201/#122) built over the current analyzed state.
+    ///
+    /// Read-after-write contract: the answer reflects the latest
+    /// [`Engine::analyze`] — callers analyze first, and a query never
+    /// applies the overlay, re-analyzes, or otherwise mutates derived state
+    /// (the only side effect is interning `name`). Querying before the
+    /// first analyze (no resolution stage yet) answers an empty set. Names
+    /// resolve against the engine's intern table at this boundary; the rows
+    /// borrow, never clone.
+    #[must_use]
+    pub fn query_symbols(&self, name: &str) -> SymbolAnswer<'_> {
+        query::symbols(&self.state, self.graph.as_ref(), name)
     }
 
     /// PRD §17.2 discovery face: package roots (from the identity table)
