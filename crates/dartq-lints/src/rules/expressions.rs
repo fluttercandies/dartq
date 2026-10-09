@@ -1,0 +1,535 @@
+//! The expression-shape family: `unnecessary_new`,
+//! `unnecessary_null_in_if_null_operators`, `prefer_is_not_operator`,
+//! `prefer_adjacent_string_concatenation`,
+//! `avoid_single_cascade_in_expression_statements`.
+
+use dartq_ast::NodeKind;
+
+use crate::engine::Check;
+use crate::registry::{Group, RuleSpec};
+
+pub(crate) mod unnecessary_new {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_new.dart:37-45` —
+    /// every `new` keyword of an instance creation reports at the keyword
+    /// (`reportAtToken(keyword)`). `new` is the span head (`NewExpression`
+    /// is a width-0 kind: the derivable word lives in `header.first_token`,
+    /// collapse map §3.5 NewExpressionEnd row + the §1 elimination note).
+    /// Message: `diagnostic.g.dart` `unnecessaryNew`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_new",
+        group: Group::Recommended,
+        problem: "Unnecessary 'new' keyword.",
+        correction: "Try removing the 'new' keyword.",
+        kinds: &[NodeKind::NewExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let start = c
+            .unit
+            .tokens
+            .get(c.head_token(node) as usize)
+            .expect("span head outside the token table")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+}
+
+pub(crate) mod unnecessary_null_in_if_null_operators {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_null_in_if_null_operators.dart:34-49`
+    /// — `a ?? null` (or `null ?? a`) reports at the `null` literal, right
+    /// operand first. The operator is payload word 0, operands the two
+    /// children (collapse map §3.5 BinaryExpression row). Message:
+    /// `diagnostic.g.dart` `unnecessaryNullInIfNullOperators`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_null_in_if_null_operators",
+        group: Group::Recommended,
+        problem: "Unnecessary use of '??' with 'null'.",
+        correction: "Try removing the '??' operator and the 'null' operand.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(&op) = c.payload(node).first() else {
+            return;
+        };
+        if c.lexeme(op) != "??" {
+            return;
+        }
+        let (left, right) = {
+            let kids = c.direct_children(node);
+            if kids.len() < 2 {
+                return;
+            }
+            (kids[0], kids[1])
+        };
+        let null_operand = if c.kind(right) == NodeKind::LiteralNull {
+            Some(right)
+        } else if c.kind(left) == NodeKind::LiteralNull {
+            Some(left)
+        } else {
+            None
+        };
+        if let Some(operand) = null_operand {
+            let range = c.utf16_span(operand);
+            c.report(range, &[]);
+        }
+    }
+}
+
+pub(crate) mod prefer_is_not_operator {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_is_not_operator.dart:33-55`
+    /// — `!(x is T)` (the `is` expression wrapped in parentheses under a
+    /// `!` prefix) reports at the prefix expression. The parenthesized +
+    /// prefix shape is required by the official parent chain
+    /// (`parent is ParenthesizedExpression && parent.parent is
+    /// PrefixExpression`, :38-54). Message: `diagnostic.g.dart`
+    /// `preferIsNotOperator`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_is_not_operator",
+        group: Group::Recommended,
+        problem: "Use the 'is!' operator rather than negating the value of the 'is' operator.",
+        correction: "Try rewriting the condition to use the 'is!' operator.",
+        kinds: &[NodeKind::IsExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.notOperator != null` bails (:39-42): payload word 0 is the
+        // `not` flag (collapse map §3.5 IsExpression row).
+        if c.payload(node).first().copied().unwrap_or(0) != 0 {
+            return;
+        }
+        let Some(paren) = c.ancestor(1) else {
+            return;
+        };
+        if c.kind(paren) != NodeKind::ParenthesizedExpression {
+            return;
+        }
+        let Some(prefix) = c.ancestor(2) else {
+            return;
+        };
+        if c.kind(prefix) != NodeKind::UnaryPrefix {
+            return;
+        }
+        // Prefix `!` only (`operator.type == TokenType.BANG`, :46-48). The
+        // operator is the `UnaryPrefix` span head (width-0 kind, collapse
+        // map §3.5 UnaryPrefixExpressionHandle row + the §1 elimination
+        // note).
+        if c.lexeme(c.head_token(prefix)) != "!" {
+            return;
+        }
+        let range = c.utf16_span(prefix);
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod prefer_adjacent_string_concatenation {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_adjacent_string_concatenation.dart:37-46`
+    /// — `+` whose two operands are both string literals reports at the
+    /// `+` (adjacent strings need no operator). Message: `diagnostic.g.dart`
+    /// `preferAdjacentStringConcatenation`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_adjacent_string_concatenation",
+        group: Group::Recommended,
+        problem: "String literals shouldn't be concatenated by the '+' operator.",
+        correction: "Try removing the operator to use adjacent strings.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(&op) = c.payload(node).first() else {
+            return;
+        };
+        if c.lexeme(op) != "+" {
+            return;
+        }
+        let string_pair = {
+            let kids = c.direct_children(node);
+            kids.len() >= 2
+                && c.kind(kids[0]) == NodeKind::StringLiteral
+                && c.kind(kids[1]) == NodeKind::StringLiteral
+        };
+        if !string_pair {
+            return;
+        }
+        let start = c
+            .unit
+            .tokens
+            .get(op as usize)
+            .expect("op token outside the token table")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+}
+
+pub(crate) mod avoid_single_cascade_in_expression_statements {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_single_cascade_in_expression_statements.dart:39-61`
+    /// — an expression statement consisting of a single-section cascade
+    /// reports at the cascade, with the equivalent `.`-operator spelled in
+    /// the message (`?.` for a `?..` section, `avoid_single_cascade...dart:40-51`).
+    /// Message: `diagnostic.g.dart` `avoidSingleCascadeInExpressionStatements`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_single_cascade_in_expression_statements",
+        group: Group::Recommended,
+        problem: "Unnecessary cascade expression.",
+        correction: "Try using the operator '{0}'.",
+        kinds: &[NodeKind::Cascade],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let (count, section) = {
+            let kids = c.direct_children(node);
+            (kids.len(), kids.first().copied())
+        };
+        if count != 1 {
+            return;
+        }
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        if c.kind(parent) != NodeKind::ExpressionStatement {
+            return;
+        }
+        let section = section.expect("count == 1 checked above");
+        // The section's cascade operator decides the message argument
+        // (avoid_single_cascade...dart:40-51): `?..` prints as `?.`.
+        let operator = if c.kind(section) == NodeKind::CascadeAccess
+            && c.payload(section).get(1).copied().unwrap_or(0) != 0
+        {
+            "?."
+        } else {
+            "."
+        };
+        let range = c.utf16_span(node);
+        c.report(range, &[operator]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dartq_ast::NodeKind;
+
+    use crate::testsupport::{identifier, one_rule, tok, utf16_at, Fixture, unit_of};
+
+    /// `test/rules/unnecessary_new_test.dart` `test_new` — the keyword
+    /// reports, zero-width at its start.
+    #[test]
+    fn unnecessary_new_reports_the_keyword() {
+        let source = "new B();";
+        // new0 B1 (2 )3 ;4
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::NewExpression, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::Arguments, 2);
+            
+            b.end(NodeKind::Arguments, 4);
+            b.end(NodeKind::NewExpression, 4);
+            b.end(NodeKind::ExpressionStatement, 5);
+        }));
+        let lints = f.run(&one_rule("unnecessary_new"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary 'new' keyword.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    }
+
+    /// Implicit creation (`test_implicit`) never dispatches.
+    #[test]
+    fn unnecessary_new_implicit_creation_passes() {
+        let source = "B();";
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.leaf_span(NodeKind::Send, 0, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        assert!(f.run(&one_rule("unnecessary_new")).is_empty());
+    }
+
+    /// `test/rules/unnecessary_null_in_if_null_operators_test.dart`
+    /// `test_rhsNull` — the right `null` reports first.
+    #[test]
+    fn if_null_right_null_reports() {
+        let source = "var a = b ?? null;";
+        // var0 a1 =2 b3 ??4 null5 ;6
+        let f = Fixture::build(source, unit_of(|b, t| {
+            b.begin(NodeKind::VariablesDeclaration, 0);
+            b.patch(0, tok(source, t, "var", 0));
+            b.begin(NodeKind::InitializedIdentifier, 1);
+            
+            b.begin(NodeKind::VariableInitializer, 2);
+            b.begin(NodeKind::BinaryExpression, 3);
+            b.patch(0, tok(source, t, "??", 0));
+            identifier(b, 3, 4);
+            b.leaf(NodeKind::LiteralNull, 5);
+            b.end(NodeKind::BinaryExpression, 6);
+            b.end(NodeKind::VariableInitializer, 6);
+            b.end(NodeKind::InitializedIdentifier, 6);
+            b.end(NodeKind::VariablesDeclaration, 7);
+        }));
+        let lints = f.run(&one_rule("unnecessary_null_in_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary use of '??' with 'null'.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// The left `null` reports when the right operand is a value
+    /// (`test_lhsNull`).
+    #[test]
+    fn if_null_left_null_reports() {
+        let source = "null ?? b;";
+        // null0 ??1 b2 ;3
+        let f = Fixture::build(source, unit_of(|b, t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::BinaryExpression, 0);
+            b.patch(0, tok(source, t, "??", 0));
+            b.leaf(NodeKind::LiteralNull, 0);
+            identifier(b, 2, 3);
+            b.end(NodeKind::BinaryExpression, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        let lints = f.run(&one_rule("unnecessary_null_in_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    }
+
+    #[test]
+    fn if_null_without_null_passes() {
+        let source = "b ?? c;";
+        let f = Fixture::build(source, unit_of(|b, t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::BinaryExpression, 0);
+            b.patch(0, tok(source, t, "??", 0));
+            identifier(b, 0, 1);
+            identifier(b, 2, 3);
+            b.end(NodeKind::BinaryExpression, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        assert!(
+            f.run(&one_rule("unnecessary_null_in_if_null_operators"))
+                .is_empty()
+        );
+    }
+
+    /// `test/rules/prefer_is_not_operator_test.dart` `test_notIs` — the
+    /// whole prefix expression reports.
+    #[test]
+    fn prefer_is_not_reports_the_prefix() {
+        let source = "!(a is int);";
+        // !0 (1 a2 is3 int4 )5 ;6
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::UnaryPrefix, 0);
+            b.begin(NodeKind::ParenthesizedExpression, 1);
+            b.begin(NodeKind::IsExpression, 1);
+            b.patch(0, 0); // `is`, not `is!`
+            identifier(b, 2, 3);
+            b.leaf_span(NodeKind::Type, 4, 5);
+            b.end(NodeKind::IsExpression, 5);
+            b.end(NodeKind::ParenthesizedExpression, 6);
+            b.end(NodeKind::UnaryPrefix, 6);
+            b.end(NodeKind::ExpressionStatement, 7);
+        }));
+        let lints = f.run(&one_rule("prefer_is_not_operator"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use the 'is!' operator rather than negating the value of the 'is' operator."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    }
+
+    /// `is!` under a `!` already uses the operator (`test_isNot`).
+    #[test]
+    fn prefer_is_not_bare_is_bang_passes() {
+        let source = "!(a is! int);";
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::UnaryPrefix, 0);
+            b.begin(NodeKind::ParenthesizedExpression, 1);
+            b.begin(NodeKind::IsExpression, 1);
+            b.patch(0, 1); // `is!`
+            identifier(b, 2, 3);
+            b.leaf_span(NodeKind::Type, 4, 5);
+            b.end(NodeKind::IsExpression, 5);
+            b.end(NodeKind::ParenthesizedExpression, 6);
+            b.end(NodeKind::UnaryPrefix, 6);
+            b.end(NodeKind::ExpressionStatement, 7);
+        }));
+        assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
+    }
+
+    /// The parenthesized-`!` chain is required (prefer_is_not_operator.dart:
+    /// 38-54) — a bare `is` never dispatches.
+    #[test]
+    fn prefer_is_not_unwrapped_is_passes() {
+        let source = "a is int;";
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::IsExpression, 0);
+            b.patch(0, 0);
+            identifier(b, 0, 1);
+            b.leaf_span(NodeKind::Type, 2, 3);
+            b.end(NodeKind::IsExpression, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
+    }
+
+    /// `test/rules/prefer_adjacent_string_concatenation_test.dart`
+    /// `test_adjacentStrings`.
+    #[test]
+    fn adjacent_strings_reports_the_plus() {
+        let source = "'a' + 'b';";
+        // 'a'0 +1 'b'2 ;3
+        let f = Fixture::build(source, unit_of(|b, t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::BinaryExpression, 0);
+            b.patch(0, tok(source, t, "+", 0));
+            b.leaf_span(NodeKind::StringLiteral, 0, 1);
+            b.leaf_span(NodeKind::StringLiteral, 2, 3);
+            b.end(NodeKind::BinaryExpression, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        let lints = f.run(&one_rule("prefer_adjacent_string_concatenation"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "String literals shouldn't be concatenated by the '+' operator."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+    }
+
+    #[test]
+    fn adjacent_strings_mixed_operands_passes() {
+        let source = "'a' + b;";
+        let f = Fixture::build(source, unit_of(|b, t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            b.begin(NodeKind::BinaryExpression, 0);
+            b.patch(0, tok(source, t, "+", 0));
+            b.leaf_span(NodeKind::StringLiteral, 0, 1);
+            identifier(b, 2, 3);
+            b.end(NodeKind::BinaryExpression, 3);
+            b.end(NodeKind::ExpressionStatement, 4);
+        }));
+        assert!(
+            f.run(&one_rule("prefer_adjacent_string_concatenation"))
+                .is_empty()
+        );
+    }
+
+    /// `test/rules/avoid_single_cascade_in_expression_statements_test.dart`
+    /// `test_oneCascade` — message spells the `.` operator.
+    #[test]
+    fn single_cascade_reports_with_dot() {
+        let source = "a..b();";
+        // a0 ..1 b2 (3 )4 ;5 — the target precedes the cascade node; the
+        // cascade's children are its sections (collapse map §3.5 CascadeEnd).
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            identifier(b, 0, 1);
+            b.begin(NodeKind::Cascade, 1);
+            b.begin(NodeKind::CascadeAccess, 2);
+            b.patch(0, 2);
+            b.patch(1, 0);
+            b.begin(NodeKind::Send, 3);
+            b.begin(NodeKind::Arguments, 3);
+            
+            b.end(NodeKind::Arguments, 5);
+            b.end(NodeKind::Send, 5);
+            b.end(NodeKind::CascadeAccess, 5);
+            b.end(NodeKind::Cascade, 5);
+            b.end(NodeKind::ExpressionStatement, 6);
+        }));
+        let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary cascade expression.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using the operator '.'.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+    }
+
+    /// A `?..` section prints `?.` (avoid_single_cascade...dart:40-51).
+    #[test]
+    fn single_null_aware_cascade_suggests_qmark_dot() {
+        let source = "a?..b();";
+        // a0 ?..1 b2 (3 )4 ;5
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            identifier(b, 0, 1);
+            b.begin(NodeKind::Cascade, 1);
+            b.begin(NodeKind::CascadeAccess, 2);
+            b.patch(0, 2);
+            b.patch(1, 1);
+            b.begin(NodeKind::Send, 3);
+            b.begin(NodeKind::Arguments, 3);
+            
+            b.end(NodeKind::Arguments, 5);
+            b.end(NodeKind::Send, 5);
+            b.end(NodeKind::CascadeAccess, 5);
+            b.end(NodeKind::Cascade, 5);
+            b.end(NodeKind::ExpressionStatement, 6);
+        }));
+        let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using the operator '?.'.".to_owned())
+        );
+    }
+
+    #[test]
+    fn multi_section_cascade_passes() {
+        let source = "a..b()..c();";
+        // a0 ..1 b2 (3 )4 ..5 c6 (7 )8 ;9
+        let f = Fixture::build(source, unit_of(|b, _t| {
+            b.begin(NodeKind::ExpressionStatement, 0);
+            identifier(b, 0, 1);
+            b.begin(NodeKind::Cascade, 1);
+            b.begin(NodeKind::CascadeAccess, 2);
+            b.patch(0, 2);
+            b.patch(1, 0);
+            b.begin(NodeKind::Send, 3);
+            b.begin(NodeKind::Arguments, 3);
+            
+            b.end(NodeKind::Arguments, 5);
+            b.end(NodeKind::Send, 5);
+            b.end(NodeKind::CascadeAccess, 5);
+            b.begin(NodeKind::CascadeAccess, 5);
+            b.patch(0, 5);
+            b.patch(1, 0);
+            b.begin(NodeKind::Send, 6);
+            b.begin(NodeKind::Arguments, 7);
+            
+            b.end(NodeKind::Arguments, 9);
+            b.end(NodeKind::Send, 9);
+            b.end(NodeKind::CascadeAccess, 9);
+            b.end(NodeKind::Cascade, 9);
+            b.end(NodeKind::ExpressionStatement, 10);
+        }));
+        assert!(
+            f.run(&one_rule("avoid_single_cascade_in_expression_statements"))
+                .is_empty()
+        );
+    }
+}

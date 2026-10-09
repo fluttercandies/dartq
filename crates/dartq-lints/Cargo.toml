@@ -5,5 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+dartq-ast = { path = "../dartq-ast" }
+dartq-parser = { path = "../dartq-parser" }
+dartq-scanner = { path = "../dartq-scanner" }
+dartq-source = { path = "../dartq-source" }
+memchr = { workspace = true }
+rustc-hash = { workspace = true }
+
 [lints]
 workspace = true
