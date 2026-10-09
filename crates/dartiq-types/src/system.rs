@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hierarchy::{CoreDecls, DeclInfo, TypeHierarchy};
-use crate::ids::{FunctionSigId, TypeDeclId, TypeId};
+use crate::ids::{FunctionSigId, TypeDeclId, TypeId, TypeParamId};
 use crate::table::TypeTable;
 use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
 
@@ -78,9 +78,10 @@ impl StampSet {
 }
 
 /// Reusable subtype-walk buffers: the interface walk's visited set and LIFO
-/// frontier, plus the LUB supertype-closure sets and their intersection.
-/// Cleared (not reallocated) at the start of every use, so steady-state
-/// queries allocate nothing.
+/// frontier, plus the LUB supertype-closure sets, their intersection, and
+/// the substitution stack the closure walk pushes per level. Cleared (not
+/// reallocated) at the start of every use, so steady-state queries allocate
+/// nothing.
 #[derive(Clone, Default)]
 pub(crate) struct WalkScratch {
     pub(crate) visited: StampSet,
@@ -88,6 +89,11 @@ pub(crate) struct WalkScratch {
     pub(crate) set_a: FxHashSet<TypeId>,
     pub(crate) set_b: FxHashSet<TypeId>,
     pub(crate) candidates: Vec<TypeId>,
+    /// Supertype-closure substitution stack: each generic node pushes its
+    /// `(parameter, argument)` bindings on entry and pops them on exit, and
+    /// every edge substitutes against the live range — one buffer for the
+    /// whole closure instead of a fresh map per node.
+    pub(crate) subst: Vec<(TypeParamId, TypeId)>,
 }
 
 /// Facade over a [`TypeTable`] plus a [`TypeHierarchy`] snapshot. All queries
@@ -704,13 +710,10 @@ impl<'a> TypeSystem<'a> {
     /// arguments `args` (the `Substitution.fromInterfaceType` step,
     /// subtype.dart:213-214). `owner` is the declaration info of the
     /// supertype template's owning class, already resolved by the caller.
+    /// The table zips `params` with the argument pool inside one borrow, so
+    /// the per-edge hot path materializes no intermediate `Vec`.
     fn instantiate(&self, edge: TypeId, owner: &DeclInfo, args: PoolRange) -> TypeId {
-        let params = &owner.type_parameters;
-        if params.is_empty() {
-            return edge;
-        }
-        let map: Vec<_> = params.iter().copied().zip(self.table.args(args)).collect();
-        self.table.substitute(edge, &map)
+        self.table.instantiate(edge, &owner.type_parameters, args)
     }
 
     /// `_interfaceArguments` (subtype.dart:44-83) with the M1 variance

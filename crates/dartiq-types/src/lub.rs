@@ -12,7 +12,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::ids::TypeId;
+use crate::ids::{TypeId, TypeParamId};
 use crate::system::{DEPTH_LIMIT, TypeSystem, WalkScratch};
 use crate::ty::{Type, TypeKind, UninternedType};
 
@@ -267,20 +267,23 @@ impl TypeSystem<'_> {
                 set_a,
                 set_b,
                 candidates,
+                subst,
                 ..
             } = &mut *scratch;
             set_a.clear();
             set_b.clear();
-            self.supertype_closure(a, DEPTH_LIMIT, set_a);
-            self.supertype_closure(b, DEPTH_LIMIT, set_b);
+            subst.clear();
+            self.supertype_closure(a, DEPTH_LIMIT, set_a, subst);
+            self.supertype_closure(b, DEPTH_LIMIT, set_b, subst);
             candidates.clear();
             candidates.extend(set_a.intersection(set_b).copied());
             self.pick_max_unique_depth(candidates)
         } else {
             let mut si = FxHashSet::default();
             let mut sj = FxHashSet::default();
-            self.supertype_closure(a, DEPTH_LIMIT, &mut si);
-            self.supertype_closure(b, DEPTH_LIMIT, &mut sj);
+            let mut subst = Vec::new();
+            self.supertype_closure(a, DEPTH_LIMIT, &mut si, &mut subst);
+            self.supertype_closure(b, DEPTH_LIMIT, &mut sj, &mut subst);
             let candidates: Vec<TypeId> = si.intersection(&sj).copied().collect();
             self.pick_max_unique_depth(&candidates)
         }
@@ -292,7 +295,18 @@ impl TypeSystem<'_> {
     /// recursion at [`DEPTH_LIMIT`]: a validated-but-pathologically-deep
     /// chain stops expanding instead of overflowing the stack (the truncated
     /// closure still resolves through the intersection fallback).
-    fn supertype_closure(&self, t: TypeId, remaining: u32, out: &mut FxHashSet<TypeId>) {
+    ///
+    /// `subst` is the shared substitution stack: this node's bindings are
+    /// pushed on entry, every edge substitutes against the live range
+    /// `&subst[base..]`, and the range pops on exit — the buffer grows to the
+    /// walk's depth once and is reused instead of a fresh map per node.
+    fn supertype_closure(
+        &self,
+        t: TypeId,
+        remaining: u32,
+        out: &mut FxHashSet<TypeId>,
+        subst: &mut Vec<(TypeParamId, TypeId)>,
+    ) {
         if !out.insert(t) {
             return;
         }
@@ -307,20 +321,17 @@ impl TypeSystem<'_> {
             .decl(decl)
             .expect("declared")
             .type_parameters;
-        if params.is_empty() {
-            for &edge in self.hierarchy().supertypes(decl) {
-                self.supertype_closure(edge, remaining - 1, out);
-            }
-        } else {
-            let map: Vec<_> = params
-                .iter()
-                .copied()
-                .zip(self.table().args(args))
-                .collect();
-            for &edge in self.hierarchy().supertypes(decl) {
-                self.supertype_closure(self.table().substitute(edge, &map), remaining - 1, out);
-            }
+        let base = subst.len();
+        // Truncated at the argument range exactly like the former `zip`, so a
+        // malformed short-arity instantiation leaves the tail unbound.
+        for (index, &param) in params.iter().take(args.len()).enumerate() {
+            subst.push((param, self.table().arg(args.offset() + index)));
         }
+        for &edge in self.hierarchy().supertypes(decl) {
+            let instantiated = self.table().substitute(edge, &subst[base..]);
+            self.supertype_closure(instantiated, remaining - 1, out, subst);
+        }
+        subst.truncate(base);
     }
 
     /// `_computeTypeAtMaxUniqueDepth` (least_upper_bound.dart:327-357).

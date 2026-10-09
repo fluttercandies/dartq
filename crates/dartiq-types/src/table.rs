@@ -75,6 +75,34 @@ struct PoolMark {
     fn_type_parameters: usize,
 }
 
+/// The substitution map behind a [`TableState::substitute`] walk: either a
+/// caller-owned slice, or a live zip of parameter names with the argument
+/// pool (rule-12 instantiation) that reads replacements straight from the
+/// pool inside the walk's single `borrow_mut` — no intermediate map `Vec`.
+enum Subst<'a> {
+    Slice(&'a [(TypeParamId, TypeId)]),
+    Zip {
+        params: &'a [TypeParamId],
+        args: PoolRange,
+    },
+}
+
+impl Subst<'_> {
+    /// The replacement for `parameter`, if it is a key. The `Zip` form
+    /// truncates at the argument range exactly like `zip` does, so a short
+    /// range leaves the tail unsubstituted as the eager map would.
+    fn replacement(&self, state: &TableState, parameter: TypeParamId) -> Option<TypeId> {
+        match self {
+            Subst::Slice(map) => map.iter().find(|(p, _)| *p == parameter).map(|&(_, r)| r),
+            Subst::Zip { params, args } => params
+                .iter()
+                .take(args.len())
+                .position(|p| *p == parameter)
+                .map(|index| state.args[args.offset() + index]),
+        }
+    }
+}
+
 impl TypeTable {
     /// Creates an empty table.
     #[must_use]
@@ -223,7 +251,33 @@ impl TypeTable {
     /// appear as map keys (no capture-avoidance needed).
     #[must_use]
     pub fn substitute(&self, ty: TypeId, map: &[(TypeParamId, TypeId)]) -> TypeId {
-        self.state.borrow_mut().substitute(ty, map)
+        if map.is_empty() {
+            return ty;
+        }
+        self.state.borrow_mut().substitute(ty, &Subst::Slice(map))
+    }
+
+    /// Instantiates a supertype template `edge` by substituting `params`
+    /// positionally with the pooled arguments `args` — one call per
+    /// supertype edge per interface-walk step (the
+    /// `Substitution.fromInterfaceType` of subtype.dart:213-214). The map is
+    /// read as a live zip of `params` with the argument pool inside a single
+    /// `borrow_mut`, so the walk materializes no intermediate `Vec`.
+    ///
+    /// # Panics
+    /// Panics when `args` is out of range.
+    pub(crate) fn instantiate(
+        &self,
+        edge: TypeId,
+        params: &[TypeParamId],
+        args: PoolRange,
+    ) -> TypeId {
+        if params.is_empty() {
+            return edge;
+        }
+        self.state
+            .borrow_mut()
+            .substitute(edge, &Subst::Zip { params, args })
     }
 
     /// Collects every type parameter referenced anywhere in `ty`'s structure,
@@ -546,16 +600,13 @@ impl TableState {
                 .all(|(a, b)| a.name == b.name && a.ty == b.ty && a.required == b.required)
     }
 
-    fn substitute(&mut self, ty: TypeId, map: &[(TypeParamId, TypeId)]) -> TypeId {
-        if map.is_empty() {
-            return ty;
-        }
+    fn substitute(&mut self, ty: TypeId, map: &Subst<'_>) -> TypeId {
         let t = self.types[ty.raw() as usize];
         match t.kind() {
             TypeKind::TypeParameter { parameter } => {
-                match map.iter().find(|(p, _)| *p == parameter) {
+                match map.replacement(self, parameter) {
                     None => ty,
-                    Some(&(_, replacement)) => {
+                    Some(replacement) => {
                         // The official substitutor unites nullabilities
                         // (type_algebra.dart:97-106): `T?=X!` is `X?`.
                         // Unit-kind normalization still applies to the
@@ -580,23 +631,16 @@ impl TableState {
             },
             TypeKind::Function { signature } => {
                 let sig = self.signatures[signature.raw() as usize];
-                let (positional, positional_changed) =
-                    self.substitute_slice_changed(sig.positional, map);
-                let mut named =
-                    self.named[sig.named.offset()..sig.named.offset() + sig.named.len()].to_vec();
-                let mut named_changed = false;
-                for member in &mut named {
-                    let substituted = self.substitute(member.ty, map);
-                    if substituted != member.ty {
-                        member.ty = substituted;
-                        named_changed = true;
-                    }
-                }
+                // Each section materializes only when its read-only pre-scan
+                // finds a key; `Option::is_some` doubles as the changed flag
+                // (the id comparison lives in the substitute helpers).
+                let positional = self.substitute_args(sig.positional, map);
+                let named = self.substitute_named(sig.named, map);
                 // The return type substitutes unconditionally: a mapped
                 // parameter can appear *only* there (`T Function()`), so the
                 // fast path must observe it too.
                 let return_type = self.substitute(sig.return_type, map);
-                if positional_changed || named_changed || return_type != sig.return_type {
+                if positional.is_some() || named.is_some() || return_type != sig.return_type {
                     let type_parameters = self.fn_type_parameters[sig.type_parameters.offset()
                         ..sig.type_parameters.offset() + sig.type_parameters.len()]
                         .to_vec();
@@ -604,8 +648,8 @@ impl TableState {
                         UninternedFunction {
                             return_type,
                             type_parameters,
-                            positional,
-                            named,
+                            positional: positional.unwrap_or_else(|| self.args_vec(sig.positional)),
+                            named: named.unwrap_or_else(|| self.named_vec(sig.named)),
                             required_positional: sig.required_positional,
                         },
                         t.is_nullable(),
@@ -621,22 +665,18 @@ impl TableState {
             }
             TypeKind::Record { shape } => {
                 let shape = self.shapes[shape.raw() as usize];
-                let (positional, positional_changed) =
-                    self.substitute_slice_changed(shape.positional, map);
-                let mut named = self.named
-                    [shape.named.offset()..shape.named.offset() + shape.named.len()]
-                    .to_vec();
-                let mut named_changed = false;
-                for member in &mut named {
-                    let substituted = self.substitute(member.ty, map);
-                    if substituted != member.ty {
-                        member.ty = substituted;
-                        named_changed = true;
-                    }
-                }
-                if positional_changed || named_changed {
-                    self.intern_record(UninternedRecord { positional, named }, t.is_nullable())
-                        .expect("substituting types preserves record well-formedness")
+                let positional = self.substitute_args(shape.positional, map);
+                let named = self.substitute_named(shape.named, map);
+                if positional.is_some() || named.is_some() {
+                    self.intern_record(
+                        UninternedRecord {
+                            positional: positional
+                                .unwrap_or_else(|| self.args_vec(shape.positional)),
+                            named: named.unwrap_or_else(|| self.named_vec(shape.named)),
+                        },
+                        t.is_nullable(),
+                    )
+                    .expect("substituting types preserves record well-formedness")
                 } else {
                     ty
                 }
@@ -708,32 +748,100 @@ impl TableState {
         }
     }
 
-    /// Substitutes through an argument range; `None` when nothing changed.
-    fn substitute_args(
-        &mut self,
-        range: PoolRange,
-        map: &[(TypeParamId, TypeId)],
-    ) -> Option<Vec<TypeId>> {
-        let (args, changed) = self.substitute_slice_changed(range, map);
-        if changed { Some(args) } else { None }
+    /// Copies a pooled argument range.
+    fn args_vec(&self, range: PoolRange) -> Vec<TypeId> {
+        self.args[range.offset()..range.offset() + range.len()].to_vec()
     }
 
-    fn substitute_slice_changed(
-        &mut self,
-        range: PoolRange,
-        map: &[(TypeParamId, TypeId)],
-    ) -> (Vec<TypeId>, bool) {
-        let slice: Vec<TypeId> = self.args[range.offset()..range.offset() + range.len()].to_vec();
+    /// Copies a pooled named-member range (cloning each `String` name).
+    fn named_vec(&self, range: PoolRange) -> Vec<NamedMember> {
+        self.named[range.offset()..range.offset() + range.len()].to_vec()
+    }
+
+    /// Substitutes through an argument range; `None` when nothing changed.
+    /// A read-only pre-scan gates the copy, and the entries are re-read from
+    /// the pool by index (pools are append-only, so indexes survive the
+    /// interning that substitution may perform), so the no-match path
+    /// allocates nothing and the changed path copies once, not twice.
+    fn substitute_args(&mut self, range: PoolRange, map: &Subst<'_>) -> Option<Vec<TypeId>> {
+        if !self.range_mentions_key(range, map) {
+            return None;
+        }
+        let mut args = Vec::with_capacity(range.len());
         let mut changed = false;
-        let args = slice
-            .into_iter()
-            .map(|arg| {
-                let substituted = self.substitute(arg, map);
-                changed |= substituted != arg;
-                substituted
-            })
-            .collect();
-        (args, changed)
+        for index in range.offset()..range.offset() + range.len() {
+            let arg = self.args[index];
+            let substituted = self.substitute(arg, map);
+            changed |= substituted != arg;
+            args.push(substituted);
+        }
+        changed.then_some(args)
+    }
+
+    /// Substitutes through a named-member range; `None` when nothing
+    /// changed. The copy carries a `String` per member, so it is gated on
+    /// the same pre-scan; `Option::is_some` doubles as the changed flag.
+    fn substitute_named(&mut self, range: PoolRange, map: &Subst<'_>) -> Option<Vec<NamedMember>> {
+        if !self.named_mentions_key(range, map) {
+            return None;
+        }
+        let mut members = self.named_vec(range);
+        let mut changed = false;
+        for member in &mut members {
+            let substituted = self.substitute(member.ty, map);
+            if substituted != member.ty {
+                member.ty = substituted;
+                changed = true;
+            }
+        }
+        changed.then_some(members)
+    }
+
+    /// Read-only pre-scan for [`TableState::substitute_args`]: whether any
+    /// type in the pooled argument range mentions a substitution key. A miss
+    /// proves the substitution cannot change any id — changes originate only
+    /// at `TypeParameter` nodes whose parameter is a key — so the caller
+    /// skips materializing the copy.
+    fn range_mentions_key(&self, range: PoolRange, map: &Subst<'_>) -> bool {
+        self.args[range.offset()..range.offset() + range.len()]
+            .iter()
+            .any(|&arg| self.mentions_key(arg, map))
+    }
+
+    /// Same pre-scan over a named-member range.
+    fn named_mentions_key(&self, range: PoolRange, map: &Subst<'_>) -> bool {
+        self.named[range.offset()..range.offset() + range.len()]
+            .iter()
+            .any(|member| self.mentions_key(member.ty, map))
+    }
+
+    /// Whether `ty`'s reachable structure contains a `TypeParameter` node
+    /// whose parameter is a key of `map`. Mirrors
+    /// [`TableState::substitute`]'s recursion exactly — function binders are
+    /// skipped because their ids are globally unique per declaration and can
+    /// never be substitution keys — but touches nothing.
+    fn mentions_key(&self, ty: TypeId, map: &Subst<'_>) -> bool {
+        match self.types[ty.raw() as usize].kind() {
+            TypeKind::TypeParameter { parameter } => map.replacement(self, parameter).is_some(),
+            TypeKind::Interface { args, .. } => self.range_mentions_key(args, map),
+            TypeKind::Function { signature } => {
+                let sig = &self.signatures[signature.raw() as usize];
+                self.mentions_key(sig.return_type, map)
+                    || self.range_mentions_key(sig.positional, map)
+                    || self.named_mentions_key(sig.named, map)
+            }
+            TypeKind::FutureOr { base } => self.mentions_key(base, map),
+            TypeKind::Record { shape } => {
+                let shape = &self.shapes[shape.raw() as usize];
+                self.range_mentions_key(shape.positional, map)
+                    || self.named_mentions_key(shape.named, map)
+            }
+            TypeKind::Never
+            | TypeKind::Dynamic
+            | TypeKind::Void
+            | TypeKind::Invalid
+            | TypeKind::Null => false,
+        }
     }
 
     fn collect(&self, ty: TypeId, out: &mut BTreeSet<TypeParamId>) {
@@ -843,6 +951,46 @@ fn mix_u64(h: u64, value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::TypeDeclId;
+
+    /// Rule-12 instantiation fixture: a one-parameter owner and a one-argument
+    /// wrapper edge, with the map values taken from `Owner<int>`'s pool range.
+    fn instantiate_fixture() -> (
+        TypeTable,
+        TypeDeclId, // wrapper edge's declaration
+        TypeId,     // int
+        TypeId,     // owner param (the substitution key)
+        TypeId,     // a foreign parameter (never a key)
+        PoolRange,  // argument range of `Owner<int>`
+    ) {
+        let table = TypeTable::new();
+        let (int_decl, owner_decl, wrapper_decl) = (
+            TypeDeclId::from_raw(1),
+            TypeDeclId::from_raw(2),
+            TypeDeclId::from_raw(3),
+        );
+        let (key, foreign) = (TypeParamId::from_raw(1), TypeParamId::from_raw(2));
+        let int = table.intern(
+            UninternedType::Interface {
+                decl: int_decl,
+                args: Vec::new(),
+            },
+            false,
+        );
+        let key_ty = table.intern(UninternedType::TypeParameter { parameter: key }, false);
+        let foreign_ty = table.intern(UninternedType::TypeParameter { parameter: foreign }, false);
+        let current = table.intern(
+            UninternedType::Interface {
+                decl: owner_decl,
+                args: vec![int],
+            },
+            false,
+        );
+        let TypeKind::Interface { args, .. } = table.get(current).kind() else {
+            panic!("expected an interface type");
+        };
+        (table, wrapper_decl, int, key_ty, foreign_ty, args)
+    }
 
     /// Real 64-bit structural collisions are impractical to construct from
     /// the outside, so the test fabricates the exact state one produces:
@@ -864,5 +1012,49 @@ mod tests {
         assert_eq!(st.types.len(), 2);
         // The dedup hit must not append to the bucket.
         assert_eq!(st.collisions.get(&hash).map(Vec::len), Some(1));
+    }
+
+    /// Instantiation pre-scan, no-match side: an edge whose structure
+    /// mentions no map key must come back as the template's own id — no
+    /// re-intern, no materialized copies.
+    #[test]
+    fn instantiate_without_a_key_mention_returns_the_template_id() {
+        let (table, wrapper, _int, _key_ty, foreign_ty, args) = instantiate_fixture();
+        let edge = table.intern(
+            UninternedType::Interface {
+                decl: wrapper,
+                args: vec![foreign_ty],
+            },
+            false,
+        );
+        assert_eq!(
+            table.instantiate(edge, &[TypeParamId::from_raw(1)], args),
+            edge
+        );
+    }
+
+    /// Instantiation pre-scan, match side: an edge that does mention the key
+    /// substitutes positionally from the argument pool.
+    #[test]
+    fn instantiate_substitutes_edges_that_mention_the_key() {
+        let (table, wrapper, int, key_ty, _foreign_ty, args) = instantiate_fixture();
+        let edge = table.intern(
+            UninternedType::Interface {
+                decl: wrapper,
+                args: vec![key_ty],
+            },
+            false,
+        );
+        let expected = table.intern(
+            UninternedType::Interface {
+                decl: wrapper,
+                args: vec![int],
+            },
+            false,
+        );
+        assert_eq!(
+            table.instantiate(edge, &[TypeParamId::from_raw(1)], args),
+            expected
+        );
     }
 }
