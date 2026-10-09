@@ -267,6 +267,141 @@ fn deep_diamond_lub_is_not_truncated_by_chain_depth() {
 }
 
 #[test]
+fn lub_beyond_the_shared_depth_limit_degrades_to_object_question() {
+    // The oracle aborts a >100-deep LUB nesting at the outermost
+    // `getLeastUpperBound` frame with `Object?` (`_maxTypeOperationDepth`,
+    // type_system.dart:85; least_upper_bound.dart:378-386). Same-declaration
+    // pairs recurse through the pointwise argument merge
+    // (least_upper_bound.dart:62-100), one counted frame per nesting level,
+    // plus one leaf frame for `UP(int, string)`, so the boundary is exact:
+    // 100 nested operations compute the full merge, 101 degrade.
+    let fx = fixture();
+    let sys = fx.system();
+    let object = fx.itf(fx.d.object, &[], false);
+    let nest = |depth: usize, leaf: TypeId| {
+        let mut t = leaf;
+        for _ in 0..depth {
+            t = fx.list_of(t, false);
+        }
+        t
+    };
+
+    // 150-deep pair: well past the limit, the outermost frame answers
+    // `Object?` — not a partially merged `List<List<...>>`.
+    assert_eq!(
+        sys.least_upper_bound(nest(150, fx.int()), nest(150, fx.string())),
+        fx.object_question()
+    );
+    // A 100-deep pair is exactly 101 nested operations (100 merge frames +
+    // the leaf) — the boundary trips.
+    assert_eq!(
+        sys.least_upper_bound(nest(100, fx.int()), nest(100, fx.string())),
+        fx.object_question()
+    );
+    // A 99-deep pair is 100 nested operations: within the limit, the full
+    // pointwise merge with UP(int, string) = `Object` at the leaf.
+    assert_eq!(
+        sys.least_upper_bound(nest(99, fx.int()), nest(99, fx.string())),
+        nest(99, object)
+    );
+}
+
+#[test]
+fn lub_and_subtype_draw_on_one_shared_depth_budget() {
+    // The oracle keeps ONE `_typeOperationDepth` cell for both faces
+    // (type_system.dart:85, :372-382): a subtype leg inside a LUB continues
+    // the LUB's count. The pair below is subtype-related through a 60-deep
+    // argument descent — within the limit alone, so the interface LUB takes
+    // the supertype shortcut (least_upper_bound.dart:55-60) and answers the
+    // supertype. Wrapped in 50 `FutureOr` merges (50 counted LUB frames,
+    // least_upper_bound.dart:815-839) the combined nesting passes 100: the
+    // leg trips to `false`, the shortcut is skipped, and the supertype-set
+    // intersection answers `Object` instead.
+    let table = TypeTable::new();
+    let (object, int, num) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+    );
+    let (future, function) = (TypeDeclId::from_raw(4), TypeDeclId::from_raw(5));
+    let (inner, low, high) = (
+        TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
+        TypeDeclId::from_raw(8),
+    );
+    let (e_inner, e_high, e_low, e_future) = (
+        TypeParamId::from_raw(1),
+        TypeParamId::from_raw(2),
+        TypeParamId::from_raw(3),
+        TypeParamId::from_raw(4),
+    );
+    let itf = |decl: TypeDeclId, args: &[TypeId]| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: args.to_vec(),
+            },
+            false,
+        )
+    };
+    let object_ty = itf(object, &[]);
+    let low_param = table.intern(UninternedType::TypeParameter { parameter: e_low }, false);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![e_future])
+    .decl(function, Vec::new())
+    .decl(int, Vec::new())
+    .decl(num, Vec::new())
+    .decl(inner, vec![e_inner])
+    .decl(low, vec![e_low])
+    .decl(high, vec![e_high])
+    .supertype(int, itf(num, &[]))
+    .supertype(num, object_ty)
+    .supertype(inner, object_ty)
+    .supertype(high, object_ty)
+    .supertype(low, itf(high, &[low_param]))
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = TypeSystem::new(&table, &hierarchy);
+
+    let mut deep_int = itf(int, &[]);
+    let mut deep_num = itf(num, &[]);
+    for _ in 0..60 {
+        deep_int = itf(inner, &[deep_int]);
+        deep_num = itf(inner, &[deep_num]);
+    }
+    let x = itf(low, &[deep_int]);
+    let y = itf(high, &[deep_num]);
+    let wrap = |t: TypeId, depth: usize| {
+        let mut t = t;
+        for _ in 0..depth {
+            t = table.intern(UninternedType::FutureOr { base: t }, false);
+        }
+        t
+    };
+
+    // Standalone: the argument descent completes (62 frames < 100) and the
+    // shortcut answers the supertype.
+    assert!(sys.is_subtype(x, y));
+    assert_eq!(sys.least_upper_bound(x, y), y);
+    // 20 FutureOr frames on top: 82 combined frames, still inside the
+    // shared budget — same shortcut answer, re-wrapped.
+    assert_eq!(sys.least_upper_bound(wrap(x, 20), wrap(y, 20)), wrap(y, 20));
+    // 50 FutureOr frames: 112 combined frames. The subtype leg trips at 101
+    // and answers `false`, so the LUB falls to the intersection
+    // {`Object`} — observably not the shortcut's supertype.
+    assert_eq!(
+        sys.least_upper_bound(wrap(x, 50), wrap(y, 50)),
+        wrap(object_ty, 50)
+    );
+}
+
+#[test]
 fn records_fall_back_to_object() {
     let fx = fixture();
     let sys = fx.system();

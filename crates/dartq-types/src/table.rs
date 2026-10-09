@@ -311,6 +311,22 @@ impl TypeTable {
         self.state.borrow().types.is_empty()
     }
 
+    /// The five side-pool lengths — `[args, named, signatures, shapes,
+    /// fn_type_parameters]`. Test observability for the dedup-rollback
+    /// contract: a dedup hit must reclaim the freshly appended payload, so
+    /// re-interning known types must leave every length stable.
+    #[cfg(test)]
+    pub(crate) fn side_pool_lens(&self) -> [usize; 5] {
+        let st = self.state.borrow();
+        [
+            st.args.len(),
+            st.named.len(),
+            st.signatures.len(),
+            st.shapes.len(),
+            st.fn_type_parameters.len(),
+        ]
+    }
+
     /// Substitutes type parameters throughout `ty`, interning the result.
     ///
     /// `map` entries replace [`TypeKind::TypeParameter`] references. A mapped
@@ -374,11 +390,16 @@ impl TypeTable {
 
 impl TableState {
     fn intern_kind(&mut self, ty: UninternedType, nullable: bool) -> TypeId {
+        // The mark precedes every pool append (the `Interface` arm appends
+        // while constructing the kind), so `commit`'s dedup-hit rollback
+        // reclaims the appended tail.
+        let mark = self.mark();
         let (kind, nullable) = match ty {
             // `Never?` behaves as `Null` (type.dart:1207-1209): intern it as
             // `Null` so the bottom type stays a single non-`?` shape.
             UninternedType::Never => {
                 return self.commit(
+                    mark,
                     if nullable {
                         TypeKind::Null
                     } else {
@@ -406,7 +427,7 @@ impl TableState {
             }
             UninternedType::FutureOr { base } => (TypeKind::FutureOr { base }, nullable),
         };
-        self.commit(kind, nullable)
+        self.commit(mark, kind, nullable)
     }
 
     fn intern_function(
@@ -414,6 +435,9 @@ impl TableState {
         sig: UninternedFunction,
         nullable: bool,
     ) -> Result<TypeId, TypeError> {
+        // The mark precedes the appends below (parameters, arguments, named
+        // members, signature) so a dedup-hit rollback reclaims all of them.
+        let mark = self.mark();
         let UninternedFunction {
             return_type,
             type_parameters,
@@ -438,7 +462,7 @@ impl TableState {
             named,
             required_positional,
         });
-        Ok(self.commit(TypeKind::Function { signature }, nullable))
+        Ok(self.commit(mark, TypeKind::Function { signature }, nullable))
     }
 
     fn intern_record(
@@ -446,6 +470,9 @@ impl TableState {
         shape: UninternedRecord,
         nullable: bool,
     ) -> Result<TypeId, TypeError> {
+        // The mark precedes the appends below (fields, shape) so a dedup-hit
+        // rollback reclaims all of them.
+        let mark = self.mark();
         let UninternedRecord { positional, named } = shape;
         // Record fields have no `required` concept.
         let mut named: Vec<NamedMember> = named;
@@ -456,14 +483,17 @@ impl TableState {
         let positional = self.append_args(&positional);
         let named = self.append_named(&named);
         let shape = self.push_shape(RecordShapeData { positional, named });
-        Ok(self.commit(TypeKind::Record { shape }, nullable))
+        Ok(self.commit(mark, TypeKind::Record { shape }, nullable))
     }
 
     /// Appends the type unconditionally, then deduplicates: a structural hit
-    /// rolls the appends back. Pool writes are cheap; rollback restores the
-    /// marks exactly.
-    fn commit(&mut self, kind: TypeKind, nullable: bool) -> TypeId {
-        let mark = self.mark();
+    /// rolls everything appended since `mark` back. The mark is taken by the
+    /// caller *before* the payload appends (they happen while constructing
+    /// `kind`), so the rollback reclaims the appended tail. Safety: nothing
+    /// published references that tail — its only referent is the fresh
+    /// `types` entry the hit deduplicates away — so truncating it is sound.
+    /// Pool writes are cheap; rollback restores the marks exactly.
+    fn commit(&mut self, mark: PoolMark, kind: TypeKind, nullable: bool) -> TypeId {
         let id = u32::try_from(self.types.len()).expect("type pool exceeds u32::MAX");
         self.types.push(Type::new(kind, nullable));
         let hash = self.hash_type(id);
@@ -1098,6 +1128,85 @@ mod tests {
             panic!("expected an interface type");
         };
         (table, wrapper_decl, int, key_ty, foreign_ty, args)
+    }
+
+    /// The dedup-hit rollback pin: re-interning a known compound type reaches
+    /// `commit` *after* the payload (arguments, named members, signature or
+    /// shape, declared parameters) was appended, so the hit must roll every
+    /// side pool back. The pre-fix mark sat inside `commit`, past the
+    /// appends, and each dedup hit orphaned the tail — e.g. one `args` slot
+    /// per repeated `instantiate` query, forever.
+    #[test]
+    fn dedup_hit_rolls_back_the_appended_side_pool_tail() {
+        let table = TypeTable::new();
+        let (decl, param) = (TypeDeclId::from_raw(1), TypeParamId::from_raw(1));
+        let int = table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            false,
+        );
+        let fn_input = || UninternedFunction {
+            return_type: int,
+            type_parameters: vec![param],
+            positional: vec![int, int],
+            named: vec![NamedMember {
+                name: "x".into(),
+                ty: int,
+                required: false,
+            }],
+            required_positional: 1,
+        };
+        let record_input = || UninternedRecord {
+            positional: vec![int],
+            named: vec![NamedMember {
+                name: "y".into(),
+                ty: int,
+                required: false,
+            }],
+        };
+        let fn_t = table.intern_function(fn_input(), false).expect("valid");
+        let record = table.intern_record(record_input(), false).expect("valid");
+        let list_int = table.intern(
+            UninternedType::Interface {
+                decl,
+                args: vec![int],
+            },
+            false,
+        );
+
+        // Second interns are pure dedup hits: identical ids, and every side
+        // pool restored to its pre-intern length.
+        let (len, lens) = (table.len(), table.side_pool_lens());
+        let fn_again = table.intern_function(fn_input(), false).expect("valid");
+        assert_eq!(fn_again, fn_t);
+        assert_eq!(
+            table.side_pool_lens(),
+            lens,
+            "function dedup hit must reclaim the parameter/argument/named/signature tail"
+        );
+        let record_again = table.intern_record(record_input(), false).expect("valid");
+        assert_eq!(record_again, record);
+        assert_eq!(
+            table.side_pool_lens(),
+            lens,
+            "record dedup hit must reclaim the argument/named/shape tail"
+        );
+        let list_again = table.intern(
+            UninternedType::Interface {
+                decl,
+                args: vec![int],
+            },
+            false,
+        );
+        assert_eq!(list_again, list_int);
+        assert_eq!(
+            table.side_pool_lens(),
+            lens,
+            "interface dedup hit must reclaim the argument tail"
+        );
+        assert_eq!(table.len(), len, "dedup hits must not grow the type pool");
     }
 
     /// Real 64-bit structural collisions are impractical to construct from

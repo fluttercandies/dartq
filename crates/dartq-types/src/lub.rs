@@ -16,18 +16,43 @@
 use rustc_hash::FxHashSet;
 
 use crate::ids::TypeId;
-use crate::system::{TypeSystem, WalkScratch};
+use crate::system::{DepthLimitExceeded, TypeSystem, WalkScratch};
 use crate::ty::{Type, TypeKind, UninternedType};
 
 impl TypeSystem<'_> {
     /// The least upper bound of two types; the static type of `c ? a : b`
     /// and the result type of `a ?? b` (before the nullability dance the
     /// checker applies).
+    ///
+    /// Depth is bounded by the shared type-operation cell
+    /// (`type_system.dart:85`, `:372-382`): a >100-deep LUB nesting unwinds
+    /// to this outermost frame, which degrades to `Object?` exactly like the
+    /// oracle (`least_upper_bound.dart:378-386`).
     #[must_use]
     pub fn least_upper_bound(&self, a: TypeId, b: TypeId) -> TypeId {
+        self.lub_step(a, b)
+            .unwrap_or_else(|DepthLimitExceeded| self.object_question())
+    }
+
+    /// One `getLeastUpperBound` frame: enters the shared depth cell (the
+    /// oracle re-enters per recursion level, least_upper_bound.dart:379) and
+    /// runs the rule table. `Err` is the oracle's rethrow
+    /// (least_upper_bound.dart:383-385) — it unwinds every nested frame to
+    /// the outermost entry, which is [`TypeSystem::least_upper_bound`].
+    fn lub_step(&self, a: TypeId, b: TypeId) -> Result<TypeId, DepthLimitExceeded> {
+        self.enter_type_operation()?;
+        let answer = self.lub_compute(a, b);
+        self.exit_type_operation();
+        answer
+    }
+
+    /// `_computeLeastUpperBound` (least_upper_bound.dart:391-672) with the
+    /// documented M1 fallbacks; recursion goes through [`Self::lub_step`] so
+    /// every level re-enters the shared depth cell.
+    fn lub_compute(&self, a: TypeId, b: TypeId) -> Result<TypeId, DepthLimitExceeded> {
         // UP(T, T) = T (least_upper_bound.dart:393-395).
         if a == b {
-            return a;
+            return Ok(a);
         }
         let t1 = self.table().get(a);
         let t2 = self.table().get(b);
@@ -36,30 +61,30 @@ impl TypeSystem<'_> {
         let top1 = self.is_top(a);
         let top2 = self.is_top(b);
         if top1 && top2 {
-            return if self.is_more_top(a, b) { a } else { b };
+            return Ok(if self.is_more_top(a, b) { a } else { b });
         }
         if top1 {
-            return a;
+            return Ok(a);
         }
         if top2 {
-            return b;
+            return Ok(b);
         }
 
         // BOTTOM (least_upper_bound.dart:429-451). `Never` is the only bottom
         // type in M1 (`Never?` is interned as `Null`).
         if self.is_bottom(a) {
-            return b;
+            return Ok(b);
         }
         if self.is_bottom(b) {
-            return a;
+            return Ok(a);
         }
 
         // NULL (least_upper_bound.dart:487-524).
         if self.is_null(a) {
-            return self.null_case(b);
+            return Ok(self.null_case(b));
         }
         if self.is_null(b) {
-            return self.null_case(a);
+            return Ok(self.null_case(a));
         }
 
         // OBJECT (least_upper_bound.dart:526-560). The both-object rule runs
@@ -70,27 +95,27 @@ impl TypeSystem<'_> {
         let a_is_object = self.is_object(a);
         let b_is_object = self.is_object(b);
         if a_is_object && b_is_object {
-            return if self.is_more_top(a, b) { a } else { b };
+            return Ok(if self.is_more_top(a, b) { a } else { b });
         }
         if a_is_object {
-            return if self.is_non_nullable(b) {
+            return Ok(if self.is_non_nullable(b) {
                 a
             } else {
                 self.make_nullable(a)
-            };
+            });
         }
         if b_is_object {
-            return if self.is_non_nullable(a) {
+            return Ok(if self.is_non_nullable(a) {
                 b
             } else {
                 self.make_nullable(b)
-            };
+            });
         }
 
         // UP(T1?, T2) = UP(T1, T2)? (least_upper_bound.dart:562-571).
         if t1.is_nullable() || t2.is_nullable() {
-            let s = self.least_upper_bound(self.strip(a), self.strip(b));
-            return self.make_nullable(s);
+            let s = self.lub_step(self.strip(a), self.strip(b))?;
+            return Ok(self.make_nullable(s));
         }
 
         // Type parameters (least_upper_bound.dart:576-609). M1 has no
@@ -101,31 +126,31 @@ impl TypeSystem<'_> {
             || matches!(t2.kind(), TypeKind::TypeParameter { .. })
         {
             if self.is_subtype(a, b) {
-                return b;
+                return Ok(b);
             }
             if self.is_subtype(b, a) {
-                return a;
+                return Ok(a);
             }
-            return self.object_question();
+            return Ok(self.object_question());
         }
 
         // FUNCTION (least_upper_bound.dart:611-635).
         if matches!(t1.kind(), TypeKind::Function { .. }) {
             if self.is_bare_function_id(b) {
-                return b;
+                return Ok(b);
             }
             if matches!(t2.kind(), TypeKind::Function { .. }) {
                 // M1: no parameter-wise GLB merge — the coarse upper bound
                 // `Function` (the official correlation-failure fallback).
-                return self.intern_bare_function();
+                return Ok(self.intern_bare_function());
             }
-            return self.up_object_with(b);
+            return Ok(self.up_object_with(b));
         }
         if matches!(t2.kind(), TypeKind::Function { .. }) {
             if self.is_bare_function_id(a) {
-                return a;
+                return Ok(a);
             }
-            return self.up_object_with(a);
+            return Ok(self.up_object_with(a));
         }
 
         // RECORD (least_upper_bound.dart:637-660). `UP((...), Record) =
@@ -150,33 +175,33 @@ impl TypeSystem<'_> {
                 // before a record shape, on either side.
                 let is_record_class = |t: Type| matches!(t.kind(), TypeKind::Interface { decl, .. } if decl == record);
                 if is_record_class(t2) {
-                    return b;
+                    return Ok(b);
                 }
                 if is_record_class(t1) {
-                    return a;
+                    return Ok(a);
                 }
                 if matches!(t1.kind(), TypeKind::Record { .. })
                     && matches!(t2.kind(), TypeKind::Record { .. })
                 {
-                    return self.table().intern(
+                    return Ok(self.table().intern(
                         UninternedType::Interface {
                             decl: record,
                             args: Vec::new(),
                         },
                         false,
-                    );
+                    ));
                 }
             }
-            return if matches!(t1.kind(), TypeKind::Record { .. }) {
+            return Ok(if matches!(t1.kind(), TypeKind::Record { .. }) {
                 self.up_object_with(b)
             } else {
                 self.up_object_with(a)
-            };
+            });
         }
 
         // FUTUREOR (least_upper_bound.dart:662, :796-844).
-        if let Some(result) = self.future_or_lub(a, b) {
-            return result;
+        if let Some(result) = self.future_or_lub(a, b)? {
+            return Ok(result);
         }
 
         // INTERFACE (least_upper_bound.dart:670-671).
@@ -204,7 +229,7 @@ impl TypeSystem<'_> {
 
     /// `_futureOr` (least_upper_bound.dart:796-844). Only no-suffix
     /// projections reach here (the nullability merge ran earlier).
-    fn future_or_lub(&self, a: TypeId, b: TypeId) -> Option<TypeId> {
+    fn future_or_lub(&self, a: TypeId, b: TypeId) -> Result<Option<TypeId>, DepthLimitExceeded> {
         let future_or = |t: TypeId| match self.table().get(t).kind() {
             TypeKind::FutureOr { base } => Some(base),
             _ => None,
@@ -219,37 +244,37 @@ impl TypeSystem<'_> {
         };
         // UP(FutureOr<T1>, FutureOr<T2>) = FutureOr<UP(T1, T2)>
         if let (Some(x), Some(y)) = (future_or(a), future_or(b)) {
-            return Some(self.intern_future_or(self.least_upper_bound(x, y)));
+            return Ok(Some(self.intern_future_or(self.lub_step(x, y)?)));
         }
         // UP(Future<T1>, FutureOr<T2>) = FutureOr<UP(T1, T2)>
         if let (Some(x), Some(y)) = (future(a), future_or(b)) {
-            return Some(self.intern_future_or(self.least_upper_bound(x, y)));
+            return Ok(Some(self.intern_future_or(self.lub_step(x, y)?)));
         }
         // UP(FutureOr<T1>, Future<T2>) = FutureOr<UP(T1, T2)>
         if let (Some(x), Some(y)) = (future_or(a), future(b)) {
-            return Some(self.intern_future_or(self.least_upper_bound(x, y)));
+            return Ok(Some(self.intern_future_or(self.lub_step(x, y)?)));
         }
         // UP(T1, FutureOr<T2>) = FutureOr<UP(T1, T2)>
         if let Some(y) = future_or(b) {
-            return Some(self.intern_future_or(self.least_upper_bound(a, y)));
+            return Ok(Some(self.intern_future_or(self.lub_step(a, y)?)));
         }
         // UP(FutureOr<T1>, T2) = FutureOr<UP(T1, T2)>
         if let Some(x) = future_or(a) {
-            return Some(self.intern_future_or(self.least_upper_bound(x, b)));
+            return Ok(Some(self.intern_future_or(self.lub_step(x, b)?)));
         }
-        None
+        Ok(None)
     }
 
     /// `InterfaceLeastUpperBoundHelper.compute`
     /// (least_upper_bound.dart:48-108) with nullability already merged.
-    fn interface_lub(&self, a: TypeId, b: TypeId) -> TypeId {
+    fn interface_lub(&self, a: TypeId, b: TypeId) -> Result<TypeId, DepthLimitExceeded> {
         // Either being a supertype of the other is the best result
         // (least_upper_bound.dart:55-60).
         if self.is_subtype(a, b) {
-            return b;
+            return Ok(b);
         }
         if self.is_subtype(b, a) {
-            return a;
+            return Ok(a);
         }
         let (
             TypeKind::Interface { decl: d1, args: s1 },
@@ -265,47 +290,52 @@ impl TypeSystem<'_> {
             let arg_count = s1.len();
             let mut merged = Vec::with_capacity(arg_count);
             for i in 0..arg_count {
-                merged.push(self.least_upper_bound(
+                merged.push(self.lub_step(
                     self.table().arg(s1.offset() + i),
                     self.table().arg(s2.offset() + i),
-                ));
+                )?);
             }
-            return self.table().intern(
+            return Ok(self.table().intern(
                 UninternedType::Interface {
                     decl: d1,
                     args: merged,
                 },
                 false,
-            );
+            ));
         }
         // Spec-defined fallback: supertype-set intersection, picking the
         // candidate with the longest unique inheritance path
         // (least_upper_bound.dart:103, :162-177, :327-357). The closure sets
-        // run on the reusable scratch; a re-entered query falls back to
-        // fresh local sets (this branch never recurses into itself, so the
-        // fallback is only a guard).
+        // and their frontier run on the reusable scratch; a re-entered query
+        // falls back to fresh local containers (this branch never recurses
+        // into itself, so the fallback is only a guard).
         if let Ok(mut scratch) = self.walk.try_borrow_mut() {
             let WalkScratch {
                 set_a,
                 set_b,
                 candidates,
+                closure_frontier,
                 ..
             } = &mut *scratch;
             set_a.clear();
             set_b.clear();
-            self.supertype_closure(a, set_a);
-            self.supertype_closure(b, set_b);
+            // Claim the pooled frontier (exclusive while taken) and return it
+            // after the walks, so the steady-state path reuses one buffer.
+            let mut frontier = std::mem::take(closure_frontier);
+            self.supertype_closure(a, &mut frontier, set_a);
+            self.supertype_closure(b, &mut frontier, set_b);
+            *closure_frontier = frontier;
             candidates.clear();
             candidates.extend(set_a.intersection(set_b).copied());
-            self.pick_max_unique_depth(candidates)
-        } else {
-            let mut si = FxHashSet::default();
-            let mut sj = FxHashSet::default();
-            self.supertype_closure(a, &mut si);
-            self.supertype_closure(b, &mut sj);
-            let candidates: Vec<TypeId> = si.intersection(&sj).copied().collect();
-            self.pick_max_unique_depth(&candidates)
+            return Ok(self.pick_max_unique_depth(candidates));
         }
+        let mut si = FxHashSet::default();
+        let mut sj = FxHashSet::default();
+        let mut frontier = Vec::new();
+        self.supertype_closure(a, &mut frontier, &mut si);
+        self.supertype_closure(b, &mut frontier, &mut sj);
+        let candidates: Vec<TypeId> = si.intersection(&sj).copied().collect();
+        Ok(self.pick_max_unique_depth(&candidates))
     }
 
     /// The supertype set including the type itself
@@ -323,8 +353,19 @@ impl TypeSystem<'_> {
     /// `Substitution.fromInterfaceType` step the interface walk runs
     /// (subtype.dart:213-214) — so the worklist carries plain `TypeId`s and
     /// no substitution stack is needed.
-    fn supertype_closure(&self, root: TypeId, out: &mut FxHashSet<TypeId>) {
-        let mut frontier = vec![root];
+    ///
+    /// `frontier` is caller-owned scratch — the pooled
+    /// `WalkScratch::closure_frontier` on the steady-state path — cleared
+    /// here and reused across both closure walks of an interface LUB, so the
+    /// walk itself allocates nothing.
+    fn supertype_closure(
+        &self,
+        root: TypeId,
+        frontier: &mut Vec<TypeId>,
+        out: &mut FxHashSet<TypeId>,
+    ) {
+        frontier.clear();
+        frontier.push(root);
         while let Some(t) = frontier.pop() {
             if !out.insert(t) {
                 continue;
