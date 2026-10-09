@@ -234,17 +234,34 @@ fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) 
 
 #[derive(Debug)]
 enum DiscoverError {
-    /// Path argument does not exist → usage error (64), oracle wording.
+    /// Path argument does not exist → usage error (64). The message body is
+    /// the oracle's `usageException` text (analyze.dart:191); the `error:`
+    /// prefix is dartq's and the oracle's trailing usage block is omitted
+    /// (`UsageException.toString` appends it, args usage_exception.dart:12)
+    /// — a deliberate divergence: stderr is outside the stdout-only
+    /// differential gate.
     Missing(String),
     /// Walk I/O failure → internal error (4).
     Io(io::Error),
 }
 
 /// Canonical, sorted, deduplicated `.dart` file set under `paths`. A file
-/// argument is taken as-is (top-level `fs::metadata` follows links); a
-/// directory argument is walked recursively, skipping dot-directories and
-/// build/system directories. Symlinked directories are never descended into
-/// (cycle safety); symlinked `.dart` files are included — the walk stats the
+/// argument is taken as-is (top-level `fs::metadata` follows links) and is
+/// unfiltered except for the `.dart` extension: the oracle yields explicit
+/// files without applying the walk rules (context_root.dart:71-72) but only
+/// `.dart` ones reach the driver (context_manager.dart:748-754 via
+/// file_paths.dart:75-78 `isDart`) — without the filter a non-Dart arg would
+/// parse as Dart and emit phantom diagnostics. A directory argument is
+/// walked recursively with the oracle's only built-in exclusion — the
+/// dot-basename rule, checked on every child path, directories and files
+/// alike (context_root.dart:116 + 146-149). `build`/`node_modules` are
+/// analysis_options concerns (excluded globs), not walk-level ones.
+///
+/// Symlinked directories are never descended into (cycle safety). This is a
+/// deliberate subset of the oracle's walk, which descends symlinked
+/// directories with canonical-path dedup (context_root.dart:119-129); the
+/// differential harness canonicalizes both sides, so the gate never sees the
+/// difference. Symlinked `.dart` files are included — the walk stats the
 /// link target and accepts regular files, matching the oracle's walk, which
 /// analyzes linked files too.
 fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
@@ -253,12 +270,12 @@ fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
             let entry = entry?;
             let file_type = entry.file_type()?;
             let path = entry.path();
+            // Byte-prefix test: the dot rule is ASCII, and reading the raw
+            // name bytes avoids a per-entry lossy-name allocation.
+            if entry.file_name().as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
             if file_type.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with('.') || name == "build" || name == "node_modules" {
-                    continue;
-                }
                 walk(&path, files)?;
             } else if path.extension().is_some_and(|ext| ext == "dart")
                 // `entry.file_type()` reports link-host facts (it does not
@@ -282,7 +299,10 @@ fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
         let meta =
             fs::metadata(path).map_err(|_| DiscoverError::Missing(path.display().to_string()))?;
         if meta.is_file() {
-            files.insert(path.clone());
+            // `.dart` only (oracle isDart parity — see the fn doc).
+            if path.extension().is_some_and(|ext| ext == "dart") {
+                files.insert(path.clone());
+            }
         } else {
             walk(path, &mut files).map_err(DiscoverError::Io)?;
         }
@@ -346,8 +366,10 @@ fn check(args: &CheckArgs) -> u8 {
         }
     };
 
+    // Buffered like the analyze/query faces: the writers emit one writeln
+    // per line, and an unbuffered lock would flush per diagnostic line.
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = BufWriter::new(stdout.lock());
     let output = AnalysisOutput {
         diagnostics: &diags,
         files: &files_state,
@@ -569,7 +591,7 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     // analyze.dart:686–707): severity, file path, position, message. Position
     // order is the UTF-16 offset (line/column are monotone in it), so no
     // line-column computation is spent on sorting.
-    let layout = EngineLayout { engine: &engine };
+    let layout = EngineLayout::over(&engine, diags.iter().map(|d| d.file));
     diags.sort_by(|a, b| {
         severity_rank(a.severity)
             .cmp(&severity_rank(b.severity))
@@ -645,8 +667,35 @@ fn load_workspace_faces(
 /// [`FileLayoutProvider`] over the engine's read faces: paths from the file
 /// table, positions from the resident line index, text borrowed straight
 /// from the content store — no per-diagnostic file reads or copies.
+///
+/// The (text, line index) pair is snapshotted once per distinct file in the
+/// output set: the writers call [`FileLayoutProvider::line_col`] up to twice
+/// per diagnostic (dartq-diagnostics writer.rs:128-129) and the content face
+/// re-validates UTF-8 on every call, so uncached resolution is O(D·N) on a
+/// diagnostic-heavy file. The check face's [`FileSet`] caches the same pair
+/// per file.
 struct EngineLayout<'a> {
     engine: &'a Engine,
+    /// Exactly the FileIds the caller will query, each with its resident
+    /// text and line index.
+    cache: BTreeMap<FileId, (&'a str, &'a LineIndex)>,
+}
+
+impl<'a> EngineLayout<'a> {
+    /// Snapshots (text, index) once per distinct file in `files`.
+    fn over(engine: &'a Engine, files: impl IntoIterator<Item = FileId>) -> Self {
+        let mut cache = BTreeMap::new();
+        for file in files {
+            cache.entry(file).or_insert_with(|| {
+                // Engine content decoded as UTF-8 at set_content time
+                // (engine doc); validated exactly once per file here.
+                let text = std::str::from_utf8(engine.content(file).expect("analyzed FileId"))
+                    .expect("engine content is UTF-8");
+                (text, engine.line_index(file).expect("analyzed FileId"))
+            });
+        }
+        Self { engine, cache }
+    }
 }
 
 impl FileLayoutProvider for EngineLayout<'_> {
@@ -658,10 +707,9 @@ impl FileLayoutProvider for EngineLayout<'_> {
     }
 
     fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
-        let index = self.engine.line_index(file).expect("analyzed FileId");
-        // Engine content decoded as UTF-8 at set_content time (engine doc).
-        let text = std::str::from_utf8(self.engine.content(file).expect("analyzed FileId"))
-            .expect("engine content is UTF-8");
+        let (text, index) = self.cache.get(&file).expect("output-set FileId");
+        // Diagnostic offsets are UTF-16; the fused conversion reports the
+        // official `LineInfo.getLocation` (line, UTF-16 column) directly.
         index.line_col_utf16(text, utf16_offset)
     }
 }
@@ -740,8 +788,14 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         eprintln!("dartq: internal error: analysis cancelled");
         return exit::INTERNAL_ERROR;
     }
-    let layout = EngineLayout { engine: &engine };
     let SymbolAnswer { mut decls, mut refs } = engine.query_symbols(&args.name);
+    let layout = EngineLayout::over(
+        &engine,
+        decls
+            .iter()
+            .map(|d| d.file)
+            .chain(refs.iter().map(|r| r.target_file)),
+    );
 
     // Output determinism: file path byte order, then position. The engine
     // returns id-ordered rows; path order is the printed contract.
@@ -1491,6 +1545,60 @@ mod tests {
             BTreeSet::from([root.join("link.dart"), root.join("real/real.dart")]),
             "linked file in, linked dir not descended into, dangling link skipped"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Walk parity with the oracle's only built-in exclusion — the
+    /// dot-basename rule, checked on every child path, directories and files
+    /// alike (context_root.dart:116 + 146-149): `build/` IS descended into
+    /// (the old dartq-only `build`/`node_modules` skip diverged from the
+    /// oracle, which reserves those names to analysis_options globs), and a
+    /// dot-prefixed FILE (`.gen.dart`) is excluded exactly like a
+    /// dot-directory. Explicit file args bypass the walk rules: a dot-file
+    /// arg is taken unfiltered (context_root.dart:71-72), while a
+    /// non-`.dart` arg is ignored (context_manager.dart:748-754 via
+    /// file_paths.dart:75-78 `isDart`) — through `check` that is an empty
+    /// set and a clean exit instead of phantom syntax diagnostics.
+    #[test]
+    fn discover_walk_and_explicit_arg_parity() {
+        let root = std::env::temp_dir().join(format!("dq_cli_walk_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("build")).expect("mkdir");
+        fs::write(root.join("build/x.dart"), "var ok = 1;\n").expect("write");
+        fs::write(root.join(".gen.dart"), "var ok = 1;\n").expect("write");
+        fs::write(root.join("notes.txt"), "not dart\n").expect("write");
+        fs::write(root.join("real.dart"), "var ok = 1;\n").expect("write");
+
+        let files = discover(std::slice::from_ref(&root)).expect("discover");
+        assert_eq!(
+            files,
+            BTreeSet::from([root.join("build/x.dart"), root.join("real.dart")]),
+            "build/ descended into, dot-file excluded by the basename rule"
+        );
+
+        // Explicit args are unfiltered by the walk rules; only `.dart` counts.
+        assert_eq!(
+            discover(&[root.join(".gen.dart")]).expect("dot-file arg"),
+            BTreeSet::from([root.join(".gen.dart")]),
+            "explicit dot-file arg is not filtered"
+        );
+        assert!(
+            discover(&[root.join("notes.txt")])
+                .expect("non-dart arg")
+                .is_empty(),
+            "non-.dart explicit arg is ignored (oracle isDart)"
+        );
+
+        // End to end: the ignored arg parses nothing → empty set, exit 0.
+        let args = CheckArgs {
+            format: CheckFormat::Machine,
+            metrics_json: None,
+            no_fatal_warnings: false,
+            fatal_infos: false,
+            paths: vec![root.join("notes.txt")],
+        };
+        assert_eq!(check(&args), exit::CLEAN);
 
         fs::remove_dir_all(&root).ok();
     }
