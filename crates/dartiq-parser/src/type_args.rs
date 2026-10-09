@@ -46,14 +46,19 @@ impl TypeParamOrArg {
 
     /// `skip` (`type_info.dart:113)`: last token of the group, or `before`
     /// when absent. Returns real ids only.
+    ///
+    /// For a compound closer (`>=`/`>>`) this names the compound token —
+    /// the position of the official *split* leading `>`
+    /// (`splitGtEq`/`splitGtGt`, `type_info_impl.dart:1263/1293), whose
+    /// successor is the remainder. The remainder is never a name, `?`, or a
+    /// `Function` intro; decision sites special-case it instead of reading
+    /// the next real token.
     pub(crate) fn skip(&self, before: TokenId) -> TokenId {
         match self {
             TypeParamOrArg::None => before,
-            TypeParamOrArg::Simple1 { closer } => match closer {
-                // `<` id closer — relative to `before` (the token before `<`).
-                SimpleCloser::Gt => before + 3,
-                SimpleCloser::GtEq | SimpleCloser::GtGt => before + 4,
-            },
+            // `<` id closer — relative to `before` (the token before `<`):
+            // the `<`, the argument, then the closer itself.
+            TypeParamOrArg::Simple1 { .. } => before + 3,
             TypeParamOrArg::Complex(g) => g.end,
         }
     }

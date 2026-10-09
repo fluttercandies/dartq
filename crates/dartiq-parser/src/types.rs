@@ -253,7 +253,23 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // An identifier was seen (type_info.dart:263); cursor on the name.
         let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
         if !matches!(type_param, TypeParamOrArg::None) {
-            if matches!(type_param, TypeParamOrArg::Simple1 { .. }) {
+            if let TypeParamOrArg::Simple1 { closer } = &type_param {
+                if *closer != SimpleCloser::Gt {
+                    // `id < id (`>=`|`>>`)`: the official decision reads the
+                    // token after the *split* closer — the remainder `=`/`>`
+                    // (splitGtEq/splitGtGt, type_info_impl.dart:1263/1293) —
+                    // which is never `?`, never a name, and never a
+                    // `Function` intro. Required keeps the fast shape (the
+                    // non-nullable `simpleTypeWith1ArgumentGtEq/GtGt`),
+                    // optional is unconditionally noType
+                    // (type_info.dart:270-292); no virtual split of the real
+                    // token table is needed.
+                    return if required {
+                        TypeInfo::SimpleWith1Arg { nullable: false }
+                    } else {
+                        TypeInfo::NoType
+                    };
+                }
                 // `id<id>` fast shape: decide via what follows (type_info.dart:270-292).
                 let closer_id = type_param.skip(self.peek_id());
                 let mut follower = self.offset_of(closer_id) + 1;
@@ -386,8 +402,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if kw.style() == dartiq_scanner::KeywordStyle::BuiltIn {
             let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
             if !matches!(type_param, TypeParamOrArg::None) {
+                // The official `looksLikeName(typeParamOrArg.skip(next).next!)`
+                // reads the split remainder for a compound closer (`=`/`>`),
+                // which is never a name (type_info_impl.dart:1263/1293).
+                let compound = matches!(
+                    &type_param,
+                    TypeParamOrArg::Simple1 {
+                        closer: SimpleCloser::GtEq | SimpleCloser::GtGt
+                    }
+                );
                 let skip_end = type_param.skip(self.peek_id());
-                if required || self.looks_like_name_at_id(skip_end + 1) {
+                if required || (!compound && self.looks_like_name_at_id(skip_end + 1)) {
                     let mut complex = self.complex_from_here(type_param);
                     complex.end = skip_end;
                     complex.compute_rest(self, skip_end, required);
