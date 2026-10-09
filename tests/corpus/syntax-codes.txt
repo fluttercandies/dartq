@@ -1,6 +1,6 @@
-# M0 syntax-caliber gate codes: the 262 scanner/parser diagnostic codes.
+# M0 syntax-caliber gate codes: the 255 scanner/parser diagnostic codes.
 # Derived from the authoritative table
-# crates/dartq-diagnostics/data/syntax-codes.tsv (265 rows) by excluding the
+# crates/dartq-diagnostics/data/syntax-codes.tsv (258 rows) by excluding the
 # 3 language-version-family codes (illegal/inconsistent/
 # invalid_language_version_override): docs/facts/version-skew.md §5.3 keeps
 # version-skew codes out of the gate denominator. The derivation is pinned by
@@ -137,7 +137,6 @@ invalid_initializer
 invalid_inside_unary_pattern
 invalid_literal_in_configuration
 invalid_operator
-invalid_operator_for_super
 invalid_operator_questionmark_period_for_super
 invalid_star_after_async
 invalid_super_in_initializer
@@ -183,7 +182,6 @@ missing_primary_constructor_parameters
 missing_quote
 missing_star_after_sync
 missing_statement
-missing_terminator_for_parameter_group
 missing_typedef_parameters
 missing_variable_in_for_each
 mixed_parameter_groups
@@ -199,7 +197,6 @@ multiple_on_clauses
 multiple_part_of_directives
 multiple_positional_parameter_groups
 multiple_representation_fields
-multiple_variables_in_for_each
 multiple_variance_modifiers
 multiple_with_clauses
 named_function_expression
@@ -212,7 +209,6 @@ non_constructor_factory
 non_identifier_library_name
 non_part_of_directive_in_part
 non_string_literal_as_uri
-non_user_definable_operator
 normal_before_optional_parameters
 null_aware_cascade_out_of_order
 out_of_order_clauses
@@ -246,10 +242,8 @@ type_before_factory
 type_parameter_on_constructor
 type_parameter_on_operator
 typedef_in_class
-unable_get_content
 unexpected_dollar_in_string
 unexpected_separator_in_number
-unexpected_terminator_for_parameter_group
 unexpected_token
 unexpected_tokens
 unsupported_operator
@@ -266,4 +260,3 @@ void_with_type_arguments
 with_before_extends
 wrong_number_of_parameters_for_setter
 wrong_separator_for_positional_parameter
-wrong_terminator_for_parameter_group

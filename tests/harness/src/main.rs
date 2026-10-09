@@ -102,7 +102,7 @@ fn print_usage() {
       out-of-set entries are dropped before scoring and never inflate the
       denominator. The three filters stack; per-severity jaccards and the
       gate verdict are computed from the filtered sets only. M0 syntax
-      caliber: codes-file (the 262 scanner/parser codes, tests/corpus/
+      caliber: codes-file (the 255 scanner/parser codes, tests/corpus/
       syntax-codes.txt = the TSV minus the 3 language-version-family codes)
       ∩ severity ERROR. An empty codes file is a usage error (zero
       discrimination). Non-vacuity guard: if the oracle side has no
@@ -512,7 +512,7 @@ fn parse_type_filter(spec: &str) -> Result<Option<Vec<String>>, Outcome> {
 ///
 /// codes (--codes-file): comparison and gate scoring keep only entries whose code is in the set --
 /// oracle-only out-of-set entries are dropped and never enter the denominator. This is exactly the
-/// M0 syntax-tier criterion: **codes-file (the 262 scanner/parser codes, see
+/// M0 syntax-tier criterion: **codes-file (the 255 scanner/parser codes, see
 /// tests/corpus/syntax-codes.txt) ∩ severity ERROR**; the analyzer reports `ParserErrorCode` as
 /// `COMPILE_TIME_ERROR` (docs/facts/corpus-baseline.md §1), so the syntax tier cannot be obtained by
 /// `--type-filter syntactic_error` alone and must be filtered by code set.
@@ -597,7 +597,7 @@ fn build_filtered_side(
 /// --codes-file content: one code name per line, case-insensitive. TSV
 /// compatible: `#` comment lines are skipped and a TAB-separated line
 /// contributes its first column — the authoritative table
-/// `crates/dartq-diagnostics/data/syntax-codes.tsv` (265 rows = 262
+/// `crates/dartq-diagnostics/data/syntax-codes.tsv` (258 rows = 255
 /// scanner/parser codes + 3 language-version-family codes) can be passed
 /// directly. The M0 gate input is `tests/corpus/syntax-codes.txt`, the TSV
 /// minus the 3 language-version-family codes (docs/facts/version-skew.md §5.3:
@@ -837,16 +837,16 @@ mod tests {
             .expect("gate codes file present");
         let tsv_codes = parse_codes_file(&tsv).expect("TSV parses");
         let gate_codes = parse_codes_file(&txt).expect("gate file parses");
-        assert_eq!(tsv_codes.len(), 265, "TSV = 262 syntax + 3 family codes");
-        assert_eq!(gate_codes.len(), 262, "gate file = 262 syntax codes");
-        // 262 raw data lines for the gate file (comments/blanks excluded): a
+        assert_eq!(tsv_codes.len(), 258, "TSV = 255 syntax + 3 family codes");
+        assert_eq!(gate_codes.len(), 255, "gate file = 255 syntax codes");
+        // 255 raw data lines for the gate file (comments/blanks excluded): a
         // duplicated line would hide in the set comparison but still be drift.
         assert_eq!(
             txt.lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .count(),
-            262
+            255
         );
         let family: BTreeSet<String> = [
             "illegal_language_version_override",

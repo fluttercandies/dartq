@@ -77,13 +77,15 @@ pub fn message_template(name: &str) -> Option<&'static str> {
 // language-version family typed by registry class: invalid_language_version_
 // override is WarningCode-class STATIC_WARNING, while illegal/inconsistent_
 // language_version_override are CompileTimeErrorCode-class COMPILE_TIME_ERROR
-// (analyzer-8.4.1 codes.g.dart). Codes the oracle routes by hand to
-// COMPILE_TIME_ERROR at emit time (facts §2 pseudoSharedCode routing) are
-// emit-site decisions, not registry facts.
+// (analyzer-8.4.1 codes.g.dart; re-verified in the pinned live registry —
+// diagnostic.g.dart:7356-7365 and :7946-7956 vs :9184-9330, dart 3.13.1).
+// Codes the oracle routes by hand to COMPILE_TIME_ERROR at emit time (facts
+// §2 pseudoSharedCode routing) are emit-site decisions, not registry facts.
 
 // --- M0-measured codes outside the generated syntax table ---
 // hasPublishedDocs values captured from the generated registries
-// (analyzer-8.4.1 error/codes.g.dart); lints are never published
+// (analyzer-8.4.1 error/codes.g.dart; re-verified in the pinned live
+// registry, diagnostic.g.dart, dart 3.13.1); lints are never published
 // (`LintCode.url` is overridden to `null`), and dartq-own codes never are.
 
 // --- Compile-time errors ---
@@ -272,10 +274,10 @@ mod tests {
     /// the static-warning family, and ERROR rows never carry a warning
     /// family. TYPE follows the oracle registry class, not per-row severity:
     /// `illegal/inconsistent_language_version_override` are CompileTime-
-    /// ErrorCode entries (codes.g.dart:3136/:3368, ERROR +
+    /// ErrorCode entries (diagnostic.g.dart:7356-7365 and :7946-7956, ERROR +
     /// COMPILE_TIME_ERROR) while `invalid_language_version_override` is
-    /// WarningCode (codes.g.dart:11530+, WARNING + STATIC_WARNING) — severity
-    /// alone does not decide the family.
+    /// WarningCode (diagnostic.g.dart:9184-9330, WARNING + STATIC_WARNING) —
+    /// severity alone does not decide the family.
     #[test]
     fn dtype_matches_oracle_severity() {
         let registry = CodeRegistry::builtin();
@@ -440,13 +442,17 @@ mod tests {
     }
 
     /// Audit F1: exactly 15 published codes among the 258 table rows — the 13
-    /// `hasPublishedDocs: true` syntax codes (analyzer-8.4.1
-    /// `syntactic_errors.g.dart`) plus `invalid_language_version_override`
-    /// (all 9 of its variants are published) and
-    /// `inconsistent_language_version_override`; `illegal_language_version_override`
-    /// and every scanner code are unpublished
-    /// (`_fe_analyzer_shared-91.0.0` `scanner/errors.g.dart`). `expected_token`
-    /// is unpublished — the golden tests pin its missing `documentation` key.
+    /// `hasPublishedDocs: true` syntax codes (captured from analyzer-8.4.1
+    /// `syntactic_errors.g.dart`, re-verified in the pinned live registry
+    /// `diagnostic.g.dart`, which absorbed the syntactic and scanner rows)
+    /// plus `invalid_language_version_override` (all 9 of its variants are
+    /// published, diagnostic.g.dart:9184-9330) and
+    /// `inconsistent_language_version_override` (:7946-7956);
+    /// `illegal_language_version_override` (:7356-7365) and every scanner
+    /// code are unpublished — no `hasPublishedDocs` in `diagnostic.g.dart`
+    /// (the 8.4.1-vintage `_fe_analyzer_shared-91.0.0` `scanner/errors.g.dart`
+    /// is not in the pinned checkout). `expected_token` is unpublished — the
+    /// golden tests pin its missing `documentation` key.
     #[test]
     fn published_docs_flags_match_oracle_registry() {
         let is_published = |name: &str| {
