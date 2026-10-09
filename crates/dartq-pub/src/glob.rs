@@ -853,8 +853,13 @@ mod tests {
         assert_eq!(found, vec!["packages/a/lib", "packages/b/lib"]);
 
         // `**/b` needs at least one intermediate segment, consistent with
-        // the raw matcher (`!matches("**/b", "b")`).
-        assert_eq!(listed("**/b", &dir), vec!["x/b"]);
+        // the raw matcher (`!matches("**/b", "b")`): the folded validator
+        // `[^]*/b` matches every entity below the root whose path ends in
+        // `b` behind a separator — directories included (readdir order,
+        // hence sorted).
+        let mut found = listed("**/b", &dir);
+        found.sort();
+        assert_eq!(found, vec!["packages/b", "pkgs/b", "x/b"]);
 
         // `pkgs/{a,b}/**` recurses under both members only; `pkgs/ab/**`
         // would match a glued `[a, **]` validator.

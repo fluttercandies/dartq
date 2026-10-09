@@ -1040,7 +1040,12 @@ dependency_overrides:
 
     #[test]
     fn overrides_dependency_overrides_replace_the_pubspecs() {
-        let yaml = "name: m\ndependency_overrides:\n  a: ^1.0.0\n  b: ^2.0.0\n";
+        // The sdk floor is load-bearing here: the overrides-file
+        // `resolution` key below is checked against the pubspec's language
+        // version, which defaults to 2.7 without an sdk constraint
+        // (pubspec.dart:106-116, language_version.dart:111).
+        let yaml =
+            "name: m\nenvironment:\n  sdk: ^3.5.0\ndependency_overrides:\n  a: ^1.0.0\n  b: ^2.0.0\n";
         // No overrides file: the pubspec map stands.
         let spec = Pubspec::parse(yaml).expect("ok");
         assert_eq!(spec.dependency_overrides.len(), 2);

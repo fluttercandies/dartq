@@ -657,11 +657,16 @@ sdks:
         assert!(table.get("-foo").is_some());
 
         // All-dot names fail the non-dot rule even though `.` is
-        // in-charset.
+        // in-charset. The root entry keeps the config graph-buildable —
+        // the rejection must surface from build's resolve face, so the
+        // fixture is otherwise a valid resolution.
         let all_dots = PackageConfig::parse(
             r#"{
               "configVersion": 2,
-              "packages": [{"name": "..", "rootUri": "../"}],
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "..", "rootUri": "../dots"}
+              ],
               "generator": "pub"
             }"#,
         )
