@@ -1,0 +1,32 @@
+[package]
+name = "dartq-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dartq-diagnostics = { path = "../dartq-diagnostics" }
+dartq-language = { path = "../dartq-language" }
+dartq-package = { path = "../dartq-package" }
+dartq-parser = { path = "../dartq-parser" }
+dartq-pub = { path = "../dartq-pub" }
+dartq-resolution = { path = "../dartq-resolution" }
+dartq-scanner = { path = "../dartq-scanner" }
+dartq-semantic = { path = "../dartq-semantic" }
+dartq-sdk = { path = "../dartq-sdk" }
+dartq-source = { path = "../dartq-source" }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[[bench]]
+name = "cold_analysis"
+harness = false
+
+[[bench]]
+name = "incremental_p95"
+harness = false
+
+[lints]
+workspace = true

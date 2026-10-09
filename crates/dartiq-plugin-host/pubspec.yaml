@@ -1,4 +1,0 @@
-name: dartiq_plugin_host
-description: Host-side Dart package of the dartiq plugin protocol (M4 milestone). Not part of the Cargo workspace.
-environment:
-  sdk: ^3.0.0

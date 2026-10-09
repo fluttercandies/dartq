@@ -174,90 +174,90 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
-name = "dartiq-ai"
+name = "dartq-ai"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-ast"
+name = "dartq-ast"
 version = "0.1.0"
 dependencies = [
- "dartiq-language",
- "dartiq-scanner",
- "dartiq-source",
+ "dartq-language",
+ "dartq-scanner",
+ "dartq-source",
 ]
 
 [[package]]
-name = "dartiq-cache"
+name = "dartq-cache"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-cli"
+name = "dartq-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "dartiq-diagnostics",
- "dartiq-engine",
- "dartiq-language",
- "dartiq-package",
- "dartiq-parser",
- "dartiq-pub",
- "dartiq-scanner",
- "dartiq-sdk",
- "dartiq-source",
+ "dartq-diagnostics",
+ "dartq-engine",
+ "dartq-language",
+ "dartq-package",
+ "dartq-parser",
+ "dartq-pub",
+ "dartq-scanner",
+ "dartq-sdk",
+ "dartq-source",
  "libc",
  "serde_json",
 ]
 
 [[package]]
-name = "dartiq-diagnostics"
+name = "dartq-diagnostics"
 version = "0.1.0"
 dependencies = [
- "dartiq-source",
+ "dartq-source",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "dartiq-engine"
+name = "dartq-engine"
 version = "0.1.0"
 dependencies = [
- "dartiq-diagnostics",
- "dartiq-language",
- "dartiq-package",
- "dartiq-parser",
- "dartiq-pub",
- "dartiq-resolution",
- "dartiq-scanner",
- "dartiq-sdk",
- "dartiq-semantic",
- "dartiq-source",
+ "dartq-diagnostics",
+ "dartq-language",
+ "dartq-package",
+ "dartq-parser",
+ "dartq-pub",
+ "dartq-resolution",
+ "dartq-scanner",
+ "dartq-sdk",
+ "dartq-semantic",
+ "dartq-source",
  "rayon",
  "rustc-hash",
  "thiserror",
 ]
 
 [[package]]
-name = "dartiq-flow"
+name = "dartq-flow"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-incremental"
+name = "dartq-incremental"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-index"
+name = "dartq-index"
 version = "0.1.0"
 dependencies = [
- "dartiq-language",
- "dartiq-parser",
- "dartiq-resolution",
- "dartiq-scanner",
- "dartiq-source",
+ "dartq-language",
+ "dartq-parser",
+ "dartq-resolution",
+ "dartq-scanner",
+ "dartq-source",
  "rustc-hash",
 ]
 
 [[package]]
-name = "dartiq-language"
+name = "dartq-language"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -266,39 +266,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "dartiq-lints"
+name = "dartq-lints"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-package"
+name = "dartq-package"
 version = "0.1.0"
 dependencies = [
- "dartiq-pub",
- "dartiq-source",
+ "dartq-pub",
+ "dartq-source",
  "rustc-hash",
  "thiserror",
 ]
 
 [[package]]
-name = "dartiq-parser"
+name = "dartq-parser"
 version = "0.1.0"
 dependencies = [
- "dartiq-diagnostics",
- "dartiq-language",
- "dartiq-scanner",
- "dartiq-source",
+ "dartq-diagnostics",
+ "dartq-language",
+ "dartq-scanner",
+ "dartq-source",
 ]
 
 [[package]]
-name = "dartiq-plugin"
+name = "dartq-plugin"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-pub"
+name = "dartq-pub"
 version = "0.1.0"
 dependencies = [
- "dartiq-language",
- "dartiq-source",
+ "dartq-language",
+ "dartq-source",
  "filetime",
  "serde",
  "serde_json",
@@ -307,59 +307,59 @@ dependencies = [
 ]
 
 [[package]]
-name = "dartiq-resolution"
+name = "dartq-resolution"
 version = "0.1.0"
 dependencies = [
- "dartiq-pub",
- "dartiq-sdk",
- "dartiq-source",
+ "dartq-pub",
+ "dartq-sdk",
+ "dartq-source",
  "rustc-hash",
  "thiserror",
 ]
 
 [[package]]
-name = "dartiq-scanner"
+name = "dartq-scanner"
 version = "0.1.0"
 dependencies = [
- "dartiq-diagnostics",
- "dartiq-language",
- "dartiq-source",
+ "dartq-diagnostics",
+ "dartq-language",
+ "dartq-source",
 ]
 
 [[package]]
-name = "dartiq-schema"
+name = "dartq-schema"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-sdk"
+name = "dartq-sdk"
 version = "0.1.0"
 dependencies = [
- "dartiq-language",
- "dartiq-source",
+ "dartq-language",
+ "dartq-source",
  "serde",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "dartiq-semantic"
+name = "dartq-semantic"
 version = "0.1.0"
 dependencies = [
- "dartiq-diagnostics",
- "dartiq-language",
- "dartiq-parser",
- "dartiq-resolution",
- "dartiq-scanner",
- "dartiq-source",
+ "dartq-diagnostics",
+ "dartq-language",
+ "dartq-parser",
+ "dartq-resolution",
+ "dartq-scanner",
+ "dartq-source",
  "rustc-hash",
 ]
 
 [[package]]
-name = "dartiq-snapshot"
+name = "dartq-snapshot"
 version = "0.1.0"
 
 [[package]]
-name = "dartiq-source"
+name = "dartq-source"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -372,7 +372,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dartiq-types"
+name = "dartq-types"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",

@@ -1,0 +1,16 @@
+[package]
+name = "dartq-language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

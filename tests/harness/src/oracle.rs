@@ -12,7 +12,7 @@ use crate::machine::{MachineDiag, OutputFormat, parse_output};
 
 /// Wall-clock budget per driver invocation. `dart analyze` takes seconds on
 /// the largest corpus; a hang (daemon/watchdog wedge) must fail the run, not
-/// block the harness forever. Overridable via `DARTIQ_HARNESS_ORACLE_TIMEOUT_MS`.
+/// block the harness forever. Overridable via `DARTQ_HARNESS_ORACLE_TIMEOUT_MS`.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 /// `try_wait` poll interval (the timeout resolution floor).
@@ -43,38 +43,38 @@ impl OracleDriver {
 /// Which child program a driver talks to; the side determines the exit-code contract.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DriverSide {
-    /// `dart analyze` (the oracle side; also the e2e self-check's dartiq-side process)
+    /// `dart analyze` (the oracle side; also the e2e self-check's dartq-side process)
     Oracle,
-    /// the dartiq CLI (measurement side)
-    Dartiq,
+    /// the dartq CLI (measurement side)
+    Dartq,
 }
 
 impl DriverSide {
     fn as_str(self) -> &'static str {
         match self {
             Self::Oracle => "oracle",
-            Self::Dartiq => "dartiq",
+            Self::Dartq => "dartq",
         }
     }
 
     /// Exit codes that count as a measurement result. Oracle (facts §3):
-    /// {0,1,2,3} are valid; 4 = crash, 64 = usage error. The dartiq CLI uses
-    /// 2 for usage errors of its own (e.g. a malformed `--dartiq-cmd`
+    /// {0,1,2,3} are valid; 4 = crash, 64 = usage error. The dartq CLI uses
+    /// 2 for usage errors of its own (e.g. a malformed `--dartq-cmd`
     /// template): folding exit 2 into "valid + empty output" would score a
     /// meaningless Jaccard 0, so it fails the run up front like 4/64. The e2e
     /// self-check pins dart analyze to exits {0,3} via `--no-fatal-warnings`
-    /// (facts §7.9), so the stricter dartiq contract cannot misfire there.
+    /// (facts §7.9), so the stricter dartq contract cannot misfire there.
     fn valid_exit(self, code: i32) -> bool {
         match self {
             Self::Oracle => (0..=3).contains(&code),
-            Self::Dartiq => matches!(code, 0 | 1 | 3),
+            Self::Dartq => matches!(code, 0 | 1 | 3),
         }
     }
 
     fn valid_exits_desc(self) -> &'static str {
         match self {
             Self::Oracle => "0-3",
-            Self::Dartiq => "0, 1, 3 (2 = usage error)",
+            Self::Dartq => "0, 1, 3 (2 = usage error)",
         }
     }
 }
@@ -142,24 +142,24 @@ pub(crate) fn run_driver(
 /// `dart pub get`): one env override, one default, one validation.
 pub(crate) fn driver_timeout_from_env() -> Result<Duration, String> {
     driver_timeout(
-        std::env::var("DARTIQ_HARNESS_ORACLE_TIMEOUT_MS")
+        std::env::var("DARTQ_HARNESS_ORACLE_TIMEOUT_MS")
             .ok()
             .as_deref(),
     )
 }
 
 /// Timeout budget: default [`DEFAULT_TIMEOUT_MS`], overridable via
-/// `DARTIQ_HARNESS_ORACLE_TIMEOUT_MS` (milliseconds, must be > 0). An
+/// `DARTQ_HARNESS_ORACLE_TIMEOUT_MS` (milliseconds, must be > 0). An
 /// unparseable value is a harness error, not a silent fallback to the default.
 fn driver_timeout(raw: Option<&str>) -> Result<Duration, String> {
     let Some(raw) = raw else {
         return Ok(Duration::from_millis(DEFAULT_TIMEOUT_MS));
     };
     let ms: u64 = raw.trim().parse().map_err(|_| {
-        format!("invalid DARTIQ_HARNESS_ORACLE_TIMEOUT_MS `{raw}`; expected milliseconds > 0")
+        format!("invalid DARTQ_HARNESS_ORACLE_TIMEOUT_MS `{raw}`; expected milliseconds > 0")
     })?;
     if ms == 0 {
-        return Err("DARTIQ_HARNESS_ORACLE_TIMEOUT_MS must be > 0".into());
+        return Err("DARTQ_HARNESS_ORACLE_TIMEOUT_MS must be > 0".into());
     }
     Ok(Duration::from_millis(ms))
 }
@@ -303,11 +303,11 @@ mod tests {
     use std::path::Path;
 
     /// End to end: runs real dart against a mini package under /tmp.
-    /// Requires dart on PATH; runs only when `DARTIQ_HARNESS_E2E=1` (opt-in for CI/local runs).
+    /// Requires dart on PATH; runs only when `DARTQ_HARNESS_E2E=1` (opt-in for CI/local runs).
     #[test]
     fn oracle_end_to_end_real_dart() {
-        if std::env::var("DARTIQ_HARNESS_E2E").as_deref() != Ok("1") {
-            eprintln!("skipped: set DARTIQ_HARNESS_E2E=1 to run the oracle e2e test");
+        if std::env::var("DARTQ_HARNESS_E2E").as_deref() != Ok("1") {
+            eprintln!("skipped: set DARTQ_HARNESS_E2E=1 to run the oracle e2e test");
             return;
         }
         let dir = std::env::temp_dir().join(format!("dq_oracle_e2e_{}", std::process::id()));
@@ -354,8 +354,8 @@ mod tests {
     /// facts §3: nonexistent path -> exit 64 -> harness failure, not an empty diagnostic set.
     #[test]
     fn missing_path_is_harness_error() {
-        if std::env::var("DARTIQ_HARNESS_E2E").as_deref() != Ok("1") {
-            eprintln!("skipped: set DARTIQ_HARNESS_E2E=1 to run the oracle e2e test");
+        if std::env::var("DARTQ_HARNESS_E2E").as_deref() != Ok("1") {
+            eprintln!("skipped: set DARTQ_HARNESS_E2E=1 to run the oracle e2e test");
             return;
         }
         let driver = OracleDriver {

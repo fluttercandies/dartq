@@ -1,6 +1,6 @@
 {
   "case": "093_dart_comment_doc_ignored",
-  "origin": "abstract_scanner.dart:1013 (/// goes to tokenizeSingleLineComment(dartdoc) without version parse; dartiq lib.rs:36)",
+  "origin": "abstract_scanner.dart:1013 (/// goes to tokenizeSingleLineComment(dartdoc) without version parse; dartq lib.rs:36)",
   "config": {"triple_shift": true, "augment": true},
   "language_version": null,
   "tokens": [

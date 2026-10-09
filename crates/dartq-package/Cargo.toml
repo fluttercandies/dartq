@@ -1,0 +1,15 @@
+[package]
+name = "dartq-package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dartq-pub = { path = "../dartq-pub" }
+dartq-source = { path = "../dartq-source" }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

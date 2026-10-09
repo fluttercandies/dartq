@@ -1,0 +1,14 @@
+[package]
+name = "dartq-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dartq-language = { path = "../dartq-language" }
+dartq-scanner = { path = "../dartq-scanner" }
+dartq-source = { path = "../dartq-source" }
+
+[lints]
+workspace = true

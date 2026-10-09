@@ -1,5 +1,5 @@
 {
- "format": "dartiq-scanner-golden/1",
+ "format": "dartq-scanner-golden/1",
  "license": "BSD-3-Clause. Transcribed from dart-lang/sdk sources; each case file carries a 2-line provenance header. Copyright (c) the Dart project authors. See .third/dart-sdk/LICENSE.",
  "provenance": ".third/dart-sdk @ e6f4207a (Dart 3.15 main, shallow clone 2026-10-08); upstream test layouts documented in docs/facts/scanner-test-corpus.md",
  "loading_contract": "strip the first 2 header lines of each case .dart, scan the remainder; offsets are UTF-16 code units relative to that remainder; token rows are [Kind, offset, length, lexeme] with optional 5th field =1 marking synthetic tokens; EOF token is implicit and not listed; diagnostics rows are [code, offset, args?]",
@@ -192,7 +192,7 @@
    "category": "comments",
    "source": "cases/014_comment_nested_unterminated.dart",
    "expectation": "cases/014_comment_nested_unterminated.tokens.json",
-   "origin": "derived from pkg/front_end/test/scanner_test.dart:234 + :238 (inner /* closes, outer /* stays open to EOF; diagnostic pins last char per dartiq lib.rs:53 contract and official comment-recovery path)",
+   "origin": "derived from pkg/front_end/test/scanner_test.dart:234 + :238 (inner /* closes, outer /* stays open to EOF; diagnostic pins last char per dartq lib.rs:53 contract and official comment-recovery path)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -318,7 +318,7 @@
    "category": "numbers",
    "source": "cases/027_double_missing_digit.dart",
    "expectation": "cases/027_double_missing_digit.tokens.json",
-   "origin": "pkg/front_end/test/scanner_test.dart:277 _assertError(missingDigit, 1, \"1e\") (synthetic DOUBLE '10' per dartiq lib.rs:55 recovery contract)",
+   "origin": "pkg/front_end/test/scanner_test.dart:277 _assertError(missingDigit, 1, \"1e\") (synthetic DOUBLE '10' per dartq lib.rs:55 recovery contract)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -500,7 +500,7 @@
    "category": "strings_and_interpolation",
    "source": "cases/050_interp_keyword_this.dart",
    "expectation": "cases/050_interp_keyword_this.tokens.json",
-   "origin": "abstract_scanner.dart:2126 (interpolation identifier path reuses keyword tokenization -> Keyword token; mirrored in dartiq lib.rs:20 contract)",
+   "origin": "abstract_scanner.dart:2126 (interpolation identifier path reuses keyword tokenization -> Keyword token; mirrored in dartq lib.rs:20 contract)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -695,7 +695,7 @@
    "language_version": null,
    "diagnostics": [],
    "line_starts": null,
-   "notes": "official inserts synthetic ')' closers for the unmatched parens into the stream (not asserted by the official test); dartiq reports expected_token diagnostics for EOF-unmatched groups per lib.rs:49 - representation delta documented in docs/facts/scanner-test-corpus.md"
+   "notes": "official inserts synthetic ')' closers for the unmatched parens into the stream (not asserted by the official test); dartq reports expected_token diagnostics for EOF-unmatched groups per lib.rs:49 - representation delta documented in docs/facts/scanner-test-corpus.md"
   },
   {
    "id": "070_mismatched_closer",
@@ -759,7 +759,7 @@
    "language_version": null,
    "diagnostics": [],
    "line_starts": null,
-   "notes": "official appends UnmatchedToken ErrorTokens into the stream at EOF (abstract_scanner.dart:529 appendEofToken + :901 unmatchedBeginGroup) without listener diagnostics; dartiq represents these as synthetic closers + expected_token diagnostics (crates/dartiq-scanner/src/lib.rs:49) - consumers must apply the documented mapping"
+   "notes": "official appends UnmatchedToken ErrorTokens into the stream at EOF (abstract_scanner.dart:529 appendEofToken + :901 unmatchedBeginGroup) without listener diagnostics; dartq represents these as synthetic closers + expected_token diagnostics (crates/dartq-scanner/src/lib.rs:49) - consumers must apply the documented mapping"
   },
   {
    "id": "074_balanced_groups_matrix",
@@ -791,7 +791,7 @@
     "expected_token"
    ],
    "line_starts": null,
-   "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartiq maps that to the expected_token diagnostic encoded here"
+   "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartq maps that to the expected_token diagnostic encoded here"
   },
   {
    "id": "077_await_outside_async",
@@ -894,7 +894,7 @@
    "category": "language_version_override",
    "source": "cases/092_dart_comment_last_wins.dart",
    "expectation": "cases/092_dart_comment_last_wins.tokens.json",
-   "origin": "abstract_scanner.dart:972 _scanHeaderLookingForLanguageVersion (header loop keeps scanning while tail unchanged; tokenizeLanguageVersionOrSingleLineComment callback overwrites -> last wins; mirrored dartiq lib.rs:37)",
+   "origin": "abstract_scanner.dart:972 _scanHeaderLookingForLanguageVersion (header loop keeps scanning while tail unchanged; tokenizeLanguageVersionOrSingleLineComment callback overwrites -> last wins; mirrored dartq lib.rs:37)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -912,7 +912,7 @@
    "category": "language_version_override",
    "source": "cases/093_dart_comment_doc_ignored.dart",
    "expectation": "cases/093_dart_comment_doc_ignored.tokens.json",
-   "origin": "abstract_scanner.dart:1013 (/// goes to tokenizeSingleLineComment(dartdoc) without version parse; dartiq lib.rs:36)",
+   "origin": "abstract_scanner.dart:1013 (/// goes to tokenizeSingleLineComment(dartdoc) without version parse; dartq lib.rs:36)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -942,7 +942,7 @@
    "category": "language_version_override",
    "source": "cases/095_dart_comment_garbage_suffix.dart",
    "expectation": "cases/095_dart_comment_garbage_suffix.tokens.json",
-   "origin": "abstract_scanner.dart:1070-1075 (after minor digits only SP* then LF/CR/EOF accepted; trailing 'x' -> plain comment; dartiq lib.rs:36)",
+   "origin": "abstract_scanner.dart:1070-1075 (after minor digits only SP* then LF/CR/EOF accepted; trailing 'x' -> plain comment; dartq lib.rs:36)",
    "config": {
     "triple_shift": true,
     "augment": true
@@ -1143,7 +1143,7 @@
    "category": "keywords_and_gating",
    "source": "cases/112_augment_gated_off.dart",
    "expectation": "cases/112_augment_gated_off.tokens.json",
-   "origin": "pkg/front_end/test/scanner_test.dart:480-489 + dartiq lib.rs:104 (enable_augmentations=false -> Identifier, same as official tokenizeKeywordOrIdentifier gating)",
+   "origin": "pkg/front_end/test/scanner_test.dart:480-489 + dartq lib.rs:104 (enable_augmentations=false -> Identifier, same as official tokenizeKeywordOrIdentifier gating)",
    "config": {
     "triple_shift": true,
     "augment": false

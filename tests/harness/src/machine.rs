@@ -265,7 +265,7 @@ impl EntryKeyBuilder {
     }
 
     /// Entry key = (lowercased code, path relative to the corpus). The oracle emits symlink-resolved
-    /// absolute paths (facts §7.4); the dartiq side canonicalizes before normalizing too, so
+    /// absolute paths (facts §7.4); the dartq side canonicalizes before normalizing too, so
     /// `corpus_root` must already be canonicalized. Files outside the corpus root keep their
     /// canonical absolute path -- both sides normalize identically, so comparison still holds.
     pub(crate) fn key(&mut self, diag: &MachineDiag) -> (String, String) {

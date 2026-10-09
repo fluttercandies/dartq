@@ -1,6 +1,6 @@
 {
   "case": "112_augment_gated_off",
-  "origin": "pkg/front_end/test/scanner_test.dart:480-489 + dartiq lib.rs:104 (enable_augmentations=false -> Identifier, same as official tokenizeKeywordOrIdentifier gating)",
+  "origin": "pkg/front_end/test/scanner_test.dart:480-489 + dartq lib.rs:104 (enable_augmentations=false -> Identifier, same as official tokenizeKeywordOrIdentifier gating)",
   "config": {"triple_shift": true, "augment": false},
   "language_version": null,
   "tokens": [

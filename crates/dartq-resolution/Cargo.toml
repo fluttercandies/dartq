@@ -1,0 +1,16 @@
+[package]
+name = "dartq-resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dartq-pub = { path = "../dartq-pub" }
+dartq-sdk = { path = "../dartq-sdk" }
+dartq-source = { path = "../dartq-source" }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

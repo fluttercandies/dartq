@@ -1,0 +1,725 @@
+//! Resolution freshness (facts §6, PRD §8.2).
+//!
+//! The judgment follows pub's fast path with a content fallback instead of
+//! pub's solver-based revalidation (dartq does no version solving):
+//! - environment fingerprint: `flutterRoot`/`flutterVersion`/`pubCache`
+//!   preserved in the config must match the caller's current environment,
+//!   and `generatorVersion` must match the current Dart SDK down to
+//!   major.minor (patch bumps do not stale);
+//! - `pubspec.lock` must exist;
+//! - mtime chain, per file: every non-cache package's `pubspec.yaml` (and
+//!   `pubspec_overrides.yaml` when present) must be **strictly older** than
+//!   the lock — equality counts as stale (entrypoint.dart:1274) — and the
+//!   package_config must not be older than the lock;
+//! - content fallback: mtimes alone cannot be trusted (VCS checkouts give
+//!   files the checkout mtime, facts §8.5), so a file failing the mtime
+//!   chain is *excused* when its blake3-128 content id
+//!   ([`ContentId`]) still matches the [`ResolutionBaseline`] captured when
+//!   the resolution was accepted — byte-identical inputs cannot invalidate a
+//!   resolution built from them. Without a baseline the mtime verdict stands
+//!   (conservative: the remedy, `pub get`, is always safe).
+//!
+//! The report is structured data; the caller turns non-empty reports into
+//! `dartq/package_config_out_of_date`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use dartq_source::{ContentId, content_hash};
+
+use crate::PubError;
+use crate::config::PackageConfig;
+
+/// The current toolchain environment, as the caller observes it.
+///
+/// `None` means "not applicable / unknown" and skips that comparison
+/// (matching pub: a missing Flutter SDK compares against an absent
+/// `flutterRoot` key).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvSnapshot {
+    /// e.g. `"3.13.1"`; compared by major.minor against `generatorVersion`.
+    pub dart_version: Option<String>,
+    /// File URI of the Flutter SDK root, exactly as pub writes it.
+    pub flutter_root: Option<String>,
+    /// Flutter version string.
+    pub flutter_version: Option<String>,
+    /// File URI of the pub cache root.
+    pub pub_cache: Option<String>,
+}
+
+/// One concrete reason the resolution looks stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaleReason {
+    /// `.dart_tool/package_config.json` absent — `pub get` never ran.
+    MissingPackageConfig,
+    /// `package_config.json` present but unreadable/unparseable.
+    MalformedPackageConfig(String),
+    /// `pubspec.lock` absent.
+    MissingLockFile,
+    /// The config's recorded environment key differs from the current one.
+    EnvironmentChanged { key: &'static str },
+    /// `generatorVersion` major.minor differs from the running SDK
+    /// (or the config carries none).
+    GeneratorSdkMismatch { config: String, current: String },
+    /// A pubspec is not strictly older than the lock; equality is stale
+    /// (facts §8.5).
+    PubspecNotStrictlyOlder { package: String, file: &'static str },
+    /// A relative config entry points at a directory without a pubspec.
+    PackageDirMissing { package: String },
+    /// The config is older than the lock. pub would content-validate here;
+    /// M1 conservatively stales (running `pub get` is idempotent).
+    ConfigOlderThanLock,
+}
+
+/// Result of a freshness check; empty `stale_reasons` means fresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshnessReport {
+    pub stale_reasons: Vec<StaleReason>,
+}
+
+impl FreshnessReport {
+    #[must_use]
+    pub fn is_fresh(&self) -> bool {
+        self.stale_reasons.is_empty()
+    }
+}
+
+/// blake3-128 content ids of the resolution inputs, captured when the
+/// resolution was last accepted. The content fallback in
+/// [`Freshness::check`] compares against this to excuse mtime-chain
+/// failures whose files did not actually change (facts §8.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolutionBaseline {
+    content_ids: BTreeMap<PathBuf, ContentId>,
+}
+
+impl ResolutionBaseline {
+    /// Captures the current inputs under `root`: the config itself plus,
+    /// for every non-cache config entry, its `pubspec.yaml` (required) and
+    /// `pubspec_overrides.yaml` (optional).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PubError`] when the config is missing, unreadable, or
+    /// malformed, or a non-cache entry's pubspec is unreadable — an
+    /// incomplete resolution has no baseline.
+    pub fn capture(root: &Path) -> Result<ResolutionBaseline, PubError> {
+        let config_path = root.join(".dart_tool").join("package_config.json");
+        let config = read_config(&config_path)?;
+        let config_dir = root.join(".dart_tool");
+        let mut content_ids = BTreeMap::new();
+        content_ids.insert(
+            crate::workspace::normalize(&config_path),
+            read_content_id(&config_path)?,
+        );
+        for entry in &config.packages {
+            let package_dir = entry.resolve_root(&config_dir)?;
+            if is_cache_member(&config, &package_dir) {
+                continue; // pub-cache packages are immutable (facts §6.5)
+            }
+            let pubspec = package_dir.join("pubspec.yaml");
+            content_ids.insert(
+                crate::workspace::normalize(&pubspec),
+                read_content_id(&pubspec)?,
+            );
+            let overrides = package_dir.join("pubspec_overrides.yaml");
+            if overrides.is_file() {
+                content_ids.insert(
+                    crate::workspace::normalize(&overrides),
+                    read_content_id(&overrides)?,
+                );
+            }
+        }
+        Ok(ResolutionBaseline { content_ids })
+    }
+
+    /// The captured content id for a (normalized) path.
+    fn content_id(&self, normalized: &Path) -> Option<ContentId> {
+        self.content_ids.get(normalized).copied()
+    }
+}
+
+/// True when `package_dir` (an entry's resolved `rootUri`) is inside the pub
+/// cache — pub's skip test is cache *membership*, not URI shape:
+/// `p.isWithin(cache.rootDir, pubspecPath)` (entrypoint.dart:1263-1265).
+/// Absolute path dependencies also carry absolute `file:` rootUris but live
+/// outside the cache and stay mtime-checked. Without a decodable `pubCache`
+/// in the config the answer is "no" (conservative: checked).
+fn is_cache_member(config: &PackageConfig, package_dir: &Path) -> bool {
+    let Some(cache_root) = config.pub_cache_root() else {
+        return false;
+    };
+    let (package_dir, cache_root) = (
+        crate::workspace::normalize(package_dir),
+        crate::workspace::normalize(&cache_root),
+    );
+    package_dir != cache_root && package_dir.strip_prefix(&cache_root).is_ok()
+}
+
+fn read_config(config_path: &Path) -> Result<PackageConfig, PubError> {
+    let text = std::fs::read_to_string(config_path).map_err(|e| {
+        PubError::PackageConfig(format!("cannot read {}: {e}", config_path.display()))
+    })?;
+    PackageConfig::parse(&text)
+}
+
+fn read_content_id(path: &Path) -> Result<ContentId, PubError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| PubError::Workspace(format!("cannot read {}: {e}", path.display())))?;
+    Ok(content_hash(&bytes))
+}
+
+/// True when `path`'s current bytes hash to the baseline's content id — the
+/// file may *look* changed by mtime but has not changed in substance.
+fn unchanged_since_baseline(baseline: Option<&ResolutionBaseline>, path: &Path) -> bool {
+    let Some(baseline) = baseline else {
+        return false;
+    };
+    match read_content_id(path) {
+        Ok(content) => baseline.content_id(&crate::workspace::normalize(path)) == Some(content),
+        Err(_) => false,
+    }
+}
+
+/// Namespace for the check; no state.
+pub struct Freshness;
+
+impl Freshness {
+    /// Checks the resolution rooted at `root` (the workspace root from
+    /// [`crate::find_workspace_root`], or the single package directory).
+    /// `baseline` is the capture from the last accepted resolution; `None`
+    /// disables the content fallback, making every mtime-chain failure
+    /// stale.
+    ///
+    /// Stops early only when the artifacts needed for further checks are
+    /// themselves missing or unreadable; otherwise reports every reason
+    /// found.
+    pub fn check(
+        root: &Path,
+        env: &EnvSnapshot,
+        baseline: Option<&ResolutionBaseline>,
+    ) -> FreshnessReport {
+        let config_path = root.join(".dart_tool").join("package_config.json");
+        let config = match read_config(&config_path) {
+            Ok(config) => config,
+            Err(message) => {
+                let reason = if config_path.is_file() {
+                    StaleReason::MalformedPackageConfig(message.to_string())
+                } else {
+                    StaleReason::MissingPackageConfig
+                };
+                return FreshnessReport {
+                    stale_reasons: vec![reason],
+                };
+            }
+        };
+
+        let lock_path = root.join("pubspec.lock");
+        let Ok(lock_mtime) = modified(&lock_path) else {
+            return FreshnessReport {
+                stale_reasons: vec![StaleReason::MissingLockFile],
+            };
+        };
+
+        let mut reasons = Vec::new();
+
+        // Environment keys: config value must equal the current one, where
+        // absence on both sides counts as equal (entrypoint.dart:1212-1231).
+        for (key, current) in [
+            ("flutterRoot", &env.flutter_root),
+            ("flutterVersion", &env.flutter_version),
+            ("pubCache", &env.pub_cache),
+        ] {
+            let recorded = config
+                .additional_properties
+                .get(key)
+                .and_then(serde_json::Value::as_str);
+            if recorded != current.as_deref() {
+                reasons.push(StaleReason::EnvironmentChanged { key });
+            }
+        }
+
+        // generatorVersion vs the running SDK, major.minor only.
+        if let Some(dart_version) = env.dart_version.as_deref() {
+            let current = crate::version::Version::parse(dart_version).ok();
+            let matches = match (current, config.generator_version.as_ref()) {
+                (Some(current), Some(generator)) => {
+                    current.major == generator.major && current.minor == generator.minor
+                }
+                // pub treats a missing generatorVersion as a different SDK.
+                (_, None) => false,
+                (None, Some(_)) => true, // unparsable input: skip the check
+            };
+            if !matches {
+                reasons.push(StaleReason::GeneratorSdkMismatch {
+                    config: config
+                        .generator_version
+                        .as_ref()
+                        .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+                    current: dart_version.to_owned(),
+                });
+            }
+        }
+
+        // mtime fast path: every entry outside the pub cache.
+        let config_dir = root.join(".dart_tool");
+        for entry in &config.packages {
+            let package_dir = match entry.resolve_root(&config_dir) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    reasons.push(StaleReason::MalformedPackageConfig(e.to_string()));
+                    continue;
+                }
+            };
+            if is_cache_member(&config, &package_dir) {
+                continue; // pub-cache packages: no mtime check (facts §6.5)
+            }
+            for file in ["pubspec.yaml", "pubspec_overrides.yaml"] {
+                let path = package_dir.join(file);
+                let mtime = match modified(&path) {
+                    Ok(mtime) => mtime,
+                    Err(_) if file == "pubspec_overrides.yaml" => continue, // optional
+                    Err(_) => {
+                        reasons.push(StaleReason::PackageDirMissing {
+                            package: entry.name.clone(),
+                        });
+                        continue;
+                    }
+                };
+                // Failing the mtime chain is excused when the file's content
+                // is byte-identical to the accepted baseline (facts §8.5).
+                if mtime >= lock_mtime && !unchanged_since_baseline(baseline, &path) {
+                    reasons.push(StaleReason::PubspecNotStrictlyOlder {
+                        package: entry.name.clone(),
+                        file,
+                    });
+                }
+            }
+        }
+
+        // Config must not be older than the lock (facts §6 pseudocode);
+        // same content fallback as above.
+        if let Ok(config_mtime) = modified(&config_path)
+            && config_mtime < lock_mtime
+            && !unchanged_since_baseline(baseline, &config_path)
+        {
+            reasons.push(StaleReason::ConfigOlderThanLock);
+        }
+
+        FreshnessReport {
+            stale_reasons: reasons,
+        }
+    }
+}
+
+fn modified(path: &Path) -> Result<SystemTime, PubError> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map_err(|e| PubError::Workspace(format!("cannot stat {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::find_workspace_root;
+    use filetime::{FileTime, set_file_mtime};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dartq-pub-fresh-{}-{}", label, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, text).expect("write");
+    }
+
+    const PUBSPEC: &str = "name: solo\nenvironment:\n  sdk: ^3.5.0\n";
+    const CONFIG: &str = r#"{
+      "configVersion": 2,
+      "packages": [
+        {"name": "solo", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}
+      ],
+      "generator": "pub",
+      "generatorVersion": "3.13.1"
+    }"#;
+
+    #[test]
+    fn missing_config_and_lock() {
+        let root = temp_dir("missing");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        let report = Freshness::check(&root, &EnvSnapshot::default(), None);
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::MissingPackageConfig]
+        );
+
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        let report = Freshness::check(&root, &EnvSnapshot::default(), None);
+        assert_eq!(report.stale_reasons, vec![StaleReason::MissingLockFile]);
+    }
+
+    #[test]
+    fn fresh_when_chain_ordered_correctly() {
+        let root = temp_dir("fresh");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        // pubspec (oldest) < lock < config (newest).
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(3_000, 0),
+        )
+        .expect("set mtime");
+
+        let env = EnvSnapshot {
+            dart_version: Some("3.13.1".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert!(
+            report.is_fresh(),
+            "unexpected reasons: {:?}",
+            report.stale_reasons
+        );
+
+        // Equal config/lock mtimes are fine (>=), unlike pubspec/lock.
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        assert!(Freshness::check(&root, &env, None).is_fresh());
+    }
+
+    #[test]
+    fn equal_pubspec_and_lock_mtime_is_stale() {
+        let root = temp_dir("equal");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        let stamp = FileTime::from_unix_time(5_000, 0);
+        set_file_mtime(root.join("pubspec.yaml"), stamp).expect("set mtime");
+        set_file_mtime(root.join("pubspec.lock"), stamp).expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(9_000, 0),
+        )
+        .expect("set mtime");
+
+        let report = Freshness::check(&root, &EnvSnapshot::default(), None);
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::PubspecNotStrictlyOlder {
+                package: "solo".into(),
+                file: "pubspec.yaml",
+            }]
+        );
+    }
+
+    #[test]
+    fn content_baseline_excuses_unchanged_pubspec() {
+        let root = temp_dir("baseline");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        // Baseline taken while the chain is still clean.
+        let baseline = ResolutionBaseline::capture(&root).expect("baseline");
+
+        // A VCS-style checkout: every mtime equal, content untouched.
+        let stamp = FileTime::from_unix_time(7_000, 0);
+        set_file_mtime(root.join("pubspec.yaml"), stamp).expect("set mtime");
+        set_file_mtime(root.join("pubspec.lock"), stamp).expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+
+        let report = Freshness::check(&root, &EnvSnapshot::default(), Some(&baseline));
+        assert!(report.is_fresh(), "unexpected: {:?}", report.stale_reasons);
+
+        // Editing the pubspec under the same equal mtimes must stay stale:
+        // the content genuinely differs from the baseline.
+        write(
+            &root.join("pubspec.yaml"),
+            "name: solo\nenvironment:\n  sdk: ^3.9.0\n",
+        );
+        set_file_mtime(root.join("pubspec.yaml"), stamp).expect("set mtime");
+        let report = Freshness::check(&root, &EnvSnapshot::default(), Some(&baseline));
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::PubspecNotStrictlyOlder {
+                package: "solo".into(),
+                file: "pubspec.yaml",
+            }]
+        );
+    }
+
+    #[test]
+    fn content_baseline_excuses_config_older_than_lock() {
+        let root = temp_dir("cfg-base");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        let baseline = ResolutionBaseline::capture(&root).expect("baseline");
+
+        // Lock rewritten after the config (e.g. by a tool), config content
+        // unchanged: the baseline excuses the ordering violation.
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(3_000, 0),
+        )
+        .expect("set mtime");
+        let report = Freshness::check(&root, &EnvSnapshot::default(), Some(&baseline));
+        assert!(report.is_fresh(), "unexpected: {:?}", report.stale_reasons);
+
+        // A changed config older than the lock stays stale.
+        write(
+            &root.join(".dart_tool").join("package_config.json"),
+            CONFIG
+                .replace(
+                    "\"languageVersion\": \"3.5\"",
+                    "\"languageVersion\": \"3.6\"",
+                )
+                .as_str(),
+        );
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        let report = Freshness::check(&root, &EnvSnapshot::default(), Some(&baseline));
+        assert_eq!(report.stale_reasons, vec![StaleReason::ConfigOlderThanLock]);
+    }
+
+    #[test]
+    fn capture_requires_config_and_local_pubspecs() {
+        let root = temp_dir("capture");
+        // No config at all.
+        assert!(ResolutionBaseline::capture(&root).is_err());
+
+        // Config with a relative entry whose pubspec is missing.
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(
+            &root.join(".dart_tool").join("package_config.json"),
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "ghost", "rootUri": "../ghost", "languageVersion": "3.5"}
+              ],
+              "generator": "pub",
+              "generatorVersion": "3.13.1"
+            }"#,
+        );
+        assert!(ResolutionBaseline::capture(&root).is_err());
+    }
+
+    #[test]
+    fn environment_and_sdk_changes_stale() {
+        let root = temp_dir("env");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+
+        // Different generator major.minor, and an env key the config lacks.
+        let env = EnvSnapshot {
+            dart_version: Some("3.14.0".into()),
+            flutter_version: Some("3.47.1".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert!(
+            report
+                .stale_reasons
+                .contains(&StaleReason::GeneratorSdkMismatch {
+                    config: "3.13.1".into(),
+                    current: "3.14.0".into(),
+                })
+        );
+        assert!(
+            report
+                .stale_reasons
+                .contains(&StaleReason::EnvironmentChanged {
+                    key: "flutterVersion",
+                })
+        );
+        // Patch-only bump does not stale.
+        let patch = EnvSnapshot {
+            dart_version: Some("3.13.9".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &patch, None);
+        assert!(report.is_fresh(), "unexpected: {:?}", report.stale_reasons);
+    }
+
+    #[test]
+    fn absolute_path_dependency_outside_cache_is_checked() {
+        let root = temp_dir("abs-dep");
+        // An absolute path dependency (`relative: false` in the lock):
+        // pub writes its rootUri as an absolute file URI pointing outside
+        // the cache (path.dart:234-245, entrypoint.dart:503-511), and still
+        // mtime-checks its pubspec on every fast-path run.
+        let dep_dir = root.join("elsewhere").join("pkg");
+        write(&dep_dir.join("pubspec.yaml"), "name: abs_dep\n");
+        let config_text = format!(
+            r#"{{
+              "configVersion": 2,
+              "packages": [
+                {{"name": "cached", "rootUri": "file:///absent-cache/hosted/cached-1.0.0", "languageVersion": "3.0"}},
+                {{"name": "abs_dep", "rootUri": "file://{}", "languageVersion": "3.5"}}
+              ],
+              "generator": "pub",
+              "generatorVersion": "3.13.1",
+              "pubCache": "file:///absent-cache"
+            }}"#,
+            dep_dir.display()
+        );
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(
+            &root.join(".dart_tool").join("package_config.json"),
+            &config_text,
+        );
+        // The cache entry's directory does not exist at all — its skip must
+        // be by cache membership, so this alone must not stale. abs_dep's
+        // pubspec postdates the lock: pub reports stale, so must we.
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            dep_dir.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_100, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(1_200, 0),
+        )
+        .expect("set mtime");
+        let env = EnvSnapshot {
+            pub_cache: Some("file:///absent-cache".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::PubspecNotStrictlyOlder {
+                package: "abs_dep".into(),
+                file: "pubspec.yaml",
+            }]
+        );
+
+        // The baseline covers non-cache entries too: an mtime bump with
+        // unchanged content is excused, a real content change is not.
+        let baseline = ResolutionBaseline::capture(&root).expect("baseline");
+        set_file_mtime(
+            dep_dir.join("pubspec.yaml"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        assert!(
+            Freshness::check(&root, &env, Some(&baseline)).is_fresh(),
+            "unchanged content must be excused: {:?}",
+            Freshness::check(&root, &env, Some(&baseline)).stale_reasons
+        );
+        write(
+            &dep_dir.join("pubspec.yaml"),
+            "name: abs_dep\ndependencies: {}\n",
+        );
+        set_file_mtime(
+            dep_dir.join("pubspec.yaml"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        assert_eq!(
+            Freshness::check(&root, &env, Some(&baseline)).stale_reasons,
+            vec![StaleReason::PubspecNotStrictlyOlder {
+                package: "abs_dep".into(),
+                file: "pubspec.yaml",
+            }]
+        );
+    }
+
+    #[test]
+    fn cache_entries_skip_mtime_but_workspace_check_still_works() {
+        let root = temp_dir("cached");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        // One cache-hosted entry (absolute file URI inside `pubCache`) and
+        // one relative entry.
+        write(
+            &root.join(".dart_tool").join("package_config.json"),
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "cached", "rootUri": "file:///cache/hosted/pub.dev/cached-1.0.0", "languageVersion": "3.0"},
+                {"name": "solo", "rootUri": "../", "languageVersion": "3.5"}
+              ],
+              "generator": "pub",
+              "generatorVersion": "3.13.1",
+              "pubCache": "file:///cache"
+            }"#,
+        );
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        // The cache package's pubspec does not exist; the fresh check must
+        // not require it. Newer pubspec than lock -> stale for `solo` only.
+        let config_path = root.join(".dart_tool").join("package_config.json");
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_100, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(&config_path, FileTime::from_unix_time(1_200, 0)).expect("set mtime");
+
+        let env = EnvSnapshot {
+            pub_cache: Some("file:///cache".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::PubspecNotStrictlyOlder {
+                package: "solo".into(),
+                file: "pubspec.yaml",
+            }]
+        );
+        // And the workspace root lookup composes with the check.
+        let layout = find_workspace_root(&root).expect("layout");
+        assert_eq!(layout.root, root);
+    }
+}

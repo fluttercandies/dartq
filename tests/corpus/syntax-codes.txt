@@ -1,6 +1,6 @@
 # M0 syntax-caliber gate codes: the 262 scanner/parser diagnostic codes.
 # Derived from the authoritative table
-# crates/dartiq-diagnostics/data/syntax-codes.tsv (265 rows) by excluding the
+# crates/dartq-diagnostics/data/syntax-codes.tsv (265 rows) by excluding the
 # 3 language-version-family codes (illegal/inconsistent/
 # invalid_language_version_override): docs/facts/version-skew.md §5.3 keeps
 # version-skew codes out of the gate denominator. The derivation is pinned by

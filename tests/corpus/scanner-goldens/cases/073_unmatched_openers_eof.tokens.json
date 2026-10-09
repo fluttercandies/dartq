@@ -7,5 +7,5 @@
     ["OpenCurly", 0, 1, "{"], ["OpenBracket", 1, 1, "["], ["OpenParen", 2, 1, "("]
   ],
   "diagnostics": [],
-  "notes": "official appends UnmatchedToken ErrorTokens into the stream at EOF (abstract_scanner.dart:529 appendEofToken + :901 unmatchedBeginGroup) without listener diagnostics; dartiq represents these as synthetic closers + expected_token diagnostics (crates/dartiq-scanner/src/lib.rs:49) - consumers must apply the documented mapping"
+  "notes": "official appends UnmatchedToken ErrorTokens into the stream at EOF (abstract_scanner.dart:529 appendEofToken + :901 unmatchedBeginGroup) without listener diagnostics; dartq represents these as synthetic closers + expected_token diagnostics (crates/dartq-scanner/src/lib.rs:49) - consumers must apply the documented mapping"
 }

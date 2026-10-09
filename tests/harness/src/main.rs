@@ -1,12 +1,12 @@
 //! Differential-testing driver CLI:
 //! - `harness corpus`: assemble the M0 synthetic corpus (tests/corpus/m0/)
-//! - `harness run`: oracle vs dartiq differential run, (code, file) entry Jaccard
+//! - `harness run`: oracle vs dartq differential run, (code, file) entry Jaccard
 //!
 //! Exit codes: 0 = ERROR-tier Jaccard meets the gate; 1 = below gate; 2 = harness error of its own.
 
 mod compare;
 mod corpus;
-mod dartiq;
+mod dartq;
 mod machine;
 mod oracle;
 mod report;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compare::{Side, build_side_labeled, compare, merge_sides};
-use dartiq::DartiqDriver;
+use dartq::DartqDriver;
 use machine::{DIAG_TYPES, MachineDiag, OutputFormat, Severity};
 use oracle::OracleDriver;
 
@@ -74,19 +74,19 @@ fn print_usage() {
       package. Default source: {DEFAULT_SOURCE}; default target: {DEFAULT_TARGET}.
 
   harness run [--corpus-dir DIR]... [--oracle-dart PATH] [--oracle-format machine|json]
-              [--dartiq-cmd TEMPLATE] [--e2e-oracle] [--severity-filter LIST]
+              [--dartq-cmd TEMPLATE] [--e2e-oracle] [--severity-filter LIST]
               [--type-filter LIST] [--codes-file PATH] [--threshold F] [--out DIR]
               [--allow-vacuous]
-      Run oracle and dartiq over the corpus, compare (code, file) entry sets.
+      Run oracle and dartq over the corpus, compare (code, file) entry sets.
       --corpus-dir is repeatable: each dir must be a corpus package; every dir
       is analyzed with one invocation per dir and the entry sets are merged
       (keys prefixed with the corpus dir name to stay unambiguous).
       TEMPLATE: whitespace-split argv; {{dir}} is replaced by the corpus dir
       (appended as last arg when absent), e.g.
-      --dartiq-cmd \"cargo run -q -p dartiq-cli -- check --format=machine\".
-      --e2e-oracle: point the dartiq side at dart analyze itself (both sides
+      --dartq-cmd \"cargo run -q -p dartq-cli -- check --format=machine\".
+      --e2e-oracle: point the dartq side at dart analyze itself (both sides
       identical -> jaccard must be 1.000; strongest comparator self-check).
-      Mutually exclusive with --dartiq-cmd: e2e would silently win and the
+      Mutually exclusive with --dartq-cmd: e2e would silently win and the
       run would measure dart vs dart at 1.000.
       --severity-filter LIST: all | ERROR[,WARNING[,INFO]] — severities that
       enter the comparison. --type-filter LIST: all |
@@ -94,7 +94,7 @@ fn print_usage() {
       TYPE values that enter the comparison (case-insensitive). --codes-file
       PATH: diagnostic code names, one per line, case-insensitive; `#` comment
       lines are skipped and a TAB-separated line contributes its first column
-      (TSV compatible — the authoritative table is crates/dartiq-diagnostics/
+      (TSV compatible — the authoritative table is crates/dartq-diagnostics/
       data/syntax-codes.tsv). Only entries whose
       code is in the set enter the comparison on either side — oracle-only
       out-of-set entries are dropped before scoring and never inflate the
@@ -163,7 +163,7 @@ struct RunOptions {
     corpus_dirs: Vec<PathBuf>,
     oracle_dart: String,
     oracle_format: OutputFormat,
-    dartiq_cmd: Option<String>,
+    dartq_cmd: Option<String>,
     severity_filter: String,
     type_filter: String,
     codes_file: Option<PathBuf>,
@@ -182,7 +182,7 @@ impl RunOptions {
             corpus_dirs: Vec::new(),
             oracle_dart: "dart".to_string(),
             oracle_format: OutputFormat::Machine,
-            dartiq_cmd: None,
+            dartq_cmd: None,
             severity_filter: "all".to_string(),
             type_filter: "all".to_string(),
             codes_file: None,
@@ -202,7 +202,7 @@ impl RunOptions {
                             Outcome::Error("invalid --oracle-format (machine|json)".into())
                         })?;
                 }
-                "--dartiq-cmd" => opts.dartiq_cmd = Some(value(args, &mut i)?.to_string()),
+                "--dartq-cmd" => opts.dartq_cmd = Some(value(args, &mut i)?.to_string()),
                 "--severity-filter" => opts.severity_filter = value(args, &mut i)?.to_string(),
                 "--type-filter" => opts.type_filter = value(args, &mut i)?.to_string(),
                 "--codes-file" => opts.codes_file = Some(value(args, &mut i)?.into()),
@@ -222,9 +222,9 @@ impl RunOptions {
             }
             i += 1;
         }
-        if opts.e2e_oracle && opts.dartiq_cmd.is_some() {
+        if opts.e2e_oracle && opts.dartq_cmd.is_some() {
             return Err(Outcome::Error(
-                "--e2e-oracle and --dartiq-cmd are mutually exclusive: e2e pins the dartiq \
+                "--e2e-oracle and --dartq-cmd are mutually exclusive: e2e pins the dartq \
                  side to dart analyze itself, so passing both would silently measure dart vs \
                  dart at 1.000"
                     .into(),
@@ -272,19 +272,19 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let oracle_version = oracle::dart_version(&opts.oracle_dart).map_err(Outcome::Error)?;
     let oracle_diags = analyze_corpora(&corpora, |dir| oracle.analyze(dir, opts.oracle_format))?;
     let oracle_side = build_filtered_side(&corpora, oracle_diags, &filters);
-    // Fail before the dartiq run: a vacuous oracle side would pass at 1.0 without judging anything
+    // Fail before the dartq run: a vacuous oracle side would pass at 1.0 without judging anything
     check_oracle_vacuity(&oracle_side, filters.error_in_scope(), opts.allow_vacuous)?;
-    // The dartiq contract is always machine; only the e2e self-check (dartiq side = dart analyze itself) follows the oracle format
-    let dartiq_format = if opts.e2e_oracle {
+    // The dartq contract is always machine; only the e2e self-check (dartq side = dart analyze itself) follows the oracle format
+    let dartq_format = if opts.e2e_oracle {
         opts.oracle_format
     } else {
         OutputFormat::Machine
     };
-    let dartiq_driver = build_dartiq_driver(&opts, opts.oracle_format)?;
-    let dartiq_diags = analyze_corpora(&corpora, |dir| dartiq_driver.analyze(dir, dartiq_format))?;
+    let dartq_driver = build_dartq_driver(&opts, opts.oracle_format)?;
+    let dartq_diags = analyze_corpora(&corpora, |dir| dartq_driver.analyze(dir, dartq_format))?;
 
-    let dartiq_side = build_filtered_side(&corpora, dartiq_diags, &filters);
-    let cmp = compare(&oracle_side, &dartiq_side);
+    let dartq_side = build_filtered_side(&corpora, dartq_diags, &filters);
+    let cmp = compare(&oracle_side, &dartq_side);
 
     let corpus_display = corpora
         .iter()
@@ -295,14 +295,14 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let meta = report::RunMeta {
         corpus_dir: corpus_display,
         oracle_cmd: format!("{} analyze {}", opts.oracle_dart, opts.oracle_format.flag()),
-        dartiq_cmd: if opts.e2e_oracle {
+        dartq_cmd: if opts.e2e_oracle {
             format!(
                 "{} analyze {} (e2e self-check)",
                 opts.oracle_dart,
                 opts.oracle_format.flag()
             )
         } else {
-            opts.dartiq_cmd.clone().unwrap_or_default()
+            opts.dartq_cmd.clone().unwrap_or_default()
         },
         oracle_version,
         threshold: opts.threshold,
@@ -324,19 +324,19 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let verdict = if passed { "PASS" } else { "FAIL" };
     let summary = format!(
         "corpus: {} (files with diagnostics: {})\n\
-         oracle: {} diags | dartiq: {} diags\n\
+         oracle: {} diags | dartq: {} diags\n\
          jaccard: {} (threshold {} on ERROR)\n\
-         diffs: oracle-only {} entries, dartiq-only {} entries\n\
+         diffs: oracle-only {} entries, dartq-only {} entries\n\
          reports: {} {}\n\
          result: {verdict}",
         meta.corpus_dir,
         cmp.file_count,
         cmp.oracle_total,
-        cmp.dartiq_total,
+        cmp.dartq_total,
         stats.join("  "),
         opts.threshold,
         cmp.oracle_only.len(),
-        cmp.dartiq_only.len(),
+        cmp.dartq_only.len(),
         json_path.display(),
         md_path.display(),
     );
@@ -390,13 +390,13 @@ fn corpus_labels(canonical_dirs: &[PathBuf]) -> Vec<Option<String>> {
         .collect()
 }
 
-/// Build the dartiq-side driver: e2e self-check = dart analyze itself; otherwise a command template is required.
-fn build_dartiq_driver(
+/// Build the dartq-side driver: e2e self-check = dart analyze itself; otherwise a command template is required.
+fn build_dartq_driver(
     opts: &RunOptions,
     oracle_format: OutputFormat,
-) -> Result<DartiqDriver, Outcome> {
+) -> Result<DartqDriver, Outcome> {
     if opts.e2e_oracle {
-        return Ok(DartiqDriver::from_program(
+        return Ok(DartqDriver::from_program(
             opts.oracle_dart.clone(),
             vec![
                 "analyze".into(),
@@ -406,14 +406,14 @@ fn build_dartiq_driver(
         ));
     }
     let template = opts
-        .dartiq_cmd
+        .dartq_cmd
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
-            Outcome::Error("run needs --dartiq-cmd TEMPLATE (or --e2e-oracle)".into())
+            Outcome::Error("run needs --dartq-cmd TEMPLATE (or --e2e-oracle)".into())
         })?;
-    Ok(DartiqDriver::from_template(template))
+    Ok(DartqDriver::from_template(template))
 }
 
 /// Invoke the driver once per corpus dir (one process per dir), returning diagnostic groups parallel to corpora.
@@ -564,7 +564,7 @@ fn build_filtered_side(
 /// --codes-file content: one code name per line, case-insensitive. TSV
 /// compatible: `#` comment lines are skipped and a TAB-separated line
 /// contributes its first column — the authoritative table
-/// `crates/dartiq-diagnostics/data/syntax-codes.tsv` (265 rows = 262
+/// `crates/dartq-diagnostics/data/syntax-codes.tsv` (265 rows = 262
 /// scanner/parser codes + 3 language-version-family codes) can be passed
 /// directly. The M0 gate input is `tests/corpus/syntax-codes.txt`, the TSV
 /// minus the 3 language-version-family codes (docs/facts/version-skew.md §5.3:
@@ -787,7 +787,7 @@ mod tests {
 
     /// Derivation pin: the M0 gate codes file (tests/corpus/syntax-codes.txt)
     /// must stay exactly the authoritative TSV
-    /// (crates/dartiq-diagnostics/data/syntax-codes.tsv) minus the 3
+    /// (crates/dartq-diagnostics/data/syntax-codes.tsv) minus the 3
     /// language-version-family codes (docs/facts/version-skew.md §5.3: skew
     /// codes must not enter the gate denominator). Catches silent drift
     /// between the two files and parser regression in one shot.
@@ -798,7 +798,7 @@ mod tests {
             .and_then(Path::parent)
             .expect("harness lives at <repo>/tests/harness");
         let tsv =
-            std::fs::read_to_string(root.join("crates/dartiq-diagnostics/data/syntax-codes.tsv"))
+            std::fs::read_to_string(root.join("crates/dartq-diagnostics/data/syntax-codes.tsv"))
                 .expect("authoritative TSV present");
         let txt = std::fs::read_to_string(root.join("tests/corpus/syntax-codes.txt"))
             .expect("gate codes file present");
@@ -852,9 +852,9 @@ mod tests {
             length: 1,
             message: "m".into(),
         };
-        // oracle: 1 in-set + 1 out-of-set (an analyzer semantic code); dartiq: only the 1 in-set entry
+        // oracle: 1 in-set + 1 out-of-set (an analyzer semantic code); dartq: only the 1 in-set entry
         let oracle = vec![mk("EXPECTED_TOKEN"), mk("UNDEFINED_CLASS")];
-        let dartiq = vec![mk("expected_token")];
+        let dartq = vec![mk("expected_token")];
         let filters = Filters {
             severities: None,
             types: None,
@@ -863,13 +863,13 @@ mod tests {
         let root = Path::new("/corpus");
         let cmp = compare(
             &build_side_labeled(&oracle, root, None, |d| filters.keep(d)),
-            &build_side_labeled(&dartiq, root, None, |d| filters.keep(d)),
+            &build_side_labeled(&dartq, root, None, |d| filters.keep(d)),
         );
         assert_eq!(cmp.oracle_total, 1, "out-of-set oracle-only entry dropped");
-        assert_eq!(cmp.dartiq_total, 1);
+        assert_eq!(cmp.dartq_total, 1);
         assert_eq!(cmp.oracle_dropped, 1, "the drop is accounted, not silent");
         assert_eq!(cmp.oracle_only.len(), 0);
-        assert_eq!(cmp.dartiq_only.len(), 0);
+        assert_eq!(cmp.dartq_only.len(), 0);
         assert_eq!(cmp.error_jaccard(), 1.0, "in-set entries agree exactly");
     }
 
@@ -937,7 +937,7 @@ mod tests {
             run_compare(&args(&["--bogus"])),
             Err(Outcome::Error(_))
         ));
-        // Missing --dartiq-cmd without --e2e-oracle: errors after corpus checks -- a nonexistent corpus reports the corpus error first
+        // Missing --dartq-cmd without --e2e-oracle: errors after corpus checks -- a nonexistent corpus reports the corpus error first
         assert!(matches!(
             run_compare(&args(&["--corpus-dir", "/nonexistent"])),
             Err(Outcome::Error(msg)) if msg.contains("harness corpus")
@@ -949,20 +949,20 @@ mod tests {
         ));
     }
 
-    /// --e2e-oracle and --dartiq-cmd are mutually exclusive at flag-parsing
+    /// --e2e-oracle and --dartq-cmd are mutually exclusive at flag-parsing
     /// time: e2e would silently win and the run would measure dart vs dart at
     /// 1.000 (a "pass" that judges nothing).
     #[test]
-    fn e2e_oracle_and_dartiq_cmd_are_mutually_exclusive() {
+    fn e2e_oracle_and_dartq_cmd_are_mutually_exclusive() {
         assert!(matches!(
-            RunOptions::parse(&args(&["--e2e-oracle", "--dartiq-cmd", "dartiq check"])),
+            RunOptions::parse(&args(&["--e2e-oracle", "--dartq-cmd", "dartq check"])),
             Err(Outcome::Error(msg)) if msg.contains("mutually exclusive")
         ));
         // Either flag alone parses
         assert!(RunOptions::parse(&args(&["--e2e-oracle"])).is_ok());
         assert!(
-            RunOptions::parse(&args(&["--dartiq-cmd", "dartiq check"])).is_ok(),
-            "dartiq-cmd alone is the measurement mode"
+            RunOptions::parse(&args(&["--dartq-cmd", "dartq check"])).is_ok(),
+            "dartq-cmd alone is the measurement mode"
         );
     }
 

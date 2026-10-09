@@ -151,29 +151,29 @@ pub(crate) struct SeverityStats {
     pub(crate) intersection: usize,
     pub(crate) union: usize,
     pub(crate) oracle_only: usize,
-    pub(crate) dartiq_only: usize,
+    pub(crate) dartq_only: usize,
 }
 
 pub(crate) struct Comparison {
     pub(crate) oracle_total: usize,
-    pub(crate) dartiq_total: usize,
+    pub(crate) dartq_total: usize,
     /// Per-side pre-filter instance totals and dropped-by-filter counts
     /// (see [`Side::dropped_by_filter`])
     pub(crate) oracle_pre_filter: usize,
     pub(crate) oracle_dropped: usize,
-    pub(crate) dartiq_pre_filter: usize,
-    pub(crate) dartiq_dropped: usize,
+    pub(crate) dartq_pre_filter: usize,
+    pub(crate) dartq_dropped: usize,
     /// Distinct files touched by the union of entries
     pub(crate) file_count: usize,
     /// Fixed order ERROR / WARNING / INFO
     pub(crate) severities: Vec<SeverityStats>,
     /// Lexicographic
     pub(crate) oracle_only: Vec<DiffEntry>,
-    pub(crate) dartiq_only: Vec<DiffEntry>,
+    pub(crate) dartq_only: Vec<DiffEntry>,
     /// Full post-filter per-side entry lists (sorted by (code, file)): the machine-side data
     /// plane for per-diff gate attribution, populated even when both diff lists are empty.
     pub(crate) oracle_entries: Vec<SideEntry>,
-    pub(crate) dartiq_entries: Vec<SideEntry>,
+    pub(crate) dartq_entries: Vec<SideEntry>,
     /// Oracle-side distribution stats (based on the filtered oracle entry set; for baseline analysis)
     pub(crate) oracle_distribution: Distribution,
 }
@@ -234,23 +234,23 @@ pub(crate) fn distribution(side: &Side) -> Distribution {
     dist
 }
 
-pub(crate) fn compare(oracle: &Side, dartiq: &Side) -> Comparison {
+pub(crate) fn compare(oracle: &Side, dartq: &Side) -> Comparison {
     let oracle_only: Vec<DiffEntry> = oracle
         .entries
-        .difference(&dartiq.entries)
+        .difference(&dartq.entries)
         .map(|k| diff_entry(k, oracle))
         .collect();
-    let dartiq_only: Vec<DiffEntry> = dartiq
+    let dartq_only: Vec<DiffEntry> = dartq
         .entries
         .difference(&oracle.entries)
-        .map(|k| diff_entry(k, dartiq))
+        .map(|k| diff_entry(k, dartq))
         .collect();
     let severities = [Severity::Error, Severity::Warning, Severity::Info]
         .into_iter()
         .map(|sev| {
             let empty = BTreeSet::new();
             let a = oracle.per_severity.get(&sev).unwrap_or(&empty);
-            let b = dartiq.per_severity.get(&sev).unwrap_or(&empty);
+            let b = dartq.per_severity.get(&sev).unwrap_or(&empty);
             let intersection = a.intersection(b).count();
             let union = a.union(b).count();
             SeverityStats {
@@ -259,29 +259,29 @@ pub(crate) fn compare(oracle: &Side, dartiq: &Side) -> Comparison {
                 intersection,
                 union,
                 oracle_only: a.len() - intersection,
-                dartiq_only: b.len() - intersection,
+                dartq_only: b.len() - intersection,
             }
         })
         .collect();
     let file_count = oracle
         .entries
-        .union(&dartiq.entries)
+        .union(&dartq.entries)
         .map(|k| k.1.clone())
         .collect::<BTreeSet<_>>()
         .len();
     Comparison {
         oracle_total: oracle.total_diags,
-        dartiq_total: dartiq.total_diags,
+        dartq_total: dartq.total_diags,
         oracle_pre_filter: oracle.pre_filter_total,
         oracle_dropped: oracle.dropped_by_filter,
-        dartiq_pre_filter: dartiq.pre_filter_total,
-        dartiq_dropped: dartiq.dropped_by_filter,
+        dartq_pre_filter: dartq.pre_filter_total,
+        dartq_dropped: dartq.dropped_by_filter,
         file_count,
         severities,
         oracle_only,
-        dartiq_only,
+        dartq_only,
         oracle_entries: side_entries(oracle),
-        dartiq_entries: side_entries(dartiq),
+        dartq_entries: side_entries(dartq),
         oracle_distribution: distribution(oracle),
     }
 }
@@ -369,7 +369,7 @@ mod tests {
             diag("E_B", "/corpus/b.dart", Severity::Error, "msg b"),
             diag("W_A", "/corpus/a.dart", Severity::Warning, "warn a"),
         ];
-        let dartiq = vec![
+        let dartq = vec![
             diag("e_a", "/corpus/a.dart", Severity::Error, "msg a"),
             diag("e_c", "/corpus/c.dart", Severity::Error, "msg c"),
             diag("w_a", "/corpus/a.dart", Severity::Warning, "warn a"),
@@ -377,11 +377,11 @@ mod tests {
         let root = Path::new("/corpus");
         let cmp = compare(
             &build_side_labeled(&oracle, root, None, |_| true),
-            &build_side_labeled(&dartiq, root, None, |_| true),
+            &build_side_labeled(&dartq, root, None, |_| true),
         );
 
         assert_eq!(cmp.oracle_total, 3);
-        assert_eq!(cmp.dartiq_total, 3);
+        assert_eq!(cmp.dartq_total, 3);
         assert_eq!(cmp.file_count, 3);
 
         let err = &cmp.severities[0];
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(err.intersection, 1);
         assert_eq!(err.union, 3);
         assert_eq!(err.oracle_only, 1);
-        assert_eq!(err.dartiq_only, 1);
+        assert_eq!(err.dartq_only, 1);
         assert!((err.jaccard - 1.0 / 3.0).abs() < 1e-12);
 
         // Lexicographic: b < c
@@ -397,8 +397,8 @@ mod tests {
         assert_eq!(cmp.oracle_only[0].code, "e_b");
         assert_eq!(cmp.oracle_only[0].file, "b.dart");
         assert_eq!(cmp.oracle_only[0].sample_message, "msg b");
-        assert_eq!(cmp.dartiq_only.len(), 1);
-        assert_eq!(cmp.dartiq_only[0].code, "e_c");
+        assert_eq!(cmp.dartq_only.len(), 1);
+        assert_eq!(cmp.dartq_only[0].code, "e_c");
 
         assert!((cmp.error_jaccard() - 1.0 / 3.0).abs() < 1e-12);
     }
@@ -428,11 +428,11 @@ mod tests {
             diag("E_A", "/corpus/a.dart", Severity::Error, "a2"),
             diag("W_A", "/corpus/a.dart", Severity::Warning, "w"),
         ];
-        let dartiq = vec![diag("e_a", "/corpus/a.dart", Severity::Error, "a")];
+        let dartq = vec![diag("e_a", "/corpus/a.dart", Severity::Error, "a")];
         let root = Path::new("/corpus");
         let cmp = compare(
             &build_side_labeled(&oracle, root, None, |_| true),
-            &build_side_labeled(&dartiq, root, None, |_| true),
+            &build_side_labeled(&dartq, root, None, |_| true),
         );
         let keys: Vec<(&str, &str)> = cmp
             .oracle_entries
@@ -448,8 +448,8 @@ mod tests {
         assert_eq!(a.severity, Severity::Error);
         assert_eq!(a.count, 2, "instance count aggregated per key");
         assert_eq!(cmp.oracle_entries[2].severity, Severity::Warning);
-        assert_eq!(cmp.dartiq_entries.len(), 1);
-        assert_eq!(cmp.dartiq_entries[0].count, 1);
+        assert_eq!(cmp.dartq_entries.len(), 1);
+        assert_eq!(cmp.dartq_entries[0].count, 1);
     }
 
     /// M0 gate semantics: after `--type-filter syntactic_error`, semantic codes (`COMPILE_TIME_ERROR`)
@@ -467,14 +467,14 @@ mod tests {
             length: 1,
             message: "m".into(),
         };
-        // oracle: 2 syntactic + 2 semantic; dartiq: 1 syntactic hit, 1 semantic hit, 1 syntactic miss
+        // oracle: 2 syntactic + 2 semantic; dartq: 1 syntactic hit, 1 semantic hit, 1 syntactic miss
         let oracle = vec![
             mk("E_A", "/corpus/a.dart", "SYNTACTIC_ERROR"),
             mk("E_B", "/corpus/b.dart", "SYNTACTIC_ERROR"),
             mk("S_A", "/corpus/a.dart", "COMPILE_TIME_ERROR"),
             mk("S_B", "/corpus/c.dart", "COMPILE_TIME_ERROR"),
         ];
-        let dartiq = vec![
+        let dartq = vec![
             mk("E_A", "/corpus/a.dart", "SYNTACTIC_ERROR"),
             mk("E_C", "/corpus/c.dart", "SYNTACTIC_ERROR"),
             mk("S_A", "/corpus/a.dart", "COMPILE_TIME_ERROR"),
@@ -482,7 +482,7 @@ mod tests {
         let root = Path::new("/corpus");
         let unfiltered = compare(
             &build_side_labeled(&oracle, root, None, |_| true),
-            &build_side_labeled(&dartiq, root, None, |_| true),
+            &build_side_labeled(&dartq, root, None, |_| true),
         );
         assert!(
             (unfiltered.error_jaccard() - 0.4).abs() < 1e-12,
@@ -492,10 +492,10 @@ mod tests {
         let keep_syn = |d: &MachineDiag| d.dtype == "SYNTACTIC_ERROR";
         let filtered = compare(
             &build_side_labeled(&oracle, root, None, keep_syn),
-            &build_side_labeled(&dartiq, root, None, keep_syn),
+            &build_side_labeled(&dartq, root, None, keep_syn),
         );
         assert_eq!(filtered.oracle_total, 2, "post-filter instance counts");
-        assert_eq!(filtered.dartiq_total, 2);
+        assert_eq!(filtered.dartq_total, 2);
         // ∩ = {E_A@a.dart}, ∪ = {E_A, E_B, E_C}
         assert!(
             (filtered.error_jaccard() - 1.0 / 3.0).abs() < 1e-12,
@@ -510,15 +510,15 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn fully_filtered_empty_sets_agree_at_one() {
         let oracle = vec![diag("E_A", "/corpus/a.dart", Severity::Error, "m")];
-        let dartiq = vec![diag("E_B", "/corpus/b.dart", Severity::Error, "m")];
+        let dartq = vec![diag("E_B", "/corpus/b.dart", Severity::Error, "m")];
         let root = Path::new("/corpus");
         let keep_lint = |d: &MachineDiag| d.dtype == "LINT";
         let cmp = compare(
             &build_side_labeled(&oracle, root, None, keep_lint),
-            &build_side_labeled(&dartiq, root, None, keep_lint),
+            &build_side_labeled(&dartq, root, None, keep_lint),
         );
         assert_eq!(cmp.oracle_total, 0);
-        assert_eq!(cmp.dartiq_total, 0);
+        assert_eq!(cmp.dartq_total, 0);
         assert_eq!(cmp.severities[0].union, 0, "ERROR tier empty after filter");
         assert_eq!(cmp.error_jaccard(), 1.0, "empty vs empty = full agreement");
     }
@@ -651,20 +651,20 @@ mod tests {
             mk("UNDEFINED_CLASS"),
             mk("EXPECTED_TOKEN"),
         ];
-        let dartiq = vec![mk("expected_token")];
+        let dartq = vec![mk("expected_token")];
         let in_set = |d: &MachineDiag| d.code.to_lowercase() == "expected_token";
         let oracle_side = build_side_labeled(&oracle, Path::new("/corpus"), None, in_set);
-        let dartiq_side = build_side_labeled(&dartiq, Path::new("/corpus"), None, in_set);
+        let dartq_side = build_side_labeled(&dartq, Path::new("/corpus"), None, in_set);
         assert_eq!(oracle_side.pre_filter_total, 3);
         assert_eq!(oracle_side.total_diags, 2);
         assert_eq!(oracle_side.dropped_by_filter, 1);
-        assert_eq!(dartiq_side.dropped_by_filter, 0);
+        assert_eq!(dartq_side.dropped_by_filter, 0);
 
-        let cmp = compare(&oracle_side, &dartiq_side);
+        let cmp = compare(&oracle_side, &dartq_side);
         assert_eq!(cmp.oracle_pre_filter, 3);
         assert_eq!(cmp.oracle_dropped, 1);
-        assert_eq!(cmp.dartiq_pre_filter, 1);
-        assert_eq!(cmp.dartiq_dropped, 0);
+        assert_eq!(cmp.dartq_pre_filter, 1);
+        assert_eq!(cmp.dartq_dropped, 0);
         assert_eq!(cmp.error_jaccard(), 1.0);
     }
 }

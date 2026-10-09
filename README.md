@@ -1,10 +1,10 @@
-# dartiq
+# dartq
 
-dartiq is a semantic analysis engine for Dart and Flutter, written in Rust.
+dartq is a semantic analysis engine for Dart and Flutter, written in Rust.
 It targets CLI and CI usage as a replacement for `dart analyze`, with AI
 coding agents as its first-class users: machine-readable output, incremental
 re-analysis, a bounded memory footprint, and multi-SDK support. The official
-Dart analyzer is the semantic oracle — dartiq replicates its diagnostics and
+Dart analyzer is the semantic oracle — dartq replicates its diagnostics and
 exceeds its performance envelope, and every semantic claim is validated by
 differential testing against `dart analyze`. See `PRD.md` for the full
 design document.
@@ -22,7 +22,7 @@ design document.
    references, deltas, batch queries; fewest tokens for equal information.
 5. **Extensibility** — new Dart versions, experiments, platforms, and
    plugins are "add data / add rules", never "change the architecture".
-6. **Analyzer replacement** — `dartiq analyze` / `dartiq check` take the
+6. **Analyzer replacement** — `dartq analyze` / `dartq check` take the
    place of `dart analyze` (machine-readable superset), measured against
    the official analyzer as the oracle.
 
@@ -55,42 +55,42 @@ differential-testing harness:
 
 | Layer | Crate | Role | Status |
 | --- | --- | --- | --- |
-| Foundation | [`dartiq-source`](crates/dartiq-source) | Content-addressed source storage: `ContentId` (blake3), source store, `FileId`, locators | landed |
-| Foundation | [`dartiq-language`](crates/dartiq-language) | Feature registry generated at build time from the SDK's `experimental_features.yaml`; `LanguageVersion` / `FeatureSet` resolution | landed |
-| Foundation | [`dartiq-diagnostics`](crates/dartiq-diagnostics) | Stable diagnostic code registry (265 official + 12 dartiq-own codes) and `machine` / `json` writers byte-compatible with `dart analyze --format=machine` | landed |
-| Foundation | [`dartiq-schema`](crates/dartiq-schema) | Versioned machine-readable JSON output schemas | in development |
-| Frontend | [`dartiq-scanner`](crates/dartiq-scanner) | Full Dart 3.15 tokenizer: single pass, no backtracking, `@dart` version-comment window, error recovery → linear token table + syntax diagnostics | landed |
-| Frontend | [`dartiq-parser`](crates/dartiq-parser) | Fault-tolerant recursive-descent parser for the full Dart 3.15 grammar: token table in, parser-event stream out | landed |
-| Frontend | [`dartiq-ast`](crates/dartiq-ast) | Compact arena AST: nodes reference token ranges, spans derive from the token table (byte + UTF-16) | landed |
-| Environment | [`dartiq-pub`](crates/dartiq-pub) | Consumers for pub's resolution artifacts (`package_config.json`, `pubspec.yaml`, `pubspec.lock`), workspace discovery, freshness, resolved package graphs; no version solving | landed |
-| Environment | [`dartiq-package`](crates/dartiq-package) | Typed package-identity model consumed by resolution, composed on `dartiq-pub`'s artifacts | landed |
-| Environment | [`dartiq-sdk`](crates/dartiq-sdk) | SDK metadata: `libraries.json` loading, identity, `dart:` library surface, target/platform scoping | landed |
-| Semantics | [`dartiq-types`](crates/dartiq-types) | Type system M1 surface: ten-shape type skeleton, nullability dimension, canonical interning, subtype / assignability, least upper bound | landed |
-| Semantics | [`dartiq-resolution`](crates/dartiq-resolution) | URI, import/export/part, and conditional-import resolution with namespace computation | in development |
-| Semantics | [`dartiq-semantic`](crates/dartiq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
-| Semantics | [`dartiq-flow`](crates/dartiq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
-| Services | [`dartiq-index`](crates/dartiq-index) | Reference, inheritance, and test graphs | in development |
-| Services | [`dartiq-incremental`](crates/dartiq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | in development |
-| Services | [`dartiq-cache`](crates/dartiq-cache) | Layered cache (L1/L2/L3) and eviction policies | in development |
-| Services | [`dartiq-snapshot`](crates/dartiq-snapshot) | Persistence for analysis contexts and snapshots | in development |
-| Services | [`dartiq-engine`](crates/dartiq-engine) | Runtime, scheduler, cancellation, overlay management | in development |
-| Services | [`dartiq-lints`](crates/dartiq-lints) | Built-in lint rule set | in development |
-| Services | [`dartiq-plugin`](crates/dartiq-plugin) | Plugin protocol IPC types | in development |
-| Interface | [`dartiq-ai`](crates/dartiq-ai) | Agent-facing queries: impact, explain, compatibility, fix | in development |
-| Interface | [`dartiq-cli`](crates/dartiq-cli) | Command-line entry point | in development |
-| Testing | [`harness`](tests/harness) | Differential-testing driver: oracle vs dartiq over shared corpora, `(code, file)` Jaccard comparison | landed |
+| Foundation | [`dartq-source`](crates/dartq-source) | Content-addressed source storage: `ContentId` (blake3), source store, `FileId`, locators | landed |
+| Foundation | [`dartq-language`](crates/dartq-language) | Feature registry generated at build time from the SDK's `experimental_features.yaml`; `LanguageVersion` / `FeatureSet` resolution | landed |
+| Foundation | [`dartq-diagnostics`](crates/dartq-diagnostics) | Stable diagnostic code registry (265 official + 12 dartq-own codes) and `machine` / `json` writers byte-compatible with `dart analyze --format=machine` | landed |
+| Foundation | [`dartq-schema`](crates/dartq-schema) | Versioned machine-readable JSON output schemas | in development |
+| Frontend | [`dartq-scanner`](crates/dartq-scanner) | Full Dart 3.15 tokenizer: single pass, no backtracking, `@dart` version-comment window, error recovery → linear token table + syntax diagnostics | landed |
+| Frontend | [`dartq-parser`](crates/dartq-parser) | Fault-tolerant recursive-descent parser for the full Dart 3.15 grammar: token table in, parser-event stream out | landed |
+| Frontend | [`dartq-ast`](crates/dartq-ast) | Compact arena AST: nodes reference token ranges, spans derive from the token table (byte + UTF-16) | landed |
+| Environment | [`dartq-pub`](crates/dartq-pub) | Consumers for pub's resolution artifacts (`package_config.json`, `pubspec.yaml`, `pubspec.lock`), workspace discovery, freshness, resolved package graphs; no version solving | landed |
+| Environment | [`dartq-package`](crates/dartq-package) | Typed package-identity model consumed by resolution, composed on `dartq-pub`'s artifacts | landed |
+| Environment | [`dartq-sdk`](crates/dartq-sdk) | SDK metadata: `libraries.json` loading, identity, `dart:` library surface, target/platform scoping | landed |
+| Semantics | [`dartq-types`](crates/dartq-types) | Type system M1 surface: ten-shape type skeleton, nullability dimension, canonical interning, subtype / assignability, least upper bound | landed |
+| Semantics | [`dartq-resolution`](crates/dartq-resolution) | URI, import/export/part, and conditional-import resolution with namespace computation | in development |
+| Semantics | [`dartq-semantic`](crates/dartq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
+| Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
+| Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | in development |
+| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | in development |
+| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache (L1/L2/L3) and eviction policies | in development |
+| Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | in development |
+| Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | in development |
+| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set | in development |
+| Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin protocol IPC types | in development |
+| Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | in development |
+| Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | in development |
+| Testing | [`harness`](tests/harness) | Differential-testing driver: oracle vs dartq over shared corpora, `(code, file)` Jaccard comparison | landed |
 
-`crates/dartiq-plugin-host/` is the host-side Dart package of the plugin
+`crates/dartq-plugin-host/` is the host-side Dart package of the plugin
 protocol (M4) and is not part of the Cargo workspace.
 
 ## Differential Testing
 
 `tests/harness` runs the official analyzer (`dart analyze --format=machine`)
-and dartiq over the same corpora and compares results as `(code, file)`
+and dartq over the same corpora and compares results as `(code, file)`
 entry sets (Jaccard). Corpora live in `tests/corpus/`: `m0` (assembled
 analyzer-suite cases), `m0-syntax` (syntax-broken files), and the syntax
 gate's code list `syntax-codes.txt` — the syntax codes of
-`crates/dartiq-diagnostics/data/syntax-codes.tsv` (265 rows: 262
+`crates/dartq-diagnostics/data/syntax-codes.tsv` (265 rows: 262
 scanner/parser codes + the 3-code language-version family; the txt file
 drops the family, leaving 262).
 
@@ -103,7 +103,7 @@ self-check, both sides the analyzer — Jaccard 1.000 across all runs):
 | syntax | `m0-syntax` | codes ∩ ERROR | 272 | 2144 | 1.000 |
 | full | `m0` + `m0-syntax` | all | 439 | 6873 | 1.000 |
 
-The M0 gate is the syntax-caliber run against the real dartiq side; the
+The M0 gate is the syntax-caliber run against the real dartq side; the
 gate passes at ERROR-tier Jaccard ≥ 0.99 (baseline: 539 entries /
 2144 instances):
 
@@ -116,11 +116,11 @@ cargo run -p harness -- run --e2e-oracle \
   --corpus-dir tests/corpus/m0 --corpus-dir tests/corpus/m0-syntax \
   --severity-filter ERROR --codes-file tests/corpus/syntax-codes.txt
 
-# Real differential run: swap --e2e-oracle for the dartiq driver.
+# Real differential run: swap --e2e-oracle for the dartq driver.
 cargo run -p harness -- run \
   --corpus-dir tests/corpus/m0 --corpus-dir tests/corpus/m0-syntax \
   --severity-filter ERROR --codes-file tests/corpus/syntax-codes.txt \
-  --dartiq-cmd "cargo run -q -p dartiq-cli -- check --format=machine"
+  --dartq-cmd "cargo run -q -p dartq-cli -- check --format=machine"
 ```
 
 Exit codes: `0` = gate met, `1` = below threshold, `2` = harness error.
@@ -136,7 +136,7 @@ itself: wall-clock time and peak RSS of `dart analyze --format=machine`
 over N sequential rounds (default 5; round 1 is "cold", rounds 2..N are
 "hot"), plus corpus scale (files / LOC / bytes). One JSON object per line,
 one per round plus a summary record. Run it before and after performance
-work to keep comparisons honest — dartiq budgets are stated relative to
+work to keep comparisons honest — dartq budgets are stated relative to
 these numbers.
 
 ## Build and Test
@@ -150,7 +150,7 @@ cargo clippy --workspace --all-targets    # rust_2018_idioms + clippy all/pedant
 
 The toolchain is pinned by `rust-toolchain.toml` (Rust 1.96.0, edition
 2024, resolver "3"). `Cargo.lock` is committed: the workspace ships
-binaries (`dartiq-cli`, `harness`).
+binaries (`dartq-cli`, `harness`).
 
 ## Status
 
@@ -179,7 +179,7 @@ Reference sources vendored under `.third/` (the Dart SDK, pub, and
 rust-analyzer repositories) are local development references used for
 semantic grounding and calibration only. They are not part of the source
 distribution, are never modified, and are not required to build or use
-dartiq.
+dartq.
 
 ## License
 

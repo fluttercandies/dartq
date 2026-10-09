@@ -1,0 +1,34 @@
+[package]
+name = "dartq-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The published command faces are `dartq check` (M0 differential,
+# engine-api-spec §4.1) and `dartq analyze` (M1 engine); ship the binary
+# under the tool name rather than the package name.
+[[bin]]
+name = "dartq"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+dartq-diagnostics = { path = "../dartq-diagnostics" }
+dartq-engine = { path = "../dartq-engine" }
+dartq-language = { path = "../dartq-language" }
+dartq-package = { path = "../dartq-package" }
+dartq-parser = { path = "../dartq-parser" }
+dartq-pub = { path = "../dartq-pub" }
+dartq-scanner = { path = "../dartq-scanner" }
+dartq-sdk = { path = "../dartq-sdk" }
+dartq-source = { path = "../dartq-source" }
+serde_json = { workspace = true }
+
+# The metrics hook reads peak RSS through getrusage (engine-api-spec §3);
+# unix-only until a non-unix story exists.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

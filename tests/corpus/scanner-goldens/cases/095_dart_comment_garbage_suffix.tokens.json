@@ -1,6 +1,6 @@
 {
   "case": "095_dart_comment_garbage_suffix",
-  "origin": "abstract_scanner.dart:1070-1075 (after minor digits only SP* then LF/CR/EOF accepted; trailing 'x' -> plain comment; dartiq lib.rs:36)",
+  "origin": "abstract_scanner.dart:1070-1075 (after minor digits only SP* then LF/CR/EOF accepted; trailing 'x' -> plain comment; dartq lib.rs:36)",
   "config": {"triple_shift": true, "augment": true},
   "language_version": null,
   "tokens": [

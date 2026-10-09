@@ -1,0 +1,18 @@
+[package]
+name = "dartq-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Frozen contract dependencies (see the "unified swap points" section in lib.rs):
+# before #11/#12/#17 land, the scanner internally uses shape-identical local types
+# (LanguageVersion / Diagnostic / LineIndex); after they land, only the type
+# sources are swapped.
+dartq-language = { path = "../dartq-language" }
+dartq-source = { path = "../dartq-source" }
+dartq-diagnostics = { path = "../dartq-diagnostics" }
+
+[lints]
+workspace = true

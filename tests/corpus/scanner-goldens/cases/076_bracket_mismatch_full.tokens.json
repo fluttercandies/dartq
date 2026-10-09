@@ -174,5 +174,5 @@
    ]
   ]
  ],
- "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartiq maps that to the expected_token diagnostic encoded here"
+ "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartq maps that to the expected_token diagnostic encoded here"
 }

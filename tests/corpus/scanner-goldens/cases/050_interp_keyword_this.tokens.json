@@ -1,6 +1,6 @@
 {
   "case": "050_interp_keyword_this",
-  "origin": "abstract_scanner.dart:2126 (interpolation identifier path reuses keyword tokenization -> Keyword token; mirrored in dartiq lib.rs:20 contract)",
+  "origin": "abstract_scanner.dart:2126 (interpolation identifier path reuses keyword tokenization -> Keyword token; mirrored in dartq lib.rs:20 contract)",
   "config": {"triple_shift": true, "augment": true},
   "language_version": null,
   "tokens": [

@@ -12,7 +12,7 @@ use crate::compare::{Comparison, Distribution};
 pub(crate) struct RunMeta {
     pub(crate) corpus_dir: String,
     pub(crate) oracle_cmd: String,
-    pub(crate) dartiq_cmd: String,
+    pub(crate) dartq_cmd: String,
     /// Full `dart --version` banner line captured once per run (PRD §19.1:
     /// every report records the oracle reference version)
     pub(crate) oracle_version: String,
@@ -32,13 +32,13 @@ struct JsonReport<'a> {
     passed: bool,
     error_jaccard: f64,
     oracle_total: usize,
-    dartiq_total: usize,
+    dartq_total: usize,
     filters: JsonFilterAccounting,
     file_count: usize,
     severities: Vec<JsonSeverityStats>,
     oracle_distribution: JsonDistribution,
     oracle_only: Vec<JsonDiffEntry>,
-    dartiq_only: Vec<JsonDiffEntry>,
+    dartq_only: Vec<JsonDiffEntry>,
 }
 
 /// Per-side filter accounting (see `compare::Side::dropped_by_filter`):
@@ -47,7 +47,7 @@ struct JsonReport<'a> {
 #[derive(Serialize)]
 struct JsonFilterAccounting {
     oracle: JsonSideFilterAccounting,
-    dartiq: JsonSideFilterAccounting,
+    dartq: JsonSideFilterAccounting,
 }
 
 #[derive(Serialize)]
@@ -74,7 +74,7 @@ struct JsonSideEntry {
 struct JsonMeta<'a> {
     corpus_dir: &'a str,
     oracle_cmd: &'a str,
-    dartiq_cmd: &'a str,
+    dartq_cmd: &'a str,
     oracle_version: &'a str,
     threshold: f64,
     severity_filter: &'a str,
@@ -113,7 +113,7 @@ struct JsonSeverityStats {
     intersection: usize,
     union: usize,
     oracle_only: usize,
-    dartiq_only: usize,
+    dartq_only: usize,
 }
 
 #[derive(Serialize)]
@@ -140,7 +140,7 @@ pub(crate) fn write_reports(
         meta: JsonMeta {
             corpus_dir: &meta.corpus_dir,
             oracle_cmd: &meta.oracle_cmd,
-            dartiq_cmd: &meta.dartiq_cmd,
+            dartq_cmd: &meta.dartq_cmd,
             oracle_version: &meta.oracle_version,
             threshold: meta.threshold,
             severity_filter: &meta.severity_filter,
@@ -150,17 +150,17 @@ pub(crate) fn write_reports(
         passed,
         error_jaccard: cmp.error_jaccard(),
         oracle_total: cmp.oracle_total,
-        dartiq_total: cmp.dartiq_total,
+        dartq_total: cmp.dartq_total,
         filters: JsonFilterAccounting {
             oracle: JsonSideFilterAccounting {
                 pre_filter_total: cmp.oracle_pre_filter,
                 dropped_by_filter: cmp.oracle_dropped,
                 entries: side_entries_json(&cmp.oracle_entries),
             },
-            dartiq: JsonSideFilterAccounting {
-                pre_filter_total: cmp.dartiq_pre_filter,
-                dropped_by_filter: cmp.dartiq_dropped,
-                entries: side_entries_json(&cmp.dartiq_entries),
+            dartq: JsonSideFilterAccounting {
+                pre_filter_total: cmp.dartq_pre_filter,
+                dropped_by_filter: cmp.dartq_dropped,
+                entries: side_entries_json(&cmp.dartq_entries),
             },
         },
         file_count: cmp.file_count,
@@ -174,7 +174,7 @@ pub(crate) fn write_reports(
                 intersection: s.intersection,
                 union: s.union,
                 oracle_only: s.oracle_only,
-                dartiq_only: s.dartiq_only,
+                dartq_only: s.dartq_only,
             })
             .collect(),
         oracle_only: cmp
@@ -191,8 +191,8 @@ pub(crate) fn write_reports(
                 sample_message: e.sample_message.clone(),
             })
             .collect(),
-        dartiq_only: cmp
-            .dartiq_only
+        dartq_only: cmp
+            .dartq_only
             .iter()
             .map(|e| JsonDiffEntry {
                 code: e.code.clone(),
@@ -232,7 +232,7 @@ fn side_entries_json(entries: &[crate::compare::SideEntry]) -> Vec<JsonSideEntry
 
 fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
     let mut md = String::new();
-    let _ = write!(md, "# dartiq differential report (M0)\n\n");
+    let _ = write!(md, "# dartq differential report (M0)\n\n");
     let _ = writeln!(
         md,
         "- corpus: {} (files with diagnostics: {})",
@@ -246,15 +246,15 @@ fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
     );
     let _ = writeln!(
         md,
-        "- dartiq: `{}` -> {} diags",
-        meta.dartiq_cmd, cmp.dartiq_total
+        "- dartq: `{}` -> {} diags",
+        meta.dartq_cmd, cmp.dartq_total
     );
     let _ = write!(
         md,
         "- severity filter: {}; threshold (ERROR): {}\n\
          - type filter: {}; codes file: {}\n\
-         (post-filter: oracle {} diags, dartiq {} diags)\n\
-         - dropped by filters: oracle {} of {} pre-filter, dartiq {} of {} pre-filter\n\n",
+         (post-filter: oracle {} diags, dartq {} diags)\n\
+         - dropped by filters: oracle {} of {} pre-filter, dartq {} of {} pre-filter\n\n",
         meta.severity_filter,
         meta.threshold,
         meta.type_filter,
@@ -264,14 +264,14 @@ fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
             &meta.codes_file
         },
         cmp.oracle_total,
-        cmp.dartiq_total,
+        cmp.dartq_total,
         cmp.oracle_dropped,
         cmp.oracle_pre_filter,
-        cmp.dartiq_dropped,
-        cmp.dartiq_pre_filter
+        cmp.dartq_dropped,
+        cmp.dartq_pre_filter
     );
     md.push_str("## Jaccard per severity\n\n");
-    md.push_str("| severity | jaccard | intersect | union | oracle-only | dartiq-only |\n");
+    md.push_str("| severity | jaccard | intersect | union | oracle-only | dartq-only |\n");
     md.push_str("| --- | --- | --- | --- | --- | --- |\n");
     for s in &cmp.severities {
         let _ = writeln!(
@@ -282,13 +282,13 @@ fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
             s.intersection,
             s.union,
             s.oracle_only,
-            s.dartiq_only
+            s.dartq_only
         );
     }
     md.push_str("\n## oracle-only entries\n\n");
     push_diff_table(&mut md, &cmp.oracle_only);
-    md.push_str("\n## dartiq-only entries\n\n");
-    push_diff_table(&mut md, &cmp.dartiq_only);
+    md.push_str("\n## dartq-only entries\n\n");
+    push_diff_table(&mut md, &cmp.dartq_only);
     let _ = write!(
         md,
         "\n## Verdict\n\n- ERROR jaccard = {:.3} vs threshold {} -> {}\n",
@@ -346,15 +346,15 @@ mod tests {
                 message: format!("msg | with pipe {i}\nsecond line"),
             })
             .collect();
-        let dartiq: Vec<MachineDiag> = oracle[..5].to_vec();
+        let dartq: Vec<MachineDiag> = oracle[..5].to_vec();
         let cmp = compare(
             &build_side_labeled(&oracle, Path::new("/corpus"), None, |_| true),
-            &build_side_labeled(&dartiq, Path::new("/corpus"), None, |_| true),
+            &build_side_labeled(&dartq, Path::new("/corpus"), None, |_| true),
         );
         let meta = RunMeta {
             corpus_dir: "/corpus".into(),
             oracle_cmd: "dart analyze".into(),
-            dartiq_cmd: "dartiq check".into(),
+            dartq_cmd: "dartq check".into(),
             oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
             threshold: 0.99,
             severity_filter: "all".into(),
@@ -367,13 +367,13 @@ mod tests {
 
         let json_text = fs::read_to_string(&json_path).expect("json");
         let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
-        // oracle has 30 keys, dartiq reuses the first 5: oracle-only = 25, dartiq-only = 0
+        // oracle has 30 keys, dartq reuses the first 5: oracle-only = 25, dartq-only = 0
         assert_eq!(
             parsed["oracle_only"].as_array().unwrap().len(),
             25,
             "JSON keeps ALL diff entries"
         );
-        assert_eq!(parsed["dartiq_only"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["dartq_only"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["error_jaccard"], 1.0 / 6.0);
         assert_eq!(parsed["passed"], false);
         assert_eq!(parsed["meta"]["type_filter"], "syntactic_error");
@@ -402,7 +402,7 @@ mod tests {
             30,
             "every post-filter key listed per side"
         );
-        assert_eq!(filters["dartiq"]["entries"].as_array().unwrap().len(), 5);
+        assert_eq!(filters["dartq"]["entries"].as_array().unwrap().len(), 5);
         let first = &filters["oracle"]["entries"][0];
         assert_eq!(first["code"], "e_00", "lexicographic order");
         assert_eq!(first["file"], "f00.dart");
@@ -451,16 +451,16 @@ mod tests {
         };
         // Simulates a truncated codes file: only expected_token survives
         let oracle = vec![mk("EXPECTED_TOKEN"), mk("UNDEFINED_CLASS")];
-        let dartiq = vec![mk("expected_token")];
+        let dartq = vec![mk("expected_token")];
         let in_set = |d: &MachineDiag| d.code.to_lowercase() == "expected_token";
         let cmp = compare(
             &build_side_labeled(&oracle, Path::new("/corpus"), None, in_set),
-            &build_side_labeled(&dartiq, Path::new("/corpus"), None, in_set),
+            &build_side_labeled(&dartq, Path::new("/corpus"), None, in_set),
         );
         let meta = RunMeta {
             corpus_dir: "/corpus".into(),
             oracle_cmd: "dart analyze".into(),
-            dartiq_cmd: "dartiq check".into(),
+            dartq_cmd: "dartq check".into(),
             oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
             threshold: 0.99,
             severity_filter: "all".into(),
@@ -475,8 +475,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
         assert_eq!(parsed["filters"]["oracle"]["pre_filter_total"], 2);
         assert_eq!(parsed["filters"]["oracle"]["dropped_by_filter"], 1);
-        assert_eq!(parsed["filters"]["dartiq"]["pre_filter_total"], 1);
-        assert_eq!(parsed["filters"]["dartiq"]["dropped_by_filter"], 0);
+        assert_eq!(parsed["filters"]["dartq"]["pre_filter_total"], 1);
+        assert_eq!(parsed["filters"]["dartq"]["dropped_by_filter"], 0);
         assert_eq!(parsed["oracle_total"], 1, "post-filter totals unchanged");
 
         let md = fs::read_to_string(&md_path).expect("md");
