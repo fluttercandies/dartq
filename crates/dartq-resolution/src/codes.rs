@@ -37,7 +37,9 @@ pub enum ResolutionCode {
     /// The directive URI is a string interpolation, so it carries no string
     /// to resolve (diagnostic.g.dart:18221).
     UriWithInterpolation,
-    /// The selected URI starts with `dart-ext:` (diagnostic.g.dart:18232).
+    /// The selected URI starts with `dart-ext:` (diagnostic.g.dart:18232);
+    /// also the CFE face of the same diagnostic
+    /// (`fragment_factory_impl.dart:935`).
     UseOfNativeExtension,
     /// Target exists but is a part file, for `import` (diagnostic.g.dart:7668).
     ImportOfNonLibrary,
@@ -66,13 +68,9 @@ pub enum ResolutionCode {
     /// (diagnostic.g.dart:317).
     AmbiguousExport,
     /// The same prefix is imported deferred in one place and non-deferred in
-    /// another (CFE `source_compilation_unit.dart:1526`; no analyzer g.dart
-    /// row — dartq emits it for the CFE-aligned face). Message text
-    /// unverified against pinned sources.
-    DeferredPrefixDuplicated,
-    /// CFE-facing `dart-ext:` import (`fragment_factory_impl.dart:935`; no
-    /// analyzer g.dart row). Message text unverified against pinned sources.
-    UnsupportedDartExt,
+    /// another (analyzer-8.4.1 `error/codes.g.dart:6651`;
+    /// COMPILE_TIME_ERROR, `hasPublishedDocs`).
+    SharedDeferredPrefix,
 }
 
 /// Official descriptor of one [`ResolutionCode`]: code name, machine form,
@@ -166,18 +164,10 @@ impl ResolutionCode {
                 machine: "AMBIGUOUS_EXPORT",
                 message: "The name '{0}' is defined in the libraries '{1}' and '{2}'.",
             },
-            Self::DeferredPrefixDuplicated => ResolutionCodeInfo {
-                name: "deferred_prefix_duplicated",
-                machine: "DEFERRED_PREFIX_DUPLICATED",
-                message: concat!(
-                    "Can't use the name '{0}' for a deferred library, as the ",
-                    "name is used elsewhere."
-                ),
-            },
-            Self::UnsupportedDartExt => ResolutionCodeInfo {
-                name: "unsupported_dart_ext",
-                machine: "UNSUPPORTED_DART_EXT",
-                message: "Dart native extensions are no longer supported.",
+            Self::SharedDeferredPrefix => ResolutionCodeInfo {
+                name: "shared_deferred_prefix",
+                machine: "SHARED_DEFERRED_PREFIX",
+                message: "The prefix of a deferred import can't be used in other import directives.",
             },
         }
     }
@@ -197,7 +187,9 @@ impl ResolutionCode {
 mod tests {
     use super::*;
 
-    /// §4.2 has exactly sixteen rows; the enum is the table.
+    /// The frozen table: §4.2's sixteen rows less `unsupported_dart_ext`,
+    /// deduplicated into [`ResolutionCode::UseOfNativeExtension`] on
+    /// re-anchor (analyzer-8.4.1 `error/codes.g.dart:7666`).
     #[test]
     fn table_is_complete_and_official_named() {
         let codes = [
@@ -215,10 +207,9 @@ mod tests {
             ResolutionCode::DuplicatePart,
             ResolutionCode::AmbiguousImport,
             ResolutionCode::AmbiguousExport,
-            ResolutionCode::DeferredPrefixDuplicated,
-            ResolutionCode::UnsupportedDartExt,
+            ResolutionCode::SharedDeferredPrefix,
         ];
-        assert_eq!(codes.len(), 16);
+        assert_eq!(codes.len(), 15);
         for code in codes {
             let info = code.info();
             assert_eq!(info.name.to_uppercase(), info.machine);
