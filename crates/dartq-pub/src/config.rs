@@ -170,20 +170,31 @@ impl PackageConfig {
 }
 
 impl PackageConfigEntry {
-    /// True when `rootUri` is an absolute URI (any scheme). This is only a
-    /// *shape* property, used by [`Self::resolve_root`] to reject non-`file`
-    /// schemes — pub writes pub-cache packages as absolute `file:` URIs, but
-    /// so are absolute path dependencies (`relative: false`), which live
-    /// outside the cache and must stay freshness-checked (facts §6.5).
+    /// True when `rootUri` is an absolute URI (any scheme): it starts with
+    /// an RFC 3986 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+    /// followed by `:`). This is only a *shape* property, used by
+    /// [`Self::resolve_root`] to reject non-`file` schemes — pub writes
+    /// pub-cache packages as absolute `file:` URIs, but so are absolute
+    /// path dependencies (`relative: false`), which live outside the cache
+    /// and must stay freshness-checked (facts §6.5). Scheme detection is
+    /// prefix-anchored, not a `://` search: a relative path that merely
+    /// contains a literal `://` (`../weird://name`) stays relative.
     #[must_use]
     pub fn is_absolute_uri(&self) -> bool {
-        self.root_uri.contains("://")
+        let Some((scheme, _)) = self.root_uri.split_once(':') else {
+            return false;
+        };
+        let mut chars = scheme.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
     }
 
     /// Resolves `rootUri` against `config_dir`, the directory holding
-    /// `package_config.json` (normally `.dart_tool/`). Works for both
-    /// absolute `file:` URIs (with or without a trailing slash — hosted
-    /// cache dirs have none, git checkouts do) and relative URI paths.
+    /// `package_config.json` (normally `.dart_tool/`). Works for absolute
+    /// `file:` URIs — `file:///abs` (the only shape pub writes) and the
+    /// single-slash `file:/abs`, which Dart's `Uri.parse` + `toFilePath`
+    /// both read as `/abs`, with or without a trailing slash (hosted cache
+    /// dirs have none, git checkouts do) — and relative URI paths.
     ///
     /// The result is only lexically joined; callers that need a canonical
     /// filesystem path should canonicalize it themselves.
@@ -191,26 +202,34 @@ impl PackageConfigEntry {
     /// # Errors
     ///
     /// Returns [`PubError::PackageConfig`] for unsupported (non-`file`)
-    /// URI schemes or malformed escapes.
+    /// URI schemes, a non-empty `file:` authority, or malformed escapes.
     pub fn resolve_root(&self, config_dir: &Path) -> Result<PathBuf, PubError> {
         let uri = &self.root_uri;
-        if let Some(rest) = uri.strip_prefix("file://") {
-            // `file:///abs/path` — everything after `file://` is the
-            // absolute path (empty authority, the only shape pub writes);
-            // non-empty authorities (`file://host/...`) are unsupported.
-            if !rest.starts_with('/') {
-                return Err(PubError::PackageConfig(format!(
-                    "unsupported file URI authority `{uri}`"
-                )));
+        if let Some(rest) = uri.strip_prefix("file:") {
+            if let Some(path) = rest.strip_prefix("//") {
+                // `file:///abs/path` — everything after `file://` is the
+                // absolute path (empty authority, the only shape pub
+                // writes); non-empty authorities (`file://host/...`) are
+                // unsupported.
+                if !path.starts_with('/') {
+                    return Err(PubError::PackageConfig(format!(
+                        "unsupported file URI authority `{uri}`"
+                    )));
+                }
+                return Ok(PathBuf::from(percent_decode(path)?));
             }
-            Ok(PathBuf::from(percent_decode(rest)?))
+            // The single-slash absolute form `file:/abs`; require the
+            // leading `/`, anything else falls through to the relative
+            // branch below.
+            if rest.starts_with('/') {
+                return Ok(PathBuf::from(percent_decode(rest)?));
+            }
         } else if self.is_absolute_uri() {
-            Err(PubError::PackageConfig(format!(
+            return Err(PubError::PackageConfig(format!(
                 "unsupported rootUri scheme `{uri}`"
-            )))
-        } else {
-            Ok(config_dir.join(percent_decode(uri)?))
+            )));
         }
+        Ok(config_dir.join(percent_decode(uri)?))
     }
 }
 
@@ -597,6 +616,58 @@ mod tests {
         let bad_host = r#"{"configVersion": 2, "packages": [
             {"name": "a", "rootUri": "file://host/cache/a-1.0.0"}]}"#;
         let config = PackageConfig::parse(bad_host).expect("ok");
+        assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
+    }
+
+    #[test]
+    fn resolve_root_accepts_single_slash_file_uris() {
+        // `file:/abs` — the single-slash form Dart's `Uri.parse` +
+        // `toFilePath` accept as `/abs` — resolves absolute, never as a
+        // config-relative join; the authority-ful empty-authority form
+        // keeps resolving, and a real authority stays rejected.
+        let single = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "file:/cache/a-1.0.0"}]}"#;
+        let config = PackageConfig::parse(single).expect("ok");
+        assert!(config.packages[0].is_absolute_uri());
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/cache/a-1.0.0")
+        );
+        let hosted = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "file:///cache/a-1.0.0"}]}"#;
+        let config = PackageConfig::parse(hosted).expect("ok");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/cache/a-1.0.0")
+        );
+        let bad_host = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "file://host/cache/a-1.0.0"}]}"#;
+        let config = PackageConfig::parse(bad_host).expect("ok");
+        assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
+    }
+
+    #[test]
+    fn scheme_detection_is_prefix_anchored() {
+        // A relative path that merely contains a literal `://` stays
+        // relative (the scheme grammar is anchored at the start, RFC 3986
+        // §3.1), while a real non-file scheme is still rejected.
+        let tricky = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "../weird://name"}]}"#;
+        let config = PackageConfig::parse(tricky).expect("ok");
+        assert!(!config.packages[0].is_absolute_uri());
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/p/.dart_tool/../weird://name")
+        );
+        let http = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "http://cache/a-1.0.0"}]}"#;
+        let config = PackageConfig::parse(http).expect("ok");
         assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
     }
 

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use dartq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
+use dartq_pub::{PackageConfig, PubError, ResolvedPackageGraph, normalize};
 use rustc_hash::FxHashMap;
 
 use crate::SourceCategory;
@@ -100,18 +100,19 @@ impl PackageTable {
     /// resolve to the same normalized root
     /// ([`crate::PackageError::DuplicateRoot`] — file→package attribution
     /// could not pick an owner). The walk's inclusive bound additionally
-    /// assumes the workspace root (the `config_dir` parent) is itself a
+    /// requires the workspace root (the `config_dir` parent) to be itself a
     /// config root — pub always writes the root package's `rootUri` so —
-    /// and a divergent hand-config violating that fails loudly via
-    /// `debug_assert` rather than mis-attributing the bound's own tree.
+    /// and a divergent hand-config violating that is rejected at build
+    /// rather than mis-attributing the bound's own tree.
     ///
     /// # Errors
     ///
     /// Returns [`crate::PackageError`] when the artifacts disagree (a config
     /// entry without a graph instance, the root or a workspace member
     /// without a config entry), when [`PackageConfig::resolve`] rejects the
-    /// config (duplicate names, grammar, subtree, relative dir), or when two
-    /// entries resolve to the same normalized root.
+    /// config (duplicate names, grammar, subtree, relative dir), when two
+    /// entries resolve to the same normalized root, or when the workspace
+    /// root is not one of the config roots.
     pub fn build(
         config: &PackageConfig,
         graph: &ResolvedPackageGraph,
@@ -206,13 +207,18 @@ impl PackageTable {
         // dot-segment `config_dir` would otherwise strand the bound
         // mid-chain while the roots resolved past it).
         let workspace_root = normalize(config_dir.parent().unwrap_or(config_dir));
-        debug_assert!(
-            by_root.contains_key(&workspace_root),
-            "workspace root `{}` must be one of the config roots: the \
-             attribution walk treats it as the inclusive bound and the \
-             root package's owner",
-            workspace_root.display()
-        );
+        // Pub always writes the root package's `rootUri` onto the
+        // `config_dir` parent, so the walk's inclusive bound is a config
+        // root; a hand-config diverging from that is rejected at build
+        // instead of mis-attributing the bound's own tree.
+        if !by_root.contains_key(&workspace_root) {
+            return Err(crate::PackageError::Pub(PubError::PackageConfig(format!(
+                "workspace root `{root}` must be one of the config roots: \
+                     the attribution walk treats it as the inclusive bound and \
+                     the root package's owner",
+                root = workspace_root.display()
+            ))));
+        }
 
         Ok(PackageTable {
             packages,
@@ -278,12 +284,16 @@ impl PackageTable {
     #[must_use]
     pub fn containing(&self, path: &Path) -> Option<&PackageIdentity> {
         let path = normalize(path);
-        // Structural file/directory class: the engine's face is per-file
-        // and file paths carry an extension, so such queries skip the
-        // memoization of the query itself; extension-less queries
-        // (directories — including the workspace root) are legitimate memo
-        // keys. Misclassification is harmless: a directory with an
-        // extension just costs a re-walk, never a wrong owner.
+        // Structural file/directory class. The supported query shape is
+        // per-file `.dart` attribution: file paths carry an extension, so
+        // such queries skip the memoization of the query itself;
+        // extension-less queries (directories — including the workspace
+        // root) are legitimate memo keys. Directory attribution is not a
+        // supported query shape: the class is purely structural, so a
+        // directory whose name carries an extension — including one that
+        // is itself an in-workspace config root — walks like a file (its
+        // own segment is skipped) and attributes to the enclosing package,
+        // never to itself.
         let file_query = path.extension().is_some();
         let mut memo = self
             .ancestor_memo
@@ -1116,20 +1126,30 @@ sdks:
         assert_eq!(table.memo_keys(), keys);
     }
 
-    /// The walk's inclusive bound assumes the workspace root (the config
-    /// dir's parent) is itself a config root — pub always writes the root
-    /// package's `rootUri` so. A divergent hand-config fails loudly in
-    /// debug builds instead of mis-attributing the bound's own tree.
+    /// The walk's inclusive bound requires the workspace root (the config
+    /// dir's parent) to be itself a config root — pub always writes the
+    /// root package's `rootUri` so. A divergent hand-config is a build
+    /// error in every profile, not a debug-only assert.
     #[test]
-    #[should_panic(expected = "must be one of the config roots")]
-    fn workspace_root_not_among_config_roots_fails_loudly() {
+    fn workspace_root_not_among_config_roots_is_an_error() {
         // The only entry roots at /proj/app; nothing owns /proj, the
         // walk's inclusive bound.
         let config = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../app"}]}"#,
         )
         .expect("valid config");
-        let _ = PackageTable::build(&config, &plain_graph(&config), Path::new("/proj/.dart_tool"));
+        let error = PackageTable::build(
+            &config,
+            &plain_graph(&config),
+            Path::new("/proj/.dart_tool"),
+        )
+        .expect_err("workspace root not a config root");
+        assert!(
+            error
+                .to_string()
+                .contains("must be one of the config roots"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
