@@ -1,7 +1,7 @@
 //! The query surface of a loaded [`SdkSnapshot`]: target tables, `dart:` URI
 //! resolution, and conditional-import support values.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::metadata::{SdkSnapshot, TargetLibraries};
 
@@ -30,7 +30,10 @@ impl SdkSnapshot {
     /// (`<root>/lib/core/core.dart`) and `"dart:core/bool.dart"` to the part
     /// file joined relative to the library's directory — the analyzer's
     /// `mapDartUri` consumption surface
-    /// (`pkg/analyzer/lib/src/dart/sdk/sdk.dart`). Resolution is purely
+    /// (`pkg/analyzer/lib/src/dart/sdk/sdk.dart`). Part joins mirror the
+    /// analyzer's string concat, so an absolute-shaped part
+    /// (`dart:core//etc/x`) lands *under* the library directory instead of
+    /// re-anchoring the path. Resolution is purely
     /// metadata-level: the returned path need not exist yet (the content
     /// layer reads and hashes it on demand).
     ///
@@ -71,7 +74,23 @@ impl SdkSnapshot {
         let library_file = lib_root.join(&library.uri);
         Ok(match part {
             "" => library_file,
-            part => library_file.parent().unwrap_or(&lib_root).join(part),
+            part => {
+                // The analyzer builds part paths by string concat
+                // (`'$prefix$relativePath'`, `pkg/analyzer/lib/src/dart/sdk/sdk.dart`),
+                // so a leading `/` in the part merely collapses into a double
+                // slash and the result always stays under the library
+                // directory. `Path::join` has no such tolerance — an absolute
+                // `part` would REPLACE the base — so absolute components
+                // (root/prefix) are dropped before joining, while `..`
+                // climbs stay exactly as the analyzer resolves them.
+                let relative = Path::new(part)
+                    .components()
+                    .skip_while(|component| {
+                        matches!(component, Component::RootDir | Component::Prefix(_))
+                    })
+                    .collect::<PathBuf>();
+                library_file.parent().unwrap_or(&lib_root).join(relative)
+            }
         })
     }
 

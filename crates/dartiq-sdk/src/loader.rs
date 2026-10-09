@@ -381,6 +381,10 @@ fn resolve_segment(
 /// → list, conditional-import default `true` and forced `false` for
 /// `_`-prefixed names, direct-import default `always`.
 fn convert_library(name: &str, raw: &RawLibrary) -> Result<SdkLibrary, String> {
+    check_uri_scheme("uri", name, &raw.uri)?;
+    for patch in &raw.patches.0 {
+        check_uri_scheme("patches", name, patch)?;
+    }
     let support_direct_import = match &raw.support_direct_import {
         Some(value) => Importability::from_spec(value)?,
         None => Importability::Always,
@@ -392,6 +396,30 @@ fn convert_library(name: &str, raw: &RawLibrary) -> Result<SdkLibrary, String> {
             && !name.starts_with('_'),
         support_direct_import,
     })
+}
+
+/// The official `checkAndResolve` scheme gate
+/// (libraries_specification.dart:300-317): a `uri`/`patches` value is either
+/// scheme-less (a path relative to the SDK `lib/` root) or a `file:` URI;
+/// any other scheme is a parse-time hard error, never a silently
+/// mis-resolved path. Scheme detection mirrors Dart's `Uri.parse`: an
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"` prefix; anything else
+/// before the first `:` is not a scheme at all.
+fn check_uri_scheme(field: &str, library: &str, value: &str) -> Result<(), String> {
+    let Some(scheme) = value.find(':').map(|colon| &value[..colon]) else {
+        return Ok(());
+    };
+    let has_scheme = scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'));
+    if has_scheme && !scheme.eq_ignore_ascii_case("file") {
+        return Err(format!(
+            "unsupported URI scheme `{scheme}:` in `{field}` of library `{library}`: \
+             only scheme-less paths and `file:` URIs are supported"
+        ));
+    }
+    Ok(())
 }
 
 // --- allowed_experiments.json ---

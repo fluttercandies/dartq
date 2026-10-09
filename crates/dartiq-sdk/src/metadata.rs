@@ -86,8 +86,11 @@ impl SdkLibraries {
     /// `libraries.json` has no such segment (segment sets drift across
     /// versions, so they are addressed by name — `vm`, `dart2js`,
     /// `dartdevc`, the wasm family — never by a hardcoded enumeration).
+    ///
+    /// Crate-internal: the public lookup is
+    /// [`SdkSnapshot::target`](crate::SdkSnapshot::target).
     #[must_use]
-    pub fn get(&self, segment: &str) -> Option<&TargetLibraries> {
+    pub(crate) fn get(&self, segment: &str) -> Option<&TargetLibraries> {
         self.targets.get(segment)
     }
 }

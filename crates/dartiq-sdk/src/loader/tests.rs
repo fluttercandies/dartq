@@ -182,6 +182,38 @@ fn library_entry_errors_are_hard() {
 }
 
 #[test]
+fn unsupported_uri_schemes_are_rejected() {
+    // The official `checkAndResolve` (libraries_specification.dart:300-317)
+    // rejects any non-`file` scheme at parse time — for `uri` and patches
+    // alike.
+    let err = parse_libraries_json(
+        r#"{"t": {"libraries": {"x": {"uri": "http://evil.example/x.dart"}}}}"#,
+    )
+    .expect_err("http uri");
+    assert!(err.contains("unsupported URI scheme `http:`"), "`{err}`");
+    assert!(err.contains("`uri`") && err.contains("`x`"), "`{err}`");
+
+    let err = parse_libraries_json(
+        r#"{"t": {"libraries": {"x": {"uri": "x.dart", "patches": "gopher://p.dart"}}}}"#,
+    )
+    .expect_err("gopher patch");
+    assert!(err.contains("unsupported URI scheme `gopher:`"), "`{err}`");
+    assert!(err.contains("`patches`"), "`{err}`");
+
+    // Scheme-less paths and `file:` URIs pass the gate untouched.
+    let libraries = parse_libraries_json(
+        r#"{"t": {"libraries": {
+                "x": {"uri": "x.dart", "patches": ["file:patched.dart"]}
+            }}}"#,
+    )
+    .expect("scheme-less and `file:` values pass");
+    assert_eq!(
+        libraries.targets["t"].libraries["x"].patches,
+        vec!["file:patched.dart".to_owned()]
+    );
+}
+
+#[test]
 fn unknown_keys_are_tolerated() {
     let libraries = parse_libraries_json(
         r#"{

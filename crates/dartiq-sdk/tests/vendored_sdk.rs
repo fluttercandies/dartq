@@ -30,9 +30,11 @@ fn loads_vendored_metadata_with_pinned_identity() {
     );
     assert_eq!(sdk.language_metadata, LanguageVersion::new(3, 13));
 
-    // Exactly the segments written to the file: `comment:*` keys and the
-    // real file's `_example_libraries` doc key never become segments
-    // (BTreeMap iterates in sorted key order).
+    // Exactly the segments written to the file: the `comment:*` generation
+    // keys never become segments (BTreeMap iterates in sorted key order).
+    // (The real file's `_example_libraries` doc key is not a libraries.json
+    // key at all — it lives under `sdk.` in allowed_experiments.json, whose
+    // parser correctly ignores it.)
     let targets = &sdk.sdk_libraries.targets;
     assert_eq!(
         targets.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -66,6 +68,28 @@ fn uri_resolution_is_pinned() {
         sdk.uri_to_path("vm", "dart:core/int.dart")
             .expect("core part"),
         lib.join("core/int.dart")
+    );
+    // Absolute-shaped parts mirror the analyzer's string concat: the
+    // leading `/` collapses into a double slash instead of re-anchoring the
+    // join (`Path::join` with an absolute part would REPLACE the base and
+    // escape the SDK).
+    assert_eq!(
+        sdk.uri_to_path("vm", "dart:core//etc/passwd")
+            .expect("absolute-shaped part"),
+        lib.join("core/etc/passwd")
+    );
+    // An all-anchor part lands at the library root, never at `/`.
+    assert_eq!(
+        sdk.uri_to_path("vm", "dart:core//")
+            .expect("bare-slash part"),
+        lib.join("core")
+    );
+    // `..` climbs stay analyzer-equivalent: concat keeps them, so
+    // `<lib>/core/../io/io.dart` is the returned shape.
+    assert_eq!(
+        sdk.uri_to_path("vm", "dart:core/../io/io.dart")
+            .expect("parent-climbing part"),
+        lib.join("core/../io/io.dart")
     );
     // dart:_internal's uri differs from its name.
     assert_eq!(

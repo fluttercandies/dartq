@@ -238,6 +238,30 @@ fn identity_is_canonical_over_parsed_content() {
     );
     let sdk_c = third.load();
     assert_ne!(sdk_a.id, sdk_c.id, "semantic content change forks the id");
+
+    // Flipping a support gate is a semantic change too: the id forks.
+    let fourth = TempTree::new(&standard_files());
+    fourth.rewrite(
+        "dart-sdk/lib/libraries.json",
+        &LIBRARIES_JSON.replace(
+            r#""support_direct_import": "with_flag""#,
+            r#""support_direct_import": "never""#,
+        ),
+    );
+    let sdk_d = fourth.load();
+    assert_ne!(sdk_a.id, sdk_d.id, "support-gate change forks the id");
+
+    // A version-annotation-only change (`3.13.1` vs `3.13.1 (stable)`)
+    // forks the id via SnapshotFingerprint.dart_version while the derived
+    // language version stays 3.13.
+    let fifth = TempTree::new(&standard_files());
+    fifth.rewrite("dart-sdk/version", "3.13.1 (stable)\n");
+    let sdk_e = fifth.load();
+    assert_eq!(sdk_e.language_metadata, sdk_a.language_metadata);
+    assert_ne!(
+        sdk_a.id, sdk_e.id,
+        "the declared version text participates in the id"
+    );
 }
 
 #[test]
