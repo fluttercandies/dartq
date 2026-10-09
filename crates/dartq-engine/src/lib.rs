@@ -23,7 +23,9 @@
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
 //! (analyze), `event`, `cancel`, `query` (the `query symbol` face, PRD
 //! §20.3), `semdiag` (the default semantic diagnoser, #236),
-//! `analysis_options` (the merged per-root options, PRD §12).
+//! `analysis_options` (the merged per-root options, PRD §12), `context` +
+//! `scheduler` (the multi-context runtime substrate — contexts, overlays,
+//! scheduling, cancellation — PRD §16).
 //!
 //! # The semantic diagnostics seam (#120/#121)
 //!
@@ -38,10 +40,12 @@
 
 pub mod analysis_options;
 pub mod cancel;
+pub mod context;
 pub mod event;
 pub mod l1;
 pub mod pipeline;
 pub mod query;
+pub mod scheduler;
 pub mod semdiag;
 pub mod state;
 
@@ -57,8 +61,10 @@ use rustc_hash::FxHashMap;
 use thiserror::Error;
 
 pub use cancel::{CancellationToken, Cancelled};
+pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
 pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
+pub use scheduler::{DrainReport, Task};
 pub use state::{DirectiveFacts, DirectiveKind, LibraryId, UnitFacts};
 
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
@@ -94,6 +100,10 @@ pub enum EngineError {
     /// incremental-l1-spec §1.2: dartq reports explicitly).
     #[error("unknown path: {0}")]
     UnknownPath(PathBuf),
+    /// Runtime addressing of a context that is not open: never opened,
+    /// already closed, or a recycled id.
+    #[error("unknown context: {0}")]
+    UnknownContext(ContextId),
     /// The pub package config cannot back the URI-resolution table
     /// (dartq-pub's shared `resolve` face rejected it: a broken `rootUri`,
     /// duplicate names, a name outside the reader grammar, or a
@@ -528,7 +538,7 @@ pub fn memory_store() -> Box<dyn SourceStore + Send + Sync> {
 /// Before-BOM state machine via the analyzer file read): the scanner runs on
 /// BOM-less text and every span is relative to the stripped text. Exactly
 /// one is dropped; a second BOM is content.
-fn strip_one_bom(bytes: &[u8]) -> &[u8] {
+pub(crate) fn strip_one_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 

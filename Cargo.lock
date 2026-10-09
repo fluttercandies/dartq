@@ -176,6 +176,13 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "dartq-ai"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "dartq-index",
+ "dartq-source",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "dartq-ast"
@@ -195,9 +202,11 @@ name = "dartq-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dartq-ai",
  "dartq-daemon",
  "dartq-diagnostics",
  "dartq-engine",
+ "dartq-index",
  "dartq-language",
  "dartq-package",
  "dartq-parser",
@@ -239,6 +248,7 @@ dependencies = [
 name = "dartq-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "dartq-diagnostics",
  "dartq-index",
  "dartq-language",
@@ -252,6 +262,7 @@ dependencies = [
  "dartq-source",
  "rayon",
  "rustc-hash",
+ "serde_yaml",
  "thiserror",
 ]
 
@@ -326,6 +337,12 @@ dependencies = [
 [[package]]
 name = "dartq-plugin"
 version = "0.1.0"
+dependencies = [
+ "memchr",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "dartq-pub"
@@ -385,6 +402,7 @@ dependencies = [
  "dartq-resolution",
  "dartq-scanner",
  "dartq-source",
+ "dartq-types",
  "rustc-hash",
 ]
 
