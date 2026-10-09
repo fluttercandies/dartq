@@ -17,6 +17,9 @@ impl DartqDriver {
     /// Template looks like `cargo run -q -p dartq-cli -- check --format=machine`.
     /// Split on whitespace into argv (spaces inside paths do not break argv: `{dir}` replacement happens after splitting).
     /// If any argument contains the `{dir}` placeholder it is replaced with the corpus directory; otherwise the corpus directory is appended as the last argument.
+    /// Adding `--no-fatal-warnings` makes both sides exit {0, 3} symmetrically
+    /// (warnings no longer fatal; diagnostic output is unaffected — the oracle
+    /// side already runs with it, see [`crate::oracle::OracleDriver`]).
     pub(crate) fn from_template(template: &str) -> Self {
         let mut parts = template.split_whitespace().map(str::to_owned);
         let program = parts.next().unwrap_or_default();
@@ -113,18 +116,31 @@ mod tests {
         assert!(err.contains("Some(4)"), "error: {err}");
     }
 
-    /// Exit 2 on the dartq side is a usage error of the dartq CLI itself
-    /// (e.g. a malformed `--dartq-cmd` template): folding it into
-    /// "valid + empty output" would score a meaningless Jaccard 0, so it is a
-    /// harness error like 4/64.
+    /// Exit 2 on the dartq side is the warnings tier (dartdev
+    /// analyze.dart:719–733 `_Result`: 0 success / 1 infos / 2 warnings /
+    /// 3 errors), not a usage error: `check` exits 2 on any warning under
+    /// default flags, and that is a measurement — diagnostics ride stdout.
     #[test]
-    fn usage_exit_2_is_harness_error() {
+    fn warnings_exit_2_is_a_valid_measurement() {
         let driver =
             DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 2".into()]);
+        let diags = driver
+            .analyze(Path::new("/tmp"), OutputFormat::Machine)
+            .expect("exit 2 is the warnings tier, not a usage error");
+        assert!(diags.is_empty(), "empty stdout parses to an empty set");
+    }
+
+    /// 64 stays the usage tier on the dartq side too (dartdev.dart:210
+    /// `EX_USAGE`): a malformed `--dartq-cmd` template would otherwise fold
+    /// into "valid + empty output" and score a meaningless Jaccard 0.
+    #[test]
+    fn usage_exit_64_is_harness_error() {
+        let driver =
+            DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 64".into()]);
         let err = driver
             .analyze(Path::new("/tmp"), OutputFormat::Machine)
-            .expect_err("usage exit 2 must error, not pass as an empty measurement");
-        assert!(err.contains("Some(2)"), "error: {err}");
-        assert!(err.contains("usage"), "error names the exit tier: {err}");
+            .expect_err("usage exit 64 must error, not pass as an empty measurement");
+        assert!(err.contains("Some(64)"), "error: {err}");
+        assert!(err.contains("valid: 0-3"), "error names the valid set: {err}");
     }
 }

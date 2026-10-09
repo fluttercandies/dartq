@@ -111,6 +111,9 @@ enum Command {
 struct CheckArgs {
     #[arg(long, value_enum, default_value_t = CheckFormat::Machine)]
     format: CheckFormat,
+    /// Write one metrics JSON object to PATH at exit (engine-api-spec §3).
+    #[arg(long)]
+    metrics_json: Option<PathBuf>,
     /// On by default (`--no-fatal-warnings` clears it) — mirrors the oracle.
     #[arg(long)]
     no_fatal_warnings: bool,
@@ -175,6 +178,7 @@ fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) 
         .unwrap_or(exit::CLEAN)
 }
 
+#[derive(Debug)]
 enum DiscoverError {
     /// Path argument does not exist → usage error (64), oracle wording.
     Missing(String),
@@ -183,9 +187,12 @@ enum DiscoverError {
 }
 
 /// Canonical, sorted, deduplicated `.dart` file set under `paths`. A file
-/// argument is taken as-is; a directory argument is walked recursively,
-/// skipping dot-directories and build/system directories, and never
-/// descending through symlinked directories (cycle safety).
+/// argument is taken as-is (top-level `fs::metadata` follows links); a
+/// directory argument is walked recursively, skipping dot-directories and
+/// build/system directories. Symlinked directories are never descended into
+/// (cycle safety); symlinked `.dart` files are included — the walk stats the
+/// link target and accepts regular files, matching the oracle's walk, which
+/// analyzes linked files too.
 fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
     fn walk(dir: &Path, files: &mut BTreeSet<PathBuf>) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
@@ -199,7 +206,17 @@ fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
                     continue;
                 }
                 walk(&path, files)?;
-            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "dart") {
+            } else if path.extension().is_some_and(|ext| ext == "dart")
+                // `entry.file_type()` reports link-host facts (it does not
+                // follow symlinks): a symlinked `.dart` file is neither
+                // `is_dir` nor `is_file` there, yet the oracle analyzes it —
+                // stat the target (`fs::metadata` follows the link); a
+                // dangling link has no target and is skipped. Regular files
+                // take the cached-type path without a syscall.
+                && (file_type.is_file()
+                    || (file_type.is_symlink()
+                        && fs::metadata(&path).is_ok_and(|meta| meta.is_file())))
+            {
                 files.insert(path);
             }
         }
@@ -220,6 +237,8 @@ fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
 }
 
 fn check(args: &CheckArgs) -> u8 {
+    let started = Instant::now();
+    let discovery_at = Instant::now();
     let files = match discover(&args.paths) {
         Ok(files) => files,
         Err(DiscoverError::Missing(path)) => {
@@ -231,12 +250,14 @@ fn check(args: &CheckArgs) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
+    let discovery_ms = elapsed_ms(discovery_at.elapsed());
 
     // Analysis runs under the crash tier (engine-api-spec §4.2: internal
     // failure → 4, the oracle `_Result.crash(4)` analog): a panic anywhere in
     // the pipeline aborts the run with stderr kept from the panic hook and
     // stdout kept empty — a partial diagnostic set must never masquerade as a
     // valid {0,1,2,3} result.
+    let analyze_at = Instant::now();
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut files_state = FileSet::default();
         let mut diags = Vec::new();
@@ -258,6 +279,7 @@ fn check(args: &CheckArgs) -> u8 {
         });
         Ok::<_, io::Error>((files_state, diags))
     }));
+    let analyze_ms = elapsed_ms(analyze_at.elapsed());
     let (files_state, diags) = match analyzed {
         Ok(Ok(analyzed)) => analyzed,
         Ok(Err(error)) => {
@@ -284,6 +306,33 @@ fn check(args: &CheckArgs) -> u8 {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
     }
+
+    if let Some(metrics_path) = &args.metrics_json {
+        // LOC counts newline bytes — the engine discovery convention, one
+        // pass, no line splitting.
+        let loc: u64 = files_state
+            .sources
+            .iter()
+            .map(|source| source.bytes().filter(|&b| b == b'\n').count() as u64)
+            .sum();
+        let metrics = RunMetrics {
+            files: files.len(),
+            loc,
+            diagnostics: diags.len(),
+            discovery_ms,
+            analyze_ms,
+            total_ms: elapsed_ms(started.elapsed()),
+            // No engine libraries on the check face; the counters exist to
+            // keep the JSON shape identical to `analyze`.
+            libraries_analyzed: 0,
+            libraries_from_cache: 0,
+            max_rss_bytes: max_rss_bytes(),
+        };
+        if let Err(error) = write_metrics(metrics_path, &metrics) {
+            eprintln!("dartq: internal error: writing metrics failed: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    }
     severity_exit(&diags, !args.no_fatal_warnings, args.fatal_infos)
 }
 
@@ -291,9 +340,11 @@ fn check(args: &CheckArgs) -> u8 {
 // dartq analyze — the M1 engine face
 // ---------------------------------------------------------------------------
 
-/// Numbers one analyze run collected for `--metrics-json` (engine-api-spec
-/// §3; the struct belongs to the CLI, the engine contributes only numbers
-/// via `DiscoveryStats` and `LibraryAnalyzed` events).
+/// Numbers one CLI run collected for `--metrics-json` (engine-api-spec §3;
+/// the struct belongs to the CLI). `analyze` fills discovery/library numbers
+/// from `DiscoveryStats` and `LibraryAnalyzed` events; `check` reports its
+/// own walk/parse phases and zero library counters — the JSON shape is
+/// identical because the §4.1 grammar pins `--metrics-json` on both faces.
 struct RunMetrics {
     files: usize,
     loc: u64,
@@ -585,6 +636,8 @@ fn write_human(
 }
 
 /// One JSON object at exit (engine-api-spec §3, benchmark-harness-spec §2.4).
+/// A failed write is an internal error (4) at the call site, never silent —
+/// a run without its metrics file would corrupt benchmark data.
 fn write_metrics(path: &Path, metrics: &RunMetrics) -> io::Result<()> {
     let mut file = fs::File::create(path)?;
     writeln!(file, "{}", metrics.json())
@@ -805,12 +858,15 @@ mod tests {
         let check = check_args(&[
             "check",
             "--format=json",
+            "--metrics-json",
+            "/tmp/m.json",
             "--no-fatal-warnings",
             "--fatal-infos",
             "/tmp/a",
             "/tmp/b",
         ]);
         assert!(matches!(check.format, CheckFormat::Json));
+        assert_eq!(check.metrics_json, Some(PathBuf::from("/tmp/m.json")));
         assert!(check.no_fatal_warnings);
         assert!(check.fatal_infos);
         assert_eq!(
@@ -836,6 +892,7 @@ mod tests {
             &["analyze"][..],
             &["analyze", "--format", "json", "/p"][..],
             &["analyze", "--metrics-json"][..],
+            &["check", "--metrics-json"][..],
         ] {
             assert!(parse_args_of(args).is_err(), "must reject {args:?}");
         }
@@ -997,6 +1054,7 @@ mod tests {
 
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            metrics_json: None,
             no_fatal_warnings: false,
             fatal_infos: false,
             paths: vec![root.clone()],
@@ -1060,6 +1118,7 @@ mod tests {
 
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            metrics_json: None,
             no_fatal_warnings: false,
             fatal_infos: false,
             paths: vec![root.clone()],
@@ -1080,6 +1139,71 @@ mod tests {
             ..clean_args
         };
         assert_eq!(check(&missing), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `--metrics-json` writes the analyze-shaped JSON at exit (spec §4.1
+    /// pins the flag in the check grammar); the library counters stay at zero
+    /// because the check face has no engine libraries.
+    #[test]
+    fn check_writes_metrics_json() {
+        let root = std::env::temp_dir().join(format!("dq_cli_metrics_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("a.dart"), "void f() { x }\n").expect("write");
+
+        let metrics_path = root.join("metrics.json");
+        let args = CheckArgs {
+            format: CheckFormat::Machine,
+            metrics_json: Some(metrics_path.clone()),
+            no_fatal_warnings: false,
+            fatal_infos: false,
+            paths: vec![root.clone()],
+        };
+        assert_eq!(check(&args), exit::ERRORS);
+
+        let metrics: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&metrics_path).expect("metrics at exit"))
+                .expect("one JSON object");
+        assert_eq!(metrics["files"], 1);
+        assert_eq!(metrics["loc"], 1);
+        assert_eq!(metrics["diagnostics"], 1);
+        assert_eq!(metrics["libraries_analyzed"], 0);
+        assert_eq!(metrics["libraries_from_cache"], 0);
+        assert!(metrics["max_rss_bytes"].is_u64());
+        assert!(metrics["discovery_ms"].is_u64());
+        assert!(metrics["analyze_ms"].is_u64());
+        assert!(metrics["total_ms"].is_u64());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The walk's symlink rule, both halves: a symlinked `.dart` file is
+    /// analyzed (its target stats as a regular file — the oracle's walk
+    /// includes linked files, and skipping them would flood the differential
+    /// gate with phantom oracle-only entries), while a symlinked directory is
+    /// never descended into (cycle safety) — `real.dart` must be found once
+    /// through `real/`, not a second time through `linked_dir/`. A dangling
+    /// link has no target and is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn discover_includes_symlinked_files_not_symlinked_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("dq_cli_symlink_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real")).expect("mkdir");
+        fs::write(root.join("real/real.dart"), "var a = 1;\n").expect("write");
+        symlink(root.join("real/real.dart"), root.join("link.dart")).expect("file link");
+        symlink(root.join("real"), root.join("linked_dir")).expect("dir link");
+        symlink(root.join("gone.dart"), root.join("dangling.dart")).expect("dangling link");
+
+        let files = discover(std::slice::from_ref(&root)).expect("discover");
+        assert_eq!(
+            files,
+            BTreeSet::from([root.join("link.dart"), root.join("real/real.dart")]),
+            "linked file in, linked dir not descended into, dangling link skipped"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

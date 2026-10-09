@@ -57,24 +57,23 @@ impl DriverSide {
         }
     }
 
-    /// Exit codes that count as a measurement result. Oracle (facts §3):
-    /// {0,1,2,3} are valid; 4 = crash, 64 = usage error. The dartq CLI uses
-    /// 2 for usage errors of its own (e.g. a malformed `--dartq-cmd`
-    /// template): folding exit 2 into "valid + empty output" would score a
-    /// meaningless Jaccard 0, so it fails the run up front like 4/64. The e2e
-    /// self-check pins dart analyze to exits {0,3} via `--no-fatal-warnings`
-    /// (facts §7.9), so the stricter dartq contract cannot misfire there.
+    /// Exit codes that count as a measurement result. Both sides implement
+    /// the dartdev `analyze` tiers (analyze.dart:719–733 `_Result`: 0 success
+    /// / 1 infos / 2 warnings / 3 errors / 4 crash; usage exit 64 =
+    /// dartdev.dart:210 `EX_USAGE`): {0,1,2,3} carry a diagnostic set on
+    /// stdout and are valid Jaccard inputs — dartq `check` exits 2 on any
+    /// warning under default flags, exactly like the oracle. 4 and 64 are
+    /// harness-own failures: folding them into "valid + empty output" would
+    /// score a meaningless Jaccard 0.
     fn valid_exit(self, code: i32) -> bool {
         match self {
-            Self::Oracle => (0..=3).contains(&code),
-            Self::Dartq => matches!(code, 0 | 1 | 3),
+            Self::Oracle | Self::Dartq => (0..=3).contains(&code),
         }
     }
 
     fn valid_exits_desc(self) -> &'static str {
         match self {
-            Self::Oracle => "0-3",
-            Self::Dartq => "0, 1, 3 (2 = usage error)",
+            Self::Oracle | Self::Dartq => "0-3",
         }
     }
 }
