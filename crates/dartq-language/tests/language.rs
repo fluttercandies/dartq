@@ -58,7 +58,7 @@ fn language_version_parse_error_message() {
     let err = "nope".parse::<LanguageVersion>().unwrap_err();
     assert_eq!(
         err.to_string(),
-        "invalid Dart language version `nope`: expected `<major>.<minor>`"
+        "invalid Dart language version `nope`: expected `<major>.<minor>` or `<major>.<minor>.<patch>`"
     );
 }
 

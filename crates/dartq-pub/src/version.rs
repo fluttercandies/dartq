@@ -569,39 +569,6 @@ impl serde::Serialize for LanguageVersion {
     }
 }
 
-/// dartq's language version inference chain (PRD §8.3 levels 1-4), highest
-/// priority first:
-///
-/// 1. `explicit` — the library's `// @dart = X.Y` override. The window scan
-///    (last explicit comment wins) lives on the scanner/parser side, which
-///    passes the parsed value here; the ceiling check
-///    (`language_version_too_high_explicit`) is a parser diagnostic, so no
-///    clamping happens in this crate.
-/// 2. `config_version` — the `package_config.json` `languageVersion` field.
-/// 3. `sdk_constraint` — the pubspec sdk constraint's lower bound.
-/// 4. [`LanguageVersion::SDK_DEFAULT`] (3.15).
-///
-/// Note the deliberate difference from [`LanguageVersion::from_sdk_constraint`]:
-/// a constraint without a lower bound yields *no* value here, so the chain
-/// falls through to the SDK default. pub's own 2.7 fallback exists only in
-/// its legacy direct-API path and modern pub rejects bound-less roots
-/// outright (facts §5).
-#[must_use]
-pub fn infer_language_version(
-    explicit: Option<LanguageVersion>,
-    config_version: Option<LanguageVersion>,
-    sdk_constraint: Option<&VersionConstraint>,
-) -> LanguageVersion {
-    explicit
-        .or(config_version)
-        .or_else(|| {
-            sdk_constraint
-                .and_then(VersionConstraint::lower_bound)
-                .map(LanguageVersion::of_version)
-        })
-        .unwrap_or(LanguageVersion::SDK_DEFAULT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,35 +793,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inference_chain_per_prd_8_3() {
-        use LanguageVersion as Lv;
-        let constraint = c("^3.5.0");
-        // L1: an explicit `// @dart` override (parsed scanner-side) wins.
-        assert_eq!(
-            infer_language_version(Some(Lv::new(2, 12)), Some(Lv::new(3, 4)), Some(&constraint)),
-            Lv::new(2, 12)
-        );
-        // L2: package_config field wins absent an override.
-        assert_eq!(
-            infer_language_version(None, Some(Lv::new(3, 4)), Some(&constraint)),
-            Lv::new(3, 4)
-        );
-        // L3: pubspec lower bound when the config lacks the field.
-        assert_eq!(
-            infer_language_version(None, None, Some(&constraint)),
-            Lv::new(3, 5)
-        );
-        // L4: no lower bound anywhere -> SDK default 3.15 (not pub's 2.7).
-        assert_eq!(
-            infer_language_version(None, None, Some(&c("any"))),
-            Lv::SDK_DEFAULT
-        );
-        assert_eq!(infer_language_version(None, None, None), Lv::SDK_DEFAULT);
-        // The chain bottom is dartq-language's constant, not a local copy.
-        assert_eq!(
-            LanguageVersion::SDK_DEFAULT.into_inner(),
-            dartq_language::DEFAULT_LANGUAGE_VERSION
-        );
-    }
 }

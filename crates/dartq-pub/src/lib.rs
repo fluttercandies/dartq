@@ -7,7 +7,7 @@
 //! `docs/facts/pub-formats.md`, which cites `.third/pub` line-by-line.
 //!
 //! Module map:
-//! - [`version`] module — pub_semver subset and language version inference (§5)
+//! - [`version`] module — pub_semver subset and language versions (§5)
 //! - [`config`] module — `package_config.json` (§1)
 //! - [`pubspec`] module — pubspec consumption field set (§2)
 //! - [`lock`] module — `pubspec.lock` with the four source shapes (§3)
@@ -39,7 +39,7 @@ pub use graph::{
 pub use lock::{DependencyKind, LockDescription, LockFile, LockedPackage, SourceKind};
 pub use pubspec::{DependencySpec, Environment, Pubspec, Resolution};
 pub use version::{
-    LanguageVersion, Version, VersionConstraint, VersionRange, infer_language_version,
+    LanguageVersion, Version, VersionConstraint, VersionRange,
 };
 pub use workspace::{WorkspaceLayout, find_workspace_root, normalize, workspace_ref_mismatches};
 

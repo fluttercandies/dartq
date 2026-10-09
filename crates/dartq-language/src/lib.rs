@@ -146,7 +146,7 @@ impl fmt::Display for LanguageVersion {
 
 /// Error returned when a string cannot be parsed as a [`LanguageVersion`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
-#[error("invalid Dart language version `{received}`: expected `<major>.<minor>`")]
+#[error("invalid Dart language version `{received}`: expected `<major>.<minor>` or `<major>.<minor>.<patch>`")]
 pub struct LanguageVersionParseError {
     received: String,
 }
