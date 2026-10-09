@@ -57,7 +57,16 @@ pub enum TypeInfo {
     Complex(ComplexType),
 }
 
-impl TypeInfo {}
+impl TypeInfo {
+    /// Whether the shape's last token is a `?` (official
+    /// `TypeInfo.isNullable`, `type_info.dart`).
+    pub(crate) fn is_nullable(&self) -> bool {
+        match self {
+            TypeInfo::SimpleNullable | TypeInfo::SimpleWith1Arg { nullable: true } => true,
+            _ => false,
+        }
+    }
+}
 
 /// `ComplexTypeInfo` (`type_info_impl.dart:526`). Ids are captured at compute
 /// time; `end` is the last token of the type.
@@ -67,6 +76,11 @@ pub struct ComplexType {
     pub(crate) type_args: TypeParamOrArg,
     pub(crate) before_question: Option<TokenId>,
     pub(crate) end: TokenId,
+    /// `end` names a raw compound closer (`>=`/`>>`/...) whose *leading*
+    /// `>` closed the group (the official parser splits it there,
+    /// `splitCloser`, `type_info_impl.dart:1772): the successor reads the
+    /// split remainder, never a real token.
+    pub(crate) end_raw_compound: bool,
     /// `Function` tokens seen during analysis, in source order.
     pub(crate) type_variable_starters: Vec<TokenId>,
     /// `Some(_)` for a generalized function type; `Some(false)` when there
@@ -112,6 +126,15 @@ pub(crate) fn is_closer(kind: TokenKind) -> bool {
             | TokenKind::GtGtEq
             | TokenKind::GtGtGtEq
     )
+}
+
+/// A closer holding more than one `>` (`>=`, `>>`, ...). The official parser
+/// splits these so the group's own closer is the leading `>` and the
+/// remainder follows it (`splitCloser`, `type_info_impl.dart:1772`); at
+/// compute time ours stays whole, so probes after such a token must read the
+/// remainder instead of the real successor.
+pub(crate) fn is_compound_closer(kind: TokenKind) -> bool {
+    is_closer(kind) && kind != TokenKind::Gt
 }
 
 /// `isVariance` (`type_info_impl.dart:1746`).
@@ -233,9 +256,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
 
         if self.is_generalized_function_type_at(0) {
-            // `Function(...)` with no return type.
+            // `Function(...)` with no return type (computeNoTypeGFT,
+            // type_info_impl.dart:747): computeRest is anchored at
+            // beforeStart, one token before `Function`.
             let mut complex = self.complex_from_here(TypeParamOrArg::None);
-            complex.compute_rest(self, complex.start, required);
+            let from = complex.start.saturating_sub(1);
+            complex.compute_rest(self, from, required);
             if complex.gft_has_return_type.is_none() {
                 return if required {
                     TypeInfo::Simple
@@ -288,10 +314,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             let mut complex = self.complex_from_here(type_param);
             complex.compute_simple_with_type_args(self, required);
-            if !required
-                && complex.gft_has_return_type.is_none()
-                && !self.looks_like_name_or_block_at_id(complex.end + 1)
-            {
+            // Optional-position follower test (computeSimpleWithTypeArguments,
+            // type_info_impl.dart:1044-1046): for a raw compound closer the
+            // official successor is the split remainder, which is never a
+            // name, so the noType arm always fires.
+            let follower_nameish =
+                !complex.end_raw_compound && self.looks_like_name_or_block_at_id(complex.end + 1);
+            if !required && complex.gft_has_return_type.is_none() && !follower_nameish {
                 return TypeInfo::NoType;
             }
             return TypeInfo::Complex(complex);
@@ -359,7 +388,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     fn compute_prefixed_shape(&mut self, required: bool, in_declaration: bool) -> TypeInfo {
         let cont = self.cursor.peek_kind_ahead(2);
         if is_valid_non_record_type_reference(cont, self.cursor.peek_kind_ahead(3)) {
-            let type_param = self.compute_type_param_or_arg_at(2, in_declaration);
+            // The group is computed at the continuation token
+            // (type_info.dart:319 computes at `next` after two steps), so
+            // the `<` sits at cursor+3.
+            let type_param = self.compute_type_param_or_arg_at(3, in_declaration);
             if matches!(type_param, TypeParamOrArg::None) {
                 // Fast decision on what follows the continuation.
                 let mut follower = 3;
@@ -415,6 +447,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if required || (!compound && self.looks_like_name_at_id(skip_end + 1)) {
                     let mut complex = self.complex_from_here(type_param);
                     complex.end = skip_end;
+                    complex.end_raw_compound = complex.type_args.ends_on_raw_compound();
                     complex.compute_rest(self, skip_end, required);
                     complex.recovered = true;
                     return TypeInfo::Complex(complex);
@@ -455,6 +488,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let skip_end = type_param.skip(self.peek_id());
                 let mut complex = self.complex_from_here(type_param);
                 complex.end = skip_end;
+                complex.end_raw_compound = complex.type_args.ends_on_raw_compound();
                 complex.compute_rest(self, complex.end, required);
                 complex.recovered = true;
                 return TypeInfo::Complex(complex);
@@ -486,16 +520,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.compute_type(true, false)
     }
 
-    /// `ComplexTypeInfo(beforeStart, typeArguments)` with `start` one token
-    /// ahead of the cursor.
+    /// `ComplexTypeInfo(beforeStart, typeArguments)` (`type_info_impl.dart:562`):
+    /// `start` = `beforeStart.next!` — the type's FIRST token, which is where
+    /// the cursor sits.
     fn complex_from_here(&self, type_args: TypeParamOrArg) -> ComplexType {
-        let start = self.real_id(self.cursor.real_pos() + 1);
+        let start = self.real_id(self.cursor.real_pos());
         let recovered = type_args.recovered();
         ComplexType {
             start,
             type_args,
             before_question: None,
             end: start,
+            end_raw_compound: false,
             type_variable_starters: Vec::new(),
             gft_has_return_type: None,
             is_record_type: false,

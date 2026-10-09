@@ -28,8 +28,14 @@ impl TypeInfo {
             TypeInfo::NoType => start.saturating_sub(1),
             TypeInfo::Void | TypeInfo::Simple => start,
             TypeInfo::SimpleNullable => start + 1,
-            TypeInfo::Prefixed | TypeInfo::SimpleWith1Arg { nullable: false } => start + 2,
-            TypeInfo::SimpleWith1Arg { nullable: true } => start + 3,
+            TypeInfo::Prefixed => start + 2,
+            // `id<id>`: `<`, the argument, then the closer (official
+            // `SimpleTypeWith1Argument.skipType` + `SimpleTypeArgument1.skip`,
+            // type_info_impl.dart:302/:1184); the nullable variant adds the
+            // `?` (:239). A compound closer still names the combined token —
+            // the position of the official split leading `>` (#135).
+            TypeInfo::SimpleWith1Arg { nullable: false } => start + 3,
+            TypeInfo::SimpleWith1Arg { nullable: true } => start + 4,
             TypeInfo::Complex(c) => c.end,
         }
     }
@@ -298,6 +304,13 @@ impl ComplexType {
         from: TokenId,
         required: bool,
     ) {
+        // A raw compound closer at `from` (splitCloser,
+        // type_info_impl.dart:1772): the group's own closer is the leading
+        // `>` and the official successor is the split remainder — never a
+        // `?` and never a `Function` intro (#168) — so the scan is a no-op.
+        if self.end_raw_compound {
+            return;
+        }
         let mut offset = parser.offset_of(from);
         if parser.kind_at(offset + 1) == TokenKind::Question {
             self.before_question = Some(parser.real_id(offset));
@@ -307,6 +320,9 @@ impl ComplexType {
         offset += 1;
         while parser.kind_at(offset) == TokenKind::Keyword(Keyword::Function) {
             let type_variable_start = parser.real_id(offset);
+            // Official: `token = computeTypeParamOrArg(token, true).skip(token);
+            // token = token.next!` — the probe lands ON the `(`, one step
+            // past the `Function` or its `<...>` group.
             let mut probe = offset + 1;
             if parser.kind_at(probe) == TokenKind::Lt {
                 match parser.cursor.table_matching_end(parser.real_id(probe)) {
@@ -314,7 +330,6 @@ impl ComplexType {
                     None => break,
                 }
             }
-            probe += 1;
             if parser.kind_at(probe) != TokenKind::OpenParen {
                 break; // Not a function type.
             }
@@ -358,6 +373,7 @@ impl ComplexType {
         required: bool,
     ) {
         self.end = self.type_args.skip(self.start);
+        self.end_raw_compound = self.type_args.ends_on_raw_compound();
         self.compute_rest(parser, self.end, required);
     }
 
@@ -378,6 +394,7 @@ impl ComplexType {
             offset += 1;
         }
         self.end = self.type_args.skip(parser.real_id(offset));
+        self.end_raw_compound = self.type_args.ends_on_raw_compound();
         self.compute_rest(parser, self.end, required);
     }
 

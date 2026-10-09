@@ -1,6 +1,9 @@
 //! Type annotation grammar tests.
 
 use super::collector::setup;
+use crate::parser::Parser;
+use crate::type_args::TypeParamOrArg;
+use crate::types::ComplexType;
 use crate::types::TypeInfo;
 
 #[test]
@@ -112,4 +115,186 @@ fn builtin_recovery_compound_closer_optional_is_no_type() {
     // entered in optional position.
     let info = compute_shape("required<B>=c d", false);
     assert!(matches!(info, TypeInfo::NoType));
+}
+
+// --- #178: type-compute defect cluster --------------------------------------
+
+/// Runs `compute_type` and returns the analyzed shape together with the
+/// parser (for lexeme/position assertions over the captured ids).
+fn compute_complex(
+    source: &'static str,
+    required: bool,
+) -> (
+    ComplexType,
+    Parser<'static, 'static, super::collector::Collector>,
+) {
+    let mut p = setup(source);
+    let info = p.compute_type(required, false);
+    match info {
+        TypeInfo::Complex(c) => (c, p),
+        other => panic!("{source:?}: expected complex type, got {other:?}"),
+    }
+}
+
+#[test]
+fn gft_with_return_type_binds() {
+    // Fixes A+B (computeRest probe; complex_from_here): the probe must land
+    // ON the `(` one step past `Function` (type_info_impl.dart:1110-1113)
+    // and `start` is the type's first token (:562-564), so `void Function()`
+    // and `int Function()` compute as generalized function types instead of
+    // bare void/simple.
+    for source in ["void Function() f;", "int Function() f;"] {
+        let (c, p) = compute_complex(source, true);
+        assert_eq!(c.gft_has_return_type, Some(true), "{source:?}");
+        assert_eq!(c.type_variable_starters.len(), 1, "{source:?}");
+        assert_eq!(p.cursor.lexeme(c.end), ")", "{source:?}");
+    }
+}
+
+#[test]
+fn gft_without_return_type_binds() {
+    // computeNoTypeGFT (type_info_impl.dart:747) anchors computeRest at
+    // beforeStart — one token BEFORE `Function` — so `gftHasReturnType`
+    // becomes false via `typeVariableStart != start` (:1136).
+    let mut p = setup("x; Function() f;");
+    p.cursor.advance();
+    p.cursor.advance(); // cursor on `Function`, beforeStart = `;`
+    let info = p.compute_type(true, false);
+    let TypeInfo::Complex(c) = &info else {
+        panic!("expected complex, got {info:?}")
+    };
+    assert_eq!(c.gft_has_return_type, Some(false));
+    assert_eq!(p.cursor.lexeme(c.start), "Function");
+    assert_eq!(p.cursor.lexeme(c.end), ")");
+}
+
+#[test]
+fn gft_parses_as_one_type() {
+    // The bound GFT consumes exactly `void Function()` and emits the
+    // begin/end pair; the `Function()` tail no longer leaks into member
+    // parsing (this is the trace behind the committed `typedef_new_style`
+    // empty-errors assertion).
+    let mut p = setup("void Function() f;");
+    let end = p.ensure_type_not_void_entry();
+    assert_eq!(p.cursor.lexeme(end.id), ")");
+    assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    p.listener
+        .assert_sequence(&[("begin", "function_type"), ("end", "function_type")]);
+}
+
+#[test]
+fn skip_type_positions() {
+    // SimpleWith1Argument.skipType names the closer (start+3) and the
+    // nullable variant the `?` (start+4) — type_info_impl.dart:302/:239.
+    let mut p = setup("List<int> x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::SimpleWith1Arg { nullable: false }));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), ">");
+
+    let mut p = setup("List<int>? x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::SimpleWith1Arg { nullable: true }));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), "?");
+
+    // Prefixed keeps its three-token shape (:204).
+    let mut p = setup("p.C x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::Prefixed));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), "C");
+
+    // A compound closer still names the combined token: the position of the
+    // official split leading `>` (splitGtGt, util.dart:156, #135).
+    let mut p = setup("A<B>> x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::SimpleWith1Arg { nullable: false }));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), ">>");
+}
+
+#[test]
+fn prefixed_type_with_arguments_computes_group() {
+    // The `id . id <...>` group is computed at the continuation token
+    // (type_info.dart:319), where `<` sits at cursor+3 — the old at(2)
+    // probe never saw it, so required position fell back to the bare
+    // prefixed shape and leaked `<T>`.
+    let (c, p) = compute_complex("p.C<T> x;", true);
+    assert!(matches!(c.type_args, TypeParamOrArg::Simple1 { .. }));
+    assert_eq!(p.cursor.lexeme(c.end), ">");
+
+    let mut p = setup("p.C<T> x;");
+    let end = p.ensure_type_not_void_entry();
+    assert_eq!(p.cursor.lexeme(end.id), ">");
+    assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    p.listener
+        .assert_sequence(&[("begin", "type_arguments"), ("end", "type_arguments")]);
+}
+
+#[test]
+fn extends_clause_scans_following_parameters() {
+    // Official `token = typeInfo.skipType(next)` (type_info_impl.dart:1530):
+    // the discarded result left the cursor on the supertype, so every
+    // following type parameter went through missing-comma recovery.
+    for source in [
+        "class C<T extends num, U> {}",
+        "class C<T extends List<int>, U> {}",
+    ] {
+        let mut p = setup(source);
+        p.parse_unit();
+        assert!(
+            p.listener.errors.is_empty(),
+            "{source:?}: {:?}",
+            p.listener.errors
+        );
+        p.listener
+            .assert_sequence(&[("begin", "class_declaration"), ("end", "class_declaration")]);
+    }
+}
+
+#[test]
+fn skip_type_len_counts_type_prefix() {
+    // The group length covers only the `<...>` tail; the identifier (or
+    // `id.id`) prefix must stay in the total (`n += len`).
+    for (source, len) in [
+        ("List<int> x", 4),
+        ("p.C<T> x", 6),
+        ("List<List<int>> x", 6),
+        ("Map<List<int>, String> x", 9),
+    ] {
+        let p = setup(source);
+        assert_eq!(p.skip_type_len(0), len, "{source:?}");
+    }
+}
+
+#[test]
+fn nested_first_then_more_is_complex() {
+    // With the length overwrite (`n = len`) the group scan landed on the
+    // inner closer, the type "ended" mid-group, and the optional-position
+    // follower check (`,`) turned `Map<List<int>, String> x` into noType.
+    let info = compute_shape("Map<List<int>, String> x", false);
+    assert!(matches!(info, TypeInfo::Complex(_)));
+}
+
+#[test]
+fn raw_compound_remainder_blocks_gft() {
+    // `A<B, C>>` stops on a raw compound closer: the official parser splits
+    // it (splitCloser, type_info_impl.dart:1772) and reads the remainder `>`
+    // as the successor, which is never a `Function` intro (#168) — required
+    // keeps the plain argumentized type, optional is noType (:1044-1046).
+    let (c, p) = compute_complex("A<B, C>> Function() f;", true);
+    assert_eq!(c.gft_has_return_type, None);
+    assert_eq!(p.cursor.lexeme(c.end), ">>");
+    let info = compute_shape("A<B, C>> f", false);
+    assert!(matches!(info, TypeInfo::NoType));
+}
+
+#[test]
+fn shared_compound_closer_keeps_gft_and_nested_type() {
+    // Control for the raw-compound rule: when a nested member's group
+    // already consumed the compound's leading `>`, the compound's LAST
+    // closer closes the outer group and the real successor follows —
+    // `List<List<int>> Function()` is still a function type and
+    // `List<List<int>> x` still computes in optional position.
+    let (c, _p) = compute_complex("List<List<int>> Function() f;", true);
+    assert_eq!(c.gft_has_return_type, Some(true));
+    let info = compute_shape("List<List<int>> x", false);
+    assert!(matches!(info, TypeInfo::Complex(_)));
 }

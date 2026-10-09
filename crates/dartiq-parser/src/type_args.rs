@@ -12,7 +12,8 @@ use crate::parser::Parser;
 use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
 use crate::types::{
-    SimpleCloser, TypeInfo, is_closer, is_valid_non_record_type_reference, is_variance,
+    SimpleCloser, TypeInfo, is_closer, is_compound_closer, is_valid_non_record_type_reference,
+    is_variance,
 };
 
 /// `TypeParamOrArgInfo` (`type_info.dart:80`).
@@ -33,6 +34,13 @@ pub struct ComplexTypeParamOrArg {
     pub start: TokenId,
     pub end: TokenId,
     pub recovered: bool,
+    /// `end` names a raw compound closer whose *leading* `>` closed this
+    /// group (the official parser splits it there, `splitCloser`,
+    /// `type_info_impl.dart:1772): the successor of `end` reads the split
+    /// remainder, never a real token. `false` when the compound is shared
+    /// with enclosing groups (its *last* closer closes this group, so the
+    /// real successor follows).
+    pub end_raw_compound: bool,
 }
 
 impl TypeParamOrArg {
@@ -41,6 +49,19 @@ impl TypeParamOrArg {
         match self {
             TypeParamOrArg::Complex(g) => g.recovered,
             _ => false,
+        }
+    }
+
+    /// Whether [`TypeParamOrArg::skip`] lands on a raw compound closer whose
+    /// leading `>` closes the group (see [`ComplexTypeParamOrArg`]).
+    pub(crate) fn ends_on_raw_compound(&self) -> bool {
+        match self {
+            // A compound closer on the fast shape is always raw: the official
+            // `skipEndGroup` returns the split leading `>` (the compound's
+            // position) and the remainder follows it.
+            TypeParamOrArg::Simple1 { closer } => *closer != SimpleCloser::Gt,
+            TypeParamOrArg::Complex(g) => g.end_raw_compound,
+            TypeParamOrArg::None => false,
         }
     }
 
@@ -191,11 +212,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         let start = self.real_id(self.cursor.real_pos() + n);
         match self.scan_type_group(start, in_declaration) {
-            Some((end, recovered)) => TypeParamOrArg::Complex(ComplexTypeParamOrArg {
-                start,
-                end,
-                recovered,
-            }),
+            Some((end, recovered, end_raw_compound)) => {
+                TypeParamOrArg::Complex(ComplexTypeParamOrArg {
+                    start,
+                    end,
+                    recovered,
+                    end_raw_compound,
+                })
+            }
             None => TypeParamOrArg::None,
         }
     }
@@ -218,6 +242,18 @@ fn simple1_closer(
         TokenKind::GtGt => Some(SimpleCloser::GtGt),
         TokenKind::GtEq => Some(SimpleCloser::GtEq),
         _ => None,
+    }
+}
+
+/// `>`-family closer count carried by one token (the unit mapping of
+/// [`Parser::gt_group_len`]).
+fn closer_units(kind: TokenKind) -> usize {
+    match kind {
+        TokenKind::Gt => 1,
+        TokenKind::GtEq | TokenKind::GtGt => 2,
+        TokenKind::GtGtEq | TokenKind::GtGtGt => 3,
+        TokenKind::GtGtGtEq => 4,
+        _ => 0,
     }
 }
 
@@ -277,10 +313,14 @@ impl RecordProbe {
 
 impl<L: ParserListener> Parser<'_, '_, L> {
     /// Scans a `<...>` group without consuming (official
-    /// `ComplexTypeParamOrArgInfo.compute`). Returns `(closer id, recovered)`.
-    /// `scan` walks the real stream: it always names the next token to
-    /// inspect.
-    fn scan_type_group(&self, lt_id: TokenId, in_declaration: bool) -> Option<(TokenId, bool)> {
+    /// `ComplexTypeParamOrArgInfo.compute`). Returns
+    /// `(closer id, recovered, closer is a raw compound)`. `scan` walks the
+    /// real stream: it always names the next token to inspect.
+    fn scan_type_group(
+        &self,
+        lt_id: TokenId,
+        in_declaration: bool,
+    ) -> Option<(TokenId, bool, bool)> {
         let lt_offset = self.offset_of(lt_id);
         let mut recovered = false;
         let mut scan = lt_offset + 1;
@@ -300,22 +340,37 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     continue;
                 }
                 if is_closer(here) {
-                    return Some((self.real_id(scan), recovered));
+                    // Stopped at the closer directly: a compound closer's
+                    // leading `>` is this group's own (raw).
+                    return Some((self.real_id(scan), recovered, is_compound_closer(here)));
                 }
                 if scan == lt_offset + 1 && !in_declaration {
                     return None;
                 }
                 recovered = true;
-                return Some((self.real_id(scan), recovered));
+                return Some((self.real_id(scan), recovered, false));
             }
-            scan += len;
+            let (end, mut backed_up) = self.step_over_type(scan, len);
+            scan = end;
             if self.kind_at(scan) == TokenKind::Keyword(Keyword::Extends) {
                 scan += 1;
-                scan += self.skip_type_len(scan);
+                let super_len = self.skip_type_len(scan);
+                let (end, super_backed) = self.step_over_type(scan, super_len);
+                scan = end;
+                backed_up = super_backed;
             }
             match self.kind_at(scan) {
                 TokenKind::Comma => scan += 1,
-                kind if is_closer(kind) => return Some((self.real_id(scan), recovered)),
+                kind if is_closer(kind) => {
+                    // A stop on a shared (backed-up-onto) compound closer is
+                    // not raw: its last closer closes this group and the
+                    // real successor follows.
+                    return Some((
+                        self.real_id(scan),
+                        recovered,
+                        is_compound_closer(kind) && !backed_up,
+                    ));
+                }
                 _ => {
                     // Recovery: declaration-style content missing commas —
                     // stop at the first non-member shape.
@@ -326,10 +381,40 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     {
                         probe = self.offset_of(end) + 1;
                     }
-                    return Some((self.real_id(probe), recovered));
+                    return Some((self.real_id(probe), recovered, false));
                 }
             }
         }
+    }
+
+    /// Advance from a type's first token past its `skipType` length. When the
+    /// type's last token is a compound closer with surplus closers, the
+    /// type's own last group closed on the compound's leading `>` and the
+    /// surplus belongs to the enclosing groups (the official parser splits
+    /// the compound there, `splitCloser`, `util.dart:156`) — the scan stops
+    /// ON the compound instead of stepping past it. Returns
+    /// `(next offset, stopped on a shared compound)`.
+    fn step_over_type(&self, offset: usize, len: usize) -> (usize, bool) {
+        if len == 0 {
+            return (offset, false);
+        }
+        let tail = self.kind_at(offset + len - 1);
+        if is_compound_closer(tail) {
+            // Open `<`s inside the type minus the closers they already
+            // consumed: the depth the tail compound closes.
+            let mut opens = 0usize;
+            let mut closed = 0usize;
+            for i in offset..offset + len - 1 {
+                match self.kind_at(i) {
+                    TokenKind::Lt => opens += 1,
+                    kind => closed += closer_units(kind),
+                }
+            }
+            if closer_units(tail) > opens.saturating_sub(closed) {
+                return (offset + len - 1, true);
+            }
+        }
+        (offset + len, false)
     }
 
     /// Length (in tokens) of the `<...>` group opening at `lt_offset`,
@@ -385,7 +470,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if self.kind_at(offset + 1) == TokenKind::Lt
                     && let Some(len) = self.gt_group_len(offset + 1)
                 {
-                    n = len;
+                    n += len;
                     if self.kind_at(offset + n) == TokenKind::Question {
                         n += 1;
                     }
@@ -411,7 +496,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let Some(len) = self.gt_group_len(offset + 1) else {
                         return 0;
                     };
-                    n = len;
+                    n += len;
                 }
                 if self.kind_at(offset + n) != TokenKind::OpenParen {
                     return 0;
@@ -438,7 +523,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if self.kind_at(offset + n) == TokenKind::Lt {
                     match self.gt_group_len(offset + n) {
                         Some(len) => {
-                            n = len;
+                            // The group length covers only the `<...>` tail;
+                            // the identifier (or `id.id`) prefix stays.
+                            n += len;
                             if self.kind_at(offset + n) == TokenKind::Question {
                                 n += 1;
                             }
@@ -621,7 +708,15 @@ impl ComplexTypeParamOrArg {
                 let extends_span = parser.peek_span();
                 parser.cursor.advance();
                 let info = parser.compute_type(true, false);
-                info.skip_type(parser);
+                // Official `token = typeInfo.skipType(next)`
+                // (type_info_impl.dart:1530): the scan position moves to the
+                // supertype's last token. `NoType` keeps the official
+                // `skipType` = the token before the type, i.e. no move.
+                if !matches!(info, TypeInfo::NoType) {
+                    let last = info.skip_type(parser);
+                    parser.skip_to_token(last);
+                    parser.cursor.advance();
+                }
                 supers.push(Some((extends_span, info)));
             } else {
                 supers.push(None);
