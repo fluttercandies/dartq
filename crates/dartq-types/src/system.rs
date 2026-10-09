@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::hierarchy::{CoreDecls, DeclInfo, TypeHierarchy};
 use crate::ids::{FunctionSigId, TypeDeclId, TypeId};
 use crate::table::TypeTable;
-use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
+use crate::ty::{PoolRange, Type, TypeKind, UninternedType};
 
 /// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
 /// mechanism with the same limit (`type_system.dart:85`); exceeding it makes
@@ -80,17 +80,37 @@ impl StampSet {
     }
 }
 
-/// Reusable subtype-walk buffers: the interface walk's visited set and LIFO
-/// frontier, plus the LUB supertype-closure sets and their intersection.
-/// Cleared (not reallocated) at the start of every use, so steady-state
-/// queries allocate nothing.
+/// One walk's private containers: the visited set and the supertype
+/// frontier. Pooled and recycled across walks; never shared between
+/// in-flight frames (claim clears it, ownership is exclusive until return).
+#[derive(Clone, Default)]
+struct WalkUnit {
+    visited: StampSet,
+    frontier: Vec<TypeId>,
+}
+
+/// Reusable subtype-walk scratch: a pool of interface-walk units (one per
+/// in-flight nesting depth) plus the LUB supertype-closure sets and their
+/// intersection. Units are claimed by popping — a pooled unit is owned by
+/// no in-flight frame — and returned on exit, so every nesting depth reuses
+/// its containers and steady-state queries (including re-entrant rule-12
+/// walks) allocate nothing. The LUB sets are cleared (not reallocated) at
+/// the start of every use.
 #[derive(Clone, Default)]
 pub(crate) struct WalkScratch {
-    pub(crate) visited: StampSet,
-    pub(crate) frontier: Vec<TypeId>,
+    units: Vec<WalkUnit>,
     pub(crate) set_a: FxHashSet<TypeId>,
     pub(crate) set_b: FxHashSet<TypeId>,
     pub(crate) candidates: Vec<TypeId>,
+}
+
+impl WalkScratch {
+    /// Number of pooled units — test observability for the reuse contract
+    /// (stable at the maximum nesting depth, growing never).
+    #[cfg(test)]
+    fn pooled_units(&self) -> usize {
+        self.units.len()
+    }
 }
 
 /// Facade over a [`TypeTable`] plus a [`TypeHierarchy`] snapshot. All queries
@@ -98,14 +118,16 @@ pub(crate) struct WalkScratch {
 /// projections) goes through the table's interior mutability, so the table
 /// grows but ids never change.
 ///
-/// The system owns two non-reentrant scratch cells:
+/// The system owns two scratch cells:
 ///
-/// - `walk`: the subtype-walk and LUB-closure buffers. A walk claims the
-///   cell for its whole duration; a *re-entrant* query (rule 12 reached
-///   again through an argument check while an outer interface walk is in
-///   flight) cannot claim it and transparently falls back to fresh local
-///   containers. Claim detection is `try_borrow_mut`, so no nesting depth
-///   bookkeeping is needed.
+/// - `walk`: the interface-walk unit pool and the LUB-closure sets. A walk
+///   claims a unit by popping it from the pool and returns it on exit, so
+///   every re-entrant rule-12 depth owns a private unit and reuses it once
+///   pooled — no per-query allocation in steady state. Isolation between
+///   sibling and nested frames is structural: a pooled unit is owned by no
+///   in-flight frame, and claiming clears it. A walk that finds the cell
+///   busy (an external holder, e.g. a test) falls back to fresh local
+///   containers.
 /// - `future_memo`: `Future<S>` synthesis keyed by the argument id. It is
 ///   only ever held across a single lookup/insert, never across a recursive
 ///   query, so re-entrancy cannot arise.
@@ -357,29 +379,10 @@ impl<'a> TypeSystem<'a> {
     /// Re-interns `t` with the given projection. Unit kinds keep their fixed
     /// nullability (the table normalizes; `dynamic` returns itself,
     /// type.dart:90-92) and `Never?` collapses to `Null` (type.dart:1207).
+    /// The flip is one bit on the interned structure, so the table answers
+    /// from its dedup maps without building any buffer.
     pub(crate) fn with_nullability(&self, t: TypeId, nullable: bool) -> TypeId {
-        let ty = self.table.get(t);
-        if ty.is_nullable() == nullable {
-            return t;
-        }
-        match ty.kind() {
-            TypeKind::Interface { decl, args } => {
-                let rebuilt = UninternedType::Interface {
-                    decl,
-                    args: self.table.args(args),
-                };
-                self.table.intern(rebuilt, nullable)
-            }
-            TypeKind::Function { signature } => self
-                .table
-                .intern_function(self.unintern_function(signature), nullable)
-                .expect("re-interning an interned signature cannot fail"),
-            TypeKind::Record { shape } => self
-                .table
-                .intern_record(self.unintern_record(shape), nullable)
-                .expect("re-interning an interned shape cannot fail"),
-            other => self.table.intern(unintern(other), nullable),
-        }
+        self.table.with_nullability(t, nullable)
     }
 
     pub(crate) fn strip(&self, t: TypeId) -> TypeId {
@@ -388,25 +391,6 @@ impl<'a> TypeSystem<'a> {
 
     pub(crate) fn make_nullable(&self, t: TypeId) -> TypeId {
         self.with_nullability(t, true)
-    }
-
-    fn unintern_function(&self, id: FunctionSigId) -> UninternedFunction {
-        let sig = self.table.signature(id);
-        UninternedFunction {
-            return_type: sig.return_type,
-            type_parameters: self.table.function_type_parameters(sig.type_parameters),
-            positional: self.table.args(sig.positional),
-            named: self.table.named_members(sig.named),
-            required_positional: sig.required_positional,
-        }
-    }
-
-    fn unintern_record(&self, id: crate::ids::RecordShapeId) -> UninternedRecord {
-        let shape = self.table.record_shape(id);
-        UninternedRecord {
-            positional: self.table.args(shape.positional),
-            named: self.table.named_members(shape.named),
-        }
     }
 
     /// Synthesizes `Future<S>` for the `FutureOr` rules
@@ -636,26 +620,27 @@ impl<'a> TypeSystem<'a> {
         }
         // Depth-first walk over instantiated supertypes, the counterpart of
         // `allSupertypes` + substitution (subtype.dart:211-221). Canonical
-        // interning makes `TypeId` a sound visited-set key. The reusable
-        // scratch is claimed for the whole walk; a re-entrant walk (rule 12
-        // reached through an argument check of an outer walk) falls back to
-        // fresh local containers — see the `TypeSystem` scratch docs.
+        // interning makes `TypeId` a sound visited-set key. The walk claims
+        // a scratch unit by popping it from the pool — a pooled unit is
+        // owned by no in-flight frame, so re-entrant rule-12 walks get
+        // private containers at every depth and reuse them once pooled; a
+        // walk that finds the cell busy (an external holder) falls back to
+        // fresh local containers. See the `TypeSystem` scratch docs.
+        let (mut visited, mut frontier) = match self.walk.try_borrow_mut() {
+            Ok(mut scratch) => {
+                let mut unit = scratch.units.pop().unwrap_or_default();
+                unit.visited.clear();
+                unit.frontier.clear();
+                (unit.visited, unit.frontier)
+            }
+            Err(_) => (StampSet::new(), Vec::new()),
+        };
+        self.seed_frontier(d0, a0, &mut frontier);
+        let answer = self.interface_walk(d1, a1, depth, &mut visited, &mut frontier);
         if let Ok(mut scratch) = self.walk.try_borrow_mut() {
-            scratch.visited.clear();
-            scratch.frontier.clear();
-            self.seed_frontier(d0, a0, &mut scratch.frontier);
-            let WalkScratch {
-                visited, frontier, ..
-            } = &mut *scratch;
-            self.interface_walk(d1, a1, depth, visited, frontier)
-        } else {
-            // Re-entrant walk (rule 12 reached through an argument check of
-            // an outer walk that owns the scratch): fresh local containers.
-            let mut visited = StampSet::new();
-            let mut frontier = Vec::new();
-            self.seed_frontier(d0, a0, &mut frontier);
-            self.interface_walk(d1, a1, depth, &mut visited, &mut frontier)
+            scratch.units.push(WalkUnit { visited, frontier });
         }
+        answer
     }
 
     /// Pushes the instantiated supertypes of `d0` — the walk's starting
@@ -819,22 +804,6 @@ impl<'a> TypeSystem<'a> {
     }
 }
 
-/// Rebuilds the uninterned form of a kind with no pooled payload.
-fn unintern(kind: TypeKind) -> UninternedType {
-    match kind {
-        TypeKind::Never => UninternedType::Never,
-        TypeKind::Dynamic => UninternedType::Dynamic,
-        TypeKind::Void => UninternedType::Void,
-        TypeKind::Invalid => UninternedType::Invalid,
-        TypeKind::Null => UninternedType::Null,
-        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
-        TypeKind::FutureOr { base } => UninternedType::FutureOr { base },
-        TypeKind::Interface { .. } | TypeKind::Function { .. } | TypeKind::Record { .. } => {
-            unreachable!("compound kinds are rebuilt by `TypeSystem::with_nullability`")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,9 +857,10 @@ mod tests {
     }
 
     /// The re-entrant walk: `List<int> <: Iterable<num>` reaches rule 12 for
-    /// `int <: num` while the outer interface walk still owns the scratch,
-    /// so the inner query runs on fresh local containers. The pinned
-    /// contract: the fallback answers exactly what the flat query answers.
+    /// `int <: num` while the outer interface walk owns its scratch unit, so
+    /// the inner query claims its own unit from the pool (fresh local
+    /// containers while an external holder keeps the cell busy). The pinned
+    /// contract: the nested answer equals the flat answer either way.
     #[test]
     fn reentrant_walk_matches_the_flat_answer() {
         let (table, hierarchy) = fixture();
@@ -917,6 +887,45 @@ mod tests {
             )
         };
         assert_eq!(forced, (true, false));
+    }
+
+    /// Deep rule-12 re-entry: `List<List<int>> <: Iterable<Iterable<num>>`
+    /// nests three interface walks (List vs Iterable, List vs Iterable
+    /// through the argument check, Int vs Num through the second argument
+    /// check). Pins the nested answers and the steady-state allocation
+    /// story: after the first query, repeated identical nested queries
+    /// reuse one pooled unit per nesting level and grow no pool.
+    #[test]
+    fn nested_rule12_reentry_answers_and_scratch_reuse() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let num = itf(&table, NUM, &[]);
+        let string = itf(&table, STRING, &[]);
+        let list_list_int = itf(&table, LIST, &[itf(&table, LIST, &[int])]);
+        let iterable_iterable_num = itf(&table, ITERABLE, &[itf(&table, ITERABLE, &[num])]);
+        let iterable_iterable_string = itf(&table, ITERABLE, &[itf(&table, ITERABLE, &[string])]);
+
+        // First pass pins the nested answers (three re-entry levels).
+        assert!(sys.is_subtype(list_list_int, iterable_iterable_num));
+        assert!(!sys.is_subtype(list_list_int, iterable_iterable_string));
+
+        // Warmup done: the pool holds exactly one unit per nesting level and
+        // repeated identical queries return identical answers, reuse the
+        // units, and grow no pool.
+        let len = table.len();
+        let units = sys.walk.borrow().pooled_units();
+        assert_eq!(units, 3, "one recycled unit per re-entry level");
+        for _ in 0..8 {
+            assert!(sys.is_subtype(list_list_int, iterable_iterable_num));
+            assert!(!sys.is_subtype(list_list_int, iterable_iterable_string));
+            assert_eq!(sys.walk.borrow().pooled_units(), units);
+            assert_eq!(
+                table.len(),
+                len,
+                "repeated nested queries must not grow the type pool"
+            );
+        }
     }
 
     #[test]

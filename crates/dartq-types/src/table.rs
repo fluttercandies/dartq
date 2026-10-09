@@ -188,6 +188,18 @@ impl TypeTable {
         self.state.borrow_mut().intern_record(shape, nullable)
     }
 
+    /// Re-interns an interned type with the given projection — the table
+    /// primitive behind [`crate::TypeSystem::with_nullability`]. A nullability
+    /// flip is one bit on the stored structure: the payload pools are already
+    /// interned, so a dedup hit returns the existing id allocation-free and a
+    /// miss shares them instead of copying. Unit kinds normalize:
+    /// `dynamic` returns itself (type.dart:90-92), `Never?` collapses to
+    /// `Null` (type.dart:1207-1209).
+    #[must_use]
+    pub(crate) fn with_nullability(&self, id: TypeId, nullable: bool) -> TypeId {
+        self.state.borrow_mut().with_nullability(id, nullable)
+    }
+
     /// Returns the stored type.
     ///
     /// # Panics
@@ -469,13 +481,21 @@ impl TableState {
                 }
             }
         }
+        self.publish(hash, id);
+        TypeId::from_raw(id)
+    }
+
+    /// Links a fresh id under its structural hash: the newest id takes the
+    /// primary slot and the previous one joins the overflow bucket — the
+    /// dedup-miss tail shared by [`TableState::commit`] and the nullability
+    /// flip probe.
+    fn publish(&mut self, hash: u64, id: u32) {
         if let Some(previous) = self.interner.insert(hash, id) {
             self.collisions
                 .entry(hash)
                 .or_insert_with(|| vec![previous])
                 .push(id);
         }
-        TypeId::from_raw(id)
     }
 
     fn mark(&self) -> PoolMark {
@@ -529,10 +549,17 @@ impl TableState {
     }
 
     fn hash_type(&self, id: u32) -> u64 {
+        self.hash_type_with(id, self.types[id as usize].is_nullable())
+    }
+
+    /// Hashes the structure stored at `id` under an overridden nullability
+    /// bit — the in-place probe behind [`TableState::with_nullability`].
+    /// Reads the existing pool words only; no buffer is built.
+    fn hash_type_with(&self, id: u32, nullable: bool) -> u64 {
         let ty = self.types[id as usize];
         let mut h = FNV_OFFSET;
         h = mix_u64(h, discriminant(ty.kind()));
-        h = mix_u64(h, u64::from(ty.is_nullable()));
+        h = mix_u64(h, u64::from(nullable));
         match ty.kind() {
             TypeKind::Interface { decl, args } => {
                 h = mix_u64(h, u64::from(decl.raw()));
@@ -589,11 +616,27 @@ impl TableState {
     }
 
     fn structurally_equal(&self, left: u32, right: u32) -> bool {
-        let left_type = self.types[left as usize];
-        let right_type = self.types[right as usize];
-        if left_type.is_nullable() != right_type.is_nullable() {
+        if self.types[left as usize].is_nullable() != self.types[right as usize].is_nullable() {
             return false;
         }
+        self.structure_equal(left, right)
+    }
+
+    /// Whether `candidate` equals "the structure stored at `id`, projected
+    /// `nullable`" — the dedup question of the nullability flip probe, which
+    /// pins the flipped bit separately because `id`'s own entry carries the
+    /// source projection.
+    fn equals_with_nullability(&self, candidate: u32, id: u32, nullable: bool) -> bool {
+        self.types[candidate as usize].is_nullable() == nullable
+            && self.structure_equal(candidate, id)
+    }
+
+    /// Kind-and-payload comparison with the nullability bit excluded — the
+    /// shared body of [`TableState::structurally_equal`] and
+    /// [`TableState::equals_with_nullability`].
+    fn structure_equal(&self, left: u32, right: u32) -> bool {
+        let left_type = self.types[left as usize];
+        let right_type = self.types[right as usize];
         // Kind comparison must not use `TypeKind: PartialEq`: the pooled
         // ids of the `Function`/`Record` variants are positions, not values.
         match (left_type.kind(), right_type.kind()) {
@@ -691,7 +734,7 @@ impl TableState {
                         if replacement_nullable || !t.is_nullable() {
                             replacement
                         } else {
-                            self.intern_nullable(replacement)
+                            self.with_nullability(replacement, true)
                         }
                     }
                 }
@@ -762,62 +805,54 @@ impl TableState {
         }
     }
 
-    /// Re-interns an interned type with the `?` projection for the
-    /// nullability union in the [`TypeKind::TypeParameter`] branch.
-    /// Unit-kind normalization still applies: `Never?` collapses to `Null`
-    /// (type.dart:1207-1209) and `dynamic`/`Null` stay no-suffix, so those
-    /// return their existing ids.
-    fn intern_nullable(&mut self, id: TypeId) -> TypeId {
+    /// Re-interns an interned type under the given projection — the
+    /// target-flag generalization of the former `intern_nullable`, serving
+    /// both the substitution walk's `T?=X!` union and
+    /// [`TypeTable::with_nullability`]. A flip is one bit on the stored
+    /// structure: the payload pools are already interned, so the dedup
+    /// probe hashes the target in place (no buffer build) and a hit returns
+    /// the existing id allocation-free; a miss shares the source's pool
+    /// ranges / signature / shape instead of copying them. Unit-kind
+    /// normalization still applies: `Never?` collapses to `Null`
+    /// (type.dart:1207-1209) and `dynamic`/`void`/`Invalid`/`Null` keep
+    /// their fixed no-suffix projection (type.dart:90-92).
+    fn with_nullability(&mut self, id: TypeId, nullable: bool) -> TypeId {
         let ty = self.types[id.raw() as usize];
+        if ty.is_nullable() == nullable {
+            return id;
+        }
         match ty.kind() {
-            TypeKind::Interface { decl, args } => {
-                let args = self.args[args.offset()..args.offset() + args.len()].to_vec();
-                self.intern_kind(UninternedType::Interface { decl, args }, true)
+            // Requesting the suffix on a fixed-projection kind lands back on
+            // the same interned shape.
+            TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => id,
+            // `Never?` is a different interned kind (`Null`), so this
+            // direction goes through the normalizing interner.
+            TypeKind::Never => self.intern_kind(UninternedType::Never, nullable),
+            TypeKind::Interface { .. }
+            | TypeKind::TypeParameter { .. }
+            | TypeKind::Function { .. }
+            | TypeKind::FutureOr { .. }
+            | TypeKind::Record { .. } => {
+                let raw = id.raw();
+                let hash = self.hash_type_with(raw, nullable);
+                if let Some(&candidate) = self.interner.get(&hash)
+                    && self.equals_with_nullability(candidate, raw, nullable)
+                {
+                    return TypeId::from_raw(candidate);
+                }
+                if let Some(bucket) = self.collisions.get(&hash) {
+                    for &candidate in bucket {
+                        if self.equals_with_nullability(candidate, raw, nullable) {
+                            return TypeId::from_raw(candidate);
+                        }
+                    }
+                }
+                // Miss: the new type shares the already-interned payload.
+                let new_id = u32::try_from(self.types.len()).expect("type pool exceeds u32::MAX");
+                self.types.push(Type::new(ty.kind(), nullable));
+                self.publish(hash, new_id);
+                TypeId::from_raw(new_id)
             }
-            TypeKind::Function { signature } => {
-                let sig = self.signatures[signature.raw() as usize];
-                let type_parameters = self.fn_type_parameters[sig.type_parameters.offset()
-                    ..sig.type_parameters.offset() + sig.type_parameters.len()]
-                    .to_vec();
-                let positional = self.args
-                    [sig.positional.offset()..sig.positional.offset() + sig.positional.len()]
-                    .to_vec();
-                let named =
-                    self.named[sig.named.offset()..sig.named.offset() + sig.named.len()].to_vec();
-                self.intern_function(
-                    UninternedFunction {
-                        return_type: sig.return_type,
-                        type_parameters,
-                        positional,
-                        named,
-                        required_positional: sig.required_positional,
-                    },
-                    true,
-                )
-                .expect("re-interning an interned signature cannot fail")
-            }
-            TypeKind::Record { shape } => {
-                let shape = self.shapes[shape.raw() as usize];
-                let positional = self.args
-                    [shape.positional.offset()..shape.positional.offset() + shape.positional.len()]
-                    .to_vec();
-                let named = self.named
-                    [shape.named.offset()..shape.named.offset() + shape.named.len()]
-                    .to_vec();
-                self.intern_record(UninternedRecord { positional, named }, true)
-                    .expect("re-interning an interned shape cannot fail")
-            }
-            TypeKind::TypeParameter { parameter } => {
-                self.intern_kind(UninternedType::TypeParameter { parameter }, true)
-            }
-            TypeKind::FutureOr { base } => {
-                self.intern_kind(UninternedType::FutureOr { base }, true)
-            }
-            TypeKind::Never => self.intern_kind(UninternedType::Never, true),
-            TypeKind::Dynamic => self.intern_kind(UninternedType::Dynamic, true),
-            TypeKind::Void => self.intern_kind(UninternedType::Void, true),
-            TypeKind::Invalid => self.intern_kind(UninternedType::Invalid, true),
-            TypeKind::Null => self.intern_kind(UninternedType::Null, true),
         }
     }
 
@@ -1129,5 +1164,83 @@ mod tests {
             table.instantiate(edge, &[TypeParamId::from_raw(1)], args),
             expected
         );
+    }
+
+    /// Nullability flips dedup against the interned `?` twin: the first flip
+    /// in each direction may intern one type, every further flip is the same
+    /// id with zero pool growth — a flip is a one-bit change, so the hit path
+    /// must be allocation-free. Covers the payload-sharing kinds (parameter,
+    /// interface with arguments, function with a named parameter — the kind
+    /// whose old path cloned a `String` per member) and the fixed-projection
+    /// unit kinds.
+    #[test]
+    fn flip_nullability_dedups_without_pool_growth() {
+        let table = TypeTable::new();
+        let decl = TypeDeclId::from_raw(1);
+        let t = table.intern(
+            UninternedType::TypeParameter {
+                parameter: TypeParamId::from_raw(1),
+            },
+            false,
+        );
+        let itf_t = table.intern(
+            UninternedType::Interface {
+                decl,
+                args: vec![t],
+            },
+            false,
+        );
+        let fn_t = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: t,
+                    type_parameters: Vec::new(),
+                    positional: vec![t],
+                    named: vec![NamedMember {
+                        name: "x".into(),
+                        ty: t,
+                        required: false,
+                    }],
+                    required_positional: 1,
+                },
+                false,
+            )
+            .expect("valid");
+
+        // First flips intern the `?` twins; flipping back returns the
+        // original ids.
+        let tq = table.with_nullability(t, true);
+        let itf_q = table.with_nullability(itf_t, true);
+        let fn_q = table.with_nullability(fn_t, true);
+        assert_ne!(tq, t);
+        assert_ne!(itf_q, itf_t);
+        assert_ne!(fn_q, fn_t);
+        assert_eq!(table.with_nullability(tq, false), t);
+        assert_eq!(table.with_nullability(itf_q, false), itf_t);
+        assert_eq!(table.with_nullability(fn_q, false), fn_t);
+
+        // Fixed-projection unit kinds: `dynamic` keeps its no-suffix shape;
+        // `Never?` collapses to `Null` once and stays there.
+        let dynamic = table.intern(UninternedType::Dynamic, false);
+        let never = table.intern(UninternedType::Never, false);
+        assert_eq!(table.with_nullability(dynamic, true), dynamic);
+        let null = table.with_nullability(never, true);
+        assert_ne!(null, never);
+        assert_eq!(table.with_nullability(null, true), null);
+        assert_eq!(table.with_nullability(null, false), null);
+
+        // Repeated flips in both directions: identical ids, zero pool growth.
+        let len = table.len();
+        for _ in 0..100 {
+            assert_eq!(table.with_nullability(t, true), tq);
+            assert_eq!(table.with_nullability(tq, false), t);
+            assert_eq!(table.with_nullability(itf_t, true), itf_q);
+            assert_eq!(table.with_nullability(itf_q, false), itf_t);
+            assert_eq!(table.with_nullability(fn_t, true), fn_q);
+            assert_eq!(table.with_nullability(fn_q, false), fn_t);
+            assert_eq!(table.with_nullability(dynamic, true), dynamic);
+            assert_eq!(table.with_nullability(never, true), null);
+        }
+        assert_eq!(table.len(), len, "flip dedup must not grow the type pool");
     }
 }
