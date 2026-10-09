@@ -10,6 +10,7 @@
 //! before a type becomes observable.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use rustc_hash::FxHashMap;
@@ -76,22 +77,46 @@ struct PoolMark {
 }
 
 /// The substitution map behind a [`TableState::substitute`] walk: either a
-/// caller-owned slice, or a live zip of parameter names with the argument
-/// pool (rule-12 instantiation) that reads replacements straight from the
-/// pool inside the walk's single `borrow_mut` — no intermediate map `Vec`.
+/// caller-owned slice, a live zip of parameter names with the argument pool
+/// (rule-12 instantiation) that reads replacements straight from the pool
+/// inside the walk's single `borrow_mut` — no intermediate map `Vec` — or a
+/// live rename of one signature's declared parameters to another's
+/// (function-subtype correlation) that interns its replacements on demand.
 enum Subst<'a> {
     Slice(&'a [(TypeParamId, TypeId)]),
     Zip {
         params: &'a [TypeParamId],
         args: PoolRange,
     },
+    Rename {
+        from: PoolRange,
+        to: PoolRange,
+    },
 }
 
 impl Subst<'_> {
+    /// Whether `parameter` is a key — the read-only question the
+    /// substitution pre-scans ask. The `Rename` form answers from the pool
+    /// without interning anything.
+    fn has_key(&self, state: &TableState, parameter: TypeParamId) -> bool {
+        match self {
+            Subst::Slice(map) => map.iter().any(|(p, _)| *p == parameter),
+            Subst::Zip { params, args } => params.iter().take(args.len()).any(|p| *p == parameter),
+            Subst::Rename { from, .. } => {
+                let lo = from.offset();
+                state.fn_type_parameters[lo..lo + from.len()].contains(&parameter)
+            }
+        }
+    }
+
     /// The replacement for `parameter`, if it is a key. The `Zip` form
     /// truncates at the argument range exactly like `zip` does, so a short
-    /// range leaves the tail unsubstituted as the eager map would.
-    fn replacement(&self, state: &TableState, parameter: TypeParamId) -> Option<TypeId> {
+    /// range leaves the tail unsubstituted as the eager map would. The
+    /// `Rename` form interns its replacement on demand — a `TypeParameter`
+    /// over the correlated parameter — so the function-subtype hot path
+    /// materializes no intermediate map; interning is canonical, so repeat
+    /// hits are O(1) lookups.
+    fn replacement(&self, state: &mut TableState, parameter: TypeParamId) -> Option<TypeId> {
         match self {
             Subst::Slice(map) => map.iter().find(|(p, _)| *p == parameter).map(|&(_, r)| r),
             Subst::Zip { params, args } => params
@@ -99,6 +124,19 @@ impl Subst<'_> {
                 .take(args.len())
                 .position(|p| *p == parameter)
                 .map(|index| state.args[args.offset() + index]),
+            Subst::Rename { from, to } => {
+                let lo = from.offset();
+                let index = state.fn_type_parameters[lo..lo + from.len()]
+                    .iter()
+                    .position(|p| *p == parameter)?;
+                let correlated = state.fn_type_parameters[to.offset() + index];
+                Some(state.intern_kind(
+                    UninternedType::TypeParameter {
+                        parameter: correlated,
+                    },
+                    false,
+                ))
+            }
         }
     }
 }
@@ -181,14 +219,34 @@ impl TypeTable {
         st.args[range.offset()..range.offset() + range.len()].to_vec()
     }
 
-    /// Returns the named member at a global pool index (the `String` is
-    /// cloned; internal hot paths access the pool directly under one borrow).
+    /// Orders the names of the named members at two pool indexes — both read
+    /// under one borrow, no `String` cloned (the function-subtype walk
+    /// compares one name pair per two-pointer step).
+    ///
+    /// # Panics
+    /// Panics when an index is out of range.
+    #[must_use]
+    pub(crate) fn named_names_cmp(&self, x: usize, y: usize) -> Ordering {
+        let st = self.state.borrow();
+        st.named[x].name.cmp(&st.named[y].name)
+    }
+
+    /// The named member's type at a pool index.
     ///
     /// # Panics
     /// Panics when the index is out of range.
     #[must_use]
-    pub fn named_member(&self, index: usize) -> NamedMember {
-        self.state.borrow().named[index].clone()
+    pub(crate) fn named_ty(&self, index: usize) -> TypeId {
+        self.state.borrow().named[index].ty
+    }
+
+    /// The named member's `required` flag at a pool index.
+    ///
+    /// # Panics
+    /// Panics when the index is out of range.
+    #[must_use]
+    pub(crate) fn named_required(&self, index: usize) -> bool {
+        self.state.borrow().named[index].required
     }
 
     /// Copies the named members covered by `range`.
@@ -255,6 +313,21 @@ impl TypeTable {
             return ty;
         }
         self.state.borrow_mut().substitute(ty, &Subst::Slice(map))
+    }
+
+    /// Substitutes through `ty` with the function-subtype correlation
+    /// (`relateTypeParameters`, subtype.dart:87-96): `from`'s declared
+    /// parameters are renamed positionally to `to`'s. The walk reads both
+    /// parameter ranges live and interns each replacement on demand, so the
+    /// per-query hot path materializes no intermediate map. `from` and `to`
+    /// must have equal lengths (the caller checks the signature arities).
+    pub(crate) fn substitute_rename(&self, ty: TypeId, from: PoolRange, to: PoolRange) -> TypeId {
+        if from.is_empty() {
+            return ty;
+        }
+        self.state
+            .borrow_mut()
+            .substitute(ty, &Subst::Rename { from, to })
     }
 
     /// Instantiates a supertype template `edge` by substituting `params`
@@ -822,7 +895,7 @@ impl TableState {
     /// never be substitution keys — but touches nothing.
     fn mentions_key(&self, ty: TypeId, map: &Subst<'_>) -> bool {
         match self.types[ty.raw() as usize].kind() {
-            TypeKind::TypeParameter { parameter } => map.replacement(self, parameter).is_some(),
+            TypeKind::TypeParameter { parameter } => map.has_key(self, parameter),
             TypeKind::Interface { args, .. } => self.range_mentions_key(args, map),
             TypeKind::Function { signature } => {
                 let sig = &self.signatures[signature.raw() as usize];

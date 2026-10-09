@@ -20,9 +20,12 @@ use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord,
 
 /// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
 /// mechanism with the same limit (`type_system.dart:85`); exceeding it makes
-/// `is_subtype` return `false` (`subtype.dart:37-41`). Shared with the
-/// hierarchy's precomputed depths and the LUB closure walk so every
-/// type-operation recursion carries the same termination bound.
+/// `is_subtype` return `false` (`subtype.dart:37-41`). Shared with the LUB
+/// closure walk so every type-operation recursion carries the same
+/// termination bound. It guards recursion only: the hierarchy's inheritance
+/// depths are precomputed exactly (topologically, no cap) so the LUB
+/// tie-break matches the oracle's uncapped
+/// `computeLongestInheritancePathToObject`.
 pub(crate) const DEPTH_LIMIT: u32 = 100;
 
 /// Visited set over interned ids: an epoch-stamp vector instead of a hash
@@ -203,14 +206,14 @@ impl<'a> TypeSystem<'a> {
     /// (`type.dart:1204`; `Never?` is interned as `Null`, so it is not bottom).
     #[must_use]
     pub fn is_bottom(&self, t: TypeId) -> bool {
-        self.table.get(t).kind() == TypeKind::Never
+        matches!(self.table.get(t).kind(), TypeKind::Never)
     }
 
     /// Membership in the equivalence class of `Null` (`type_system.dart:1195-1213`).
     /// `Never?` counts because it is interned as `Null` (type.dart:1207-1209).
     #[must_use]
     pub fn is_null(&self, t: TypeId) -> bool {
-        self.table.get(t).kind() == TypeKind::Null
+        matches!(self.table.get(t).kind(), TypeKind::Null)
     }
 
     /// Membership in the equivalence class of `Object` with no suffix
@@ -265,7 +268,7 @@ impl<'a> TypeSystem<'a> {
             return true;
         }
         // An already-reported error: accept and suppress (type_system.dart:901-904).
-        if self.table.get(from).kind() == TypeKind::Invalid {
+        if matches!(self.table.get(from).kind(), TypeKind::Invalid) {
             return true;
         }
         // `strict-casts: true` disables all downcasts, including `dynamic`
@@ -273,7 +276,7 @@ impl<'a> TypeSystem<'a> {
         if strict_casts {
             return false;
         }
-        self.table.get(from).kind() == TypeKind::Dynamic
+        matches!(self.table.get(from).kind(), TypeKind::Dynamic)
     }
 
     /// Total order on top types (`isMoreTop`, `type_system.dart:1124-1189`).
@@ -281,10 +284,10 @@ impl<'a> TypeSystem<'a> {
     pub fn is_more_top(&self, t: TypeId, s: TypeId) -> bool {
         let ty = self.table.get(t);
         let sy = self.table.get(s);
-        if ty.kind() == TypeKind::Void {
+        if matches!(ty.kind(), TypeKind::Void) {
             return true;
         }
-        if sy.kind() == TypeKind::Void {
+        if matches!(sy.kind(), TypeKind::Void) {
             return false;
         }
         if matches!(ty.kind(), TypeKind::Dynamic | TypeKind::Invalid) {
@@ -456,21 +459,20 @@ impl<'a> TypeSystem<'a> {
         let b = self.table.get(t1);
 
         // 0c InvalidType: suppress error avalanches (subtype.dart:274-276).
-        if a.kind() == TypeKind::Invalid || b.kind() == TypeKind::Invalid {
+        if matches!(a.kind(), TypeKind::Invalid) || matches!(b.kind(), TypeKind::Invalid) {
             return true;
         }
 
         // Rule 1 Right Top (subtype.dart:283-288). `Object?` is the only
         // nullable type here — rule 4 below relies on that.
-        if b.kind() == TypeKind::Dynamic
-            || b.kind() == TypeKind::Void
+        if matches!(b.kind(), TypeKind::Dynamic | TypeKind::Void)
             || (b.is_nullable() && self.is_object_declaration(b))
         {
             return true;
         }
 
         // Rule 2 Left Top (subtype.dart:292-296); falls through on failure.
-        if (a.kind() == TypeKind::Dynamic || a.kind() == TypeKind::Void)
+        if matches!(a.kind(), TypeKind::Dynamic | TypeKind::Void)
             && self.subtype_impl(self.object_question(), t1, depth + 1)
         {
             return true;
@@ -478,7 +480,7 @@ impl<'a> TypeSystem<'a> {
 
         // Rule 3 Left Bottom (subtype.dart:299-301). `Never?` never reaches
         // here — it is interned as `Null`.
-        if a.kind() == TypeKind::Never {
+        if matches!(a.kind(), TypeKind::Never) {
             return true;
         }
 
@@ -496,14 +498,14 @@ impl<'a> TypeSystem<'a> {
                 // a nullable `FutureOr` falls to the `S?` case below.
                 return self.subtype_impl(base, t1, depth + 1);
             }
-            return !(a.kind() == TypeKind::Null
-                || a.kind() == TypeKind::Dynamic
-                || a.kind() == TypeKind::Void
-                || a.is_nullable());
+            return !matches!(
+                a.kind(),
+                TypeKind::Null | TypeKind::Dynamic | TypeKind::Void
+            ) && !a.is_nullable();
         }
 
         // Rule 5 Left Null (subtype.dart:349-369).
-        if a.kind() == TypeKind::Null {
+        if matches!(a.kind(), TypeKind::Null) {
             if matches!(b.kind(), TypeKind::FutureOr { .. }) {
                 // `Null <: FutureOr<S>` iff `Null <: S` (subtype.dart:352-357);
                 // nullable `FutureOr<S>` is `S?` and accepts `Null`.
@@ -513,7 +515,7 @@ impl<'a> TypeSystem<'a> {
                 }
                 return true;
             }
-            return b.kind() == TypeKind::Null || b.is_nullable();
+            return matches!(b.kind(), TypeKind::Null) || b.is_nullable();
         }
 
         // Rule 6 Left FutureOr (subtype.dart:372-385).
@@ -739,31 +741,21 @@ impl<'a> TypeSystem<'a> {
 
     /// `_isFunctionSubtypeOf` (subtype.dart:86-182). Type-parameter
     /// correlation is positional (`relateTypeParameters`, subtype.dart:87-96);
-    /// bound compatibility is M2.
+    /// bound compatibility is M2. Pool payloads are read by index and the
+    /// correlation runs as a live `Rename` substitution, so the per-query
+    /// hot path materializes no `Vec` and clones no `String`.
     fn function_subtype(&self, f_id: FunctionSigId, g_id: FunctionSigId, depth: u32) -> bool {
         let f = self.table.signature(f_id);
         let g = self.table.signature(g_id);
-        let f_params = self.table.function_type_parameters(f.type_parameters);
-        let g_params = self.table.function_type_parameters(g.type_parameters);
+        // Universally quantified correlation: rename f's parameters to g's.
+        let (f_params, g_params) = (f.type_parameters, g.type_parameters);
         if f_params.len() != g_params.len() {
             return false;
         }
-        // Universally quantified correlation: rename f's parameters to g's.
-        let map: Vec<_> = f_params
-            .iter()
-            .copied()
-            .zip(g_params.iter().copied())
-            .map(|(fp, gp)| {
-                (
-                    fp,
-                    self.table
-                        .intern(UninternedType::TypeParameter { parameter: gp }, false),
-                )
-            })
-            .collect();
         // Return type is covariant (subtype.dart:98-100).
         if !self.subtype_impl(
-            self.table.substitute(f.return_type, &map),
+            self.table
+                .substitute_rename(f.return_type, f_params, g_params),
             g.return_type,
             depth + 1,
         ) {
@@ -779,9 +771,11 @@ impl<'a> TypeSystem<'a> {
             return false;
         }
         for i in 0..g.positional.len() {
-            let fp = self
-                .table
-                .substitute(self.table.arg(f.positional.offset() + i), &map);
+            let fp = self.table.substitute_rename(
+                self.table.arg(f.positional.offset() + i),
+                f_params,
+                g_params,
+            );
             let gp = self.table.arg(g.positional.offset() + i);
             if !self.subtype_impl(gp, fp, depth + 1) {
                 return false;
@@ -796,22 +790,22 @@ impl<'a> TypeSystem<'a> {
             g_named.offset() + g_named.len(),
         );
         while fi < f_end && gi < g_end {
-            let fm = self.table.named_member(fi);
-            let gm = self.table.named_member(gi);
-            match fm.name.as_str().cmp(gm.name.as_str()) {
+            match self.table.named_names_cmp(fi, gi) {
                 Ordering::Less => {
-                    if fm.required {
+                    if self.table.named_required(fi) {
                         return false;
                     }
                     fi += 1;
                 }
                 Ordering::Greater => return false,
                 Ordering::Equal => {
-                    if fm.required && !gm.required {
+                    if self.table.named_required(fi) && !self.table.named_required(gi) {
                         return false;
                     }
-                    let ft = self.table.substitute(fm.ty, &map);
-                    if !self.subtype_impl(gm.ty, ft, depth + 1) {
+                    let ft =
+                        self.table
+                            .substitute_rename(self.table.named_ty(fi), f_params, g_params);
+                    if !self.subtype_impl(self.table.named_ty(gi), ft, depth + 1) {
                         return false;
                     }
                     fi += 1;
@@ -821,7 +815,7 @@ impl<'a> TypeSystem<'a> {
         }
         // Remaining f parameters must not be required (subtype.dart:168-173).
         while fi < f_end {
-            if self.table.named_member(fi).required {
+            if self.table.named_required(fi) {
                 return false;
             }
             fi += 1;

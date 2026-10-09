@@ -8,12 +8,18 @@ use dartq_types::{NullabilitySuffix, TypeError, UninternedType};
 
 #[test]
 fn suffix_mapping() {
-    assert_eq!(NullabilitySuffix::Question.as_nullable(), Ok(true));
-    assert_eq!(NullabilitySuffix::None.as_nullable(), Ok(false));
-    assert_eq!(
+    // `TypeError` carries no `PartialEq` (its `SupertypeNotInterface` payload
+    // is a pool-position `TypeKind`), so `Result` equality is unavailable —
+    // the outcomes are matched instead.
+    assert!(matches!(
+        NullabilitySuffix::Question.as_nullable(),
+        Ok(true)
+    ));
+    assert!(matches!(NullabilitySuffix::None.as_nullable(), Ok(false)));
+    assert!(matches!(
         NullabilitySuffix::Star.as_nullable(),
         Err(TypeError::LegacyNullability)
-    );
+    ));
 }
 
 #[test]

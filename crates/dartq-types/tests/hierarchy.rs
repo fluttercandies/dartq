@@ -1,5 +1,7 @@
 //! Hierarchy snapshot validation: one test per [`TypeError`] path raised by
-//! [`TypeHierarchyBuilder::build`] (spec §6, R5).
+//! [`TypeHierarchyBuilder::build`] (spec §6, R5). `TypeError` carries no
+//! `PartialEq` (its `SupertypeNotInterface` payload is a pool-position
+//! [`TypeKind`]), so errors are asserted by matching.
 
 use dartq_types::{
     CoreDecls, TypeDeclId, TypeError, TypeHierarchy, TypeId, TypeKind, TypeParamId, TypeSystem,
@@ -32,7 +34,7 @@ fn duplicate_decl_is_rejected() {
     .decl(object, Vec::new())
     .build(&table)
     .expect_err("duplicate declaration");
-    assert_eq!(err, TypeError::DuplicateDecl(object));
+    assert!(matches!(err, TypeError::DuplicateDecl(d) if d == object));
 }
 
 #[test]
@@ -53,7 +55,7 @@ fn undeclared_supertype_target_is_rejected() {
     .supertype(a, itf(&table, missing, &[]))
     .build(&table)
     .expect_err("undeclared supertype target");
-    assert_eq!(err, TypeError::UndeclaredDecl(missing));
+    assert!(matches!(err, TypeError::UndeclaredDecl(d) if d == missing));
 }
 
 #[test]
@@ -75,13 +77,13 @@ fn supertype_must_be_an_interface() {
     .supertype(a, dynamic)
     .build(&table)
     .expect_err("non-interface supertype");
-    assert_eq!(
+    assert!(matches!(
         err,
         TypeError::SupertypeNotInterface {
-            decl: a,
+            decl,
             actual: TypeKind::Dynamic,
-        }
-    );
+        } if decl == a
+    ));
 }
 
 #[test]
@@ -103,14 +105,14 @@ fn supertype_arity_is_validated() {
     .supertype(a, itf(&table, iterable, &[]))
     .build(&table)
     .expect_err("wrong supertype arity");
-    assert_eq!(
+    assert!(matches!(
         err,
         TypeError::ArityMismatch {
-            decl: iterable,
+            decl,
             expected: 1,
             actual: 0,
-        }
-    );
+        } if decl == iterable
+    ));
 }
 
 #[test]
@@ -141,13 +143,10 @@ fn foreign_type_parameter_is_rejected() {
     .supertype(a, itf(&table, iterable, &[iterable_of_t]))
     .build(&table)
     .expect_err("supertype references a foreign type parameter");
-    assert_eq!(
+    assert!(matches!(
         err,
-        TypeError::ForeignTypeParameter {
-            decl: a,
-            param: iterable_t,
-        }
-    );
+        TypeError::ForeignTypeParameter { decl, param } if decl == a && param == iterable_t
+    ));
 }
 
 #[test]
@@ -202,7 +201,7 @@ fn object_supertype_edge_is_rejected() {
     .supertype(object, itf(&table, other, &[]))
     .build(&table)
     .expect_err("supertype edge owned by `Object`");
-    assert_eq!(err, TypeError::ObjectSupertype(object));
+    assert!(matches!(err, TypeError::ObjectSupertype(d) if d == object));
 }
 
 #[test]
@@ -233,7 +232,7 @@ fn nullable_supertype_edge_is_rejected() {
     .supertype(a, animal_question)
     .build(&table)
     .expect_err("nullable supertype edge");
-    assert_eq!(err, TypeError::NullableSupertype(a));
+    assert!(matches!(err, TypeError::NullableSupertype(d) if d == a));
 }
 
 #[test]

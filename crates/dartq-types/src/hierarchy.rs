@@ -14,7 +14,6 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::error::TypeError;
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
-use crate::system::DEPTH_LIMIT;
 use crate::table::TypeTable;
 use crate::ty::{TypeKind, UninternedType};
 
@@ -70,7 +69,10 @@ pub struct TypeHierarchy {
     /// Longest supertype-chain depth to `Object` per declaration, counted
     /// over *all* direct supertype edges exactly like the oracle's
     /// superinterface walk, precomputed at build time for the LUB
-    /// max-unique-depth rule (`least_upper_bound.dart:327-357`).
+    /// max-unique-depth rule (`least_upper_bound.dart:327-357`). Exact —
+    /// computed topologically with no depth cap — so the tie-break matches
+    /// the oracle's uncapped `computeLongestInheritancePathToObject` on
+    /// chains of any depth.
     depths: FxHashMap<TypeDeclId, u32>,
 }
 
@@ -243,15 +245,12 @@ impl TypeHierarchyBuilder {
             );
         }
 
-        // Precompute inheritance depths (LUB max-unique-depth rule). The
-        // graph is acyclic (validated above); the recursion is additionally
-        // capped at `DEPTH_LIMIT`, so validated-but-pathologically-deep
-        // chains saturate at the cap instead of overflowing the stack.
-        let mut depths: FxHashMap<TypeDeclId, u32> =
-            FxHashMap::with_capacity_and_hasher(decls.len(), FxBuildHasher);
-        for &decl in decls.keys() {
-            class_depth(decl, &edges, &adjacency, DEPTH_LIMIT, &mut depths);
-        }
+        // Precompute inheritance depths (LUB max-unique-depth rule) exactly:
+        // the graph is acyclic (validated above), so one iterative sweep in
+        // topological order suffices — no recursion budget that could
+        // memoize a truncated value for a node first reached deep in a
+        // chain.
+        let depths = class_depths(&decls, &edges, &adjacency);
 
         let object_question = table.intern(
             UninternedType::Interface {
@@ -277,34 +276,57 @@ impl TypeHierarchyBuilder {
 /// Longest supertype-chain depth to `Object` over all direct supertype
 /// edges (`computeLongestInheritancePathToObject`,
 /// least_upper_bound.dart:204-323): every edge targets a validated interface
-/// declaration, so the recursion covers the oracle's superinterface walk
-/// without kind filtering. The memoized DFS expects the acyclic graph
-/// validated at build time; `remaining` caps recursion at [`DEPTH_LIMIT`] so
-/// hostile-deep chains saturate at the cap instead of overflowing the stack.
-fn class_depth(
-    decl: TypeDeclId,
+/// declaration, so the walk covers the oracle's superinterface walk
+/// without kind filtering. Depths are computed exactly by a Kahn sweep
+/// over the reversed edges: a declaration is resolved only after all of its
+/// supertypes are, so `depth = 1 + max(target depths)` needs no recursion —
+/// one O(V+E) pass, unconditionally stack-safe, with no depth budget that
+/// could memoize a truncated value (the depths feed the LUB tie-break and
+/// must match the oracle's uncapped walk; only the type-operation recursion
+/// guards keep [`DEPTH_LIMIT`](crate::system::DEPTH_LIMIT)).
+fn class_depths(
+    decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],
     adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
-    remaining: u32,
-    memo: &mut FxHashMap<TypeDeclId, u32>,
-) -> u32 {
-    if let Some(&depth) = memo.get(&decl) {
-        return depth;
+) -> FxHashMap<TypeDeclId, u32> {
+    // Unresolved supertypes per owner, and the reverse adjacency that
+    // releases an owner each time one of its supertypes resolves.
+    let mut waiting: FxHashMap<TypeDeclId, usize> = decls
+        .keys()
+        .map(|&decl| (decl, adjacency.get(&decl).map_or(0, Vec::len)))
+        .collect();
+    let mut owners_of: FxHashMap<TypeDeclId, Vec<TypeDeclId>> = FxHashMap::default();
+    for &(owner, target, _) in edges {
+        owners_of.entry(target).or_default().push(owner);
     }
-    let depth = if remaining == 0 {
-        DEPTH_LIMIT
-    } else {
-        let max_child = adjacency
+
+    let mut depths: FxHashMap<TypeDeclId, u32> =
+        FxHashMap::with_capacity_and_hasher(decls.len(), FxBuildHasher);
+    // Seeds: declarations with no supertypes — only `Object`, since every
+    // other class received the implicit `Object` edge above.
+    let mut ready: Vec<TypeDeclId> = waiting
+        .iter()
+        .filter(|&(_, &count)| count == 0)
+        .map(|(&decl, _)| decl)
+        .collect();
+    while let Some(decl) = ready.pop() {
+        let depth = 1 + adjacency
             .get(&decl)
             .map_or(&[][..], Vec::as_slice)
             .iter()
-            .map(|&index| class_depth(edges[index].1, edges, adjacency, remaining - 1, memo))
+            .map(|&index| depths[&edges[index].1])
             .max()
             .unwrap_or(0);
-        (1 + max_child).min(DEPTH_LIMIT)
-    };
-    memo.insert(decl, depth);
-    depth
+        depths.insert(decl, depth);
+        for &owner in owners_of.get(&decl).into_iter().flatten() {
+            let count = waiting.get_mut(&owner).expect("owner is declared");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(owner);
+            }
+        }
+    }
+    depths
 }
 
 /// Validates one supertype edge and returns its target declaration.
@@ -416,7 +438,9 @@ mod depth_fallback {
     //! Termination pin for `pick_max_unique_depth` (lub.rs). The test lives
     //! here because only this module can corrupt a snapshot's private depth
     //! table, simulating the malformed snapshot the saturating fallback
-    //! exists for (a frozen host incident made termination repo law).
+    //! exists for (a frozen host incident made termination repo law). The
+    //! precompute itself is exact (`class_depths`, see `depth_exactness`
+    //! below), so the corruption here is purely synthetic.
 
     use super::*;
     use crate::system::TypeSystem;
@@ -477,5 +501,63 @@ mod depth_fallback {
             TypeSystem::new(&table, &hierarchy).least_upper_bound(itf(a), itf(b)),
             itf(object)
         );
+    }
+}
+
+#[cfg(test)]
+mod depth_exactness {
+    //! Regression pin for the exact depth precompute: the former budgeted
+    //! DFS memoized the saturating value for a node first reached with an
+    //! exhausted budget, so a shallow node behind a deep first-visit path
+    //! carried depth [`DEPTH_LIMIT`](crate::system::DEPTH_LIMIT) and the LUB
+    //! tie-break diverged from the oracle's uncapped
+    //! `computeLongestInheritancePathToObject`. The topological sweep must
+    //! be exact on chains of any depth.
+
+    use super::*;
+
+    #[test]
+    fn deep_chain_leaves_every_depth_exact() {
+        let table = TypeTable::new();
+        let (object, future, function) = (
+            TypeDeclId::from_raw(1),
+            TypeDeclId::from_raw(2),
+            TypeDeclId::from_raw(3),
+        );
+        // `C1 -> C2 -> ... -> C101 -> Object`: `C101` is the shallow end
+        // (depth 2) but sits 100 steps behind `C1`'s first visit, and `C1`
+        // itself is deeper than the old saturation cap (depth 102 > 100).
+        let chain = |i: u32| TypeDeclId::from_raw(3 + i);
+        let itf = |table: &TypeTable, decl: TypeDeclId| {
+            table.intern(
+                UninternedType::Interface {
+                    decl,
+                    args: Vec::new(),
+                },
+                false,
+            )
+        };
+        let mut builder = TypeHierarchy::builder(CoreDecls {
+            object,
+            future,
+            function,
+            record: None,
+        })
+        .decl(object, Vec::new())
+        .decl(future, vec![TypeParamId::from_raw(1)])
+        .decl(function, Vec::new());
+        for i in 1..=101 {
+            builder = builder.decl(chain(i), Vec::new());
+        }
+        builder = builder.supertype(chain(101), itf(&table, object));
+        for i in 1..=100 {
+            builder = builder.supertype(chain(i), itf(&table, chain(i + 1)));
+        }
+        let hierarchy = builder.build(&table).expect("deep chain is a valid DAG");
+
+        assert_eq!(hierarchy.depth(object), 1);
+        for i in 1..=101 {
+            assert_eq!(hierarchy.depth(chain(i)), 103 - i, "depth of C{i}");
+        }
     }
 }

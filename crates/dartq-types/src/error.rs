@@ -8,7 +8,11 @@ use crate::ty::TypeKind;
 /// Every variant is a caller-contract violation, not a recoverable runtime
 /// condition: the table refuses to intern malformed input so that every stored
 /// [`crate::Type`] is well-formed by construction.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Deliberately not `PartialEq`: [`TypeError::SupertypeNotInterface`] embeds
+/// a [`TypeKind`], and kinds hold pool positions, not values (see the
+/// [`TypeKind`] docs). Match on the variant instead.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TypeError {
     /// The legacy `*` suffix (pre-2.12 libraries; see
     /// `nullability_suffix.dart:20-35`) cannot appear in a dartq type: the

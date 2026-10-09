@@ -31,7 +31,15 @@ use crate::suffix::NullabilitySuffix;
 /// Bulk data (type arguments, parameters, signatures) lives in
 /// [`crate::TypeTable`] side tables; the kind carries only an opaque range or
 /// id so that the whole kind fits in 16 bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Deliberately not `PartialEq`: a kind's pooled payload is a *position*
+/// handle, so derived equality would be arity-only fake equality — two
+/// `List<...>` instantiations of equal arity but different arguments would
+/// compare equal. Compare kinds by matching (payload-free unit kinds) and
+/// types by [`crate::TypeId`]; structural questions go through the
+/// subtype/equivalence queries ([`crate::TypeSystem`], the interning
+/// contract in the [`crate::TypeTable`] docs).
+#[derive(Clone, Copy, Debug)]
 pub enum TypeKind {
     /// `Never` — the bottom type. Interning `Never` with `nullable = true`
     /// yields [`TypeKind::Null`] (type.dart:1207-1209), so a stored `Never`
@@ -84,7 +92,15 @@ pub enum TypeKind {
 }
 
 /// An interned type: a [`TypeKind`] plus the nullability dimension.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Comparison contract: identity is [`crate::TypeId`] — equal ids are
+/// structurally equal by the interner's canonical-key contract (spec §4.3,
+/// the analyzer's structural `==`, type.dart:876-889). `Type`/`TypeKind`
+/// deliberately carry no `PartialEq`: kinds hold pool *positions*, not
+/// values, so a derived comparison would be arity-only fake equality.
+/// Structural questions go through the subtype/equivalence queries
+/// ([`crate::TypeSystem`]).
+#[derive(Clone, Copy, Debug)]
 pub struct Type {
     kind: TypeKind,
     nullable: bool,
@@ -128,27 +144,14 @@ impl Type {
 /// Pools are append-only, so the range is a stable *position* handle, but
 /// equal contents need not sit at equal offsets (empty ranges, dedup
 /// rollback). Only the length is intrinsic to the shape; content equality
-/// is the table's structural comparison
-/// ([`crate::TypeTable`] internals), which is why `PartialEq`/`Hash`
-/// deliberately ignore the offset.
+/// is the table's structural comparison ([`crate::TypeTable`] internals).
+/// Deliberately no `PartialEq`/`Hash`: equality over positions is either
+/// offset-identity (meaningless across dedup) or length-only fake equality
+/// (two ranges of equal length but different contents would compare equal).
 #[derive(Clone, Copy, Debug)]
 pub struct PoolRange {
     pub(crate) offset: u32,
     pub(crate) len: u32,
-}
-
-impl PartialEq for PoolRange {
-    fn eq(&self, other: &Self) -> bool {
-        self.len == other.len
-    }
-}
-
-impl Eq for PoolRange {}
-
-impl core::hash::Hash for PoolRange {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.len.hash(state);
-    }
 }
 
 impl PoolRange {
@@ -250,8 +253,9 @@ pub struct UninternedRecord {
 }
 
 /// Pooled view of a function signature (copyable snapshot of
-/// [`UninternedFunction`] after normalization).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// [`UninternedFunction`] after normalization). Like [`PoolRange`], its
+/// payload fields are positions, not values: no `PartialEq`/`Hash`.
+#[derive(Clone, Copy, Debug)]
 pub struct FunctionSigData {
     /// The return type.
     pub return_type: TypeId,
@@ -265,8 +269,9 @@ pub struct FunctionSigData {
     pub required_positional: u32,
 }
 
-/// Pooled view of a record shape.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Pooled view of a record shape. Like [`PoolRange`], its payload fields
+/// are positions, not values: no `PartialEq`/`Hash`.
+#[derive(Clone, Copy, Debug)]
 pub struct RecordShapeData {
     /// Positional field types, in the argument pool.
     pub positional: PoolRange,

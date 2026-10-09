@@ -256,23 +256,36 @@ fn version_literal(version: Option<&str>) -> String {
 
 /// Parses `major.minor` or `major.minor.patch` (the patch part is ignored;
 /// language versions are `major.minor` only). Aligned with the runtime
-/// `FromStr for LanguageVersion`: exactly 2 or 3 dot-separated numeric parts,
-/// so a 4-part (or otherwise malformed) yaml field fails the build instead of
-/// being silently truncated.
+/// `FromStr for LanguageVersion` (src/lib.rs): exactly 2 or 3 dot-separated
+/// parts, each a bare run of ASCII digits — no sign, no whitespace — so a
+/// 4-part (or otherwise malformed) yaml field fails the build instead of
+/// being silently truncated, and a `+3.15` (which `u32::from_str` would
+/// accept) fails the build instead of silently parsing.
 fn parse_language_version(input: &str, field: &str) -> (u32, u32) {
     let mut parts = input.split('.');
     let parse = |s: Option<&str>| {
-        s.and_then(|s| s.parse::<u32>().ok())
+        s.and_then(parse_digits)
             .unwrap_or_else(|| panic!("{DATA_FILE}: {field} `{input}` is not <major>.<minor>"))
     };
     let major = parse(parts.next());
     let minor = parse(parts.next());
     match parts.next() {
         None => {}
-        Some(patch) if patch.parse::<u32>().is_ok() && parts.next().is_none() => {}
+        Some(patch) if parse_digits(patch).is_some() && parts.next().is_none() => {}
         Some(_) => panic!("{DATA_FILE}: {field} `{input}` is not <major>.<minor>[.<patch>]"),
     }
     (major, minor)
+}
+
+/// Parses a version-number part: a non-empty run of ASCII digits, nothing
+/// else — the same bare-digits rule as the runtime `parse_digits` in
+/// src/lib.rs; `u32::from_str` alone would also accept a leading `+`.
+fn parse_digits(s: &str) -> Option<u32> {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// First sentence of a `help` string: text up to the first `". "`, inclusive.

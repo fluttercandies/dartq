@@ -82,10 +82,10 @@ fn duplicate_named_members_are_rejected() {
         named: vec![named("x", fx.int(), false), named("x", fx.num(), false)],
         required_positional: 0,
     };
-    assert_eq!(
+    assert!(matches!(
         fx.table.intern_function(dup, false),
-        Err(TypeError::DuplicateNamedMember("x".to_string()))
-    );
+        Err(TypeError::DuplicateNamedMember(name)) if name == "x"
+    ));
 }
 
 #[test]
@@ -98,13 +98,13 @@ fn required_positional_count_is_validated() {
         named: Vec::new(),
         required_positional: 2,
     };
-    assert_eq!(
+    assert!(matches!(
         fx.table.intern_function(sig, false),
         Err(TypeError::RequiredPositionalOutOfBounds {
             required: 2,
             total: 1,
         })
-    );
+    ));
 }
 
 #[test]
@@ -114,10 +114,10 @@ fn record_duplicate_named_fields_are_rejected() {
         positional: vec![fx.int()],
         named: vec![named("x", fx.int(), false), named("x", fx.string(), false)],
     };
-    assert_eq!(
+    assert!(matches!(
         fx.table.intern_record(dup, false),
-        Err(TypeError::DuplicateNamedMember("x".to_string()))
-    );
+        Err(TypeError::DuplicateNamedMember(name)) if name == "x"
+    ));
 }
 
 #[test]
