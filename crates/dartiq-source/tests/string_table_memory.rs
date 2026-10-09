@@ -1,11 +1,11 @@
 //! Measured per-entry footprint of [`StringTable`] (ast-layout-spec §5 note).
 //!
 //! One test per binary with a counting global allocator: net live bytes
-//! (allocations minus frees) around interning 10k distinct 12-byte strings,
+//! (allocations minus frees) around interning 100k distinct 12-byte strings,
 //! minus the payload itself, divided by the entry count. The reported figure
 //! includes power-of-two growth slack of the id/origin vecs and the hash
-//! bucket array at exactly 10k entries; the doc note in ast-layout-spec §5
-//! quotes this measurement.
+//! bucket array at 100k entries; the doc note in ast-layout-spec §5 quotes
+//! this measurement.
 //!
 //! Run: `cargo test -p dartiq-source --test string_table_memory -- --nocapture`
 
@@ -43,7 +43,7 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 #[allow(clippy::cast_precision_loss)]
 fn string_table_per_entry_overhead() {
-    const N: u64 = 10_000;
+    const N: u64 = 100_000;
     const PAYLOAD_LEN: u64 = 12; // "id0000000001" style, exactly 12 bytes
 
     let table = StringTable::new();
