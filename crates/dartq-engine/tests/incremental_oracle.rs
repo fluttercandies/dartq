@@ -12,13 +12,11 @@
 //! `analyze()` per step; bytes identical, event stream identical to the
 //! combined apply+analyze stream).
 //!
-//! C8's name-form halves are engine-green and its pins hold end to end; C3
-//! and C5's semantic halves light through the wired `SemanticDiagnoser`
+//! C8's name-form halves are engine-green and its pins hold end to end; C1,
+//! C3 and C5's semantic halves light through the wired `SemanticDiagnoser`
 //! (#236: the default `semdiag::Diagnoser`, the graph-level dart:core face).
-//! Three cases stay red on pre-existing gaps the working seam exposed, none
-//! of them seam defects: C1's step-3 case content drops b's import while its
-//! A3 expectation claims ∅ (contradicting C3's own `undefined_function`
-//! expectation for the identical no-import shape — adjudication needed); C5's
+//! Two cases stay red on pre-existing gaps the working seam exposed, none
+//! of them seam defects: C5's
 //! overlay-only part file interns under a different FileTable spelling than
 //! the resolver composes (existence-dependent normalization), so the part
 //! claim misses residency and p2 forms an orphan singleton; C7's
@@ -124,16 +122,13 @@ struct Case {
     order_pin: Option<usize>,
 }
 
-/// C1 — body change, gate no-op, closure direction (l1-spec ①). RED at step
-/// 3 on a case-content defect the wired diagnoser exposed (the semantic
-/// families were unwired when the table was authored): step 3's b content
-/// `int g() => f() + 0;` drops the `import 'a.dart';` line, so `f` is
-/// genuinely undefined and the engine reports `undefined_function` — exactly
-/// what CASE_C3 steps 0/2 pin for the identical no-import shape, and what
-/// the oracle's dart analyze produces. The §2 doc's ∅ delta cannot hold for
-/// this content; either the step content keeps the import (the doc-intent
-/// body edit) or the A3 entry gains the diagnostic. Case-content edits are
-/// out of this lane's mandate, so the table stays as authored.
+/// C1 — body change, gate no-op, closure direction (l1-spec ①). Step 3's b
+/// content `int g() => f() + 0;` drops the `import 'a.dart';` line, so `f`
+/// is genuinely undefined there — the identical no-import shape C3 steps 0/2
+/// pin. Adjudicated #288 against the oracle probe
+/// (docs/facts/oracle-probes/c1/, dart analyze 3.13.1): the case doc's ∅
+/// delta was the case defect; the A3 table asserts `undefined_function` on b
+/// at step 3 (∅ through steps 0-2, where b still carries the import).
 static CASE_C1: Case = Case {
     id: "C1",
     initial: &[("lib/a.dart", C1_A0), ("lib/b.dart", C1_B0)],
@@ -157,7 +152,14 @@ static CASE_C1: Case = Case {
             invalidated: &["lib/b.dart"],
         },
     ],
-    absolute: Absolute::Empty,
+    absolute: Absolute::Explicit(&[
+        // Step 0 baseline and steps 1-2: b still imports a, so f resolves.
+        &[],
+        &[],
+        &[],
+        // Step 3: C1_B1 drops the import — same shape as C3 step 0 (#288).
+        &[("undefined_function", "lib/b.dart")],
+    ]),
     stable_bytes: &[],
     mode_b: false,
     order_pin: None,
