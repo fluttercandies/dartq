@@ -227,6 +227,7 @@ dependencies = [
  "dartq-package",
  "dartq-pub",
  "dartq-sdk",
+ "dartq-snapshot",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -380,6 +381,10 @@ dependencies = [
 [[package]]
 name = "dartq-schema"
 version = "0.1.0"
+dependencies = [
+ "dartq-ai",
+ "serde_json",
+]
 
 [[package]]
 name = "dartq-sdk"
@@ -396,6 +401,7 @@ dependencies = [
 name = "dartq-semantic"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "dartq-diagnostics",
  "dartq-language",
  "dartq-parser",
