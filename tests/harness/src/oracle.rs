@@ -16,7 +16,7 @@ use crate::machine::{MachineDiag, OutputFormat, parse_output};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 /// `try_wait` poll interval (the timeout resolution floor).
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `dart analyze` driver. `dart` is the executable path (defaults to dart on PATH).
 /// `--no-fatal-warnings` makes the exit code reflect only 0/3 (facts §7.9); diagnostic output is unaffected.
@@ -301,7 +301,7 @@ pub(crate) fn run_captured(
 /// fails with ESRCH); both are no-ops on an already-exited target. Windows has
 /// no std-level process-group equivalent, so only the direct child is killed
 /// there.
-fn kill_driver(child: &mut std::process::Child) {
+pub(crate) fn kill_driver(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: kill(2) with a negative PID signals the process group whose
@@ -313,8 +313,9 @@ fn kill_driver(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-/// Last 5 stderr lines (diagnostic tail for failure reports).
-fn stderr_tail(stderr: &[u8]) -> String {
+/// Last 5 stderr lines (diagnostic tail for failure reports). Shared with the
+/// bench drivers' exit validation.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(5);
@@ -322,15 +323,16 @@ fn stderr_tail(stderr: &[u8]) -> String {
 }
 
 /// Temp capture files for one driver invocation; removed on drop (all exit paths).
-struct TempCapture {
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+/// Shared with the bench sampler (`bench::run_sampled`).
+pub(crate) struct TempCapture {
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
 }
 
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 impl TempCapture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let id = NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!("dq_harness_{}_{}", std::process::id(), id));
         Self {
@@ -339,11 +341,11 @@ impl TempCapture {
         }
     }
 
-    fn stdout_bytes(&self) -> Vec<u8> {
+    pub(crate) fn stdout_bytes(&self) -> Vec<u8> {
         std::fs::read(&self.stdout_path).unwrap_or_default()
     }
 
-    fn stderr_bytes(&self) -> Vec<u8> {
+    pub(crate) fn stderr_bytes(&self) -> Vec<u8> {
         std::fs::read(&self.stderr_path).unwrap_or_default()
     }
 }

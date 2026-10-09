@@ -15,7 +15,8 @@ use crate::oracle::{driver_timeout_from_env, run_captured};
 /// docs/facts/version-skew.md §4): a lower pin re-disables shipped language
 /// features (e.g. inline-class @ 3.3) and floods the gate with
 /// `experiment_not_enabled` assembly noise (51/51 of the old syntactic bucket).
-const PUBSPEC: &str = "name: corpus_m0\nenvironment:\n  sdk: ^3.13.0\n";
+/// Shared with the bench fixture materialization (`bench::BenchFixture`).
+pub(crate) const PUBSPEC: &str = "name: corpus_m0\nenvironment:\n  sdk: ^3.13.0\n";
 
 /// Minimum corpus language version (Plan A, docs/facts/version-skew.md §4).
 const MIN_LANGUAGE_VERSION: (u32, u32) = (3, 13);

@@ -66,6 +66,13 @@ impl DartqDriver {
         args
     }
 
+    /// argv pair for one corpus dir — the program and its `{dir}`-substituted
+    /// arguments (see [`Self::command_args`]). Exposed for the bench
+    /// collectors, which drive the command directly (RSS sampling, timing).
+    pub(crate) fn command(&self, corpus_dir: &Path) -> (&str, Vec<String>) {
+        (self.program.as_str(), self.command_args(corpus_dir))
+    }
+
     /// One classified dartq invocation: valid exits (0-3) measure, the crash
     /// tier (exit 4 with empty stdout — a panicking whole-batch run) surfaces
     /// as [`DartqProbe::Panic`] so the corpus auto-bisect can key on it, and

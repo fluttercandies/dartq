@@ -6,6 +6,7 @@
 //! under the severity filter — pure-report mode, verdict SKIPPED); 1 = below gate;
 //! 2 = harness error of its own.
 
+mod bench;
 mod bisect;
 mod compare;
 mod corpus;
@@ -58,6 +59,7 @@ fn dispatch(args: &[String]) -> Result<(String, bool), Outcome> {
     match args.first().map(String::as_str) {
         Some("corpus") => run_corpus(&args[1..]).map(|s| (s, true)),
         Some("run") => run_compare(&args[1..]),
+        Some("bench") => bench::bench_entry(&args[1..]),
         Some("--help" | "-h" | "help") | None => {
             print_usage();
             Ok((String::new(), true))
@@ -121,7 +123,39 @@ fn print_usage() {
       attribution report under --out.
       Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD})
       or the gate not in scope under --severity-filter (verdict SKIPPED,
-      pure-report mode), 1 = below threshold, 2 = harness error."
+      pure-report mode), 1 = below threshold, 2 = harness error.
+
+  harness bench [--metric NAME]... [--corpus-dir DIR] [--out DIR]
+                [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
+                [--rss-interval-ms MS] [--with-oracle]
+      §19.3 benchmark metric collectors (PRD §1.5), one JSON report per
+      metric under <out>/<metric>/report.json (schema_version 1; every
+      report records its inputs for reproducibility). --metric is
+      repeatable (rss-100k | incremental-p95 | token-cost); default = all
+      three, in that order. Default corpus: {DEFAULT_TARGET}; default
+      out: docs/audits/bench.
+      rss-100k: peak tree-RSS of one full dartq analysis over the corpus
+      (/bin/ps polling at --rss-interval-ms, default 50ms, process-group
+      tree walk; an 8 GiB tree-RSS watchdog kills the sampled group),
+      divided by LOC/100_000. LOC = non-blank lines (>= 1 non-whitespace
+      character) across the corpus .dart files, .dart_tool excluded; the
+      verbatim definition rides every report.
+      incremental-p95: per-step wall time of the dartq driver over a
+      materialized fixture package driven through --manifest (edit
+      manifest JSON, incremental_oracle batch shape:
+      {{\"initial\": {{path: content}}?, \"steps\": [{{\"edits\": [{{path,
+      content | remove}}]}}]}}; initial present = fresh package from it,
+      absent = a copy of the corpus). Reports P50/P95/P99 (nearest-rank)
+      over the edit steps; --with-oracle additionally captures one full
+      `dart analyze` wall time per step into the oracle column.
+      token-cost: `dartq check --format=machine` stdout vs `dart analyze
+      --format=machine` stdout on the same corpus, tokenized with the
+      chars-per-4 heuristic (pluggable tokenizer trait; cl100k slots in
+      behind it); reports both totals and the savings ratio.
+      The collectors drive real analysis processes; run them in the serial
+      verification phase only (memory-incident discipline).
+      Exit codes: 0 = every requested metric produced a report, 2 = harness
+      error (bad flags, corpus preflight, driver failure, watchdog trip)."
     );
 }
 
@@ -384,7 +418,7 @@ fn gate_verdict(error_in_scope: bool, error_jaccard: f64, threshold: f64) -> rep
     }
 }
 
-fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
+pub(crate) fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
     if !corpus_dir.join("pubspec.yaml").is_file() {
         return Err(Outcome::Error(format!(
             "`{}` is not a corpus package; run `harness corpus` first",
@@ -652,14 +686,14 @@ fn parse_codes_file(text: &str) -> Result<BTreeSet<String>, Outcome> {
     Ok(codes)
 }
 
-fn value<'a>(args: &'a [String], i: &mut usize) -> Result<&'a str, Outcome> {
+pub(crate) fn value<'a>(args: &'a [String], i: &mut usize) -> Result<&'a str, Outcome> {
     *i += 1;
     args.get(*i)
         .map(String::as_str)
         .ok_or_else(|| Outcome::Error(format!("flag `{}` requires a value", args[*i - 1])))
 }
 
-fn unknown_flag(flag: &str, subcommand: &str) -> Outcome {
+pub(crate) fn unknown_flag(flag: &str, subcommand: &str) -> Outcome {
     Outcome::Error(format!(
         "unknown flag `{flag}` for `{subcommand}`; see `harness --help`"
     ))
