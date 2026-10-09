@@ -22,7 +22,7 @@
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
 //! (analyze), `event`, `cancel`, `query` (the `query symbol` face, PRD
-//! §20.3).
+//! §20.3), `semdiag` (the default semantic diagnoser, #236).
 //!
 //! # The semantic diagnostics seam (#120/#121)
 //!
@@ -30,17 +30,17 @@
 //! diagnostics itself. Semantic diagnosis — `undefined_*`, `wrong_number_*`,
 //! the part/part-of family — plugs in through [`SemanticDiagnoser`]: the
 //! trait lives here so the engine needs no dependency edge back upward, and
-//! its implementor lives above the engine (the CLI wires a small adapter
-//! onto the dartq-semantic diagnostic modules once #120/#121 land —
-//! dartq-semantic itself cannot implement it without inverting the
-//! dependency). With no diagnoser configured the engine under-reports
-//! exactly those families and nothing else.
+//! the engine ships the default implementor ([`semdiag::Diagnoser`], #236),
+//! which folds `dartq_semantic::diagnose` over the [`LibraryView`] faces.
+//! With no diagnoser configured the engine under-reports exactly those
+//! families and nothing else.
 
 pub mod cancel;
 pub mod event;
 pub mod l1;
 pub mod pipeline;
 pub mod query;
+pub mod semdiag;
 pub mod state;
 
 use std::path::{Path, PathBuf};
@@ -437,7 +437,11 @@ impl CsrGraph {
 
 /// Read-only view of one library for the semantic diagnostics seam — the
 /// context #120/#121 diagnose against (semantic crate's assumption contract
-/// documents what these fields guarantee).
+/// documents what these fields guarantee). The per-unit faces a
+/// `dartq_semantic::diagnose` fold needs ride here: source text
+/// ([`LibraryView::store`] + the facts' content ids) and the token table
+/// (re-derived through the apply-phase scan face — the #210 per-query
+/// posture, no persistent token residency).
 pub struct LibraryView<'a> {
     /// The engine library id.
     pub library: LibraryId,
@@ -454,16 +458,23 @@ pub struct LibraryView<'a> {
     pub facts: &'a FxHashMap<FileId, Arc<UnitFacts>>,
     /// The SDK snapshot (`dart:` library support queries).
     pub sdk: &'a SdkSnapshot,
+    /// The content store backing the facts' content ids (per-unit source).
+    pub store: &'a (dyn dartq_source::SourceStore + Send + Sync),
+    /// The package identity table (per-file language version source).
+    pub packages: &'a PackageTable,
+    /// The interned paths (file → path for the package attribution).
+    pub file_table: &'a FileTable,
+    /// The import namespaces of the current graph (built once per analyze).
+    pub namespaces: &'a dartq_resolution::Namespaces,
 }
 
 /// The semantic diagnostics plug point (#120/#121).
 ///
-/// Implemented above the engine (the CLI wires it onto the dartq-semantic
-/// diagnostic modules — dartq-semantic cannot depend on the engine without
-/// inverting the layering). Per-library calls arrive on the batch fan-out
-/// workers, so implementations must be `Send + Sync` and stateless across
-/// calls; diagnostics append into `out` and carry no ordering obligations (the
-/// engine sorts canonically).
+/// The engine ships the default implementor ([`semdiag::Diagnoser`], folding
+/// `dartq_semantic::diagnose`); a caller may substitute its own. Per-library
+/// calls arrive on the batch fan-out workers, so implementations must be
+/// `Send + Sync` and stateless across calls; diagnostics append into `out`
+/// and carry no ordering obligations (the engine sorts canonically).
 pub trait SemanticDiagnoser: Send + Sync {
     /// Appends this library's semantic diagnostics to `out`.
     fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Diagnostic>);

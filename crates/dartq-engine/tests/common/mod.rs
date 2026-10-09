@@ -118,7 +118,9 @@ impl Fixture {
     }
 
     /// A fresh engine over the fixture (SDK reloads per engine — the
-    /// snapshot is not `Clone`, and loading is a few metadata reads).
+    /// snapshot is not `Clone`, and loading is a few metadata reads). The
+    /// semantic diagnoser is on by default (#236) — the same posture the
+    /// CLI's analyze path ships.
     pub fn engine(&self) -> Engine {
         Engine::new(EngineConfig {
             store: memory_store(),
@@ -126,7 +128,7 @@ impl Fixture {
             packages: self.packages.clone(),
             pub_config: Arc::clone(&self.config),
             config_dir: self.config_dir.clone(),
-            semdiag: None,
+            semdiag: Some(dartq_engine::semdiag::diagnoser()),
         })
         .expect("engine")
     }

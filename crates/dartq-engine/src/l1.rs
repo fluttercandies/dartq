@@ -8,12 +8,15 @@ use std::sync::Arc;
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
+use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{
     CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver,
 };
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
-use dartq_source::{ContentId, FileId, SourceRange, StringTable, utf16_len_of};
+use dartq_source::{
+    ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of,
+};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -159,7 +162,7 @@ fn recompute_facts(
     // single source of truth for file → package attribution).
     let versions: Vec<LanguageVersion> = changed
         .iter()
-        .map(|(file, _, _)| language_version_for(state, *file))
+        .map(|(file, _, _)| language_version_for(&state.packages, &state.files, *file))
         .collect();
 
     // Cache lookups up front (read-only); misses dispatch to the fan-out
@@ -222,13 +225,18 @@ fn recompute_facts(
         .collect()
 }
 
-/// The per-file language version: owning package version, or the default
-/// when the file belongs to no package (engine-api-spec §1.1).
-fn language_version_for(state: &EngineState, file: FileId) -> LanguageVersion {
-    state
-        .files
+/// The per-file language version: the owning package's version, or the
+/// default when the file belongs to no package (engine-api-spec §1.1) — the
+/// engine's single source of truth for file → package attribution, shared by
+/// the apply recompute and the semantic-seam fold.
+pub(crate) fn language_version_for(
+    packages: &IdentityTable,
+    files: &FileTable,
+    file: FileId,
+) -> LanguageVersion {
+    files
         .path(file)
-        .and_then(|path| state.packages.containing(path))
+        .and_then(|path| packages.containing(path))
         .and_then(|identity| identity.language_version)
         .map(dartq_pub::LanguageVersion::into_inner)
         .unwrap_or(DEFAULT_LANGUAGE_VERSION)

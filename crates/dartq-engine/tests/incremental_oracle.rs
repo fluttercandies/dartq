@@ -12,18 +12,21 @@
 //! `analyze()` per step; bytes identical, event stream identical to the
 //! combined apply+analyze stream).
 //!
-//! C8 is doc-faithful and currently RED on substance, for two engine-side
-//! reasons: the engine builds part-of belonging edges from URI-resolved
-//! targets only, so a name-form `part of p8;` file never joins library n,
-//! and the URI layer mis-resolves the name-form directive itself (it emits a
-//! bogus `uri_with_interpolation` at offset 0). C3/C5/C7 are red only on
-//! their `undefined_function` entries: the fixture's engine has
-//! `semdiag: None`, and no `SemanticDiagnoser` adapter can be written
-//! test-side yet because `LibraryView` exposes neither the source text nor
-//! the token table `dartq_semantic::diagnose` needs. Their URI-layer halves
-//! are verified green (C7 step 1 fires exactly the contracted
-//! `uri_does_not_exist` pair over a green A2 + A1). Faithful red over fake
-//! green; see the case comments.
+//! C8's name-form halves are engine-green and its pins hold end to end; C3
+//! and C5's semantic halves light through the wired `SemanticDiagnoser`
+//! (#236: the default `semdiag::Diagnoser`, the graph-level dart:core face).
+//! Three cases stay red on pre-existing gaps the working seam exposed, none
+//! of them seam defects: C1's step-3 case content drops b's import while its
+//! A3 expectation claims ∅ (contradicting C3's own `undefined_function`
+//! expectation for the identical no-import shape — adjudication needed); C5's
+//! overlay-only part file interns under a different FileTable spelling than
+//! the resolver composes (existence-dependent normalization), so the part
+//! claim misses residency and p2 forms an orphan singleton; C7's
+//! `undefined_function` entries are suppressed by dartq-semantic's
+//! `UndefinedGuard` (a bare miss under any unfiltered broken import
+//! over-suppresses; the oracle ignores only show-listed names — its own doc
+//! defers the tightening). Faithful red over fake green; see the case
+//! comments.
 //!
 //! The manifests and expectations live as in-test tables. Hoisting them into
 //! `tests/cases/<case>/{manifest.json, expectations.json}` (§4 placement) is
@@ -121,7 +124,16 @@ struct Case {
     order_pin: Option<usize>,
 }
 
-/// C1 — body change, gate no-op, closure direction (l1-spec ①).
+/// C1 — body change, gate no-op, closure direction (l1-spec ①). RED at step
+/// 3 on a case-content defect the wired diagnoser exposed (the semantic
+/// families were unwired when the table was authored): step 3's b content
+/// `int g() => f() + 0;` drops the `import 'a.dart';` line, so `f` is
+/// genuinely undefined and the engine reports `undefined_function` — exactly
+/// what CASE_C3 steps 0/2 pin for the identical no-import shape, and what
+/// the oracle's dart analyze produces. The §2 doc's ∅ delta cannot hold for
+/// this content; either the step content keeps the import (the doc-intent
+/// body edit) or the A3 entry gains the diagnostic. Case-content edits are
+/// out of this lane's mandate, so the table stays as authored.
 static CASE_C1: Case = Case {
     id: "C1",
     initial: &[("lib/a.dart", C1_A0), ("lib/b.dart", C1_B0)],
@@ -222,9 +234,8 @@ static CASE_C6: Case = Case {
 /// `undefined_function`, the remove re-breaks it, a second import to an
 /// unresolvable target adds `uri_does_not_exist`, and dropping it heals
 /// again. b's directive changes rebuild b's outgoing edges only, so a is
-/// never invalidated. KNOWN RED (shared with C5/C7): the
-/// `undefined_function` entries need a wired `SemanticDiagnoser`, which no
-/// `LibraryView` consumer can provide yet.
+/// never invalidated. Green end to end over the wired semantic diagnoser
+/// (#236).
 static CASE_C3: Case = Case {
     id: "C3",
     initial: &[("lib/a.dart", C1_A0), ("lib/b.dart", C3_B0)],
@@ -269,8 +280,16 @@ static CASE_C3: Case = Case {
 /// C5 — part add/remove: library shape change (l1-spec ⑤). One batch edits a
 /// and interns p2; the membership churn rebuilds a's content identity (part
 /// directive order, §7.4) and step 2 must round-trip it — over-cascade to b
-/// is L1 definition behavior. KNOWN RED: see CASE_C3 (the `r()` miss at
-/// steps 0/2 needs the unwired semantic diagnoser).
+/// is L1 definition behavior. The semantic half is wired (#236). RED on a
+/// pre-existing engine divergence the harness's path projection used to mask:
+/// overlay-only p2 (never on disk) interns under the literal temp_dir
+/// spelling while a's re-resolved `part 'p2.dart'` composes from a's
+/// canonicalized path — FileTable normalization is existence-dependent, so
+/// the two spellings carry different ids, the part claim misses residency,
+/// and p2 forms an orphan singleton (`invalidated` gains it; the gap rule
+/// would add a bogus `uri_does_not_exist`). Fix belongs to the
+/// resolution/formation layer: reconcile freshly resolved targets against
+/// residency by canonical URI.
 static CASE_C5: Case = Case {
     id: "C5",
     initial: &[
@@ -307,9 +326,13 @@ static CASE_C5: Case = Case {
 /// target left residency carries `uri_does_not_exist`) is what surfaces the
 /// deletions in both arms. Step 3: library a ceases, pa's `part of 'a.dart'`
 /// dangles, and pa reappears in `invalidated` as a newly-formed singleton —
-/// the engine-api-spec §1.2 orphan rule, observed. KNOWN RED: the
-/// `undefined_function` entries need the unwired semantic diagnoser (see
-/// CASE_C3); the URI half is verified green.
+/// the engine-api-spec §1.2 orphan rule, observed. RED on the semantic half:
+/// dartq-semantic's `UndefinedGuard` suppresses a bare miss under ANY
+/// unfiltered broken import, so `u()` after util's removal is silenced — the
+/// oracle ignores only show-listed names (element.dart:7470-7502) and
+/// expects the pair. The guard's own doc defers the tightening to
+/// show-clause enumeration; the fix belongs in dartq-semantic. The URI half
+/// is verified green.
 static CASE_C7: Case = Case {
     id: "C7",
     initial: &[
@@ -370,17 +393,11 @@ static CASE_C7: Case = Case {
 };
 
 /// C8 — name-form `part of` + rename orphan (l1-spec §7.1, engine-api-spec
-/// §5.3). KNOWN RED on substance, two engine-side causes. First, the URI
-/// layer mis-resolves the name-form directive: `walk_part` records
-/// `uri: None`, `resolve_unit` still pushes it through `resolve`, and the
-/// null-URI branch codes it `uri_with_interpolation` at offset 0 — pn's only
-/// step-0 diagnostic, where the contract expects `duplicate_definition`.
-/// Second, belonging edges claim URI-resolved `part` targets only
-/// (`reform_libraries` matches `ResolvedTarget::Resolved`), so pn stays an
-/// orphan singleton: g never enters n's scope and step 1's cascade cannot
-/// reach [m, n]. Expectations stay doc-faithful (faithful red over fake
-/// green); the pins flip when URI resolution skips name-form part-of and
-/// the §7.1 bounded same-package name scan lands.
+/// §5.3). Green end to end: the URI layer skips name-form part-of
+/// resolution, the §7.1 bounded same-package name scan claims pn, the
+/// capture-time duplicate log bakes step 0's `duplicate_definition`, and the
+/// wired semantic diagnoser reports m's `g()` loss after the rename orphan
+/// leaves n's scope (#236).
 static CASE_C8: Case = Case {
     id: "C8",
     initial: &[
@@ -525,10 +542,13 @@ fn relative(fixture: &Fixture, file: FileId, engine: &Engine) -> String {
         .path(file)
         .expect("event file is resident");
     // dartq-pub canonicalizes package roots, so on macOS interned paths live
-    // under /private/var while temp_dir() spells /var: strip against the
-    // canonical root, not the literal one.
-    let root = fixture.root.canonicalize().expect("fixture root resolves");
-    path.strip_prefix(&root)
+    // under /private/var while temp_dir() spells /var. Overlay-only files
+    // (never on disk) keep the literal temp_dir spelling — FileTable
+    // canonicalizes existing paths only — so strip against whichever root
+    // spelling the interned path carries.
+    let canonical = fixture.root.canonicalize().expect("fixture root resolves");
+    path.strip_prefix(&canonical)
+        .or_else(|_| path.strip_prefix(&fixture.root))
         .expect("fixture-relative path")
         .to_string_lossy()
         .into_owned()

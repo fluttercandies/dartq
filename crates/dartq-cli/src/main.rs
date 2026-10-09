@@ -49,6 +49,7 @@ use dartq_engine::{
     CancellationToken, Cancelled, DeclHit, DeclKind, Engine, EngineConfig, EngineEvent, RefHit,
     RefKind, SymbolAnswer, memory_store,
 };
+use dartq_engine::semdiag;
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
 };
@@ -512,7 +513,9 @@ fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), u8> 
         packages,
         pub_config: config,
         config_dir,
-        semdiag: None,
+        // The semantic families are part of the analyze contract (#236):
+        // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
+        semdiag: Some(semdiag::diagnoser()),
     }) {
         Ok(engine) => engine,
         Err(error) => {

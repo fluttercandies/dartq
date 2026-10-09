@@ -4,12 +4,14 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::Diagnostic;
 use dartq_resolution::{
-    ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, ResolutionCode, ResolvedTarget,
+    Combinators, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
+    ResolutionCode, ResolvedTarget,
 };
 use dartq_semantic::MicroKind;
 use dartq_source::FileId;
@@ -62,6 +64,16 @@ pub(crate) fn analyze(
     // into no-ops, completed libraries keep their results.
     let cancelled = AtomicBool::new(false);
     let resolved = graph.as_ref();
+
+    // The semantic seam's shared context (#236): the import namespaces every
+    // per-library fold resolves through, built once when a diagnoser is
+    // configured and there is work — a per-library build would square the
+    // cost, and a clean workset needs none. The element models stay
+    // un-cloned here: the fold indexes only its own library's members (see
+    // `semdiag`), so no per-analyze workspace-wide copy exists.
+    let seam = (semdiag.is_some() && !order.is_empty())
+        .then(|| Namespaces::build(&resolved.expect("graph exists when libraries exist").graph));
+
     let computed: Vec<Option<(Duration, Vec<Diagnostic>)>> = order
         .par_iter()
         .map(|library| {
@@ -74,6 +86,7 @@ pub(crate) fn analyze(
                 state,
                 resolved.expect("graph exists when libraries exist"),
                 semdiag,
+                seam.as_ref(),
                 *library,
             );
             Some((start.elapsed(), diagnostics))
@@ -149,6 +162,7 @@ fn diagnose_library(
     state: &EngineState,
     resolved: &ResolvedGraph,
     semdiag: Option<&dyn SemanticDiagnoser>,
+    seam: Option<&Namespaces>,
     library: LibraryId,
 ) -> Vec<Diagnostic> {
     let info = state.libraries.info(library).expect("live library");
@@ -178,7 +192,8 @@ fn diagnose_library(
             }
         }
     }
-    if let Some(seam) = semdiag {
+    if let Some(diagnoser) = semdiag {
+        let namespaces = seam.expect("seam context exists when a diagnoser is configured");
         let view = LibraryView {
             library,
             files: &members,
@@ -187,17 +202,101 @@ fn diagnose_library(
             strings: &state.strings,
             facts: &state.residency,
             sdk: &state.sdk,
+            store: state.store.as_ref(),
+            packages: &state.packages,
+            file_table: &state.files,
+            namespaces,
         };
-        seam.diagnose_library(view, &mut out);
+        diagnoser.diagnose_library(view, &mut out);
     }
     out
 }
 
-/// Builds the resolution stage from the current residency: interned library
-/// nodes (canonical URIs), local declarations per member file (part files
-/// folded into their library, type parameters skipped per the element
-/// model's contract), and the resolved import/export edges.
-fn build_library_graph(state: &EngineState) -> ResolvedGraph {
+/// The dart:core public face the engine's implicit core import resolves
+/// against: dart:core's own top-level declarations plus its
+/// `dart:async`/`dart:collection` export face, verbatim from the reference
+/// SDK (`sdk/lib/core/*.dart` class/typedef/top-level-function surface).
+/// Names are declared into the synthetic core graph node (`build_library_graph`);
+/// a local or imported declaration of the same name shadows the face
+/// (locals beat imports), matching the implicit import's lowest precedence.
+const DART_CORE_FACE: &[&str] = &[
+    "ArgumentError",
+    "AssertionError",
+    "BigInt",
+    "Comparable",
+    "Comparator",
+    "ConcurrentModificationError",
+    "DateTime",
+    "Deprecated",
+    "Duration",
+    "Enum",
+    "Error",
+    "Exception",
+    "Expando",
+    "Finalizer",
+    "FormatException",
+    "Function",
+    "Future",
+    "FutureExtensions",
+    "FutureIterable",
+    "FutureRecord2",
+    "FutureRecord3",
+    "FutureRecord4",
+    "FutureRecord5",
+    "FutureRecord6",
+    "FutureRecord7",
+    "FutureRecord8",
+    "FutureRecord9",
+    "IndexError",
+    "IntegerDivisionByZeroException",
+    "Invocation",
+    "IterableExtensions",
+    "Iterator",
+    "List",
+    "Map",
+    "MapEntry",
+    "Match",
+    "NoSuchMethodError",
+    "Null",
+    "Object",
+    "OutOfMemoryError",
+    "ParallelWaitError",
+    "Pattern",
+    "RangeError",
+    "Record",
+    "RegExp",
+    "RegExpMatch",
+    "RuneIterator",
+    "Runes",
+    "Set",
+    "Sink",
+    "StackOverflowError",
+    "StackTrace",
+    "StateError",
+    "Stopwatch",
+    "Stream",
+    "String",
+    "StringBuffer",
+    "StringSink",
+    "Symbol",
+    "Type",
+    "TypeError",
+    "UnimplementedError",
+    "UnsupportedError",
+    "Uri",
+    "UriData",
+    "WeakReference",
+    "bool",
+    "double",
+    "identical",
+    "identityHashCode",
+    "int",
+    "num",
+    "pragma",
+    "print",
+];
+
+fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     let mut builder = LibraryGraphBuilder::new(&state.strings);
     let mut graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId> = FxHashMap::default();
 
@@ -213,8 +312,34 @@ fn build_library_graph(state: &EngineState) -> ResolvedGraph {
             }
         }
     }
+
+    // The implicit `dart:core` import (the analyzer's synthesized core
+    // import): one synthetic graph node carrying dart:core's public face,
+    // imported unfiltered by every library. A hit answers "defined" without
+    // an element model — kind-unknown, so container and member questions
+    // about core faces suppress (the M1 under-report posture) — while a
+    // name outside the face still reports: the edge carries declarations,
+    // not suppressions, and the semantic engine's undefined guard reads
+    // broken (`target: None`) edges only. The node has no engine-library
+    // mapping: no directive resolves to it, and it contributes no
+    // dependency edges (cascade and CSR shapes are untouched).
+    let core_file = state.files.intern(Path::new("<dart:core>"));
+    let core = builder.intern("dart:core");
+    for name in DART_CORE_FACE {
+        builder.declare(core, state.strings.intern(name), core_file);
+    }
+
     for library in state.libraries.live() {
         let graph_id = graph_ids[&library];
+        builder.import(
+            graph_id,
+            ImportEdge {
+                target: Some(core),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
         for file in member_files(state.libraries.info(library).expect("live library")) {
             for directive in &state.residency[&file].directives {
                 match directive.kind {
