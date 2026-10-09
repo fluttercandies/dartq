@@ -44,25 +44,31 @@
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
 
 use crate::model::{Container, FileElements, MemberEntry, MicroKind, TopDecl};
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
+///
+/// Models are shared by [`Arc`]: inserting from a shared store is a refcount
+/// bump, so indexing beyond the diagnosing library — the cross-library
+/// member-walk face (#236's zero-clone design) — costs no deep clones.
 #[derive(Debug, Default)]
 pub struct ElementIndex {
-    files: FxHashMap<FileId, FileElements>,
+    files: FxHashMap<FileId, Arc<FileElements>>,
 }
 
 impl ElementIndex {
-    /// Stores (or replaces, on re-analysis) the model of `file`.
-    pub fn insert(&mut self, file: FileId, elements: FileElements) {
-        self.files.insert(file, elements);
+    /// Stores (or replaces, on re-analysis) the model of `file`. An
+    /// [`Arc`] clone shares the model; an owned value is taken.
+    pub fn insert(&mut self, file: FileId, elements: impl Into<Arc<FileElements>>) {
+        self.files.insert(file, elements.into());
     }
 
     /// The model of `file`, if analyzed.
     #[must_use]
     pub fn get(&self, file: FileId) -> Option<&FileElements> {
-        self.files.get(&file)
+        self.files.get(&file).map(Arc::as_ref)
     }
 }
 

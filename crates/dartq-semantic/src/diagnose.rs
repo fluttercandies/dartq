@@ -108,19 +108,16 @@
 //!
 //! # The undefined guard (analyzer `shouldIgnoreUndefined`)
 //!
-//! `element.dart:7470-7502`: a name referenced through an import whose target
-//! did not resolve is suppressed. The mirror reads the graph's import edges
-//! (`target: None`) and suppresses through the combinators' `allows`
-//! predicate — narrower oracle fidelity needs show-clause enumeration, which
-//! lives in `dartq_resolution` (see [`UndefinedGuard`] for the recorded
-//! divergence: bare misses under an unfiltered broken import are
-//! over-suppressed, an under-report direction). The `_$`-generated-part
-//! clause needs the part tree; the parser has no part events yet, so it is
-//! deferred with the directive milestone (the clause only ever suppresses).
-//! Because `target: None` edges suppress bare misses, an M1 harness models
-//! core-library names through concrete declarations or shown broken edges —
-//! never a blanket unfiltered core import, or the `undefined_identifier`
-//! path goes dead.
+//! `element.dart:8217-8250`: a name referenced through an import whose target
+//! did not resolve is suppressed — but the filter face is show-list-only. The
+//! mirror reads the graph's import edges (`target: None`) and suppresses a
+//! name listed in a broken import's `show` clause, or a prefixed name whose
+//! broken import has no `show` clause; a bare miss under an unfiltered or
+//! hide-only broken import still reports ([`UndefinedGuard`]). The
+//! `_$`-generated-part clause needs the part tree; the parser has no part
+//! events yet, so it is deferred with the directive milestone (the clause
+//! only ever suppresses). Harnesses model core-library names through
+//! concrete declarations or shown broken edges.
 //!
 //! # False-positive defenses (each mirrors a verified analyzer behavior)
 //!
@@ -161,8 +158,9 @@
 //! (constructors outside the M1 model), `undefined_referenced_parameter`
 //! (`@UseResult(unless:)` check, `annotation_verifier.dart:519-541`),
 //! `undefined_hidden_name` / `undefined_shown_name` (directives are consumed
-//! diet-style and combinators expose no clause enumeration — both arrive with
-//! the directive milestone), and `_function` (a function-typed *expression*
+//! diet-style and the combinator model carries clause names without source
+//! spans — both arrive with the directive milestone), and `_function` (a
+//! function-typed *expression*
 //! instantiation — its message displays the function type, a shape M1 cannot
 //! render). `wrong_number_of_parameters_for_setter` is emitted here although
 //! the oracle fires it from the parser: dartq's parser does not emit the code
@@ -246,23 +244,12 @@ pub struct FileReport {
     pub names: Vec<NameRow>,
 }
 
-/// The `shouldIgnoreUndefined` mirror (`element.dart:7470-7502`) over the
+/// The `shouldIgnoreUndefined` mirror (`element.dart:8217-8250`) over the
 /// library's import edges: a name referenced through an import whose target
 /// did not resolve is suppressed, because the missing target is the reported
-/// root cause.
-///
-/// # Known divergence from the oracle (deliberate, under-report direction)
-///
-/// The oracle ignores a *bare* name only when it sits in a broken import's
-/// `show` list (`shownNames.contains`), and a prefixed name when the broken
-/// import has no `show` clause or shows it. `dartq_resolution::Combinators`
-/// exposes only the merged `allows` predicate — clause enumeration lives in
-/// that crate — so a bare name through ANY broken import matching the
-/// (empty) prefix is suppressed here. That over-suppresses exactly one shape:
-/// a bare miss in a file that declares an unfiltered broken import (where the
-/// oracle reports `uri_does_not_exist` anyway). When resolution exposes
-/// show-clause membership, tighten `ignore` to `shownNames.contains` for the
-/// bare path; the emit sites need no change.
+/// root cause. The filter face is show-list-only — only `show` clauses
+/// qualify a name, so a bare miss under an unfiltered (or hide-only) broken
+/// import still reports.
 #[derive(Clone, Copy, Debug)]
 pub struct UndefinedGuard<'a> {
     edges: &'a [ImportEdge],
@@ -280,26 +267,24 @@ impl<'a> UndefinedGuard<'a> {
     /// Whether a reference to `name` (optionally through `prefix`) must not
     /// be reported as undefined.
     ///
-    /// Mirrors the analyzer's loop over broken imports matching the prefix,
-    /// within the `allows`-only combinator surface (see the type doc for the
-    /// deliberate divergence): a broken edge matching the prefix suppresses
-    /// the name when it survives the combinators; a prefixed reference is
-    /// suppressed regardless (the oracle ignores everything under a broken
-    /// prefix whose `show` list does not exclude it — clause enumeration is
-    /// not visible here).
+    /// Mirrors the oracle loop (`element.dart:8217-8250`) over the broken
+    /// imports matching the prefix: the name is suppressed when it sits in a
+    /// `show` list (`shownNames.contains`, hide clauses never consulted), or
+    /// when it is prefixed and the broken import has no `show` clause at
+    /// all. Everything else — a bare miss under an unfiltered or hide-only
+    /// broken import, a prefixed name absent from the show list — reports.
+    /// The `_$`-generated-part clause is deferred with the directive
+    /// milestone (it only ever suppresses; see the module docs).
     #[must_use]
     pub fn ignore(&self, prefix: Option<StringId>, name: StringId) -> bool {
         for edge in self.edges {
             if edge.target.is_some() || edge.prefix != prefix {
                 continue;
             }
-            if edge.combinators.allows(name) {
+            if edge.combinators.shows(name) {
                 return true;
             }
-            if prefix.is_some() {
-                // Analyzer: everything under a broken prefix is ignored
-                // unless a `show` clause exists and excludes the name; clause
-                // enumeration is not visible here, so suppress.
+            if prefix.is_some() && !edge.combinators.has_show() {
                 return true;
             }
         }
@@ -932,10 +917,10 @@ impl<'a> Engine<'a> {
                     ty: self.member_declared_ty(container, name),
                 };
             }
-            if kind == ContainerKind::Enum && self.is_reserved(name, &self.enum_synth_members) {
+            if kind == ContainerKind::Enum && self.enum_synth_members.contains(&name) {
                 return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
-            if self.instance_context() && self.is_reserved(name, &self.object_members) {
+            if self.instance_context() && self.object_members.contains(&name) {
                 return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
         }
@@ -1022,11 +1007,6 @@ impl<'a> Engine<'a> {
             },
             _ => BareInfo::Plain { ty: decl.var_ty },
         }
-    }
-
-    /// Whether `name` is in a precomputed reserved-id set.
-    fn is_reserved(&self, name: StringId, set: &[StringId]) -> bool {
-        set.contains(&name)
     }
 
     /// Walks `container`'s member face over superclass name edges. Any
@@ -1177,7 +1157,7 @@ impl<'a> Engine<'a> {
         let suppressed = self.non_type_pos > 0;
         match head {
             TypeHead::Bare => {
-                if self.is_reserved(name, &self.builtin_types) {
+                if self.builtin_types.contains(&name) {
                     return;
                 }
                 if !matches!(self.resolve_bare(name), BareInfo::Missing { .. }) {
@@ -1624,7 +1604,7 @@ impl<'a> Engine<'a> {
     /// typedef/function keeps its declaration's; anything unresolved is
     /// `None` (suppress — `undefined_class` already reports).
     fn declared_type_params(&self, name: StringId) -> Option<u16> {
-        if self.is_reserved(name, &self.builtin_types) || self.type_params.contains(&name) {
+        if self.builtin_types.contains(&name) || self.type_params.contains(&name) {
             return Some(0);
         }
         match self.resolve_bare(name) {
@@ -2441,7 +2421,7 @@ impl<'a> Engine<'a> {
         let Some(kind) = self.container_kind_of(container) else {
             return; // external receiver type: suppress
         };
-        if kind == ContainerKind::Enum && self.is_reserved(row.name, &self.enum_synth_members) {
+        if kind == ContainerKind::Enum && self.enum_synth_members.contains(&row.name) {
             return;
         }
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
@@ -2654,7 +2634,7 @@ impl<'a> Engine<'a> {
         if found {
             return true;
         }
-        if row.name == self.intern("==") || self.is_reserved(row.name, &self.object_members) {
+        if row.name == self.intern("==") || self.object_members.contains(&row.name) {
             return true;
         }
         self.index
@@ -3569,9 +3549,8 @@ mod tests {
 
     /// Diagnoses `source` as the sole file of a library with no imports.
     /// Core-library names are deliberately absent: an M1 harness must model
-    /// them through concrete declarations or shown broken edges (a blanket
-    /// unfiltered `dart:core` edge would suppress every bare miss — see the
-    /// undefined-guard module docs).
+    /// them through concrete declarations or shown broken edges — see the
+    /// undefined-guard module docs.
     fn report(source: &str) -> FileReport {
         report_with_edge(source, |_| None)
     }
@@ -3768,7 +3747,7 @@ mod tests {
     /// (`shouldIgnoreUndefined`) but still recorded in the §8 names table.
     ///
     /// Hand-trace: the edge matches (target `None`, prefix `None`) and
-    /// `allows(gone)` holds — the guard fires before the emit.
+    /// `shows(gone)` holds — the guard fires before the emit.
     #[test]
     fn broken_import_shown_name_is_suppressed() {
         let report = report_with_edge("void f() { gone; }", |strings| {
@@ -3787,6 +3766,25 @@ mod tests {
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.names.len(), 1);
         assert_eq!(report.names[0].use_kind, NameUse::Read);
+    }
+
+    /// A bare miss under an *unfiltered* broken import still reports — the
+    /// oracle ignores only show-listed names (`shouldIgnoreUndefined`,
+    /// element.dart:8217-8250; the C7 shape).
+    ///
+    /// Hand-trace: the edge matches (target `None`, prefix `None`) but has
+    /// no `show` clause, so neither guard arm fires and the emit happens.
+    #[test]
+    fn unfiltered_broken_import_keeps_bare_miss() {
+        let report = report_with_edge("void f() { gone; }", |_| {
+            Some(ImportEdge {
+                target: None,
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            })
+        });
+        assert_eq!(code_names(&report), ["undefined_identifier"]);
     }
 
     /// A defined prefixed function resolves silently; a prefixed invocation

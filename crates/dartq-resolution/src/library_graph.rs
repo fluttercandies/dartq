@@ -157,6 +157,28 @@ impl Combinators {
             CombinatorClause::Hide(names) => names.binary_search(&name).is_err(),
         })
     }
+
+    /// Whether the directive carries a `show` clause (the oracle's
+    /// `showCombinators.isEmpty` test, `element.dart:8229`).
+    #[must_use]
+    pub fn has_show(&self) -> bool {
+        self.0
+            .iter()
+            .any(|clause| matches!(clause, CombinatorClause::Show(_)))
+    }
+
+    /// Whether any `show` clause lists `name` — the undefined-guard
+    /// suppression membership (`element.dart:8234-8238`
+    /// `combinator.shownNames.contains(name)`, consulted per show
+    /// combinator; `hide` clauses never qualify a name). Written names plus
+    /// their setter spellings; guard queries are bare identifiers, so the
+    /// extra spellings are unreachable.
+    #[must_use]
+    pub fn shows(&self, name: StringId) -> bool {
+        self.0.iter().any(|clause| {
+            matches!(clause, CombinatorClause::Show(names) if names.binary_search(&name).is_ok())
+        })
+    }
 }
 
 /// Expands bare combinator names with their `name=` setter spellings, sorted
@@ -744,6 +766,41 @@ mod tests {
         let combinators = Combinators::new([CombinatorClause::Hide(Box::from([foo]))], &strings);
         assert!(!combinators.allows(foo));
         assert!(!combinators.allows(setter));
+    }
+
+    /// The undefined-guard show face (`shouldIgnoreUndefined`,
+    /// element.dart:8217-8250): only `show` clauses count — unfiltered and
+    /// hide-only directives have no show list, membership is per-clause
+    /// containment (`show foo hide foo` still shows for the guard even
+    /// though it no longer admits through `allows`).
+    #[test]
+    fn show_face_answers_membership_and_presence() {
+        let strings = StringTable::new();
+        let foo = strings.intern("foo");
+        let bar = strings.intern("bar");
+
+        let unfiltered = Combinators::unfiltered();
+        assert!(!unfiltered.has_show());
+        assert!(!unfiltered.shows(foo));
+
+        let hide_only = Combinators::new([CombinatorClause::Hide(Box::from([foo]))], &strings);
+        assert!(!hide_only.has_show());
+        assert!(!hide_only.shows(foo));
+
+        let show_foo = Combinators::new([CombinatorClause::Show(Box::from([foo]))], &strings);
+        assert!(show_foo.has_show());
+        assert!(show_foo.shows(foo));
+        assert!(!show_foo.shows(bar));
+
+        let shown_then_hidden = Combinators::new(
+            [
+                CombinatorClause::Show(Box::from([foo])),
+                CombinatorClause::Hide(Box::from([foo])),
+            ],
+            &strings,
+        );
+        assert!(shown_then_hidden.shows(foo));
+        assert!(!shown_then_hidden.allows(foo));
     }
 
     // ---- export scope fixpoint ----
