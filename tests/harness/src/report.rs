@@ -166,6 +166,39 @@ struct JsonDiffEntry {
     sample_message: String,
 }
 
+/// Shared meta face for both report shapes (standard run + panic attribution).
+fn json_meta(meta: &RunMeta) -> JsonMeta<'_> {
+    JsonMeta {
+        corpus_dir: &meta.corpus_dir,
+        oracle_cmd: &meta.oracle_cmd,
+        dartq_cmd: &meta.dartq_cmd,
+        oracle_version: &meta.oracle_version,
+        threshold: meta.threshold,
+        severity_filter: &meta.severity_filter,
+        type_filter: &meta.type_filter,
+        codes_file: &meta.codes_file,
+    }
+}
+
+/// Attribution report shape (dartq crash tier; see [`crate::bisect`]). The
+/// gate never produced a verdict on this path, so there is no comparison
+/// payload — only the run meta and the attributed panicking files.
+#[derive(Serialize)]
+struct PanicReport<'a> {
+    meta: JsonMeta<'a>,
+    /// Why the gate produced no verdict.
+    gate: &'static str,
+    /// Attributed panicking files, labeled with the corpus name on
+    /// multi-corpus runs (same prefix convention as the merged entry keys).
+    dartq_panic_files: Vec<String>,
+    /// `true` = the rerun budget ran out (or reruns failed off-signature):
+    /// the list may be incomplete.
+    attribution_partial: bool,
+    /// dartq rerun invocations spent bisecting.
+    probe_reruns: usize,
+    notes: &'a [String],
+}
+
 pub(crate) fn write_reports(
     cmp: &Comparison,
     meta: &RunMeta,
@@ -175,16 +208,7 @@ pub(crate) fn write_reports(
     fs::create_dir_all(out_dir).map_err(|e| format!("creating {}: {e}", out_dir.display()))?;
 
     let json = JsonReport {
-        meta: JsonMeta {
-            corpus_dir: &meta.corpus_dir,
-            oracle_cmd: &meta.oracle_cmd,
-            dartq_cmd: &meta.dartq_cmd,
-            oracle_version: &meta.oracle_version,
-            threshold: meta.threshold,
-            severity_filter: &meta.severity_filter,
-            type_filter: &meta.type_filter,
-            codes_file: &meta.codes_file,
-        },
+        meta: json_meta(meta),
         passed: verdict.passed(),
         error_jaccard: cmp.error_jaccard(),
         oracle_total: cmp.oracle_total,
@@ -266,6 +290,38 @@ fn side_entries_json(entries: &[crate::compare::SideEntry]) -> Vec<JsonSideEntry
             count: e.count,
         })
         .collect()
+}
+
+/// Attribution report for a crashed dartq side: `report.json` carrying the
+/// attributed panicking files (no markdown twin — the console error line and
+/// the JSON are the two faces this path needs).
+pub(crate) fn write_panic_report(
+    meta: &RunMeta,
+    attribution: &crate::bisect::PanicAttribution,
+    out_dir: &Path,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(out_dir).map_err(|e| format!("creating {}: {e}", out_dir.display()))?;
+    let report = PanicReport {
+        meta: json_meta(meta),
+        gate: "not judged: dartq side crashed (exit 4, empty stdout)",
+        dartq_panic_files: attribution
+            .entries
+            .iter()
+            .map(|(label, file)| match label {
+                Some(label) => format!("{label}/{file}"),
+                None => file.clone(),
+            })
+            .collect(),
+        attribution_partial: attribution.partial,
+        probe_reruns: attribution.probes,
+        notes: &attribution.notes,
+    };
+    let json_text =
+        serde_json::to_string_pretty(&report).map_err(|e| format!("serializing report: {e}"))?;
+    let json_path = out_dir.join("report.json");
+    fs::write(&json_path, json_text)
+        .map_err(|e| format!("writing {}: {e}", json_path.display()))?;
+    Ok(json_path)
 }
 
 fn markdown(cmp: &Comparison, meta: &RunMeta, verdict: Verdict) -> String {
@@ -401,7 +457,8 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_{}", std::process::id()));
-        let (json_path, md_path) = write_reports(&cmp, &meta, Verdict::Fail, &out).expect("reports");
+        let (json_path, md_path) =
+            write_reports(&cmp, &meta, Verdict::Fail, &out).expect("reports");
 
         let json_text = fs::read_to_string(&json_path).expect("json");
         let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
@@ -507,7 +564,8 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_drop_{}", std::process::id()));
-        let (json_path, md_path) = write_reports(&cmp, &meta, Verdict::Pass, &out).expect("reports");
+        let (json_path, md_path) =
+            write_reports(&cmp, &meta, Verdict::Pass, &out).expect("reports");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
@@ -543,8 +601,12 @@ mod tests {
             message: "m".into(),
         };
         let cmp = compare(
-            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| true),
-            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| true),
+            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| {
+                true
+            }),
+            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| {
+                true
+            }),
         );
         let meta = RunMeta {
             corpus_dir: "/corpus".into(),
@@ -570,7 +632,59 @@ mod tests {
         );
         let md = fs::read_to_string(&md_path).expect("md");
         assert!(md.contains("-> SKIPPED (ERROR gate not in scope)"), "{md}");
-        assert!(!md.contains("PASS"), "no judged-pass token may appear: {md}");
+        assert!(
+            !md.contains("PASS"),
+            "no judged-pass token may appear: {md}"
+        );
+
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Attribution report (dartq crash tier): `dartq_panic_files` with corpus
+    /// labels, the not-judged gate marker, partial flag and probe accounting.
+    #[test]
+    fn panic_report_carries_attribution_fields() {
+        let meta = RunMeta {
+            corpus_dir: "/corpus".into(),
+            oracle_cmd: "dart analyze machine".into(),
+            dartq_cmd: "dartq check --format=machine".into(),
+            oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
+            threshold: 0.99,
+            severity_filter: "all".into(),
+            type_filter: "all".into(),
+            codes_file: String::new(),
+        };
+        let attribution = crate::bisect::PanicAttribution {
+            entries: vec![
+                (Some("m0".into()), "lib/poison.dart".into()),
+                (None, "lib/other.dart".into()),
+            ],
+            partial: true,
+            probes: 12,
+            notes: vec!["rerun budget exhausted".into()],
+        };
+
+        let out = std::env::temp_dir().join(format!("dq_report_panic_{}", std::process::id()));
+        let json_path =
+            write_panic_report(&meta, &attribution, &out).expect("panic report written");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
+        assert_eq!(
+            parsed["dartq_panic_files"],
+            serde_json::json!(["m0/lib/poison.dart", "lib/other.dart"]),
+            "labels prefix entries on multi-corpus runs"
+        );
+        assert_eq!(parsed["attribution_partial"], true);
+        assert_eq!(parsed["probe_reruns"], 12);
+        assert!(
+            parsed["gate"]
+                .as_str()
+                .expect("gate marker")
+                .contains("not judged"),
+            "the panic path never claims a verdict"
+        );
+        assert_eq!(parsed["meta"]["dartq_cmd"], "dartq check --format=machine");
 
         fs::remove_dir_all(&out).ok();
     }

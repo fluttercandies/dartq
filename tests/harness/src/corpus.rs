@@ -5,7 +5,7 @@
 //! subdirectories silently overwrite each other (lessons from facts §7.2).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::oracle::{driver_timeout_from_env, run_captured};
@@ -238,6 +238,41 @@ fn sorted_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     Ok(entries)
 }
 
+/// All `.dart` files under `corpus_dir` (recursive, `.dart_tool` skipped), as
+/// sorted corpus-relative paths — the candidate universe for the dartq panic
+/// auto-bisect ([`crate::bisect`]). Symlinked entries are skipped (lstat
+/// semantics, same rule as [`copy_tree`]); real corpora contain none.
+pub(crate) fn dart_files(corpus_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in sorted_entries(dir)? {
+            let ty = entry
+                .file_type()
+                .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
+            if ty.is_dir() {
+                if entry.file_name() == ".dart_tool" {
+                    continue;
+                }
+                walk(&entry.path(), out)?;
+            } else if ty.is_file() && entry.path().extension().is_some_and(|e| e == "dart") {
+                out.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut absolute = Vec::new();
+    walk(corpus_dir, &mut absolute)?;
+    let mut files: Vec<PathBuf> = absolute
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(corpus_dir)
+                .expect("walked paths live under corpus_dir")
+                .to_path_buf()
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 /// Self-contained rule (facts §5): the full text contains no `package:` substring (equivalent to `grep -L 'package:'`),
 /// and the URIs of all import/export/part directives (if any) are `dart:*`.
 /// Each line has `//` line comments stripped before scanning directives; extreme forms such as a `//` (URL)
@@ -386,7 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn self_contained_rules() {        assert!(is_self_contained("void f() {}"));
+    fn self_contained_rules() {
+        assert!(is_self_contained("void f() {}"));
         assert!(is_self_contained(
             "import 'dart:async';\nexport 'dart:math' show max;"
         ));
@@ -452,6 +488,32 @@ mod tests {
         assert!(
             check_language_version(&corpus).is_err(),
             "junk version must fail"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The bisect candidate walk: recursive, corpus-relative, sorted, `.dart_tool`
+    /// skipped, non-`.dart` files ignored.
+    #[test]
+    fn dart_files_walk_is_relative_sorted_and_skips_dart_tool() {
+        let root = std::env::temp_dir().join(format!("dq_dartfiles_{}", std::process::id()));
+        write(&root, "lib/b.dart", "void b() {}\n");
+        write(&root, "lib/a.dart", "void a() {}\n");
+        write(&root, "lib/sub/c.dart", "void c() {}\n");
+        write(&root, "top.dart", "void t() {}\n");
+        write(&root, ".dart_tool/hidden.dart", "void h() {}\n");
+        write(&root, "notes.txt", "not dart\n");
+
+        let files = dart_files(&root).expect("walk");
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("lib/a.dart"),
+                PathBuf::from("lib/b.dart"),
+                PathBuf::from("lib/sub/c.dart"),
+                PathBuf::from("top.dart"),
+            ]
         );
 
         fs::remove_dir_all(&root).ok();

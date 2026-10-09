@@ -9,11 +9,24 @@
 use std::path::Path;
 
 use crate::machine::{MachineDiag, OutputFormat};
-use crate::oracle::{DriverSide, run_driver};
+use crate::oracle::{DriverOutcome, DriverSide, run_driver_classified};
+
 /// dartq command driver: `program + args` are both given by the caller.
 pub(crate) struct DartqDriver {
     program: String,
     args: Vec<String>,
+}
+
+/// Classification of one dartq driver invocation (see [`DartqDriver::probe`]).
+#[derive(Debug)]
+pub(crate) enum DartqProbe {
+    /// Valid measurement exit (0-3); parsed diagnostics, possibly empty.
+    Measured(Vec<MachineDiag>),
+    /// Crash tier (exit 4) with empty stdout — the whole-batch `catch_unwind`
+    /// shape the corpus auto-bisect attributes.
+    Panic,
+    /// Any other failure; the message is the historical harness-error text.
+    Failed(String),
 }
 
 impl DartqDriver {
@@ -37,13 +50,9 @@ impl DartqDriver {
         Self { program, args }
     }
 
-    /// `format`: output format of the external command. The dartq contract is machine (PRD P6);
-    /// in `--e2e-oracle` self-check mode the dartq side is dart analyze itself, so it must use the same format as the oracle side.
-    pub(crate) fn analyze(
-        &self,
-        corpus_dir: &Path,
-        format: OutputFormat,
-    ) -> Result<Vec<MachineDiag>, String> {
+    /// argv for one corpus dir: `{dir}` placeholder replacement, appending the
+    /// dir when the template carries no placeholder.
+    fn command_args(&self, corpus_dir: &Path) -> Vec<String> {
         let dir_str = corpus_dir.display().to_string();
         let has_placeholder = self.args.iter().any(|a| a.contains("{dir}"));
         let mut args: Vec<String> = self
@@ -54,7 +63,24 @@ impl DartqDriver {
         if !has_placeholder {
             args.push(dir_str);
         }
-        run_driver(DriverSide::Dartq, &self.program, &args, format)
+        args
+    }
+
+    /// One classified dartq invocation: valid exits (0-3) measure, the crash
+    /// tier (exit 4 with empty stdout — a panicking whole-batch run) surfaces
+    /// as [`DartqProbe::Panic`] so the corpus auto-bisect can key on it, and
+    /// every other failure keeps the historical harness-error message.
+    pub(crate) fn probe(&self, corpus_dir: &Path, format: OutputFormat) -> DartqProbe {
+        match run_driver_classified(
+            DriverSide::Dartq,
+            &self.program,
+            &self.command_args(corpus_dir),
+            format,
+        ) {
+            DriverOutcome::Measured(diags) => DartqProbe::Measured(diags),
+            DriverOutcome::Crash(_) => DartqProbe::Panic,
+            DriverOutcome::Failed(msg) => DartqProbe::Failed(msg),
+        }
     }
 }
 
@@ -79,9 +105,9 @@ mod tests {
         .expect("fixture");
 
         let driver = DartqDriver::from_template("/bin/cat {dir}/machine.txt");
-        let diags = driver
-            .analyze(&dir, OutputFormat::Machine)
-            .unwrap_or_else(|e| panic!("cat mock failed: {e}"));
+        let DartqProbe::Measured(diags) = driver.probe(&dir, OutputFormat::Machine) else {
+            panic!("cat mock must measure");
+        };
 
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].code, "EXPECTED_TOKEN");
@@ -90,9 +116,9 @@ mod tests {
 
         // Template without a placeholder: the corpus directory is appended as the last argument
         let driver = DartqDriver::from_template("/bin/cat /dev/null");
-        let diags = driver
-            .analyze(&dir, OutputFormat::Machine)
-            .expect("cat /dev/null");
+        let DartqProbe::Measured(diags) = driver.probe(&dir, OutputFormat::Machine) else {
+            panic!("cat /dev/null must measure");
+        };
         assert!(diags.is_empty(), "empty stdout = no diags");
 
         fs::remove_dir_all(&dir).ok();
@@ -101,22 +127,25 @@ mod tests {
     #[test]
     fn missing_command_is_clear_error() {
         let driver = DartqDriver::from_template("/nonexistent/dartq-binary-xyz check");
-        let err = driver
-            .analyze(Path::new("/tmp"), OutputFormat::Machine)
-            .expect_err("missing binary must error");
+        let DartqProbe::Failed(err) = driver.probe(Path::new("/tmp"), OutputFormat::Machine) else {
+            panic!("missing binary must fail");
+        };
         assert!(err.contains("failed to launch"), "error: {err}");
         assert!(err.contains("dartq"), "error names the side: {err}");
     }
 
+    /// Exit 4 with empty stdout is the crash tier (facts §3) AND the panic
+    /// signature: the whole-batch `catch_unwind` shape the corpus auto-bisect
+    /// attributes. A crash with leftover stdout is a plain failure instead
+    /// (see `probe_classifies_measurement_panic_and_failure`).
     #[test]
-    fn abnormal_exit_is_clear_error() {
-        // exit 4 (crash tier, facts §3) is outside the valid set {0,1,2,3}
+    fn crash_exit_4_empty_stdout_is_panic_signature() {
         let driver =
             DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 4".into()]);
-        let err = driver
-            .analyze(Path::new("/tmp"), OutputFormat::Machine)
-            .expect_err("exit 4 must error");
-        assert!(err.contains("Some(4)"), "error: {err}");
+        assert!(matches!(
+            driver.probe(Path::new("/tmp"), OutputFormat::Machine),
+            DartqProbe::Panic
+        ));
     }
 
     /// Exit 2 on the dartq side is the warnings tier (dartdev
@@ -127,9 +156,10 @@ mod tests {
     fn warnings_exit_2_is_a_valid_measurement() {
         let driver =
             DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 2".into()]);
-        let diags = driver
-            .analyze(Path::new("/tmp"), OutputFormat::Machine)
-            .expect("exit 2 is the warnings tier, not a usage error");
+        let DartqProbe::Measured(diags) = driver.probe(Path::new("/tmp"), OutputFormat::Machine)
+        else {
+            panic!("exit 2 is the warnings tier, not a usage error");
+        };
         assert!(diags.is_empty(), "empty stdout parses to an empty set");
     }
 
@@ -140,10 +170,50 @@ mod tests {
     fn usage_exit_64_is_harness_error() {
         let driver =
             DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 64".into()]);
-        let err = driver
-            .analyze(Path::new("/tmp"), OutputFormat::Machine)
-            .expect_err("usage exit 64 must error, not pass as an empty measurement");
+        let DartqProbe::Failed(err) = driver.probe(Path::new("/tmp"), OutputFormat::Machine) else {
+            panic!("usage exit 64 must fail, not pass as an empty measurement");
+        };
         assert!(err.contains("Some(64)"), "error: {err}");
-        assert!(err.contains("valid: 0-3"), "error names the valid set: {err}");
+        assert!(
+            err.contains("valid: 0-3"),
+            "error names the valid set: {err}"
+        );
+    }
+
+    /// Probe classification: a clean exit measures, the crash signature
+    /// (exit 4 + empty stdout — the whole-batch `catch_unwind` shape) surfaces
+    /// as [`DartqProbe::Panic`], and everything else stays a plain failure.
+    #[test]
+    fn probe_classifies_measurement_panic_and_failure() {
+        let measure =
+            DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 0".into()]);
+        assert!(matches!(
+            measure.probe(Path::new("/tmp"), OutputFormat::Machine),
+            DartqProbe::Measured(_)
+        ));
+
+        let panic = DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 4".into()]);
+        assert!(matches!(
+            panic.probe(Path::new("/tmp"), OutputFormat::Machine),
+            DartqProbe::Panic
+        ));
+
+        // Crash with partial stdout is NOT the bisect signature: a plain failure.
+        let partial = DartqDriver::from_program(
+            "sh".to_string(),
+            vec!["-c".into(), "echo leftover; exit 4".into()],
+        );
+        match partial.probe(Path::new("/tmp"), OutputFormat::Machine) {
+            DartqProbe::Failed(msg) => assert!(msg.contains("Some(4)"), "error: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Usage exit 64: plain failure (never a bisect trigger).
+        let usage =
+            DartqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 64".into()]);
+        match usage.probe(Path::new("/tmp"), OutputFormat::Machine) {
+            DartqProbe::Failed(msg) => assert!(msg.contains("Some(64)"), "error: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

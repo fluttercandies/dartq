@@ -198,9 +198,11 @@ impl Comparison {
         self.severities
             .iter()
             .find(|s| s.severity == Severity::Error)
-            .expect("severities is built from the fixed ERROR/WARNING/INFO array; \
+            .expect(
+                "severities is built from the fixed ERROR/WARNING/INFO array; \
                      a missing ERROR tier is a construction bug and must never \
-                     be scored as a silent 1.0 pass")
+                     be scored as a silent 1.0 pass",
+            )
             .jaccard
     }
 }

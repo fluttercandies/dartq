@@ -6,6 +6,7 @@
 //! under the severity filter — pure-report mode, verdict SKIPPED); 1 = below gate;
 //! 2 = harness error of its own.
 
+mod bisect;
 mod compare;
 mod corpus;
 mod dartq;
@@ -114,6 +115,10 @@ fn print_usage() {
       whose own languageVersion is >= 3.13 (Plan A, docs/facts/
       version-skew.md §4) — a stale pin floods the gate with
       experiment_not_enabled assembly noise and fails the run up front.
+      Panic isolation: if the dartq side crashes (exit 4 with empty stdout),
+      the corpus is auto-bisected to attribute the panicking files; the run
+      still fails as a harness error (exit 2) and writes a dartq_panic_files
+      attribution report under --out.
       Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD})
       or the gate not in scope under --severity-filter (verdict SKIPPED,
       pure-report mode), 1 = below threshold, 2 = harness error."
@@ -276,42 +281,31 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         OutputFormat::Machine
     };
     let dartq_driver = build_dartq_driver(&opts, opts.oracle_format)?;
-    let dartq_diags = analyze_corpora(&corpora, |dir| dartq_driver.analyze(dir, dartq_format))?;
+
+    // Meta is built before the dartq phase: the panic path reports it too.
+    let meta = build_run_meta(&opts, &corpora, oracle_version);
+
+    // dartq phase with panic isolation: a crash tier (exit 4, empty stdout)
+    // triggers a corpus auto-bisect; the run still fails as a harness error,
+    // but the failure carries the attributed panicking files.
+    let dartq_diags = match bisect::dartq_phase(&corpora, &dartq_driver, dartq_format) {
+        Ok(diags) => diags,
+        Err(bisect::DartqPhaseError::Hard(msg)) => return Err(Outcome::Error(msg)),
+        Err(bisect::DartqPhaseError::Panicked(attribution)) => {
+            let json_path = report::write_panic_report(&meta, &attribution, &opts.out)
+                .map_err(Outcome::Error)?;
+            return Err(Outcome::Error(attribution.error_message(&json_path)));
+        }
+    };
 
     let dartq_side = build_filtered_side(&corpora, dartq_diags, &filters);
     let cmp = compare(&oracle_side, &dartq_side);
 
-    let corpus_display = corpora
-        .iter()
-        .map(|(_, canon)| canon.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let verdict = gate_verdict(
         filters.error_in_scope(),
         cmp.error_jaccard(),
         opts.threshold,
     );
-    let meta = report::RunMeta {
-        corpus_dir: corpus_display,
-        oracle_cmd: format!("{} analyze {}", opts.oracle_dart, opts.oracle_format.flag()),
-        dartq_cmd: if opts.e2e_oracle {
-            format!(
-                "{} analyze {} (e2e self-check)",
-                opts.oracle_dart,
-                opts.oracle_format.flag()
-            )
-        } else {
-            opts.dartq_cmd.clone().unwrap_or_default()
-        },
-        oracle_version,
-        threshold: opts.threshold,
-        severity_filter: opts.severity_filter.clone(),
-        type_filter: opts.type_filter.clone(),
-        codes_file: opts
-            .codes_file
-            .as_ref()
-            .map_or(String::new(), |p| p.display().to_string()),
-    };
     let (json_path, md_path) =
         report::write_reports(&cmp, &meta, verdict, &opts.out).map_err(Outcome::Error)?;
 
@@ -340,6 +334,41 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         verdict.token(),
     );
     Ok((summary, verdict.exit_success()))
+}
+
+/// Report meta: everything known before the comparison runs; both report
+/// shapes (standard run + panic attribution) record it verbatim.
+fn build_run_meta(
+    opts: &RunOptions,
+    corpora: &[(Option<String>, PathBuf)],
+    oracle_version: String,
+) -> report::RunMeta {
+    let corpus_display = corpora
+        .iter()
+        .map(|(_, canon)| canon.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    report::RunMeta {
+        corpus_dir: corpus_display,
+        oracle_cmd: format!("{} analyze {}", opts.oracle_dart, opts.oracle_format.flag()),
+        dartq_cmd: if opts.e2e_oracle {
+            format!(
+                "{} analyze {} (e2e self-check)",
+                opts.oracle_dart,
+                opts.oracle_format.flag()
+            )
+        } else {
+            opts.dartq_cmd.clone().unwrap_or_default()
+        },
+        oracle_version,
+        threshold: opts.threshold,
+        severity_filter: opts.severity_filter.clone(),
+        type_filter: opts.type_filter.clone(),
+        codes_file: opts
+            .codes_file
+            .as_ref()
+            .map_or(String::new(), |p| p.display().to_string()),
+    }
 }
 
 /// Map the ERROR gate to its verdict: judged against the threshold when the ERROR
@@ -443,9 +472,7 @@ fn build_dartq_driver(
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            Outcome::Error("run needs --dartq-cmd TEMPLATE (or --e2e-oracle)".into())
-        })?;
+        .ok_or_else(|| Outcome::Error("run needs --dartq-cmd TEMPLATE (or --e2e-oracle)".into()))?;
     Ok(DartqDriver::from_template(template))
 }
 
@@ -1076,7 +1103,11 @@ mod tests {
     fn gate_verdict_skips_only_when_error_not_in_scope() {
         use report::Verdict;
         assert_eq!(gate_verdict(true, 1.0, 0.99), Verdict::Pass);
-        assert_eq!(gate_verdict(true, 0.99, 0.99), Verdict::Pass, "boundary meets the gate");
+        assert_eq!(
+            gate_verdict(true, 0.99, 0.99),
+            Verdict::Pass,
+            "boundary meets the gate"
+        );
         assert_eq!(gate_verdict(true, 0.5, 0.99), Verdict::Fail);
         assert_eq!(
             gate_verdict(false, 1.0, 0.99),
@@ -1086,7 +1117,10 @@ mod tests {
         assert_eq!(gate_verdict(false, 0.0, 0.99), Verdict::Skipped);
         // Exit semantics: only a judged FAIL exits 1
         assert!(Verdict::Pass.exit_success());
-        assert!(Verdict::Skipped.exit_success(), "pure-report mode is exit 0");
+        assert!(
+            Verdict::Skipped.exit_success(),
+            "pure-report mode is exit 0"
+        );
         assert!(!Verdict::Fail.exit_success());
     }
 
@@ -1112,7 +1146,10 @@ mod tests {
             canonical_corpus_dirs(&[a.clone(), a_via_dot, b.clone()]).expect("canonical dirs");
         assert_eq!(
             canonical,
-            vec![a.canonicalize().expect("canon a"), b.canonicalize().expect("canon b")],
+            vec![
+                a.canonicalize().expect("canon a"),
+                b.canonicalize().expect("canon b")
+            ],
             "duplicate dropped, order preserved"
         );
 

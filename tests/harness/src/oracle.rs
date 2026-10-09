@@ -41,7 +41,7 @@ impl OracleDriver {
 }
 
 /// Which child program a driver talks to; the side determines the exit-code contract.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverSide {
     /// `dart analyze` (the oracle side; also the e2e self-check's dartq-side process)
     Oracle,
@@ -78,7 +78,7 @@ impl DriverSide {
     }
 }
 
-/// Capture the oracle's reference version once per run (`dart --version`, one line on stderr) —
+/// Capture the oracle's reference version once per run (`dart --version`, one banner line) —
 /// recorded in every report per PRD §19.1 (the embedded analyzer version rides the SDK).
 pub(crate) fn dart_version(dart: &str) -> Result<String, String> {
     let timeout = driver_timeout_from_env()?;
@@ -90,12 +90,21 @@ pub(crate) fn dart_version(dart: &str) -> Result<String, String> {
             output.status.code()
         ));
     }
+    // The banner stream moved across dartdev versions: older SDKs print it to
+    // stderr, the pinned 3.13.1 dartdev prints it to stdout (measured: the
+    // fvm wrapper adds no redirection). Take the first non-empty line across
+    // both streams, stdout first — the stderr-only behavior of older oracles
+    // is preserved whenever stdout is empty.
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("[oracle] `{dart} --version` stdout is not valid UTF-8: {e}"))?;
     let stderr = String::from_utf8(output.stderr)
         .map_err(|e| format!("[oracle] `{dart} --version` stderr is not valid UTF-8: {e}"))?;
-    parse_dart_version(&stderr)
+    parse_dart_version(&format!("{stdout}\n{stderr}"))
 }
 
-/// `dart --version` prints a single banner line to stderr, e.g.
+/// `dart --version` prints a single banner line to stdout or stderr depending
+/// on the dartdev version (stderr on older SDKs, stdout on 3.13.1+; see
+/// [`dart_version`]), e.g.
 /// `Dart SDK version: 3.9.4 (stable) (Tue Sep 9 12:00:00 2025 +0000) on "macos_arm64"`.
 /// The full trimmed line is the reference version (build date + platform included);
 /// no format strictness beyond non-empty: the field records whatever banner the
@@ -110,6 +119,23 @@ fn parse_dart_version(stderr: &str) -> Result<String, String> {
         .ok_or_else(|| "[oracle] `dart --version` printed no version banner".to_string())
 }
 
+/// Classification of one driver invocation. [`run_driver`] folds this into the
+/// historical `Result` face; the dartq-side panic isolation ([`crate::bisect`])
+/// needs the crash tier split out so the corpus auto-bisect can key on it
+/// without matching error strings.
+pub(crate) enum DriverOutcome {
+    /// Valid measurement exit (0-3); parsed diagnostics, possibly empty.
+    Measured(Vec<MachineDiag>),
+    /// dartq crash tier (exit 4) with empty stdout — the whole-batch
+    /// `catch_unwind` shape that triggers the corpus auto-bisect. The `String`
+    /// is the same harness-error message a plain failure would carry, so the
+    /// non-bisect paths keep their exact historical error text.
+    Crash(String),
+    /// Any other failure (launch error, timeout, usage exit, non-UTF-8 or
+    /// malformed output, crash with partial output).
+    Failed(String),
+}
+
 /// Pipeline shared by both drivers: "run command under a time budget -> validate exit code -> parse output".
 /// `side` selects the exit-code contract (see [`DriverSide::valid_exit`]).
 /// Diagnostic lines always go to stdout (facts §3); stderr is ignored on valid exit codes, and its tail is attached to aid locating failures on abnormal exits.
@@ -119,22 +145,56 @@ pub(crate) fn run_driver(
     args: &[String],
     format: OutputFormat,
 ) -> Result<Vec<MachineDiag>, String> {
+    match run_driver_classified(side, program, args, format) {
+        DriverOutcome::Measured(diags) => Ok(diags),
+        DriverOutcome::Crash(msg) | DriverOutcome::Failed(msg) => Err(msg),
+    }
+}
+
+/// [`run_driver`] with the dartq crash tier (exit 4 + empty stdout) surfaced as
+/// [`DriverOutcome::Crash`] instead of a generic failure — the signature the
+/// corpus auto-bisect keys on.
+pub(crate) fn run_driver_classified(
+    side: DriverSide,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+) -> DriverOutcome {
     let name = side.as_str();
-    let timeout = driver_timeout_from_env()?;
-    let output = run_captured(name, program, args, None, timeout)?;
+    let timeout = match driver_timeout_from_env() {
+        Ok(t) => t,
+        Err(e) => return DriverOutcome::Failed(e),
+    };
+    let output = match run_captured(name, program, args, None, timeout) {
+        Ok(output) => output,
+        Err(e) => return DriverOutcome::Failed(e),
+    };
     let exit = output.status.code();
     if !exit.is_some_and(|code| side.valid_exit(code)) {
         let tail = stderr_tail(&output.stderr);
-        return Err(format!(
+        let msg = format!(
             "[{name}] `{program}` exited with {exit:?} (valid: {}); stderr tail:\n{tail}",
             side.valid_exits_desc()
-        ));
+        );
+        if side == DriverSide::Dartq && exit == Some(4) && output.stdout.is_empty() {
+            return DriverOutcome::Crash(msg);
+        }
+        return DriverOutcome::Failed(msg);
     }
     // Strict decode: diagnostic text is UTF-8 (facts §1/§2); lossy decoding
     // would silently mangle messages, so a non-UTF-8 stream is a harness error.
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| format!("[{name}] `{program}` stdout is not valid UTF-8: {e}"))?;
-    parse_output(&stdout, format).map_err(|e| format!("[{name}] {e}"))
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            return DriverOutcome::Failed(format!(
+                "[{name}] `{program}` stdout is not valid UTF-8: {e}"
+            ));
+        }
+    };
+    match parse_output(&stdout, format) {
+        Ok(diags) => DriverOutcome::Measured(diags),
+        Err(e) => DriverOutcome::Failed(format!("[{name}] {e}")),
+    }
 }
 
 /// Shared budget for every child driver (`dart analyze` and corpus
@@ -515,5 +575,34 @@ mod tests {
             parse_dart_version("  \n \n").is_err(),
             "blank-only banner must error"
         );
+    }
+
+    /// The banner stream moved across dartdev versions: 3.13.1+ prints to
+    /// stdout, older SDKs to stderr — both are captured, stdout wins when both
+    /// exist, and the legacy stderr-only oracle behavior is preserved.
+    #[test]
+    fn dart_version_reads_stdout_banner_with_stderr_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dq_oracle_ver_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let banner = "Dart SDK version: 3.13.1 (stable) on \"macos_arm64\"";
+        let mock = |name: &str, body: String| {
+            let path = dir.join(name);
+            fs::write(&path, body).expect("script");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            path.display().to_string()
+        };
+        // 3.13.1 face: banner on stdout
+        let stdout_banner = mock("stdout_banner.sh", format!("#!/bin/sh\necho '{banner}'\n"));
+        assert_eq!(dart_version(&stdout_banner).expect("stdout banner"), banner);
+        // legacy face: empty stdout, banner on stderr
+        let stderr_banner = mock(
+            "stderr_banner.sh",
+            format!("#!/bin/sh\necho '{banner}' >&2\n"),
+        );
+        assert_eq!(dart_version(&stderr_banner).expect("stderr banner"), banner);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
