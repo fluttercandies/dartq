@@ -342,7 +342,7 @@ fn analyze_file(source: &str, file: FileId) -> Vec<Diagnostic> {
 /// re-derived and the file rescanned before parsing). An override above the
 /// latest known version is dropped with the official `STATIC_WARNING`
 /// (official scanner: `_overrideVersion = null`); the scanner reports only
-/// the first header-window match, so the loop settles after at most one
+/// the last header-window match, so the loop settles after at most one
 /// rescan.
 fn scan_file(source: &str, file: FileId) -> (LanguageVersion, ScanResult, Vec<Diagnostic>) {
     let mut version = DEFAULT_LANGUAGE_VERSION;
@@ -544,9 +544,9 @@ mod tests {
     }
 
     /// The F11 override contract: differing override rescans; above-latest
-    /// drops with the official warning; first header match wins.
+    /// drops with the official warning; last header match wins.
     #[test]
-    fn override_rescan_drop_and_first_wins() {
+    fn override_rescan_drop_and_last_wins() {
         let mut table = FileTable::new();
         let file = table.intern(Path::new("t.dart"));
 
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(warnings[0].range.length, 14, "whole comment lexeme");
 
         let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
-        assert_eq!(version, LanguageVersion::new(2, 12), "first match wins");
+        assert_eq!(version, LanguageVersion::new(3, 1), "last match wins");
 
         let (version, ..) = scan_file("var x = 1;\n", file);
         assert_eq!(version, DEFAULT_LANGUAGE_VERSION);

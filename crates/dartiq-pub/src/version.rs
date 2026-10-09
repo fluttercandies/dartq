@@ -573,7 +573,7 @@ impl serde::Serialize for LanguageVersion {
 /// priority first:
 ///
 /// 1. `explicit` — the library's `// @dart = X.Y` override. The window scan
-///    (first explicit comment wins) lives on the scanner/parser side, which
+///    (last explicit comment wins) lives on the scanner/parser side, which
 ///    passes the parsed value here; the ceiling check
 ///    (`language_version_too_high_explicit`) is a parser diagnostic, so no
 ///    clamping happens in this crate.
