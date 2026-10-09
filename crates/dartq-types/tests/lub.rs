@@ -208,6 +208,65 @@ fn tied_max_depths_walk_down_to_the_unique_candidate() {
 }
 
 #[test]
+fn deep_diamond_lub_is_not_truncated_by_chain_depth() {
+    // Two >100-step chains meeting at `M`: `C1 -> ... -> C119 -> M -> Object`
+    // and `D1 -> ... -> D119 -> M -> Object`. The supertype closures
+    // intersect at {M, Object} (least_upper_bound.dart:162-177 is plain
+    // uncapped recursion), so the LUB is `M` — the former DEPTH_LIMIT=100
+    // recursion budget truncated both closures and resolved this pair to
+    // `Object` instead. The subtype face is cross-checked: the walk to `M`
+    // is 120 edges deep.
+    let table = TypeTable::new();
+    let (object, future, function, m) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+        TypeDeclId::from_raw(4),
+    );
+    let (c, d) = (
+        |i: u32| TypeDeclId::from_raw(100 + i),
+        |i: u32| TypeDeclId::from_raw(300 + i),
+    );
+    let itf = |decl: TypeDeclId| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            false,
+        )
+    };
+    let mut builder = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(m, Vec::new());
+    for i in 1..=119 {
+        builder = builder.decl(c(i), Vec::new()).decl(d(i), Vec::new());
+    }
+    builder = builder
+        .supertype(m, itf(object))
+        .supertype(c(119), itf(m))
+        .supertype(d(119), itf(m));
+    for i in 1..=118 {
+        builder = builder
+            .supertype(c(i), itf(c(i + 1)))
+            .supertype(d(i), itf(d(i + 1)));
+    }
+    let hierarchy = builder.build(&table).expect("deep diamond is a valid DAG");
+    let sys = TypeSystem::new(&table, &hierarchy);
+
+    assert!(sys.is_subtype(itf(c(1)), itf(m)));
+    assert!(!sys.is_subtype(itf(c(1)), itf(d(1))));
+    assert_eq!(sys.least_upper_bound(itf(c(1)), itf(d(1))), itf(m));
+}
+
+#[test]
 fn records_fall_back_to_object() {
     let fx = fixture();
     let sys = fx.system();
@@ -224,12 +283,13 @@ fn record_vs_record_class_returns_the_record_class() {
     // `Record` class declared in the snapshot; the shared fixture has
     // `record: None` (the fallback test above pins that path).
     let table = TypeTable::new();
-    let (object, future, function, int, record) = (
+    let (object, future, function, int, string, record) = (
         TypeDeclId::from_raw(1),
         TypeDeclId::from_raw(2),
         TypeDeclId::from_raw(3),
         TypeDeclId::from_raw(4),
         TypeDeclId::from_raw(5),
+        TypeDeclId::from_raw(6),
     );
     let hierarchy = TypeHierarchy::builder(CoreDecls {
         object,
@@ -241,32 +301,25 @@ fn record_vs_record_class_returns_the_record_class() {
     .decl(future, vec![TypeParamId::from_raw(1)])
     .decl(function, Vec::new())
     .decl(int, Vec::new())
+    .decl(string, Vec::new())
     .decl(record, Vec::new())
     .build(&table)
     .expect("fixture hierarchy is valid");
     let sys = TypeSystem::new(&table, &hierarchy);
 
-    let int_ty = sys.table().intern(
-        UninternedType::Interface {
-            decl: int,
-            args: Vec::new(),
-        },
-        false,
-    );
-    let record_class = sys.table().intern(
-        UninternedType::Interface {
-            decl: record,
-            args: Vec::new(),
-        },
-        false,
-    );
-    let bare_object = sys.table().intern(
-        UninternedType::Interface {
-            decl: object,
-            args: Vec::new(),
-        },
-        false,
-    );
+    let itf = |decl: TypeDeclId| {
+        sys.table().intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            false,
+        )
+    };
+    let int_ty = itf(int);
+    let string_ty = itf(string);
+    let record_class = itf(record);
+    let bare_object = itf(object);
     let pair = sys
         .table()
         .intern_record(
@@ -280,9 +333,11 @@ fn record_vs_record_class_returns_the_record_class() {
     assert_eq!(sys.least_upper_bound(pair, record_class), record_class);
     assert_eq!(sys.least_upper_bound(record_class, pair), record_class);
 
-    // A record shape is not the `Record` class: two distinct shapes stay on
-    // the official record-vs-other fallback
-    // (`UP(Object, T2)`, least_upper_bound.dart:652-659).
+    // Two record shapes: the oracle's `_recordType` answers the bare
+    // `Record` class for non-mergeable shapes (positional-arity mismatch,
+    // least_upper_bound.dart:855-857); the field-wise merge (:865-884) is
+    // M2, so mergeable shapes answer the same class as their closest sound
+    // upper bound instead of the coarser `Object`.
     let other = sys
         .table()
         .intern_record(
@@ -293,9 +348,24 @@ fn record_vs_record_class_returns_the_record_class() {
             false,
         )
         .expect("valid fixture record");
-    assert_eq!(sys.least_upper_bound(pair, other), bare_object);
+    assert_eq!(sys.least_upper_bound(pair, other), record_class);
+    // Same arity, mergeable fields: field-wise merge stays M2 (spec §5), so
+    // the `Record` class is the documented M1 answer.
+    let mergeable = sys
+        .table()
+        .intern_record(
+            UninternedRecord {
+                positional: vec![int_ty, string_ty],
+                named: Vec::new(),
+            },
+            false,
+        )
+        .expect("valid fixture record");
+    assert_eq!(sys.least_upper_bound(pair, mergeable), record_class);
 
-    // Record vs an unrelated class never sees the Record-class rule.
+    // Record vs an unrelated class never sees the Record-class rules: the
+    // official record-vs-other fallback `UP(Object, T2)`
+    // (least_upper_bound.dart:652-655) applies.
     assert_eq!(sys.least_upper_bound(pair, int_ty), bare_object);
 }
 

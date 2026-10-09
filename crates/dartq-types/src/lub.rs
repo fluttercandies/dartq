@@ -4,16 +4,19 @@
 //! Port of `LeastUpperBoundHelper._computeLeastUpperBound`
 //! (`least_upper_bound.dart:391-672`) with the documented M1 fallbacks:
 //! function/function yields bare `Function` (the official fallback when
-//! correlation fails, least_upper_bound.dart:684-686) and records return the
-//! declared `Record` class (`least_upper_bound.dart:637-644`) or, when no
-//! `Record` class is in the snapshot and for record/record pairs, the
-//! official record-vs-other fallback `UP(Object, T2)`
+//! correlation fails, least_upper_bound.dart:684-686), and record/record
+//! pairs yield the declared `Record` class — the oracle's answer for
+//! non-mergeable shapes (`_recordType`, least_upper_bound.dart:855-863);
+//! the field-wise merge (:865-884) is M2, so mergeable shapes use the same
+//! class as their closest sound answer. Only record-vs-OTHER (and snapshots
+//! without a `Record` class — the semantic layer must supply one; Dart
+//! always has it) take the official fallback `UP(Object, T2)`
 //! (least_upper_bound.dart:652-659).
 
 use rustc_hash::FxHashSet;
 
-use crate::ids::{TypeId, TypeParamId};
-use crate::system::{DEPTH_LIMIT, TypeSystem, WalkScratch};
+use crate::ids::TypeId;
+use crate::system::{TypeSystem, WalkScratch};
 use crate::ty::{Type, TypeKind, UninternedType};
 
 impl TypeSystem<'_> {
@@ -127,22 +130,41 @@ impl TypeSystem<'_> {
 
         // RECORD (least_upper_bound.dart:637-660). `UP((...), Record) =
         // Record` and `UP(Record, (...)) = Record`
-        // (least_upper_bound.dart:637-644); record/record merging
-        // (`_recordType`, least_upper_bound.dart:853-885) stays M2, so
-        // everything else uses the official record-vs-other fallback
-        // `UP(Object, T2)` (least_upper_bound.dart:652-659).
+        // (least_upper_bound.dart:637-644). The both-record arm dispatches to
+        // `_recordType` (least_upper_bound.dart:648-650, :852-885), which
+        // answers the bare `Record` class for non-mergeable shapes
+        // (positional/named arity mismatch, :855-863; field-name mismatch,
+        // :873-876) and field-merges otherwise (:865-884) — the merge is M2,
+        // so both-record pairs answer the `Record` class itself here (exact
+        // for the non-mergeable shapes; a sound upper bound for the
+        // mergeable ones). Only record-vs-OTHER falls through to the
+        // official fallback `UP(RecordType, T2) = UP(Object, T2)` /
+        // `UP(T1, RecordType) = UP(T1, Object)`
+        // (least_upper_bound.dart:652-659); snapshots without a `Record`
+        // class use it for every record pair too.
         if matches!(t1.kind(), TypeKind::Record { .. })
             || matches!(t2.kind(), TypeKind::Record { .. })
         {
             if let Some(record) = self.hierarchy().core().record {
-                // Rule order matches the source: `T2` as the `Record` class
-                // wins before `T1`.
+                // Rule order matches the source: the `Record` class wins
+                // before a record shape, on either side.
                 let is_record_class = |t: Type| matches!(t.kind(), TypeKind::Interface { decl, .. } if decl == record);
                 if is_record_class(t2) {
                     return b;
                 }
                 if is_record_class(t1) {
                     return a;
+                }
+                if matches!(t1.kind(), TypeKind::Record { .. })
+                    && matches!(t2.kind(), TypeKind::Record { .. })
+                {
+                    return self.table().intern(
+                        UninternedType::Interface {
+                            decl: record,
+                            args: Vec::new(),
+                        },
+                        false,
+                    );
                 }
             }
             return if matches!(t1.kind(), TypeKind::Record { .. }) {
@@ -267,71 +289,62 @@ impl TypeSystem<'_> {
                 set_a,
                 set_b,
                 candidates,
-                subst,
                 ..
             } = &mut *scratch;
             set_a.clear();
             set_b.clear();
-            subst.clear();
-            self.supertype_closure(a, DEPTH_LIMIT, set_a, subst);
-            self.supertype_closure(b, DEPTH_LIMIT, set_b, subst);
+            self.supertype_closure(a, set_a);
+            self.supertype_closure(b, set_b);
             candidates.clear();
             candidates.extend(set_a.intersection(set_b).copied());
             self.pick_max_unique_depth(candidates)
         } else {
             let mut si = FxHashSet::default();
             let mut sj = FxHashSet::default();
-            let mut subst = Vec::new();
-            self.supertype_closure(a, DEPTH_LIMIT, &mut si, &mut subst);
-            self.supertype_closure(b, DEPTH_LIMIT, &mut sj, &mut subst);
+            self.supertype_closure(a, &mut si);
+            self.supertype_closure(b, &mut sj);
             let candidates: Vec<TypeId> = si.intersection(&sj).copied().collect();
             self.pick_max_unique_depth(&candidates)
         }
     }
 
     /// The supertype set including the type itself
-    /// (least_upper_bound.dart:167-172). Canonical interning makes `TypeId` a
-    /// sound set key across differently substituted paths. `remaining` caps
-    /// recursion at [`DEPTH_LIMIT`]: a validated-but-pathologically-deep
-    /// chain stops expanding instead of overflowing the stack (the truncated
-    /// closure still resolves through the intersection fallback).
+    /// (least_upper_bound.dart:167-172) — the oracle's plain uncapped
+    /// recursion (least_upper_bound.dart:162-177) rendered as a
+    /// frontier+visited worklist, so deep-but-valid hierarchies cannot
+    /// overflow the thread stack (the subtype face,
+    /// `TypeSystem::interface_walk`, is iterative for the same reason).
+    /// Canonical interning makes `TypeId` a sound set key across
+    /// differently substituted paths, and the answer only reads the set,
+    /// never the visit order.
     ///
-    /// `subst` is the shared substitution stack: this node's bindings are
-    /// pushed on entry, every edge substitutes against the live range
-    /// `&subst[base..]`, and the range pops on exit — the buffer grows to the
-    /// walk's depth once and is reused instead of a fresh map per node.
-    fn supertype_closure(
-        &self,
-        t: TypeId,
-        remaining: u32,
-        out: &mut FxHashSet<TypeId>,
-        subst: &mut Vec<(TypeParamId, TypeId)>,
-    ) {
-        if !out.insert(t) {
-            return;
+    /// Every visited node instantiates its supertype templates against its
+    /// own already-concrete arguments — the same per-edge
+    /// `Substitution.fromInterfaceType` step the interface walk runs
+    /// (subtype.dart:213-214) — so the worklist carries plain `TypeId`s and
+    /// no substitution stack is needed.
+    fn supertype_closure(&self, root: TypeId, out: &mut FxHashSet<TypeId>) {
+        let mut frontier = vec![root];
+        while let Some(t) = frontier.pop() {
+            if !out.insert(t) {
+                continue;
+            }
+            let TypeKind::Interface { decl, args } = self.table().get(t).kind() else {
+                continue;
+            };
+            let params = &self
+                .hierarchy()
+                .decl(decl)
+                .expect("declared")
+                .type_parameters;
+            for &edge in self.hierarchy().supertypes(decl) {
+                // `instantiate` zips params with the argument range and
+                // leaves a malformed short-arity tail unbound, exactly like
+                // the substitution the recursive form pushed per node.
+                let instantiated = self.table().instantiate(edge, params, args);
+                frontier.push(instantiated);
+            }
         }
-        if remaining == 0 {
-            return;
-        }
-        let TypeKind::Interface { decl, args } = self.table().get(t).kind() else {
-            return;
-        };
-        let params = &self
-            .hierarchy()
-            .decl(decl)
-            .expect("declared")
-            .type_parameters;
-        let base = subst.len();
-        // Truncated at the argument range exactly like the former `zip`, so a
-        // malformed short-arity instantiation leaves the tail unbound.
-        for (index, &param) in params.iter().take(args.len()).enumerate() {
-            subst.push((param, self.table().arg(args.offset() + index)));
-        }
-        for &edge in self.hierarchy().supertypes(decl) {
-            let instantiated = self.table().substitute(edge, &subst[base..]);
-            self.supertype_closure(instantiated, remaining - 1, out, subst);
-        }
-        subst.truncate(base);
     }
 
     /// `_computeTypeAtMaxUniqueDepth` (least_upper_bound.dart:327-357).

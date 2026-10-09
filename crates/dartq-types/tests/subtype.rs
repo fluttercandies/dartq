@@ -322,8 +322,10 @@ fn rule14_record_pairs_beyond_reflexivity_are_false() {
     let r = fx.record(&[fx.int(), fx.string()], &[]);
     // Rule 0a reflexivity is the only `true` record/record answer in M1.
     assert!(sys.is_subtype(r, r));
-    // Rule 14 (subtype.dart:512-519) is an M1 stub: every non-identical
-    // record/record pair is `false`, even related shapes.
+    // Rule 14 (subtype.dart:512-519) is deferred to M2: the vendored oracle
+    // dispatches record/record to a fully implemented `_isRecordSubtypeOf`,
+    // but M1 answers `false` for every non-identical pair, even related
+    // shapes.
     assert!(!sys.is_subtype(r, fx.record(&[fx.num(), fx.string()], &[])));
     assert!(!sys.is_subtype(r, fx.record(&[fx.int()], &[])));
     assert!(!sys.is_subtype(

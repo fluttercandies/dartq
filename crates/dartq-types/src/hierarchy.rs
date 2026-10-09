@@ -386,7 +386,12 @@ enum Visit {
     Done,
 }
 
-/// Depth-first cycle detection over the declaration graph.
+/// Depth-first cycle detection over the declaration graph, on an explicit
+/// `(declaration, next-edge)` frame stack: the `Unvisited`/`InProgress`/
+/// `Done` coloring and the reported cycle path are exactly the recursive
+/// form's, but the walk cannot overflow the thread stack on deep-but-valid
+/// hierarchies — the same guarantee the Kahn sweep in [`class_depths`] was
+/// built for (PRD targets 10⁵-file workspaces).
 fn detect_cycles(
     decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],
@@ -394,42 +399,49 @@ fn detect_cycles(
 ) -> Result<(), TypeError> {
     let mut state: FxHashMap<TypeDeclId, Visit> =
         decls.keys().map(|&decl| (decl, Visit::Unvisited)).collect();
+    // The DFS path, as frames of (declaration, index of the next unexplored
+    // supertype edge).
     let mut path: Vec<TypeDeclId> = Vec::new();
+    let mut frames: Vec<(TypeDeclId, usize)> = Vec::new();
 
     for &root in decls.keys() {
-        dfs(root, edges, adjacency, &mut state, &mut path)?;
-    }
-    Ok(())
-}
-
-/// Visits `decl`, reporting a cycle as the path slice that closes it.
-fn dfs(
-    decl: TypeDeclId,
-    edges: &[(TypeDeclId, TypeDeclId, TypeId)],
-    adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
-    state: &mut FxHashMap<TypeDeclId, Visit>,
-    path: &mut Vec<TypeDeclId>,
-) -> Result<(), TypeError> {
-    match state[&decl] {
-        Visit::Done => return Ok(()),
-        Visit::InProgress => {
-            let start = path
-                .iter()
-                .position(|&d| d == decl)
-                .expect("in-progress node is on the path");
-            let mut cycle: Vec<TypeDeclId> = path[start..].to_vec();
-            cycle.push(decl);
-            return Err(TypeError::CyclicHierarchy(cycle));
+        if state[&root] != Visit::Unvisited {
+            continue;
         }
-        Visit::Unvisited => {}
+        state.insert(root, Visit::InProgress);
+        path.push(root);
+        frames.push((root, 0));
+        while let Some(&(decl, index)) = frames.last() {
+            let slots = adjacency.get(&decl).map_or(&[][..], Vec::as_slice);
+            let Some(&slot) = slots.get(index) else {
+                // Every edge explored: the post-order exit.
+                state.insert(decl, Visit::Done);
+                path.pop();
+                frames.pop();
+                continue;
+            };
+            frames.last_mut().expect("peeked above").1 = index + 1;
+            let target = edges[slot].1;
+            match state[&target] {
+                Visit::Done => {}
+                Visit::InProgress => {
+                    // A back edge: report the path slice that closes it.
+                    let start = path
+                        .iter()
+                        .position(|&d| d == target)
+                        .expect("in-progress node is on the path");
+                    let mut cycle: Vec<TypeDeclId> = path[start..].to_vec();
+                    cycle.push(target);
+                    return Err(TypeError::CyclicHierarchy(cycle));
+                }
+                Visit::Unvisited => {
+                    state.insert(target, Visit::InProgress);
+                    path.push(target);
+                    frames.push((target, 0));
+                }
+            }
+        }
     }
-    state.insert(decl, Visit::InProgress);
-    path.push(decl);
-    for &index in adjacency.get(&decl).map_or(&[][..], Vec::as_slice) {
-        dfs(edges[index].1, edges, adjacency, state, path)?;
-    }
-    state.insert(decl, Visit::Done);
-    path.pop();
     Ok(())
 }
 
@@ -559,5 +571,60 @@ mod depth_exactness {
         for i in 1..=101 {
             assert_eq!(hierarchy.depth(chain(i)), 103 - i, "depth of C{i}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_safety {
+    //! Regression pin for the iterative build passes: 50,000 declarations in
+    //! one supertype chain must build without touching the thread stack —
+    //! cycle detection runs the explicit-frame DFS (`detect_cycles`) and the
+    //! depth precompute the Kahn sweep (`class_depths`) — where the former
+    //! recursive cycle check overflowed on deep-but-valid hierarchies.
+
+    use super::*;
+
+    #[test]
+    fn deep_acyclic_chain_builds_without_recursion() {
+        let table = TypeTable::new();
+        let (object, future, function) = (
+            TypeDeclId::from_raw(1),
+            TypeDeclId::from_raw(2),
+            TypeDeclId::from_raw(3),
+        );
+        let chain = |i: u32| TypeDeclId::from_raw(10 + i);
+        let itf = |table: &TypeTable, decl: TypeDeclId| {
+            table.intern(
+                UninternedType::Interface {
+                    decl,
+                    args: Vec::new(),
+                },
+                false,
+            )
+        };
+        let mut builder = TypeHierarchy::builder(CoreDecls {
+            object,
+            future,
+            function,
+            record: None,
+        })
+        .decl(object, Vec::new())
+        .decl(future, vec![TypeParamId::from_raw(1)])
+        .decl(function, Vec::new());
+        for i in 1..=50_000 {
+            builder = builder.decl(chain(i), Vec::new());
+        }
+        builder = builder.supertype(chain(50_000), itf(&table, object));
+        for i in 1..=49_999 {
+            builder = builder.supertype(chain(i), itf(&table, chain(i + 1)));
+        }
+        let hierarchy = builder
+            .build(&table)
+            .expect("deep acyclic chain is a valid DAG");
+
+        assert_eq!(hierarchy.depth(object), 1);
+        assert_eq!(hierarchy.depth(chain(50_000)), 2);
+        assert_eq!(hierarchy.depth(chain(25_000)), 25_002);
+        assert_eq!(hierarchy.depth(chain(1)), 50_001);
     }
 }

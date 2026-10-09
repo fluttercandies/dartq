@@ -14,18 +14,18 @@ use std::cmp::Ordering;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hierarchy::{CoreDecls, DeclInfo, TypeHierarchy};
-use crate::ids::{FunctionSigId, TypeDeclId, TypeId, TypeParamId};
+use crate::ids::{FunctionSigId, TypeDeclId, TypeId};
 use crate::table::TypeTable;
 use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
 
 /// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
 /// mechanism with the same limit (`type_system.dart:85`); exceeding it makes
-/// `is_subtype` return `false` (`subtype.dart:37-41`). Shared with the LUB
-/// closure walk so every type-operation recursion carries the same
-/// termination bound. It guards recursion only: the hierarchy's inheritance
-/// depths are precomputed exactly (topologically, no cap) so the LUB
-/// tie-break matches the oracle's uncapped
-/// `computeLongestInheritancePathToObject`.
+/// `is_subtype` return `false` (`subtype.dart:37-41`). It guards recursion
+/// only: the hierarchy's inheritance depths are precomputed exactly
+/// (topologically, no cap) so the LUB tie-break matches the oracle's uncapped
+/// `computeLongestInheritancePathToObject`, and the LUB supertype closure is
+/// an iterative worklist, uncapped like the oracle's plain recursion
+/// (`least_upper_bound.dart:162-177`).
 pub(crate) const DEPTH_LIMIT: u32 = 100;
 
 /// Visited set over interned ids: an epoch-stamp vector instead of a hash
@@ -81,10 +81,9 @@ impl StampSet {
 }
 
 /// Reusable subtype-walk buffers: the interface walk's visited set and LIFO
-/// frontier, plus the LUB supertype-closure sets, their intersection, and
-/// the substitution stack the closure walk pushes per level. Cleared (not
-/// reallocated) at the start of every use, so steady-state queries allocate
-/// nothing.
+/// frontier, plus the LUB supertype-closure sets and their intersection.
+/// Cleared (not reallocated) at the start of every use, so steady-state
+/// queries allocate nothing.
 #[derive(Clone, Default)]
 pub(crate) struct WalkScratch {
     pub(crate) visited: StampSet,
@@ -92,11 +91,6 @@ pub(crate) struct WalkScratch {
     pub(crate) set_a: FxHashSet<TypeId>,
     pub(crate) set_b: FxHashSet<TypeId>,
     pub(crate) candidates: Vec<TypeId>,
-    /// Supertype-closure substitution stack: each generic node pushes its
-    /// `(parameter, argument)` bindings on entry and pops them on exit, and
-    /// every edge substitutes against the live range — one buffer for the
-    /// whole closure instead of a fresh map per node.
-    pub(crate) subst: Vec<(TypeParamId, TypeId)>,
 }
 
 /// Facade over a [`TypeTable`] plus a [`TypeHierarchy`] snapshot. All queries

@@ -52,9 +52,11 @@
 //! ## M1 boundaries (spec §5)
 //!
 //! Implemented: `T?` syntax and the two-state suffix, the subtype rules
-//! 0a/0c/1-7/10-13 of `subtype.dart:262-523` (rule 14 ships as the record
-//! stub: every non-identical record/record pair is `false`,
-//! subtype.dart:512-519), `isAssignableTo`
+//! 0a/0c/1-7/10-13 of `subtype.dart:262-523` (rule 14 — record subtyping —
+//! is deferred to M2: every non-identical record/record pair is `false` and
+//! `record <: Record`-class is not answered yet; the vendored oracle's rule
+//! 14 at `subtype.dart:512-519` calls a fully implemented
+//! `_isRecordSubtypeOf`), `isAssignableTo`
 //! (type_system.dart:891-925) with the `strict-casts` gate, the `FutureOr`
 //! rules (subtype.dart:372-385/418-449), the interface walk with invariant
 //! arity/covariant arguments (subtype.dart:44-83, class parameters are
@@ -65,10 +67,14 @@
 //!
 //! Not implemented (M2): promoted bounds (flow), declared bounds and
 //! variance annotations, extension types, `UnknownInferredType`, record
-//! subtype/LUB rules (records are construction + equality skeletons),
-//! function/function LUB merging (falls back to bare `Function`), and
-//! implicit `call` tear-offs in assignability. Each fallback is documented
-//! at its site and matches an official fallback path where one exists.
+//! subtype/LUB rules — including the one-line `record <: Record`-class rule
+//! (subtype.dart:512-515) and the record/record LUB field merge
+//! (`_recordType`, least_upper_bound.dart:852-885; both-record LUB answers
+//! the `Record` class itself) — (records are construction + equality
+//! skeletons), function/function LUB merging (falls back to bare
+//! `Function`), and implicit `call` tear-offs in assignability. Each
+//! fallback is documented at its site and matches an official fallback path
+//! where one exists.
 //!
 //! The table is single-threaded (interior `RefCell`); the M2 arena story
 //! revisits parallelism.
