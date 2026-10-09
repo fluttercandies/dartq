@@ -76,6 +76,7 @@ fn print_usage() {
   harness run [--corpus-dir DIR]... [--oracle-dart PATH] [--oracle-format machine|json]
               [--dartiq-cmd TEMPLATE] [--e2e-oracle] [--severity-filter LIST]
               [--type-filter LIST] [--codes-file PATH] [--threshold F] [--out DIR]
+              [--allow-vacuous]
       Run oracle and dartiq over the corpus, compare (code, file) entry sets.
       --corpus-dir is repeatable: each dir must be a corpus package; every dir
       is analyzed with one invocation per dir and the entry sets are merged
@@ -85,6 +86,8 @@ fn print_usage() {
       --dartiq-cmd \"cargo run -q -p dartiq-cli -- check --format=machine\".
       --e2e-oracle: point the dartiq side at dart analyze itself (both sides
       identical -> jaccard must be 1.000; strongest comparator self-check).
+      Mutually exclusive with --dartiq-cmd: e2e would silently win and the
+      run would measure dart vs dart at 1.000.
       --severity-filter LIST: all | ERROR[,WARNING[,INFO]] — severities that
       enter the comparison. --type-filter LIST: all |
       syntactic_error[,compile_time_error[,static_warning[,lint]]] — machine
@@ -100,8 +103,11 @@ fn print_usage() {
       caliber: codes-file (the 262 scanner/parser codes, tests/corpus/
       syntax-codes.txt = the TSV minus the 3 language-version-family codes)
       ∩ severity ERROR. An empty codes file is a usage error (zero
-      discrimination). If a filter empties BOTH sides, the
-      existing rule applies: empty vs empty = full agreement (jaccard 1.000).
+      discrimination). Non-vacuity guard: if the oracle side has no
+      ERROR-tier entries after filtering, the ERROR gate would pass at 1.000
+      via the empty-vs-empty rule without judging anything — the run fails as
+      a harness error unless --allow-vacuous is given. --allow-vacuous:
+      accept such a run (e.g. a genuinely clean corpus).
       Preflight: every corpus dir must carry a .dart_tool/package_config.json
       whose own languageVersion is >= 3.13 (Plan A, docs/facts/
       version-skew.md §4) — a stale pin floods the gate with
@@ -164,6 +170,10 @@ struct RunOptions {
     threshold: f64,
     out: PathBuf,
     e2e_oracle: bool,
+    /// Escape hatch for the non-vacuity guard: accept a run whose oracle side
+    /// has no ERROR-tier entries post-filter (would otherwise pass at 1.0
+    /// without judging anything).
+    allow_vacuous: bool,
 }
 
 impl RunOptions {
@@ -179,6 +189,7 @@ impl RunOptions {
             threshold: DEFAULT_THRESHOLD,
             out: PathBuf::from(DEFAULT_OUT),
             e2e_oracle: false,
+            allow_vacuous: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -206,9 +217,18 @@ impl RunOptions {
                 }
                 "--out" => opts.out = value(args, &mut i)?.into(),
                 "--e2e-oracle" => opts.e2e_oracle = true,
+                "--allow-vacuous" => opts.allow_vacuous = true,
                 other => return Err(unknown_flag(other, "run")),
             }
             i += 1;
+        }
+        if opts.e2e_oracle && opts.dartiq_cmd.is_some() {
+            return Err(Outcome::Error(
+                "--e2e-oracle and --dartiq-cmd are mutually exclusive: e2e pins the dartiq \
+                 side to dart analyze itself, so passing both would silently measure dart vs \
+                 dart at 1.000"
+                    .into(),
+            ));
         }
         Ok(opts)
     }
@@ -248,7 +268,12 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let oracle = OracleDriver {
         dart: opts.oracle_dart.clone(),
     };
+    // Oracle reference version, captured once per run (PRD §19.1: every report records it)
+    let oracle_version = oracle::dart_version(&opts.oracle_dart).map_err(Outcome::Error)?;
     let oracle_diags = analyze_corpora(&corpora, |dir| oracle.analyze(dir, opts.oracle_format))?;
+    let oracle_side = build_filtered_side(&corpora, oracle_diags, &filters);
+    // Fail before the dartiq run: a vacuous oracle side would pass at 1.0 without judging anything
+    check_oracle_vacuity(&oracle_side, filters.error_in_scope(), opts.allow_vacuous)?;
     // The dartiq contract is always machine; only the e2e self-check (dartiq side = dart analyze itself) follows the oracle format
     let dartiq_format = if opts.e2e_oracle {
         opts.oracle_format
@@ -258,7 +283,6 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let dartiq_driver = build_dartiq_driver(&opts, opts.oracle_format)?;
     let dartiq_diags = analyze_corpora(&corpora, |dir| dartiq_driver.analyze(dir, dartiq_format))?;
 
-    let oracle_side = build_filtered_side(&corpora, oracle_diags, &filters);
     let dartiq_side = build_filtered_side(&corpora, dartiq_diags, &filters);
     let cmp = compare(&oracle_side, &dartiq_side);
 
@@ -280,6 +304,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         } else {
             opts.dartiq_cmd.clone().unwrap_or_default()
         },
+        oracle_version,
         threshold: opts.threshold,
         severity_filter: opts.severity_filter.clone(),
         type_filter: opts.type_filter.clone(),
@@ -461,8 +486,10 @@ fn parse_type_filter(spec: &str) -> Result<Option<Vec<String>>, Outcome> {
 ///
 /// Empty-set semantics: a filter may remove all diagnostics from both sides -- then both entry sets
 /// are empty and Jaccard keeps the existing rule "both empty = full agreement = 1.0" (see
-/// `compare::jaccard`), so the gate still passes; same as the pure-report mode when severity-filter
-/// drops the ERROR tier.
+/// `compare::jaccard`), so the gate would still pass; same as the pure-report mode when
+/// severity-filter drops the ERROR tier. On top of that rule stands the non-vacuity guard
+/// ([`check_oracle_vacuity`]): a run whose oracle side has no ERROR-tier entries post-filter is a
+/// harness error unless `--allow-vacuous` is given.
 struct Filters {
     severities: Option<Vec<Severity>>,
     types: Option<Vec<String>>,
@@ -480,6 +507,42 @@ impl Filters {
                 .as_ref()
                 .is_none_or(|c| c.contains(&d.code.to_lowercase()))
     }
+
+    /// Whether the ERROR tier — the gate metric's tier — enters the comparison
+    /// under the severity filter (`false` = pure-report mode, no gate to be vacuous about).
+    fn error_in_scope(&self) -> bool {
+        self.severities
+            .as_ref()
+            .is_none_or(|s| s.contains(&Severity::Error))
+    }
+}
+
+/// Non-vacuity guard: the ERROR gate scores "both empty = 1.0", so an oracle side that
+/// survives the filters with zero ERROR-tier entries would pass at 1.0 without judging
+/// anything (a broken --codes-file, a wrong corpus dir, a severity/type filter mismatch,
+/// or an oracle that silently produced nothing). Such a run is a harness error unless
+/// `--allow-vacuous` accepts it explicitly.
+fn check_oracle_vacuity(
+    oracle_side: &Side,
+    error_in_scope: bool,
+    allow_vacuous: bool,
+) -> Result<(), Outcome> {
+    if allow_vacuous || !error_in_scope {
+        return Ok(());
+    }
+    let error_tier_empty = oracle_side
+        .per_severity
+        .get(&Severity::Error)
+        .is_none_or(|entries| entries.is_empty());
+    if !error_tier_empty {
+        return Ok(());
+    }
+    Err(Outcome::Error(format!(
+        "oracle side is vacuous post-filter: {} pre-filter entries, {} dropped by the filters, \
+         0 ERROR-tier entries survive — the ERROR gate would pass at 1.000 without judging \
+         anything (pass --allow-vacuous to accept)",
+        oracle_side.pre_filter_total, oracle_side.dropped_by_filter
+    )))
 }
 
 /// Filter per corpus dir, build a side per dir, then merge; key prefixes come from the corpora labels (None for a single corpus).
@@ -884,6 +947,80 @@ mod tests {
             run_compare(&args(&["--corpus-dir", "/nonexistent", "--threshold", "1.5"])),
             Err(Outcome::Error(msg)) if msg.contains("--threshold")
         ));
+    }
+
+    /// --e2e-oracle and --dartiq-cmd are mutually exclusive at flag-parsing
+    /// time: e2e would silently win and the run would measure dart vs dart at
+    /// 1.000 (a "pass" that judges nothing).
+    #[test]
+    fn e2e_oracle_and_dartiq_cmd_are_mutually_exclusive() {
+        assert!(matches!(
+            RunOptions::parse(&args(&["--e2e-oracle", "--dartiq-cmd", "dartiq check"])),
+            Err(Outcome::Error(msg)) if msg.contains("mutually exclusive")
+        ));
+        // Either flag alone parses
+        assert!(RunOptions::parse(&args(&["--e2e-oracle"])).is_ok());
+        assert!(
+            RunOptions::parse(&args(&["--dartiq-cmd", "dartiq check"])).is_ok(),
+            "dartiq-cmd alone is the measurement mode"
+        );
+    }
+
+    /// Non-vacuity guard: an oracle side whose ERROR tier is empty post-filter
+    /// (all entries dropped, or only non-ERROR entries) would pass the ERROR
+    /// gate at 1.0 via the both-empty rule -- rejected unless --allow-vacuous;
+    /// pure-report mode (severity filter without ERROR) has no gate to be
+    /// vacuous about and is never rejected.
+    #[test]
+    fn vacuity_guard_rejects_empty_oracle_error_tier() {
+        let mk = |severity: Severity, code: &str| MachineDiag {
+            severity,
+            dtype: "SYNTACTIC_ERROR".into(),
+            code: code.into(),
+            file: std::path::PathBuf::from("lib/a.dart"),
+            line: 1,
+            col: 1,
+            length: 1,
+            message: "m".into(),
+        };
+
+        // All oracle entries dropped by the codes filter -> vacuous
+        let filters = Filters {
+            severities: None,
+            types: None,
+            codes: Some(BTreeSet::from(["expected_token".to_string()])),
+        };
+        assert!(filters.error_in_scope());
+        let diags = vec![mk(Severity::Error, "UNDEFINED_CLASS")];
+        let side = build_side_labeled(&diags, Path::new("/corpus"), None, |d| filters.keep(d));
+        assert!(matches!(
+            check_oracle_vacuity(&side, true, false),
+            Err(Outcome::Error(msg)) if msg.contains("vacuous")
+                && msg.contains("1 pre-filter entries, 1 dropped"),
+            "error carries the accounting"
+        ));
+        // The escape hatch accepts exactly this run
+        assert!(check_oracle_vacuity(&side, true, true).is_ok());
+
+        // Only WARNING entries survive -> ERROR tier empty while in scope -> vacuous
+        let diags = vec![mk(Severity::Warning, "UNUSED_LOCAL_VARIABLE")];
+        let side = build_side_labeled(&diags, Path::new("/corpus"), None, |_| true);
+        assert!(check_oracle_vacuity(&side, true, false).is_err());
+
+        // One ERROR entry survives -> non-vacuous
+        let diags = vec![mk(Severity::Error, "EXPECTED_TOKEN")];
+        let side = build_side_labeled(&diags, Path::new("/corpus"), None, |_| true);
+        assert!(check_oracle_vacuity(&side, true, false).is_ok());
+
+        // Pure-report mode: severity filter drops ERROR, gate not in scope -> never rejected
+        let filters = Filters {
+            severities: Some(vec![Severity::Warning]),
+            types: None,
+            codes: None,
+        };
+        assert!(!filters.error_in_scope());
+        let side = build_side_labeled(&diags, Path::new("/corpus"), None, |d| filters.keep(d));
+        assert!(check_oracle_vacuity(&side, false, false).is_ok());
     }
 
     #[test]

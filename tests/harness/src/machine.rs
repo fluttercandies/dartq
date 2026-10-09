@@ -88,6 +88,8 @@ pub(crate) fn parse_output(text: &str, format: OutputFormat) -> Result<Vec<Machi
 fn parse_machine(text: &str) -> Result<Vec<MachineDiag>, String> {
     let mut diags = Vec::new();
     for (idx, line) in text.lines().enumerate() {
+        // Blank lines are skipped: the oracle is not observed to emit blank
+        // lines; strictness here was deferred to the serial verification phase.
         if line.is_empty() {
             continue;
         }

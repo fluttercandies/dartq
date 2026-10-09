@@ -34,26 +34,99 @@ impl OracleDriver {
             "--no-fatal-warnings".to_string(),
             corpus_dir.display().to_string(),
         ];
-        run_driver("oracle", &self.dart, &args, format)
+        run_driver(DriverSide::Oracle, &self.dart, &args, format)
     }
 }
 
+/// Which child program a driver talks to; the side determines the exit-code contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DriverSide {
+    /// `dart analyze` (the oracle side; also the e2e self-check's dartiq-side process)
+    Oracle,
+    /// the dartiq CLI (measurement side)
+    Dartiq,
+}
+
+impl DriverSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Oracle => "oracle",
+            Self::Dartiq => "dartiq",
+        }
+    }
+
+    /// Exit codes that count as a measurement result. Oracle (facts §3):
+    /// {0,1,2,3} are valid; 4 = crash, 64 = usage error. The dartiq CLI uses
+    /// 2 for usage errors of its own (e.g. a malformed `--dartiq-cmd`
+    /// template): folding exit 2 into "valid + empty output" would score a
+    /// meaningless Jaccard 0, so it fails the run up front like 4/64. The e2e
+    /// self-check pins dart analyze to exits {0,3} via `--no-fatal-warnings`
+    /// (facts §7.9), so the stricter dartiq contract cannot misfire there.
+    fn valid_exit(self, code: i32) -> bool {
+        match self {
+            Self::Oracle => (0..=3).contains(&code),
+            Self::Dartiq => matches!(code, 0 | 1 | 3),
+        }
+    }
+
+    fn valid_exits_desc(self) -> &'static str {
+        match self {
+            Self::Oracle => "0-3",
+            Self::Dartiq => "0, 1, 3 (2 = usage error)",
+        }
+    }
+}
+
+/// Capture the oracle's reference version once per run (`dart --version`, one line on stderr) —
+/// recorded in every report per PRD §19.1 (the embedded analyzer version rides the SDK).
+pub(crate) fn dart_version(dart: &str) -> Result<String, String> {
+    let timeout = driver_timeout_from_env()?;
+    let output = run_captured("oracle", dart, &["--version".to_string()], None, timeout)?;
+    if !output.status.success() {
+        let tail = stderr_tail(&output.stderr);
+        return Err(format!(
+            "[oracle] `{dart} --version` exited with {:?}; stderr tail:\n{tail}",
+            output.status.code()
+        ));
+    }
+    let stderr = String::from_utf8(output.stderr)
+        .map_err(|e| format!("[oracle] `{dart} --version` stderr is not valid UTF-8: {e}"))?;
+    parse_dart_version(&stderr)
+}
+
+/// `dart --version` prints a single banner line to stderr, e.g.
+/// `Dart SDK version: 3.9.4 (stable) (Tue Sep 9 12:00:00 2025 +0000) on "macos_arm64"`.
+/// The full trimmed line is the reference version (build date + platform included);
+/// no format strictness beyond non-empty: the field records whatever banner the
+/// pinned oracle prints, and an empty banner is a harness error rather than a
+/// silent fallback that would leave reports unattributable.
+fn parse_dart_version(stderr: &str) -> Result<String, String> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "[oracle] `dart --version` printed no version banner".to_string())
+}
+
 /// Pipeline shared by both drivers: "run command under a time budget -> validate exit code -> parse output".
+/// `side` selects the exit-code contract (see [`DriverSide::valid_exit`]).
 /// Diagnostic lines always go to stdout (facts §3); stderr is ignored on valid exit codes, and its tail is attached to aid locating failures on abnormal exits.
 pub(crate) fn run_driver(
-    name: &str,
+    side: DriverSide,
     program: &str,
     args: &[String],
     format: OutputFormat,
 ) -> Result<Vec<MachineDiag>, String> {
+    let name = side.as_str();
     let timeout = driver_timeout_from_env()?;
     let output = run_captured(name, program, args, None, timeout)?;
     let exit = output.status.code();
-    let valid = matches!(exit, Some(code) if (0..=3).contains(&code));
-    if !valid {
+    if !exit.is_some_and(|code| side.valid_exit(code)) {
         let tail = stderr_tail(&output.stderr);
         return Err(format!(
-            "[{name}] `{program}` exited with {exit:?} (valid: 0-3); stderr tail:\n{tail}"
+            "[{name}] `{program}` exited with {exit:?} (valid: {}); stderr tail:\n{tail}",
+            side.valid_exits_desc()
         ));
     }
     // Strict decode: diagnostic text is UTF-8 (facts §1/§2); lossy decoding
@@ -305,7 +378,7 @@ mod tests {
     #[test]
     fn invalid_utf8_stdout_is_strict_error() {
         let err = run_driver(
-            "oracle",
+            DriverSide::Oracle,
             "sh",
             &["-c".to_string(), "printf '\\377\\376'".to_string()],
             OutputFormat::Machine,
@@ -333,5 +406,30 @@ mod tests {
         assert!(driver_timeout(Some("abc")).is_err());
         assert!(driver_timeout(Some("0")).is_err());
         assert!(driver_timeout(Some("-5")).is_err());
+    }
+
+    /// The reference version is the oracle's full trimmed banner line (build
+    /// date + platform included); leading noise lines are tolerated, an empty
+    /// banner is a harness error instead of an unattributable report.
+    #[test]
+    fn dart_version_banner_parsing() {
+        let banner =
+            "Dart SDK version: 3.9.4 (stable) (Tue Sep 9 12:00:00 2025 +0000) on \"macos_arm64\"";
+        assert_eq!(parse_dart_version(banner).unwrap(), banner);
+        // Banner arrives with surrounding whitespace / trailing newline
+        assert_eq!(
+            parse_dart_version(&format!("  {banner}  \n")).unwrap(),
+            banner
+        );
+        assert_eq!(
+            parse_dart_version("\nwarning line\n\n").unwrap(),
+            "warning line",
+            "first non-empty line wins"
+        );
+        assert!(parse_dart_version("").is_err());
+        assert!(
+            parse_dart_version("  \n \n").is_err(),
+            "blank-only banner must error"
+        );
     }
 }

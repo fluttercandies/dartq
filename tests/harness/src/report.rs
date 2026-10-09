@@ -13,6 +13,9 @@ pub(crate) struct RunMeta {
     pub(crate) corpus_dir: String,
     pub(crate) oracle_cmd: String,
     pub(crate) dartiq_cmd: String,
+    /// Full `dart --version` banner line captured once per run (PRD §19.1:
+    /// every report records the oracle reference version)
+    pub(crate) oracle_version: String,
     pub(crate) threshold: f64,
     pub(crate) severity_filter: String,
     pub(crate) type_filter: String,
@@ -72,6 +75,7 @@ struct JsonMeta<'a> {
     corpus_dir: &'a str,
     oracle_cmd: &'a str,
     dartiq_cmd: &'a str,
+    oracle_version: &'a str,
     threshold: f64,
     severity_filter: &'a str,
     type_filter: &'a str,
@@ -137,6 +141,7 @@ pub(crate) fn write_reports(
             corpus_dir: &meta.corpus_dir,
             oracle_cmd: &meta.oracle_cmd,
             dartiq_cmd: &meta.dartiq_cmd,
+            oracle_version: &meta.oracle_version,
             threshold: meta.threshold,
             severity_filter: &meta.severity_filter,
             type_filter: &meta.type_filter,
@@ -233,6 +238,7 @@ fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
         "- corpus: {} (files with diagnostics: {})",
         meta.corpus_dir, cmp.file_count
     );
+    let _ = writeln!(md, "- oracle version: {}", meta.oracle_version);
     let _ = writeln!(
         md,
         "- oracle: `{}` -> {} diags",
@@ -349,6 +355,7 @@ mod tests {
             corpus_dir: "/corpus".into(),
             oracle_cmd: "dart analyze".into(),
             dartiq_cmd: "dartiq check".into(),
+            oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
             threshold: 0.99,
             severity_filter: "all".into(),
             type_filter: "syntactic_error".into(),
@@ -373,6 +380,10 @@ mod tests {
         assert_eq!(
             parsed["meta"]["codes_file"],
             "tests/corpus/syntax-codes.txt"
+        );
+        assert_eq!(
+            parsed["meta"]["oracle_version"], "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"",
+            "the oracle reference version rides the report meta"
         );
         let dist = &parsed["oracle_distribution"];
         assert_eq!(
@@ -413,6 +424,10 @@ mod tests {
             md.contains("type filter: syntactic_error; codes file: tests/corpus/syntax-codes.txt"),
             "md records type filter and codes file"
         );
+        assert!(
+            md.contains("- oracle version: Dart SDK version: 3.9.4"),
+            "md header records the oracle reference version"
+        );
         // md is capped to the first 20 entries, the rest points to report.json
         assert!(md.contains("5 more entries"), "cap notice present");
 
@@ -446,6 +461,7 @@ mod tests {
             corpus_dir: "/corpus".into(),
             oracle_cmd: "dart analyze".into(),
             dartiq_cmd: "dartiq check".into(),
+            oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
             threshold: 0.99,
             severity_filter: "all".into(),
             type_filter: "all".into(),

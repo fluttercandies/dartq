@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use crate::machine::{MachineDiag, OutputFormat};
-use crate::oracle::run_driver;
+use crate::oracle::{DriverSide, run_driver};
 /// dartiq command driver: `program + args` are both given by the caller.
 pub(crate) struct DartiqDriver {
     program: String,
@@ -48,7 +48,7 @@ impl DartiqDriver {
         if !has_placeholder {
             args.push(dir_str);
         }
-        run_driver("dartiq", &self.program, &args, format)
+        run_driver(DriverSide::Dartiq, &self.program, &args, format)
     }
 }
 
@@ -111,5 +111,20 @@ mod tests {
             .analyze(Path::new("/tmp"), OutputFormat::Machine)
             .expect_err("exit 4 must error");
         assert!(err.contains("Some(4)"), "error: {err}");
+    }
+
+    /// Exit 2 on the dartiq side is a usage error of the dartiq CLI itself
+    /// (e.g. a malformed `--dartiq-cmd` template): folding it into
+    /// "valid + empty output" would score a meaningless Jaccard 0, so it is a
+    /// harness error like 4/64.
+    #[test]
+    fn usage_exit_2_is_harness_error() {
+        let driver =
+            DartiqDriver::from_program("sh".to_string(), vec!["-c".into(), "exit 2".into()]);
+        let err = driver
+            .analyze(Path::new("/tmp"), OutputFormat::Machine)
+            .expect_err("usage exit 2 must error, not pass as an empty measurement");
+        assert!(err.contains("Some(2)"), "error: {err}");
+        assert!(err.contains("usage"), "error names the exit tier: {err}");
     }
 }
