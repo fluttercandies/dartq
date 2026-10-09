@@ -1310,6 +1310,20 @@ mod tests {
         assert_eq!(warnings[0].range.offset, 0, "span at the comment");
         assert_eq!(warnings[0].range.length, 14, "whole comment lexeme");
 
+        // Era anchors (oracle dart 3.13.1, facts version-skew §1.3 T2): 3.14
+        // is above the oracle's latest known version — warned and dropped;
+        // 3.13 is the latest and is accepted.
+        let (version, _, warnings) = scan_file("// @dart = 3.14\nvar x = 1;\n", file);
+        assert_eq!(
+            version, DEFAULT_LANGUAGE_VERSION,
+            "above-latest 3.14 dropped"
+        );
+        assert_eq!(warnings.len(), 1);
+
+        let (version, _, warnings) = scan_file("// @dart = 3.13\nvar x = 1;\n", file);
+        assert_eq!(version, LanguageVersion::new(3, 13), "oracle latest accepted");
+        assert!(warnings.is_empty());
+
         let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
         assert_eq!(version, LanguageVersion::new(3, 1), "last match wins");
 

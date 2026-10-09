@@ -15,9 +15,11 @@ fn lv(major: u32, minor: u32) -> LanguageVersion {
 
 #[test]
 fn default_language_version_matches_sdk() {
-    // Vendored yaml `current-version: '3.15.0'`; the SDK-generated
-    // `defaultLanguageVersion` in _fe_analyzer_shared is `Version(3, 15)`.
-    assert_eq!(DEFAULT_LANGUAGE_VERSION, lv(3, 15));
+    // Era pin: the vendored yaml is the dart 3.13.1 measurement-oracle
+    // snapshot (`current-version: '3.13.0'`; provenance in the yaml header).
+    // The oracle rejects `// @dart` overrides above 3.13 (facts version-skew
+    // §1.3 T2).
+    assert_eq!(DEFAULT_LANGUAGE_VERSION, lv(3, 13));
 }
 
 #[test]
@@ -98,7 +100,7 @@ fn language_version_orders_numerically() {
 
 #[test]
 fn registry_counts_are_consistent() {
-    assert_eq!(FEATURE_COUNT, 49);
+    assert_eq!(FEATURE_COUNT, 46);
     assert_eq!(Feature::ALL.len(), FEATURE_COUNT);
     assert_eq!(FEATURES.len(), FEATURE_COUNT);
 }
@@ -243,16 +245,17 @@ fn latest_matches_default_version() {
 /// `INVALID_LANGUAGE_VERSION_OVERRIDE` warning + override drop (the official
 /// scanner emits the warning and nulls the override; the version then
 /// re-resolves via the package-config/default chain). Measured oracle shape
-/// (facts version-skew §1.3 T2, oracle latest = 3.13): `@dart = 3.14` is
-/// above-latest (WARNING, override dropped), `@dart = 3.13` is not. Against
-/// the vendored latest (3.15) the predicate fires at 3.16+.
+/// (facts version-skew §1.3 T2, oracle dart 3.13.1): `@dart = 3.14` is
+/// above-latest (WARNING, override dropped), `@dart = 3.13` is not.
 #[test]
 fn is_above_latest_pins_the_override_rejection_boundary() {
-    assert_eq!(DEFAULT_LANGUAGE_VERSION, lv(3, 15));
+    assert_eq!(DEFAULT_LANGUAGE_VERSION, lv(3, 13));
+    // The measured oracle boundary: the 3.13.1 toolchain warns on 3.14.
+    assert!(lv(3, 14).is_above_latest());
     assert!(lv(3, 16).is_above_latest());
     assert!(lv(4, 0).is_above_latest());
-    assert!(!lv(3, 15).is_above_latest());
     assert!(!lv(3, 13).is_above_latest());
+    assert!(!lv(3, 12).is_above_latest());
 }
 
 /// Exercises the gate-bypassing constructor; flag decoding must use
@@ -308,11 +311,11 @@ fn unreleased_flag_opts_in_only_at_current_version() {
             .experimental_release_version,
         None
     );
-    let below_current = FeatureSet::for_language_version(lv(3, 14))
-        .with_experiment_for_version(lv(3, 14), Feature::InferenceUpdate4);
+    let below_current = FeatureSet::for_language_version(lv(3, 12))
+        .with_experiment_for_version(lv(3, 12), Feature::InferenceUpdate4);
     assert!(!below_current.is_enabled(Feature::InferenceUpdate4));
-    let above_current = FeatureSet::for_language_version(lv(3, 16))
-        .with_experiment_for_version(lv(3, 16), Feature::InferenceUpdate4);
+    let above_current = FeatureSet::for_language_version(lv(3, 14))
+        .with_experiment_for_version(lv(3, 14), Feature::InferenceUpdate4);
     assert!(!above_current.is_enabled(Feature::InferenceUpdate4));
     let at_current = FeatureSet::for_language_version(DEFAULT_LANGUAGE_VERSION)
         .with_experiment_for_version(DEFAULT_LANGUAGE_VERSION, Feature::InferenceUpdate4);
@@ -383,8 +386,8 @@ fn fingerprint_distinguishes_sets() {
 }
 
 /// Golden fingerprints pinned to the current vendored yaml snapshot
-/// (dart-lang/sdk `e6f4207adef69106d7519a79144efdb5c1acc4d0`,
-/// `current-version: '3.15.0'`, vendored 2026-10-08).
+/// (dart-lang/sdk tag `3.13.1`, `current-version: '3.13.0'`, era-pinned to
+/// the dart 3.13.1 measurement oracle, vendored 2026-10-09).
 ///
 /// Fingerprints derive from registry bit order (= yaml appearance order), so
 /// re-vendoring the yaml can silently shift bits and change every
@@ -396,15 +399,16 @@ fn fingerprint_distinguishes_sets() {
 #[test]
 fn fingerprint_golden_values() {
     let latest = FeatureSet::latest().fingerprint();
-    assert_eq!(latest, 0x8ee5_3921_de0a_b360);
-    // Same bit set as `latest`, same print: DEFAULT_LANGUAGE_VERSION is 3.15.
+    assert_eq!(latest, 0x5fcc_2aed_7200_e849);
+    // No feature ships above 3.13 in the era table, so an above-latest
+    // version (3.15) resolves to the same set — and the same print.
     assert_eq!(
         FeatureSet::for_language_version(lv(3, 15)).fingerprint(),
         latest
     );
     assert_eq!(
         FeatureSet::for_language_version(lv(2, 12)).fingerprint(),
-        0x3aca_cb83_56da_1694
+        0xd005_c0b5_a771_e7d0
     );
 }
 

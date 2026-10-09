@@ -7,9 +7,9 @@
 //!   `current-version`.
 //! * [`Feature`] — one variant per entry in the Dart SDK's
 //!   `tools/experimental_features.yaml`, vendored at
-//!   `data/experimental_features.yaml` (dart-lang/sdk main, commit
-//!   `e6f4207adef69106d7519a79144efdb5c1acc4d0`, `current-version: '3.15.0'`,
-//!   vendored 2026-10-08).
+//!   `data/experimental_features.yaml` (dart-lang/sdk tag `3.13.1`,
+//!   `current-version: '3.13.0'`, era-pinned to the dart 3.13.1 measurement
+//!   oracle — see the yaml header for provenance; vendored 2026-10-09).
 //! * [`FeatureSet`] — the features enabled for a library: derived from its
 //!   language version, plus explicit `--enable-experiment` opt-ins.
 //!
@@ -98,7 +98,7 @@ pub fn triple_shift_enabled(version: LanguageVersion) -> bool {
     FeatureSet::for_language_version(version).is_enabled(Feature::TripleShift)
 }
 
-/// A Dart language version (`major.minor`), e.g. `3.15`.
+/// A Dart language version (`major.minor`), e.g. `3.13`.
 ///
 /// The version a library is analyzed under comes from the package config or
 /// a `// @dart = <version>` override comment, defaulting to
@@ -155,7 +155,7 @@ impl FromStr for LanguageVersion {
     type Err = LanguageVersionParseError;
 
     /// Parses `major.minor` (package config and `// @dart` override style) or
-    /// `major.minor.patch` (SDK release style, e.g. the yaml's `'3.15.0'`);
+    /// `major.minor.patch` (SDK release style, e.g. the yaml's `'3.13.0'`);
     /// a patch part is accepted and ignored. Every part must be bare ASCII
     /// digits — the official grammar has no sign (a leading `+` would be
     /// accepted by `u32::from_str`).
