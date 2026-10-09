@@ -16,7 +16,10 @@
 //! - one **prefix table** per distinct `as` prefix, merged across all
 //!   imports sharing it, keyed by prefix name — the analyzer's
 //!   `_prefixElements` map (`LibraryFragmentScope._`,
-//!   scope.dart:348-358). Prefixes live *outside* the combined import
+//!   scope.dart:343-353). Every named prefix registers, even when its
+//!   import's target resolves to nothing (the table is then empty:
+//!   `_buildLibraryImportPrefixes` has no resolution gating,
+//!   `element.dart:7529-7536`). Prefixes live *outside* the combined import
 //!   namespace: `_lookupCombined` consults `_prefixElements` first and
 //!   returns the prefix unconditionally, before the import namespace
 //!   (scope.dart:455-471), and `p.x` always goes through the prefix's
@@ -36,9 +39,10 @@
 //! time, and this layer only exposes it through [`Lookup::Ambiguous`].
 //!
 //! Lookup order is the oracle's scope chain (`LibraryFragmentScope.lookup`,
-//! scope.dart:418-432): local declarations first (they shadow imports),
-//! then prefixes (the `_prefixElements` branch of `_lookupCombined`), then
-//! the merged import namespace. The deeper chain (type-parameter scopes,
+//! scope.dart:419-433): the name-coupled locals layer first (a local face
+//! under either spelling of a base name shadows imports for both), then
+//! prefixes (the `_prefixElements` branch of `_lookupCombined`), then the
+//! merged import namespace. The deeper chain (type-parameter scopes,
 //! part-local scopes) is the semantic layer's.
 //!
 //! # Deviations from the spec sketch (§5), pinned here
@@ -51,9 +55,11 @@
 //!   for the semantic layer to resolve.
 //! - External (`dart:`) namespaces are opaque at this layer — the SDK's
 //!   names are grafted downstream (analyzer fills them from summaries). The
-//!   `front_end` non-`dart:`-over-`dart:` merge priority (scope.dart:177-181)
-//!   becomes relevant only once SDK namespaces exist and is deferred with
-//!   that graft.
+//!   non-`dart:`-over-`dart:` merge priority — `PrefixScope._merge`'s
+//!   `_isSdkElement` preference (`element/scope.dart:675-697`, predicate at
+//!   `:721`; CFE agreement in `source_library_builder.dart:401-434`, which
+//!   `library_graph.rs` already pins) — becomes relevant only once SDK
+//!   namespaces exist and is deferred with that graft.
 //! - The spec's `Namespace`/`Scope` type split is folded into one index
 //!   ([`Namespaces`]) with the chain order fixed (local → imports): M1 has a
 //!   single two-level chain, and a parent-delegation abstraction would model
@@ -63,7 +69,7 @@ use dartq_source::{FileId, StringId};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map;
 
-use crate::library_graph::{LibraryGraph, LibraryId};
+use crate::library_graph::{LibraryGraph, LibraryId, LocalLookup};
 
 /// One lookup target in a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +125,10 @@ struct LibraryNamespaces {
     /// Prefix name → its merged table (across all imports sharing the
     /// prefix), the [`Prefix`] face of [`NamespaceEntry`].
     prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>>,
+    /// The interned `_` when one of the library's imports registers that
+    /// prefix — the wildcard gate of the bare-name prefix branch (see
+    /// [`Namespaces::lookup`]).
+    wildcard_prefix: Option<StringId>,
 }
 
 impl Namespaces {
@@ -135,11 +145,19 @@ impl Namespaces {
     }
 
     /// Bare-name lookup in `lib`'s scope chain (`LibraryFragmentScope.lookup`,
-    /// scope.dart:418-432): local declarations first (they shadow imports),
-    /// then a registered prefix — the `_prefixElements` branch of
-    /// `_lookupCombined` returns the prefix unconditionally, before the
-    /// import namespace (scope.dart:455-471) — then the merged import
-    /// namespace.
+    /// scope.dart:419-433): the name-coupled locals layer first, then a
+    /// registered prefix — the `_prefixElements` branch of `_lookupCombined`
+    /// returns the prefix unconditionally, before the import namespace
+    /// (scope.dart:455-471) — then the merged import namespace.
+    ///
+    /// The locals link is all-or-nothing per base name: `_lookupLibrary`
+    /// hands back the getter/setter pair and `_lookupCombined` is never
+    /// consulted when either face is non-null (scope.dart:473-486), so a
+    /// local face under either spelling suppresses import lookup for both
+    /// while contributing only its own face (`Shadowed` → [`Lookup::NotFound`],
+    /// mirroring the pair's absent face). Bare `_` never hits the prefix
+    /// branch: with `wildcard_variables` (Dart 3.7+ default-on; pinned here)
+    /// `_shouldTryPrefixElement` skips it (scope.dart:486-494).
     ///
     /// # Panics
     ///
@@ -147,11 +165,13 @@ impl Namespaces {
     /// from — a caller bug (ids only come from that graph).
     #[must_use]
     pub fn lookup(&self, graph: &LibraryGraph, lib: LibraryId, name: StringId) -> Lookup<'_> {
-        if let Some(file) = graph.local(lib, name) {
-            return Lookup::Found(NamespaceEntry::Decl(file));
+        match graph.local(lib, name) {
+            LocalLookup::Found(file) => return Lookup::Found(NamespaceEntry::Decl(file)),
+            LocalLookup::Shadowed => return Lookup::NotFound,
+            LocalLookup::Absent => {}
         }
         let lib_ns = &self.libs[lib.index() as usize];
-        if lib_ns.prefixes.contains_key(&name) {
+        if lib_ns.prefixes.contains_key(&name) && lib_ns.wildcard_prefix != Some(name) {
             return Lookup::Found(NamespaceEntry::Prefix);
         }
         to_lookup(lib_ns.names.get(&name))
@@ -186,15 +206,23 @@ impl Namespaces {
 fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
     let mut names: FxHashMap<StringId, NameEntry> = FxHashMap::default();
     let mut prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>> = FxHashMap::default();
+    let wildcard_prefix = graph.wildcard_prefix(lib);
     for edge in graph.import_edges(lib) {
-        let Some(target) = edge.target else {
-            continue; // external/missing/non-library: contributes nothing
-        };
+        // The prefix registers unconditionally: `_buildLibraryImportPrefixes`
+        // (element.dart:7529-7536) sweeps every import's prefix with no
+        // resolution gating, and `LibraryFragmentScope._` (scope.dart:343-353)
+        // enters each named prefix into `_prefixElements` — only the prefix's
+        // NAME table stays empty when the URI carries no library
+        // (`PrefixScope` admits only `DirectiveUriWithLibraryImpl` imports,
+        // scope.dart:530-535).
         // `Option<&mut _>` is not `Copy`: reborrow through `as_deref_mut` so
         // the table survives every iteration of the name loop.
         let mut table: Option<&mut FxHashMap<StringId, NameEntry>> = edge
             .prefix
             .map(|prefix| prefixes.entry(prefix).or_default());
+        let Some(target) = edge.target else {
+            continue; // prefix registered above; it simply has no names
+        };
         for (name, entry) in graph.export_scope(target) {
             if !edge.combinators.allows(name) {
                 continue;
@@ -206,7 +234,11 @@ fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
             }
         }
     }
-    LibraryNamespaces { names, prefixes }
+    LibraryNamespaces {
+        names,
+        prefixes,
+        wildcard_prefix,
+    }
 }
 
 /// Import-merge conflict rule (Dart 18.1; `front_end`
@@ -515,11 +547,16 @@ mod tests {
         );
     }
 
-    /// Imports resolving to nothing contribute no names and register no
-    /// prefix — the oracle skips directives whose imported library is null
-    /// (imports_verifier.dart:63-70).
+    /// An import whose URI has no library contributes no names, but its
+    /// `as` prefix still registers with an empty table: the oracle builds
+    /// the prefix set from every import with no resolution gating
+    /// (`_buildLibraryImportPrefixes`, element.dart:7529-7536;
+    /// `LibraryFragmentScope._`, scope.dart:343-353) and only the prefix's
+    /// name table is filtered to resolved libraries (`PrefixScope`,
+    /// scope.dart:530-535). So bare `p` resolves to the prefix while `p.x`
+    /// finds nothing in it.
     #[test]
-    fn missing_imports_contribute_nothing() {
+    fn missing_import_target_still_registers_its_prefix() {
         let mut rig = Rig::new();
         let consumer = rig.builder.intern("package:c/c.dart");
         rig.import(consumer, None, None, Combinators::unfiltered());
@@ -528,16 +565,139 @@ mod tests {
 
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("anything")),
-            Lookup::NotFound
+            Lookup::NotFound,
+            "an unresolved target contributes no names"
         );
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("p")),
-            Lookup::NotFound,
-            "no prefix entry without a target"
+            Lookup::Found(NamespaceEntry::Prefix),
+            "the prefix registers without a target"
         );
         assert_eq!(
             namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),
-            Lookup::NotFound
+            Lookup::NotFound,
+            "the prefix's name table stays empty"
+        );
+    }
+
+    /// Locals shadow imports at the NAME level, not per spelling: a local
+    /// getter under a base name suppresses the import namespace for the
+    /// setter spelling too — `_lookupLibrary` hands back the getter/setter
+    /// pair and `_lookupCombined` is never consulted when either face is
+    /// non-null (scope.dart:419-433/473-486; setters keyed by the base
+    /// name, scope.dart:801-806). The locals contribute only their own
+    /// face, so the imported setter is unreachable (a setter use misses).
+    #[test]
+    fn local_getter_shadows_imported_setter() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let t_file = rig.file("t.dart");
+        let c_file = rig.file("c.dart");
+        rig.declare(target, "foo=", t_file);
+        rig.declare(consumer, "foo", c_file);
+        rig.import(consumer, Some(target), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("foo")),
+            Lookup::Found(NamespaceEntry::Decl(c_file)),
+            "the local getter wins"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("foo=")),
+            Lookup::NotFound,
+            "the imported setter is shadowed by the local getter's base name"
+        );
+    }
+
+    /// The mirror coupling: a local setter suppresses the imported getter
+    /// spelling (same all-or-nothing `_lookupLibrary` rule,
+    /// scope.dart:419-433/473-486).
+    #[test]
+    fn local_setter_shadows_imported_getter() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let t_file = rig.file("t.dart");
+        let c_file = rig.file("c.dart");
+        rig.declare(target, "foo", t_file);
+        rig.declare(consumer, "foo=", c_file);
+        rig.import(consumer, Some(target), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("foo=")),
+            Lookup::Found(NamespaceEntry::Decl(c_file)),
+            "the local setter wins"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("foo")),
+            Lookup::NotFound,
+            "the imported getter is shadowed by the local setter's base name"
+        );
+    }
+
+    /// The locals layer is not privacy-filtered: private top-levels resolve
+    /// for same-library references — including ones declared in a part file
+    /// — while staying out of the export face (`LibraryDeclarations` adds
+    /// all library members with no `_` filter, scope.dart:272-289; the `_`
+    /// drop lives only in `buildInitialExportScope`,
+    /// library_builder.dart:252-262, so cross-library privates never leak
+    /// through imports).
+    #[test]
+    fn private_top_level_resolves_same_library() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let a_file = rig.file("a.dart"); // declared in the library file
+        let lib_b = rig.builder.intern("package:b/b.dart");
+        let b_part = rig.file("b_part.dart"); // declared in a part file
+        let consumer = rig.builder.intern("package:c/c.dart");
+        rig.declare(a, "_helper", a_file);
+        rig.declare(lib_b, "_helper", b_part);
+        rig.import(consumer, Some(a), None, Combinators::unfiltered());
+        rig.import(consumer, Some(lib_b), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, a, strings.intern("_helper")),
+            Lookup::Found(NamespaceEntry::Decl(a_file))
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, lib_b, strings.intern("_helper")),
+            Lookup::Found(NamespaceEntry::Decl(b_part)),
+            "same-library, declared from a part file"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("_helper")),
+            Lookup::NotFound,
+            "privates never leak through imports"
+        );
+    }
+
+    /// With `wildcard_variables` (Dart 3.7+ default-on; pinned here) a bare
+    /// `_` never hits the prefix branch: `_shouldTryPrefixElement` skips it
+    /// (scope.dart:486-494), so `import 'x' as _;` does not make a bare `_`
+    /// reference resolve to the prefix.
+    #[test]
+    fn wildcard_underscore_lookup_skips_prefix_branch() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let t_file = rig.file("t.dart");
+        rig.declare(target, "x", t_file);
+        rig.import(consumer, Some(target), Some("_"), Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("_")),
+            Lookup::NotFound,
+            "the wildcard `_` skips the prefix branch"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed(consumer, strings.intern("_"), strings.intern("x")),
+            Lookup::Found(NamespaceEntry::Decl(t_file)),
+            "`_.x` still resolves through the prefix table"
         );
     }
 

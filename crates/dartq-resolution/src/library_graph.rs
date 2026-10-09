@@ -9,10 +9,12 @@
 //! directives ([`ImportEdge`]/[`ExportEdge`]): URI resolution and conditional
 //! selection are upstream ([`crate::UriResolver::resolve`]), and a directive
 //! whose target is external (`dart:`), missing, or not a library carries
-//! `target: None` — it contributes no names, matching the oracle's
-//! null-library guard (`imports_verifier.dart:63-70`). The §4.2 codes for
-//! such directives stay with the caller's [`crate::UriResolution`]; this
-//! layer only computes namespaces.
+//! `target: None` — it contributes no names, matching the oracle's name-table
+//! filter (`PrefixScope` admits only `DirectiveUriWithLibraryImpl` imports,
+//! `element/scope.dart:530-535`); an import-side `as` prefix still registers
+//! with an empty table downstream (the namespace layer's contract). The §4.2
+//! codes for such directives stay with the caller's
+//! [`crate::UriResolution`]; this layer only computes namespaces.
 //!
 //! # Export scopes (pinned oracle behavior)
 //!
@@ -73,6 +75,7 @@
 
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::FxHashMap;
+use std::collections::hash_map;
 
 /// An interned library node: the resolution layer's logical identity
 /// (spec §5; the engine's arena `LibraryId` is a separate, downstream type).
@@ -175,7 +178,10 @@ fn expand_names(names: &[StringId], strings: &StringTable) -> Box<[StringId]> {
 /// The caller resolves the directive URI upstream and maps the outcome: a
 /// library of the analysis set becomes `Some`, an external (`dart:`),
 /// missing, or part-file target becomes `None` — such an import contributes
-/// no names and registers no prefix.
+/// no names, while its `as` prefix still registers with an empty table (the
+/// oracle sweeps every import's prefix with no resolution gating,
+/// `element.dart:7529-7536`; the name-table filter is
+/// `DirectiveUriWithLibraryImpl`, `scope.dart:530-535`).
 #[derive(Clone, Debug)]
 pub struct ImportEdge {
     /// The imported library, or `None` when it contributes nothing.
@@ -212,6 +218,33 @@ pub struct ExportEntry {
     pub file: FileId,
     /// `true` for a local public declaration, `false` for a re-export.
     pub is_local: bool,
+}
+
+/// One spelling's slot in a library's locals layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalSlot {
+    /// The spelling is locally declared: its face's declaring file.
+    Decl(FileId),
+    /// The coupled spelling of a locally declared base name (the getter
+    /// spelling when only the setter is declared, or vice versa): imports
+    /// are suppressed for it, but it has no local face of its own.
+    ShadowOnly,
+}
+
+/// The locals-link outcome for one spelling — the first link of the
+/// namespace scope chain ([`crate::namespace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalLookup {
+    /// The spelling is locally declared.
+    Found(FileId),
+    /// The base name has a local face but not this spelling's: the whole
+    /// base name shadows imports (the oracle consults the name-coupled
+    /// getter/setter pair and never reaches the import scope when either
+    /// face is non-null, `element/scope.dart:419-433/473-486`), so the
+    /// lookup stops here with no target.
+    Shadowed,
+    /// No local declaration under the base name; import lookup proceeds.
+    Absent,
 }
 
 /// A propagation flow: the export scope of `from` flows into `to` through
@@ -279,16 +312,15 @@ impl<'t> LibraryGraphBuilder<'t> {
 
     /// Records one top-level declaration `name` of `lib`, declared in `file`
     /// (the library file or one of its parts; folding the part tree is the
-    /// caller's job). Private names — leading `_`, per
-    /// `library_builder.dart:254-256` — are dropped: they never enter any
-    /// export scope. Duplicate names keep the first: a library's members have
-    /// unique names by construction, and duplicates are the semantic layer's
-    /// diagnosis, not a namespace-shaping event.
+    /// caller's job). The declaration enters both faces: the locals layer
+    /// ([`LibraryGraph::local`], privates included — the oracle's locals
+    /// table has no `_` filter, `element/scope.dart:272-289`) and the export
+    /// face, where privates are dropped at seeding (the oracle's `_` filter
+    /// lives only in `buildInitialExportScope`,
+    /// `library_builder.dart:252-262`). Duplicate names keep the first: a
+    /// library's members have unique names by construction, and duplicates
+    /// are the semantic layer's diagnosis, not a namespace-shaping event.
     pub fn declare(&mut self, lib: LibraryId, name: StringId, file: FileId) {
-        let strings = self.strings;
-        if strings.resolve(name).starts_with('_') {
-            return;
-        }
         self.nodes[lib.index() as usize].decls.push((name, file));
     }
 
@@ -314,21 +346,41 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// [`u32::MAX`] — a program bug at any realistic scale.
     #[must_use]
     pub fn finish(self) -> LibraryGraph {
-        // Seed: locals first, so no propagation can ever displace them.
-        let mut scopes: Vec<FxHashMap<StringId, ExportEntry>> = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let mut scope = FxHashMap::default();
-                for (name, file) in &node.decls {
-                    scope.entry(*name).or_insert(ExportEntry {
-                        file: *file,
-                        is_local: true,
-                    });
+        let strings = self.strings;
+        // The wildcard id: a prefix registered under `_` is gated out of the
+        // bare-name prefix branch (`_shouldTryPrefixElement`,
+        // `element/scope.dart:486-494`; `wildcard_variables` is default-on
+        // and pinned here).
+        let underscore = strings.intern("_");
+
+        // Seed: locals first, so no propagation can ever displace them;
+        // `_`-private names stay out of the export face (the oracle's
+        // `buildInitialExportScope` filter, `library_builder.dart:252-262`)
+        // while entering the locals layer.
+        let mut scopes: Vec<FxHashMap<StringId, ExportEntry>> =
+            Vec::with_capacity(self.nodes.len());
+        let mut locals: Vec<FxHashMap<StringId, LocalSlot>> =
+            Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let mut scope = FxHashMap::default();
+            for (name, file) in &node.decls {
+                if strings.resolve(*name).starts_with('_') {
+                    continue;
                 }
-                scope
-            })
-            .collect();
+                // Deliberate deviation: first-wins, where the oracle's
+                // `ExportScope.declare` unconditionally overwrites
+                // (summary2/export.dart:97-100, last-wins) — the divergence
+                // only manifests in already-erroneous duplicate
+                // declarations, which the spec pins as
+                // non-namespace-shaping.
+                scope.entry(*name).or_insert(ExportEntry {
+                    file: *file,
+                    is_local: true,
+                });
+            }
+            scopes.push(scope);
+            locals.push(build_locals(&node.decls, strings));
+        }
 
         // Flows: one per export edge with an in-graph target, grouped by
         // source library; within a source, (exporter registration order,
@@ -410,15 +462,65 @@ impl<'t> LibraryGraphBuilder<'t> {
         let nodes = nodes
             .into_iter()
             .zip(scopes)
-            .map(|(node, export_scope)| LibraryNode {
-                uri: node.uri,
-                imports: node.imports,
-                exports: node.exports,
-                export_scope,
+            .zip(locals)
+            .map(|((node, export_scope), local_slots)| {
+                let wildcard_prefix = node
+                    .imports
+                    .iter()
+                    .any(|edge| edge.prefix == Some(underscore))
+                    .then_some(underscore);
+                LibraryNode {
+                    uri: node.uri,
+                    imports: node.imports,
+                    exports: node.exports,
+                    export_scope,
+                    locals: local_slots,
+                    wildcard_prefix,
+                }
             })
             .collect();
         LibraryGraph { nodes }
     }
+}
+
+/// Builds one library's locals layer: per-spelling slots with precomputed
+/// base-name coupling. The oracle keys the getter/setter pair of a base name
+/// into shared maps — `_addSetter` strips the trailing `=` from the lookup
+/// name (`element/scope.dart:801-806`) — and consults the pair wholesale
+/// before any import (`_lookupLibrary`, scope.dart:473-486, all-or-nothing
+/// per base name); dartq keeps per-spelling interned keys and materializes
+/// the coupling as [`LocalSlot::ShadowOnly`] markers, so a lookup is a
+/// single hash hit on interned ids. Privates are included: the oracle's
+/// locals table has no `_` filter (`LibraryDeclarations`,
+/// scope.dart:272-289).
+fn build_locals(
+    decls: &[(StringId, FileId)],
+    strings: &StringTable,
+) -> FxHashMap<StringId, LocalSlot> {
+    let mut slots: FxHashMap<StringId, LocalSlot> = FxHashMap::default();
+    for &(name, file) in decls {
+        match slots.entry(name) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert(LocalSlot::Decl(file));
+            }
+            // A coupling marker yields to the real declaration; a duplicate
+            // declaration keeps the first (the oracle's `_getters[id] ??=`,
+            // scope.dart:797-806).
+            hash_map::Entry::Occupied(mut slot) if matches!(slot.get(), LocalSlot::ShadowOnly) => {
+                slot.insert(LocalSlot::Decl(file));
+            }
+            hash_map::Entry::Occupied(_) => {}
+        }
+        // Either local face suppresses import lookup for BOTH spellings of
+        // the base name: register the coupled spelling as a shadow marker.
+        let text = strings.resolve(name);
+        let coupled = match text.strip_suffix('=') {
+            Some(base) => strings.intern(base),
+            None => strings.intern(&format!("{text}=")),
+        };
+        slots.entry(coupled).or_insert(LocalSlot::ShadowOnly);
+    }
+    slots
 }
 
 /// Applies one flow for `name`: combinator filter, then a first-come-wins
@@ -466,6 +568,11 @@ struct LibraryNode {
     imports: Vec<ImportEdge>,
     exports: Vec<ExportEdge>,
     export_scope: FxHashMap<StringId, ExportEntry>,
+    /// The locals layer: per-spelling slots with base-name coupling,
+    /// privates included ([`LibraryGraph::local`]).
+    locals: FxHashMap<StringId, LocalSlot>,
+    /// The interned `_` when one of `imports` registers that prefix.
+    wildcard_prefix: Option<StringId>,
 }
 
 impl LibraryGraph {
@@ -515,13 +622,29 @@ impl LibraryGraph {
         self.nodes[lib.index() as usize].export_scope.get(&name)
     }
 
-    /// The locally declared entry for `name`, or `None` — the shadowing face:
-    /// a library's own declarations beat its imports in
-    /// [`crate::namespace`] lookup.
+    /// The locals link of the scope chain for `name` (either spelling): what
+    /// `lib` itself declares, before any import is consulted. The oracle
+    /// couples the two faces of a base name — `_lookupLibrary` hands back
+    /// the (getter, setter) pair and `_lookupCombined` is never consulted
+    /// when either face is non-null (`element/scope.dart:419-433/455-471`),
+    /// with setters keyed by the base name (`_addSetter` strips the trailing
+    /// `=`, scope.dart:801-806). dartq precomputes that coupling per
+    /// spelling ([`LocalSlot`]), keeping the check a single hash hit.
     #[must_use]
-    pub fn local(&self, lib: LibraryId, name: StringId) -> Option<FileId> {
-        let entry = self.nodes[lib.index() as usize].export_scope.get(&name)?;
-        entry.is_local.then_some(entry.file)
+    pub fn local(&self, lib: LibraryId, name: StringId) -> LocalLookup {
+        match self.nodes[lib.index() as usize].locals.get(&name) {
+            None => LocalLookup::Absent,
+            Some(LocalSlot::Decl(file)) => LocalLookup::Found(*file),
+            Some(LocalSlot::ShadowOnly) => LocalLookup::Shadowed,
+        }
+    }
+
+    /// The interned `_` when `lib` registers a prefix of that name — the
+    /// wildcard-variable gate of the bare-name prefix branch
+    /// ([`crate::namespace`]; `_shouldTryPrefixElement`,
+    /// `element/scope.dart:486-494`).
+    pub(crate) fn wildcard_prefix(&self, lib: LibraryId) -> Option<StringId> {
+        self.nodes[lib.index() as usize].wildcard_prefix
     }
 }
 
@@ -645,7 +768,11 @@ mod tests {
             .expect("propagated");
         assert_eq!(entry.file, c_file);
         assert!(!entry.is_local, "arrived via re-export");
-        assert!(graph.local(a, rig.strings.intern("cName")).is_none());
+        assert_eq!(
+            graph.local(a, rig.strings.intern("cName")),
+            LocalLookup::Absent,
+            "a re-exported name is not a local face"
+        );
     }
 
     /// Export cycles converge: a and b export each other; both faces carry
@@ -899,7 +1026,7 @@ mod tests {
 
     /// Private names never enter an export scope
     /// (`buildInitialExportScope` skips `_`-prefixed names,
-    /// library_builder.dart:254-256).
+    /// library_builder.dart:254-256) but stay reachable in the locals layer.
     #[test]
     fn private_names_stay_unexported() {
         let mut rig = Rig::new();
@@ -918,11 +1045,47 @@ mod tests {
         );
     }
 
+    /// The locals layer couples the two spellings of a base name and keeps
+    /// privates: a local getter shadows the setter spelling (and vice versa)
+    /// without contributing a face for it — the oracle's `_lookupLibrary`
+    /// pair, all-or-nothing per base name (element/scope.dart:473-486;
+    /// `_addSetter` keys setters by the base name, scope.dart:801-806) — and
+    /// `_`-private top-levels resolve same-library (`LibraryDeclarations`
+    /// has no `_` filter, scope.dart:272-289).
+    #[test]
+    fn local_layer_couples_faces_and_keeps_privates() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let a_file = rig.file("a.dart");
+        let b = rig.builder.intern("package:b/b.dart");
+        let b_file = rig.file("b.dart");
+        rig.declare(a, "foo", a_file); // getter only
+        rig.declare(b, "_helper", b_file); // private
+        let graph = rig.builder.finish();
+
+        let strings = &rig.strings;
+        assert_eq!(
+            graph.local(a, strings.intern("foo")),
+            LocalLookup::Found(a_file)
+        );
+        assert_eq!(
+            graph.local(a, strings.intern("foo=")),
+            LocalLookup::Shadowed,
+            "imports suppressed, but no local setter face"
+        );
+        assert_eq!(
+            graph.local(b, strings.intern("_helper")),
+            LocalLookup::Found(b_file),
+            "privates resolve same-library"
+        );
+        assert_eq!(graph.local(a, strings.intern("bar")), LocalLookup::Absent);
+    }
+
     /// Directive targets that are external/missing/not-a-library
     /// (`target: None`) contribute nothing — the oracle skips directives
     /// whose exported library is null (`addExporters` continue,
-    /// library_builder.dart:128-131; import-side guard
-    /// imports_verifier.dart:63-70).
+    /// library_builder.dart:128-131; the import-side name-table filter is
+    /// `DirectiveUriWithLibraryImpl`, scope.dart:530-535).
     #[test]
     fn unresolved_targets_contribute_nothing() {
         let mut rig = Rig::new();

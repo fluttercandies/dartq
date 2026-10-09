@@ -32,7 +32,7 @@ pub use codes::{ResolutionCode, ResolutionCodeInfo};
 pub use conditional::{ConditionalEnv, Configuration, SelectedUri, select_configured_uri};
 pub use library_graph::{
     CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
-    LibraryGraphBuilder, LibraryId,
+    LibraryGraphBuilder, LibraryId, LocalLookup,
 };
 pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces};
 pub use uri::{
