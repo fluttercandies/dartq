@@ -19,6 +19,9 @@ pub const MAIN_0: &str = "import 'greeter.dart';\n\nvoid main() {\n  print(greet
 pub const GREETER_0: &str = "String greet() => 'hi';\n";
 /// Edited import target: same shape, different bytes (ContentId gate must pass).
 pub const GREETER_1: &str = "String greet() => 'hello';\n";
+/// Standalone library: imports nothing, imported by nothing — it never enters
+/// any cascade, so it serves as the clean analysis target.
+pub const STANDALONE_0: &str = "int standalone() => 3;\n";
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 

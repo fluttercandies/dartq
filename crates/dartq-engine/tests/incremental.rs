@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0};
+use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0, STANDALONE_0};
 use dartq_engine::RevalidateGate;
 
 fn summarized(
@@ -73,7 +73,11 @@ fn identical_rewrite_is_a_gate_no_op() {
 
 #[test]
 fn single_edit_recomputes_only_its_cascade() {
-    let fixture = Fixture::new(&[("lib/main.dart", MAIN_0), ("lib/greeter.dart", GREETER_0)]);
+    let fixture = Fixture::new(&[
+        ("lib/main.dart", MAIN_0),
+        ("lib/greeter.dart", GREETER_0),
+        ("lib/standalone.dart", STANDALONE_0),
+    ]);
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     engine
@@ -84,9 +88,17 @@ fn single_edit_recomputes_only_its_cascade() {
     // importer (L1 is content-driven — §3.2, no signature refinement).
     engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_1.as_bytes());
 
+    // The untouched library rides along as the AnalyzeFile target: targets
+    // drive only the amplification events, and a clean targeted library
+    // reports a cache hit (engine-api-spec §1.3).
+    let target = engine
+        .file_table()
+        .try_file_id(&fixture.path("lib/standalone.dart"))
+        .expect("interned");
+
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[target], &mut log.sink(), &Default::default())
         .expect("edit");
     assert!(diagnostics.is_empty());
 

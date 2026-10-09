@@ -289,7 +289,14 @@ fn relative(fixture: &Fixture, file: FileId, engine: &Engine) -> String {
         .file_table()
         .path(file)
         .expect("event file is resident");
-    path.strip_prefix(&fixture.root)
+    // dartq-pub canonicalizes package roots, so on macOS interned paths live
+    // under /private/var while temp_dir() spells /var: strip against the
+    // canonical root, not the literal one.
+    let root = fixture
+        .root
+        .canonicalize()
+        .expect("fixture root resolves");
+    path.strip_prefix(&root)
         .expect("fixture-relative path")
         .to_string_lossy()
         .into_owned()
