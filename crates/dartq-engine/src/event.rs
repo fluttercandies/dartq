@@ -27,7 +27,8 @@ pub enum EngineEvent {
     },
     /// Per-file gate outcome. `ContentIdHit` = unchanged bytes, zero work.
     /// `Parsed` = revalidated; `ast_cache_hit` = the (content, feature set)
-    /// key hit the facts cache, so no re-scan/re-parse ran.
+    /// key was already computed — hit the facts cache or an identical
+    /// sibling earlier in the same batch — so no re-scan/re-parse ran.
     FileRevalidated {
         /// The revalidated file.
         file: FileId,
@@ -63,6 +64,7 @@ pub enum RevalidateGate {
     /// `file_tracker.dart:161` `nothing` branch).
     ContentIdHit,
     /// Content changed and was revalidated; `ast_cache_hit` says whether
-    /// the parse was skipped via the facts cache.
+    /// the parse was skipped (facts cache, or an identical-content sibling
+    /// computed earlier in the same batch).
     Parsed { ast_cache_hit: bool },
 }

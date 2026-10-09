@@ -151,11 +151,19 @@ pub(crate) fn apply(
 /// (it interns directive targets into the shared `FileTable`).
 ///
 /// A file whose `(content, feature fingerprint)` key already sits in the
-/// facts cache skips the fan-out entirely (`ast_cache_hit`). Changed files
-/// parse **twice** at M1 — once for recovery diagnostics through the
-/// engine's listener, once inside `dartq_semantic::collect`, which
-/// hardcodes its own listener. The waste is bounded to changed files and is
-/// on record as the reason #120/#121 should land a combined listener face.
+/// facts cache skips the fan-out entirely (`ast_cache_hit`). Batch members
+/// sharing a key — identical bytes at the same feature set — compute once:
+/// the fan-out runs for the first member only and the rest derive from it
+/// (also reported as `ast_cache_hit`, no scan/parse ran). The derivation
+/// re-runs only the per-file steps: diagnostics are re-attributed to the
+/// member's own file, and its directives re-resolve against its own path —
+/// a relative `import 'u.dart'` resolves differently per directory, so the
+/// shared part is exactly the pure `(content, feature set)` computation.
+/// Changed files parse **twice** at M1 — once for recovery diagnostics
+/// through the engine's listener, once inside `dartq_semantic::collect`,
+/// which hardcodes its own listener. The waste is bounded to changed files
+/// and is on record as the reason #120/#121 should land a combined listener
+/// face.
 fn recompute_facts(
     state: &mut EngineState,
     changed: &[(FileId, ContentId, String)],
@@ -168,10 +176,16 @@ fn recompute_facts(
         .collect();
 
     // Cache lookups up front (read-only); misses dispatch to the fan-out
-    // below.
+    // below, deduplicated by key so a batch computes each distinct
+    // `(content, feature set)` once.
     let mut slots: Vec<Option<(Arc<UnitFacts>, bool)>> = Vec::with_capacity(changed.len());
     slots.resize_with(changed.len(), || None);
     let mut misses: Vec<(usize, FactsKey)> = Vec::new();
+    // FactsKey → batch slot of the first miss carrying it.
+    let mut first_miss: FxHashMap<FactsKey, usize> = FxHashMap::default();
+    // Batch slots deriving from an earlier slot's computation (same key),
+    // grouped by their template slot.
+    let mut siblings: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for (index, (_, content, _)) in changed.iter().enumerate() {
         let key = FactsKey {
             content: *content,
@@ -180,7 +194,10 @@ fn recompute_facts(
         };
         if let Some(facts) = state.cached_facts(key) {
             slots[index] = Some((facts, true));
+        } else if let Some(&template) = first_miss.get(&key) {
+            siblings.entry(template).or_default().push(index);
         } else {
+            first_miss.insert(key, index);
             misses.push((index, key));
         }
     }
@@ -203,10 +220,21 @@ fn recompute_facts(
         })
         .collect();
 
-    // Sequential URI resolution over the shared FileTable, then cache insert.
+    // Sequential URI resolution over the shared FileTable: each template
+    // resolves for its own file, then each sibling derives from the
+    // pre-resolution template — diagnostics re-attributed, directives
+    // re-resolved — under the same sequential pass (resolution interns).
     let mut resolver = state.uri_resolver();
     let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
     for (index, key, mut facts) in computed {
+        for sibling in siblings.remove(&index).unwrap_or_default() {
+            let mut derived = facts.clone();
+            for diagnostic in &mut derived.diagnostics {
+                diagnostic.file = changed[sibling].0;
+            }
+            resolve_unit(&mut derived, changed[sibling].0, &mut resolver);
+            slots[sibling] = Some((Arc::new(derived), true));
+        }
         resolve_unit(&mut facts, changed[index].0, &mut resolver);
         let facts = Arc::new(facts);
         to_cache.push((key, Arc::clone(&facts)));

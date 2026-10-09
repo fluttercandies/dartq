@@ -102,8 +102,11 @@ pub struct DirectiveFacts {
 ///
 /// Produced by the apply-phase recompute (fan-out for scan/parse/
 /// collect, then sequential URI resolution) and shared as an `Arc` between
-/// residency, the facts cache, and the semantic-diagnosis seam.
-#[derive(Debug)]
+/// residency, the facts cache, and the semantic-diagnosis seam. The
+/// batch-internal dedupe clones a member's facts from its same-key
+/// template's pre-resolution state (all fields are cheap data: interned
+/// ids, spans, diagnostics).
+#[derive(Clone, Debug)]
 pub struct UnitFacts {
     /// The content the facts were computed from.
     pub(crate) content: ContentId,
@@ -218,7 +221,7 @@ pub(crate) enum PendingChange {
 /// A small stable integer naming one library of the analysis set. Opaque,
 /// engine-internal, process-lifetime only (engine-api-spec §1.2); the
 /// identity stable across applies is the library's canonical URI, and a
-/// removed library retires its id into a permanent hole.
+/// removed library returns its id to the arena's reuse freelist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LibraryId(u32);
 
@@ -236,20 +239,32 @@ impl LibraryId {
 }
 
 /// The library arena: canonical URI → `LibraryId`, stable across applies.
+/// Retired ids are recycled through a freelist, so the slot count tracks the
+/// historical live peak rather than the total interns.
 #[derive(Debug, Default)]
 pub(crate) struct LibraryTable {
     ids_by_uri: FxHashMap<Box<str>, LibraryId>,
     infos: Vec<Option<LibraryInfo>>,
+    /// Retired ids available for reuse. Entries are distinct (an id can
+    /// re-enter only through a later [`Self::retire_except`]), so the list
+    /// is bounded by the historical live peak.
+    free: Vec<LibraryId>,
 }
 
 impl LibraryTable {
     /// The library registered under `uri`, interning the id on first sight.
+    /// A previously retired id is reused before the arena grows.
     pub(crate) fn intern(&mut self, uri: Box<str>) -> LibraryId {
         if let Some(&id) = self.ids_by_uri.get(&uri) {
             return id;
         }
-        let id = LibraryId::next(self.infos.len());
-        self.infos.push(None);
+        let id = if let Some(id) = self.free.pop() {
+            id
+        } else {
+            let id = LibraryId::next(self.infos.len());
+            self.infos.push(None);
+            id
+        };
         self.ids_by_uri.insert(uri, id);
         id
     }
@@ -285,8 +300,8 @@ impl LibraryTable {
             .filter_map(|(index, info)| info.is_some().then_some(LibraryId(index as u32)))
     }
 
-    /// Drops every registration whose id is not in `keep`, retiring their
-    /// ids into permanent holes. Returns the retired ids (ascending).
+    /// Drops every registration whose id is not in `keep`, returning their
+    /// ids to the reuse freelist. Returns the retired ids (ascending).
     pub(crate) fn retire_except(&mut self, keep: &FxHashSet<LibraryId>) -> Vec<LibraryId> {
         let mut retired = Vec::new();
         self.ids_by_uri.retain(|_, id| {
@@ -299,6 +314,7 @@ impl LibraryTable {
         });
         for id in &retired {
             self.infos[id.index() as usize] = None;
+            self.free.push(*id);
         }
         retired.sort_unstable();
         retired
