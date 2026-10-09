@@ -14,8 +14,13 @@
 //! scheduler's writer-priority order — every staged write applies before any
 //! read analyzes, so N batched edits collapse into one apply + one analysis,
 //! and a read enqueued before a write still answers with the post-write
-//! view. A task superseded by a [`Runtime::cancel`] drops at the drain: its
-//! requests answer `RequestCancelled` and produce nothing.
+//! view. `$/cancelRequest` cancels per id (rust-analyzer's posture): the
+//! coalesced read is partitioned — the cancelled id answers
+//! `RequestCancelled`, its co-riders re-attach to a read re-stamped at the
+//! fresh epoch (mirroring the write re-stamp), and when a write survives
+//! with no request left riding on the read, a *zero-request read* is
+//! re-stamped with it so the publish diff still drains — an edit+cancel
+//! batch can never leave the client's diagnostics stale.
 //!
 //! # Snapshot persistence (#306)
 //!
@@ -313,35 +318,54 @@ impl Session {
         }
     }
 
-    /// `$/cancelRequest`: bumps the context's epoch, so every task enqueued
-    /// so far drops at the drain and its requests answer `RequestCancelled`.
-    /// Cancelling an unknown or already-answered id is ignored (LSP
-    /// §cancelRequest); the granularity is the context's pending turn work.
+    /// `$/cancelRequest`: cancels one queued request by id, precisely
+    /// (rust-analyzer cancels per id, not per batch). The coalesced read
+    /// task is partitioned: the cancelled id answers `RequestCancelled` at
+    /// the drain, while co-riding requests re-attach to a read task
+    /// re-stamped at the fresh epoch — mirroring the write re-stamp below.
+    /// When a write task survives (staged, unobserved edits) and no request
+    /// is left riding on the read, a zero-request read is re-stamped with
+    /// it, so the publish diff the cancelled read was carrying still runs.
     ///
-    /// The staged overlay edits are *not* cancellable (LSP notifications
-    /// carry no ids): the write task re-stamps at the fresh epoch, so a read
-    /// enqueued after the cancel still drains behind the writes.
+    /// Cancelling an unknown or already-answered id is ignored (LSP
+    /// §cancelRequest). The staged overlay edits are *not* cancellable (LSP
+    /// notifications carry no ids).
     ///
     /// # Panics
     ///
-    /// Never in practice: the re-stamp enqueues against the root context,
+    /// Never in practice: the re-stamps enqueue against the root context,
     /// which lives for the session.
     pub fn cancel_request(&mut self, id: &RequestId) {
         let Some(pending) = &self.read else {
             return;
         };
-        if !pending.requests.contains(id) {
+        let Some(position) = pending.requests.iter().position(|queued| queued == id) else {
             return;
-        }
+        };
+        let mut pending = self
+            .read
+            .take()
+            .expect("position proved the read is queued");
+        let cancelled = pending.requests.remove(position);
+        self.cancelled.push(cancelled);
         let _ = self.runtime.cancel(self.context);
-        if let Some(pending) = self.read.take() {
-            self.cancelled.extend(pending.requests);
-        }
+        // Re-stamp the surviving work at the fresh epoch — the stale
+        // (superseded) tasks drop at the drain.
         if let Some(cookie) = self.write.take() {
             self.runtime
                 .enqueue(self.context, true, cookie)
                 .expect("the root context lives for the session; write re-stamp cannot fail");
             self.write = Some(cookie);
+        }
+        let survivors = pending.requests;
+        if !survivors.is_empty() || self.write.is_some() {
+            let cookie = self.next_cookie();
+            self.runtime
+                .enqueue(self.context, false, cookie)
+                .expect("the root context lives for the session; read re-stamp cannot fail");
+            self.read = Some(PendingRead {
+                requests: survivors,
+            });
         }
     }
 
@@ -420,8 +444,12 @@ impl Session {
                     turn.answers.push((id, Ok(entries.clone())));
                 }
             }
-            // The analysis token is the engine's own cancellation
-            // checkpoint; stale work never surfaces as a partial answer.
+            // Known semantics until the M4 worker pool: in-flight
+            // cancellation is NOT wired — the token handed to `analyze` is
+            // never cancelled, and the epoch only drops *queued* tasks at
+            // the drain, before they execute. This arm exists for the
+            // engine's contract (`analyze` can fail cancelled); stale work
+            // never surfaces as a partial answer because it never starts.
             Err(Cancelled) => {
                 for id in pending.requests {
                     turn.answers.push((id, Err(SessionError::Cancelled)));
@@ -686,26 +714,24 @@ mod tests {
     /// Epoch cancellation (PRD §16.6), deterministically: a request
     /// superseded by `$/cancelRequest` drops at the drain and answers
     /// cancelled with no result, while the overlay edit sharing the batch
-    /// still lands (writes carry no ids) — the follow-up read publishes it
-    /// and answers the post-write view.
+    /// still lands (writes carry no ids) — and the publish the cancelled
+    /// read was carrying is re-stamped onto a zero-request read, so the
+    /// clear push reaches the client in the same turn even if it goes
+    /// silent afterwards.
     #[test]
-    fn cancel_drops_queued_reads_but_writes_survive() {
+    fn cancel_drops_queued_reads_but_writes_and_publishes_survive() {
         let (workspace, mut session) = fixture("cancel-unit");
         let uri = uri::from_path(&workspace.path("lib/main.dart"));
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // Request + edit + cancel in one batch.
+        // Request + edit + cancel in one batch, then silence.
         session.queue_analyze(RequestId::Num(2));
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
         session.cancel_request(&RequestId::Num(2));
         let turn = session.service();
-        assert!(
-            turn.publishes.is_empty(),
-            "no read survived the cancel: {:?}",
-            turn.publishes
-        );
+
         let [(id, answer)] = turn.answers.as_slice() else {
             panic!("one request, one answer: {:?}", turn.answers);
         };
@@ -714,15 +740,103 @@ mod tests {
             matches!(answer, Err(SessionError::Cancelled)),
             "the stale request answers cancelled: {answer:?}"
         );
-
-        // The write survived: the follow-up read publishes the clear and
-        // answers the post-write view.
-        session.queue_analyze(RequestId::Num(3));
-        let turn = session.service();
-        assert_eq!(turn.publishes.len(), 1, "the surviving write's clear push");
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the write's clear push survives the cancel: {:?}",
+            turn.publishes
+        );
         assert_eq!(turn.publishes[0].version, Some(2));
         assert!(turn.publishes[0].diagnostics.is_empty());
+
+        // The publish baseline caught up in that turn: a follow-up analysis
+        // (had the client not stayed silent) pushes nothing new.
+        session.queue_analyze(RequestId::Num(3));
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "no duplicate push: {:?}",
+            turn.publishes
+        );
         let entries = turn.answers[0].1.as_ref().expect("post-write answer");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
+    }
+
+    /// Cancel partitions the coalesced read per id: the cancelled request
+    /// answers cancelled, its co-rider survives on the re-stamped read and
+    /// answers with the real analysis.
+    #[test]
+    fn cancel_partitions_the_coalesced_read() {
+        let (_workspace, mut session) = fixture("cancel-partition-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Two analyses coalesce onto one read; cancelling one spares the
+        // other.
+        session.queue_analyze(RequestId::Num(2));
+        session.queue_analyze(RequestId::Num(3));
+        session.cancel_request(&RequestId::Num(2));
+        let turn = session.service();
+
+        assert!(
+            turn.publishes.is_empty(),
+            "nothing changed since the sweep: {:?}",
+            turn.publishes
+        );
+        assert_eq!(
+            turn.answers.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            [&RequestId::Num(2), &RequestId::Num(3)],
+            "cancelled answers first, survivor after"
+        );
+        assert!(
+            matches!(&turn.answers[0].1, Err(SessionError::Cancelled)),
+            "the cancelled id: {:?}",
+            turn.answers[0]
+        );
+        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.diagnostic.code == "uri_does_not_exist"),
+            "the survivor got the real analysis: {entries:?}"
+        );
+    }
+
+    /// Cancelling an unknown id, or one that already answered, is silently
+    /// ignored (LSP §cancelRequest): no cancelled answer, no state change.
+    #[test]
+    fn cancel_of_unknown_or_answered_id_is_ignored() {
+        let (_workspace, mut session) = fixture("cancel-ignore-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Unknown id while a read is queued: the queued request still
+        // answers normally.
+        session.queue_analyze(RequestId::Num(2));
+        session.cancel_request(&RequestId::Num(99));
+        let turn = session.service();
+        assert_eq!(
+            turn.answers.len(),
+            1,
+            "only the queued request: {:?}",
+            turn.answers
+        );
+        assert!(turn.answers[0].1.is_ok(), "the cancel never landed");
+
+        // An id that already answered: the read drained; the cancel is a
+        // no-op and the next analysis still answers.
+        session.cancel_request(&RequestId::Num(2));
+        session.queue_analyze(RequestId::Num(3));
+        let turn = session.service();
+        assert_eq!(
+            turn.answers.len(),
+            1,
+            "only the new request: {:?}",
+            turn.answers
+        );
+        assert_eq!(turn.answers[0].0, RequestId::Num(3));
+        assert!(turn.answers[0].1.is_ok());
     }
 }

@@ -62,6 +62,12 @@ fn full_session_overlay_and_diagnostics() {
         answered_frames[0]["result"]["capabilities"]["textDocumentSync"],
         1
     );
+    assert!(
+        answered_frames[0]["result"]["capabilities"]["experimental"]
+            .get("dartq/analyze")
+            .is_some(),
+        "dartq/analyze is announced under experimental"
+    );
 
     // The `initialized` sweep publishes the seeded disk error; didOpen with
     // identical text must NOT re-publish (the diff baseline holds).
@@ -250,4 +256,140 @@ fn broken_framing_ends_the_session() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     assert_eq!(transcript.len(), 1, "one answer, then the session ends");
     assert_eq!(transcript[0]["error"]["code"], -32700);
+}
+
+/// The burst path's first use: didChange + dartq/analyze + $/cancelRequest
+/// in ONE batch through the real server loop (the `try_recv` batching
+/// window in server.rs).
+/// The cancelled request answers -32800 precisely, and the edit's clear
+/// publish still rides the re-stamped zero-request read — the client gets
+/// it in the same turn and then goes silent (only shutdown/exit follow).
+#[test]
+fn burst_edit_analyze_cancel_still_publishes() {
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let uri = dartq_daemon::uri::from_path(&workspace.path("lib/main.dart"));
+    let mut h = spawn(&workspace, &store_root("burst-edit-cancel"));
+
+    h.step(&request(1, "initialize", json!({})), 1);
+    h.step(&notification("initialized", json!({})), 1);
+    h.burst(
+        &[
+            notification(
+                "textDocument/didChange",
+                json!({"textDocument": {"uri": uri, "version": 2},
+                       "contentChanges": [{"text": CLEAN_MAIN}]}),
+            ),
+            request(2, "dartq/analyze", json!({})),
+            notification("$/cancelRequest", json!({"id": 2})),
+        ],
+        2,
+    );
+    h.step(&request(3, "shutdown", json!(null)), 1);
+    let (code, transcript) = h.exit();
+
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    let pushes = publishes(&transcript);
+    assert_eq!(pushes.len(), 2, "sweep push + the batch's clear push");
+    assert_eq!(pushes[1]["params"]["version"], 2);
+    assert_eq!(pushes[1]["params"]["diagnostics"], json!([]));
+    let answered_frames = answered(&transcript);
+    let analyze = answered_frames
+        .iter()
+        .find(|frame| frame["id"] == 2)
+        .expect("analyze answer");
+    assert_eq!(
+        analyze["error"]["code"], -32800,
+        "cancelled precisely: {analyze}"
+    );
+    let shutdown = answered_frames
+        .iter()
+        .find(|frame| frame["id"] == 3)
+        .expect("shutdown answer");
+    assert_eq!(shutdown["result"], Value::Null);
+}
+
+/// Two analyses coalesce onto one read; a cancel in the same batch
+/// partitions it per id: the cancelled id answers -32800 while its co-rider
+/// answers Ok with the real diagnostics (and nothing changed, so no push).
+#[test]
+fn burst_two_requests_one_cancel_partitions() {
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let mut h = spawn(&workspace, &store_root("burst-partition"));
+
+    h.step(&request(1, "initialize", json!({})), 1);
+    h.step(&notification("initialized", json!({})), 1);
+    h.burst(
+        &[
+            request(2, "dartq/analyze", json!({})),
+            request(3, "dartq/analyze", json!({})),
+            notification("$/cancelRequest", json!({"id": 2})),
+        ],
+        2,
+    );
+    h.step(&request(4, "shutdown", json!(null)), 1);
+    let (code, transcript) = h.exit();
+
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    assert_eq!(
+        publishes(&transcript).len(),
+        1,
+        "only the sweep push: nothing changed in the batch"
+    );
+    let answered_frames = answered(&transcript);
+    let cancelled = answered_frames
+        .iter()
+        .find(|frame| frame["id"] == 2)
+        .expect("cancelled answer");
+    assert_eq!(cancelled["error"]["code"], -32800);
+    let survivor = answered_frames
+        .iter()
+        .find(|frame| frame["id"] == 3)
+        .expect("survivor answer");
+    assert!(
+        survivor["result"]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|d| d["code"] == "uri_does_not_exist"),
+        "the survivor got the real analysis: {survivor}"
+    );
+}
+
+/// Cancelling an unknown id inside a batch is ignored: the coalesced
+/// request still answers normally, with the seeded diagnostics.
+#[test]
+fn burst_unknown_id_cancel_is_ignored() {
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let mut h = spawn(&workspace, &store_root("burst-unknown-cancel"));
+
+    h.step(&request(1, "initialize", json!({})), 1);
+    h.step(&notification("initialized", json!({})), 1);
+    h.burst(
+        &[
+            request(2, "dartq/analyze", json!({})),
+            notification("$/cancelRequest", json!({"id": 99})),
+        ],
+        1,
+    );
+    h.step(&request(3, "shutdown", json!(null)), 1);
+    let (code, transcript) = h.exit();
+
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    assert_eq!(publishes(&transcript).len(), 1, "only the sweep push");
+    let analyze = answered(&transcript)
+        .into_iter()
+        .find(|frame| frame["id"] == 2)
+        .expect("analyze answer");
+    assert!(
+        analyze.get("error").is_none(),
+        "the cancel never landed: {analyze}"
+    );
+    assert!(
+        analyze["result"]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|d| d["code"] == "uri_does_not_exist"),
+        "real diagnostics: {analyze}"
+    );
 }

@@ -261,6 +261,11 @@ fn initialize_response(id: jsonrpc::RequestId) -> Response {
             "capabilities": {
                 "positionEncoding": "utf-16",
                 "textDocumentSync": 1,
+                // Non-LSP request surface: the raw-diagnose `dartq/analyze`.
+                // Announced as experimental so clients can opt in by name.
+                "experimental": {
+                    "dartq/analyze": {},
+                },
             },
             "serverInfo": {
                 "name": "dartq",
@@ -397,6 +402,12 @@ mod tests {
         assert_eq!(id, Some(RequestId::Num(1)));
         assert_eq!(result["capabilities"]["textDocumentSync"], 1);
         assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
+        assert!(
+            result["capabilities"]["experimental"]
+                .get("dartq/analyze")
+                .is_some(),
+            "the experimental analyze request is announced"
+        );
         assert_eq!(result["serverInfo"]["name"], "dartq");
     }
 }

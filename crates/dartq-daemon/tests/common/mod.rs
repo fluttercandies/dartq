@@ -246,12 +246,16 @@ impl Harness {
     }
 
     /// Sends messages without pacing: the server drains them as one batch
-    /// (the writer-priority path).
+    /// (the writer-priority path). All frames travel as ONE byte chunk — a
+    /// single channel send — so the reader decodes the whole batch off a
+    /// single wake instead of re-blocking between frames.
     pub fn burst(&mut self, messages: &[Value], expect: usize) {
         let before = self.transcript().len();
+        let mut chunk = Vec::new();
         for message in messages {
-            self.client.send(framed(message)).expect("client send");
+            chunk.extend_from_slice(&framed(message));
         }
+        self.client.send(chunk).expect("client send");
         self.settle(before + expect);
     }
 
