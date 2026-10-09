@@ -409,7 +409,11 @@ fn derived_accessors_read_eliminated_words() {
     b.patch(1, TOKEN_NONE);
     b.patch(2, TOKEN_NONE);
     b.patch(3, TOKEN_NONE);
-    b.end(NodeKind::ClassDeclaration, result.tokens.len() as u32);
+    // Official End extents: the last real token, never the trailing Eof
+    // sentinel — end_token is the exclusive bound, so the derived tail
+    // (last_token) reads the official End token, not Eof. The compilation
+    // unit root legitimately spans through Eof (endCompilationUnit).
+    b.end(NodeKind::ClassDeclaration, result.tokens.len() as u32 - 1);
     b.end(NodeKind::CompilationUnit, result.tokens.len() as u32);
     let ast = b.finish();
     let class_id = ast.root().unwrap() - 1;
@@ -450,7 +454,7 @@ fn derived_accessors_read_eliminated_words() {
     b.begin(NodeKind::CompilationUnit, 0);
     b.begin(NodeKind::Break, 0);
     b.patch(0, 0);
-    b.end(NodeKind::Break, brk.tokens.len() as u32);
+    b.end(NodeKind::Break, brk.tokens.len() as u32 - 1); // End = `;`, Eof out
     b.end(NodeKind::CompilationUnit, brk.tokens.len() as u32);
     let ast = b.finish();
     let semi = derived::last_token(&brk.tokens, &ast, 0).unwrap();
@@ -466,7 +470,7 @@ fn derived_accessors_read_eliminated_words() {
     b.begin(NodeKind::CompilationUnit, 0);
     b.begin(NodeKind::Indexed, 1); // span head is the `?`
     b.patch(0, 1); // question word
-    b.end(NodeKind::Indexed, idx.tokens.len() as u32);
+    b.end(NodeKind::Indexed, idx.tokens.len() as u32 - 1); // End = `]`
     b.end(NodeKind::CompilationUnit, idx.tokens.len() as u32);
     let ast = b.finish();
     assert_eq!(derived::indexed_open(&ast, 0, ast.payload(0)[0]), 2);
@@ -478,7 +482,7 @@ fn derived_accessors_read_eliminated_words() {
     b.begin(NodeKind::CompilationUnit, 0);
     b.begin(NodeKind::VariablesDeclaration, 0);
     b.patch(0, 1); // modifier word: `var`
-    b.end(NodeKind::VariablesDeclaration, late.tokens.len() as u32);
+    b.end(NodeKind::VariablesDeclaration, late.tokens.len() as u32 - 1); // `;`
     b.end(NodeKind::CompilationUnit, late.tokens.len() as u32);
     let ast = b.finish();
     assert!(derived::head_is(&late.tokens, &ast, 0, Keyword::Late));

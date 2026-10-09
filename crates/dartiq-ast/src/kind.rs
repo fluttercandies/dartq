@@ -326,14 +326,15 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // ModSet → header bits (#174): class/extends/with/implements and
         // kind/(new|get_set)/param/initializers remain.
         ClassDeclaration | NamedMixinApplication | Method | Constructor => 4,
+        // ForParts/ForInParts: the `for` token is the span head (map §3.4:
+        // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived;
+        // lparen/left_sep/right_sep + update_count, and
+        // await/lparen/pattern_kw/in, remain (width 5→4).
+        ForParts | ForInParts => 4,
         MixinDeclaration
         | ExtensionTypeDeclaration
         | EnumDeclaration
         | ExtensionDeclaration
-        // ForParts/ForInParts: the `for` token is the span head (map §3.4:
-        // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived.
-        | ForParts
-        | ForInParts
         // Assert: `assert` is the span head, derived.
         | Assert
         | ExpressionBody

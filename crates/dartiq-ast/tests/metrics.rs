@@ -18,15 +18,15 @@
 //! Density history: the pre-#151 model (token leaves stored their token as
 //! payload word 0) measured **27.86 B/node** and **1.251 MB/MB** on this
 //! corpus. The #151 contract stores no payload word for token leaves or
-//! span-only kinds; its model cycled 0/2/0/2/0/0/0/1 pool words (5 per 9
-//! nodes) ⇒ 24 + 4×5/9 ≈ **26.22 B/node** and 0.40 × 26.22 / 8.0 ≈
-//! **1.31 MB/MB**. The #174 contract additionally eliminated the Identifier
-//! token word (span head) and the ModSet words (header flag bits); the model
-//! below cycles 0/1/0/2/0/0/0/1 pool words over its 9-node chunks — 4 words
-//! per 9 nodes — so the arithmetic expectation is 24 + 4×4/9 ≈ **25.78
-//! B/node** steady-state and ≈ 0.40 × 25.78 / 8.0 ≈ **1.29 MB/MB** at the
-//! budget's definition point — to be confirmed by the serial-phase metrics
-//! run.
+//! span-only kinds (Arguments' lparen is its span head — derivable-word0);
+//! its model cycled 0/2/0/2/0/0/0/0 pool words (4 per 9 nodes) ⇒ 24 +
+//! 16/9 ≈ **25.78 B/node** and 0.40 × 25.78 / 8.0 ≈ **1.29 MB/MB**. The
+//! #174 contract additionally eliminated the Identifier token word (span
+//! head) and the ModSet words (header flag bits); the model below cycles
+//! 0/1/0/2/0/0/0/0 pool words over its 9-node chunks — 3 words per 9 nodes
+//! — so the arithmetic expectation is 24 + 12/9 ≈ **25.33 B/node**
+//! steady-state and ≈ 0.40 × 25.33 / 8.0 ≈ **1.27 MB/MB** at the budget's
+//! definition point — confirmed by the serial-phase metrics run.
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 #![allow(clippy::cast_precision_loss)] // measurement math only
@@ -66,12 +66,12 @@ fn collect_dart_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Builds the model AST for one file: chunks of one span-only container plus
-/// 8 leaf-slot events whose payload widths cycle 0/1/0/2/0/0/0/1 — 4 words
+/// 8 leaf-slot events whose payload widths cycle 0/1/0/2/0/0/0/0 — 3 words
 /// per 9 nodes. Post-#174: token leaves (LiteralInt/Bool/Null) and span-only
-/// kinds (StringLiteral, Send) store no payload word, and the Identifier
-/// token is derived from the span head; the words that remain are real
-/// fields (Identifier ctx, Conditional question/colon, Arguments lparen),
-/// built via begin/patch/end.
+/// kinds (StringLiteral, Send, Arguments) store no payload word, and the
+/// Identifier token is derived from the span head; the words that remain are
+/// real fields (Identifier ctx, Conditional question/colon), built via
+/// begin/patch/end.
 fn model_ast(tokens: &TokenTable) -> dartiq_ast::SyntaxTable {
     let token_count = tokens.len() as u32;
     #[allow(clippy::cast_sign_loss)] // the model count is positive by construction
@@ -108,10 +108,9 @@ fn model_ast(tokens: &TokenTable) -> dartiq_ast::SyntaxTable {
         // SpanOnly leaf_span: 0 words.
         b.leaf_span(NodeKind::Send, token, token + 1);
         token = (token + 1) % token_count.max(1);
-        // Fielded Arguments { lparen }: 1 word.
-        b.begin(NodeKind::Arguments, token);
-        b.patch(0, token);
-        b.end(NodeKind::Arguments, token + 1);
+        // SpanOnly: 0 words — lparen is the span head (#151 derivable-word0),
+        // rparen the last span token.
+        b.leaf(NodeKind::Arguments, token);
         token = (token + 1) % token_count.max(1);
         b.end(NodeKind::Block, token);
     }
