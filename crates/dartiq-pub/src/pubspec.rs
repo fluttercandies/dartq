@@ -5,7 +5,8 @@
 //! dartiq does no version solving, so only *structural* validity is
 //! enforced here, matching pub's parse-time errors (unknown `resolution`
 //! values, the `>=3.5` gate on `workspace`/`resolution`, `dart` as an
-//! environment key, `packageNameRegExp` + reserved-word name checks). The
+//! environment key, `packageNameRegExp` + reserved-word checks on `name`,
+//! and `packageNameRegExp` on every dependency name). The
 //! discovery-critical `workspace`/`resolution` keys and the whole
 //! `dependency_overrides` section are honored via
 //! [`Pubspec::parse_with_overrides`] — the overrides file wins where its key
@@ -358,13 +359,20 @@ fn parse_workspace(
     Ok(members)
 }
 
-/// pub's name validation (`expectPackageNameField`, utils.dart:795-808): the
-/// dot-separated Dart identifier pattern `packageNameRegExp`
-/// (pubspec_parse.dart:17-19, over the ASCII `identifierRegExp` of
-/// utils.dart:31), then the Dart reserved-word rejection (utils.dart:38-107 —
-/// the commented-out words there are deliberately allowed).
+/// pub's `packageNameRegExp` (`^[a-zA-Z_]\w*(\.[a-zA-Z_]\w*)*$`,
+/// pubspec_parse.dart:17-19 over the ASCII `identifierRegExp` of
+/// utils.dart:31): dot-separated Dart identifiers, fully anchored.
+fn is_valid_package_name(name: &str) -> bool {
+    name.split('.').all(is_dart_identifier)
+}
+
+/// pub's name-field validation (`expectPackageNameField`,
+/// utils.dart:795-808): `packageNameRegExp`, then the Dart reserved-word
+/// rejection (utils.dart:38-107 — the commented-out words there are
+/// deliberately allowed). Dependency names get the regexp only
+/// (pubspec.dart:596-598).
 fn validate_package_name(name: &str, invalid: &dyn Fn(String) -> PubError) -> Result<(), PubError> {
-    if !name.split('.').all(is_dart_identifier) {
+    if !is_valid_package_name(name) {
         return Err(invalid(
             "\"name\" field must be a valid Dart identifier.".into(),
         ));
@@ -464,7 +472,14 @@ fn parse_dependency_map(
     for (key, spec) in mapping {
         let name = key
             .as_str()
-            .ok_or_else(|| invalid("dependency names must be strings".into()))?;
+            .ok_or_else(|| invalid("A dependency name must be a string.".into()))?;
+        // Every dependency name — regular, dev and override, whatever the
+        // source — is checked before its spec is parsed
+        // (pubspec.dart:596-598). Reserved words are NOT rejected here;
+        // that check applies to the `name:` field only (utils.dart:795-808).
+        if !is_valid_package_name(name) {
+            return Err(invalid("Not a valid package name.".into()));
+        }
         let parsed = parse_dependency_spec(spec, invalid)?;
         deps.insert(name.to_owned(), parsed);
     }
@@ -883,6 +898,55 @@ dev_dependencies:
                 "{allowed}"
             );
         }
+    }
+
+    #[test]
+    fn validates_dependency_names_like_pub() {
+        // pubspec.dart:596-598: the same `packageNameRegExp` as the `name`
+        // field, with the message "Not a valid package name." — applied to
+        // all three sections and every source form.
+        let ok = "name: a\ndependencies:\n  a.b_c: ^1.0.0\n";
+        let spec = Pubspec::parse(ok).expect("ok");
+        assert!(spec.dependencies.contains_key("a.b_c"));
+
+        for section in ["dependencies", "dev_dependencies", "dependency_overrides"] {
+            let yaml = format!("name: a\n{section}:\n  1abc: ^1.0.0\n");
+            let err = Pubspec::parse(&yaml).expect_err(section);
+            assert!(
+                err.to_string().contains("Not a valid package name."),
+                "unexpected error: {err}"
+            );
+        }
+
+        // The name is checked before the spec, so the source form is
+        // irrelevant (pubspec.dart:596 precedes the source dispatch).
+        let git_bad =
+            "name: a\ndependencies:\n  a-:\n    git:\n      url: /tmp/r\n      ref: main\n";
+        let err = Pubspec::parse(git_bad).expect_err("git bad name");
+        assert!(
+            err.to_string().contains("Not a valid package name."),
+            "unexpected error: {err}"
+        );
+
+        // Reserved words are legal dependency names: that rejection lives
+        // only in `expectPackageNameField` (utils.dart:795-808), not in
+        // `_parseDependencies`.
+        let reserved = "name: a\ndependencies:\n  class: ^1.0.0\n";
+        let spec = Pubspec::parse(reserved).expect("reserved words are allowed as dep names");
+        assert!(spec.dependencies.contains_key("class"));
+    }
+
+    #[test]
+    fn overrides_file_dependency_names_are_validated() {
+        let err = Pubspec::parse_with_overrides(
+            "name: m\n",
+            Some("dependency_overrides:\n  a..b: ^1.0.0\n"),
+        )
+        .expect_err("bad overrides dep name");
+        assert!(
+            err.to_string().contains("Not a valid package name."),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
