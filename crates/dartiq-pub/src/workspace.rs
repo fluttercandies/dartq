@@ -5,17 +5,25 @@
 //! entrypoint.dart:85-153: an explicit `local`/`external` does *not* stop
 //! the walk) — and collects the transitive member list in pub's
 //! `transitiveWorkspace` DFS order (root first, children in declaration
-//! order). Every pubspec is loaded together with its optional
-//! `pubspec_overrides.yaml`, whose `workspace`/`resolution` keys take
-//! precedence (pubspec.dart:87-91, 108-112). All filesystem access is
+//! order). Glob workspace entries are expanded by filesystem listing with
+//! pub's semantics (package.dart:183-238, gated on language version >= 3.11
+//! via the pinned `package:glob` port in [`crate::glob`]). Every pubspec is
+//! loaded together with its optional `pubspec_overrides.yaml`, whose
+//! `workspace`/`resolution` keys take precedence (pubspec.dart:87-91,
+//! 108-112). Members must opt in with `resolution: workspace`
+//! (package.dart:241-249), overrides must be unique and may not target
+//! workspace packages, and pubspecs may not sit interstitially between the
+//! root and a member (package.dart:531-592). All filesystem access is
 //! read-only; artifact cross-validation only reads
 //! `.dart_tool/pub/workspace_ref.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::PubError;
+use crate::glob::{Glob, has_glob_wildcards};
 use crate::pubspec::{Pubspec, Resolution};
+use crate::version::LanguageVersion;
 
 /// A workspace layout: the resolution root and its member directories.
 ///
@@ -39,9 +47,13 @@ pub struct WorkspaceLayout {
 /// walk, when every pubspec met carries an explicit `resolution` (pub's
 /// "found a pubspec but no workspace root" FileException in
 /// `_loadWorkspace`, entrypoint.dart:141-152), when a member pubspec is
-/// missing, unparseable, or unreadable, or when the member graph is not a
-/// tree — duplicate inclusion or duplicate member names, per pub's
-/// `validateWorkspace` (package.dart:486-524).
+/// missing, unparseable, or unreadable, when a `workspace:` entry matches
+/// zero packages (package.dart:233-238) or a glob pattern fails to parse,
+/// when a member has not opted in with `resolution: workspace`
+/// (package.dart:241-249), or when `validateWorkspace` rejects the layout —
+/// duplicate inclusion, duplicate member names, duplicate or
+/// workspace-targeting overrides, or a stray interstitial pubspec
+/// (package.dart:486-592).
 pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
     let mut dir = from.to_path_buf();
     // The first pubspec met on the walk, for the no-root error.
@@ -96,16 +108,24 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, PubError> {
 
 /// Member directories named by `spec.workspace`, expanded transitively:
 /// DFS with a stack so that popping yields root-first, declared-order
-/// traversal (package.dart:69-79). A second arrival at an already-included
-/// directory — the same entry listed twice, a diamond, a cycle, or a
-/// symlink alias — is a hard error, matching pub's `validateWorkspace`
-/// (package.dart:486-524) rather than a silent visited-set cut; so is a
-/// duplicate member name (package.dart:517-524, the root included).
+/// traversal (package.dart:69-79). Entries containing glob wildcards are
+/// expanded by filesystem listing (pub's semantics: matches without a
+/// `pubspec.yaml` are skipped, and an entry yielding zero packages is a hard
+/// error — package.dart:183-238; wildcards on a pubspec below language
+/// version 3.11 are matched literally, with pub's hint appended). A second
+/// arrival at an already-included directory — the same entry listed twice, a
+/// diamond, a cycle, or a symlink alias — is a hard error, matching pub's
+/// `validateWorkspace` (package.dart:486-524) rather than a silent
+/// visited-set cut; so is a duplicate member name (package.dart:517-524, the
+/// root included), a member without `resolution: workspace`
+/// (package.dart:241-249), two members overriding the same package or an
+/// override targeting a workspace package (package.dart:531-555), and a
+/// pubspec sitting between the root and a member (package.dart:557-592).
 ///
-/// Duplicate detection keys on canonicalized paths (pub canonicalizes
-/// before comparing, package.dart:496,513): two lexically distinct
-/// spellings that resolve to one directory collide. Discovery itself stays
-/// lexical — only the inclusion map's keys are canonical.
+/// Duplicate detection keys on canonicalized paths (pub canonicalizes before
+/// comparing, package.dart:496,513): two lexically distinct spellings that
+/// resolve to one directory collide. Discovery itself stays lexical — only
+/// the inclusion map's keys are canonical.
 fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError> {
     let mut members = Vec::new();
     // Included member directory -> the pubspec directory that included it.
@@ -117,15 +137,20 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
         BTreeMap::from([(inclusion_key(root), normalized_root)]);
     let mut names_seen: BTreeMap<String, PathBuf> =
         BTreeMap::from([(spec.name.clone(), root.to_path_buf())]);
+    // Every workspace package with an overrides map, in `transitiveWorkspace`
+    // order — the input of the override checks (package.dart:531-555).
+    let mut loaded: Vec<(String, PathBuf, Vec<String>)> = vec![(
+        spec.name.clone(),
+        root.to_path_buf(),
+        spec.dependency_overrides.keys().cloned().collect(),
+    )];
 
     // Pushed in reverse so the first declared child pops first; each entry
-    // carries the directory whose `workspace:` list named it.
-    let mut stack: Vec<(PathBuf, PathBuf)> = spec
-        .workspace
-        .iter()
-        .rev()
-        .map(|child| (root.join(child), root.to_path_buf()))
-        .collect();
+    // carries the directory whose `workspace:` list named it. Glob entries
+    // push one slot per match, in match order.
+    let language_version = LanguageVersion::from_sdk_constraint(spec.environment.sdk.as_ref());
+    let mut stack: Vec<(PathBuf, PathBuf)> = Vec::new();
+    expand_entries(root, spec, language_version, &mut stack)?;
 
     while let Some((dir, parent)) = stack.pop() {
         let key = inclusion_key(&dir);
@@ -150,6 +175,15 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
         included_from.insert(key, normalize(&parent));
 
         let child_spec = load_pubspec(&dir)?;
+        if child_spec.resolution != Resolution::Workspace {
+            return Err(PubError::Workspace(format!(
+                "`{}` is included in the workspace from `{}`, but does not have \
+                 `resolution: workspace`. See https://dart.dev/go/pub-workspaces \
+                 for more information.",
+                dir.join("pubspec.yaml").display(),
+                parent.join("pubspec.yaml").display(),
+            )));
+        }
         if let Some(previous_dir) = names_seen.get(&child_spec.name).cloned() {
             return Err(PubError::Workspace(format!(
                 "Workspace members must have unique names: `{}` and `{}` are both called `{}`.",
@@ -160,11 +194,159 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
         }
         names_seen.insert(child_spec.name.clone(), dir.clone());
         members.push(dir.clone());
-        for grandchild in child_spec.workspace.iter().rev() {
-            stack.push((dir.join(grandchild), dir.clone()));
-        }
+        loaded.push((
+            child_spec.name.clone(),
+            dir.clone(),
+            child_spec.dependency_overrides.keys().cloned().collect(),
+        ));
+        let child_language_version =
+            LanguageVersion::from_sdk_constraint(child_spec.environment.sdk.as_ref());
+        expand_entries(&dir, &child_spec, child_language_version, &mut stack)?;
+    }
+
+    // validateWorkspace skips the override and stray-pubspec checks on a
+    // single-package workspace (package.dart:487).
+    if !members.is_empty() {
+        check_overrides(&loaded, &names_seen)?;
+        check_stray_pubspecs(root, &members, &included_from)?;
     }
     Ok(members)
+}
+
+/// Expands one pubspec's `workspace:` entries into (child, parent) stack
+/// slots, in pop order. Glob entries (wildcard characters, language version
+/// >= 3.11) are listed on the filesystem; both modes fail when the entry
+/// yields zero packages, with pub's wording and — below 3.11 — its hint
+/// (package.dart:183-238).
+fn expand_entries(
+    dir: &Path,
+    spec: &Pubspec,
+    language_version: LanguageVersion,
+    stack: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), PubError> {
+    let pubspec_path = dir.join("pubspec.yaml").display().to_string();
+    let mut children: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in &spec.workspace {
+        if has_glob_wildcards(entry)
+            && language_version >= LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS
+        {
+            let glob = Glob::new(entry).map_err(|error| {
+                PubError::Workspace(format!("Failed to parse glob `{entry}`. {error}"))
+            })?;
+            let matches = glob.list_sync(dir).map_err(|error| {
+                PubError::Workspace(format!(
+                    "cannot list `{}`: {error}",
+                    dir.join(entry).display()
+                ))
+            })?;
+            for path in matches {
+                // Glob matches without a pubspec.yaml are skipped
+                // (package.dart:198-200).
+                if path.join("pubspec.yaml").is_file() {
+                    children.push((path, dir.to_path_buf()));
+                }
+            }
+        } else {
+            let hint = if has_glob_wildcards(entry) {
+                format!(
+                    " Glob syntax is only supported from language version {}. \
+                     Consider changing the language version of `{pubspec_path}` to {}.",
+                    LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS,
+                    LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS,
+                )
+            } else {
+                String::new()
+            };
+            let child = dir.join(entry);
+            // Literal entries hit the same zero-packages error when their
+            // pubspec.yaml is missing (package.dart:210-238).
+            if !child.join("pubspec.yaml").is_file() {
+                return Err(PubError::Workspace(format!(
+                    "No workspace packages matching `{entry}`. \
+                     That was included in the workspace of `{pubspec_path}`.{hint}"
+                )));
+            }
+            children.push((child, dir.to_path_buf()));
+        }
+    }
+    stack.extend(children.into_iter().rev());
+    Ok(())
+}
+
+/// The `validateWorkspace` override checks (package.dart:531-555): each
+/// package may be overridden once across the workspace, and workspace
+/// packages may not be overridden at all. `loaded` is in
+/// `transitiveWorkspace` order (root first); `names_seen` maps every
+/// workspace package name to its directory.
+fn check_overrides(
+    loaded: &[(String, PathBuf, Vec<String>)],
+    names_seen: &BTreeMap<String, PathBuf>,
+) -> Result<(), PubError> {
+    let mut overrides_seen: BTreeMap<&str, (&str, &Path)> = BTreeMap::new();
+    for (name, dir, override_names) in loaded {
+        for override_name in override_names {
+            if let Some((collision, collision_dir)) = overrides_seen.get(override_name.as_str()) {
+                return Err(PubError::Workspace(format!(
+                    "The package `{override_name}` is overridden in both: \
+                     package `{collision}` at `{}` and '{name}' at `{}`. \
+                     Consider removing one of the overrides.",
+                    collision_dir.display(),
+                    dir.display(),
+                )));
+            }
+            overrides_seen.insert(override_name, (name.as_str(), dir));
+            if let Some(overridden_dir) = names_seen.get(override_name) {
+                return Err(PubError::Workspace(format!(
+                    "Cannot override workspace packages. \
+                     Package `{override_name}` at `{}` is overridden in `{}`.",
+                    overridden_dir.display(),
+                    dir.join("pubspec.yaml").display(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stray-pubspec check (package.dart:557-592): walking up from each
+/// member, any pubspec.yaml between it and the root (or another member)
+/// blocks resolution and is an error.
+fn check_stray_pubspecs(
+    root: &Path,
+    members: &[PathBuf],
+    included_from: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), PubError> {
+    // By seeding with the root the walk never ascends past it
+    // (package.dart:558-561).
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::from([inclusion_key(root)]);
+    for member in members {
+        let mut current = member.parent().map(Path::to_path_buf);
+        while let Some(dir) = current {
+            let key = inclusion_key(&dir);
+            if included_from.contains_key(&key) {
+                break; // another member reached
+            }
+            if !visited.insert(key) {
+                break; // already inspected from an earlier member
+            }
+            let pubspec_candidate = dir.join("pubspec.yaml");
+            if pubspec_candidate.is_file() {
+                return Err(PubError::Workspace(format!(
+                    "The file `{}` is located in a directory between the workspace \
+                     root at `{}` and a workspace package at `{}`. But is not a member \
+                     of the workspace. This blocks the resolution of the package at \
+                     `{}`. Consider removing it. See \
+                     https://dart.dev/go/workspaces-stray-files for details.",
+                    pubspec_candidate.display(),
+                    root.display(),
+                    member.display(),
+                    member.display(),
+                )));
+            }
+            current = dir.parent().map(Path::to_path_buf);
+        }
+    }
+    Ok(())
 }
 
 fn read_file(path: &Path) -> Result<String, PubError> {
@@ -173,8 +355,9 @@ fn read_file(path: &Path) -> Result<String, PubError> {
 }
 
 /// `.dart_tool/pub/workspace_ref.json` is written for every workspace
-/// package *including the root* (facts §4/§8.7); its `workspaceRoot` is a
-/// relative path from `<member>/.dart_tool/pub` back to the root.
+/// package *including the root* — but only for non-trivial workspaces: a
+/// single-package workspace gets no ref file at all (entrypoint.dart:441),
+/// so an empty `layout.members` short-circuits to "no mismatches".
 ///
 /// Returns the member directories (root included) whose ref file is
 /// missing, malformed, or points somewhere else — each a staleness signal
@@ -184,6 +367,9 @@ fn read_file(path: &Path) -> Result<String, PubError> {
 /// from a real one.
 #[must_use]
 pub fn workspace_ref_mismatches(layout: &WorkspaceLayout) -> Vec<PathBuf> {
+    if layout.members.is_empty() {
+        return Vec::new();
+    }
     let mut mismatched = Vec::new();
     for dir in std::iter::once(&layout.root).chain(layout.members.iter()) {
         let ref_path = dir
@@ -206,12 +392,15 @@ pub fn workspace_ref_mismatches(layout: &WorkspaceLayout) -> Vec<PathBuf> {
 }
 
 /// The duplicate-detection key for an included member directory: the
-/// lexically normalized path with symlinks resolved, so symlink aliases of
-/// one directory collide exactly as pub's `p.canonicalize` map key treats
-/// them (package.dart:496,513). Only the inclusion map uses this —
-/// discovery stays lexical. A path that cannot be canonicalized (a
-/// dangling symlink) falls back to its lexical form; the subsequent
-/// pubspec read fails loudly on it either way.
+/// lexically normalized path with symlinks resolved. Pub's `p.canonicalize`
+/// is purely lexical (normalize + absolutize, `package:path`), so its map
+/// keys do not collapse symlink aliases — the same alias layout is rejected
+/// there by the duplicate-*name* check instead, with different error text
+/// but the same outcome. Resolving symlinks here keeps dartiq's rejection at
+/// the inclusion map; a path that cannot be canonicalized (a dangling
+/// symlink) falls back to its lexical form and the subsequent load fails on
+/// it either way. Only the inclusion map uses this — discovery stays
+/// lexical.
 fn inclusion_key(path: &Path) -> PathBuf {
     let normalized = normalize(path);
     std::fs::canonicalize(&normalized).unwrap_or(normalized)
@@ -339,11 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_resolution_does_not_root_the_walk() {
-        // A `resolution: local` package inside a workspace tree is not a
-        // root: pub keeps ascending to the unspecified pubspec above it
-        // (entrypoint.dart:124, `resolution == Resolution.none` only).
-        let root = temp_dir("local-below");
+    fn member_without_workspace_resolution_is_rejected() {
+        // A member listed in the workspace whose pubspec (after overrides
+        // merging) does not opt in with `resolution: workspace` is pub's
+        // package.dart:241-249 error.
+        let root = temp_dir("local-member");
         write(
             &root.join("pubspec.yaml"),
             "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - opted_out\n",
@@ -352,12 +541,20 @@ mod tests {
             &root.join("opted_out").join("pubspec.yaml"),
             "name: opted_out\nenvironment:\n  sdk: ^3.5.0\nresolution: local\n",
         );
-        let layout = find_workspace_root(&root.join("opted_out")).expect("layout");
-        assert_eq!(layout.root, root);
+        let err = find_workspace_root(&root).expect_err("local member");
+        assert!(
+            err.to_string()
+                .contains("does not have `resolution: workspace`"),
+            "unexpected error: {err}"
+        );
+    }
 
+    #[test]
+    fn explicit_standalone_resolution_yields_no_root() {
         // Ascending past `local`/`external` pubspecs with no unspecified
         // pubspec anywhere is pub's "found a pubspec but no root" error,
-        // not a false root at the `local` package.
+        // not a false root at the `local` package (entrypoint.dart:124,
+        // `resolution == Resolution.none` only).
         let standalone = temp_dir("local-standalone");
         write(
             &standalone.join("pubspec.yaml"),
@@ -414,7 +611,9 @@ mod tests {
         assert_eq!(layout.root, root);
         assert_eq!(layout.members, vec![root.join("pkg_b"), root.join("pkg_c")]);
 
-        // The member list itself honors the overrides `workspace:` key.
+        // The member list itself honors the overrides `workspace:` key. The
+        // member still has to opt in with `resolution: workspace`
+        // (package.dart:241-249 applies to overrides-included members too).
         let overrides_root = temp_dir("overrides-root");
         write(
             &overrides_root.join("pubspec.yaml"),
@@ -426,7 +625,7 @@ mod tests {
         );
         write(
             &overrides_root.join("member").join("pubspec.yaml"),
-            "name: member\nenvironment:\n  sdk: ^3.5.0\n",
+            "name: member\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
         );
         let layout = find_workspace_root(&overrides_root).expect("layout");
         assert_eq!(layout.root, overrides_root);
@@ -568,10 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn broken_symlink_member_falls_back_to_lexical_key() {
-        // canonicalize fails on a dangling link; the duplicate key falls
-        // back to the lexical path and the pubspec read reports the real
-        // problem instead.
+    fn dangling_symlink_member_is_a_zero_packages_error() {
+        // A literal entry whose pubspec.yaml is missing — including through
+        // a dangling symlink, whose canonicalize falls back to the lexical
+        // key before the load fails — is pub's zero-packages error
+        // (package.dart:215-238), not a read error.
         let root = temp_dir("symlink-broken");
         write(
             &root.join("pubspec.yaml"),
@@ -580,9 +780,253 @@ mod tests {
         std::os::unix::fs::symlink(root.join("missing"), root.join("ghost")).expect("symlink");
         let err = find_workspace_root(&root).expect_err("broken symlink member");
         assert!(
-            err.to_string().contains("cannot read"),
+            err.to_string()
+                .contains("No workspace packages matching `ghost`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn glob_entries_expand_to_member_directories() {
+        // package.dart:183-208: `pkgs/*` lists matches, skipping entries
+        // without a pubspec.yaml.
+        let root = temp_dir("glob");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.11.0\nworkspace:\n  - pkgs/*\n",
+        );
+        for name in ["b", "a"] {
+            write(
+                &root.join("pkgs").join(name).join("pubspec.yaml"),
+                &format!("name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"),
+            );
+        }
+        write(&root.join("pkgs").join("notes.txt"), "not a package\n");
+        let layout = find_workspace_root(&root).expect("layout");
+        let mut members = layout.members.clone();
+        members.sort();
+        assert_eq!(members, vec![root.join("pkgs/a"), root.join("pkgs/b")]);
+
+        // Options with distinct literal prefixes expand in declaration order
+        // (separate tree branches); same-level options would merge into one
+        // validator and list in readdir order, which has no guarantee.
+        let root = temp_dir("glob-order");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.11.0\nworkspace:\n  - '{pkgs_b/*,pkgs_a/*}'\n",
+        );
+        for dir in ["pkgs_b", "pkgs_a"] {
+            write(
+                &root.join(dir).join("only").join("pubspec.yaml"),
+                &format!("name: {dir}_only\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"),
+            );
+        }
+        let layout = find_workspace_root(&root).expect("layout");
+        assert_eq!(
+            layout.members,
+            vec![
+                root.join("pkgs_b").join("only"),
+                root.join("pkgs_a").join("only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_entry_matching_zero_packages_is_an_error() {
+        let root = temp_dir("glob-empty");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.11.0\nworkspace:\n  - pkgs/*\n",
+        );
+        let err = find_workspace_root(&root).expect_err("no matches");
+        assert!(
+            err.to_string()
+                .contains("No workspace packages matching `pkgs/*`"),
+            "unexpected error: {err}"
+        );
+        // A directory match without a pubspec.yaml does not count either
+        // (package.dart:198-200).
+        std::fs::create_dir_all(root.join("pkgs").join("empty")).expect("mkdir");
+        assert!(find_workspace_root(&root).is_err());
+    }
+
+    #[test]
+    fn glob_entry_on_old_language_version_is_literal_with_hint() {
+        // Below 3.11 pub matches the raw path literally: a directory named
+        // `*` becomes the member (pub's workspace_test "globs are not
+        // resolved in older language versions").
+        let root = temp_dir("glob-old");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.10.0\nworkspace:\n  - pkgs/*\n",
+        );
+        write(
+            &root.join("pkgs").join("*").join("pubspec.yaml"),
+            "name: starred\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let layout = find_workspace_root(&root).expect("layout");
+        assert_eq!(layout.members, vec![root.join("pkgs").join("*")]);
+
+        // Without such a directory: zero packages, with pub's hint
+        // (package.dart:216-222).
+        let root = temp_dir("glob-old-hint");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.10.0\nworkspace:\n  - pkgs/*\n",
+        );
+        let err = find_workspace_root(&root).expect_err("no matches");
+        let text = err.to_string();
+        assert!(
+            text.contains("No workspace packages matching `pkgs/*`"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("Glob syntax is only supported from language version 3.11"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("Consider changing the language version"),
+            "unexpected error: {text}"
+        );
+    }
+
+    #[test]
+    fn malformed_glob_entry_is_an_error() {
+        // package.dart:186-190 wraps package:glob's scanner error verbatim.
+        let root = temp_dir("glob-bad");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.11.0\nworkspace:\n  - 'pkgs/{*'\n",
+        );
+        let err = find_workspace_root(&root).expect_err("malformed glob");
+        let text = err.to_string();
+        assert!(
+            text.contains("Failed to parse glob `pkgs/{*`"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("Error on line 1, column 8"),
+            "unexpected error: {text}"
+        );
+    }
+
+    #[test]
+    fn glob_match_and_literal_entry_collide() {
+        // A glob match and a later literal entry for the same directory are
+        // two inclusions from the same parent (package.dart:498-505).
+        let root = temp_dir("glob-dup");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.11.0\nworkspace:\n  - pkgs/*\n  - pkgs/a\n",
+        );
+        write(
+            &root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let err = find_workspace_root(&root).expect_err("duplicate inclusion");
+        assert!(
+            err.to_string().contains("included twice"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_overrides_across_the_workspace_are_rejected() {
+        // package.dart:531-545.
+        let root = temp_dir("override-dup");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkg_a\n\
+             dependency_overrides:\n  shared: ^1.0.0\n",
+        );
+        write(
+            &root.join("pkg_a").join("pubspec.yaml"),
+            "name: pkg_a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n\
+             dependency_overrides:\n  shared: ^2.0.0\n",
+        );
+        let err = find_workspace_root(&root).expect_err("duplicate overrides");
+        assert!(
+            err.to_string().contains("is overridden in both"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn overriding_a_workspace_package_is_rejected() {
+        // package.dart:547-553.
+        let root = temp_dir("override-ws");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkg_a\n\
+             dependency_overrides:\n  pkg_a: ^9.0.0\n",
+        );
+        write(
+            &root.join("pkg_a").join("pubspec.yaml"),
+            "name: pkg_a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let err = find_workspace_root(&root).expect_err("workspace override");
+        assert!(
+            err.to_string()
+                .contains("Cannot override workspace packages"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn stray_interstitial_pubspec_is_rejected() {
+        // pkgs/pubspec.yaml sits between the root and the member pkgs/a
+        // (package.dart:557-592).
+        let root = temp_dir("stray");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkgs/a\n",
+        );
+        write(
+            &root.join("pkgs").join("pubspec.yaml"),
+            "name: interstitial\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let err = find_workspace_root(&root).expect_err("stray pubspec");
+        assert!(
+            err.to_string()
+                .contains("is located in a directory between the workspace root"),
+            "unexpected error: {err}"
+        );
+
+        // When the interstitial directory is itself a member the walk stops
+        // there and its pubspec is fine (package.dart:568-571).
+        let root = temp_dir("stray-member");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkgs\n  - pkgs/a\n",
+        );
+        write(
+            &root.join("pkgs").join("pubspec.yaml"),
+            "name: pkgs\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        write(
+            &root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let layout = find_workspace_root(&root).expect("layout");
+        assert_eq!(layout.members, vec![root.join("pkgs"), root.join("pkgs/a")]);
+    }
+
+    #[test]
+    fn single_package_workspace_needs_no_ref_file() {
+        // pub writes no workspace_ref.json when the root has no members
+        // (entrypoint.dart:441), so a missing ref is not a mismatch there.
+        let dir = temp_dir("refs-single");
+        write(
+            &dir.join("pubspec.yaml"),
+            "name: solo\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        let layout = find_workspace_root(&dir).expect("layout");
+        assert!(layout.members.is_empty());
+        assert!(workspace_ref_mismatches(&layout).is_empty());
     }
 
     #[test]

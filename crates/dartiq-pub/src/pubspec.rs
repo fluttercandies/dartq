@@ -5,12 +5,15 @@
 //! dartiq does no version solving, so only *structural* validity is
 //! enforced here, matching pub's parse-time errors (unknown `resolution`
 //! values, the `>=3.5` gate on `workspace`/`resolution`, `dart` as an
-//! environment key). Dependency merging from `pubspec_overrides.yaml` is
-//! out of scope, but the discovery-critical `workspace`/`resolution` keys
-//! are honored via [`Pubspec::parse_with_overrides`] — pub merges them with
-//! the overrides file taking precedence (pubspec.dart:86-88, 107-109).
+//! environment key, `packageNameRegExp` + reserved-word name checks). The
+//! discovery-critical `workspace`/`resolution` keys and the whole
+//! `dependency_overrides` section are honored via
+//! [`Pubspec::parse_with_overrides`] — the overrides file wins where its key
+//! is present (pubspec.dart:86-112, 169-193), and its key set is whitelisted
+//! (pubspec.dart:393-407).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::PubError;
 use crate::version::{LanguageVersion, Version, VersionConstraint};
@@ -111,11 +114,12 @@ impl Pubspec {
     }
 
     /// Parses `pubspec.yaml` text, letting an existing `pubspec_overrides.yaml`
-    /// override the discovery-critical `workspace` and `resolution` keys —
-    /// pub loads every pubspec on the root walk with `allowOverridesFile:
-    /// true` (entrypoint.dart:95-101) and merges those two keys with the
-    /// overrides file winning (pubspec.dart:87-91, 108-112). Other overrides
-    /// keys (dependency merging) are not consumed here.
+    /// override the discovery-critical `workspace` and `resolution` keys and
+    /// supply the whole `dependency_overrides` section — pub loads every
+    /// pubspec on the root walk with `allowOverridesFile: true`
+    /// (entrypoint.dart:95-101) and takes each key from the overrides file
+    /// when present (pubspec.dart:87-91, 108-112, 169-193). The overrides
+    /// file's key set is whitelisted (pubspec.dart:393-407).
     ///
     /// `overrides` is the overrides file's text, or `None` when the file
     /// does not exist.
@@ -132,7 +136,23 @@ impl Pubspec {
                     .map_err(|e| PubError::Pubspec(format!("pubspec_overrides.yaml: {e}")))?;
                 match value {
                     serde_yaml::Value::Null => None, // empty overrides file
-                    serde_yaml::Value::Mapping(map) => Some(map),
+                    serde_yaml::Value::Mapping(map) => {
+                        // pub rejects any key outside the whitelist
+                        // (pubspec.dart:393-407).
+                        for key in map.keys() {
+                            if !matches!(
+                                key.as_str(),
+                                Some("dependency_overrides" | "resolution" | "workspace")
+                            ) {
+                                return Err(PubError::Pubspec(
+                                    "pubspec_overrides.yaml only supports the \
+                                     `dependency_overrides`, `resolution` and `workspace` fields."
+                                        .into(),
+                                ));
+                            }
+                        }
+                        Some(map)
+                    }
                     _ => {
                         return Err(PubError::Pubspec(
                             "pubspec_overrides.yaml must be a mapping".into(),
@@ -158,6 +178,7 @@ impl Pubspec {
         let name = optional_field(root, "name")?
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid("pubspec.yaml needs a non-empty `name`".into()))?;
+        validate_package_name(&name, &invalid)?;
 
         let version = match optional_field(root, "version")? {
             None => None,
@@ -204,7 +225,14 @@ impl Pubspec {
         };
         let dependencies = dep("dependencies")?;
         let dev_dependencies = dep("dev_dependencies")?;
-        let dependency_overrides = dep("dependency_overrides")?;
+        // The overrides file's `dependency_overrides` replaces the pubspec's
+        // entirely when present (pubspec.dart:169-193), and the root's
+        // effective map is what `validateWorkspace` and the graph see
+        // (package.dart:531-555).
+        let dependency_overrides = match overrides.and_then(|map| map.get("dependency_overrides")) {
+            Some(node) => parse_dependency_map(Some(node), "dependency_overrides", &invalid)?,
+            None => dep("dependency_overrides")?,
+        };
 
         Ok(Pubspec {
             name,
@@ -305,20 +333,121 @@ fn parse_workspace(
         let path = entry
             .as_str()
             .ok_or_else(|| invalid("`workspace` must be a list of strings".into()))?;
-        // pub: relative, within '.', and not '.' itself (pubspec.dart:89-101).
-        if path.is_empty()
-            || path.starts_with('/')
-            || path == "."
-            || path.split('/').any(|part| part.is_empty() || part == "..")
-        {
-            return Err(invalid(format!(
-                "`workspace` members must be subdirectory paths, got `{path}`"
-            )));
+        // pub validates the lexically normalized path: relative, not '.', and
+        // within '.' (pubspec.dart:89-101 — `p.isRelative`, `p.equals`,
+        // `p.isWithin`, all normalization-based, so `a/../b` -> `b` and
+        // `pkg_a/` -> `pkg_a` are valid; only '.' itself and paths whose
+        // normalization keeps a leading `..` fail). The raw spelling is kept
+        // (pubspec.dart:100).
+        if path.starts_with('/') {
+            return Err(invalid(
+                "\"workspace\" members must be relative paths".into(),
+            ));
+        }
+        let normalized = crate::workspace::normalize(Path::new(path));
+        let escapes = normalized
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir));
+        if normalized.as_os_str().is_empty() || normalized == Path::new(".") || escapes {
+            return Err(invalid(
+                "\"workspace\" members must be subdirectories".into(),
+            ));
         }
         members.push(path.to_owned());
     }
     Ok(members)
 }
+
+/// pub's name validation (`expectPackageNameField`, utils.dart:795-808): the
+/// dot-separated Dart identifier pattern `packageNameRegExp`
+/// (pubspec_parse.dart:17-19, over the ASCII `identifierRegExp` of
+/// utils.dart:31), then the Dart reserved-word rejection (utils.dart:38-107 —
+/// the commented-out words there are deliberately allowed).
+fn validate_package_name(name: &str, invalid: &dyn Fn(String) -> PubError) -> Result<(), PubError> {
+    if !name.split('.').all(is_dart_identifier) {
+        return Err(invalid(
+            "\"name\" field must be a valid Dart identifier.".into(),
+        ));
+    }
+    if RESERVED_WORDS.contains(&name.to_lowercase().as_str()) {
+        return Err(invalid(
+            "\"name\" field may not be a Dart reserved word.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_dart_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Dart reserved words, ported verbatim from utils.dart:38-107 (including its
+/// commented-out allowances: `async`, `base`, `dynamic`, `extension`,
+/// `factory`, `get`, `show`, `static`, `sync`, `typedef`, `when` stay legal).
+const RESERVED_WORDS: [&str; 57] = [
+    "abstract",
+    "as",
+    "assert",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "external",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "inline",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "of",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "sealed",
+    "set",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
 
 fn parse_dependency_map(
     value: Option<&serde_yaml::Value>,
@@ -704,5 +833,122 @@ dev_dependencies:
         assert!(Pubspec::parse("version: 1.0.0\n").is_err());
         assert!(Pubspec::parse("").is_err());
         assert!(Pubspec::parse("- a\n- b\n").is_err());
+    }
+
+    #[test]
+    fn validates_package_names_like_pub() {
+        // pubspec_parse.dart:17-19: dot-separated Dart identifiers.
+        for valid in ["a", "mini_a", "_hidden", "a.b", "f1_2.x_y"] {
+            assert!(
+                Pubspec::parse(&format!("name: {valid}\n")).is_ok(),
+                "{valid}"
+            );
+        }
+        for invalid in ["1abc", "-a", "a-", "a..b", "a b", "a.b."] {
+            let err = Pubspec::parse(&format!("name: \"{invalid}\"\n"))
+                .expect_err(&format!("`{invalid}`"));
+            assert!(
+                err.to_string().contains("valid Dart identifier"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dart_reserved_words_as_names() {
+        let err = Pubspec::parse("name: class\n").expect_err("reserved");
+        assert!(
+            err.to_string().contains("may not be a Dart reserved word"),
+            "unexpected error: {err}"
+        );
+        // Matching is case-insensitive (utils.dart:802).
+        assert!(Pubspec::parse("name: While\n").is_err());
+        // Words pub deliberately allows (the commented-out entries of
+        // utils.dart:38-107).
+        for allowed in [
+            "async",
+            "base",
+            "dynamic",
+            "extension",
+            "factory",
+            "get",
+            "show",
+            "static",
+            "sync",
+            "typedef",
+            "when",
+        ] {
+            assert!(
+                Pubspec::parse(&format!("name: {allowed}\n")).is_ok(),
+                "{allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_overrides_keys() {
+        // pubspec.dart:393-407: only three keys are allowed.
+        let err = Pubspec::parse_with_overrides("name: m\n", Some("name: other\n"))
+            .expect_err("name key");
+        assert!(
+            err.to_string()
+                .contains("pubspec_overrides.yaml only supports the `dependency_overrides`, `resolution` and `workspace` fields"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            Pubspec::parse_with_overrides("name: m\n", Some("environment:\n  sdk: ^3.5.0\n"))
+                .is_err()
+        );
+        // All three whitelisted keys together are fine.
+        let spec = Pubspec::parse_with_overrides(
+            "name: m\nenvironment:\n  sdk: ^3.5.0\n",
+            Some(
+                "dependency_overrides:\n  foo: ^1.0.0\nresolution: workspace\nworkspace:\n  - a\n",
+            ),
+        )
+        .expect("ok");
+        assert_eq!(spec.resolution, Resolution::Workspace);
+    }
+
+    #[test]
+    fn overrides_dependency_overrides_replace_the_pubspecs() {
+        let yaml = "name: m\ndependency_overrides:\n  a: ^1.0.0\n  b: ^2.0.0\n";
+        // No overrides file: the pubspec map stands.
+        let spec = Pubspec::parse(yaml).expect("ok");
+        assert_eq!(spec.dependency_overrides.len(), 2);
+        // Overrides file carrying `dependency_overrides` replaces it wholly
+        // (pubspec.dart:169-193).
+        let replaced =
+            Pubspec::parse_with_overrides(yaml, Some("dependency_overrides:\n  c: ^3.0.0\n"))
+                .expect("ok");
+        assert_eq!(replaced.dependency_overrides.len(), 1);
+        assert!(replaced.dependency_overrides.contains_key("c"));
+        // Key absent from the overrides file: pubspec map stands.
+        let untouched =
+            Pubspec::parse_with_overrides(yaml, Some("resolution: workspace\n")).expect("ok");
+        assert_eq!(untouched.dependency_overrides.len(), 2);
+    }
+
+    #[test]
+    fn workspace_members_validate_on_normalized_paths() {
+        // pubspec.dart:89-101 via package:path normalization: inner `..`,
+        // `.` segments and trailing slashes are legal spellings.
+        for valid in ["a/../b", "pkg_a/", "./a", "a/./b", "a//b", "a/b/"] {
+            let spec = Pubspec::parse(&format!(
+                "name: r\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - \"{valid}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{valid}`: {e}"));
+            assert_eq!(spec.workspace, vec![valid], "raw spelling is kept");
+        }
+        // Only '.' itself and paths escaping the root fail.
+        for invalid in [".", "..", "../out", "a/../../b", "/abs"] {
+            assert!(
+                Pubspec::parse(&format!(
+                    "name: r\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - \"{invalid}\"\n"
+                ))
+                .is_err(),
+                "`{invalid}`"
+            );
+        }
     }
 }

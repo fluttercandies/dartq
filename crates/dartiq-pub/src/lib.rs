@@ -23,6 +23,7 @@
 
 pub mod config;
 pub mod freshness;
+mod glob;
 pub mod graph;
 pub mod lock;
 pub mod pubspec;

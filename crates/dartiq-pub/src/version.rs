@@ -475,6 +475,9 @@ impl LanguageVersion {
     pub const PUB_DEFAULT: LanguageVersion = LanguageVersion::new(2, 7);
     /// `firstVersionWithWorkspaces` — gates `workspace:`/`resolution:`.
     pub const FIRST_WITH_WORKSPACES: LanguageVersion = LanguageVersion::new(3, 5);
+    /// `firstVersionWithWorkspaceGlobs` — gates glob expansion of
+    /// `workspace:` entries (language_version.dart:115).
+    pub const FIRST_WITH_WORKSPACE_GLOBS: LanguageVersion = LanguageVersion::new(3, 11);
     /// dartiq's chain bottom (PRD §8.3 level 4): the current SDK default,
     /// taken from the vendored registry's `DEFAULT_LANGUAGE_VERSION` (3.15).
     pub const SDK_DEFAULT: LanguageVersion = LanguageVersion::new(

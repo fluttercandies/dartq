@@ -129,6 +129,13 @@ impl PackageConfig {
     }
 
     /// Looks an entry up by package name.
+    ///
+    /// Duplicates are never rejected at parse time — parity with
+    /// package:package_config's reader, which tolerates repeated names in
+    /// the file (pub's writer cannot produce them: workspace name collisions
+    /// fail in `validateWorkspace`). A hand-edited config with duplicate
+    /// names therefore only surfaces late, as whichever entry this finds
+    /// first.
     #[must_use]
     pub fn entry(&self, name: &str) -> Option<&PackageConfigEntry> {
         self.packages.iter().find(|entry| entry.name == name)
