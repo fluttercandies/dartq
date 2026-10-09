@@ -27,6 +27,7 @@ use dartq_source::{FileId, FileTable};
 use rustc_hash::FxHashMap;
 
 use crate::codes::ResolutionCode;
+use crate::conditional::{Configuration, PlatformSet, SelectedUri, resolve_conditional};
 
 /// How a directive URI resolved (§5 core types).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +216,10 @@ pub struct UriResolver<'a> {
     packages: &'a PackageTable,
     sdk: &'a SdkSnapshot,
     target: Box<str>,
+    /// The target segment's `dart.library.*` availability table
+    /// ([`PlatformSet`]), derived once at construction from `sdk` +
+    /// `target`; consumed by [`Self::resolve_conditional`].
+    platform: PlatformSet,
     files: &'a mut FileTable,
     /// The engine's file-state existence face (`FileState.exists`): which
     /// interned ids hold content in the analyzed world. A target the engine
@@ -289,7 +294,9 @@ impl<'a> UriResolver<'a> {
     /// against the SDK target segment `target` (e.g. `"vm"`) and interning
     /// file targets into `files`. `resident` reports which interned ids hold
     /// content in the analyzed world (disk files and declared overlays
-    /// alike); a target it accepts never codes `uri_does_not_exist`.
+    /// alike); a target it accepts never codes `uri_does_not_exist`. The
+    /// target segment also derives the conditional-URI [`PlatformSet`]; an
+    /// unknown segment leaves every condition unmatched (primary URIs win).
     pub fn new(
         packages: &'a PackageTable,
         sdk: &'a SdkSnapshot,
@@ -301,6 +308,7 @@ impl<'a> UriResolver<'a> {
             packages,
             sdk,
             target: Box::from(target),
+            platform: PlatformSet::from_segment(&sdk.sdk_libraries, target),
             files,
             resident,
             bases: FxHashMap::default(),
@@ -357,6 +365,32 @@ impl<'a> UriResolver<'a> {
                 ..resolution
             },
         }
+    }
+
+    /// Resolves one configurable directive (`import`/`export` with `if`
+    /// clauses, `parseConditionalUriStar` serving both grammars): selects
+    /// the directive's URI against this resolver's [`PlatformSet`] — first
+    /// matching configuration wins, the primary URI is the official
+    /// fallback (`fragment_factory_impl.dart:921-929`) — and resolves the
+    /// chosen candidate through [`Self::resolve`]. Only the chosen candidate
+    /// can carry a missing-target diagnostic; unmatched candidates are never
+    /// read from disk (`library_analyzer.dart:698-717` reports
+    /// `state.selectedUri` alone).
+    ///
+    /// `primary_uri` is `None` when the directive's primary URI literal is a
+    /// string interpolation; it only matters when no configuration matches.
+    pub fn resolve_conditional(
+        &mut self,
+        container: FileId,
+        primary_uri: Option<&str>,
+        configs: &[Configuration],
+        kind: DirectiveKind,
+    ) -> UriResolution {
+        let chosen = match resolve_conditional(configs, &self.platform) {
+            SelectedUri::Primary => primary_uri,
+            SelectedUri::Configuration(index) => Some(configs[index].uri.as_ref()),
+        };
+        self.resolve(container, chosen, kind)
     }
 
     /// The kind-independent target lookup behind [`Self::resolve`].
@@ -1383,7 +1417,9 @@ mod tests {
     /// test so fixture reads stay possible while the resolver is alive).
     /// Disk-only existence: no residency beyond the fixture's real files.
     fn resolver<'a>(fixture: &'a Fixture, files: &'a mut FileTable) -> UriResolver<'a> {
-        UriResolver::new(&fixture.packages, &fixture.snapshot, "vm", files, &|_| false)
+        UriResolver::new(&fixture.packages, &fixture.snapshot, "vm", files, &|_| {
+            false
+        })
     }
 
     /// Interns a fixture-relative path as a container file.
@@ -1948,5 +1984,128 @@ mod tests {
                 .contains("Duplicate name a in generated package config"),
             "unexpected error: {error}"
         );
+    }
+
+    // ---- resolve_conditional: configurable directives against the vm
+    // fixture SDK (segment `vm` exposes `io`, not `html`) ----
+
+    /// The first matching configuration wins and its candidate is the only
+    /// one resolved: the unmatched `html` candidate is missing on disk, yet
+    /// no missing-target code fires (`library_analyzer.dart:698-717` reads
+    /// the selected URI alone).
+    #[test]
+    fn conditional_selects_first_matching_candidate() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let configs = [
+            Configuration::new("dart.library.io", None, "util.dart"),
+            Configuration::new("dart.library.html", None, "missing_html.dart"),
+        ];
+        let resolution = resolver(&fixture, &mut files).resolve_conditional(
+            container,
+            Some("primary.dart"),
+            &configs,
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+        assert_eq!(resolution.code, None);
+    }
+
+    /// No match under `vm` falls back to the primary URI — the official
+    /// fallback (`fragment_factory_impl.dart:921-929`, `file_state.dart:762`).
+    #[test]
+    fn conditional_without_match_falls_back_to_primary() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let configs = [Configuration::new("dart.library.html", None, "util.dart")];
+        let resolution = resolver(&fixture, &mut files).resolve_conditional(
+            container,
+            Some("util.dart"),
+            &configs,
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+        assert_eq!(resolution.code, None);
+    }
+
+    /// When the chosen candidate (here the io-matched one) is missing, the
+    /// missing-target code names the chosen URI only — the target stays a
+    /// file projection (`ResolvedUri::File`) with the §4.2 code attached
+    /// (`land`'s missing-file face, `library_analyzer.dart:698-717`
+    /// reporting `state.selectedUri` alone); the existing primary is never
+    /// substituted in.
+    #[test]
+    fn conditional_reports_missing_chosen_candidate() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let configs = [Configuration::new("dart.library.io", None, "absent.dart")];
+        let resolution = resolver(&fixture, &mut files).resolve_conditional(
+            container,
+            Some("util.dart"),
+            &configs,
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/absent.dart"))
+        );
+        assert_eq!(code_of(&resolution), ResolutionCode::UriDoesNotExist);
+        let ResolvedTarget::Resolved(id) = resolution.target else {
+            panic!("a missing file keeps its file target");
+        };
+        assert_eq!(
+            files.path(id),
+            Some(fixture.workspace.root.join("app/lib/absent.dart").as_path())
+        );
+    }
+
+    /// Export directives select and resolve identically
+    /// (`parseConditionalUriStar` serves both grammars).
+    #[test]
+    fn conditional_export_parity() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let configs = [
+            Configuration::new("dart.library.html", None, "missing_html.dart"),
+            Configuration::new("dart.library.io", None, "util.dart"),
+        ];
+        let resolution = resolver(&fixture, &mut files).resolve_conditional(
+            container,
+            Some("util.dart"),
+            &configs,
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            resolution.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart")),
+            "html misses under vm, io is the first match"
+        );
+    }
+
+    /// An interpolated primary URI with no matching configuration keeps the
+    /// interpolation face (`file_state.dart:762`: selected ?? primary).
+    #[test]
+    fn conditional_interpolated_primary_without_match() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let configs = [Configuration::new("dart.library.html", None, "util.dart")];
+        let resolution = resolver(&fixture, &mut files).resolve_conditional(
+            container,
+            None,
+            &configs,
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(code_of(&resolution), ResolutionCode::UriWithInterpolation);
     }
 }

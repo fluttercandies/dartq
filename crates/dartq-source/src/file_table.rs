@@ -188,6 +188,13 @@ fn normalize_keyed(cleaned: &Path) -> PathBuf {
             let remainder = cleaned
                 .strip_prefix(ancestor)
                 .expect("ancestors are prefixes");
+            // When `cleaned` itself canonicalizes, the remainder is empty and
+            // `PathBuf::join("")` appends a trailing separator (`/a/b.dart/`
+            // — a directory spelling for a file), corrupting every
+            // `files.path` reader downstream.
+            if remainder.as_os_str().is_empty() {
+                return base;
+            }
             return base.join(remainder);
         }
     }

@@ -8,8 +8,10 @@
 //!   rules, relative composition against the container's canonical URI,
 //!   scheme dispatch (`dart:`/`package:`/`file:`), interning to
 //!   [`dartq_source::FileId`], and the [`ResolvedTarget`] projection.
-//! - [`conditional`] — the analyzer-oracle conditional-URI selection
-//!   (declared-variables exact string match, first match wins).
+//! - [`conditional`] — conditional-URI selection for configurable
+//!   import/export directives (PRD §9.4): the target-derived
+//!   [`conditional::PlatformSet`] availability table and first-match-wins
+//!   selection with the official primary-URI fallback.
 //! - [`library_graph`] — interned library nodes keyed by canonical URI,
 //!   import/export edges, and the eager export-scope fixpoint pinned to the
 //!   analyzer's worklist behavior (locals beat re-exports, conflicting
@@ -29,7 +31,7 @@ pub mod namespace;
 pub mod uri;
 
 pub use codes::{ResolutionCode, ResolutionCodeInfo};
-pub use conditional::{ConditionalEnv, Configuration, SelectedUri, select_configured_uri};
+pub use conditional::{Configuration, PlatformSet, SelectedUri, resolve_conditional};
 pub use library_graph::{
     CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
     LibraryGraphBuilder, LibraryId, LocalLookup,
