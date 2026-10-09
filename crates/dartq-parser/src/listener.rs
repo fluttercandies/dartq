@@ -276,6 +276,24 @@ pub enum IdentifierContext {
     LabelReference,
     /// `catchParameter`.
     CatchParameter,
+    // —— directive identifier positions (#300) ———————————————————————————
+    /// `libraryName` (`identifier_context.dart`): the first name of a
+    /// `library` directive's qualified name.
+    LibraryName,
+    /// `libraryNameContinuation`: names after a `.` in a library name.
+    LibraryNameContinuation,
+    /// `importPrefixDeclaration`: the prefix name after `as`.
+    ImportPrefixDeclaration,
+    /// `dottedName`: the first identifier of a conditional-uri dotted name.
+    DottedName,
+    /// `dottedNameContinuation`: identifiers after a `.` in a dotted name.
+    DottedNameContinuation,
+    /// `combinator`: an identifier in a `show`/`hide` name list.
+    Combinator,
+    /// `partName`: the first name of a `part of` directive's qualified name.
+    PartName,
+    /// `partNameContinuation`: names after a `.` in a part-of name.
+    PartNameContinuation,
 }
 
 /// Experimental feature flag referenced by
@@ -302,6 +320,72 @@ pub trait ParserListener {
     // —— compilation unit ————————————————————————————————————————————
     fn begin_compilation_unit(&mut self, token: Token) {}
     fn end_compilation_unit(&mut self, count: usize, token: Token) {}
+
+    // —— directives (#300) ———————————————————————————————————————————————
+    /// `beginLibraryName(libraryKeyword)`.
+    fn begin_library_name(&mut self, token: Token) {}
+    /// `endLibraryName(libraryKeyword, semicolon, hasName)`.
+    fn end_library_name(&mut self, library_keyword: Token, semicolon: Token, has_name: bool) {}
+    /// `beginLibraryAugmentation(augmentKeyword, libraryKeyword)`.
+    fn begin_library_augmentation(&mut self, augment_kw: Token, library_keyword: Token) {}
+    /// `endLibraryAugmentation(augmentKeyword, libraryKeyword, semicolon)`.
+    fn end_library_augmentation(
+        &mut self,
+        augment_kw: Token,
+        library_keyword: Token,
+        semicolon: Token,
+    ) {
+    }
+    /// `beginImport(importKeyword)`.
+    fn begin_import(&mut self, import_keyword: Token) {}
+    /// `endImport(importKeyword, semicolon)`; `None` when
+    /// [`ParserListener::handle_recover_import`] takes over the tail
+    /// (official `endImport(importKeyword, /* semicolon = */ null)`).
+    fn end_import(&mut self, import_keyword: Token, semicolon: Option<Token>) {}
+    /// `handleImportPrefix(deferredKeyword, asKeyword)`: the prefix face of
+    /// the current import; either token may be absent.
+    fn handle_import_prefix(&mut self, deferred_kw: Option<Token>, as_kw: Option<Token>) {}
+    /// `handleRecoverImport(semicolon)`: one out-of-order-clause recovery
+    /// pass after `endImport(_, None)` finished (official `listener.dart:997`).
+    fn handle_recover_import(&mut self, semicolon: Option<Token>) {}
+    /// `beginConditionalUris(token)`.
+    fn begin_conditional_uris(&mut self, token: Token) {}
+    /// `endConditionalUris(count)`.
+    fn end_conditional_uris(&mut self, count: usize) {}
+    /// `beginConditionalUri(ifKeyword)`.
+    fn begin_conditional_uri(&mut self, if_kw: Token) {}
+    /// `endConditionalUri(ifKeyword, leftParen, equalSign)`.
+    fn end_conditional_uri(&mut self, if_kw: Token, left_paren: Token, equal_sign: Option<Token>) {}
+    /// `handleDottedName(count, firstIdentifier)`.
+    fn handle_dotted_name(&mut self, count: usize, first_identifier: Token) {}
+    /// `beginExport(exportKeyword)`.
+    fn begin_export(&mut self, token: Token) {}
+    /// `endExport(exportKeyword, semicolon)`.
+    fn end_export(&mut self, export_keyword: Token, semicolon: Token) {}
+    /// `beginCombinators(token)`.
+    fn begin_combinators(&mut self, token: Token) {}
+    /// `endCombinators(count)`.
+    fn end_combinators(&mut self, count: usize) {}
+    /// `beginShow(showKeyword)`.
+    fn begin_show(&mut self, show_keyword: Token) {}
+    /// `endShow(showKeyword)`.
+    fn end_show(&mut self, show_keyword: Token) {}
+    /// `beginHide(hideKeyword)`.
+    fn begin_hide(&mut self, hide_keyword: Token) {}
+    /// `endHide(hideKeyword)`.
+    fn end_hide(&mut self, hide_keyword: Token) {}
+    /// `handleIdentifierList(count)`: the name list of one show/hide.
+    fn handle_identifier_list(&mut self, count: usize) {}
+    /// `beginPart(partKeyword)`.
+    fn begin_part(&mut self, token: Token) {}
+    /// `endPart(partKeyword, semicolon)`.
+    fn end_part(&mut self, part_keyword: Token, semicolon: Token) {}
+    /// `beginPartOf(partKeyword)`.
+    fn begin_part_of(&mut self, token: Token) {}
+    /// `endPartOf(partKeyword, ofKeyword, semicolon, hasName)`: `hasName`
+    /// selects the qualified-name form over the URI form.
+    fn end_part_of(&mut self, part_keyword: Token, of_kw: Token, semicolon: Token, has_name: bool) {
+    }
 
     // —— metadata (D1/D2) ————————————————————————————————————————————
     fn begin_metadata_star(&mut self, token: Token) {}

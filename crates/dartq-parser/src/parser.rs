@@ -72,6 +72,9 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// Official `_currentlyRecovering` (`parser_impl.dart:7008`): suppresses
     /// nested written-out-operator recovery while one is being speculated.
     pub(crate) currently_recovering: bool,
+    /// `DirectiveContext.state` (`directive_context.dart:20`): where the
+    /// unit is in the directive prelude (ordering checks, #300).
+    pub(crate) directive_state: crate::directives::DirectiveState,
 }
 
 impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
@@ -98,6 +101,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             loop_state: crate::listener::LoopState::OutsideLoop,
             pending_augment: None,
             currently_recovering: false,
+            directive_state: crate::directives::DirectiveState::Unknown,
         }
     }
 
@@ -218,6 +222,10 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         let first = self.peek_span();
         self.listener.begin_compilation_unit(first);
         if self.peek_kind() == TokenKind::ScriptTag {
+            // `checkScriptTag` (directive_context.dart:31-37): the scanner
+            // only produces the tag as the first token, so the state always
+            // moves Unknown → Script.
+            self.directive_state = crate::directives::DirectiveState::Script;
             self.cursor.advance();
         }
         let mut count = 0usize;
@@ -308,6 +316,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             loop_state: self.loop_state,
             pending_augment: self.pending_augment,
             currently_recovering: self.currently_recovering,
+            directive_state: self.directive_state,
         }
     }
 }

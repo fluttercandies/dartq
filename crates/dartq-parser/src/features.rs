@@ -41,6 +41,11 @@ pub struct ParserFeatures {
     /// gate — when it is off, `augment` never reaches the parser as a
     /// keyword at all.
     pub augmentations_enabled: bool,
+    /// `isEnhancedPartsFeatureEnabled` (`parser_impl.dart:328`): the
+    /// directive-ordering relaxation in a `part of` file (`DirectiveContext`,
+    /// `directive_context.dart:63-67`) — with the feature on, directives
+    /// after `part of` are admitted instead of reported.
+    pub enhanced_parts_enabled: bool,
 }
 
 impl ParserFeatures {
@@ -57,6 +62,7 @@ impl ParserFeatures {
             primary_constructors_enabled: features
                 .is_enabled(dartq_language::Feature::PrimaryConstructors),
             augmentations_enabled: features.is_enabled(dartq_language::Feature::Augmentations),
+            enhanced_parts_enabled: features.is_enabled(dartq_language::Feature::EnhancedParts),
         }
     }
 }

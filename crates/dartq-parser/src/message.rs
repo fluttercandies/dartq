@@ -87,6 +87,13 @@ pub(crate) mod msg {
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
     };
     use dartq_diagnostics::{CodeInfo, DARTQ_INTERNAL_ERROR, DiagnosticType};
+    use dartq_diagnostics::{
+        DEFERRED_AFTER_PREFIX, DIRECTIVE_AFTER_DECLARATION, DUPLICATE_DEFERRED, DUPLICATE_PREFIX,
+        EXPECTED_STRING_LITERAL, EXPORT_DIRECTIVE_AFTER_PART_DIRECTIVE,
+        IMPORT_DIRECTIVE_AFTER_PART_DIRECTIVE, LIBRARY_DIRECTIVE_NOT_FIRST,
+        MISSING_PREFIX_IN_DEFERRED_IMPORT, MULTIPLE_LIBRARY_DIRECTIVES,
+        MULTIPLE_PART_OF_DIRECTIVES, NON_PART_OF_DIRECTIVE_IN_PART, PREFIX_AFTER_COMBINATOR,
+    };
 
     /// `expectedToken` / `expectedButGot` / `expectedAfterButGot` all surface
     /// as the analyzer's `EXPECTED_TOKEN` (pseudoSharedCode in messages.yaml).
@@ -298,6 +305,101 @@ pub(crate) mod msg {
 
     pub(crate) fn unexpected_token(lexeme: &str) -> Message {
         Message::new(UNEXPECTED_TOKEN, format!("Unexpected token '{lexeme}'."))
+    }
+
+    // —— directive family (#300) —————————————————————————————————————————
+
+    /// `expectedString` (`ensureLiteralString`, `parser_impl.dart:5075`;
+    /// pseudoSharedCode `expectedStringLiteral`, withArguments text).
+    pub(crate) fn expected_string(lexeme: &str) -> Message {
+        Message::new(
+            EXPECTED_STRING_LITERAL,
+            format!("Expected a String, but got '{lexeme}'."),
+        )
+    }
+
+    pub(crate) fn directive_after_declaration() -> Message {
+        Message::new(
+            DIRECTIVE_AFTER_DECLARATION,
+            "Directives must appear before any declarations.",
+        )
+    }
+
+    pub(crate) fn import_after_part() -> Message {
+        Message::new(
+            IMPORT_DIRECTIVE_AFTER_PART_DIRECTIVE,
+            "Import directives must precede part directives.",
+        )
+    }
+
+    pub(crate) fn export_after_part() -> Message {
+        Message::new(
+            EXPORT_DIRECTIVE_AFTER_PART_DIRECTIVE,
+            "Export directives must precede part directives.",
+        )
+    }
+
+    pub(crate) fn non_part_of_directive_in_part() -> Message {
+        Message::new(
+            NON_PART_OF_DIRECTIVE_IN_PART,
+            "The part-of directive must be the only directive in a part.",
+        )
+    }
+
+    pub(crate) fn multiple_library_directives() -> Message {
+        Message::new(
+            MULTIPLE_LIBRARY_DIRECTIVES,
+            "Only one library directive may be declared in a file.",
+        )
+    }
+
+    pub(crate) fn library_directive_not_first() -> Message {
+        Message::new(
+            LIBRARY_DIRECTIVE_NOT_FIRST,
+            "The library directive must appear before all other directives.",
+        )
+    }
+
+    pub(crate) fn part_of_twice() -> Message {
+        Message::new(
+            MULTIPLE_PART_OF_DIRECTIVES,
+            "Only one part-of directive may be declared in a file.",
+        )
+    }
+
+    pub(crate) fn duplicate_deferred() -> Message {
+        Message::new(
+            DUPLICATE_DEFERRED,
+            "An import directive can only have one 'deferred' keyword.",
+        )
+    }
+
+    pub(crate) fn deferred_after_prefix() -> Message {
+        Message::new(
+            DEFERRED_AFTER_PREFIX,
+            "The deferred keyword should come immediately before the prefix ('as' clause).",
+        )
+    }
+
+    pub(crate) fn duplicate_prefix() -> Message {
+        Message::new(
+            DUPLICATE_PREFIX,
+            "An import directive can only have one prefix ('as' clause).",
+        )
+    }
+
+    pub(crate) fn prefix_after_combinator() -> Message {
+        Message::new(
+            PREFIX_AFTER_COMBINATOR,
+            "The prefix ('as' clause) should come before any show/hide combinators.",
+        )
+    }
+
+    pub(crate) fn missing_prefix_in_deferred_import() -> Message {
+        Message::new(
+            MISSING_PREFIX_IN_DEFERRED_IMPORT,
+            "Deferred imports should have a prefix.",
+        )
     }
 
     pub(crate) fn expected_instead(expected: &str) -> Message {

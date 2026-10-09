@@ -595,6 +595,86 @@ impl ParserListener for Collector {
         self.log
             .push(("handle", "pattern_variable_declaration_statement"));
     }
+
+    // —— directives (#300) ———————————————————————————————————————————————
+    fn begin_library_name(&mut self, _: Token) {
+        self.log.push(("begin", "library_name"));
+    }
+    fn end_library_name(&mut self, _: Token, _: Token, _: bool) {
+        self.log.push(("end", "library_name"));
+    }
+    fn begin_library_augmentation(&mut self, _: Token, _: Token) {
+        self.log.push(("begin", "library_augmentation"));
+    }
+    fn end_library_augmentation(&mut self, _: Token, _: Token, _: Token) {
+        self.log.push(("end", "library_augmentation"));
+    }
+    fn begin_import(&mut self, _: Token) {
+        self.log.push(("begin", "import"));
+    }
+    fn end_import(&mut self, _: Token, _: Option<Token>) {
+        self.log.push(("end", "import"));
+    }
+    fn handle_import_prefix(&mut self, _: Option<Token>, _: Option<Token>) {
+        self.log.push(("handle", "import_prefix"));
+    }
+    fn handle_recover_import(&mut self, _: Option<Token>) {
+        self.log.push(("handle", "recover_import"));
+    }
+    fn begin_conditional_uris(&mut self, _: Token) {
+        self.log.push(("begin", "conditional_uris"));
+    }
+    fn end_conditional_uris(&mut self, _: usize) {
+        self.log.push(("end", "conditional_uris"));
+    }
+    fn begin_conditional_uri(&mut self, _: Token) {
+        self.log.push(("begin", "conditional_uri"));
+    }
+    fn end_conditional_uri(&mut self, _: Token, _: Token, _: Option<Token>) {
+        self.log.push(("end", "conditional_uri"));
+    }
+    fn handle_dotted_name(&mut self, _: usize, _: Token) {
+        self.log.push(("handle", "dotted_name"));
+    }
+    fn begin_export(&mut self, _: Token) {
+        self.log.push(("begin", "export"));
+    }
+    fn end_export(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "export"));
+    }
+    fn begin_combinators(&mut self, _: Token) {
+        self.log.push(("begin", "combinators"));
+    }
+    fn end_combinators(&mut self, _: usize) {
+        self.log.push(("end", "combinators"));
+    }
+    fn begin_show(&mut self, _: Token) {
+        self.log.push(("begin", "show"));
+    }
+    fn end_show(&mut self, _: Token) {
+        self.log.push(("end", "show"));
+    }
+    fn begin_hide(&mut self, _: Token) {
+        self.log.push(("begin", "hide"));
+    }
+    fn end_hide(&mut self, _: Token) {
+        self.log.push(("end", "hide"));
+    }
+    fn handle_identifier_list(&mut self, _: usize) {
+        self.log.push(("handle", "identifier_list"));
+    }
+    fn begin_part(&mut self, _: Token) {
+        self.log.push(("begin", "part"));
+    }
+    fn end_part(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "part"));
+    }
+    fn begin_part_of(&mut self, _: Token) {
+        self.log.push(("begin", "part_of"));
+    }
+    fn end_part_of(&mut self, _: Token, _: Token, _: Token, _: bool) {
+        self.log.push(("end", "part_of"));
+    }
 }
 
 /// Builds a parser over `source` with a fresh [`Collector`].

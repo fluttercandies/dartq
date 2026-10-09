@@ -1,0 +1,399 @@
+//! Directive grammar tests (#300): library/library-augmentation, import
+//! (conditional URIs, prefix, combinators), export, part, part-of, the
+//! `DirectiveContext` ordering checks, and the out-of-order-clause import
+//! recovery (official `parseImportRecovery`, `parser_impl.dart:995`).
+
+use super::collector::{Collector, scan_ok, setup};
+use crate::parser::Parser;
+
+fn parse(source: &'static str) -> Collector {
+    let mut p = setup(source);
+    p.parse_unit();
+    p.listener
+}
+
+fn error_codes(source: &'static str) -> Vec<String> {
+    parse(source).error_codes()
+}
+
+// —— valid directive forms ———————————————————————————————————————————————
+
+#[test]
+fn import_plain() {
+    let c = parse("import 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "import"), ("end", "import")]);
+}
+
+#[test]
+fn import_full_clause_set() {
+    let c = parse("import 'a.dart' deferred as p show a, b hide c;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "import"),
+        ("handle", "import_prefix"),
+        ("begin", "combinators"),
+        ("begin", "show"),
+        ("handle", "identifier_list"),
+        ("end", "show"),
+        ("begin", "hide"),
+        ("handle", "identifier_list"),
+        ("end", "hide"),
+        ("end", "combinators"),
+        ("end", "import"),
+    ]);
+}
+
+#[test]
+fn import_conditional_uris() {
+    let c = parse("import 'a.dart' if (dart.library.io) 'io.dart' if (x == 'y') 'z.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "import"),
+        ("begin", "conditional_uris"),
+        ("begin", "conditional_uri"),
+        ("handle", "dotted_name"),
+        ("end", "conditional_uri"),
+        ("begin", "conditional_uri"),
+        ("handle", "dotted_name"),
+        ("end", "conditional_uri"),
+        ("end", "conditional_uris"),
+        ("end", "import"),
+    ]);
+}
+
+#[test]
+fn export_with_combinators() {
+    let c = parse("export 'a.dart' show a hide b;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "export"),
+        ("begin", "combinators"),
+        ("begin", "show"),
+        ("end", "show"),
+        ("begin", "hide"),
+        ("end", "hide"),
+        ("end", "combinators"),
+        ("end", "export"),
+    ]);
+}
+
+#[test]
+fn part_uri() {
+    let c = parse("part 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "part"), ("end", "part")]);
+}
+
+#[test]
+fn part_of_uri_form() {
+    let c = parse("part of 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "part_of"), ("end", "part_of")]);
+}
+
+#[test]
+fn part_of_name_form() {
+    let c = parse("part of foo.bar;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "part_of"), ("end", "part_of")]);
+}
+
+#[test]
+fn library_named_and_unnamed() {
+    let c = parse("library foo.bar;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "library_name"), ("end", "library_name")]);
+
+    let c = parse("library;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "library_name"), ("end", "library_name")]);
+}
+
+#[test]
+fn library_augmentation() {
+    let c = parse("augment library 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "library_augmentation"),
+        ("end", "library_augmentation"),
+    ]);
+}
+
+#[test]
+fn full_directive_prelude_before_declarations() {
+    let c = parse("library l; import 'a.dart'; export 'b.dart'; part 'c.dart'; class C {}");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "library_name"),
+        ("end", "library_name"),
+        ("begin", "import"),
+        ("end", "import"),
+        ("begin", "export"),
+        ("end", "export"),
+        ("begin", "part"),
+        ("end", "part"),
+        ("begin", "class_declaration"),
+        ("end", "class_declaration"),
+    ]);
+}
+
+#[test]
+fn metadata_on_directive() {
+    let c = parse("@foo import 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "import"), ("end", "import")]);
+}
+
+#[test]
+fn script_tag_then_library() {
+    let c = parse("#!/usr/bin/env dart\nlibrary l;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "library_name"), ("end", "library_name")]);
+}
+
+// —— DirectiveContext ordering checks —————————————————————————————————————
+
+#[test]
+fn import_after_part() {
+    assert_eq!(
+        error_codes("part 'a.dart'; import 'b.dart';"),
+        ["import_directive_after_part_directive"]
+    );
+}
+
+#[test]
+fn export_after_part() {
+    assert_eq!(
+        error_codes("part 'a.dart'; export 'b.dart';"),
+        ["export_directive_after_part_directive"]
+    );
+}
+
+#[test]
+fn directive_after_declaration() {
+    assert_eq!(
+        error_codes("class C {} import 'a.dart';"),
+        ["directive_after_declaration"]
+    );
+    assert_eq!(
+        error_codes("int x = 1; part 'a.dart';"),
+        ["directive_after_declaration"]
+    );
+}
+
+#[test]
+fn multiple_library_directives() {
+    assert_eq!(
+        error_codes("library a; library b;"),
+        ["multiple_library_directives"]
+    );
+}
+
+#[test]
+fn library_directive_not_first() {
+    assert_eq!(
+        error_codes("import 'a.dart'; library b;"),
+        ["library_directive_not_first"]
+    );
+}
+
+#[test]
+fn part_of_twice() {
+    assert_eq!(
+        error_codes("part of 'a.dart'; part of 'b.dart';"),
+        ["multiple_part_of_directives"]
+    );
+}
+
+#[test]
+fn non_part_of_directive_in_part() {
+    // enhanced-parts is off by default: a directive after `part of` is the
+    // official `nonPartOfDirectiveInPart` report.
+    assert_eq!(
+        error_codes("part of 'a.dart'; import 'b.dart';"),
+        ["non_part_of_directive_in_part"]
+    );
+}
+
+#[test]
+fn directive_after_part_of_with_enhanced_parts() {
+    // With the experiment on, the directive is admitted
+    // (directive_context.dart:63-67).
+    use crate::ParserFeatures;
+    let (table, text) = scan_ok("part of 'a.dart'; import 'b.dart';");
+    let features = ParserFeatures::from_feature_set(
+        dartq_language::FeatureSet::for_language_version(dartq_language::LanguageVersion::new(
+            3, 15,
+        ))
+        .with_experiment(dartq_language::Feature::EnhancedParts),
+    );
+    let mut p = Parser::new(text, table, features, Collector::default());
+    p.parse_unit();
+    assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+}
+
+// —— import clause recovery (parseImportRecovery) —————————————————————————
+
+#[test]
+fn import_out_of_order_clause_recovery() {
+    // The second `import` is not a clause: the primary parse closes with
+    // `endImport(_, null)`, one recovery pass inserts the `;`, and the
+    // second import parses as its own directive.
+    let c = parse("import 'a.dart' import 'b.dart';");
+    assert_eq!(c.error_codes(), ["expected_token"]);
+    c.assert_sequence(&[
+        ("begin", "import"),
+        ("end", "import"),
+        ("handle", "recover_import"),
+        ("begin", "import"),
+        ("end", "import"),
+    ]);
+}
+
+#[test]
+fn duplicate_prefix() {
+    assert_eq!(
+        error_codes("import 'a.dart' as p as q;"),
+        ["duplicate_prefix"]
+    );
+}
+
+#[test]
+fn prefix_after_combinator() {
+    assert_eq!(
+        error_codes("import 'a.dart' show a as p;"),
+        ["prefix_after_combinator"]
+    );
+}
+
+#[test]
+fn duplicate_deferred_and_prefix() {
+    assert_eq!(
+        error_codes("import 'a.dart' deferred as p deferred as q;"),
+        ["duplicate_deferred", "duplicate_prefix"]
+    );
+}
+
+#[test]
+fn deferred_without_as_is_silent() {
+    // The loop's `deferred`-without-`as` special case emits the prefix
+    // event and records nothing (official :1046-1051): no diagnostic.
+    let c = parse("import 'a.dart' deferred;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("handle", "import_prefix"),
+        ("handle", "import_prefix"),
+        ("handle", "recover_import"),
+    ]);
+}
+
+#[test]
+fn unexpected_token_before_clause_is_skipped() {
+    // `skipUnexpectedTokenOpt` (:5148): a stray identifier followed by a
+    // clause keyword is reported and skipped.
+    assert_eq!(
+        error_codes("import 'a.dart' foo as p;"),
+        ["unexpected_token"]
+    );
+}
+
+#[test]
+fn import_at_eof_recovers_semicolon() {
+    assert_eq!(error_codes("import 'a.dart'"), ["expected_token"]);
+}
+
+// —— clause-level recovery ————————————————————————————————————————————————
+
+#[test]
+fn uri_must_be_string() {
+    assert_eq!(error_codes("import 5;"), ["expected_string_literal"]);
+    assert_eq!(error_codes("part 5;"), ["expected_string_literal"]);
+}
+
+#[test]
+fn combinator_missing_name() {
+    assert_eq!(error_codes("import 'a.dart' show;"), ["missing_identifier"]);
+}
+
+#[test]
+fn conditional_uri_missing_paren() {
+    // insertParens recovery (official :1136-1143): a synthetic
+    // `( <empty-id> )` triple stands in for the paren pair; the offending
+    // token then fails the URI read.
+    assert_eq!(
+        error_codes("import 'a.dart' if x;"),
+        ["expected_token", "expected_string_literal"]
+    );
+}
+
+#[test]
+fn conditional_uri_garbage_before_close() {
+    // A well-formed but misplaced group close: the intervening token is
+    // reported and the real `)` is jumped to (official :1124-1136).
+    assert_eq!(
+        error_codes("import 'a.dart' if (x y) 'b.dart';"),
+        ["unexpected_token"]
+    );
+}
+
+#[test]
+fn library_name_missing() {
+    // The synthetic name lands before `5`, so the semicolon recovery
+    // reports against it (official order: missing_identifier, then the
+    // `expected ';'`); the leftover `5;` then member-parses with its own
+    // recovery tail.
+    let codes = error_codes("library 5;");
+    assert_eq!(&codes[..2], ["missing_identifier", "expected_token"]);
+}
+
+#[test]
+fn repeated_part_directives_are_legal() {
+    // checkPart admits Part → Part (directive_context.dart:91); a
+    // declaration between them is still the after-declaration error.
+    assert!(error_codes("part 'a.dart'; part 'b.dart';").is_empty());
+    assert_eq!(
+        error_codes("part 'a.dart'; int x = 1; part 'b.dart';"),
+        ["directive_after_declaration"]
+    );
+}
+
+#[test]
+fn directive_modifier_errors() {
+    // parseTopLevelKeywordModifiers (modifier_context.dart:183): const and
+    // external are out-of-order; the rest are extraneous. (var/late/final/
+    // const before a directive never reach this walk — the official
+    // dispatch routes them to member parsing, parser_impl.dart:613-624.)
+    assert_eq!(
+        error_codes("external import 'a.dart';"),
+        ["modifier_out_of_order"]
+    );
+    assert_eq!(
+        error_codes("abstract part 'a.dart';"),
+        ["extraneous_modifier"]
+    );
+    assert_eq!(
+        error_codes("augment export 'a.dart';"),
+        ["extraneous_modifier"]
+    );
+    assert_eq!(
+        error_codes("static import 'a.dart';"),
+        ["extraneous_modifier"]
+    );
+}
+
+#[test]
+fn augmentation_modifier_is_captured_for_library_only() {
+    // `augment library` selects the augmentation form; `augment import`
+    // reports extraneous (modifier_context.dart:188).
+    let c = parse("augment library 'a.dart';");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "library_augmentation"),
+        ("end", "library_augmentation"),
+    ]);
+    assert_eq!(
+        error_codes("augment import 'a.dart';"),
+        ["extraneous_modifier"]
+    );
+}

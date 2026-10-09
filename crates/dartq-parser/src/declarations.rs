@@ -5,9 +5,9 @@
 //! `parseClass` :3099, `parseMixin` :3391, `parseExtension` :3613,
 //! `parseExtensionTypeDeclaration` :3960, and the header-clause helpers).
 //!
-//! Directives (`import`/`export`/`part`/`library`) are consumed diet-style
-//! this milestone (group-aware skip to `;`): their dedicated grammar and
-//! event surface are a later directive milestone.
+//! Directives (`import`/`export`/`part`/`library`) dispatch to the
+//! dedicated directive grammar (`directives.rs`, #300); this module places
+//! the `DirectiveContext` ordering checks at the official call sites.
 
 use dartq_scanner::{Keyword, TokenKind};
 
@@ -67,6 +67,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         // member walk and report below).
         let kind = self.peek_kind();
         if matches!(kind, TokenKind::Keyword(Keyword::Var | Keyword::Late)) {
+            self.check_declaration();
             self.parse_top_level_member_impl();
             return;
         }
@@ -76,12 +77,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 TokenKind::Keyword(Keyword::Class | Keyword::Mixin | Keyword::Enum)
             )
         {
+            self.check_declaration();
             self.parse_top_level_member_impl();
             return;
         }
         if kind == TokenKind::Keyword(Keyword::Const)
             && self.cursor.look_kind(1) != TokenKind::Keyword(Keyword::Class)
         {
+            self.check_declaration();
             self.parse_top_level_member_impl();
             return;
         }
@@ -133,6 +136,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.force_advance();
             return;
         }
+        self.check_declaration();
         self.parse_top_level_member_impl();
     }
 
@@ -180,6 +184,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let keyword = self.peek_span();
         match self.peek_kind() {
             TokenKind::Keyword(Keyword::Class) => {
+                self.check_declaration();
                 let mods = self.parse_class_modifiers(modifier_start, keyword);
                 self.parse_class_or_named_mixin_application(
                     begin,
@@ -194,6 +199,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 );
             }
             TokenKind::Keyword(Keyword::Enum) => {
+                self.check_declaration();
                 let mods = self.parse_declaration_modifiers(modifier_start, keyword);
                 if let Some(f) = mods.final_kw {
                     self.report(msg::final_enum(), f);
@@ -230,6 +236,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         if let Some(end_group) = self.angle_group_after(2)
                             && self.kind_at_abs(end_group + 1) == TokenKind::Keyword(Keyword::On)
                         {
+                            self.check_declaration();
                             let mods = self.parse_declaration_modifiers(modifier_start, keyword);
                             self.parse_extension(begin, mods.augment, keyword);
                             return;
@@ -239,6 +246,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         if let Some(end_group) = self.angle_group_after(2)
                             && self.kind_at_abs(end_group + 1) == TokenKind::Eq
                         {
+                            self.check_declaration();
                             let mods = self.parse_declaration_modifiers(modifier_start, keyword);
                             if let Some(f) = mods.final_kw {
                                 self.report(msg::extraneous_modifier("final"), f);
@@ -247,6 +255,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             return;
                         }
                     }
+                    self.check_declaration();
                     self.cursor.reset(modifier_start);
                     self.parse_top_level_member_impl();
                     return;
@@ -257,10 +266,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         if let Some(f) = mods.final_kw {
                             self.report(msg::extraneous_modifier("final"), f);
                         }
+                        self.check_declaration();
                         self.parse_typedef(keyword);
                     }
                     TokenKind::Keyword(Keyword::Mixin) => {
                         if self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::Class) {
+                            self.check_declaration();
                             let class_keyword = self.peek_span_at(1);
                             let mods = self.parse_class_modifiers(modifier_start, class_keyword);
                             if let Some(f) = mods.final_kw {
@@ -296,24 +307,41 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             }
                             // `base` is consumed and reported by the dispatch lookahead.
                             let base_kw = None;
+                            self.check_declaration();
                             self.parse_mixin(begin, mods.augment, base_kw, keyword);
                         }
                     }
                     TokenKind::Keyword(Keyword::Extension) => {
                         let mods = self.parse_declaration_modifiers(modifier_start, keyword);
+                        self.check_declaration();
                         self.parse_extension(begin, mods.augment, keyword);
                     }
-                    TokenKind::Keyword(
-                        Keyword::Import | Keyword::Export | Keyword::Part | Keyword::Library,
-                    ) => {
-                        // Diet directive consumption (directives are a later
-                        // milestone): group-aware skip to `;`.
-                        self.skip_to_sync(&[TokenKind::Semicolon]);
-                        if self.peek_kind() == TokenKind::Semicolon {
-                            self.cursor.advance();
+                    TokenKind::Keyword(Keyword::Import) => {
+                        let _ = self.parse_directive_modifiers(modifier_start, keyword, false);
+                        self.check_import(keyword);
+                        self.parse_import();
+                    }
+                    TokenKind::Keyword(Keyword::Export) => {
+                        let _ = self.parse_directive_modifiers(modifier_start, keyword, false);
+                        self.check_export(keyword);
+                        self.parse_export();
+                    }
+                    TokenKind::Keyword(Keyword::Part) => {
+                        let _ = self.parse_directive_modifiers(modifier_start, keyword, false);
+                        self.parse_part_or_part_of();
+                    }
+                    TokenKind::Keyword(Keyword::Library) => {
+                        // Official order (:837-845): the ordering check runs
+                        // BEFORE the modifier walk for `library` only.
+                        self.check_library(keyword);
+                        let augment = self.parse_directive_modifiers(modifier_start, keyword, true);
+                        match augment {
+                            Some(aug) => self.parse_library_augmentation(aug, keyword),
+                            None => self.parse_library_name(keyword),
                         }
                     }
                     _ => {
+                        self.check_declaration();
                         self.cursor.reset(modifier_start);
                         self.parse_top_level_member_impl();
                     }
@@ -455,8 +483,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Shared modifier walk for enum/mixin/extension/typedef (`reportTopLevel
     /// ModifierError` shape: const/external are reported against the
-    /// declaration keyword).
-    fn parse_declaration_modifiers(
+    /// declaration keyword). Also the base walk of the directive modifier
+    /// families (`directives::parse_directive_modifiers`).
+    pub(crate) fn parse_declaration_modifiers(
         &mut self,
         modifier_start: crate::cursor::CursorMark,
         keyword: TokenSpan,
@@ -1761,9 +1790,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
 /// Modifier tokens captured by the shared declaration-modifier walk.
 #[derive(Default)]
-struct DeclModifiers {
-    augment: Option<TokenSpan>,
-    final_kw: Option<TokenSpan>,
+pub(crate) struct DeclModifiers {
+    pub(crate) augment: Option<TokenSpan>,
+    pub(crate) final_kw: Option<TokenSpan>,
 }
 
 /// Modifier tokens captured by the class-modifier walk.

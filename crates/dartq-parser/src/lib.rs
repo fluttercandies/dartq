@@ -57,8 +57,11 @@
 //! bodies** (#19): `{ ... }` bodies parse the statement grammar
 //! (`statements.rs`, official `parseFunctionBody`), `=>` bodies parse their
 //! expression through the full expression engine, and `;`
-//! bodies emit the official empty-body event. Directives are consumed
-//! diet-style (group-aware skip to `;`) until the directive milestone.
+//! bodies emit the official empty-body event. Directives (#300) parse the
+//! full family (`directives.rs`): library/library-augmentation, import
+//! (conditional URIs, `deferred`/`as` prefix, show/hide combinators,
+//! out-of-order-clause recovery), export, part, and part-of, with the
+//! official `DirectiveContext` ordering checks.
 //! Statement, initializer, and default-value expression operands parse
 //! through the full expression engine (`expressions.rs`, official
 //! `parseExpression` family, #20); patterns keep the reduced
@@ -79,6 +82,7 @@ use dartq_scanner::TokenTable;
 
 mod cursor;
 mod declarations;
+mod directives;
 mod expr_const;
 mod expressions;
 mod features;
