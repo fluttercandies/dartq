@@ -149,6 +149,21 @@ pub struct PackageTable {
     by_depth: Vec<(PathBuf, Box<str>)>,
 }
 
+/// A lib dir in the spelling universe the identity layer keys files under:
+/// `FileTable` interns existing files by `std::fs::canonicalize`
+/// (`file_table.rs` `normalize_path`, rule 1) while package-config
+/// resolution is lexical (`resolve_root` joins onto `config_dir`), so a
+/// workspace under a symlinked ancestor (macOS `/var` → `/private/var`)
+/// would otherwise never prefix-match its own lib dirs and every
+/// intra-package relative import would fall out of package space. Same
+/// discipline as dartq-pub's inclusion map (`workspace.rs`
+/// `inclusion_key`); a lib dir with no filesystem identity (a missing
+/// package) keeps its normalized lexical form.
+fn canonical_dir(dir: &Path) -> PathBuf {
+    let normalized = normalize(dir);
+    normalized.canonicalize().unwrap_or(normalized)
+}
+
 impl PackageTable {
     /// Indexes `config` whose entries resolve against `config_dir`, the
     /// directory holding the `package_config.json` (normally `.dart_tool/`).
@@ -162,7 +177,10 @@ impl PackageTable {
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
         let mut lib_dirs: FxHashMap<Box<str>, PathBuf> = FxHashMap::default();
         for resolved in config.resolve(config_dir)? {
-            lib_dirs.insert(Box::from(resolved.name.as_str()), resolved.lib_dir);
+            lib_dirs.insert(
+                Box::from(resolved.name.as_str()),
+                canonical_dir(&resolved.lib_dir),
+            );
         }
         let mut by_depth: Vec<_> = lib_dirs
             .iter()
@@ -548,6 +566,12 @@ pub struct RawUri {
 /// [`InvalidUriSyntax`] where Dart throws `FormatException` — reported as
 /// `invalid_uri`.
 pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
+    // `Uri.parse` routes any string starting with a case-insensitive `data:`
+    // to `UriData._parse` before the general scanner runs (uri.dart:931-939),
+    // so the path character tables never apply to it.
+    if uri.len() >= 5 && uri.as_bytes()[..5].eq_ignore_ascii_case(b"data:") {
+        return parse_data_uri(uri);
+    }
     let bytes = uri.as_bytes();
 
     // Scheme: `:` after a run of scheme characters; must start alphabetic
@@ -608,6 +632,119 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
         authority,
         path: Box::from(&uri[index..path_end]),
     })
+}
+
+/// Parses the `data:` face. The validity boundary is `UriData._parse`'s
+/// `FormatException` faces (uri.dart:4254-4313), mirrored here: a non-empty
+/// MIME type carries exactly one `/`; every `;` parameter carries an `=`,
+/// except a lone `base64` immediately before the `,`; and on the `;base64`
+/// face the payload must satisfy `base64.normalize` (base64.dart:97-189).
+/// The non-base64 payload never rejects: the oracle only normalizes it
+/// (malformed escapes repaired, everything else percent-escaped), so
+/// anything after the comma is accepted as written — `?` and `#` are data,
+/// not delimiters.
+fn parse_data_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
+    let bytes = uri.as_bytes();
+    // MIME type: up to the first `,` or `;`.
+    let mut index = 5;
+    let mut slash_seen = false;
+    while index < bytes.len() && bytes[index] != b',' && bytes[index] != b';' {
+        if bytes[index] == b'/' {
+            if slash_seen {
+                return Err(InvalidUriSyntax); // "Invalid MIME type"
+            }
+            slash_seen = true;
+        }
+        index += 1;
+    }
+    if !slash_seen && index > 5 {
+        return Err(InvalidUriSyntax); // non-empty MIME type without `/`
+    }
+    // Parameter sections. The oracle's loop runs until the current character
+    // is a comma, so a string that ends without one rejects here too.
+    let mut is_base64 = false;
+    while bytes.get(index) != Some(&b',') {
+        let section = index;
+        index += 1;
+        let mut equals_seen = false;
+        while index < bytes.len() && bytes[index] != b';' && bytes[index] != b',' {
+            if bytes[index] == b'=' {
+                equals_seen = true;
+            }
+            index += 1;
+        }
+        if equals_seen {
+            continue;
+        }
+        // Without `=` the section must be exactly `base64` with the comma
+        // right behind it ("base64," is 7 characters).
+        if index == section + 7
+            && bytes.get(index) == Some(&b',')
+            && &bytes[section + 1..index] == b"base64"
+        {
+            is_base64 = true;
+            break;
+        }
+        return Err(InvalidUriSyntax); // "Expecting '='"
+    }
+    if is_base64 && !is_normalized_base64(&bytes[index + 1..]) {
+        return Err(InvalidUriSyntax); // "Invalid base64 data" / padding
+    }
+    Ok(RawUri {
+        scheme: Box::from("data"),
+        authority: None,
+        path: Box::from(&uri[5..]),
+    })
+}
+
+/// The acceptance half of `base64.normalize` (base64.dart:97-189), which
+/// `UriData._parse` applies to `;base64` payloads: `%XX` escapes decode
+/// first (short or non-hex escapes, and a decoded `%`, are invalid), the
+/// alphabet is `A-Za-z0-9+/ -_`, padding must be one or two `=` closing the
+/// payload with the total length a multiple of four, and an unpadded
+/// payload whose length is 1 modulo 4 is the one rejected length.
+fn is_normalized_base64(bytes: &[u8]) -> bool {
+    let mut length = 0;
+    let mut first_padding = None;
+    let mut padding = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let mut char = bytes[index];
+        index += 1;
+        if char == b'%' {
+            let Some(hex) = bytes.get(index..index + 2) else {
+                return false;
+            };
+            let Some(high) = (hex[0] as char).to_digit(16) else {
+                return false;
+            };
+            let Some(low) = (hex[1] as char).to_digit(16) else {
+                return false;
+            };
+            let Ok(byte) = u8::try_from(high * 16 + low) else {
+                return false;
+            };
+            char = byte;
+            if char == b'%' {
+                return false;
+            }
+        }
+        match char {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'-' | b'_' => length += 1,
+            b'=' => {
+                if first_padding.is_none() {
+                    first_padding = Some(length);
+                }
+                padding += 1;
+                length += 1;
+            }
+            _ => return false,
+        }
+    }
+    match first_padding {
+        Some(first) => length % 4 == 0 && first + padding == length && padding <= 2,
+        None => length % 4 != 1,
+    }
 }
 
 /// Path vs query/fragment character tables (`_pathCharOrSlashMask` vs
@@ -1100,6 +1237,13 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("root dir");
+            // The identity layer interns existing files by their canonical
+            // path (`file_table.rs` `normalize_path`) and the resolver
+            // composes from those spellings, so the fixture pins every
+            // expectation to the canonical root: on macOS `temp_dir()` is
+            // `/var/folders/...` and `/var` is a symlink to `/private/var`.
+            let root = root.canonicalize().expect("canonical root");
             let write = |relative: &str, content: &str| {
                 let path = root.join(relative);
                 fs::create_dir_all(path.parent().expect("parent")).expect("dir");
@@ -1115,10 +1259,13 @@ mod tests {
             write(
                 "app/.dart_tool/package_config.json",
                 &format!(
+                    // rootUris resolve against the config dir
+                    // (`app/.dart_tool`), so `../../pkg_a` is the fixture's
+                    // sibling package.
                     r#"{{
                       "configVersion": 2,
                       "packages": [
-                        {{"name": "pkg_a", "rootUri": "../pkg_a"}},
+                        {{"name": "pkg_a", "rootUri": "../../pkg_a"}},
                         {{"name": "hosted", "rootUri": "file://{}"}}
                       ]
                     }}"#,
@@ -1345,8 +1492,10 @@ mod tests {
     fn package_targets_map_through_lib_dirs() {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
+        // The container lives in the resolver's own table: ids are
+        // table-local, and the relative face below composes from the
+        // container's interned path.
         let container = container(&fixture, &mut files, "app/lib/main.dart");
-        let mut files = FileTable::new();
         let mut resolver = resolver(&fixture, &mut files);
 
         let hit = resolver.resolve(
@@ -1756,8 +1905,9 @@ mod tests {
     }
 
     /// The shared dartq-pub face applies to this table too: duplicate
-    /// config names are pub's hard error (`package_config.dart:44-51`),
-    /// never a silent last-wins over the lib-dir index.
+    /// config names are pub's hard error (`package_config.dart:44-51`, the
+    /// verbatim ArgumentError text), never a silent last-wins over the
+    /// lib-dir index.
     #[test]
     fn duplicate_names_fail_loudly() {
         let config = PackageConfig::parse(
@@ -1769,7 +1919,9 @@ mod tests {
         let error =
             PackageTable::new(&config, Path::new("/p/.dart_tool")).expect_err("duplicate name");
         assert!(
-            error.to_string().contains("Duplicate name `a`"),
+            error
+                .to_string()
+                .contains("Duplicate name a in generated package config"),
             "unexpected error: {error}"
         );
     }

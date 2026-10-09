@@ -359,8 +359,7 @@ impl<'t> LibraryGraphBuilder<'t> {
         // while entering the locals layer.
         let mut scopes: Vec<FxHashMap<StringId, ExportEntry>> =
             Vec::with_capacity(self.nodes.len());
-        let mut locals: Vec<FxHashMap<StringId, LocalSlot>> =
-            Vec::with_capacity(self.nodes.len());
+        let mut locals: Vec<FxHashMap<StringId, LocalSlot>> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut scope = FxHashMap::default();
             for (name, file) in &node.decls {
