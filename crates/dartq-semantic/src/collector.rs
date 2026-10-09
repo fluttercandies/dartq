@@ -132,8 +132,6 @@ struct Builder<'src, 'tab> {
     containers: Vec<OpenContainer>,
     /// The current field group's static bit (`None` = no group open).
     field_static: Option<bool>,
-    super_armed: bool,
-    super_pending: Option<StringId>,
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTypedef>,
@@ -149,6 +147,19 @@ struct Builder<'src, 'tab> {
     type_var_group: Vec<StringId>,
     /// Count of the open depth-1 type-parameter list.
     type_param_count: u16,
+    /// A depth-1 count that closed before its declaration's container
+    /// opened: class/mixin/enum/extension headers parse their type
+    /// variables before `begin_*_declaration` (official
+    /// `parseClassOrNamedMixinApplication`), so the count carries here and
+    /// [`Builder::open_container`] consumes it.
+    header_type_params: u16,
+    /// A class header is open (container opened, `extends` clause not yet
+    /// committed): type references buffer as the superclass candidate. The
+    /// official order parses the supertype before `handle_class_extends`
+    /// (`parser_impl.dart` `parseClassExtendsSeenExtendsClause`), so the
+    /// name can only be captured while the header is open.
+    header_super_open: bool,
+    super_candidate: Option<StringId>,
     /// Set once the pending executable's header is past its type-parameter
     /// position (formals began, or none exist); body declarations must not
     /// touch the header's counts.
@@ -169,8 +180,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             file: FileElements::default(),
             containers: Vec::new(),
             field_static: None,
-            super_armed: false,
-            super_pending: None,
             pending_member: None,
             pending_top: None,
             pending_typedef: None,
@@ -180,6 +189,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             type_group_depth: 0,
             type_var_group: Vec::new(),
             type_param_count: 0,
+            header_type_params: 0,
+            header_super_open: false,
+            super_candidate: None,
             executable_header_done: false,
             armed_ty: None,
             field_group_ty: None,
@@ -252,20 +264,23 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if let Some((name, range)) = name {
             self.declare_top(name, range, TopDecl::bare(tag));
         }
+        // The header's type variables closed before this open (official
+        // event order); they belong to this container.
+        let header_type_params = std::mem::take(&mut self.header_type_params);
         self.containers.push(OpenContainer {
             name,
             kind,
             superclass: None,
             members: FxHashMap::default(),
-            type_params: 0,
+            type_params: header_type_params,
         });
-        self.super_armed = false;
-        self.super_pending = None;
+        self.header_super_open = true;
+        self.super_candidate = None;
     }
 
     fn close_container(&mut self) {
-        self.super_armed = false;
-        self.super_pending = None;
+        self.header_super_open = false;
+        self.super_candidate = None;
         let Some(open) = self.containers.pop() else {
             return;
         };
@@ -298,17 +313,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
-    fn commit_superclass(&mut self) {
-        if !self.super_armed {
-            return;
-        }
-        self.super_armed = false;
+    /// Commits the buffered header type reference as the superclass edge
+    /// (the `extends` clause or the named mixin application's head type).
+    fn commit_super_candidate(&mut self) {
+        let candidate = self.super_candidate.take();
+        self.header_super_open = false;
         if let Some(open) = self.containers.last_mut()
             && open.superclass.is_none()
         {
-            open.superclass = self.super_pending.take();
-        } else {
-            self.super_pending = None;
+            open.superclass = candidate;
         }
     }
 
@@ -394,9 +407,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Latches the depth-1 type-parameter count onto the pending declaration
     /// (method, top-level function, typedef, or innermost open container).
-    fn attach_type_param_count(&mut self) {
+    /// Attaches the closed depth-1 count to the declaration it belongs to;
+    /// `false` when nothing was open to receive it (a container header —
+    /// [`Builder::open_container`] then consumes [`Builder::
+    /// header_type_params`]).
+    fn attach_type_param_count(&mut self) -> bool {
         if self.executable_header_done {
-            return;
+            return false;
         }
         let count = self.type_param_count;
         if let Some(pending) = &mut self.pending_member {
@@ -407,7 +424,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending.type_params = count;
         } else if let Some(open) = self.containers.last_mut() {
             open.type_params = count;
+        } else {
+            return false;
         }
+        true
     }
 
     /// The pending executable's arity log entries, drained at commit.
@@ -511,9 +531,6 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut *self.builder.borrow_mut();
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
-        // The head type (`class C = A with B;`) is the superclass edge.
-        builder.super_armed = true;
-        builder.super_pending = None;
     }
 
     fn end_named_mixin_application(
@@ -610,16 +627,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.builder.borrow_mut().close_container();
     }
 
-    fn handle_class_extends(&mut self, extends: Option<Token>, _count: usize) {
-        if extends.is_some() {
-            let mut builder = self.builder.borrow_mut();
-            builder.super_armed = true;
-            builder.super_pending = None;
-        }
+    fn handle_class_extends(&mut self, _extends: Option<Token>, _count: usize) {
+        // The supertype's type events fired before this event (official
+        // `parseClassExtendsSeenExtendsClause`), so the buffered header
+        // reference — present only with `extends` — is the edge.
+        self.builder.borrow_mut().commit_super_candidate();
     }
 
-    fn handle_qualified(&mut self, _period: Token) {
-        self.builder.borrow_mut().commit_superclass();
+    fn handle_named_mixin_application_with_clause(&mut self, _with: Token) {
+        // The head type fired between `begin_named_mixin_application` and
+        // this event; the `with` list itself is not the superclass.
+        self.builder.borrow_mut().commit_super_candidate();
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
@@ -650,14 +668,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let name = name_with_range.map(|(name, _)| name);
         match context {
             IdentifierContext::TypeReference => {
-                if builder.super_armed && builder.super_pending.is_none() {
-                    builder.super_pending = name;
+                if builder.header_super_open && builder.super_candidate.is_none() {
+                    builder.super_candidate = name;
                 }
             }
             IdentifierContext::TypeReferenceContinuation => {
-                if builder.super_armed {
+                if builder.header_super_open {
                     // Qualified `p.S`: the continuation names the type.
-                    builder.super_pending = name;
+                    builder.super_candidate = name;
                 }
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
@@ -790,8 +808,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn end_type_variables(&mut self, _begin: Token, _end: Token) {
         let mut builder = self.builder.borrow_mut();
-        if builder.type_group_depth == 1 {
-            builder.attach_type_param_count();
+        if builder.type_group_depth == 1 && !builder.attach_type_param_count() {
+            // A container header: the count carries into the container's
+            // `begin_*_declaration` open (official order — the type
+            // variables parse before `beginClassDeclaration`).
+            builder.header_type_params = builder.type_param_count;
         }
         builder.type_group_depth -= 1;
     }
@@ -1084,7 +1105,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 builder.named_formals.push(Formal {
                     name,
                     ty,
-                    required: false,
+                    required: kind == FormalParameterKind::RequiredNamed,
                 });
             }
         } else {

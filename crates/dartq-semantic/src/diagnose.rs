@@ -514,6 +514,11 @@ struct Engine<'a> {
     frames: Vec<Frame>,
     /// In-scope type parameters, outermost first (truncated per frame).
     type_params: Vec<StringId>,
+    /// Type variables declared since the last frame opened. A declaration's
+    /// header events fire before its frame (`begin_class_declaration` opens
+    /// after the type variables, official `parseClassOrNamedMixinApplication`),
+    /// so they park here and drain into the frame that owns them.
+    pending_type_params: Vec<StringId>,
     /// The armed declared type: `handle_type`/`handle_void_keyword` arm,
     /// `handle_no_type` disarms. Consumed by declaration bindings and by the
     /// executable return-type latches.
@@ -561,6 +566,14 @@ struct Engine<'a> {
     non_type_pos: u32,
     /// Suppression depth inside `new`/`const`/implicit-creation expressions.
     ctor_pos: u32,
+    /// Interned reserved-member spellings (populated once in [`Engine::new`]:
+    /// the hot `resolve_bare` path compares ids, never re-interns).
+    object_members: [StringId; OBJECT_MEMBERS.len()],
+    enum_synth_members: [StringId; ENUM_SYNTH_MEMBERS.len()],
+    builtin_types: [StringId; BUILTIN_TYPES.len()],
+    /// `name` → `name=` lookup spellings already interned (write targets
+    /// repeat across a unit; the cache is bounded by their distinct names).
+    setter_ids: FxHashMap<StringId, StringId>,
 }
 
 impl<'a> Engine<'a> {
@@ -578,6 +591,9 @@ impl<'a> Engine<'a> {
         lib: LibraryId,
     ) -> Self {
         let guard = UndefinedGuard::build(graph, lib);
+        let object_members = OBJECT_MEMBERS.map(|m| strings.intern(m));
+        let enum_synth_members = ENUM_SYNTH_MEMBERS.map(|m| strings.intern(m));
+        let builtin_types = BUILTIN_TYPES.map(|m| strings.intern(m));
         Self {
             graph,
             namespaces,
@@ -592,6 +608,7 @@ impl<'a> Engine<'a> {
             rows: Vec::new(),
             frames: Vec::new(),
             type_params: Vec::new(),
+            pending_type_params: Vec::new(),
             armed_ty: None,
             pending_decl_ty: None,
             group_heads: Vec::new(),
@@ -608,6 +625,10 @@ impl<'a> Engine<'a> {
             type_prefix: None,
             non_type_pos: 0,
             ctor_pos: 0,
+            object_members,
+            enum_synth_members,
+            builtin_types,
+            setter_ids: FxHashMap::default(),
         }
     }
 
@@ -682,6 +703,8 @@ impl<'a> Engine<'a> {
 
     fn push_frame(&mut self, kind: FrameKind) {
         let type_mark = self.type_params.len();
+        let pending = std::mem::take(&mut self.pending_type_params);
+        self.type_params.extend(pending);
         self.frames.push(Frame {
             kind,
             locals: FxHashSet::default(),
@@ -781,10 +804,11 @@ impl<'a> Engine<'a> {
         self.push_frame(FrameKind::Block);
     }
 
-    /// Enters a type parameter's scope (its frame's `type_mark` truncates it
-    /// away on pop).
+    /// Enters a type parameter's scope: parked until the declaration's
+    /// frame opens ([`Engine::push_frame`] drains), whose `type_mark`
+    /// truncates it away on pop.
     fn push_type_parameter(&mut self, name: StringId) {
-        self.type_params.push(name);
+        self.pending_type_params.push(name);
     }
 
     /// The name after the dot of a qualified type arrived: the prefix slot
@@ -908,10 +932,10 @@ impl<'a> Engine<'a> {
                     ty: self.member_declared_ty(container, name),
                 };
             }
-            if kind == ContainerKind::Enum && self.is_reserved(name, &ENUM_SYNTH_MEMBERS) {
+            if kind == ContainerKind::Enum && self.is_reserved(name, &self.enum_synth_members) {
                 return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
-            if self.instance_context() && self.is_reserved(name, &OBJECT_MEMBERS) {
+            if self.instance_context() && self.is_reserved(name, &self.object_members) {
                 return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
         }
@@ -930,7 +954,7 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Local(decl) => bare_info_of(name, decl),
+            ScopedHit::Local(decl) => self.bare_info_of(name, decl),
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
             ScopedHit::Ambiguous(_) => BareInfo::Plain { ty: Ty::UNKNOWN },
             ScopedHit::NotFound => self.missing_info(),
@@ -960,7 +984,7 @@ impl<'a> Engine<'a> {
             NamespaceEntry::Prefix => BareInfo::Prefix { name },
             NamespaceEntry::Decl(file) => {
                 let decl = self.index.get(file).and_then(|f| f.decl(name));
-                bare_info_of(
+                self.bare_info_of(
                     name,
                     decl.map_or(
                         &TopDecl::bare(MicroKind::TopLevelVar),
@@ -971,8 +995,38 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn is_reserved(&self, name: StringId, set: &[&str]) -> bool {
-        set.iter().any(|&m| self.intern(m) == name)
+    /// The [`BareInfo`] of a resolved top-level declaration.
+    fn bare_info_of(&self, name: StringId, decl: &TopDecl) -> BareInfo {
+        match decl.kind {
+            // Type parameters are declaration-scoped: the per-unit tag is
+            // stale outside its declaration, and in-scope uses were answered
+            // by the engine's type-parameter stack. The stale reference is a
+            // plain miss whose code name follows the live invocation context
+            // (`undefined_method`'s host inside a class instance member).
+            MicroKind::TypeParam => self.missing_info(),
+            MicroKind::Class => BareInfo::Container {
+                name,
+                kind: ContainerKind::Class,
+            },
+            MicroKind::Enum => BareInfo::Container {
+                name,
+                kind: ContainerKind::Enum,
+            },
+            MicroKind::Mixin => BareInfo::Container {
+                name,
+                kind: ContainerKind::Mixin,
+            },
+            MicroKind::Extension => BareInfo::Container {
+                name,
+                kind: ContainerKind::Extension,
+            },
+            _ => BareInfo::Plain { ty: decl.var_ty },
+        }
+    }
+
+    /// Whether `name` is in a precomputed reserved-id set.
+    fn is_reserved(&self, name: StringId, set: &[StringId]) -> bool {
+        set.contains(&name)
     }
 
     /// Walks `container`'s member face over superclass name edges. Any
@@ -1123,7 +1177,7 @@ impl<'a> Engine<'a> {
         let suppressed = self.non_type_pos > 0;
         match head {
             TypeHead::Bare => {
-                if self.is_reserved(name, &BUILTIN_TYPES) {
+                if self.is_reserved(name, &self.builtin_types) {
                     return;
                 }
                 if !matches!(self.resolve_bare(name), BareInfo::Missing { .. }) {
@@ -1570,7 +1624,7 @@ impl<'a> Engine<'a> {
     /// typedef/function keeps its declaration's; anything unresolved is
     /// `None` (suppress — `undefined_class` already reports).
     fn declared_type_params(&self, name: StringId) -> Option<u16> {
-        if self.is_reserved(name, &BUILTIN_TYPES) || self.type_params.contains(&name) {
+        if self.is_reserved(name, &self.builtin_types) || self.type_params.contains(&name) {
             return Some(0);
         }
         match self.resolve_bare(name) {
@@ -1875,14 +1929,19 @@ impl<'a> Engine<'a> {
         if matches!(self.rows[target].intent, Intent::Operator(..)) {
             return;
         }
-        // The right-hand side: exactly one row strictly after the operator.
-        let rhs: Vec<usize> = (target + 1..self.rows.len())
-            .filter(|index| self.rows[*index].range.offset > limit)
-            .collect();
-        if rhs.len() != 1 {
+        // The right-hand side: exactly one row strictly after the operator
+        // (rows are pushed in source order, so the first post-operator row
+        // and the absence of a second decide without collecting).
+        let mut rhs = self.rows[target + 1..]
+            .iter()
+            .filter(|row| row.range.offset > limit);
+        let Some(rhs_row) = rhs.next() else {
+            return;
+        };
+        if rhs.next().is_some() {
             return;
         }
-        let (from, range) = (self.rows[rhs[0]].ty, self.rows[rhs[0]].range);
+        let (from, range) = (rhs_row.ty, rhs_row.range);
         let to = self.assignment_target_ty(&self.rows[target]);
         if to.assignable_from(from) == Some(false) {
             let (a0, a1) = (self.ty_display(from), self.ty_display(to));
@@ -2004,12 +2063,19 @@ impl<'a> Engine<'a> {
             None => return,
         };
         let (resolved, defined) = match &shape {
+            // The membership test exists only where the oracle's does: a real
+            // top-level function's formal table. A class callee is a
+            // constructor invocation (a constructor accepting the label is
+            // silent — constructors sit outside the M1 model) and a getter
+            // callee is a property access; both stay unresolved, mirroring
+            // the arity path's filter.
             RowShape::Bare(_) => {
-                let decl = self.top_level_decl(callee_name);
-                (
-                    decl.is_some(),
-                    decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name)),
-                )
+                let decl = self
+                    .top_level_decl(callee_name)
+                    .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some());
+                let defined =
+                    decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
+                (decl.is_some(), defined)
             }
             RowShape::Member { recv } => {
                 let formals = self.member_formals_full(recv, callee_name);
@@ -2375,7 +2441,7 @@ impl<'a> Engine<'a> {
         let Some(kind) = self.container_kind_of(container) else {
             return; // external receiver type: suppress
         };
-        if kind == ContainerKind::Enum && self.is_reserved(row.name, &ENUM_SYNTH_MEMBERS) {
+        if kind == ContainerKind::Enum && self.is_reserved(row.name, &self.enum_synth_members) {
             return;
         }
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
@@ -2509,11 +2575,17 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The `name=` lookup spelling of a write target.
-    fn setter_spelling(&self, name: StringId) -> StringId {
+    /// The `name=` lookup spelling of a write target. Cached: the `format!`
+    /// plus intern allocation repeats for the same write targets across a
+    /// unit, and pass-time member checks ask on every write.
+    fn setter_spelling(&mut self, name: StringId) -> StringId {
+        if let Some(&spelling) = self.setter_ids.get(&name) {
+            return spelling;
+        }
         let text = self.strings.resolve(name);
-        let setter = format!("{text}=");
-        self.strings.intern(&setter)
+        let spelling = self.strings.intern(&format!("{text}="));
+        self.setter_ids.insert(name, spelling);
+        spelling
     }
 
     /// A member's result type as far as M1 knows it: the declared field type
@@ -2572,29 +2644,32 @@ impl<'a> Engine<'a> {
     /// accepts the setter spelling (`name=`): a same-named getter, field, or
     /// method suppresses with the oracle's assignment-to-* codes, a setter
     /// defines the write.
-    fn member_defined(&self, container: StringId, row: &Row, super_walk: bool) -> bool {
+    fn member_defined(&mut self, container: StringId, row: &Row, super_walk: bool) -> bool {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-        let walk = |member: StringId| {
-            let walk = if super_walk {
-                self.walk_super(container, member)
-            } else {
-                self.walk_members(container, member)
-            };
-            matches!(walk, Walk::Found(_))
-        };
-        let mut found = walk(row.name);
+        let mut found = self.member_found(container, row.name, super_walk);
         if !found && write {
-            found = walk(self.setter_spelling(row.name));
+            let spelling = self.setter_spelling(row.name);
+            found = self.member_found(container, spelling, super_walk);
         }
         if found {
             return true;
         }
-        if row.name == self.intern("==") || self.is_reserved(row.name, &OBJECT_MEMBERS) {
+        if row.name == self.intern("==") || self.is_reserved(row.name, &self.object_members) {
             return true;
         }
         self.index
             .get(self.file)
             .is_some_and(|f| f.extension_member(row.name).is_some())
+    }
+
+    /// Whether the plain member walk finds `member` on `container`.
+    fn member_found(&self, container: StringId, member: StringId, super_walk: bool) -> bool {
+        let walk = if super_walk {
+            self.walk_super(container, member)
+        } else {
+            self.walk_members(container, member)
+        };
+        matches!(walk, Walk::Found(_))
     }
 
     fn container_kind_of(&self, container: StringId) -> Option<ContainerKind> {
@@ -3071,6 +3146,12 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
+    fn begin_type_variables(&mut self, _token: Token) {
+        // A new header started: a previous declaration's parked variables
+        // never met their frame (a typedef's, say) — drop them.
+        self.engine.borrow_mut().pending_type_params.clear();
+    }
+
     // —— identifiers ——————————————————————————————————————————————————
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
@@ -3467,37 +3548,6 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 }
 
-fn bare_info_of(name: StringId, decl: &TopDecl) -> BareInfo {
-    match decl.kind {
-        // Type parameters are declaration-scoped: the per-unit tag is stale
-        // outside its declaration, and in-scope uses were answered by the
-        // engine's type-parameter stack.
-        MicroKind::TypeParam => BareInfo::Missing {
-            // Stale out-of-scope type-parameter references carry no context.
-            this_type: None,
-            in_exec: false,
-            on_opaque: false,
-        },
-        MicroKind::Class => BareInfo::Container {
-            name,
-            kind: ContainerKind::Class,
-        },
-        MicroKind::Enum => BareInfo::Container {
-            name,
-            kind: ContainerKind::Enum,
-        },
-        MicroKind::Mixin => BareInfo::Container {
-            name,
-            kind: ContainerKind::Mixin,
-        },
-        MicroKind::Extension => BareInfo::Container {
-            name,
-            kind: ContainerKind::Extension,
-        },
-        _ => BareInfo::Plain { ty: decl.var_ty },
-    }
-}
-
 /// The §8 names-table use kind of a row's finalized intent.
 fn use_kind_of(intent: &Intent) -> NameUse {
     match intent {
@@ -3849,6 +3899,40 @@ mod tests {
             .filter(|row| row.use_kind == NameUse::NamedArgument)
             .collect();
         assert_eq!(named.len(), 2, "both labels feed the §8 table");
+    }
+
+    /// The named-argument membership test runs only against a real
+    /// top-level function's formals (`type_analyzer.dart:5811-5824`: the
+    /// code fires when the invoked target's named-parameter table exists
+    /// and lacks the name). A class callee is a constructor invocation — a
+    /// constructor accepting the label is silent — and a getter callee is a
+    /// property access; both previously false-positived on their
+    /// `formals: None` declarations.
+    ///
+    /// Hand-trace: `C(x: 1)`'s bare head resolves `Container`, and the
+    /// filtered `top_level_decl` leaves it unresolved (silent); `g(x: 1)`'s
+    /// getter declaration carries no formals (silent); `bad` on the real
+    /// function `g` still reports.
+    #[test]
+    fn named_argument_gates_on_a_real_function_formals_table() {
+        let class_callee = report("class C { C({var x}); } void f() { C(x: 1); }");
+        assert!(
+            class_callee.diagnostics.is_empty(),
+            "{:?}",
+            code_names(&class_callee)
+        );
+        let getter_callee = report("class C {} C get g => C(); void f() { g(x: 1); }");
+        assert!(
+            getter_callee.diagnostics.is_empty(),
+            "{:?}",
+            code_names(&getter_callee)
+        );
+        let real_miss = report("void g({var n}) {} void f() { g(bad: 1); }");
+        assert_eq!(code_names(&real_miss), ["undefined_named_parameter"]);
+        assert_eq!(
+            real_miss.diagnostics[0].message,
+            "The named parameter 'bad' isn't defined."
+        );
     }
 
     /// `await` in a sync body is `undefined_identifier_await` (no
@@ -4286,18 +4370,20 @@ mod tests {
         );
     }
 
-    /// The arity checks suppress on unresolved heads: an unknown creation
-    /// head already reports `undefined_class`, and a second code there would
-    /// contaminate the diff (rule 0c — invalid types never cascade).
+    /// The arity checks suppress on unresolved heads: a second code at the
+    /// type-argument group would contaminate the diff (rule 0c — invalid
+    /// types never cascade).
     ///
-    /// Hand-trace: `Missing<A>()`'s head misses the lookup (no container) →
-    /// the `ctor_pos` branch defers past the container checks; the send
-    /// consumes no deferred entry with a resolvable declaration → only the
-    /// type-use row emits `undefined_class`.
+    /// Hand-trace: `Missing<A>()` parses as a bare invocation, not a
+    /// creation — no `new`/`const` prefix, so the official parser runs it
+    /// through the send path and the resolver reports the identifier miss
+    /// (`undefined_function`, the static-context invocation miss). The
+    /// group's arity check finds no resolvable declaration and defers past
+    /// it → exactly one code.
     #[test]
     fn unresolved_creation_head_suppresses_arity() {
         let report = report("class A {} void f() { Missing<A>(); }");
-        assert_eq!(code_names(&report), ["undefined_class"]);
+        assert_eq!(code_names(&report), ["undefined_function"]);
     }
 
     // —— batch 2 (#197): the member family ————————————————————————————
@@ -4309,11 +4395,14 @@ mod tests {
     /// or on a setter spelling; a setter-only name still reads as a
     /// getter miss.
     ///
-    /// Hand-trace: `c.h` walks `C` (no `h`, no superclass) → clean miss →
-    /// `undefined_getter`; `c.g` finds the getter (silent); `c.s = 1`
-    /// misses `s` and `s=` → `undefined_setter`; `c.g = 1` finds the
-    /// getter `g` (write survives, unfrozen assignment-to-final);
-    /// `c.p` on the setter-only `p=` misses the read → `undefined_getter`.
+    /// Hand-trace: the harness has no core library, so `int` — undeclared
+    /// here — is a missing type reference at each member declaration
+    /// (`undefined_class` ×2, the oracle's annotation miss); `c.h` walks
+    /// `C` (no `h`, no superclass) → clean miss → `undefined_getter`;
+    /// `c.g` finds the getter (silent); `c.s = 1` misses `s` and `s=` →
+    /// `undefined_setter`; `c.g = 1` finds the getter `g` (write survives,
+    /// unfrozen assignment-to-final); `c.p` on the setter-only `p=` misses
+    /// the read → `undefined_getter`.
     #[test]
     fn instance_member_family_reports_by_intent() {
         let report = report(
@@ -4322,20 +4411,26 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["undefined_getter", "undefined_setter", "undefined_getter"],
+            [
+                "undefined_class",
+                "undefined_class",
+                "undefined_getter",
+                "undefined_setter",
+                "undefined_getter",
+            ],
             "{:?}",
             code_names(&report)
         );
         assert_eq!(
-            report.diagnostics[0].message,
+            report.diagnostics[2].message,
             "The getter 'h' isn't defined for the type 'C'."
         );
         assert_eq!(
-            report.diagnostics[1].message,
+            report.diagnostics[3].message,
             "The setter 's' isn't defined for the type 'C'."
         );
         assert_eq!(
-            report.diagnostics[0].range.offset,
+            report.diagnostics[2].range.offset,
             u32::try_from("class C { int get g => 1; set p(int v) {} } void f(C c) { c.".len())
                 .unwrap()
         );
@@ -4425,8 +4520,10 @@ mod tests {
     /// per-shape message against the enclosing container (`SuperLookupDomain`);
     /// members found through the superclass edge stay silent.
     ///
-    /// Hand-trace: `super.g/m/s` resolve in `B` (walk starts at B) — silent;
-    /// the `q*` misses walk B cleanly → getter/method/setter texts.
+    /// Hand-trace: the harness has no core library, so B's `int`-typed
+    /// members carry two `undefined_class` rows; `super.g/m/s` resolve in
+    /// `B` (the superclass edge reaches it) — silent; the `q*` misses walk
+    /// B cleanly → getter/method/setter texts.
     #[test]
     fn super_member_family_reports_by_shape() {
         let report = report(
@@ -4436,6 +4533,8 @@ mod tests {
         assert_eq!(
             code_names(&report),
             [
+                "undefined_class",
+                "undefined_class",
                 "undefined_super_member",
                 "undefined_super_member",
                 "undefined_super_member",
@@ -4444,15 +4543,15 @@ mod tests {
             code_names(&report)
         );
         assert_eq!(
-            report.diagnostics[0].message,
+            report.diagnostics[2].message,
             "The getter 'q' isn't defined in a superclass of 'C'."
         );
         assert_eq!(
-            report.diagnostics[1].message,
+            report.diagnostics[3].message,
             "The method 'q2' isn't defined in a superclass of 'C'."
         );
         assert_eq!(
-            report.diagnostics[2].message,
+            report.diagnostics[4].message,
             "The setter 'q3' isn't defined in a superclass of 'C'."
         );
     }
@@ -4572,6 +4671,31 @@ mod tests {
         assert_eq!(
             report.diagnostics[2].message,
             "The method 'missing3' isn't defined for the type 'E'."
+        );
+    }
+
+    /// A stale type-parameter reference follows the live invocation context:
+    /// invoked inside a class instance member it reports `undefined_method`
+    /// naming the enclosing type (the `UnqualifiedLookupDomain` arm), not
+    /// the context-free `undefined_function`.
+    ///
+    /// Hand-trace: `T` is out of scope in `D.m` (the engine's type-parameter
+    /// stack truncated when `C`'s frame closed), but the scoped lookup still
+    /// resolves the per-unit tag to `C`'s `TypeParam` declaration;
+    /// `bare_info_of` snapshots the live frames (`this` of `D`) instead of a
+    /// context-free missing row → `undefined_method(D)`.
+    #[test]
+    fn stale_type_param_invocation_follows_live_frame() {
+        let report = report("class C<T> {} class D { void m() { T(); } }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_method"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'T' isn't defined for the type 'D'."
         );
     }
 
