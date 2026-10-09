@@ -22,7 +22,8 @@
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
 //! (analyze), `event`, `cancel`, `query` (the `query symbol` face, PRD
-//! §20.3), `semdiag` (the default semantic diagnoser, #236).
+//! §20.3), `semdiag` (the default semantic diagnoser, #236),
+//! `analysis_options` (the merged per-root options, PRD §12).
 //!
 //! # The semantic diagnostics seam (#120/#121)
 //!
@@ -35,6 +36,7 @@
 //! With no diagnoser configured the engine under-reports exactly those
 //! families and nothing else.
 
+pub mod analysis_options;
 pub mod cancel;
 pub mod event;
 pub mod l1;
@@ -264,6 +266,12 @@ impl Engine {
 
         let mut stats = DiscoveryStats::default();
         for root in &roots {
+            // The root's merged options (PRD §12.2): excluded paths leave
+            // the analysis set — directories are not descended into, files
+            // are not interned — so neither diagnostics nor lints ever see
+            // them.
+            let options = self.state.options.get(root).cloned();
+            let is_excluded = |path: &Path| options.as_ref().is_some_and(|o| o.is_excluded(path));
             // The four declared surfaces plus directly-in-root dart files.
             let mut queue: Vec<PathBuf> =
                 SURFACES.iter().map(|surface| root.join(surface)).collect();
@@ -287,6 +295,9 @@ impl Engine {
                         if name.starts_with('.') || EXCLUDED.contains(&name.as_ref()) {
                             continue;
                         }
+                        if is_excluded(&path) {
+                            continue;
+                        }
                         queue.push(path);
                     } else if path.extension().is_some_and(|ext| ext == "dart")
                         // `entry.file_type()` reports link-host facts (it does
@@ -303,6 +314,7 @@ impl Engine {
                             || (file_type.is_symlink()
                                 && std::fs::metadata(&path)
                                     .is_ok_and(|meta| meta.is_file())))
+                        && !is_excluded(&path)
                     {
                         let bytes = std::fs::read(&path)?;
                         stats.loc_total += u64::from(
@@ -322,6 +334,15 @@ impl Engine {
     #[must_use]
     pub fn file_table(&self) -> &FileTable {
         &self.state.files
+    }
+
+    /// The merged analysis options governing `root` (a package root), or
+    /// `None` when the root has no options file in its ancestry. The lint
+    /// face resolves its enable set from [`analysis_options::AnalysisOptions::lint_rules`];
+    /// discovery has already applied [`analysis_options::AnalysisOptions::is_excluded`].
+    #[must_use]
+    pub fn options_for_root(&self, root: &Path) -> Option<&analysis_options::AnalysisOptions> {
+        self.state.options.get(root).map(Arc::as_ref)
     }
 
     /// The line index of a resident file.

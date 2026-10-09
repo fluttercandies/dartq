@@ -19,6 +19,7 @@ dartq-sdk = { path = "../dartq-sdk" }
 dartq-source = { path = "../dartq-source" }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [[bench]]

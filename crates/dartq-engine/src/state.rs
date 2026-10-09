@@ -3,7 +3,7 @@
 //! per-library result cache, and the bounded per-file facts cache.
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dartq_diagnostics::Diagnostic;
@@ -373,6 +373,11 @@ pub(crate) struct EngineState {
     pub pending: FxHashMap<FileId, PendingChange>,
     pub pending_order: Vec<FileId>,
 
+    /// Resolved analysis options per package root (PRD §12): the include
+    /// chain merged once at context assembly; discovery applies the exclude
+    /// globs, the lint face reads the rule names.
+    pub options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
+
     /// Memoized facts of previous contents (bounded, `FACTS_CACHE_CAP`).
     facts_cache: FxHashMap<FactsKey, Arc<UnitFacts>>,
     facts_order: VecDeque<FactsKey>,
@@ -398,6 +403,16 @@ impl EngineState {
         store: Box<dyn SourceStore + Send + Sync>,
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
+        // Options are a context field: the include chains merge once here,
+        // keyed by package root (cold path, workspace-assembly time).
+        let mut roots: Vec<PathBuf> = packages
+            .iter()
+            .map(|package| package.root.clone())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        let options =
+            crate::analysis_options::AnalysisOptions::for_roots(&roots, pub_config, config_dir);
         Ok(Self {
             packages,
             uri_packages,
@@ -415,6 +430,7 @@ impl EngineState {
             structure_dirty: false,
             pending: FxHashMap::default(),
             pending_order: Vec::new(),
+            options,
             facts_cache: FxHashMap::default(),
             facts_order: VecDeque::new(),
             gc_debt: 0,

@@ -15,6 +15,8 @@
 //! - [`freshness`]: staleness judgment — mtime chain, environment
 //!   fingerprint, and the content-id fallback (§6); reports reasons, never
 //!   diagnostics directly
+//! - [`glob`]: the pinned `package:glob` 2.1.3 port (parse + full-path match
+//!   + listing), shared by workspace expansion and analysis-options excludes
 //! - [`graph`]: `ResolvedPackageGraph` / `PackageGraphId`
 //!
 //! Docs throughout cite `.third/pub` source paths and measured facts from
@@ -23,7 +25,7 @@
 
 pub mod config;
 pub mod freshness;
-mod glob;
+pub mod glob;
 pub mod graph;
 pub mod lock;
 pub mod pubspec;

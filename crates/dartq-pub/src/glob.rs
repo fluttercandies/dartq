@@ -18,6 +18,11 @@
 //! treats `{` as a glob wildcard), and `globset` diverges on `**`
 //! (zero-segment matches) and character-class syntax while still leaving the
 //! filesystem traversal to us.
+//!
+//! Two consumers share this module: pub's workspace expansion (listing via
+//! [`Glob::list_sync`]) and the analysis-options exclude face (full-path
+//! matching via [`Glob::matches_path`], the `package:glob` `Glob.matches`
+//! shape the analyzer compiles exclude patterns into).
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +37,7 @@ pub(crate) fn has_glob_wildcards(s: &str) -> bool {
 /// interpolates verbatim into its "Failed to parse glob" error
 /// (package.dart:187-190).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GlobError {
+pub struct GlobError {
     line: usize,
     column: usize,
     message: String,
@@ -71,24 +76,43 @@ enum Node {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Sequence(Vec<Node>);
 
-/// The parsed glob: the list-tree root (`list_tree.dart` `ListTree`).
+/// The parsed glob: the list tree (`list_tree.dart` `ListTree`) plus the
+/// flattened alternatives backing [`Glob::matches_path`].
 #[derive(Debug)]
-pub(crate) struct Glob {
+pub struct Glob {
     root: TreeNode,
+    options: Vec<Sequence>,
 }
 
 impl Glob {
     /// Parses a glob pattern (`glob.dart` `Glob.new`, defaults: relative,
     /// case-sensitive, non-recursive).
-    pub(crate) fn new(pattern: &str) -> Result<Glob, GlobError> {
+    ///
+    /// # Errors
+    ///
+    /// [`GlobError`] with Dart `StringScanner` line/column rendering for
+    /// malformed pattern syntax (unclosed `{`/`[`, empty ranges, single-option
+    /// `{a}`, stray separators).
+    pub fn new(pattern: &str) -> Result<Glob, GlobError> {
         let sequence = Parser::new(pattern).parse()?;
         // `ListTree`: flatten options (and singleton ranges) to top level,
         // then split each option into path components (`/` inside literals).
+        let options = flatten(sequence);
         let mut root = TreeNode::default();
-        for option in flatten(sequence) {
-            add_components(&mut root, &split(option));
+        for option in &options {
+            add_components(&mut root, &split(option.clone()));
         }
-        Ok(Glob { root })
+        Ok(Glob { root, options })
+    }
+
+    /// Full-path match (`glob.dart` `matches`): `path` is a relative POSIX
+    /// path (components joined by `/`, no leading or trailing separator —
+    /// the shape `LocatedGlob.matches` produces in the analyzer's exclude
+    /// walk). Each flattened alternative is matched whole, `**` spanning
+    /// separators (still needing one intermediate segment for `a/**/b`).
+    #[must_use]
+    pub fn matches_path(&self, path: &str) -> bool {
+        self.options.iter().any(|option| matches(&option.0, path))
     }
 
     /// Lists every filesystem entity beneath `root_dir` matching the glob,
