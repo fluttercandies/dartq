@@ -143,7 +143,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
             TokenKind::PlusPlus | TokenKind::MinusMinus => POSTFIX_PRECEDENCE,
-            TokenKind::Period | TokenKind::QuestionPeriod => SELECTOR_PRECEDENCE,
+            // `(`, `[` and `[]` carry SELECTOR_PRECEDENCE in the token table
+            // (`token.dart:2090/2098/1988`); `[]=` is NO_PRECEDENCE there.
+            TokenKind::Period
+            | TokenKind::QuestionPeriod
+            | TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::Index => SELECTOR_PRECEDENCE,
             _ => return None,
         })
     }
@@ -773,6 +779,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.cursor.advance();
                 }
                 let open = self.peek_span();
+                // The bracket is a delimiter, not the operand: official
+                // `parseExpression(next)` starts at `next.next`
+                // (`parser_impl.dart:8028`), so consume `[` before the
+                // operand — otherwise `[i]` re-parses as a list literal.
+                self.cursor.advance();
                 let saved = self.may_parse_function_expressions;
                 self.may_parse_function_expressions = true;
                 let _ = self.parse_expression();
