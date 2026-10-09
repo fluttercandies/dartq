@@ -390,7 +390,10 @@ impl AstBuilder {
         self.nodes.truncate(marker.nodes);
         self.pool.truncate(marker.pool);
         for node in &mut self.open[..marker.open] {
-            if node.payload_start.is_some_and(|start| start as usize >= marker.pool) {
+            if node
+                .payload_start
+                .is_some_and(|start| start as usize >= marker.pool)
+            {
                 node.payload_start = None;
             }
         }

@@ -1,6 +1,13 @@
 //! Span derivation: nodes store token-index pairs; byte and UTF-16 offsets
 //! derive from the token table at access time (layout spec §2). Zero-width
 //! synthetic-only nodes derive a zero-length span at their insertion point.
+//!
+//! Sequencing: these functions require the *unified* table — the parser must
+//! first fold its inserted-token side table into the scanner's table via
+//! `TokenTable::append_inserted` (Eof re-seated last, dartq-ast `TokenRef`
+//! doc). Before that, an inserted id (`table_len + i`) is outside the table
+//! and `token_at` panics on it; after it, every id resolves. (Distinct from
+//! the builder's lazy payload-slot materialization.)
 
 use dartq_scanner::{Token, TokenKind, TokenTable};
 use dartq_source::utf16_len_of;

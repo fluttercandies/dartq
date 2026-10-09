@@ -254,6 +254,27 @@ impl Token {
         }
     }
 
+    /// Builds a parser-inserted token for [`TokenTable::append_inserted`]: a
+    /// closer-split remainder or a recovery synthetic. `synthetic` marks
+    /// recovery synthetics ([`Token::is_synthetic`] true); split remainders
+    /// materialize valid code and are not synthetic.
+    #[must_use]
+    pub fn inserted(
+        kind: TokenKind,
+        byte_offset: u32,
+        byte_len: u32,
+        utf16_offset: u32,
+        synthetic: bool,
+    ) -> Self {
+        Self {
+            kind,
+            byte_offset,
+            byte_len,
+            utf16_offset,
+            flags: if synthetic { FLAG_SYNTHETIC } else { 0 },
+        }
+    }
+
     pub(crate) fn synthetic(mut self) -> Self {
         self.flags |= FLAG_SYNTHETIC;
         self
@@ -357,6 +378,28 @@ impl TokenTable {
     pub fn lexeme<'s>(&self, source: &'s str, index: usize) -> &'s str {
         let t = &self.tokens[index];
         &source[t.byte_range()]
+    }
+
+    /// Appends parser-inserted tokens (closer-split remainders and recovery
+    /// synthetics) into the main storage and re-seats the Eof sentinel last,
+    /// yielding the one contiguous unified table the AST reads. Appended
+    /// token `i` lands at index `old_len - 1 + i` in iteration order — the
+    /// first takes the Eof sentinel's former slot — so original indices are
+    /// untouched and Eof stays the final element.
+    ///
+    /// Original tokens keep their indices, offsets and slices exactly, and
+    /// `matching_end` stays valid (its entries point at close tokens, never
+    /// at Eof). Sequencing contract: this runs once at parse end — before it,
+    /// an inserted id resolves only in the parser's side table, and no span
+    /// may be derived through the table for one.
+    pub fn append_inserted(&mut self, inserted: impl IntoIterator<Item = Token>) {
+        let eof = self
+            .tokens
+            .pop()
+            .expect("append_inserted expects a scanned table ending at Eof");
+        debug_assert_eq!(eof.kind, TokenKind::Eof, "Eof must be the last token");
+        self.tokens.extend(inserted);
+        self.tokens.push(eof);
     }
 }
 

@@ -62,9 +62,16 @@ pub use table::SyntaxTable;
 pub type NodeId = u32;
 
 /// Index into the unified token table: scanned tokens keep their scanner
-/// ids; parser-inserted tokens are materialized and appended at parse end,
-/// so the AST sees one contiguous table (layout spec §2). Same space as the
-/// parser's `TokenId`.
+/// ids; parser-inserted tokens are appended into the scanner's table by
+/// `dartq_scanner::TokenTable::append_inserted` at parse end (Eof re-seated
+/// last), so the AST sees one contiguous table (layout spec §2). Same space
+/// as the parser's `TokenId`.
+///
+/// Sequencing contract: until the parser runs that append, an inserted id
+/// (`table_len + i`) resolves only in the parser's side table — no span read
+/// ([`byte_span`]/[`utf16_span`]) may happen before it. (Not to be confused
+/// with the builder's lazy payload-slot materialization, which is about pool
+/// words, not tokens.)
 ///
 /// The index space is `u32` — a unit's token table is contract-bound below
 /// 2³² entries (about 4.3 billion tokens per file; overflow is a
