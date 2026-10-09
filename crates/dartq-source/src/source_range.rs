@@ -640,6 +640,10 @@ mod tests {
             "汉字测试\n日本語テキスト\r\n한국어\n",
             "\u{FEFF}a\u{1F600}b\n\u{1F600}\r\nx",
             "ascii\nlines\nonly\n",
+            // Lone `\r` as the sole terminator, surrounded by astral chars:
+            // line starts must track across the CR while surrogates surround
+            // it on both lines.
+            "\u{1F600}a\r\u{1F600}b",
             "a /* \u{1F600}",
         ];
         for source in sources {
@@ -653,6 +657,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// U+000B (VT), U+000C (FF), and U+0085 (NEL) are ordinary characters,
+    /// not line terminators — the termination set is exactly `\n`, `\r\n`,
+    /// and lone `\r` (the official scanner's set). Negative pin: with a
+    /// trailing `\n` as the only break, the whole text stays on line 1 and
+    /// the count is 2 (content line + the final empty line the terminator
+    /// starts).
+    #[test]
+    fn ff_vt_nel_do_not_break_lines() {
+        // Every character is one UTF-16 unit, so offsets are plain
+        // positions: a 0, VT 1, b 2, FF 3, c 4, NEL 5, d 6, \n 7.
+        let source = "a\u{000B}b\u{000C}c\u{0085}d\n";
+        let index = LineIndex::new(source);
+        assert_eq!(index.line_count(), 2);
+        assert_eq!(index.line_col_utf16(source, 0), (1, 1));
+        // The character right after each control is still on line 1.
+        assert_eq!(index.line_col_utf16(source, 2), (1, 3)); // b, after VT
+        assert_eq!(index.line_col_utf16(source, 4), (1, 5)); // c, after FF
+        assert_eq!(index.line_col_utf16(source, 6), (1, 7)); // d, after NEL
+        assert_eq!(index.line_col_utf16(source, 8), (2, 1)); // only \n breaks
     }
 
     /// A UTF-16 offset between the surrogates of an astral character must
