@@ -6,7 +6,9 @@
 //!
 //! * [`model`] — the per-unit element model: top-level name set with
 //!   micro-kind tags, class member sets with static/instance bits, direct
-//!   superclass name edges, and per-executable named-formal tables.
+//!   superclass name edges, per-executable formal tables (positional +
+//!   named, with declared types), declared types (fields, variables, return
+//!   types), type-parameter counts, and the capture-time arity log.
 //! * [`collector`] — the collecting [`ParserListener`]: consumes the
 //!   parser's declaration-surface event stream into a model
 //!   ([`collector::collect`]). The parser event stream is the stable face —
@@ -16,13 +18,14 @@
 //!   (#117): the public scope face ([`library::LibraryScopes`]), the
 //!   in-library scoped lookup ([`library::lookup_scoped`]), and the
 //!   superclass-aware member walk ([`library::member_lookup`]).
-//! * [`codes`] — the M1 semantic code table: the frozen `undefined_*` +
-//!   `duplicate_definition` family with tier and verbatim oracle message.
-//! * [`diagnose`] — the M1 diagnosis engine (#120): a reference-collecting
-//!   pass over the parser event stream that resolves every reference against
-//!   #117/#119 and emits the batch-1 codes (`undefined_identifier`,
-//!   `undefined_class`, `undefined_function`, `duplicate_definition`),
-//!   recording every other miss as the index names-table rows
+//! * [`codes`] — the M1 semantic code table: the frozen families with tier
+//!   and verbatim oracle message.
+//! * [`diagnose`] — the M1 diagnosis engine (#120 batch 1 + #121 batch 2):
+//!   a reference-collecting pass over the parser event stream that resolves
+//!   every reference against #117/#119 and emits the implemented frozen
+//!   codes — the `undefined_*`/`duplicate_definition` family plus the
+//!   `wrong_number_of_*` family and the static-nullability four — recording
+//!   every other miss as the index names-table rows
 //!   ([`diagnose::FileReport::names`], index-design-spec §8).
 //!
 //! # What the `undefined_*` / `wrong_number_*` tickets (#120/#121) can
@@ -61,13 +64,12 @@
 //!   extension application is name-level opaque, and its members are merged
 //!   conservatively so that reporting stays under-reporting, never a false
 //!   positive.
-//! * Named formals ([`TopDecl::named_formals`],
-//!   [`MemberEntry::named_formals`]) are `Some` exactly when the executable
-//!   declares ≥ 1 named formal (`None` = definitely none, not unknown).
+//! * Formal tables ([`TopDecl::formals`], [`MemberEntry::formals`]) are
+//!   `Some` exactly when the executable declares a parameter list (`None` =
+//!   no list — getters — not unknown). Positional formals keep declaration
+//!   order with their declared types; named formals keep theirs.
 //!   Only methods and top-level functions carry them: **constructors are
-//!   outside the M1 model** (not in the adjudicated essentials), so
-//!   `wrong_number_of_*)` checks against constructor invocations cannot be
-//!   served yet.
+//!   outside the M1 model** (not in the adjudicated essentials).
 //!
 //! ## Known gaps (each under-reports, never false-positives)
 //!

@@ -28,19 +28,33 @@
 //! * Field groups (`begin_fields` … `end_fields`/`end_top_level_fields`)
 //!   carry their `static` bit at open; each `FieldDeclaration`/
 //!   `TopLevelVariableDeclaration` identifier commits immediately under
-//!   that bit. Enum constants (`EnumValueDeclaration`) commit as static
-//!   fields of the enum.
+//!   that bit, with the group's declared [`Ty`] latched at the first name
+//!   (one `parse_type` per group). Enum constants (`EnumValueDeclaration`)
+//!   commit as static fields of the enum.
 //! * Executables: `begin_method` carries name/static/get-or-set directly;
 //!   a top-level method's name arrives via the
 //!   `TopLevelFunctionDeclaration` identifier event and its get-or-set only
-//!   at `end_top_level_method`. Named formals are collected while
-//!   `end_formal_parameter` reports a named kind at formal-nesting depth 1
-//!   and attached to the executable once (the attach-once guard keeps
-//!   closures in bodies or default values from clobbering it).
+//!   at `end_top_level_method`. The formal table (positional + named, with
+//!   declared types) is collected while `end_formal_parameter` reports at
+//!   formal-nesting depth 1 and attached to the executable once (the
+//!   attach-once guard keeps closures in bodies or default values from
+//!   clobbering it). Return types latch at the name identifier event —
+//!   `begin_method`/`begin_top_level_method` fire before the return type's
+//!   `parse_type`, the name fires after it.
 //! * Typedef names arrive via the `TypedefDeclaration` identifier event
 //!   between `begin_typedef`/`end_typedef`.
 //! * `begin_type_variable` names land in the unit's name set tagged
-//!   `typeParam`.
+//!   `typeParam`; the depth-1 group's count latches onto the pending
+//!   declaration (method, top-level function, typedef, or innermost open
+//!   container). The `executable_header_done` flag keeps body declarations
+//!   (local functions, closures) from clobbering a header count.
+//! * Declared types arm at `handle_type`/`handle_void_keyword` and disarm
+//!   at `handle_no_type` — every declaration head (typed or not) runs one
+//!   `parse_type`, so the arm never leaks across declarations.
+//! * Declaration-arity violations (operator parameter counts, setter
+//!   parameter shape) are logged at commit into
+//!   [`FileElements::arity_violations`]; hash-map order must not reach the
+//!   report.
 //!
 //! Recovery-synthetic identifiers (parser-inserted token ids past the token
 //! table) carry no honest text; their names are skipped. Setter names are
@@ -59,11 +73,18 @@ use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 use crate::model::{
-    Container, ContainerKind, DuplicateDecl, FileElements, MemberEntry, MemberKind, MicroKind,
-    TopDecl,
+    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, FileElements, Formal,
+    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 
 use dartq_source::SourceRange;
+
+/// The binary/unary operator spellings with a fixed expected parameter count
+/// (`error_verifier.dart:5688-5727`): `[]=` wants 2, these want 1, `~`
+/// wants 0, and `-` allows 0 or 1 (minus template).
+const OPERATORS_WITH_ONE_PARAMETER: [&str; 16] = [
+    "<", ">", "<=", ">=", "==", "+", "/", "~/", "*", "%", "|", "^", "&", "<<", ">>", ">>>",
+];
 
 /// An open container on the capture stack.
 struct OpenContainer {
@@ -73,6 +94,7 @@ struct OpenContainer {
     kind: ContainerKind,
     superclass: Option<StringId>,
     members: FxHashMap<StringId, MemberEntry>,
+    type_params: u16,
 }
 
 /// A class member executable between `begin_method` and `end_method`.
@@ -81,14 +103,24 @@ struct PendingMember {
     /// is unrecoverable.
     shape: Option<(StringId, MemberKind, SourceRange)>,
     is_static: bool,
-    formals: Option<Box<[StringId]>>,
+    type_params: u16,
+    return_ty: Ty,
+    formals: Option<Box<Formals>>,
 }
 
 /// A top-level executable between `begin_top_level_method` and its end; the
 /// name arrives from the identifier event, get-or-set from the end event.
 struct PendingTop {
     name: Option<(StringId, SourceRange)>,
-    formals: Option<Box<[StringId]>>,
+    type_params: u16,
+    return_ty: Ty,
+    formals: Option<Box<Formals>>,
+}
+
+/// A typedef between `begin_typedef` and `end_typedef`.
+struct PendingTypedef {
+    name: Option<(StringId, SourceRange)>,
+    type_params: u16,
 }
 
 /// The capture state shared between the listener and [`collect`].
@@ -104,13 +136,28 @@ struct Builder<'src, 'tab> {
     super_pending: Option<StringId>,
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
-    pending_typedef: Option<(StringId, SourceRange)>,
+    pending_typedef: Option<PendingTypedef>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
-    named_formals: Vec<StringId>,
-    /// The current type-parameter list's names (`duplicate_definition`
+    positional_formals: Vec<Formal>,
+    named_formals: Vec<Formal>,
+    /// The current type-parameter list's nesting depth (the executable's
+    /// own list is depth 1).
+    type_group_depth: u32,
+    /// Names in the current depth-1 type-parameter list (`duplicate_definition`
     /// compares per list, `duplicate_definition_verifier.dart:124-135`).
     type_var_group: Vec<StringId>,
+    /// Count of the open depth-1 type-parameter list.
+    type_param_count: u16,
+    /// Set once the pending executable's header is past its type-parameter
+    /// position (formals began, or none exist); body declarations must not
+    /// touch the header's counts.
+    executable_header_done: bool,
+    /// The armed declared type (`handle_type`/`handle_void_keyword` arm,
+    /// `handle_no_type` disarms).
+    armed_ty: Option<Ty>,
+    /// The latched declared type of the open field group.
+    field_group_ty: Option<Ty>,
 }
 
 impl<'src, 'tab> Builder<'src, 'tab> {
@@ -128,8 +175,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_top: None,
             pending_typedef: None,
             formal_depth: 0,
+            positional_formals: Vec::new(),
             named_formals: Vec::new(),
+            type_group_depth: 0,
             type_var_group: Vec::new(),
+            type_param_count: 0,
+            executable_header_done: false,
+            armed_ty: None,
+            field_group_ty: None,
         }
     }
 
@@ -144,6 +197,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// first entry, this log is the `duplicate_definition` surface.
     fn record_duplicate(&mut self, name: StringId, range: SourceRange) {
         self.file.duplicates.push(DuplicateDecl { name, range });
+    }
+
+    /// Records a declaration-arity violation.
+    fn record_arity(&mut self, violation: ArityViolation, range: SourceRange) {
+        self.file
+            .arity_violations
+            .push(ArityDecl { violation, range });
     }
 
     /// Declares a top-level name, logging a duplicate when taken.
@@ -169,6 +229,20 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.strings.intern(&setter)
     }
 
+    /// The armed declared type, or [`Ty::UNKNOWN`] when the head had none.
+    fn take_armed(&mut self) -> Ty {
+        self.armed_ty.take().unwrap_or(Ty::UNKNOWN)
+    }
+
+    /// The field group's declared type: latched at the group's first name,
+    /// reused by its remaining names (`int a, b`).
+    fn field_group_ty(&mut self) -> Ty {
+        if self.field_group_ty.is_none() {
+            self.field_group_ty = Some(self.take_armed());
+        }
+        self.field_group_ty.expect("latched above")
+    }
+
     fn open_container(
         &mut self,
         kind: ContainerKind,
@@ -176,20 +250,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         tag: MicroKind,
     ) {
         if let Some((name, range)) = name {
-            self.declare_top(
-                name,
-                range,
-                TopDecl {
-                    kind: tag,
-                    named_formals: None,
-                },
-            );
+            self.declare_top(name, range, TopDecl::bare(tag));
         }
         self.containers.push(OpenContainer {
             name,
             kind,
             superclass: None,
             members: FxHashMap::default(),
+            type_params: 0,
         });
         self.super_armed = false;
         self.super_pending = None;
@@ -221,6 +289,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 kind: open.kind,
                 superclass: open.superclass,
                 members,
+                type_params: open.type_params,
             });
         } else {
             for (name, entry) in members {
@@ -257,18 +326,100 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
+    /// The member's arity-violation log entry, when the declaration's
+    /// parameter shape is wrong (`error_verifier.dart:5688-5740` for
+    /// operators, `ast_builder.dart:6283-6291` for setters).
+    fn member_arity_violation(
+        &self,
+        spelling: StringId,
+        kind: MemberKind,
+        formals: Option<&Formals>,
+    ) -> Option<ArityViolation> {
+        let found = formals.map_or(0_u16, |f| {
+            u16::try_from(f.positional.len() + f.named.len()).unwrap_or(u16::MAX)
+        });
+        match kind {
+            MemberKind::Setter => {
+                let ok = formals.is_some_and(|f| {
+                    f.named.is_empty() && f.positional.len() == 1 && f.positional[0].required
+                });
+                (!ok).then_some(ArityViolation::Setter)
+            }
+            MemberKind::Method => {
+                let text = self.strings.resolve(spelling);
+                if text == "-" {
+                    (found > 1).then_some(ArityViolation::OperatorMinus { found })
+                } else if text == "[]=" {
+                    (found != 2).then_some(ArityViolation::Operator {
+                        name: spelling,
+                        expected: 2,
+                        found,
+                    })
+                } else if text == "~" {
+                    (found != 0).then_some(ArityViolation::Operator {
+                        name: spelling,
+                        expected: 0,
+                        found,
+                    })
+                } else if OPERATORS_WITH_ONE_PARAMETER.contains(&text) || text == "[]" {
+                    (found != 1).then_some(ArityViolation::Operator {
+                        name: spelling,
+                        expected: 1,
+                        found,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Attaches the depth-0 formal group to the pending executable, once.
     fn attach_formals(&mut self) {
-        let formals = (!self.named_formals.is_empty())
-            .then(|| std::mem::take(&mut self.named_formals).into_boxed_slice());
+        let formals = Formals {
+            positional: std::mem::take(&mut self.positional_formals).into_boxed_slice(),
+            named: std::mem::take(&mut self.named_formals).into_boxed_slice(),
+        };
         if let Some(pending) = &mut self.pending_member {
             if pending.formals.is_none() {
-                pending.formals = formals;
+                pending.formals = Some(Box::new(formals));
             }
         } else if let Some(pending) = &mut self.pending_top
             && pending.formals.is_none()
         {
-            pending.formals = formals;
+            pending.formals = Some(Box::new(formals));
+        }
+    }
+
+    /// Latches the depth-1 type-parameter count onto the pending declaration
+    /// (method, top-level function, typedef, or innermost open container).
+    fn attach_type_param_count(&mut self) {
+        if self.executable_header_done {
+            return;
+        }
+        let count = self.type_param_count;
+        if let Some(pending) = &mut self.pending_member {
+            pending.type_params = count;
+        } else if let Some(pending) = &mut self.pending_top {
+            pending.type_params = count;
+        } else if let Some(pending) = &mut self.pending_typedef {
+            pending.type_params = count;
+        } else if let Some(open) = self.containers.last_mut() {
+            open.type_params = count;
+        }
+    }
+
+    /// The pending executable's arity log entries, drained at commit.
+    fn drain_arity(
+        &mut self,
+        spelling: StringId,
+        kind: MemberKind,
+        range: SourceRange,
+        formals: Option<&Formals>,
+    ) {
+        if let Some(violation) = self.member_arity_violation(spelling, kind, formals) {
+            self.record_arity(violation, range);
         }
     }
 
@@ -471,8 +622,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.builder.borrow_mut().commit_superclass();
     }
 
-    fn handle_type(&mut self, _name: Token, _question: Option<Token>) {
-        self.builder.borrow_mut().commit_superclass();
+    fn handle_type(&mut self, name: Token, question: Option<Token>) {
+        let mut builder = self.builder.borrow_mut();
+        builder.armed_ty = builder.name_of(name).map(|name| Ty::Named {
+            name,
+            nullable: question.is_some(),
+        });
+    }
+
+    fn handle_no_type(&mut self, _last_consumed: Token) {
+        self.builder.borrow_mut().armed_ty = None;
+    }
+
+    fn handle_void_keyword(&mut self, _token: Token) {
+        self.builder.borrow_mut().armed_ty = Some(Ty::Void);
+    }
+
+    fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
+        self.builder.borrow_mut().armed_ty = Some(Ty::Void);
     }
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
@@ -494,44 +661,61 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
+                // The return type parsed between the begin event and the
+                // name; the armed type is it.
+                let armed = builder.armed_ty.take().unwrap_or(Ty::UNKNOWN);
                 if let Some(pending) = &mut builder.pending_top {
                     pending.name = name_with_range;
+                    pending.return_ty = armed;
                 }
             }
-            IdentifierContext::TopLevelVariableDeclaration => {
-                if let Some((name, range)) = name_with_range {
-                    builder.declare_top(
-                        name,
-                        range,
-                        TopDecl {
-                            kind: MicroKind::TopLevelVar,
-                            named_formals: None,
-                        },
-                    );
+            IdentifierContext::MethodDeclaration => {
+                // The return type parsed between the begin event and the
+                // name; the armed type is it. Operators never re-fire
+                // their name here — their return types stay unknown.
+                let armed = builder.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+                if let Some(pending) = &mut builder.pending_member {
+                    pending.return_ty = armed;
                 }
             }
-            IdentifierContext::FieldDeclaration => {
+            IdentifierContext::TopLevelVariableDeclaration
+            | IdentifierContext::FieldDeclaration => {
                 if let Some((name, range)) = name_with_range {
+                    let ty = builder.field_group_ty();
                     let is_static = builder.field_static.unwrap_or(false);
-                    if let Some(open) = builder.containers.last_mut() {
+                    if context == IdentifierContext::TopLevelVariableDeclaration {
+                        builder.declare_top(
+                            name,
+                            range,
+                            TopDecl {
+                                kind: MicroKind::TopLevelVar,
+                                type_params: 0,
+                                var_ty: ty,
+                                return_ty: Ty::UNKNOWN,
+                                formals: None,
+                            },
+                        );
+                    } else if let Some(open) = builder.containers.last_mut() {
                         match open.members.entry(name) {
                             std::collections::hash_map::Entry::Vacant(slot) => {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
                                     is_static,
-                                    named_formals: None,
+                                    type_params: 0,
+                                    var_ty: ty,
+                                    return_ty: Ty::UNKNOWN,
+                                    formals: None,
                                 });
                             }
                             // Same-bit collision: the second field is a
                             // duplicate. Keep-first; a cross-bit coexistence
                             // is `conflicting_static_and_instance`'s
                             // business, not a duplicate.
-                            std::collections::hash_map::Entry::Occupied(existing)
-                                if existing.get().is_static == is_static =>
-                            {
-                                builder.record_duplicate(name, range);
+                            std::collections::hash_map::Entry::Occupied(existing) => {
+                                if existing.get().is_static == is_static {
+                                    builder.record_duplicate(name, range);
+                                }
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -548,27 +732,38 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             slot.insert(MemberEntry {
                                 kind: MemberKind::Field,
                                 is_static: true,
-                                named_formals: None,
+                                type_params: 0,
+                                var_ty: Ty::UNKNOWN,
+                                return_ty: Ty::UNKNOWN,
+                                formals: None,
                             });
                         }
-                        std::collections::hash_map::Entry::Occupied(existing)
-                            if existing.get().is_static =>
-                        {
-                            builder.record_duplicate(name, range);
+                        std::collections::hash_map::Entry::Occupied(existing) => {
+                            if existing.get().is_static {
+                                builder.record_duplicate(name, range);
+                            }
                         }
-                        _ => {}
                     }
                 }
             }
-            IdentifierContext::TypedefDeclaration if builder.pending_typedef.is_some() => {
-                builder.pending_typedef = name_with_range.or(builder.pending_typedef);
+            IdentifierContext::TypedefDeclaration => {
+                if let Some(pending) = &mut builder.pending_typedef
+                    && pending.name.is_none()
+                {
+                    pending.name = name_with_range;
+                }
             }
             _ => {}
         }
     }
 
     fn begin_type_variables(&mut self, _token: Token) {
-        self.builder.borrow_mut().type_var_group.clear();
+        let mut builder = self.builder.borrow_mut();
+        builder.type_group_depth += 1;
+        if builder.type_group_depth == 1 {
+            builder.type_param_count = 0;
+        }
+        builder.type_var_group.clear();
     }
 
     fn begin_type_variable(&mut self, token: Token) {
@@ -582,11 +777,23 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             } else {
                 builder.type_var_group.push(name);
             }
-            builder.file.decls.entry(name).or_insert(TopDecl {
-                kind: MicroKind::TypeParam,
-                named_formals: None,
-            });
+            builder
+                .file
+                .decls
+                .entry(name)
+                .or_insert(TopDecl::bare(MicroKind::TypeParam));
+            if builder.type_group_depth == 1 {
+                builder.type_param_count += 1;
+            }
         }
+    }
+
+    fn end_type_variables(&mut self, _begin: Token, _end: Token) {
+        let mut builder = self.builder.borrow_mut();
+        if builder.type_group_depth == 1 {
+            builder.attach_type_param_count();
+        }
+        builder.type_group_depth -= 1;
     }
 
     fn begin_fields(
@@ -619,7 +826,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin: Token,
         _end: Token,
     ) {
-        self.builder.borrow_mut().field_static = None;
+        let mut builder = self.builder.borrow_mut();
+        builder.field_static = None;
+        builder.field_group_ty = None;
+        builder.armed_ty = None;
     }
 
     fn end_top_level_fields(
@@ -635,7 +845,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin: Token,
         _end: Token,
     ) {
-        self.builder.borrow_mut().field_static = None;
+        let mut builder = self.builder.borrow_mut();
+        builder.field_static = None;
+        builder.field_group_ty = None;
+        builder.armed_ty = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -659,8 +872,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.pending_member = Some(PendingMember {
             shape,
             is_static: static_kw.is_some(),
+            type_params: 0,
+            return_ty: Ty::UNKNOWN,
             formals: None,
         });
+        builder.executable_header_done = false;
     }
 
     fn end_method(
@@ -675,25 +891,32 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_member.take()
             && let Some((name, kind, range)) = pending.shape
-            && let Some(open) = builder.containers.last_mut()
         {
-            match open.members.entry(name) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(MemberEntry {
-                        kind,
-                        is_static: pending.is_static,
-                        named_formals: pending.formals,
-                    });
+            let formals = pending.formals.as_deref();
+            builder.drain_arity(name, kind, range, formals);
+            if let Some(open) = builder.containers.last_mut() {
+                let entry = MemberEntry {
+                    kind,
+                    is_static: pending.is_static,
+                    type_params: pending.type_params,
+                    var_ty: Ty::UNKNOWN,
+                    return_ty: pending.return_ty,
+                    formals: pending.formals,
+                };
+                match open.members.entry(name) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(entry);
+                    }
+                    // Same-bit collisions are duplicates; cross-bit ones are not.
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        if existing.get().is_static == pending.is_static {
+                            builder.record_duplicate(name, range);
+                        }
+                    }
                 }
-                // Same-bit collisions are duplicates; cross-bit ones are not.
-                std::collections::hash_map::Entry::Occupied(existing)
-                    if existing.get().is_static == pending.is_static =>
-                {
-                    builder.record_duplicate(name, range);
-                }
-                _ => {}
             }
         }
+        builder.executable_header_done = false;
     }
 
     fn begin_top_level_method(
@@ -702,10 +925,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _augment: Option<Token>,
         _external: Option<Token>,
     ) {
-        self.builder.borrow_mut().pending_top = Some(PendingTop {
+        let mut builder = self.builder.borrow_mut();
+        builder.pending_top = Some(PendingTop {
             name: None,
+            type_params: 0,
+            return_ty: Ty::UNKNOWN,
             formals: None,
         });
+        builder.executable_header_done = false;
     }
 
     fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, _end: Token) {
@@ -729,19 +956,39 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             } else {
                 name
             };
+            let setter = get_or_set.is_some_and(|t| {
+                builder
+                    .tokens
+                    .get(t.id as usize)
+                    .is_some_and(|tok| &builder.source[tok.byte_range()] == "set")
+            });
+            let kind = if setter {
+                MemberKind::Setter
+            } else {
+                MemberKind::Method
+            };
+            builder.drain_arity(spelling, kind, range, pending.formals.as_deref());
             builder.declare_top(
                 spelling,
                 range,
                 TopDecl {
                     kind: MicroKind::TopLevelFn,
-                    named_formals: pending.formals,
+                    type_params: pending.type_params,
+                    var_ty: Ty::UNKNOWN,
+                    return_ty: pending.return_ty,
+                    formals: pending.formals,
                 },
             );
         }
+        builder.executable_header_done = false;
     }
 
     fn begin_typedef(&mut self, _token: Token) {
-        self.builder.borrow_mut().pending_typedef = None;
+        let mut builder = self.builder.borrow_mut();
+        builder.pending_typedef = Some(PendingTypedef {
+            name: None,
+            type_params: 0,
+        });
     }
 
     fn end_typedef(
@@ -752,13 +999,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         let mut builder = self.builder.borrow_mut();
-        if let Some((name, range)) = builder.pending_typedef.take() {
+        if let Some(pending) = builder.pending_typedef.take()
+            && let Some((name, range)) = pending.name
+        {
             builder.declare_top(
                 name,
                 range,
                 TopDecl {
                     kind: MicroKind::TypeAlias,
-                    named_formals: None,
+                    type_params: pending.type_params,
+                    var_ty: Ty::UNKNOWN,
+                    return_ty: Ty::UNKNOWN,
+                    formals: None,
                 },
             );
         }
@@ -767,7 +1019,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
         let mut builder = self.builder.borrow_mut();
         if builder.formal_depth == 0 {
+            builder.positional_formals.clear();
             builder.named_formals.clear();
+            // The executable's type parameters must all precede its formals.
+            builder.executable_header_done = true;
         }
         builder.formal_depth += 1;
     }
@@ -786,6 +1041,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
     }
 
+    fn handle_no_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
+        let mut builder = self.builder.borrow_mut();
+        builder.executable_header_done = true;
+    }
+
+    fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
+        let mut builder = self.builder.borrow_mut();
+        builder.executable_header_done = true;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn end_formal_parameter(
         &mut self,
@@ -799,23 +1064,35 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         kind: FormalParameterKind,
         _member_kind: ParserMemberKind,
     ) {
-        if !matches!(
-            kind,
-            FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
-        ) {
+        if self.builder.borrow().formal_depth != 1 {
             return;
         }
         let mut builder = self.builder.borrow_mut();
-        if builder.formal_depth == 1
-            && let Some((name, range)) = builder.capture_name(name)
-        {
+        let Some((name, range)) = builder.capture_name(name) else {
+            return;
+        };
+        let ty = builder.take_armed();
+        if matches!(
+            kind,
+            FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+        ) {
             // Duplicate named formals are `duplicate_definition`s
             // (`checkParameters`, duplicate_definition_verifier.dart:71-90).
-            if builder.named_formals.contains(&name) {
+            if builder.named_formals.iter().any(|f| f.name == name) {
                 builder.record_duplicate(name, range);
             } else {
-                builder.named_formals.push(name);
+                builder.named_formals.push(Formal {
+                    name,
+                    ty,
+                    required: false,
+                });
             }
+        } else {
+            builder.positional_formals.push(Formal {
+                name,
+                ty,
+                required: kind == FormalParameterKind::RequiredPositional,
+            });
         }
     }
 }
@@ -939,10 +1216,13 @@ mod tests {
         assert_eq!(member("C", "s=").kind, MemberKind::Setter);
         assert_eq!(member("C", "ss=").kind, MemberKind::Setter);
         assert!(member("C", "ss=").is_static);
-        // Group fields `int a, b` both captured with the group's bit.
+        // Group fields `int a, b` both captured with the group's bit and the
+        // group's declared type.
         assert_eq!(member("C", "a").kind, MemberKind::Field);
         assert!(!member("C", "a").is_static);
         assert_eq!(member("C", "b").kind, MemberKind::Field);
+        assert_eq!(member("C", "a").var_ty, Ty::named(id(&strings, "int")));
+        assert_eq!(member("C", "b").var_ty, Ty::named(id(&strings, "int")));
         assert!(member("C", "sa").is_static);
         // Enum constants are static fields; real members are instance ones.
         assert_eq!(member("E", "x").kind, MemberKind::Field);
@@ -979,10 +1259,11 @@ mod tests {
         assert_eq!(superclass("N"), None);
     }
 
-    /// Named formals: top-level functions and methods; nested function-typed
-    /// formals do not pollute the outer table; getters/setters have none.
+    /// Formal tables: positional (required-first, with types) and named;
+    /// nested function-typed formals do not pollute the outer table;
+    /// getters/setters carry their declared shapes.
     #[test]
-    fn captures_named_formals() {
+    fn captures_formals() {
         let strings = StringTable::new();
         let elements = build(
             "void f(int a, {int? b, required int c}) {} \
@@ -998,27 +1279,46 @@ mod tests {
             elements
                 .decl(id(&strings, name))
                 .expect(name)
-                .named_formals
-                .as_ref()
-                .map(|names| names.to_vec())
-                .unwrap_or_default()
+                .formals
+                .as_deref()
+                .map(|f| {
+                    (
+                        f.positional.iter().map(|p| p.name).collect::<Vec<_>>(),
+                        f.named.iter().map(|p| p.name).collect::<Vec<_>>(),
+                    )
+                })
         };
-        assert_eq!(formals("f"), vec![id(&strings, "b"), id(&strings, "c")]);
-        assert_eq!(
-            formals("g"),
-            vec![id(&strings, "cb"), id(&strings, "outer")],
-            "nested depth-2 names are excluded"
-        );
-        assert!(formals("plain").is_empty());
+        let (pos, named) = formals("f").expect("f formals");
+        assert_eq!(pos, vec![id(&strings, "a")]);
+        assert_eq!(named, vec![id(&strings, "b"), id(&strings, "c")]);
+        let (pos, named) = formals("g").expect("g formals");
+        assert!(pos.is_empty(), "nested depth-2 names are excluded");
+        assert_eq!(named, vec![id(&strings, "cb"), id(&strings, "outer")]);
+        let (pos, _) = formals("plain").expect("plain formals");
+        assert_eq!(pos, vec![id(&strings, "a")]);
         let m = elements
             .container(id(&strings, "C"))
             .unwrap()
             .members
             .get(&id(&strings, "m"))
             .unwrap();
+        let f = m.formals.as_deref().unwrap();
+        assert_eq!(f.named[0].name, id(&strings, "y"));
+        assert!(f.named[0].required);
+        // Formal declared types: `int a` non-nullable, `int? b` nullable.
+        let f = elements
+            .decl(id(&strings, "f"))
+            .unwrap()
+            .formals
+            .as_deref()
+            .unwrap();
+        assert_eq!(f.positional[0].ty, Ty::named(id(&strings, "int")));
         assert_eq!(
-            m.named_formals.as_ref().unwrap().to_vec(),
-            vec![id(&strings, "y")]
+            f.named[0].ty,
+            Ty::Named {
+                name: id(&strings, "int"),
+                nullable: true,
+            }
         );
         let gg = elements
             .container(id(&strings, "C"))
@@ -1026,7 +1326,138 @@ mod tests {
             .members
             .get(&id(&strings, "gg"))
             .unwrap();
-        assert!(gg.named_formals.is_none());
+        assert!(gg.formals.is_none());
+    }
+
+    /// Type-parameter counts per declaration, from the depth-1 group only:
+    /// containers, generic methods, generic functions, typedefs; body
+    /// declarations never clobber a header count.
+    #[test]
+    fn captures_type_param_counts() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C<T, U> { void m<V>() {} } \
+             enum E<X> { a; } \
+             void fnTop<Y>() {} \
+             typedef Alias<Z> = void Function(); \
+             void outer<W>() { int inner<Q>() => 1; }",
+            &strings,
+        );
+        assert_eq!(
+            elements.container(id(&strings, "C")).unwrap().type_params,
+            2
+        );
+        let m = elements
+            .container(id(&strings, "C"))
+            .unwrap()
+            .members
+            .get(&id(&strings, "m"))
+            .unwrap();
+        assert_eq!(m.type_params, 1);
+        assert_eq!(
+            elements.container(id(&strings, "E")).unwrap().type_params,
+            1
+        );
+        assert_eq!(elements.decl(id(&strings, "fnTop")).unwrap().type_params, 1);
+        assert_eq!(elements.decl(id(&strings, "Alias")).unwrap().type_params, 1);
+        // The local function's group must not clobber the outer count.
+        assert_eq!(elements.decl(id(&strings, "outer")).unwrap().type_params, 1);
+    }
+
+    /// Declared types: top-level variables, return types (functions,
+    /// getters), and the nullable flag.
+    #[test]
+    fn captures_declared_types() {
+        let strings = StringTable::new();
+        let elements = build(
+            "int top = 0; \
+             int? topNull; \
+             C make() => C(); \
+             C? makeNull() => null; \
+             void nothing() {} \
+             int get gTop => 1; \
+             class C { int? get gNull => null; }",
+            &strings,
+        );
+        let decl = |name: &str| elements.decl(id(&strings, name)).unwrap();
+        assert_eq!(decl("top").var_ty, Ty::named(id(&strings, "int")));
+        assert_eq!(
+            decl("topNull").var_ty,
+            Ty::Named {
+                name: id(&strings, "int"),
+                nullable: true,
+            }
+        );
+        assert_eq!(decl("make").return_ty, Ty::named(id(&strings, "C")));
+        assert_eq!(
+            decl("makeNull").return_ty,
+            Ty::Named {
+                name: id(&strings, "C"),
+                nullable: true,
+            }
+        );
+        assert_eq!(decl("nothing").return_ty, Ty::Void);
+        assert_eq!(decl("gTop").return_ty, Ty::named(id(&strings, "int")));
+        let g = elements
+            .container(id(&strings, "C"))
+            .unwrap()
+            .members
+            .get(&id(&strings, "gNull"))
+            .unwrap();
+        assert_eq!(
+            g.return_ty,
+            Ty::Named {
+                name: id(&strings, "int"),
+                nullable: true,
+            }
+        );
+    }
+
+    /// Declaration-arity violations: operator parameter counts (including
+    /// the minus special case) and the setter shape rule.
+    #[test]
+    fn captures_arity_violations() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C { \
+               int operator +(int o, int p) => 1; \
+               int operator ~(int o) => 1; \
+               int operator [](int i, int j) => 1; \
+               C operator -(int o, int p) => C(); \
+               set bad(int a, int b) {} \
+               set namedOnly({int a = 1}) {} \
+               set ok(int v) {} \
+               int operator [](int i) => 1; \
+             } \
+             set topBad([int a = 1]) {}",
+            &strings,
+        );
+        let vs: Vec<ArityViolation> = elements
+            .arity_violations()
+            .iter()
+            .map(|a| a.violation)
+            .collect();
+        assert_eq!(vs.len(), 7, "{vs:?}");
+        assert!(vs.contains(&ArityViolation::Operator {
+            name: id(&strings, "+"),
+            expected: 1,
+            found: 2,
+        }));
+        assert!(vs.contains(&ArityViolation::Operator {
+            name: id(&strings, "~"),
+            expected: 0,
+            found: 1,
+        }));
+        assert!(vs.contains(&ArityViolation::Operator {
+            name: id(&strings, "[]"),
+            expected: 1,
+            found: 2,
+        }));
+        assert!(vs.contains(&ArityViolation::OperatorMinus { found: 2 }));
+        assert_eq!(
+            vs.iter().filter(|v| **v == ArityViolation::Setter).count(),
+            3
+        );
     }
 
     /// Unnamed extensions keep no top-level name; their members and named

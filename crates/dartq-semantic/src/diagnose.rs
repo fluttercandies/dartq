@@ -1,7 +1,9 @@
-//! The M1 semantic diagnosis engine (`undefined_*` + `duplicate_definition`):
-//! a pass over the parser's event stream that resolves every reference a unit
-//! makes against the #117 lookup surface and the #119 element model, and
-//! emits the frozen family as [`Diagnostic`]s.
+//! The M1 semantic diagnosis engine: the frozen `undefined_*` /
+//! `duplicate_definition` family (batch 1, #120) plus the
+//! `wrong_number_of_*` family and the static-nullability four (batch 2,
+//! #121) — a pass over the parser's event stream that resolves every
+//! reference a unit makes against the #117 lookup surface and the #119
+//! element model, and emits the implemented frozen rows as [`Diagnostic`]s.
 //!
 //! # Architecture
 //!
@@ -13,19 +15,58 @@
 //! typed receivers (`this`/`super`/container names/declaration-typed names),
 //! and per-row access intent (read / write / invoke / operator) finalized by
 //! the send/assignment/operator events. Rows snapshot their resolution
-//! verdict at push time (the frames tear down before pass 2) and resolve in
-//! source order. Duplicate declarations are not this pass's output —
-//! the collector logs them at capture time and [`diagnose`] folds that log
-//! into the report.
+//! verdict and declared type at push time (the frames tear down before
+//! pass 2) and resolve in source order. Declaration-surface diagnostics —
+//! `duplicate_definition` and the arity log — fold into the report from the
+//! collector's capture-time logs.
+//!
+//! # Batch 2: arity and static nullability (#121)
+//!
+//! The type-argument family keys off `begin/end_type_arguments`, with the
+//! code chosen by the use-site shape (the pinned oracle registry,
+//! `.third/dart-sdk` `diagnostic.g.dart`):
+//! a pending *type head* (a `TypeReference` identifier that has not seen
+//! its `handle_type` yet) makes the group an annotation or a
+//! creation type reference → the base code; a head consumed inside an
+//! enum constant → `_enum`; an expression head under `new`/`const`/
+//! implicit-creation position → base for a resolved container, `_constructor`
+//! for a named constructor segment; any other expression head defers to the
+//! send or to the type-argument application event, both of which report
+//! `_element` for a resolved executable — the message names the
+//! executable's oracle kind word, `function` or `method`
+//! (`type_instantiation_target.dart`,
+//! `InvocationTargetExecutableElement`) — or `_extension` for extension
+//! overrides. The `_function` row (a function-typed *expression*
+//! instantiation) displays the function type, a shape M1 cannot render, so
+//! it has no emit site. Only resolvable *functions and methods* produce
+//! counts — external (`dart:`) and unresolved heads suppress, and
+//! getter-shaped callees (whose oracle kind word M1 does not model)
+//! suppress too: the under-report direction.
+//!
+//! The static-nullability four decide on declared types only
+//! (types-nullability-spec §2–§3): the engine tracks the declared type of
+//! locals, formals, fields, top-level variables, and return types (armed by
+//! `handle_type`/`handle_void_keyword`, disarmed by `handle_no_type` — every
+//! declaration head runs one `parse_type`, so the arm cannot leak), and
+//! types expressions minimally: the `null` literal is `Null`, a name with a
+//! captured declared type is that type, everything else is `Unknown` — the
+//! oracle's `InvalidType`, which suppresses every question it touches. The
+//! decidable set is therefore exactly the nullability decisions:
+//! `null`/`T?` into a non-nullable target (`invalid_assignment`,
+//! `argument_type_not_assignable`, `return_of_invalid_type`), and `?.`/`?[`/
+//! `?..` on a strictly non-nullable receiver (`invalid_null_aware_operator`,
+//! a `STATIC_WARNING`). Assignment/initializer/argument/return checks apply
+//! only to single-row expressions (one pushed row) so compound operands
+//! never lend their type to the whole expression.
 //!
 //! # The batch-1 gate (#131 first-batch ruling)
 //!
-//! This engine emits exactly four codes: `undefined_identifier`,
+//! Batch 1 emits exactly four codes: `undefined_identifier`,
 //! `undefined_class`, `undefined_function`, and `duplicate_definition` (plus
 //! `undefined_function` on the prefixed-invoke path, which is that family's
-//! qualified trigger). Every other frozen trigger — the member family
-//! (`undefined_getter`/`undefined_method`/`undefined_setter`/`undefined_operator`
-//! and their extension/`super`/enum-constant variants),
+//! qualified trigger). Every other frozen `undefined_*` trigger — the member
+//! family (`undefined_getter`/`undefined_method`/`undefined_setter`/
+//! `undefined_operator` and their extension/`super`/enum-constant variants),
 //! `undefined_prefixed_name`, `undefined_identifier_await`,
 //! `undefined_named_parameter` — is recorded into the §8 names table without
 //! emitting: under-reporting is the M1 contract, and a wrong code is worse
@@ -62,7 +103,7 @@
 //!   reference to a local never reaches the library lookup.
 //! * `dynamic` is a language builtin, not an import — never `undefined_class`.
 //! * `await` as a bare read/type name inside an executable reports
-//!   `undefined_identifier_await` instead (`dart-sdk main
+//!   `undefined_identifier_await` instead (dart-sdk main
 //!   `named_type_resolver.dart:815`, `property_element_resolver.dart:2143`).
 //! * `is`/`as` type operands and type arguments carry other oracle codes
 //!   (`type_test_with_undefined_name`, `cast_to_non_type`,
@@ -82,7 +123,8 @@
 //! * Constructor invocations are outside the model: a class-name callee is
 //!   defined without inspection, and `new`/`const`-position callees resolve
 //!   as type references (the oracle's `undefined_class`), never invocations —
-//!   their constructor-family codes stay deferred.
+//!   their constructor-family codes stay deferred. Implicit creations
+//!   (`C<T>(...)` without `new`) bracket the same suppression window.
 //! * Locals leak only where the parser offers no frame pairing (switch-case
 //!   bodies share the switch block's frame) — a leak can only mask a miss
 //!   (under-report), never fabricate one.
@@ -94,7 +136,12 @@
 //! (`@UseResult(unless:)` check, `annotation_verifier.dart:519-541`),
 //! `undefined_hidden_name` / `undefined_shown_name` (directives are consumed
 //! diet-style and combinators expose no clause enumeration — both arrive with
-//! the directive milestone). Every deferral under-reports.
+//! the directive milestone), and `_function` (a function-typed *expression*
+//! instantiation — its message displays the function type, a shape M1 cannot
+//! render). `wrong_number_of_parameters_for_setter` is emitted here although
+//! the oracle fires it from the parser: dartq's parser does not emit the code
+//! yet, and when it does, the collector-side emission must be removed or the
+//! code double-reports. Every deferral under-reports.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -108,9 +155,9 @@ use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::codes::SemanticCode;
+use crate::codes::{ExecKind, SemanticCode};
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
-use crate::model::{ContainerKind, MemberKind, MicroKind};
+use crate::model::{ArityViolation, ContainerKind, Formals, MemberKind, MicroKind, TopDecl, Ty};
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
 /// the M1 walk can reach (the superclass chain ends at an unindexed root).
@@ -240,8 +287,9 @@ enum BareInfo {
     Container { name: StringId, kind: ContainerKind },
     /// Defined as an import prefix.
     Prefix { name: StringId },
-    /// Defined, but not a receiver face.
-    Plain,
+    /// Defined, but not a receiver face; `ty` is the declared type when the
+    /// model captured one (the static-nullability checks read it).
+    Plain { ty: Ty },
     /// Not defined (the row's intent decides the emitted code).
     Missing,
 }
@@ -285,8 +333,9 @@ enum Receiver {
     Container { name: StringId, kind: ContainerKind },
     /// An import prefix (`p.m`).
     Prefix { name: StringId },
-    /// A declaration-typed name (`C c; c.m()`).
-    Typed { type_name: StringId },
+    /// A declaration-typed name (`C c; c.m()`); `ty` is the declared type
+    /// the static-nullability checks read.
+    Typed { type_name: StringId, ty: Ty },
     /// Unknown type — checks are skipped (under-report).
     Unknown,
 }
@@ -299,8 +348,12 @@ struct Row {
     qualified: bool,
     shape: RowShape,
     intent: Intent,
-    /// The write form an assignment applied (operator rows only).
+    /// The write form an assignment applied to an operator row (`a[i] = v`).
     write_op: Option<OpWrite>,
+    /// The row's expression type as far as M1 knows it (push-time snapshot:
+    /// `Null` for the `null` literal, a captured declared type for names,
+    /// `Unknown` — the suppress-everything sentinel — for everything else).
+    ty: Ty,
 }
 
 /// The structural shape of a row.
@@ -324,8 +377,8 @@ struct Frame {
     kind: FrameKind,
     /// Names declared directly in this frame's scope.
     locals: FxHashSet<StringId>,
-    /// Declared-type bindings: name → declared type's container name.
-    var_types: FxHashMap<StringId, StringId>,
+    /// Declared-type bindings: name → declared type.
+    var_types: FxHashMap<StringId, Ty>,
     /// `type_params` length to truncate back to when this frame closes.
     type_mark: usize,
 }
@@ -333,10 +386,32 @@ struct Frame {
 enum FrameKind {
     /// A class/mixin/enum/extension body: fields and the member face.
     Container { name: StringId, kind: ContainerKind },
-    /// An executable (method, constructor, function, function literal).
-    Executable { instance: bool },
+    /// An executable (method, constructor, function, function literal);
+    /// `ret` carries the declared return type, the oracle host word, and the
+    /// host name when the declaration shape exposes them (constructors and
+    /// local functions stay `None` — their return checks under-report).
+    Executable {
+        instance: bool,
+        ret: Option<ExecReturn>,
+    },
     /// A statement block, catch clause, or typedef body.
     Block,
+}
+
+/// The return-check host of an executable frame (`return_of_invalid_type`'s
+/// per-host message picks the word and the name).
+struct ExecReturn {
+    ty: Ty,
+    host: ExecKind,
+    name: StringId,
+}
+
+/// One open argument list: the arguments collected so far (name, type,
+/// range — the range of the argument's expression row) plus the argument
+/// currently being parsed.
+struct ArgLevel {
+    args: Vec<(Option<StringId>, Ty, SourceRange)>,
+    pending: Option<(Option<StringId>, usize)>,
 }
 
 /// The member-walk outcome: found, genuinely absent after a clean walk, or a
@@ -374,6 +449,7 @@ enum TypeVerdict {
 
 /// Which part of a type annotation an identifier occupies. The prefix head
 /// takes the dedicated [`Engine::arm_type_prefix`] path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TypeHead {
     /// A bare type name (`Foo`).
     Bare,
@@ -397,12 +473,43 @@ struct Engine<'a> {
     frames: Vec<Frame>,
     /// In-scope type parameters, outermost first (truncated per frame).
     type_params: Vec<StringId>,
-    /// The last bare type annotation's container name, for declaration
-    /// binding.
-    last_type: Option<StringId>,
+    /// The armed declared type: `handle_type`/`handle_void_keyword` arm,
+    /// `handle_no_type` disarms. Consumed by declaration bindings and by the
+    /// executable return-type latches.
+    armed_ty: Option<Ty>,
+    /// The open variable-declaration group's declared type (one
+    /// `parse_type` per group), for the initializer checks.
+    pending_decl_ty: Option<Ty>,
+    /// Per open type-argument group: the type head it belongs to, when the
+    /// group follows a type-annotation identifier (`C<int> x`, `const
+    /// C<int>()`, `p.C<int>`). A group without a head belongs to an
+    /// expression (`g<int>()`, `g<int>`).
+    group_heads: Vec<Option<(StringId, SourceRange)>>,
+    /// The type head awaiting its group (`C` of `C<int>`), armed at the
+    /// identifier and moved into `group_heads` at `begin_type_arguments`.
+    pending_type_head: Option<(StringId, SourceRange)>,
+    /// Expression type-argument groups awaiting their use: the callee row
+    /// index, the given count, and the group span.
+    deferred_args: Vec<(usize, u16, SourceRange)>,
+    /// Per open argument list, the argument types collected so far.
+    arg_levels: Vec<ArgLevel>,
+    /// The enclosing enum constant's declared type-parameter count (the
+    /// `_enum` code's declared side).
+    in_enum_element: Option<u16>,
+    /// The row-stack mark where the current function body's expression
+    /// began (the arrow-body return check reads it).
+    body_mark: Option<usize>,
+    /// The row-stack mark where the current variable initializer's
+    /// expression began (the initializer check reads it).
+    init_mark: Option<usize>,
+    /// The row-stack mark where the current return statement's expression
+    /// began (the return check reads it).
+    return_mark: Option<usize>,
+    /// Inside a cascade (`a?..b` picks the `?..` message shape).
+    in_cascade: bool,
     /// Per open argument list: the callee row index, when identifiable
-    /// (`None` while inside a `new`/`const` reference — its class name is a
-    /// type use, never an invocation callee).
+    /// (`None` while inside a `new`/`const`/implicit-creation reference —
+    /// its class name is a type use, never an invocation callee).
     invokes: Vec<Option<usize>>,
     /// The argument group that just closed, awaiting the send event that
     /// consumes it (an argless send never opens a group, so a bare read
@@ -411,13 +518,14 @@ struct Engine<'a> {
     type_prefix: Option<TypePrefix>,
     /// Suppression depth inside `is`/`as` type operands.
     non_type_pos: u32,
-    /// Suppression depth inside `new`/`const` expressions.
+    /// Suppression depth inside `new`/`const`/implicit-creation expressions.
     ctor_pos: u32,
 }
 
 impl<'a> Engine<'a> {
     // —— plumbing ————————————————————————————————————————————————————
 
+    #[allow(clippy::too_many_arguments)] // the analysis context, one field each
     fn new(
         graph: &'a LibraryGraph,
         namespaces: &'a Namespaces,
@@ -443,7 +551,17 @@ impl<'a> Engine<'a> {
             rows: Vec::new(),
             frames: Vec::new(),
             type_params: Vec::new(),
-            last_type: None,
+            armed_ty: None,
+            pending_decl_ty: None,
+            group_heads: Vec::new(),
+            pending_type_head: None,
+            deferred_args: Vec::new(),
+            arg_levels: Vec::new(),
+            in_enum_element: None,
+            body_mark: None,
+            init_mark: None,
+            return_mark: None,
+            in_cascade: false,
             invokes: Vec::new(),
             pending_send: None,
             type_prefix: None,
@@ -472,6 +590,38 @@ impl<'a> Engine<'a> {
             code.severity(),
             code.code_info(),
             code.message(a0, a1),
+            self.file,
+            range,
+            None,
+        ));
+    }
+
+    /// The three-placeholder emit (`message3`).
+    fn emit3(&mut self, code: SemanticCode, range: SourceRange, a0: &str, a1: &str, a2: &str) {
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message3(a0, a1, a2),
+            self.file,
+            range,
+            None,
+        ));
+    }
+
+    /// The four-placeholder emit (`message4`).
+    fn emit4(
+        &mut self,
+        code: SemanticCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+        a2: &str,
+        a3: &str,
+    ) {
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message4(a0, a1, a2, a3),
             self.file,
             range,
             None,
@@ -518,7 +668,7 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find_map(|f| match &f.kind {
-                FrameKind::Executable { instance } => Some(*instance),
+                FrameKind::Executable { instance, ret: _ } => Some(*instance),
                 _ => None,
             })
             .unwrap_or(false)
@@ -536,24 +686,24 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Binds the pending declared type to `name` in the innermost frame.
+    /// Binds the open declaration group's type to `name` in the innermost
+    /// frame (one `parse_type` arms the group; every name in it binds).
     fn bind_declared_type(&mut self, name: StringId) {
-        let Some(type_name) = self.last_type.take() else {
-            return;
-        };
+        let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
         if let Some(frame) = self.frames.last_mut() {
-            frame.var_types.insert(name, type_name);
+            frame.var_types.insert(name, ty);
         }
     }
 
-    /// Drops a stale pending declaration type (`var`/`final`/`const` carry
-    /// no type name).
-    fn clear_last_type(&mut self) {
-        self.last_type = None;
+    /// Binds a formal or catch parameter's own declared type (one arm per
+    /// parameter, not shared with a group).
+    fn bind_parameter_type(&mut self, name: StringId) {
+        let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+        if let Some(frame) = self.frames.last_mut() {
+            frame.var_types.insert(name, ty);
+        }
     }
 
-    /// A container head (`class C`, unnamed extension placeholder): the
-    /// member face and the `this` receiver for its body.
     /// A container head: the member face and the `this`/`super` receiver for
     /// its body. Unnamed extensions get a placeholder face — their container
     /// name resolves to nothing, so member walks through them suppress.
@@ -566,7 +716,23 @@ impl<'a> Engine<'a> {
 
     /// An executable head: formals and its own type parameters live inside.
     fn push_executable_frame(&mut self, instance: bool) {
-        self.push_frame(FrameKind::Executable { instance });
+        self.push_frame(FrameKind::Executable {
+            instance,
+            ret: None,
+        });
+    }
+
+    /// Latches the armed declared type as the innermost executable's return
+    /// type (`begin_method`/`begin_top_level_method` fire before the return
+    /// type's `parse_type`; the name identifier fires after it).
+    fn latch_return_type(&mut self, host: ExecKind, name: StringId) {
+        let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+        if let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable { ret, .. } = &mut frame.kind
+            && ret.is_none()
+        {
+            *ret = Some(ExecReturn { ty, host, name });
+        }
     }
 
     /// A statement block, catch clause, for body, or typedef scope.
@@ -602,12 +768,93 @@ impl<'a> Engine<'a> {
         self.ctor_pos -= 1;
     }
 
-    /// A bare name's declared type's container, innermost frame first.
-    fn typed_local(&self, name: StringId) -> Option<StringId> {
+    /// A bare name's declared type, innermost frame first.
+    fn typed_local(&self, name: StringId) -> Option<Ty> {
         self.frames
             .iter()
             .rev()
             .find_map(|f| f.var_types.get(&name).copied())
+    }
+
+    /// A container member's declared field type from a clean walk
+    /// (`Unknown` for executables and broken chains).
+    fn member_declared_ty(&self, container: StringId, member: StringId) -> Ty {
+        match self.walk_members(container, member) {
+            Walk::Found(entry) if entry.kind == MemberKind::Field => entry.var_ty,
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// Whether the formal table declares a named formal under `name`.
+    fn has_named_formal(formals: Option<&Formals>, name: StringId) -> bool {
+        formals.is_some_and(|f| f.named.iter().any(|formal| formal.name == name))
+    }
+
+    /// The named formals of a resolved top-level callee, for the
+    /// named-argument membership test.
+    fn top_level_named_formal(&self, name: StringId, formal: StringId) -> bool {
+        self.top_level_decl(name)
+            .is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), formal))
+    }
+
+    /// The named formals of a resolved member callee, walked from `recv`.
+    fn member_has_named_formal(&self, recv: &Receiver, name: StringId, formal: StringId) -> bool {
+        self.member_formals_full(recv, name)
+            .is_some_and(|f| f.named.iter().any(|entry| entry.name == formal))
+    }
+
+    /// The resolved top-level declaration under `name` (`None` = no check).
+    fn top_level_decl(&self, name: StringId) -> Option<&TopDecl> {
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => Some(decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                self.index.get(file).and_then(|f| f.decl(name))
+            }
+            _ => None,
+        }
+    }
+
+    /// The full formal table of a resolved member callee, walked from `recv`.
+    fn member_formals_full(&self, recv: &Receiver, name: StringId) -> Option<&Formals> {
+        let (container, super_walk) = match *recv {
+            Receiver::This { container, .. } => (container, false),
+            Receiver::Super { container, .. } => (container, true),
+            Receiver::Typed { type_name, .. } => (type_name, false),
+            Receiver::Container {
+                name: container, ..
+            } => {
+                let entry = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .and_then(|(c, _)| c.members.get(&name));
+                return match entry {
+                    Some(entry) if entry.kind == MemberKind::Method => entry.formals.as_deref(),
+                    _ => None,
+                };
+            }
+            Receiver::Prefix { .. } | Receiver::Unknown => return None,
+        };
+        let walk = if super_walk {
+            self.walk_super(container, name)
+        } else {
+            self.walk_members(container, name)
+        };
+        match walk {
+            Walk::Found(entry) if entry.kind == MemberKind::Method => entry.formals.as_deref(),
+            _ => None,
+        }
     }
 
     // —— resolution ——————————————————————————————————————————————————
@@ -617,21 +864,27 @@ impl<'a> Engine<'a> {
     /// synthesized members, then the scoped library lookup.
     fn resolve_bare(&self, name: StringId) -> BareInfo {
         if self.frames.iter().rev().any(|f| f.locals.contains(&name)) {
-            return BareInfo::Plain;
+            return BareInfo::Plain {
+                ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
+            };
         }
         if self.type_params.contains(&name) {
-            return BareInfo::Plain;
+            return BareInfo::Plain {
+                ty: Ty::named(name),
+            };
         }
         if let Some((container, kind)) = self.container_context() {
             if !matches!(self.walk_members(container, name), Walk::Missing) {
                 // Found, or a broken chain — both suppress.
-                return BareInfo::Plain;
+                return BareInfo::Plain {
+                    ty: self.member_declared_ty(container, name),
+                };
             }
             if kind == ContainerKind::Enum && self.is_reserved(name, &ENUM_SYNTH_MEMBERS) {
-                return BareInfo::Plain;
+                return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
             if self.instance_context() && self.is_reserved(name, &OBJECT_MEMBERS) {
-                return BareInfo::Plain;
+                return BareInfo::Plain { ty: Ty::UNKNOWN };
             }
         }
         if self
@@ -639,7 +892,7 @@ impl<'a> Engine<'a> {
             .get(self.file)
             .is_some_and(|f| f.extension_member(name).is_some())
         {
-            return BareInfo::Plain;
+            return BareInfo::Plain { ty: Ty::UNKNOWN };
         }
         match lookup_scoped(
             self.graph,
@@ -649,9 +902,9 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Local(decl) => bare_info_of(name, decl.kind),
+            ScopedHit::Local(decl) => bare_info_of(name, decl),
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
-            ScopedHit::Ambiguous(_) => BareInfo::Plain,
+            ScopedHit::Ambiguous(_) => BareInfo::Plain { ty: Ty::UNKNOWN },
             ScopedHit::NotFound => BareInfo::Missing,
         }
     }
@@ -660,12 +913,14 @@ impl<'a> Engine<'a> {
         match entry {
             NamespaceEntry::Prefix => BareInfo::Prefix { name },
             NamespaceEntry::Decl(file) => {
-                let kind = self
-                    .index
-                    .get(file)
-                    .and_then(|f| f.decl(name))
-                    .map_or(MicroKind::TopLevelVar, |d| d.kind);
-                bare_info_of(name, kind)
+                let decl = self.index.get(file).and_then(|f| f.decl(name));
+                bare_info_of(
+                    name,
+                    decl.map_or(
+                        &TopDecl::bare(MicroKind::TopLevelVar),
+                        std::convert::identity,
+                    ),
+                )
             }
         }
     }
@@ -724,69 +979,6 @@ impl<'a> Engine<'a> {
         self.walk_members(superclass, member)
     }
 
-    /// The named formals of a resolved top-level callee (`None` = no check),
-    /// for the named-argument membership test.
-    fn top_level_formals(&self, name: StringId) -> Option<&[StringId]> {
-        let decl = match lookup_scoped(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            name,
-        ) {
-            ScopedHit::Local(decl) => decl,
-            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
-                self.index.get(file).and_then(|f| f.decl(name))?
-            }
-            _ => return None,
-        };
-        match decl.kind {
-            MicroKind::TopLevelFn => Some(decl.named_formals.as_deref().unwrap_or(&[])),
-            _ => None,
-        }
-    }
-
-    /// The named formals of a resolved member callee, walked from `recv`.
-    fn member_formals(&self, recv: &Receiver, name: StringId) -> Option<&[StringId]> {
-        let (container, super_walk) = match *recv {
-            Receiver::This { container, .. } => (container, false),
-            Receiver::Super { container, .. } => (container, true),
-            Receiver::Typed { type_name } => (type_name, false),
-            Receiver::Container {
-                name: container, ..
-            } => {
-                let entry = resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    container,
-                )
-                .and_then(|(c, _)| c.members.get(&name));
-                return match entry {
-                    Some(entry) if entry.kind == MemberKind::Method => {
-                        Some(entry.named_formals.as_deref().unwrap_or(&[]))
-                    }
-                    _ => None,
-                };
-            }
-            Receiver::Prefix { .. } | Receiver::Unknown => return None,
-        };
-        let walk = if super_walk {
-            self.walk_super(container, name)
-        } else {
-            self.walk_members(container, name)
-        };
-        match walk {
-            Walk::Found(entry) if entry.kind == MemberKind::Method => {
-                Some(entry.named_formals.as_deref().unwrap_or(&[]))
-            }
-            _ => None,
-        }
-    }
-
     // —— row stack ———————————————————————————————————————————————————
 
     fn push_row(&mut self, row: Row) {
@@ -797,6 +989,10 @@ impl<'a> Engine<'a> {
     /// verdict is the snapshot pass 2 emits from).
     fn push_bare(&mut self, name: StringId, range: SourceRange) {
         let info = self.resolve_bare(name);
+        let ty = match info {
+            BareInfo::Plain { ty } => ty,
+            _ => Ty::UNKNOWN,
+        };
         self.push_row(Row {
             name,
             range,
@@ -804,6 +1000,7 @@ impl<'a> Engine<'a> {
             shape: RowShape::Bare(info),
             intent: Intent::Read,
             write_op: None,
+            ty,
         });
     }
 
@@ -813,9 +1010,10 @@ impl<'a> Engine<'a> {
             name,
             range,
             qualified: true,
-            shape: RowShape::Bare(BareInfo::Plain),
+            shape: RowShape::Bare(BareInfo::Plain { ty: Ty::UNKNOWN }),
             intent: Intent::Read,
             write_op: None,
+            ty: Ty::UNKNOWN,
         });
     }
 
@@ -831,6 +1029,20 @@ impl<'a> Engine<'a> {
             shape: RowShape::Value,
             intent: Intent::Read,
             write_op: None,
+            ty: Ty::UNKNOWN,
+        });
+    }
+
+    /// The `null` literal: the only literal whose type M1 knows exactly.
+    fn push_null_row(&mut self, token: Token) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::Null,
         });
     }
 
@@ -854,16 +1066,17 @@ impl<'a> Engine<'a> {
             shape: RowShape::Receiver(recv),
             intent: Intent::Read,
             write_op: None,
+            ty: Ty::UNKNOWN,
         });
     }
 
     /// A type-annotation position. Defined types push no row; the §8 names
-    /// table carries misses only.
+    /// table carries misses only. The declaration binding arms at
+    /// `handle_type` now — this only classifies the reference.
     fn push_type_use(&mut self, name: StringId, range: SourceRange, head: TypeHead) {
         let suppressed = self.non_type_pos > 0;
         match head {
             TypeHead::Bare => {
-                self.last_type = Some(name);
                 if self.is_reserved(name, &BUILTIN_TYPES) {
                     return;
                 }
@@ -877,6 +1090,7 @@ impl<'a> Engine<'a> {
                     shape: RowShape::TypeUse(TypeVerdict::Missing, suppressed),
                     intent: Intent::Read,
                     write_op: None,
+                    ty: Ty::UNKNOWN,
                 });
             }
             TypeHead::Continuation => {
@@ -888,7 +1102,6 @@ impl<'a> Engine<'a> {
                 }
                 let prefix = tp.prefix;
                 let hit = self.prefixed_hit(prefix, name);
-                self.last_type = Some(name);
                 if !hit {
                     self.push_row(Row {
                         name,
@@ -897,6 +1110,7 @@ impl<'a> Engine<'a> {
                         shape: RowShape::TypeUse(TypeVerdict::Prefixed { prefix }, false),
                         intent: Intent::Read,
                         write_op: None,
+                        ty: Ty::UNKNOWN,
                     });
                 }
             }
@@ -916,24 +1130,51 @@ impl<'a> Engine<'a> {
                 shape: RowShape::TypeUse(TypeVerdict::PrefixHead, false),
                 intent: Intent::Read,
                 write_op: None,
+                ty: Ty::UNKNOWN,
             });
         }
     }
 
     /// Merges `receiver.member` at the dot/cascade event: pops the member row,
-    /// classifies the receiver below it, and pushes the merged row.
-    fn merge_member(&mut self) {
+    /// classifies the receiver below it, and pushes the merged row. A
+    /// null-aware access on a strictly non-nullable receiver emits
+    /// `invalid_null_aware_operator` (a `STATIC_WARNING` — the receiver can
+    /// never be null, `type_system.dart:1921-`).
+    fn merge_member(&mut self, is_null_aware: bool) {
         let Some(member) = self.rows.pop() else {
             return;
         };
         let recv = match self.rows.pop() {
             Some(popped) => match popped.shape {
-                RowShape::Bare(info) => self.receiver_of_bare(info, popped.name),
+                RowShape::Bare(info) => Engine::receiver_of_bare(info),
                 RowShape::Receiver(recv) => recv,
                 _ => Receiver::Unknown,
             },
             None => Receiver::Unknown,
         };
+        if is_null_aware {
+            let receiver_ty = match recv {
+                Receiver::This { container, .. } | Receiver::Super { container, .. } => {
+                    Ty::named(container)
+                }
+                Receiver::Typed { ty, .. } => ty,
+                _ => Ty::UNKNOWN,
+            };
+            if receiver_ty.is_strictly_non_nullable() {
+                let (op, replacement): (&'static str, &'static str) = if self.in_cascade {
+                    ("?..", "..")
+                } else {
+                    ("?.", ".")
+                };
+                self.emit3(
+                    SemanticCode::InvalidNullAwareOperator,
+                    member.range,
+                    op,
+                    replacement,
+                    "",
+                );
+            }
+        }
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -941,12 +1182,13 @@ impl<'a> Engine<'a> {
             shape: RowShape::Member { recv },
             intent: member.intent,
             write_op: member.write_op,
+            ty: Ty::UNKNOWN,
         });
     }
 
     /// Opens an argument group: the top row is its callee — unless the group
-    /// belongs to a `new`/`const` reference, whose class name resolves as a
-    /// type use, never an invocation.
+    /// belongs to a `new`/`const`/implicit-creation reference, whose class
+    /// name resolves as a type use, never an invocation.
     fn open_arguments(&mut self) {
         let callee = if self.ctor_pos > 0 {
             None
@@ -954,16 +1196,104 @@ impl<'a> Engine<'a> {
             self.callee_index()
         };
         self.invokes.push(callee);
+        self.arg_levels.push(ArgLevel {
+            args: Vec::new(),
+            pending: None,
+        });
     }
 
-    /// Closes an argument group; its callee awaits the send event.
+    /// Closes an argument group; its callee awaits the send event. The
+    /// collected argument types check against the callee's formals first
+    /// (`argument_type_not_assignable`, decided on declared types only).
     fn close_arguments(&mut self) {
+        self.flush_argument();
+        let levels = self.arg_levels.pop();
+        self.check_arguments(levels);
         self.pending_send = self.invokes.pop().flatten();
+    }
+
+    /// Starts a new argument in the open argument list.
+    fn open_argument(&mut self, name: Option<StringId>) {
+        self.flush_argument();
+        if let Some(level) = self.arg_levels.last_mut() {
+            level.pending = Some((name, self.rows.len()));
+        }
+    }
+
+    /// Closes the pending argument: exactly one pushed row is a terminal
+    /// expression whose type stands for the whole argument; anything else
+    /// stays `Unknown` (compound operands must not lend their type).
+    fn flush_argument(&mut self) {
+        let Some(level) = self.arg_levels.last_mut() else {
+            return;
+        };
+        let Some((name, mark)) = level.pending.take() else {
+            return;
+        };
+        let (ty, range) = match self.rows.get(mark) {
+            Some(row) if self.rows.len() == mark + 1 => (row.ty, row.range),
+            _ => (
+                Ty::UNKNOWN,
+                SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+            ),
+        };
+        level.args.push((name, ty, range));
+    }
+
+    /// Pairs the closed argument list against the callee's declared formals:
+    /// positional by index, named by spelling. Extra positionals are the
+    /// `extra_positional_arguments` family's business (unfrozen — skipped);
+    /// unresolved callees suppress.
+    fn check_arguments(&mut self, level: Option<ArgLevel>) {
+        let Some(level) = level else { return };
+        let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
+            return;
+        };
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        let formals: Option<&Formals> = match &row.shape {
+            // A top-level function's declared formals.
+            RowShape::Bare(BareInfo::Plain { .. }) => self
+                .top_level_decl(row.name)
+                .and_then(|d| d.formals.as_deref()),
+            RowShape::Member { recv } => self.member_formals_full(recv, row.name),
+            _ => None,
+        };
+        let Some(formals) = formals else {
+            return;
+        };
+        let mut positional_index = 0usize;
+        let mut mismatches: Vec<(Ty, Ty, SourceRange)> = Vec::new();
+        for (name, ty, range) in &level.args {
+            let formal = if let Some(n) = name {
+                formals.named_formal(*n)
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                formal
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            if formal.ty.assignable_from(*ty) == Some(false) {
+                mismatches.push((*ty, formal.ty, *range));
+            }
+        }
+        for (from, to, range) in mismatches {
+            let (a0, a1) = (self.ty_display(from), self.ty_display(to));
+            self.emit3(SemanticCode::ArgumentTypeNotAssignable, range, &a0, &a1, "");
+        }
     }
 
     /// Consumes a completed send: the closed group's callee row becomes an
     /// invocation. A send without arguments never opened a group, so a bare
-    /// read stays a read (`foo;` vs `foo()`).
+    /// read stays a read (`foo;` vs `foo()`). An explicit type-argument group
+    /// on the callee checks its arity (`_element`, or `_extension` for an
+    /// extension override).
     fn consume_send(&mut self) {
         let Some(callee) = self.pending_send.take() else {
             return;
@@ -973,18 +1303,394 @@ impl<'a> Engine<'a> {
         {
             row.intent = Intent::Invoke;
         }
+        if let Some(pos) = self
+            .deferred_args
+            .iter()
+            .rposition(|(row, _, _)| *row == callee)
+        {
+            let (_, count, range) = self.deferred_args.remove(pos);
+            self.check_invocation_arity(callee, count, range);
+        }
     }
 
-    fn receiver_of_bare(&self, info: BareInfo, name: StringId) -> Receiver {
+    /// An implicit creation ended (`g<int>(...)`): the oracle rewrites the
+    /// shape to a plain invocation when the element resolves to a function
+    /// (`ast_rewrite.dart`), so a deferred bare-function head checks its
+    /// arity here (`_element`). Class/extension heads already checked at
+    /// their group.
+    fn end_implicit_creation(&mut self) {
+        if self.ctor_pos != 1 {
+            return;
+        }
+        let Some((row, count, range)) = self.deferred_args.pop() else {
+            return;
+        };
+        let Some(head) = self.rows.get(row) else {
+            return;
+        };
+        if matches!(head.shape, RowShape::Bare(BareInfo::Plain { .. })) {
+            self.check_invocation_arity(row, count, range);
+        }
+    }
+
+    /// The invoked-callee arity check (`invocation_inferrer.dart` reports
+    /// through the oracle's target dispatch, `type_instantiation_target.
+    /// dart`): a resolved executable invoked with explicit type arguments
+    /// reports `_element`, naming its kind word — a top-level function is
+    /// `function`, a member method is `method`. Function-typed variables and
+    /// getters resolve to type displays M1 cannot render (the oracle's
+    /// `_function` / kind-`getter` rows) — no declared count, suppress.
+    fn check_invocation_arity(&mut self, callee: usize, count: u16, range: SourceRange) {
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        let declared = match &row.shape {
+            // A top-level function (`g<int>()`); only real functions carry a
+            // parameter list — getters stay silent.
+            RowShape::Bare(BareInfo::Plain { .. }) => self
+                .top_level_decl(row.name)
+                .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
+                .map(|d| (d.type_params, ExecKind::Function)),
+            RowShape::Member { recv } => self.member_exec_arity(recv, row.name),
+            _ => None,
+        };
+        if let Some((declared, kind)) = declared
+            && declared != count
+        {
+            let name_text = self.strings.resolve(row.name).to_string();
+            self.emit4(
+                SemanticCode::WrongNumberOfTypeArgumentsElement(kind),
+                range,
+                kind.word(),
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
+        }
+    }
+
+    /// A resolved container's declared type-parameter count (`None` when the
+    /// name does not resolve — external types suppress).
+    fn declared_type_params_of_container(&self, name: StringId) -> Option<u16> {
+        resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )
+        .map(|(c, _)| c.type_params)
+    }
+
+    /// A member callee's declared type-parameter count with its oracle kind
+    /// word: methods only — getters, setters, and fields resolve to oracle
+    /// shapes M1 does not model, so they suppress (`None`).
+    fn member_exec_arity(&self, recv: &Receiver, name: StringId) -> Option<(u16, ExecKind)> {
+        let (container, super_walk) = match *recv {
+            Receiver::This { container, .. } => (container, false),
+            Receiver::Super { container, .. } => (container, true),
+            Receiver::Typed {
+                type_name: container,
+                ..
+            }
+            | Receiver::Container {
+                name: container, ..
+            } => (container, false),
+            _ => return None,
+        };
+        let walk = if super_walk {
+            self.walk_super(container, name)
+        } else {
+            self.walk_members(container, name)
+        };
+        match walk {
+            Walk::Found(entry) if entry.kind == MemberKind::Method => {
+                Some((entry.type_params, ExecKind::Method))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type-argument application event (`g<int>;`, `c<int>;`): a
+    /// resolved executable tear-off reports `_element` naming its kind word
+    /// (`function_reference_resolver.dart` → the
+    /// `InvocationTargetExecutableElement` dispatch); a type literal reports
+    /// the base code; an implicit call reference reports `_element` naming
+    /// `call`. Getters and function-typed variables resolve to oracle shapes
+    /// M1 cannot name (the getter kind word, the `_function` type display) —
+    /// suppress.
+    fn consume_type_argument_application(&mut self) {
+        let callee = self.rows.len().checked_sub(1);
+        let Some(pos) = callee.and_then(|callee| {
+            self.deferred_args
+                .iter()
+                .position(|(row, _, _)| *row == callee)
+        }) else {
+            return;
+        };
+        let (row_index, count, range) = self.deferred_args.remove(pos);
+        let Some(row) = self.rows.get(row_index) else {
+            return;
+        };
+        match &row.shape {
+            RowShape::Bare(BareInfo::Container { name, .. }) => {
+                // Type-literal instantiation `C<int>`: the base code.
+                self.check_annotation_arity(*name, count, range);
+            }
+            RowShape::Bare(BareInfo::Plain { ty }) => {
+                // A named top-level function tear-off, or an implicit call
+                // reference through a declaration-typed receiver (`c<int>`
+                // checks `call`).
+                let named_fn = self
+                    .top_level_decl(row.name)
+                    .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
+                    .map(|d| (d.type_params, ExecKind::Function));
+                if let Some((declared, kind)) = named_fn {
+                    self.emit_element_arity(row.name, declared, kind, count, range);
+                } else if let Ty::Named { name, .. } = *ty
+                    && let Some(entry) = self.resolved_member(name, self.intern("call"))
+                    && entry.kind == MemberKind::Method
+                {
+                    self.emit_element_arity(
+                        self.intern("call"),
+                        entry.type_params,
+                        ExecKind::Method,
+                        count,
+                        range,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `_element` emit: kind word, executable name, declared vs given.
+    fn emit_element_arity(
+        &mut self,
+        name: StringId,
+        declared: u16,
+        kind: ExecKind,
+        count: u16,
+        range: SourceRange,
+    ) {
+        if declared != count {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit4(
+                SemanticCode::WrongNumberOfTypeArgumentsElement(kind),
+                range,
+                kind.word(),
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
+        }
+    }
+
+    /// The resolved member entry of `container.member` from a clean walk.
+    fn resolved_member(
+        &self,
+        container: StringId,
+        member: StringId,
+    ) -> Option<&crate::model::MemberEntry> {
+        match self.walk_members(container, member) {
+            Walk::Found(entry) => Some(entry),
+            _ => None,
+        }
+    }
+
+    /// The annotation/creation arity check: the head's declared
+    /// type-parameter count against the given count (`dynamic` and
+    /// in-scope type parameters declare none; unresolved and external heads
+    /// suppress).
+    fn check_annotation_arity(&mut self, name: StringId, count: u16, range: SourceRange) {
+        let Some(declared) = self.declared_type_params(name) else {
+            return;
+        };
+        if declared != count {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit3(
+                SemanticCode::WrongNumberOfTypeArguments,
+                range,
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
+        }
+    }
+
+    /// A type head's declared type-parameter count: `dynamic` and type
+    /// parameters declare none, a container keeps its own count, a
+    /// typedef/function keeps its declaration's; anything unresolved is
+    /// `None` (suppress — `undefined_class` already reports).
+    fn declared_type_params(&self, name: StringId) -> Option<u16> {
+        if self.is_reserved(name, &BUILTIN_TYPES) || self.type_params.contains(&name) {
+            return Some(0);
+        }
+        match self.resolve_bare(name) {
+            BareInfo::Container { name, .. } => resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .map(|(c, _)| c.type_params),
+            BareInfo::Plain { .. } => self.top_level_decl(name).map(|d| d.type_params),
+            _ => None,
+        }
+    }
+
+    /// The `end_type_arguments` dispatch — the code choice by use-site shape.
+    fn end_type_arguments(&mut self, count: usize, begin: Token, end: Token) {
+        let count = u16::try_from(count).unwrap_or(u16::MAX);
+        let range = SourceRange {
+            offset: begin.range.offset,
+            length: end.range.end() - begin.range.offset,
+        };
+        // A type head makes the group an annotation or a creation type
+        // reference.
+        match self.group_heads.pop() {
+            Some(Some((head, _head_range))) => {
+                self.check_annotation_arity(head, count, range);
+                return;
+            }
+            Some(None) | None => {}
+        }
+        // An enum constant's constructor arguments (`a<int>()`).
+        if let Some(declared) = self.in_enum_element
+            && declared != count
+        {
+            self.emit3(
+                SemanticCode::WrongNumberOfTypeArgumentsEnum,
+                range,
+                &declared.to_string(),
+                &count.to_string(),
+                "",
+            );
+            return;
+        }
+        let Some(callee) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        if self.ctor_pos > 0 {
+            // A creation reference head. `parse_constructor_reference` keeps
+            // its segments unmerged on the row stack: `C<int>` is a bare
+            // container row (base code), `C.named<int>` is two bare rows —
+            // the class face then the constructor segment (any count
+            // reports: constructors never declare type parameters).
+            let named_ctor = (callee >= 1)
+                .then(|| {
+                    let ctor = &self.rows[callee];
+                    let class = &self.rows[callee - 1];
+                    match (&class.shape, &ctor.shape) {
+                        (
+                            RowShape::Bare(BareInfo::Container {
+                                name: class_name,
+                                kind: ContainerKind::Class,
+                            }),
+                            RowShape::Bare(_),
+                        ) => Some((*class_name, ctor.name)),
+                        _ => None,
+                    }
+                })
+                .flatten();
+            if let Some((class, ctor)) = named_ctor {
+                let class = self.strings.resolve(class).to_string();
+                let ctor = self.strings.resolve(ctor).to_string();
+                self.emit3(
+                    SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+                    range,
+                    &class,
+                    &ctor,
+                    "",
+                );
+                return;
+            }
+            let row = &self.rows[callee];
+            match &row.shape {
+                RowShape::Bare(BareInfo::Container {
+                    name,
+                    kind: ContainerKind::Extension,
+                }) => {
+                    // Explicit extension override `Ext<int>(list)` — any
+                    // arity mismatch reports at the group
+                    // (`extension_member_resolver.dart:380`).
+                    let name = *name;
+                    if let Some(declared) = self.declared_type_params_of_container(name)
+                        && declared != count
+                    {
+                        let name_text = self.strings.resolve(name).to_string();
+                        self.emit3(
+                            SemanticCode::WrongNumberOfTypeArgumentsExtension,
+                            range,
+                            &name_text,
+                            &declared.to_string(),
+                            &count.to_string(),
+                        );
+                    }
+                }
+                RowShape::Bare(BareInfo::Container { name, .. }) => {
+                    let name = *name;
+                    self.check_annotation_arity(name, count, range);
+                }
+                _ => {
+                    // A function invoked through the implicit-creation
+                    // syntax resolves at the send; defer.
+                    self.deferred_args.push((callee, count, range));
+                }
+            }
+            return;
+        }
+        if matches!(
+            self.rows[callee].shape,
+            RowShape::Bare(_) | RowShape::Member { .. }
+        ) {
+            self.deferred_args.push((callee, count, range));
+        }
+    }
+
+    /// The receiver classification of a bare row's info.
+    fn receiver_of_bare(info: BareInfo) -> Receiver {
         match info {
             BareInfo::Container { name, kind } => Receiver::Container { name, kind },
             BareInfo::Prefix { name } => Receiver::Prefix { name },
-            BareInfo::Plain => self
-                .typed_local(name)
-                .map_or(Receiver::Unknown, |type_name| Receiver::Typed { type_name }),
+            BareInfo::Plain { ty } => match ty {
+                Ty::Named {
+                    name: type_name, ..
+                } => Receiver::Typed { type_name, ty },
+                _ => Receiver::Unknown,
+            },
             // The receiver itself is undefined; its own row reports, so the
             // member access must not.
             BareInfo::Missing => Receiver::Unknown,
+        }
+    }
+
+    /// Arms the pending type head: the identifier just parsed a type
+    /// annotation and may be followed by a type-argument group.
+    fn arm_type_head(&mut self, name: StringId, range: SourceRange) {
+        self.pending_type_head = Some((name, range));
+    }
+
+    /// The expression type of an already-pushed row shaped as a receiver or
+    /// value (`a?[i]`'s receiver check).
+    fn receiver_row_ty(row: &Row) -> Ty {
+        match &row.shape {
+            RowShape::Bare(info) => match info {
+                BareInfo::Plain { ty } => *ty,
+                BareInfo::Container { name, .. } => Ty::named(*name),
+                _ => Ty::UNKNOWN,
+            },
+            RowShape::Receiver(recv) => match recv {
+                Receiver::This { container, .. } | Receiver::Super { container, .. } => {
+                    Ty::named(*container)
+                }
+                Receiver::Typed { ty, .. } => *ty,
+                _ => Ty::UNKNOWN,
+            },
+            _ => Ty::UNKNOWN,
         }
     }
 
@@ -1010,14 +1716,12 @@ impl<'a> Engine<'a> {
                         Intent::Write
                     };
                 }
-                Intent::Operator(op) => {
-                    if *op == index_op {
-                        row.write_op = Some(if compound {
-                            OpWrite::Compound
-                        } else {
-                            OpWrite::Assign
-                        });
-                    }
+                Intent::Operator(op) if *op == index_op => {
+                    row.write_op = Some(if compound {
+                        OpWrite::Compound
+                    } else {
+                        OpWrite::Assign
+                    });
                 }
                 _ => {}
             }
@@ -1052,22 +1756,199 @@ impl<'a> Engine<'a> {
         .then_some(index)
     }
 
+    /// The declared type of the assignment target row (`x = e`, `obj.f = e`):
+    /// a bare name reads its snapshot, a member walks to the field's declared
+    /// type; executables and unknown receivers stay `Unknown`.
+    fn assignment_target_ty(&self, row: &Row) -> Ty {
+        match &row.shape {
+            RowShape::Bare(BareInfo::Plain { ty }) => *ty,
+            RowShape::Bare(BareInfo::Container { name, kind }) => {
+                // A container name is never a valid assignment target — the
+                // oracle reports assignment-to-`this`-prefix shapes with
+                // other codes; suppress here.
+                let _ = (name, kind);
+                Ty::UNKNOWN
+            }
+            RowShape::Member { recv } => match recv {
+                Receiver::This { container, .. } | Receiver::Super { container, .. } => {
+                    self.member_declared_ty(*container, row.name)
+                }
+                Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, row.name),
+                Receiver::Container {
+                    name: container, ..
+                } => resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    *container,
+                )
+                .and_then(|(c, _)| c.members.get(&row.name))
+                .filter(|e| e.kind == MemberKind::Field)
+                .map_or(Ty::UNKNOWN, |e| e.var_ty),
+                _ => Ty::UNKNOWN,
+            },
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// The assignment check (`invalid_assignment`,
+    /// `assignment_expression_resolver.dart:795`): a single-row right-hand
+    /// side whose type the M1 facts know (`Null` or a captured declared
+    /// type) against the target's declared type. Plain `=` only — compound
+    /// operators carry their own read semantics (under-report).
+    fn check_assignment(&mut self, operator: Token) {
+        let Some(op_text) = self.text_of(operator) else {
+            return;
+        };
+        if op_text != "=" {
+            return;
+        }
+        let limit = operator.range.offset;
+        // The target: the closest row wholly before the operator (the same
+        // scan `mark_assignment` runs).
+        let Some(target) = self
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.range.end() <= limit)
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        // The right-hand side: exactly one row strictly after the operator.
+        let rhs: Vec<usize> = (target + 1..self.rows.len())
+            .filter(|index| self.rows[*index].range.offset > limit)
+            .collect();
+        if rhs.len() != 1 {
+            return;
+        }
+        let (from, range) = (self.rows[rhs[0]].ty, self.rows[rhs[0]].range);
+        let to = self.assignment_target_ty(&self.rows[target]);
+        if to.assignable_from(from) == Some(false) {
+            let (a0, a1) = (self.ty_display(from), self.ty_display(to));
+            self.emit3(SemanticCode::InvalidAssignment, range, &a0, &a1, "");
+        }
+    }
+
+    /// The variable-declaration initializer check
+    /// (`variable_declaration_resolver.dart:140`): the same decision as the
+    /// assignment check against the declaration group's declared type.
+    fn check_decl_initializer(&mut self) {
+        let Some(to) = self.pending_decl_ty else {
+            return;
+        };
+        let Some(mark) = self.init_mark else {
+            return;
+        };
+        if self.rows.len() != mark + 1 {
+            return;
+        }
+        let row = &self.rows[mark];
+        if to.assignable_from(row.ty) == Some(false) {
+            let (a0, a1) = (self.ty_display(row.ty), self.ty_display(to));
+            self.emit3(SemanticCode::InvalidAssignment, row.range, &a0, &a1, "");
+        }
+        self.init_mark = None;
+    }
+
+    /// The return check (`rtv.dart:209-249` sync matrix): `void` hosts
+    /// accept `void`/`dynamic`/`Null`; `void`/`dynamic` expressions only
+    /// fit `void`/`dynamic` hosts; everything else defers to the
+    /// assignability decision. Bare `return;` is a `void` expression.
+    fn check_return(&mut self, from: Ty, range: SourceRange) {
+        let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { ret: Some(ret), .. } => Some((ret.ty, ret.host, ret.name)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let (to, host, name) = ret;
+        let verdict = match to {
+            Ty::Void => match from {
+                Ty::Void | Ty::Dynamic | Ty::Null => Some(true),
+                Ty::Unknown => None,
+                _ => Some(false),
+            },
+            Ty::Unknown => None,
+            _ => match from {
+                Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
+                Ty::Dynamic => Some(true),
+                _ => to.assignable_from(from),
+            },
+        };
+        if verdict == Some(false) {
+            let (a0, a1, a2) = (
+                self.ty_display(from),
+                self.ty_display(to),
+                self.strings.resolve(name).to_string(),
+            );
+            self.emit3(
+                SemanticCode::ReturnOfInvalidType(host),
+                range,
+                &a0,
+                &a1,
+                &a2,
+            );
+        }
+    }
+
+    /// A single-row expression's type since `mark`, for the body/return
+    /// checks; `None` when the expression is compound.
+    fn single_row_since(&self, mark: usize) -> Option<(Ty, SourceRange)> {
+        let row = self.rows.get(mark)?;
+        (self.rows.len() == mark + 1).then_some((row.ty, row.range))
+    }
+
+    /// Enters an enum constant: its constructor type arguments check against
+    /// the enclosing enum's declared type-parameter count.
+    fn enter_enum_element(&mut self) {
+        self.in_enum_element = self
+            .container_context()
+            .filter(|(_, kind)| *kind == ContainerKind::Enum)
+            .and_then(|(name, _)| self.declared_type_params_of_container(name));
+    }
+
+    fn leave_enum_element(&mut self) {
+        self.in_enum_element = None;
+    }
+
+    /// The display text of an M1 type (`int?`, `Null`, `dynamic`).
+    fn ty_display(&self, ty: Ty) -> String {
+        match ty {
+            Ty::Unknown => String::new(),
+            Ty::Null => "Null".to_string(),
+            Ty::Dynamic => "dynamic".to_string(),
+            Ty::Void => "void".to_string(),
+            Ty::Named { name, nullable } => {
+                let text = self.strings.resolve(name);
+                if nullable {
+                    format!("{text}?")
+                } else {
+                    text.to_string()
+                }
+            }
+        }
+    }
+
     /// The named argument membership test against the active callee.
     fn check_named_argument(&mut self, name: StringId, range: SourceRange) {
-        let Some(formals) = self
+        let Some(callee) = self
             .invokes
             .last()
             .and_then(|slot| *slot)
             .and_then(|index| self.rows.get(index))
-            .and_then(|callee| match &callee.shape {
-                RowShape::Bare(_) => self.top_level_formals(callee.name),
-                RowShape::Member { recv } => self.member_formals(recv, callee.name),
-                _ => None,
-            })
         else {
             return;
         };
-        if formals.contains(&name) {
+        let defined = match &callee.shape {
+            RowShape::Bare(_) => self.top_level_named_formal(callee.name, name),
+            RowShape::Member { recv } => self.member_has_named_formal(recv, callee.name, name),
+            _ => return,
+        };
+        if defined {
             return;
         }
         // `undefined_named_parameter` is a batch-2 emission; batch 1 records
@@ -1122,10 +2003,9 @@ impl<'a> Engine<'a> {
     fn resolve_bare_row(&mut self, row: &Row, info: BareInfo) {
         let name_text = self.strings.resolve(row.name);
         match info {
-            BareInfo::Container { .. } | BareInfo::Plain => {}
             // A prefix used bare: invoking a prefix is an error the oracle
             // names with an unfrozen code — record only.
-            BareInfo::Prefix { .. } => {}
+            BareInfo::Container { .. } | BareInfo::Plain { .. } | BareInfo::Prefix { .. } => {}
             BareInfo::Missing => match row.intent {
                 Intent::Invoke => {
                     if !self.guard.ignore(None, row.name) {
@@ -1232,12 +2112,13 @@ impl<'a> Engine<'a> {
     /// extension pool, enum synthesized members, and `Object` members
     /// suppress. The member family's codes are batch-2 emissions.
     fn check_instance_member(&mut self, row: &Row, recv: Receiver) {
-        let container = match recv {
-            Receiver::This { container, .. }
-            | Receiver::Typed {
-                type_name: container,
-            } => container,
-            _ => return,
+        let (Receiver::This { container, .. }
+        | Receiver::Typed {
+            type_name: container,
+            ..
+        }) = recv
+        else {
+            return;
         };
         let (op_read, op_write) = self.operator_spellings(row);
         if self.member_defined(container, row.name, false, op_read, op_write) {
@@ -1342,6 +2223,12 @@ struct DiagnoseListener<'a> {
 /// report as `duplicate_definition`s) and its non-type-parameter
 /// declarations are already declared into the library graph. The parse is a
 /// second pass over the same token table `collect` used.
+///
+/// # Panics
+///
+/// Panics if the parser still holds the listener at teardown — impossible
+/// by construction (`parser` is dropped above), asserted with `expect`.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
 pub fn diagnose(
     source: &str,
     tokens: &TokenTable,
@@ -1373,11 +2260,15 @@ pub fn diagnose(
         .into_inner();
     engine.resolve_rows();
     let mut report = std::mem::take(&mut engine.report);
-    // `duplicate_definition`s lead the report; each points at the SECOND
+    // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
     // the bare identifier.
-    let mut diagnostics = Vec::with_capacity(index.get(file).map_or(0, |f| f.duplicates().len()));
+    let mut diagnostics = Vec::with_capacity(
+        index
+            .get(file)
+            .map_or(0, |f| f.duplicates().len() + f.arity_violations().len()),
+    );
     if let Some(elements) = index.get(file) {
         for dup in elements.duplicates() {
             let text = strings.resolve(dup.name);
@@ -1388,6 +2279,44 @@ pub fn diagnose(
                 SemanticCode::DuplicateDefinition.message(display, ""),
                 file,
                 dup.range,
+                None,
+            ));
+        }
+        // The declaration-arity log folds next (capture-time order =
+        // source order): operator parameter counts and the setter shape
+        // rule.
+        for arity in elements.arity_violations() {
+            let (code, message) = match arity.violation {
+                ArityViolation::Operator {
+                    name,
+                    expected,
+                    found,
+                } => {
+                    let code = SemanticCode::WrongNumberOfParametersForOperator;
+                    (
+                        code,
+                        code.message3(
+                            strings.resolve(name),
+                            &expected.to_string(),
+                            &found.to_string(),
+                        ),
+                    )
+                }
+                ArityViolation::OperatorMinus { found } => {
+                    let code = SemanticCode::WrongNumberOfParametersForOperatorMinus;
+                    (code, code.message3(&found.to_string(), "", ""))
+                }
+                ArityViolation::Setter => (
+                    SemanticCode::WrongNumberOfParametersForSetter,
+                    SemanticCode::WrongNumberOfParametersForSetter.message("", ""),
+                ),
+            };
+            diagnostics.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                message,
+                file,
+                arity.range,
                 None,
             ));
         }
@@ -1710,15 +2639,28 @@ impl ParserListener for DiagnoseListener<'_> {
         &mut self,
         _token: Token,
         _late_kw: Option<Token>,
-        var_final_or_const: Option<Token>,
+        _var_final_or_const: Option<Token>,
     ) {
         let mut engine = self.engine.borrow_mut();
-        // `var`/`final`/`const` carry no type name: drop any stale
-        // declaration type so the bound names stay untyped (unknown
-        // receivers suppress, never fabricate).
-        if var_final_or_const.is_some() {
-            engine.clear_last_type();
-        }
+        // The group's declared type arms here (one `parse_type` per group,
+        // `handle_no_type` disarmed it for untyped groups); every name in
+        // the group binds it.
+        engine.pending_decl_ty = engine.armed_ty.take();
+    }
+
+    fn end_variables_declaration(&mut self, _count: usize, _end: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        engine.pending_decl_ty = None;
+        engine.armed_ty = None;
+    }
+
+    fn begin_variable_initializer(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.init_mark = Some(engine.rows.len());
+    }
+
+    fn end_variable_initializer(&mut self, _token: Token) {
+        self.engine.borrow_mut().check_decl_initializer();
     }
 
     fn begin_type_variable(&mut self, token: Token) {
@@ -1745,19 +2687,22 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.push_member(name, token.range);
                 }
             }
-            C::TypeReference => {
+            C::TypeReference | C::TypeReferenceContinuation => {
                 if let Some(name) = name {
-                    engine.push_type_use(name, token.range, TypeHead::Bare);
+                    let head = if context == C::TypeReference {
+                        TypeHead::Bare
+                    } else {
+                        TypeHead::Continuation
+                    };
+                    engine.push_type_use(name, token.range, head);
+                    // The head awaits its type-argument group (or its
+                    // completing `handle_type`).
+                    engine.arm_type_head(name, token.range);
                 }
             }
             C::PrefixedTypeReference => {
                 if let Some(name) = name {
                     engine.arm_type_prefix(name, token.range);
-                }
-            }
-            C::TypeReferenceContinuation => {
-                if let Some(name) = name {
-                    engine.push_type_use(name, token.range, TypeHead::Continuation);
                 }
             }
             // A constructor reference names a class: the guarded miss is the
@@ -1768,15 +2713,32 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.push_type_use(name, token.range, TypeHead::Bare);
                 }
             }
-            C::LocalVariableDeclaration | C::FormalParameterDeclaration | C::CatchParameter => {
+            C::LocalVariableDeclaration => {
                 if let Some(name) = name {
                     engine.add_local(name);
                     engine.bind_declared_type(name);
                 }
             }
+            C::FormalParameterDeclaration | C::CatchParameter => {
+                if let Some(name) = name {
+                    engine.add_local(name);
+                    engine.bind_parameter_type(name);
+                }
+            }
             C::NamedArgumentReference => {
                 if let Some(name) = name {
                     engine.check_named_argument(name, token.range);
+                    engine.open_argument(Some(name));
+                }
+            }
+            C::TopLevelFunctionDeclaration => {
+                if let Some(name) = name {
+                    engine.latch_return_type(ExecKind::Function, name);
+                }
+            }
+            C::MethodDeclaration => {
+                if let Some(name) = name {
+                    engine.latch_return_type(ExecKind::Method, name);
                 }
             }
             _ => {}
@@ -1785,6 +2747,40 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_qualified(&mut self, _period: Token) {
         self.engine.borrow_mut().consume_type_prefix();
+    }
+
+    // —— declared types ——————————————————————————————————————————————
+
+    fn handle_type(&mut self, name: Token, question: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        // The type completed without a group; its head slot is consumed.
+        engine.pending_type_head = None;
+        let Some(text) = engine.text_of(name) else {
+            return;
+        };
+        // `dynamic` is a top type and `Null` is the null-type singleton —
+        // both have dedicated [`Ty`] shapes.
+        let ty = match text {
+            "dynamic" => Ty::Dynamic,
+            "Null" => Ty::Null,
+            _ => Ty::Named {
+                name: engine.strings.intern(text),
+                nullable: question.is_some(),
+            },
+        };
+        engine.armed_ty = Some(ty);
+    }
+
+    fn handle_no_type(&mut self, _last_consumed: Token) {
+        self.engine.borrow_mut().armed_ty = None;
+    }
+
+    fn handle_void_keyword(&mut self, _token: Token) {
+        self.engine.borrow_mut().armed_ty = Some(Ty::Void);
+    }
+
+    fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
+        self.engine.borrow_mut().armed_ty = Some(Ty::Void);
     }
 
     // —— receivers and selectors ——————————————————————————————————————
@@ -1797,12 +2793,12 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().push_keyword_receiver(token, true);
     }
 
-    fn handle_dot_access(&mut self, _token: Token, _end: Token, _is_null_aware: bool) {
-        self.engine.borrow_mut().merge_member();
+    fn handle_dot_access(&mut self, _token: Token, _end: Token, is_null_aware: bool) {
+        self.engine.borrow_mut().merge_member(is_null_aware);
     }
 
-    fn handle_cascade_access(&mut self, _operator: Token, _end: Token, _is_null_aware: bool) {
-        self.engine.borrow_mut().merge_member();
+    fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
+        self.engine.borrow_mut().merge_member(is_null_aware);
     }
 
     fn handle_send(&mut self, _begin: Token, _end: Token) {
@@ -1810,7 +2806,9 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
-        self.engine.borrow_mut().mark_assignment(operator);
+        let mut engine = self.engine.borrow_mut();
+        engine.mark_assignment(operator);
+        engine.check_assignment(operator);
     }
 
     fn begin_binary_expression(&mut self, operator: Token) {
@@ -1858,12 +2856,131 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().leave_ctor_pos();
     }
 
+    fn begin_implicit_creation_expression(&mut self, _token: Token) {
+        self.engine.borrow_mut().enter_ctor_pos();
+    }
+
+    fn end_implicit_creation_expression(&mut self, _begin: Token, _open_angle: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.end_implicit_creation();
+        engine.leave_ctor_pos();
+    }
+
     fn begin_arguments(&mut self, _token: Token) {
         self.engine.borrow_mut().open_arguments();
     }
 
     fn end_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
         self.engine.borrow_mut().close_arguments();
+    }
+
+    fn handle_positional_argument(&mut self, _token: Token) {
+        self.engine.borrow_mut().open_argument(None);
+    }
+
+    fn handle_named_argument(&mut self, _colon: Token) {
+        // Fires after the value: the pending named argument closes here.
+        self.engine.borrow_mut().flush_argument();
+    }
+
+    fn begin_return_statement(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.return_mark = Some(engine.rows.len());
+    }
+
+    fn end_return_statement(&mut self, has_expression: bool, _begin: Token, end: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let mark = engine.return_mark.take();
+        if !has_expression {
+            // Bare `return;` is a `void` expression in the oracle's matrix.
+            engine.check_return(Ty::Void, end.range);
+            return;
+        }
+        if let Some(mark) = mark
+            && let Some((ty, range)) = engine.single_row_since(mark)
+        {
+            engine.check_return(ty, range);
+        }
+    }
+
+    fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        let Some(mark) = engine.body_mark.take() else {
+            return;
+        };
+        if let Some((ty, range)) = engine.single_row_since(mark) {
+            engine.check_return(ty, range);
+        }
+    }
+
+    fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        engine.body_mark = Some(engine.rows.len());
+    }
+
+    fn begin_cascade(&mut self, _operator: Token) {
+        self.engine.borrow_mut().in_cascade = true;
+    }
+
+    fn end_cascade(&mut self) {
+        self.engine.borrow_mut().in_cascade = false;
+    }
+
+    fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, _close: Token) {
+        if question.is_none() {
+            return;
+        }
+        let mut engine = self.engine.borrow_mut();
+        // The receiver: the closest row wholly before the `[`.
+        let Some((_, row)) = engine
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.range.end() <= open.range.offset)
+        else {
+            return;
+        };
+        let row = row.clone();
+        let ty = Engine::receiver_row_ty(&row);
+        if ty.is_strictly_non_nullable() {
+            engine.emit3(
+                SemanticCode::InvalidNullAwareOperator,
+                row.range,
+                "?[",
+                "[",
+                "",
+            );
+        }
+    }
+
+    fn handle_enum_element(&mut self, _begin: Token, _augment: Option<Token>) {
+        self.engine.borrow_mut().enter_enum_element();
+    }
+
+    fn handle_enum_elements(&mut self, _elements_end: Token, _count: usize) {
+        self.engine.borrow_mut().leave_enum_element();
+    }
+
+    fn begin_type_arguments(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let head = engine.pending_type_head.take();
+        engine.group_heads.push(head);
+    }
+
+    fn end_type_arguments(&mut self, count: usize, begin: Token, end: Token) {
+        self.engine
+            .borrow_mut()
+            .end_type_arguments(count, begin, end);
+    }
+
+    fn handle_no_type_arguments(&mut self, _token: Token) {
+        // The type completed without a group; the head slot is consumed.
+        self.engine.borrow_mut().pending_type_head = None;
+    }
+
+    fn handle_type_argument_application(&mut self, _open_angle: Token) {
+        self.engine.borrow_mut().consume_type_argument_application();
     }
 
     // —— value rows: literals and groups ———————————————————————————————
@@ -1891,7 +3008,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_null(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().push_null_row(token);
     }
 
     fn end_literal_string(&mut self, _interpolation_count: usize, end: Token) {
@@ -1936,8 +3053,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 }
 
-fn bare_info_of(name: StringId, kind: MicroKind) -> BareInfo {
-    match kind {
+fn bare_info_of(name: StringId, decl: &TopDecl) -> BareInfo {
+    match decl.kind {
         // Type parameters are declaration-scoped: the per-unit tag is stale
         // outside its declaration, and in-scope uses were answered by the
         // engine's type-parameter stack.
@@ -1958,10 +3075,11 @@ fn bare_info_of(name: StringId, kind: MicroKind) -> BareInfo {
             name,
             kind: ContainerKind::Extension,
         },
-        _ => BareInfo::Plain,
+        _ => BareInfo::Plain { ty: decl.var_ty },
     }
 }
 
+/// The §8 names-table use kind of a row's finalized intent.
 fn use_kind_of(intent: &Intent) -> NameUse {
     match intent {
         Intent::Invoke => NameUse::Invoke,
@@ -2064,7 +3182,7 @@ mod tests {
         let d = &report.diagnostics[0];
         assert_eq!(d.message, "Undefined name 'nose'.");
         assert_eq!(d.severity, Severity::Error);
-        assert_eq!(d.range.offset, "void f() { ".len() as u32);
+        assert_eq!(d.range.offset, u32::try_from("void f() { ".len()).unwrap());
         assert_eq!(report.names.len(), 1);
         assert_eq!(report.names[0].use_kind, NameUse::Read);
         assert!(!report.names[0].qualified);
@@ -2158,7 +3276,7 @@ mod tests {
         // The second `x`'s token: after `var ` of the third declaration.
         assert_eq!(
             dup.range.offset,
-            "var x = 0; void f() { nose; } var ".len() as u32
+            u32::try_from("var x = 0; void f() { nose; } var ".len()).unwrap()
         );
     }
 
@@ -2322,5 +3440,418 @@ mod tests {
         let report = report("class C { static var s = 0; } void fn() {} void f() { fn; C.s; }");
         assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
         assert!(report.names.is_empty());
+    }
+
+    // —— batch 2 (#121): wrong_number_of_type_arguments ——————————————————
+
+    /// A type annotation's arity is the declaration's type-parameter count.
+    ///
+    /// Hand-trace: `C` fires `TypeReference` (resolves — no row) and arms the
+    /// pending head; `begin_type_arguments` moves the head into the group
+    /// slot; `end_type_arguments(1)` pops it and checks `C`'s declared count
+    /// (2, from the model) against 1 → base code at the group. `A` resolves
+    /// (silent); `handle_type(C)` then binds `x`'s declared type.
+    #[test]
+    fn annotation_arity_reports_base_code() {
+        let report = report("class A {} class C<T, U> {} void f() { C<A> x; }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type 'C' is declared with 2 type parameters, but 1 type arguments were given."
+        );
+        assert!(report.names.is_empty());
+    }
+
+    /// A creation type reference reports the base code too
+    /// (oracle `test_const_nonGeneric`).
+    ///
+    /// Hand-trace: `const` raises `ctor_pos`; `C` fires `Expression` (a
+    /// creation head, never a type reference) resolving as a container; the
+    /// group's head slot is empty and the `ctor_pos` branch checks the
+    /// container's count (0) against 1 → base code. `new C()` stays silent.
+    #[test]
+    fn creation_arity_reports_base_code() {
+        let report = report("class A {} class C {} void f() { new C(); const C<A>(); }");
+        assert_eq!(code_names(&report), ["wrong_number_of_type_arguments"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type 'C' is declared with 0 type parameters, but 1 type arguments were given."
+        );
+    }
+
+    /// Type arguments on a named constructor segment report `_constructor`:
+    /// constructors never declare type parameters (`ast_rewrite.dart:549`).
+    ///
+    /// Hand-trace: `parse_constructor_reference` keeps `C` and `named`
+    /// unmerged on the row stack (no dot event inside the reference), so the
+    /// `ctor_pos` branch sees two bare rows — the class face (a resolved
+    /// class container) then the segment — and reports the pair. `D`
+    /// resolves, so no other code fires.
+    #[test]
+    fn named_constructor_type_args_report_constructor_code() {
+        let report = report("class D {} class C { C.named(); } void f() { new C.named<D>(); }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_constructor"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The constructor 'C.named' doesn't have type parameters."
+        );
+    }
+
+    /// An enum constant's constructor type arguments report `_enum`
+    /// (`type_arguments_verifier.dart:163`).
+    ///
+    /// Hand-trace: `handle_enum_element` snapshots the enclosing enum's
+    /// declared count (2, from the collector's depth-1 group); the constant's
+    /// group closes with 1 → counts differ → `_enum` at the group. `a`
+    /// itself fires `EnumValueDeclaration` (no row), so the trailing `()`
+    /// opens a group with no callee — silent.
+    #[test]
+    fn enum_constant_type_args_report_enum_code() {
+        let report = report("class D {} enum E<T, U> { a<D>(); }");
+        assert_eq!(code_names(&report), ["wrong_number_of_type_arguments_enum"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The enum is declared with 2 type parameters, but 1 type arguments were given."
+        );
+    }
+
+    /// An invoked generic function with explicit type arguments reports
+    /// `_element` with the `function` kind word (the oracle's target
+    /// dispatch, `type_instantiation_target.dart`: the invocation syntax
+    /// parses as an implicit creation and resolution reports through
+    /// `InvocationTargetExecutableElement`).
+    ///
+    /// Hand-trace: `g<A, A>()` parses as an implicit creation (`ctor_pos`
+    /// raised), so `g` stays a read and the group defers;
+    /// `end_implicit_creation` pops the deferred entry, sees a bare
+    /// top-level function head, and checks its declared count (1) against 2.
+    /// The `A` arguments resolve — no other code.
+    #[test]
+    fn generic_invocation_arity_reports_element_function() {
+        let report = report("class A {} void g<T>() {} void f() { g<A, A>(); }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The function 'g' is declared with 1 type parameters, but 2 type arguments are given."
+        );
+    }
+
+    /// An invoked generic member method reports `_element` with the `method`
+    /// kind word through the send path.
+    ///
+    /// Hand-trace: `c.m<D>()` keeps a normal send (dot access, not an
+    /// implicit creation): the group defers, `consume_send` matches the
+    /// deferred entry to `m`'s callee row, and the member walk finds `m`'s
+    /// declared count (2) → `_element`/`method`. `c`'s declared type comes
+    /// from the formal binding.
+    #[test]
+    fn member_invocation_arity_reports_element_method() {
+        let report = report("class D {} class C { void m<T, U>() {} } void f(C c) { c.m<D>(); }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'm' is declared with 2 type parameters, but 1 type arguments are given."
+        );
+    }
+
+    /// A getter invoked or applied with type arguments stays silent: the
+    /// oracle names the getter kind word (or the function type display),
+    /// neither of which M1 models — under-report, never a wrong code.
+    ///
+    /// Hand-trace: `g`'s top-level declaration carries no formals (no
+    /// parameter list), so the `formals.is_some()` filter suppresses both
+    /// the send path and the application path.
+    #[test]
+    fn getter_type_arguments_suppress() {
+        let report = report("class A {} class C {} C get g => C(); void f() { g<A, A>(); g<A>; }");
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// An applied (non-invoked) top-level function tear-off reports
+    /// `_element` with the `function` kind word
+    /// (`function_reference_resolver.dart` →
+    /// `InvocationTargetExecutableElement`).
+    ///
+    /// Hand-trace: `g<A, A>;` never opens an argument group; the application
+    /// event consumes the deferred entry against `g`'s declared count.
+    #[test]
+    fn function_reference_arity_reports_element_function() {
+        let report = report("class A {} void g<T>() {} void f() { g<A, A>; }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The function 'g' is declared with 1 type parameters, but 2 type arguments are given."
+        );
+    }
+
+    /// An implicit call reference (`c<int>;` on a callable class) reports
+    /// `_element` naming `call` with the `method` kind word (the oracle's
+    /// `_getCallMethod` resolves the `call` method element).
+    ///
+    /// Hand-trace: `c`'s row snapshots its declared type `C`; the
+    /// application event walks `C.call`, finds a method with 1 type
+    /// parameter, and checks it against the given 2.
+    #[test]
+    fn implicit_call_reference_reports_element_call() {
+        let report = report("class C { T call<T>(T x) => x; } void f(C c) { c<A, A>; }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'call' is declared with 1 type parameters, but 2 type arguments are given."
+        );
+    }
+
+    /// An explicit extension override with mismatched type arguments reports
+    /// `_extension` (`extension_member_resolver.dart:380`).
+    ///
+    /// Hand-trace: `Ex<A>(a)` parses as an implicit creation; the group's
+    /// `ctor_pos` branch resolves `Ex` as an extension container and checks
+    /// its declared count (0) against 1 immediately. The trailing `(a)` runs
+    /// under `ctor_pos` (callee `None`) and stays silent.
+    #[test]
+    fn extension_override_arity_reports_extension_code() {
+        let report = report("class A {} extension Ex on A {} void f(A a) { Ex<A>(a); }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_extension"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The extension 'Ex' is declared with 0 type parameters, but 1 type arguments were given."
+        );
+    }
+
+    // —— batch 2 (#121): static-nullability four ——————————————————————————
+
+    /// `null` into a non-nullable target reports `invalid_assignment`
+    /// (`assignment_expression_resolver.dart:795`).
+    ///
+    /// Hand-trace: `int x` arms the group type and binds `x` =
+    /// `int` (non-nullable); `x = null` finds the target row before `=`,
+    /// exactly one right-hand row (`null`, typed `Null`), and
+    /// `Ty::assignable_from(Null → int)` = `Some(false)` (Left Null,
+    /// subtype.dart:349) → the code. The `int` class models the core type in
+    /// the no-core harness.
+    #[test]
+    fn null_assignment_reports_invalid_assignment() {
+        let report = report("class int {} void f() { int x; x = null; }");
+        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Null' can't be assigned to a variable of type 'int'."
+        );
+        assert_eq!(report.diagnostics[0].severity, Severity::Error);
+    }
+
+    /// A declaration initializer runs the same decision
+    /// (`variable_declaration_resolver.dart:140`); a nullable target accepts
+    /// `null` silently.
+    ///
+    /// Hand-trace: `int x = null` checks the single-row initializer against
+    /// the group type → `invalid_assignment`; `int? y = null` is Right Top
+    /// (subtype.dart:263) → silent.
+    #[test]
+    fn declaration_initializer_null_reports_invalid_assignment() {
+        let report = report("class int {} void f() { int x = null; int? y = null; }");
+        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Null' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// A nullable right-hand side into a non-nullable target is decidable
+    /// from nullability alone (Left Nullable, subtype.dart:389-392).
+    ///
+    /// Hand-trace: `y`'s row snapshots its declared type `int?`; the check
+    /// needs no name lattice → `Some(false)`; the display texts are `int?`
+    /// and `int`.
+    #[test]
+    fn nullable_assignment_reports_invalid_assignment() {
+        let report = report("class int {} void f() { int? y; int x; x = y; }");
+        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'int?' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// `null` (and nullable values) into a known non-nullable parameter
+    /// reports `argument_type_not_assignable` (helpers.dart:96-142). The
+    /// message keeps the template's trailing record appendix (empty at M1).
+    ///
+    /// Hand-trace: `g(null)` — the argument list collects one terminal row
+    /// (typed `Null`); the callee's declared positional formal is `int`
+    /// (non-nullable) → `Some(false)`. `g(y)` with `int? y` reads `y`'s
+    /// snapshot (`int?`).
+    #[test]
+    fn null_argument_reports_argument_type_not_assignable() {
+        let report = report("class int {} void g(int p) {} void f() { int? y; g(null); g(y); }");
+        assert_eq!(
+            code_names(&report),
+            [
+                "argument_type_not_assignable",
+                "argument_type_not_assignable"
+            ]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The argument type 'Null' can't be assigned to the parameter type 'int'. "
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+        );
+    }
+
+    /// `return null` in a non-nullable function reports
+    /// `return_of_invalid_type` with the per-host message
+    /// (`rtv.dart:209-249` sync matrix).
+    ///
+    /// Hand-trace: `f`'s return type latches at the name identifier (the
+    /// return type's `handle_type` precedes it); `return null`'s single row
+    /// fails Left Null → the function-host message. `m`'s method shape picks
+    /// the method-host word.
+    #[test]
+    fn null_return_reports_return_of_invalid_type() {
+        let report =
+            report("class int {} class C { int m() { return null; } } int f() { return null; }");
+        assert_eq!(
+            code_names(&report),
+            ["return_of_invalid_type", "return_of_invalid_type"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Null' can't be returned from the method 'm' because it has a return type of 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "A value of type 'Null' can't be returned from the function 'f' because it has a return type of 'int'."
+        );
+    }
+
+    /// The void-host arm of the return matrix: `return <non-void>` in a
+    /// `void` function reports; `return null` in a void function is
+    /// oracle-legal.
+    ///
+    /// Hand-trace: host `void` accepts `void`/`dynamic`/`Null` — `return x`
+    /// with `x: int` is none of them → report; `return null` matches the
+    /// `Null` accept set → silent.
+    #[test]
+    fn void_return_matrix() {
+        let report = report("class int {} void f(int x) { return x; } void g() { return null; }");
+        assert_eq!(code_names(&report), ["return_of_invalid_type"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'int' can't be returned from the function 'f' because it has a return type of 'void'."
+        );
+    }
+
+    /// `?.` on a strictly non-nullable receiver reports the
+    /// `invalid_null_aware_operator` `STATIC_WARNING`; a nullable receiver
+    /// stays silent (`type_system.dart:1921-` `isStrictlyNonNullable`).
+    ///
+    /// Hand-trace: `c`'s declared type is `C` (no `?`) → strictly
+    /// non-nullable → the warning at the merge; `c2`'s type is `C?` →
+    /// suppress. `m` is genuinely absent from `C` — the member miss records
+    /// without a batch-2 diagnostic.
+    #[test]
+    fn null_aware_on_non_nullable_reports_static_warning() {
+        let report = report("class C {} void f(C c, C? c2) { c?.m(); c2?.m(); }");
+        assert_eq!(code_names(&report), ["invalid_null_aware_operator"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
+        );
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.code.dtype,
+            dartq_diagnostics::DiagnosticType::StaticWarning
+        );
+    }
+
+    /// Declaration-arity violations fold from the collector's log ahead of
+    /// the row diagnostics, in capture order: the operator count table
+    /// (`error_verifier.dart:5688-5740`) and the setter shape rule
+    /// (`ast_builder.dart:6283-6291`).
+    ///
+    /// Hand-trace: `operator +(a, b)` → expected 1, found 2; `set s(a, b)` →
+    /// not one required-positional → the syntactic-tier setter text; the
+    /// correct `operator [](i)` and `set ok(v)` stay silent.
+    #[test]
+    fn declaration_arity_folds_operator_and_setter() {
+        let report = report(
+            "class C { int operator +(int a, int b) => 1; set s(int x, int y) {} int operator [](int i) => 1; set ok(int v) {} }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "wrong_number_of_parameters_for_operator",
+                "wrong_number_of_parameters_for_setter",
+            ]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Operator '+' should declare exactly 1 parameters, but 2 found."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Setters must declare exactly one required positional parameter."
+        );
+        assert_eq!(report.diagnostics[1].severity, Severity::Error);
+    }
+
+    /// The minus operator keeps its own template under the same analyzerCode
+    /// (0 or 1 parameters — unary and binary minus coexist).
+    ///
+    /// Hand-trace: `operator -(a, b)` declares 2 parameters; the table's
+    /// fall-through arm (`error_verifier.dart:5731-5740`) fires the minus
+    /// variant with the found count only.
+    #[test]
+    fn minus_operator_arity_uses_the_minus_template() {
+        let report = report("class C { C operator -(int a, int b) => C(); }");
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_parameters_for_operator"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Operator '-' should declare 0 or 1 parameter, but 2 found."
+        );
+    }
+
+    /// The arity checks suppress on unresolved heads: an unknown creation
+    /// head already reports `undefined_class`, and a second code there would
+    /// contaminate the diff (rule 0c — invalid types never cascade).
+    ///
+    /// Hand-trace: `Missing<A>()`'s head misses the lookup (no container) →
+    /// the `ctor_pos` branch defers past the container checks; the send
+    /// consumes no deferred entry with a resolvable declaration → only the
+    /// type-use row emits `undefined_class`.
+    #[test]
+    fn unresolved_creation_head_suppresses_arity() {
+        let report = report("class A {} void f() { Missing<A>(); }");
+        assert_eq!(code_names(&report), ["undefined_class"]);
     }
 }
