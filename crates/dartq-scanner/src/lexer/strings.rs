@@ -122,7 +122,12 @@ impl Lexer<'_> {
         if self.peek() == Some(quote) && self.peek2() == Some(quote) {
             self.bump();
             self.bump();
-            return Some(StringFrame { quote, raw, triple: true, segment_start: quote_start });
+            return Some(StringFrame {
+                quote,
+                raw,
+                triple: true,
+                segment_start: quote_start,
+            });
         }
         if self.peek() == Some(quote) {
             // Empty string `''`.
@@ -130,7 +135,12 @@ impl Lexer<'_> {
             self.emit_fixed(TokenKind::String, quote_start);
             return None;
         }
-        Some(StringFrame { quote, raw, triple: false, segment_start: quote_start })
+        Some(StringFrame {
+            quote,
+            raw,
+            triple: false,
+            segment_start: quote_start,
+        })
     }
 
     /// Body (content mode) dispatch on the frame's string form.
@@ -307,7 +317,7 @@ impl Lexer<'_> {
                 self.emit_synthetic(TokenKind::Identifier, at, 0);
                 self.diag(
                     dartq_diagnostics::MISSING_IDENTIFIER,
-                    msg::MISSING_IDENTIFIER.to_owned(),
+                    || msg::MISSING_IDENTIFIER.to_owned(),
                     at,
                     at + 1,
                 );
@@ -333,7 +343,7 @@ impl Lexer<'_> {
         };
         self.diag_pin_last_unit(
             UNTERMINATED_STRING_LITERAL,
-            msg::unterminated_string(&open, &close),
+            || msg::unterminated_string(&open, &close),
             stop,
         );
     }

@@ -268,13 +268,15 @@ impl<'s> Lexer<'s> {
     }
 
     /// Recording past [`MAX_DIAGNOSTICS`] is dropped (cap semantics above).
-    fn diag(&mut self, code: CodeInfo, message: String, start: usize, end: usize) {
+    /// The message is a lazy closure, run only after the cap check: capped-out
+    /// input pays no message formatting or allocation.
+    fn diag(&mut self, code: CodeInfo, message: impl FnOnce() -> String, start: usize, end: usize) {
         if self.diags.len() >= MAX_DIAGNOSTICS {
             return;
         }
         self.diags.push(ScanDiag {
             code,
-            message,
+            message: message(),
             start: start as u32,
             end: end as u32,
             pin_last_unit: false,
@@ -285,13 +287,18 @@ impl<'s> Lexer<'s> {
     /// `endOffset - 1, length 1`, `translate_error_token.dart`): the unit is
     /// the character's low surrogate when it is astral, which no byte range
     /// can address, so the backoff is applied after UTF-16 conversion.
-    fn diag_pin_last_unit(&mut self, code: CodeInfo, message: String, stop: usize) {
+    fn diag_pin_last_unit(
+        &mut self,
+        code: CodeInfo,
+        message: impl FnOnce() -> String,
+        stop: usize,
+    ) {
         if self.diags.len() >= MAX_DIAGNOSTICS {
             return;
         }
         self.diags.push(ScanDiag {
             code,
-            message,
+            message: message(),
             start: stop as u32,
             end: stop as u32,
             pin_last_unit: true,
@@ -495,7 +502,7 @@ impl<'s> Lexer<'s> {
                     let stop = self.pos;
                     self.diag_pin_last_unit(
                         crate::diag::UNTERMINATED_MULTI_LINE_COMMENT,
-                        msg::UNTERMINATED_COMMENT.to_owned(),
+                        || msg::UNTERMINATED_COMMENT.to_owned(),
                         stop,
                     );
                     return;
@@ -651,7 +658,7 @@ impl<'s> Lexer<'s> {
             // Non-ASCII whitespace: skip (official advanceAfterError).
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                msg::illegal_character(c),
+                || msg::illegal_character(c),
                 start,
                 start + c.len_utf8(),
             );
@@ -666,7 +673,7 @@ impl<'s> Lexer<'s> {
             // the merge path below.
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                msg::illegal_character(c),
+                || msg::illegal_character(c),
                 start,
                 start + c.len_utf8(),
             );
@@ -686,18 +693,18 @@ impl<'s> Lexer<'s> {
             let low = 0xDC00 + ((cp - 0x10000) & 0x3FF);
             self.diag_pin_last_unit(
                 crate::diag::ILLEGAL_CHARACTER,
-                msg::illegal_character_cp(high),
+                || msg::illegal_character_cp(high),
                 start + 1,
             );
             self.diag_pin_last_unit(
                 crate::diag::ILLEGAL_CHARACTER,
-                msg::illegal_character_cp(low),
+                || msg::illegal_character_cp(low),
                 start + c.len_utf8(),
             );
         } else {
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                msg::illegal_character(c),
+                || msg::illegal_character(c),
                 start,
                 start + c.len_utf8(),
             );
@@ -834,7 +841,7 @@ impl<'s> Lexer<'s> {
         let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
         self.diag(
             EXPECTED_TOKEN,
-            msg::expected_token(lexeme),
+            || msg::expected_token(lexeme),
             close_start,
             close_start + 1,
         );
@@ -861,7 +868,7 @@ impl<'s> Lexer<'s> {
             // the unit past the source, so the encoded range is zero-width
             // at eof.
             let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
-            self.diag(EXPECTED_TOKEN, msg::expected_token(lexeme), eof, eof);
+            self.diag(EXPECTED_TOKEN, || msg::expected_token(lexeme), eof, eof);
         }
     }
 }
