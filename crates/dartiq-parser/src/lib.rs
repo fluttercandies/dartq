@@ -28,6 +28,14 @@
 //!   names are the official listener names mechanically transliterated to
 //!   `snake_case`; token positions carry [`TokenSpan`] (token id + UTF-16
 //!   [`SourceRange`]).
+//! * **Termination on any input** — three structural guarantees keep the
+//!   parser finite (and memory input-bounded) for arbitrary bytes: every
+//!   recovery loop consumes at least one real token per iteration or bails
+//!   (no-progress guards force the consume); structural recursion is capped
+//!   at the official `recoverFromStackOverflow` depth; and a per-file
+//!   diagnostics cap latches a terminal bailout (one bounded diagnostic, no
+//!   further consumption) before a runaway recovery loop can flood memory
+//!   with reports, events, and synthetic tokens.
 //! * **Zero cost without a listener** — the parser is generic over `L:
 //!   ParserListener`; [`NullListener`] (or any all-default impl) monomorphizes
 //!   to dead code. The parser itself allocates nothing per event.
@@ -49,13 +57,9 @@
 //! bodies** (the official `ClassMemberParser` mode: the body shape is
 //! consumed with `handleNoFunctionBody`/`handleFunctionBodySkipped` while
 //! statement internals await #19). Directives are consumed diet-style
-//! (group-aware skip to `;`) until the directive milestone. Until #20 lands:
-//! * constant-pattern / default-value / annotation-argument operands are
-//!   parsed by the reduced constant-expression engine (see `expr_const`);
-//! * function-type formal parameters use the `formal_params` subset without
-//!   modifier validation;
-//! * [`parse_unit`] is a skeleton that consumes the stream through the
-//!   recovery machinery without declaration dispatch.
+//! (group-aware skip to `;`) until the directive milestone. Until #20 lands,
+//! constant-pattern / default-value / annotation-argument operands parse
+//! through the reduced constant-expression engine (see `expr_const`).
 //!
 //! # Scanner interplay
 //!

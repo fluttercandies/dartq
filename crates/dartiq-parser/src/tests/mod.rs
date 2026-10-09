@@ -7,4 +7,5 @@ mod features;
 mod goldens;
 mod patterns;
 mod recovery;
+mod termination;
 mod types;

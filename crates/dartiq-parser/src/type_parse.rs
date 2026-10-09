@@ -459,7 +459,14 @@ fn parse_complex_plain_type(
 impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseRecordType`. The cursor sits before the `(`.
     /// `recordType ::= '(' recordTypeFields ','? recordTypeNamedFields? ')'`.
+    ///
+    /// Depth-guarded: record fields recurse into `compute_type` and back into
+    /// nested record types, so `((((...` is unbounded recursion without the
+    /// guard (official `recoverFromStackOverflow`).
     pub(crate) fn parse_record_type(&mut self, is_question_part_of_type: bool) -> TokenSpan {
+        if !self.enter_depth() {
+            return self.peek_span();
+        }
         let start = self.peek_span(); // `(`
         self.listener.begin_record_type(start);
         self.cursor.advance();
@@ -532,6 +539,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         self.listener
             .end_record_type(start, question, parameter_count, has_named_fields);
+        self.leave_depth();
         question.unwrap_or(end)
     }
 

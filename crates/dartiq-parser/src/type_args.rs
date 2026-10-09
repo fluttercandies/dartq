@@ -60,6 +60,11 @@ impl TypeParamOrArg {
 
     /// Official `parseArguments`: consumes type arguments, emitting
     /// `begin/end_type_arguments` (or `handle_no_type_arguments`).
+    ///
+    /// Entry contract (both arms): the cursor sits on the `<` (`self.start`),
+    /// matching the `SimpleTypeArgument1`/`ComplexTypeParamOrArgInfo` shapes
+    /// (`type_info_impl.dart:1185/:1428`); the fast-shape guard guarantees
+    /// exactly one nameish token before the `>`-family closer.
     pub(crate) fn parse_arguments(
         &self,
         parser: &mut Parser<'_, '_, impl ParserListener>,
@@ -71,10 +76,13 @@ impl TypeParamOrArg {
                 next
             }
             TypeParamOrArg::Simple1 { .. } => {
+                if !parser.enter_depth() {
+                    return parser.peek_span();
+                }
                 let begin = parser.peek_span(); // `<`
                 parser.listener.begin_type_arguments(begin);
+                parser.cursor.advance(); // `<`
                 let name = parser.peek_span();
-                parser.cursor.advance();
                 parser
                     .listener
                     .handle_identifier(name, IdentifierContext::TypeReference);
@@ -83,6 +91,7 @@ impl TypeParamOrArg {
                 let closer_id = parser.cursor.consume_closer();
                 let closer = parser.span_of(closer_id);
                 parser.listener.end_type_arguments(1, begin, closer);
+                parser.leave_depth();
                 closer
             }
             TypeParamOrArg::Complex(g) => (*g).parse_arguments(parser),
@@ -102,20 +111,27 @@ impl TypeParamOrArg {
                 next
             }
             TypeParamOrArg::Simple1 { .. } => {
+                if !parser.enter_depth() {
+                    return parser.peek_span();
+                }
+                // Official `SimpleTypeArgument1.parseVariables`
+                // (`type_info_impl.dart:1204`): `<`, metadata star over the
+                // name, the single variable, then the closer.
                 let begin = parser.peek_span(); // `<`
                 parser.listener.begin_type_variables(begin);
+                parser.cursor.advance(); // `<`
                 parser.listener.begin_metadata_star(parser.peek_span());
                 parser.listener.end_metadata_star(0);
                 let name = parser.ensure_identifier(IdentifierContext::TypeVariableDeclaration);
                 parser.listener.begin_type_variable(name);
                 parser.listener.handle_type_variables_defined(name, 1);
                 parser.listener.handle_no_type(name);
-                parser.cursor.advance();
                 debug_assert!(parser.cursor.peek_is_closer());
                 let closer_id = parser.cursor.consume_closer();
                 let end = parser.span_of(closer_id);
                 parser.listener.end_type_variable(end, 0, None, None);
                 parser.listener.end_type_variables(begin, end);
+                parser.leave_depth();
                 end
             }
             TypeParamOrArg::Complex(g) => (*g).parse_variables(parser, allows_variance),
@@ -477,11 +493,21 @@ impl ComplexTypeParamOrArg {
     ) -> TokenSpan {
         let begin = parser.peek_span(); // `<`
         debug_assert_eq!(parser.cursor.peek_id(), self.start); // entry invariant: cursor on `<`
+        if !parser.enter_depth() {
+            return begin;
+        }
         parser.listener.begin_type_arguments(begin);
         parser.cursor.advance();
         let mut count = 0usize;
         let end;
         loop {
+            if parser.is_bailed() {
+                end = parser.peek_span();
+                parser.listener.end_type_arguments(count, begin, end);
+                parser.leave_depth();
+                return end;
+            }
+            let before = parser.cursor.progress();
             let mut type_info = parser.compute_type(true, false);
             if matches!(type_info, TypeInfo::NoType) {
                 // Recovery: annotations over type arguments are reported and
@@ -504,6 +530,7 @@ impl ComplexTypeParamOrArg {
                         parser.span_of(id)
                     };
                     parser.listener.end_type_arguments(count, begin, end);
+                    parser.leave_depth();
                     return end;
                 }
                 // Recovery: jump to the scanner-paired closer of this group.
@@ -515,10 +542,23 @@ impl ComplexTypeParamOrArg {
                         parser.span_of(id)
                     };
                     parser.listener.end_type_arguments(count, begin, end);
+                    parser.leave_depth();
                     return end;
                 }
+                // Recovery: report and keep going with a synthesized comma
+                // (official). Progress guarantee: this arm runs only when no
+                // closer exists anywhere ahead, so the next iteration must
+                // examine a *new* real token — drain everything queued (the
+                // synthetics' events are already emitted) and force one real
+                // token forward when the iteration consumed none.
                 parser.report(msg::expected_but_got(","), parser.peek_span());
                 parser.synthetic(TokenKind::Comma, parser.peek_span().range.offset);
+                while parser.cursor.peek_id() as usize >= parser.table.len() {
+                    parser.cursor.advance();
+                }
+                if !parser.cursor.at_eof() && parser.cursor.progress() == before {
+                    parser.force_advance();
+                }
                 continue;
             }
             parser.cursor.advance();
@@ -534,6 +574,9 @@ impl ComplexTypeParamOrArg {
     ) -> TokenSpan {
         let begin = parser.peek_span(); // `<`
         debug_assert_eq!(parser.cursor.peek_id(), self.start); // entry invariant: cursor on `<`
+        if !parser.enter_depth() {
+            return begin;
+        }
         parser.listener.begin_type_variables(begin);
         parser.cursor.advance();
 
@@ -544,6 +587,12 @@ impl ComplexTypeParamOrArg {
         let mut variances: Vec<Option<TokenSpan>> = Vec::new();
 
         loop {
+            if parser.is_bailed() {
+                break;
+            }
+            // Real-progress baseline for this variable iteration (the
+            // missing-comma recovery arm compares against it).
+            let iteration_before = parser.cursor.progress();
             parser.parse_metadata_star();
 
             // Variance modifier (`in`/`inout`/`out`) when allowed.
@@ -588,6 +637,16 @@ impl ComplexTypeParamOrArg {
                     if looks_like_type_param_member(parser) {
                         parser.report(msg::expected_but_got(","), parser.peek_span());
                         parser.synthetic(TokenKind::Comma, parser.peek_span().range.offset);
+                        // Progress guarantee: drain the synthesized comma so
+                        // the next iteration's `ensure_identifier` consumes
+                        // the real name token, and force one token forward
+                        // when the whole iteration consumed nothing real.
+                        while parser.cursor.peek_id() as usize >= parser.table.len() {
+                            parser.cursor.advance();
+                        }
+                        if !parser.cursor.at_eof() && parser.cursor.progress() == iteration_before {
+                            parser.force_advance();
+                        }
                         continue;
                     }
                     break;
@@ -624,6 +683,7 @@ impl ComplexTypeParamOrArg {
             parser.type_arg_group_end_or_synthetic(begin)
         };
         parser.listener.end_type_variables(begin, end);
+        parser.leave_depth();
         end
     }
 }

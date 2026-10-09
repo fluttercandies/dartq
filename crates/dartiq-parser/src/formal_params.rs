@@ -39,7 +39,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     /// Official `parseFormalParametersRest`; the cursor sits before `(`.
+    ///
+    /// Depth-guarded: inline function-typed parameters recurse back into this
+    /// function through `parseFormalParameter`, so `((((...` in a parameter
+    /// list is unbounded recursion without the guard (official
+    /// `recoverFromStackOverflow`).
     pub(crate) fn parse_formal_parameters_rest(&mut self, kind: MemberKind) -> TokenSpan {
+        if !self.enter_depth() {
+            return self.peek_span();
+        }
         let begin = self.peek_span();
         let begin_group_close = self.current_matching_end();
         self.listener.begin_formal_parameters(begin, kind);
@@ -47,6 +55,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut parameter_count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                end = self.peek_span();
+                break;
+            }
             match self.peek_kind() {
                 TokenKind::CloseParen => {
                     end = self.peek_span();
@@ -115,6 +127,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         self.listener
             .end_formal_parameters(parameter_count, begin, end, kind);
+        self.leave_depth();
         end
     }
 
@@ -152,6 +165,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut parameter_count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                end = self.peek_span();
+                break;
+            }
             if self.peek_kind() == TokenKind::CloseSquare {
                 end = self.peek_span();
                 break;
@@ -198,6 +215,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut parameter_count = 0usize;
         let end;
         loop {
+            if self.is_bailed() {
+                end = self.peek_span();
+                break;
+            }
             if self.peek_kind() == TokenKind::CloseCurly {
                 end = self.peek_span();
                 break;

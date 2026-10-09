@@ -18,6 +18,14 @@ use crate::token_id::{TokenId, TokenSpan};
 /// `recoverFromStackOverflow` cap of 500, `parser_impl.dart:6709`).
 const MAX_DEPTH: u32 = 500;
 
+/// Per-file diagnostics cap (rust-analyzer parser-bailout practice). A
+/// recovery loop that cannot make progress must not stream unbounded
+/// diagnostics (and the synthetic tokens and listener events that ride along
+/// with each report) into memory. When the cap hits, the parser records one
+/// terminal diagnostic, latches the bailout, and every grammar loop unwinds
+/// without consuming further tokens.
+pub(crate) const MAX_DIAGNOSTICS: usize = 10_000;
+
 /// `AsyncModifier` (official `AsyncModifier` in `parser_impl.dart`): the
 /// async/sync modifier state of the function currently being parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +51,11 @@ pub struct Parser<'s, 't, L: ParserListener> {
     pub(crate) is_last_pattern_allowed_inside_unary_pattern: bool,
     /// Structural nesting depth guard.
     depth: u32,
+    /// Diagnostics emitted so far, against [`MAX_DIAGNOSTICS`].
+    diagnostics_emitted: u32,
+    /// Terminal bailout latch (diagnostics cap or nesting cap): set once,
+    /// every grammar loop then unwinds without consuming.
+    bailed: bool,
     /// `asyncState`: modifier state for `inPlainSync` checks.
     pub(crate) async_state: AsyncModifier,
     /// Augment token captured by a declaration-modifier walk, handed to the
@@ -66,6 +79,8 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             features,
             is_last_pattern_allowed_inside_unary_pattern: true,
             depth: 0,
+            diagnostics_emitted: 0,
+            bailed: false,
             async_state: AsyncModifier::Sync,
             pending_augment: None,
         }
@@ -123,13 +138,19 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         is_identifier(self.cursor.peek().kind)
     }
 
-    // --- depth guard ------------------------------------------------------------
+    // --- depth + bailout guards ---------------------------------------------
 
-    /// Enters a nested structure; `false` means the cap was hit and the
-    /// caller must return immediately without consuming (the enclosing loop
-    /// no-progress guards then unwind).
+    /// Enters a nested structure; `false` means a cap was hit (nesting cap,
+    /// or the bailout already latched) and the caller must return immediately
+    /// without consuming — the enclosing loops' no-progress guards unwind.
+    /// Hitting the nesting cap latches the bailout (official
+    /// `recoverFromStackOverflow`: report `stackOverflow` once and stop).
     pub(crate) fn enter_depth(&mut self) -> bool {
+        if self.bailed {
+            return false;
+        }
         if self.depth >= MAX_DEPTH {
+            self.bail(crate::message::msg::stack_overflow(MAX_DEPTH));
             return false;
         }
         self.depth += 1;
@@ -138,6 +159,39 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
 
     pub(crate) fn leave_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    /// Whether the terminal bailout latched: every grammar loop checks this
+    /// and unwinds without consuming further tokens.
+    pub(crate) fn is_bailed(&self) -> bool {
+        self.bailed
+    }
+
+    /// Latches the terminal bailout, recording exactly one bounded diagnostic
+    /// (`rust-analyzer` cuts the parse the same way). Idempotent: later cap
+    /// hits and descent attempts are silent.
+    pub(crate) fn bail(&mut self, message: crate::message::Message) {
+        if self.bailed {
+            return;
+        }
+        self.bailed = true;
+        let at = self.peek_span();
+        self.listener.handle_recoverable_error(message, at, at);
+    }
+
+    /// Accounting for one diagnostic against [`MAX_DIAGNOSTICS`]; `false`
+    /// means the caller must suppress the report (the cap latched now or
+    /// earlier).
+    pub(crate) fn admit_diagnostic(&mut self) -> bool {
+        if self.bailed {
+            return false;
+        }
+        self.diagnostics_emitted += 1;
+        if self.diagnostics_emitted as usize == MAX_DIAGNOSTICS {
+            self.bail(crate::message::msg::too_many_errors(MAX_DIAGNOSTICS));
+            return false;
+        }
+        true
     }
 
     // --- top-level entry -----------------------------------------------------------
@@ -152,7 +206,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             self.cursor.advance();
         }
         let mut count = 0usize;
-        while !self.cursor.at_eof() {
+        while !self.cursor.at_eof() && !self.bailed {
             let start_pos = self.cursor.peek_id();
             self.parse_top_level_declaration();
             self.listener.end_top_level_declaration(self.peek_span());
@@ -200,11 +254,13 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     /// gate (the only experiment-gated declaration shape this milestone
     /// parses).
     pub(crate) fn report_experiment_not_enabled(&mut self, at: TokenSpan) {
-        self.listener.handle_experiment_not_enabled(
-            crate::listener::ExperimentalFlag::PrimaryConstructors,
-            at,
-            at,
-        );
+        if self.admit_diagnostic() {
+            self.listener.handle_experiment_not_enabled(
+                crate::listener::ExperimentalFlag::PrimaryConstructors,
+                at,
+                at,
+            );
+        }
     }
 
     /// Parses a full pattern at the cursor in `context` (official

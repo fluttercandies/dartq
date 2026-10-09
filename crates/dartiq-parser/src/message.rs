@@ -73,10 +73,10 @@ pub(crate) mod msg {
         INVALID_CONSTANT_PATTERN_BINARY, INVALID_INSIDE_UNARY_PATTERN, MISSING_IDENTIFIER,
         MULTIPLE_VARIANCE_MODIFIERS, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
         RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
-        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, VAR_AND_TYPE,
+        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
     };
-    use dartiq_diagnostics::{CodeInfo, DiagnosticType};
+    use dartiq_diagnostics::{CodeInfo, DARTIQ_INTERNAL_ERROR, DiagnosticType};
 
     /// `expectedToken` / `expectedButGot` / `expectedAfterButGot` all surface
     /// as the analyzer's `EXPECTED_TOKEN` (pseudoSharedCode in messages.yaml).
@@ -214,6 +214,27 @@ pub(crate) mod msg {
         Message::new(
             ANNOTATION_WITH_TYPE_ARGUMENTS_UNINSTANTIATED,
             "An annotation with type arguments must be followed by an argument list.",
+        )
+    }
+
+    /// Terminal bailout (rust-analyzer parser-bailout practice): the
+    /// per-file diagnostics cap latched, so parsing stops with this one
+    /// bounded diagnostic instead of streaming unbounded errors. dartiq-own
+    /// code: no official analyzer message covers a parser bailout.
+    pub(crate) fn too_many_errors(cap: usize) -> Message {
+        Message::new(
+            DARTIQ_INTERNAL_ERROR,
+            format!("Too many syntax errors ({cap}); the rest of the file was not analyzed."),
+        )
+    }
+
+    /// Terminal bailout for structural nesting past the parser's
+    /// stack-overflow guard (official `recoverFromStackOverflow`,
+    /// `parser_impl.dart:11386`, `diag.stackOverflow`).
+    pub(crate) fn stack_overflow(cap: u32) -> Message {
+        Message::new(
+            STACK_OVERFLOW,
+            format!("The file has too many nested expressions or statements (limit {cap})."),
         )
     }
 

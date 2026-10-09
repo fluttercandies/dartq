@@ -437,6 +437,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.cursor.advance();
                     self.report(msg::extraneous_modifier("var"), t);
                 }
+                // Pseudo-keywords already captured by the dispatch walk
+                // (`sealed`/`base`/`interface`): consume them here so the
+                // walk ends on the declaration keyword.
+                TokenKind::Keyword(Keyword::Sealed | Keyword::Base | Keyword::Interface) => {
+                    self.cursor.advance();
+                }
                 _ => break,
             }
         }
@@ -517,6 +523,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.cursor.advance();
                     mods.augment = Some(t);
                 }
+                // Pseudo-keywords already captured (and reported where
+                // invalid) by the dispatch walk: consume and move on.
+                TokenKind::Keyword(Keyword::Sealed | Keyword::Base | Keyword::Interface) => {
+                    self.cursor.advance();
+                }
                 _ => break,
             }
         }
@@ -539,12 +550,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.cursor.advance(); // `typedef`
 
         let type_info = self.compute_type(false, true);
-        let after_type = type_info.skip_type(self);
         let mut equals: Option<TokenSpan> = None;
 
-        // New-style vs old-style decision (official :1487-1518).
+        // New-style vs old-style decision (official :1487-1518). The official
+        // probes the group from `skipType(..).next!` — the token after the
+        // (possibly empty) `typedef <type>` head — so the offset from the
+        // cursor (still on the head's first token) depends on the head shape:
+        // `NoType` skips to before the start (+1), a consumed type to its last
+        // token (+2). The garbage-recovery recompute below re-anchors at the
+        // cursor for the missing-name shape (`typedef <T> = ...`).
         let mut new_style = false;
-        let mut type_param = self.compute_type_param_or_arg_at(0, true);
+        let head_end = type_info.skip_type(self);
+        let head_offset = self.offset_of(head_end) + 2 - self.cursor.real_pos();
+        let mut type_param = self.compute_type_param_or_arg_at(head_offset, true);
         if matches!(type_info, TypeInfo::NoType) {
             let skip = type_param.skip(self.peek_id());
             let next_kind = self.kind_at(self.offset_of(skip) + 1);
@@ -560,7 +578,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 new_style = true;
             }
         }
-        let _ = after_type;
 
         let end;
         if new_style {
@@ -646,10 +663,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
             let mut element_count = 0usize;
             loop {
-                if matches!(
-                    self.peek_kind(),
-                    TokenKind::CloseCurly | TokenKind::Semicolon
-                ) {
+                if self.is_bailed()
+                    || matches!(
+                        self.peek_kind(),
+                        TokenKind::CloseCurly | TokenKind::Semicolon
+                    )
+                {
                     break;
                 }
                 self.parse_enum_element();
@@ -688,7 +707,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 .handle_enum_elements(self.peek_span(), element_count);
             if self.peek_kind() == TokenKind::Semicolon {
                 self.cursor.advance();
-                while !self.cursor.at_eof() && self.peek_kind() != TokenKind::CloseCurly {
+                while !self.cursor.at_eof()
+                    && !self.is_bailed()
+                    && self.peek_kind() != TokenKind::CloseCurly
+                {
                     let before = self.cursor.progress();
                     self.parse_class_member_impl(DeclarationKind::Enum, self.enum_name(name));
                     member_count += 1;
@@ -1147,6 +1169,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     fn parse_class_header_recovery(&mut self, kind: DeclarationHeaderKind, seen: HeaderClauses) {
         let mut clauses = seen;
         loop {
+            if self.is_bailed() {
+                break;
+            }
             let before = self.cursor.progress();
             // skipUnexpectedTokenOpt: a non-keyword token directly before a
             // clause keyword is reported and skipped.
@@ -1256,7 +1281,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.listener
             .begin_class_or_mixin_or_extension_body(kind, open);
         let mut count = 0usize;
-        while !self.cursor.at_eof() && self.peek_kind() != TokenKind::CloseCurly {
+        while !self.cursor.at_eof()
+            && !self.is_bailed()
+            && self.peek_kind() != TokenKind::CloseCurly
+        {
             let before = self.cursor.progress();
             self.parse_class_member_impl(kind, enclosing);
             count += 1;
@@ -1347,6 +1375,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     fn parse_mixin_header_recovery(&mut self, seen: HeaderClauses, is_augmentation: bool) {
         let mut clauses = seen;
         loop {
+            if self.is_bailed() {
+                break;
+            }
             let before = self.cursor.progress();
             // on
             if self.peek_kind() == TokenKind::Keyword(Keyword::On) {

@@ -4,10 +4,10 @@ use dartiq_language::{FeatureSet, LanguageVersion};
 use dartiq_scanner::{ScanConfig, TokenTable};
 use dartiq_source::FileTable;
 
+use crate::listener::Token;
 use crate::listener::{ExperimentalFlag, ParserListener};
 use crate::message::Message;
 use crate::parser::Parser;
-use crate::listener::Token;
 use crate::token_id::TokenSpan;
 
 /// Scans `source` with the default (latest) configuration and asserts no
@@ -178,13 +178,35 @@ impl ParserListener for Collector {
     }
 
     // —— declarations (#18) ————————————————————————————————————————————
-    fn begin_class_declaration(&mut self, _: Token, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Token) {
+    fn begin_class_declaration(
+        &mut self,
+        _: Token,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+    ) {
         self.log.push(("begin", "class_declaration"));
     }
     fn end_class_declaration(&mut self, _: Token, _: Token) {
         self.log.push(("end", "class_declaration"));
     }
-    fn begin_named_mixin_application(&mut self, _: Token, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Token) {
+    fn begin_named_mixin_application(
+        &mut self,
+        _: Token,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+    ) {
         self.log.push(("begin", "named_mixin_application"));
     }
     fn end_named_mixin_application(
@@ -197,7 +219,14 @@ impl ParserListener for Collector {
     ) {
         self.log.push(("end", "named_mixin_application"));
     }
-    fn begin_mixin_declaration(&mut self, _: Token, _: Option<Token>, _: Option<Token>, _: Token, _: Token) {
+    fn begin_mixin_declaration(
+        &mut self,
+        _: Token,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+        _: Token,
+    ) {
         self.log.push(("begin", "mixin_declaration"));
     }
     fn end_mixin_declaration(&mut self, _: Token, _: Token) {
@@ -218,7 +247,14 @@ impl ParserListener for Collector {
     fn begin_extension_type_declaration(&mut self, _: Option<Token>, _: Token, _: Token) {
         self.log.push(("begin", "extension_type_declaration"));
     }
-    fn end_extension_type_declaration(&mut self, _: Token, _: Option<Token>, _: Token, _: Token, _: Token) {
+    fn end_extension_type_declaration(
+        &mut self,
+        _: Token,
+        _: Option<Token>,
+        _: Token,
+        _: Token,
+        _: Token,
+    ) {
         self.log.push(("end", "extension_type_declaration"));
     }
     fn begin_typedef(&mut self, _: Token) {
@@ -230,25 +266,82 @@ impl ParserListener for Collector {
     fn begin_top_level_member(&mut self, _: Token) {
         self.log.push(("begin", "top_level_member"));
     }
-    fn begin_method(&mut self, _: crate::listener::DeclarationKind, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Token, _: Option<&str>) {
+    fn begin_method(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+        _: Option<&str>,
+    ) {
         self.log.push(("begin", "method"));
     }
-    fn end_method(&mut self, _: crate::listener::DeclarationKind, _: Option<Token>, _: Token, _: Token, _: Option<Token>, _: Token) {
+    fn end_method(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Option<Token>,
+        _: Token,
+        _: Token,
+        _: Option<Token>,
+        _: Token,
+    ) {
         self.log.push(("end", "method"));
     }
-    fn begin_constructor(&mut self, _: crate::listener::DeclarationKind, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Token, _: Option<&str>) {
+    fn begin_constructor(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+        _: Option<&str>,
+    ) {
         self.log.push(("begin", "constructor"));
     }
-    fn end_constructor(&mut self, _: crate::listener::DeclarationKind, _: Token, _: Option<Token>, _: Token, _: Option<Token>, _: Token) {
+    fn end_constructor(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Token,
+        _: Option<Token>,
+        _: Token,
+        _: Option<Token>,
+        _: Token,
+    ) {
         self.log.push(("end", "constructor"));
     }
-    fn begin_factory(&mut self, _: crate::listener::DeclarationKind, _: Token, _: Option<Token>, _: Option<Token>, _: Option<Token>) {
+    fn begin_factory(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Token,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+    ) {
         self.log.push(("begin", "factory"));
     }
     fn end_factory(&mut self, _: crate::listener::DeclarationKind, _: Token, _: Token, _: Token) {
         self.log.push(("end", "factory"));
     }
-    fn begin_fields(&mut self, _: crate::listener::DeclarationKind, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Option<Token>, _: Token) {
+    fn begin_fields(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Token,
+    ) {
         self.log.push(("begin", "fields"));
     }
     fn end_fields(
@@ -267,7 +360,11 @@ impl ParserListener for Collector {
     ) {
         self.log.push(("end", "fields"));
     }
-    fn begin_class_or_mixin_or_extension_body(&mut self, _: crate::listener::DeclarationKind, _: Token) {
+    fn begin_class_or_mixin_or_extension_body(
+        &mut self,
+        _: crate::listener::DeclarationKind,
+        _: Token,
+    ) {
         self.log.push(("begin", "body"));
     }
     fn end_class_or_mixin_or_extension_body(

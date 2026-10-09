@@ -37,10 +37,7 @@ fn named_mixin_application() {
 fn mixin_with_on_and_implements() {
     let c = parse("base mixin M on A implements B {}");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    c.assert_sequence(&[
-        ("begin", "mixin_declaration"),
-        ("end", "mixin_declaration"),
-    ]);
+    c.assert_sequence(&[("begin", "mixin_declaration"), ("end", "mixin_declaration")]);
 }
 
 #[test]
@@ -61,10 +58,7 @@ fn mixin_application_semantics_on_class() {
 fn enum_with_elements() {
     let c = parse("enum E { a, b }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    c.assert_sequence(&[
-        ("begin", "enum_declaration"),
-        ("end", "enum_declaration"),
-    ]);
+    c.assert_sequence(&[("begin", "enum_declaration"), ("end", "enum_declaration")]);
 }
 
 #[test]
@@ -187,10 +181,7 @@ fn function_typed_parameter() {
 fn final_enum_reports() {
     let c = parse("final enum E { a }");
     assert_eq!(c.error_codes(), ["final_enum"]);
-    c.assert_sequence(&[
-        ("begin", "enum_declaration"),
-        ("end", "enum_declaration"),
-    ]);
+    c.assert_sequence(&[("begin", "enum_declaration"), ("end", "enum_declaration")]);
 }
 
 #[test]
@@ -217,10 +208,7 @@ fn interface_mixin_reports() {
 fn duplicate_extends_reports_once() {
     let c = parse("class C extends A extends B {}");
     assert_eq!(c.error_codes(), ["multiple_extends_clauses"]);
-    c.assert_sequence(&[
-        ("begin", "class_declaration"),
-        ("end", "class_declaration"),
-    ]);
+    c.assert_sequence(&[("begin", "class_declaration"), ("end", "class_declaration")]);
 }
 
 #[test]
@@ -302,4 +290,3 @@ fn empty_unit_is_two_events() {
     let c = parse("");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
 }
-

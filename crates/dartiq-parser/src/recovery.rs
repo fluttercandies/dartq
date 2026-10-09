@@ -26,19 +26,26 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// `findNonZeroLengthToken` adjustment is unnecessary here because the
     /// scanner keeps zero-width synthetics out of the way of normal
     /// reporting — our spans stay within bounds regardless).
+    ///
+    /// Counted against the per-file diagnostics cap: suppressed once the
+    /// bailout latched.
     pub(crate) fn report(&mut self, message: crate::message::Message, at: TokenSpan) {
-        self.listener.handle_recoverable_error(message, at, at);
+        if self.admit_diagnostic() {
+            self.listener.handle_recoverable_error(message, at, at);
+        }
     }
 
     /// Reports with an explicit span end (official
-    /// `reportRecoverableErrorWithEnd`).
+    /// `reportRecoverableErrorWithEnd`); same cap accounting as [`Self::report`].
     pub(crate) fn report_with_end(
         &mut self,
         message: crate::message::Message,
         start: TokenSpan,
         end: TokenSpan,
     ) {
-        self.listener.handle_recoverable_error(message, start, end);
+        if self.admit_diagnostic() {
+            self.listener.handle_recoverable_error(message, start, end);
+        }
     }
 
     /// Consumes a required token or reports `Expected to find '<lexeme>'.`
