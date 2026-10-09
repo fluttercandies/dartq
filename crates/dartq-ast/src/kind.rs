@@ -574,8 +574,8 @@ pub enum LeafShape {
     /// token fields). Built only through `begin`/`patch`/`end` — `patch`
     /// reaches open nodes, so a leaf-emitted Fielded kind could never fill
     /// its slot. The pattern (every word written explicitly; debug builds
-    /// poison-fill the slot at `begin` and sweep it at `end`, so a missed
-    /// write fails there — release trusts the parser):
+    /// poison-fill the slot when it materializes and sweep it at `end`, so a
+    /// missed write fails there — release trusts the parser):
     ///
     /// ```
     /// use dartq_ast::{AstBuilder, NodeKind};

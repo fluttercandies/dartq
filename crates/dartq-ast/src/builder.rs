@@ -5,13 +5,17 @@
 //!
 //! Invariants locked here (milestone-independent, layout spec §6): post-order
 //! push on every `end`, so child ranges are contiguous; begin/end pairs
-//! checked against the collapse-map pairing table; payload slots reserved at
-//! `begin` and back-filled by member events (the official class-like builder
-//! pattern; debug builds poison-fill the slot and sweep it at `end` so a
-//! missed write fails at seal time); the compilation unit root sealed last
-//! (events after the root seal are refused in debug builds). Leaf
-//! construction follows the [`LeafShape`] contract: `leaf`/`leaf_span` carry
-//! no payload words — Fielded kinds build via `begin`/`patch`/`end`.
+//! checked against the collapse-map pairing table; a Fielded node's payload
+//! slot materializes lazily at the pool tail on its first `patch` and is
+//! back-filled in place by member events (the official class-like builder
+//! pattern; debug builds poison-fill the slot on materialization and sweep
+//! it at `end` so a missed write fails at seal time — a node that seals
+//! without ever materializing allocates zero pool words); the compilation
+//! unit root sealed last (events after the root seal are refused in debug
+//! builds). Speculation (`mark`/`rollback`) also undoes `patch` writes into
+//! slots that predate the mark. Leaf construction follows the [`LeafShape`]
+//! contract: `leaf`/`leaf_span` carry no payload words — Fielded kinds build
+//! via `begin`/`patch`/`end`.
 //!
 //! This crate never depends on the parser: `dartq-parser` implements its
 //! `ParserListener` trait over these event families (layout spec §1.3 end).
@@ -21,10 +25,11 @@
 use crate::kind::{LeafShape, NodeKind, accepts_begin, flags, leaf_shape, payload_len};
 use crate::table::{DATA_NONE, NodeHeader, SyntaxTable};
 
-/// One open (begun, not yet sealed) container. Its payload slot is already
-/// reserved at the tail of the pool; later member events back-fill it in
-/// place, which is what lets a class-like declaration absorb events spread
-/// across its whole header (collapse map §2.2 pattern).
+/// One open (begun, not yet sealed) container. Its payload slot materializes
+/// lazily at the tail of the pool on the first [`AstBuilder::patch`] — a node
+/// sealed without one allocates nothing — and later member events back-fill
+/// it in place, which is what lets a class-like declaration absorb events
+/// spread across its whole header (collapse map §2.2 pattern).
 #[derive(Debug)]
 struct OpenNode {
     kind: NodeKind,
@@ -32,14 +37,18 @@ struct OpenNode {
     /// First child = arena length when this node was begun; every node
     /// completed while it stays open is its child, contiguously.
     first_child: u32,
-    payload_start: u32,
+    /// Pool index of the payload slot once materialized; `None` until the
+    /// first `patch`. Materialization always appends at the pool tail, so
+    /// `rollback` can tell post-mark slots from pre-mark ones by the pool
+    /// mark alone.
+    payload_start: Option<u32>,
     /// Modifier-set bits (`ModSet`, collapse map §1) collected before sealing
     /// — stored into the header by `end` (`set_modifiers`, #174).
     mod_flags: u16,
     errored: bool,
 }
 
-/// Debug-only payload poison: `begin` fills the reserved slot with it and
+/// Debug-only payload poison: materialization fills the slot with it and
 /// `end` sweeps, so a Fielded word the parser forgot to `patch` fails loudly
 /// at seal time instead of silently reading as token 0 (which is a valid
 /// index — zero-fill is never a value). Release keeps zero-fill and trusts
@@ -48,14 +57,28 @@ struct OpenNode {
 /// and small counters, none of which reach 3.7 billion).
 const POISON: u32 = 0xDEAD_BEEF;
 
+/// One `patch` write recorded for [`AstBuilder::rollback`]: the pool word
+/// and the value it held before the write. Logged on every `patch` and
+/// retained until `finish` — O(patches) by construction (speculation
+/// depth × payload width, both parser-bounded).
+#[derive(Clone, Copy, Debug)]
+struct UndoWrite {
+    word: u32,
+    old: u32,
+}
+
 /// Restoration point for parser speculation: `rollback` truncates the open
-/// stack, the arena, the pool, and every error-flag bit set since the mark.
+/// stack, the arena, the pool, and every error-flag bit set since the mark,
+/// and undoes every `patch` write made since it — including writes into
+/// slots whose node predates the mark, which the pool truncation alone
+/// cannot reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Marker {
     open: usize,
     nodes: usize,
     pool: usize,
     error_log: usize,
+    undo_log: usize,
 }
 
 /// Builds one [`SyntaxTable`] from parser events.
@@ -67,6 +90,11 @@ pub struct AstBuilder {
     /// Open-stack indices whose `errored` bit was flipped false→true, in
     /// order — the undo log that makes error propagation rollback-safe.
     error_log: Vec<usize>,
+    /// `patch` writes as (word, previous value), in order — the undo log
+    /// that makes payload back-fill rollback-safe even for slots
+    /// materialized before the mark (a pool truncation cannot reach those
+    /// words).
+    undo_log: Vec<UndoWrite>,
     /// Whether the root was already sealed (the open stack drained on an
     /// `end`). Anything begun or leaf-emitted afterwards would land *behind*
     /// the root and corrupt [`SyntaxTable::root`], so every event entry
@@ -80,8 +108,10 @@ impl AstBuilder {
         Self::default()
     }
 
-    /// Opens a container node anchored at `first_token` and reserves its
-    /// payload slot (poison-filled in debug builds — see [`POISON`]).
+    /// Opens a container node anchored at `first_token`. No pool words are
+    /// reserved: the payload slot materializes at the pool tail on the first
+    /// [`Self::patch`] (poison-filled in debug builds — see [`POISON`]), so
+    /// a node that seals without patches allocates nothing.
     ///
     /// For shared-begin pairs (collapse map §2) the parser opens the kind it
     /// can name up front; the payload width of that kind must be at least the
@@ -90,15 +120,11 @@ impl AstBuilder {
     /// this with a debug assertion.
     pub fn begin(&mut self, kind: NodeKind, first_token: u32) {
         debug_assert!(!self.root_sealed, "begin after the root was sealed");
-        let payload_start = self.pool.len() as u32;
-        let fill = if cfg!(debug_assertions) { POISON } else { 0 };
-        self.pool
-            .resize(self.pool.len() + payload_len(kind) as usize, fill);
         self.open.push(OpenNode {
             kind,
             first_token,
             first_child: self.nodes.len() as u32,
-            payload_start,
+            payload_start: None,
             mod_flags: 0,
             errored: false,
         });
@@ -136,9 +162,9 @@ impl AstBuilder {
     /// Panics when no node is open (parser bug, surfaces in any build).
     /// Debug builds additionally assert that `end_token` is not before the
     /// node's `first_token`, that `end_kind` accepts the open kind (pairing
-    /// table), that the sealed kind's payload fits the slot reserved at
-    /// `begin`, and that no payload word is still [`POISON`] (a missed
-    /// `patch`); release builds trust the parser.
+    /// table), that the sealed kind's payload fits the materialized slot,
+    /// and that no payload word is still [`POISON`] (a missed `patch`);
+    /// release builds trust the parser.
     pub fn end(&mut self, end_kind: NodeKind, end_token: u32) {
         let node = self.open.pop().expect("end without a matching begin");
         debug_assert!(
@@ -151,16 +177,29 @@ impl AstBuilder {
             "end {end_kind:?}: end_token {end_token} precedes first_token {}",
             node.first_token
         );
-        let width = payload_len(end_kind);
-        debug_assert!(
-            node.payload_start as usize + width as usize <= self.pool.len(),
-            "payload slot narrower than the sealed kind's width"
-        );
+        let width = payload_len(end_kind) as usize;
+        let data = match node.payload_start {
+            Some(start) => {
+                debug_assert!(
+                    start as usize + width <= self.pool.len(),
+                    "payload slot narrower than the sealed kind's width"
+                );
+                if width == 0 { DATA_NONE } else { start }
+            }
+            // Nothing ever patched the node. A width-0 seal allocates zero
+            // pool words (the parenthesized-expression narrow-seal case); a
+            // Fielded seal materializes its slot at the tail so `payload`
+            // stays width-faithful — and the poison fill trips the sweep
+            // below at seal time, exactly as if the slot had been reserved
+            // at `begin`.
+            None if width == 0 => DATA_NONE,
+            None => self.reserve_payload(width),
+        };
         #[cfg(debug_assertions)]
-        for word in
-            &self.pool[node.payload_start as usize..node.payload_start as usize + width as usize]
-        {
-            debug_assert!(*word != POISON, "unpatched payload word in {end_kind:?}");
+        if width > 0 {
+            for word in &self.pool[data as usize..data as usize + width] {
+                debug_assert!(*word != POISON, "unpatched payload word in {end_kind:?}");
+            }
         }
         let errored = node.errored;
         if errored {
@@ -174,11 +213,7 @@ impl AstBuilder {
             end_token,
             first_child: node.first_child,
             end_child: self.nodes.len() as u32,
-            data: if width == 0 {
-                DATA_NONE
-            } else {
-                node.payload_start
-            },
+            data,
         });
     }
 
@@ -232,9 +267,21 @@ impl AstBuilder {
         });
     }
 
+    /// Appends `width` payload words at the pool tail — poison-filled in
+    /// debug builds so the `end` sweep catches unwritten ones, zero in
+    /// release — and returns the slot's start index.
+    fn reserve_payload(&mut self, width: usize) -> u32 {
+        let fill = if cfg!(debug_assertions) { POISON } else { 0 };
+        let start = self.pool.len() as u32;
+        self.pool.resize(self.pool.len() + width, fill);
+        start
+    }
+
     /// Back-fills field `field` (0-based word index into the innermost open
     /// node's payload slot) with `value` — the member-event side of the
-    /// class-like slot pattern.
+    /// class-like slot pattern. The slot materializes at the pool tail on
+    /// the node's first `patch`; the write is logged so [`Self::rollback`]
+    /// can undo it.
     ///
     /// # Panics
     ///
@@ -243,9 +290,10 @@ impl AstBuilder {
     /// the error through the error log and skip the write — a field
     /// outside the slot would overwrite a neighboring node's payload word.
     pub fn patch(&mut self, field: usize, value: u32) {
-        let node = self.open.last().expect("patch without an open node");
-        let slot = node.payload_start as usize;
-        let kind = node.kind;
+        let (kind, payload_start) = match self.open.last() {
+            Some(node) => (node.kind, node.payload_start),
+            None => panic!("patch without an open node"),
+        };
         if field >= payload_len(kind) as usize {
             // Release guard for the debug assertion: a field outside the
             // open node's slot addresses a NEIGHBORING node's pool word —
@@ -257,7 +305,24 @@ impl AstBuilder {
             self.mark_error();
             return;
         }
-        self.pool[slot + field] = value;
+        let start = match payload_start {
+            Some(start) => start,
+            None => {
+                let start = self.reserve_payload(payload_len(kind) as usize);
+                self.open
+                    .last_mut()
+                    .expect("patch without an open node")
+                    .payload_start = Some(start);
+                start
+            }
+        };
+        let slot = start as usize + field;
+        let old = self.pool[slot];
+        self.undo_log.push(UndoWrite {
+            word: slot as u32,
+            old,
+        });
+        self.pool[slot] = value;
     }
 
     /// Marks an error inside the innermost open node; the bit propagates to
@@ -299,12 +364,22 @@ impl AstBuilder {
             nodes: self.nodes.len(),
             pool: self.pool.len(),
             error_log: self.error_log.len(),
+            undo_log: self.undo_log.len(),
         }
     }
 
-    /// Discards every event since `marker`, including error-flag bits set on
-    /// still-open nodes.
+    /// Discards every event since `marker`: the `patch` writes made since
+    /// it (each word restored to its previous value — including writes into
+    /// slots whose node predates the mark, which the pool truncation alone
+    /// cannot reach), the error-flag bits set on still-open nodes, the open
+    /// stack, the arena, and the pool. Open nodes that survive the
+    /// truncation but first materialized after the mark are dematerialized:
+    /// their slot lived in the truncated pool tail, and the next `patch`
+    /// re-materializes it.
     pub fn rollback(&mut self, marker: Marker) {
+        for entry in self.undo_log.drain(marker.undo_log..).rev() {
+            self.pool[entry.word as usize] = entry.old;
+        }
         for &index in &self.error_log[marker.error_log..] {
             if index < self.open.len() {
                 self.open[index].errored = false;
@@ -314,6 +389,11 @@ impl AstBuilder {
         self.open.truncate(marker.open);
         self.nodes.truncate(marker.nodes);
         self.pool.truncate(marker.pool);
+        for node in &mut self.open[..marker.open] {
+            if node.payload_start.is_some_and(|start| start as usize >= marker.pool) {
+                node.payload_start = None;
+            }
+        }
         // Restore the flag to its state at mark time: the root was already
         // sealed then iff nothing was open and the arena was non-empty.
         self.root_sealed = marker.open == 0 && marker.nodes > 0;
@@ -323,8 +403,10 @@ impl AstBuilder {
     ///
     /// # Panics
     ///
-    /// Panics when a begun node was never sealed — the compilation unit root
-    /// is allocated last, so a non-empty open stack means a truncated unit.
+    /// Debug builds panic when a begun node was never sealed — the
+    /// compilation unit root is allocated last, so a non-empty open stack
+    /// means a truncated unit. Release builds yield a mis-rooted table
+    /// instead (the truncated unit's last arena row would read as the root).
     #[must_use]
     pub fn finish(self) -> SyntaxTable {
         debug_assert!(

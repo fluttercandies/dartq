@@ -895,6 +895,81 @@ fn rollback_truncates_nodes_pool_and_error_bits() {
 }
 
 #[test]
+fn rollback_undoes_patches_into_pre_mark_slots() {
+    // The rollback leak: a patch into a node opened BEFORE the mark writes
+    // a pool word the pool truncation cannot reach — it silently poisoned
+    // the committed node's payload. `rollback` must restore the word's
+    // previous value (the patch-undo log).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::ClassDeclaration, 0);
+    b.patch(0, 7); // committed before the mark
+    let marker: Marker = b.mark();
+    b.begin(NodeKind::Block, 1);
+    b.end(NodeKind::Block, 1);
+    b.patch(0, 99); // speculated write into the pre-mark ClassDeclaration slot
+    b.rollback(marker);
+
+    // The committed suffix builds on; word 0 holds its pre-mark value.
+    b.patch(1, 9);
+    b.patch(2, TOKEN_NONE);
+    b.patch(3, TOKEN_NONE);
+    b.end(NodeKind::ClassDeclaration, 2);
+    b.end(NodeKind::CompilationUnit, 2);
+    let ast = b.finish();
+
+    // Post-order: [class, unit] — the speculated block was discarded with
+    // the rollback.
+    assert_eq!(ast.len(), 2);
+    assert_eq!(
+        ast.payload(0),
+        &[7, 9, TOKEN_NONE, TOKEN_NONE],
+        "the speculated patch into the committed slot must be undone"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "unpatched payload word")]
+fn rollback_of_the_only_patch_leaves_no_ghost_seal() {
+    // The discarded patch was the node's only one: the node first
+    // materialized after the mark, so the rollback dematerializes it (its
+    // slot lived in the truncated pool tail). Sealing it now is a missed
+    // patch — the poison sweep must trip instead of silently sealing a
+    // ghost.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Break, 0); // Fielded, width 1
+    let marker: Marker = b.mark();
+    b.patch(0, 99);
+    b.rollback(marker);
+    b.end(NodeKind::Break, 1);
+}
+
+#[test]
+fn unmaterialized_narrow_seal_allocates_no_pool_words() {
+    // begin RecordLiteral (canonical open, width 1) -> end
+    // ParenthesizedExpression (width 0): no patch ever materializes the
+    // slot, so the seal allocates zero pool words — the eager reservation
+    // leaked one dead u32 under the child words per parenthesized expression.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::RecordLiteral, 0);
+    b.leaf(NodeKind::LiteralInt, 1);
+    b.end(NodeKind::ParenthesizedExpression, 2);
+    b.end(NodeKind::CompilationUnit, 2);
+    let ast = b.finish();
+
+    assert_eq!(ast.len(), 3);
+    assert!(ast.payload(1).is_empty(), "narrow seal to the width-0 end");
+    assert_eq!(
+        ast.memory_footprint(),
+        ast.len() * 24,
+        "headers only: no pool word was ever allocated for the slot"
+    );
+}
+
+#[test]
 fn spans_derive_from_token_table() {
     let source = "ab // note\nf(é, \"x\")";
     let mut files = FileTable::new();

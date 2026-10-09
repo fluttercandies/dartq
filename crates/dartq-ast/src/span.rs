@@ -27,6 +27,14 @@ fn assert_read_boundary(tokens: &TokenTable, ast: &SyntaxTable, id: u32) {
         range.end as usize <= tokens.len(),
         "node {id} token range {range:?} runs past the token table"
     );
+    // The end bound alone lets an EMPTY range anchored at `tokens.len()`
+    // through — the Eof check below skips empty ranges, and `token_at` would
+    // then die on `range.start` with a misleading message. An EOF-synthetic
+    // node anchors at `len - 1`.
+    debug_assert!(
+        (range.start as usize) < tokens.len(),
+        "node {id} token range {range:?} starts past the token table"
+    );
     if ast.kind(id) != NodeKind::CompilationUnit && !range.is_empty() {
         debug_assert!(
             token_at(tokens, range.end - 1).kind != TokenKind::Eof,

@@ -46,8 +46,13 @@ pub struct SyntaxTable {
 }
 
 impl SyntaxTable {
-    /// Assembles a table from its parts. Only the builder calls this.
-    pub(crate) fn from_parts(nodes: Vec<NodeHeader>, pool: Vec<u32>) -> Self {
+    /// Assembles a table from its parts, compacting both vectors — the
+    /// table is frozen from here on, so the len-based
+    /// [`Self::memory_footprint`] reports the exact allocation. Only the
+    /// builder calls this.
+    pub(crate) fn from_parts(mut nodes: Vec<NodeHeader>, mut pool: Vec<u32>) -> Self {
+        nodes.shrink_to_fit();
+        pool.shrink_to_fit();
         Self { nodes, pool }
     }
 
@@ -138,7 +143,8 @@ impl SyntaxTable {
 
     /// Bytes held by the arena itself: headers plus pool words. The engine's
     /// AST-cache accounting uses this (layout spec §1.5 density targets are
-    /// asserted against it).
+    /// asserted against it). Both vectors are `shrink_to_fit` at freeze
+    /// ([`Self::from_parts`]), so len-based accounting is exact.
     #[must_use]
     pub fn memory_footprint(&self) -> usize {
         self.nodes.len() * size_of::<NodeHeader>() + self.pool.len() * size_of::<u32>()
