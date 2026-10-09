@@ -23,13 +23,50 @@ pub(crate) struct RunMeta {
     pub(crate) codes_file: String,
 }
 
+/// Gate verdict for one run. `Skipped` = the ERROR tier — the gate metric's tier — is not
+/// in scope under the severity filter (pure-report mode): nothing was judged, and every
+/// verdict face must say so instead of masquerading as a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Pass,
+    Fail,
+    Skipped,
+}
+
+impl Verdict {
+    /// Summary/markdown token; the skipped variant carries its reason inline.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Skipped => "SKIPPED (ERROR gate not in scope)",
+        }
+    }
+
+    /// JSON `passed` face: `null` when the gate was not judged.
+    pub(crate) fn passed(self) -> Option<bool> {
+        match self {
+            Self::Pass => Some(true),
+            Self::Fail => Some(false),
+            Self::Skipped => None,
+        }
+    }
+
+    /// Process exit: only a judged FAIL exits 1 (skipped = pure-report mode, exit 0).
+    pub(crate) fn exit_success(self) -> bool {
+        !matches!(self, Self::Fail)
+    }
+}
+
 /// Maximum entries shown per side in the Markdown diff table; the rest is counted in a trailing line pointing to the full JSON.
 const MD_DIFF_CAP: usize = 20;
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
     meta: JsonMeta<'a>,
-    passed: bool,
+    /// `null` = the ERROR gate was not in scope (verdict [`Verdict::Skipped`]):
+    /// a skipped gate must be distinguishable from a judged pass.
+    passed: Option<bool>,
     error_jaccard: f64,
     oracle_total: usize,
     dartq_total: usize,
@@ -56,9 +93,10 @@ struct JsonSideFilterAccounting {
     pre_filter_total: usize,
     /// Instances removed by the severity/type/codes filters
     dropped_by_filter: usize,
-    /// Every (code, file) entry that survived the filters, sorted, severity-tagged —
-    /// the machine-side data plane for per-diff gate attribution, populated even
-    /// when both diff lists are empty (e.g. a passing e2e run).
+    /// Every (severity tier, code, file) combination that survived the filters, sorted,
+    /// with the tier's own instance count — the machine-side data plane for per-diff
+    /// gate attribution, populated even when both diff lists are empty (e.g. a
+    /// passing e2e run).
     entries: Vec<JsonSideEntry>,
 }
 
@@ -131,7 +169,7 @@ struct JsonDiffEntry {
 pub(crate) fn write_reports(
     cmp: &Comparison,
     meta: &RunMeta,
-    passed: bool,
+    verdict: Verdict,
     out_dir: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
     fs::create_dir_all(out_dir).map_err(|e| format!("creating {}: {e}", out_dir.display()))?;
@@ -147,7 +185,7 @@ pub(crate) fn write_reports(
             type_filter: &meta.type_filter,
             codes_file: &meta.codes_file,
         },
-        passed,
+        passed: verdict.passed(),
         error_jaccard: cmp.error_jaccard(),
         oracle_total: cmp.oracle_total,
         dartq_total: cmp.dartq_total,
@@ -213,7 +251,7 @@ pub(crate) fn write_reports(
     let md_path = out_dir.join("report.md");
     fs::write(&json_path, json_text)
         .map_err(|e| format!("writing {}: {e}", json_path.display()))?;
-    fs::write(&md_path, markdown(cmp, meta, passed))
+    fs::write(&md_path, markdown(cmp, meta, verdict))
         .map_err(|e| format!("writing {}: {e}", md_path.display()))?;
     Ok((json_path, md_path))
 }
@@ -230,7 +268,7 @@ fn side_entries_json(entries: &[crate::compare::SideEntry]) -> Vec<JsonSideEntry
         .collect()
 }
 
-fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
+fn markdown(cmp: &Comparison, meta: &RunMeta, verdict: Verdict) -> String {
     let mut md = String::new();
     let _ = write!(md, "# dartq differential report (M0)\n\n");
     let _ = writeln!(
@@ -294,7 +332,7 @@ fn markdown(cmp: &Comparison, meta: &RunMeta, passed: bool) -> String {
         "\n## Verdict\n\n- ERROR jaccard = {:.3} vs threshold {} -> {}\n",
         cmp.error_jaccard(),
         meta.threshold,
-        if passed { "PASS" } else { "FAIL" }
+        verdict.token()
     );
     md
 }
@@ -363,7 +401,7 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_{}", std::process::id()));
-        let (json_path, md_path) = write_reports(&cmp, &meta, false, &out).expect("reports");
+        let (json_path, md_path) = write_reports(&cmp, &meta, Verdict::Fail, &out).expect("reports");
 
         let json_text = fs::read_to_string(&json_path).expect("json");
         let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
@@ -469,10 +507,11 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_drop_{}", std::process::id()));
-        let (json_path, md_path) = write_reports(&cmp, &meta, true, &out).expect("reports");
+        let (json_path, md_path) = write_reports(&cmp, &meta, Verdict::Pass, &out).expect("reports");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
+        assert_eq!(parsed["passed"], true);
         assert_eq!(parsed["filters"]["oracle"]["pre_filter_total"], 2);
         assert_eq!(parsed["filters"]["oracle"]["dropped_by_filter"], 1);
         assert_eq!(parsed["filters"]["dartq"]["pre_filter_total"], 1);
@@ -484,6 +523,54 @@ mod tests {
             md.contains("dropped by filters: oracle 1 of 2 pre-filter"),
             "md shows the accounting: {md}"
         );
+
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Skipped gate (pure-report mode: the severity filter drops the ERROR tier):
+    /// nothing was judged, so every verdict face must distinguish itself from a
+    /// judged pass — JSON `passed` is null, the md verdict reads SKIPPED.
+    #[test]
+    fn skipped_gate_does_not_masquerade_as_pass() {
+        let mk = |code: &str| MachineDiag {
+            severity: Severity::Error,
+            dtype: "COMPILE_TIME_ERROR".into(),
+            code: code.into(),
+            file: PathBuf::from("/corpus/a.dart"),
+            line: 1,
+            col: 1,
+            length: 1,
+            message: "m".into(),
+        };
+        let cmp = compare(
+            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| true),
+            &build_side_labeled(&[mk("EXPECTED_TOKEN")], Path::new("/corpus"), None, |_| true),
+        );
+        let meta = RunMeta {
+            corpus_dir: "/corpus".into(),
+            oracle_cmd: "dart analyze".into(),
+            dartq_cmd: "dartq check".into(),
+            oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
+            threshold: 0.99,
+            severity_filter: "WARNING".into(),
+            type_filter: "all".into(),
+            codes_file: String::new(),
+        };
+
+        let out = std::env::temp_dir().join(format!("dq_report_skip_{}", std::process::id()));
+        let (json_path, md_path) =
+            write_reports(&cmp, &meta, Verdict::Skipped, &out).expect("reports");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
+        assert!(
+            parsed["passed"].is_null(),
+            "a skipped gate must not claim passed: {}",
+            parsed["passed"]
+        );
+        let md = fs::read_to_string(&md_path).expect("md");
+        assert!(md.contains("-> SKIPPED (ERROR gate not in scope)"), "{md}");
+        assert!(!md.contains("PASS"), "no judged-pass token may appear: {md}");
 
         fs::remove_dir_all(&out).ok();
     }

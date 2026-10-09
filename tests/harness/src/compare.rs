@@ -149,8 +149,8 @@ pub(crate) struct DiffEntry {
     pub(crate) sample_message: String,
 }
 
-/// One row of a side's full post-filter entry list: the (code, file) key plus its severity tier
-/// and diagnostic instance count. Rows are sorted lexicographic by (code, file).
+/// One row of a side's full post-filter entry list: a (severity tier, code, file) triple with
+/// that tier's own diagnostic instance count. Rows are sorted by (severity, code, file).
 pub(crate) struct SideEntry {
     pub(crate) code: String,
     pub(crate) file: String,
@@ -183,8 +183,9 @@ pub(crate) struct Comparison {
     /// Lexicographic
     pub(crate) oracle_only: Vec<DiffEntry>,
     pub(crate) dartq_only: Vec<DiffEntry>,
-    /// Full post-filter per-side entry lists (sorted by (code, file)): the machine-side data
-    /// plane for per-diff gate attribution, populated even when both diff lists are empty.
+    /// Full post-filter per-side entry lists (one row per (severity tier, key), sorted by
+    /// (severity, code, file)): the machine-side data plane for per-diff gate attribution,
+    /// populated even when both diff lists are empty.
     pub(crate) oracle_entries: Vec<SideEntry>,
     pub(crate) dartq_entries: Vec<SideEntry>,
     /// Oracle-side distribution stats (based on the filtered oracle entry set; for baseline analysis)
@@ -197,7 +198,10 @@ impl Comparison {
         self.severities
             .iter()
             .find(|s| s.severity == Severity::Error)
-            .map_or(1.0, |s| s.jaccard)
+            .expect("severities is built from the fixed ERROR/WARNING/INFO array; \
+                     a missing ERROR tier is a construction bug and must never \
+                     be scored as a silent 1.0 pass")
+            .jaccard
     }
 }
 
@@ -297,23 +301,20 @@ pub(crate) fn compare(oracle: &Side, dartq: &Side) -> Comparison {
     }
 }
 
-/// Full post-filter entry list of one side, sorted by (code, file). A key is tagged with the
-/// first severity tier it appears in (iteration order ERROR/WARNING/INFO); one analyzer gives
-/// one tier per code, so this is 1:1 in practice.
+/// Full post-filter entry list of one side: one row per (severity tier, key) with that
+/// tier's own diagnostic instance count, sourced from `tier_samples` (the same per-tier
+/// map [`distribution`] aggregates — an all-tier total from `samples` would glue a
+/// cross-tier count onto a single-tier row). A key appearing in more than one tier (one
+/// analyzer emitting a code under different severities) gets one row per tier; rows are
+/// sorted by (severity, code, file), the `BTreeMap` iteration order.
 fn side_entries(side: &Side) -> Vec<SideEntry> {
-    let mut severity_of: BTreeMap<&EntryKey, Severity> = BTreeMap::new();
-    for (severity, keys) in &side.per_severity {
-        for key in keys {
-            severity_of.entry(key).or_insert(*severity);
-        }
-    }
-    side.entries
+    side.tier_samples
         .iter()
-        .map(|key| SideEntry {
+        .map(|((severity, key), &count)| SideEntry {
             code: key.0.clone(),
             file: key.1.clone(),
-            severity: severity_of[key],
-            count: side.samples[key].count,
+            severity: *severity,
+            count,
         })
         .collect()
 }
@@ -428,15 +429,18 @@ mod tests {
         assert_eq!(side.samples[key].message, "first", "keeps first message");
     }
 
-    /// Full per-side entry lists: every post-filter (code,file) key exactly once, sorted,
-    /// severity-tagged with instance counts -- populated even when the diff lists are empty,
-    /// so a passing gate still records what each side saw.
+    /// Full per-side entry lists: one row per (severity tier, key) with the tier's own
+    /// instance count, sorted by (severity, code, file) -- populated even when the diff
+    /// lists are empty, so a passing gate still records what each side saw. A key spanning
+    /// two tiers gets two rows, each carrying its tier-scoped count, never the cross-tier
+    /// total.
     #[test]
     fn side_entries_list_every_post_filter_key_sorted() {
         let oracle = vec![
             diag("E_B", "/corpus/b.dart", Severity::Error, "b"),
             diag("E_A", "/corpus/a.dart", Severity::Error, "a1"),
             diag("E_A", "/corpus/a.dart", Severity::Error, "a2"),
+            diag("E_A", "/corpus/a.dart", Severity::Warning, "as warning"),
             diag("W_A", "/corpus/a.dart", Severity::Warning, "w"),
         ];
         let dartq = vec![diag("e_a", "/corpus/a.dart", Severity::Error, "a")];
@@ -445,20 +449,21 @@ mod tests {
             &build_side_labeled(&oracle, root, None, |_| true),
             &build_side_labeled(&dartq, root, None, |_| true),
         );
-        let keys: Vec<(&str, &str)> = cmp
+        let rows: Vec<(&str, &str, Severity, usize)> = cmp
             .oracle_entries
             .iter()
-            .map(|e| (e.code.as_str(), e.file.as_str()))
+            .map(|e| (e.code.as_str(), e.file.as_str(), e.severity, e.count))
             .collect();
         assert_eq!(
-            keys,
-            [("e_a", "a.dart"), ("e_b", "b.dart"), ("w_a", "a.dart"),],
-            "every key once, sorted by (code, file)"
+            rows,
+            [
+                ("e_a", "a.dart", Severity::Error, 2),
+                ("e_b", "b.dart", Severity::Error, 1),
+                ("e_a", "a.dart", Severity::Warning, 1),
+                ("w_a", "a.dart", Severity::Warning, 1),
+            ],
+            "one row per (tier, key), tier-scoped counts, sorted (severity, code, file)"
         );
-        let a = &cmp.oracle_entries[0];
-        assert_eq!(a.severity, Severity::Error);
-        assert_eq!(a.count, 2, "instance count aggregated per key");
-        assert_eq!(cmp.oracle_entries[2].severity, Severity::Warning);
         assert_eq!(cmp.dartq_entries.len(), 1);
         assert_eq!(cmp.dartq_entries[0].count, 1);
     }

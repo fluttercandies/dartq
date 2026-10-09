@@ -2,7 +2,9 @@
 //! - `harness corpus`: assemble the M0 synthetic corpus (tests/corpus/m0/)
 //! - `harness run`: oracle vs dartq differential run, (code, file) entry Jaccard
 //!
-//! Exit codes: 0 = ERROR-tier Jaccard meets the gate; 1 = below gate; 2 = harness error of its own.
+//! Exit codes: 0 = ERROR-tier Jaccard meets the gate (or the gate is not in scope
+//! under the severity filter — pure-report mode, verdict SKIPPED); 1 = below gate;
+//! 2 = harness error of its own.
 
 mod compare;
 mod corpus;
@@ -33,12 +35,12 @@ enum Outcome {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match dispatch(&args) {
-        // (summary, gate passed); the corpus subcommand always passes
-        Ok((summary, passed)) => {
+        // (summary, exit success); the corpus subcommand always exits 0
+        Ok((summary, exit_success)) => {
             if !summary.is_empty() {
                 println!("{summary}");
             }
-            if passed {
+            if exit_success {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
@@ -112,8 +114,9 @@ fn print_usage() {
       whose own languageVersion is >= 3.13 (Plan A, docs/facts/
       version-skew.md §4) — a stale pin floods the gate with
       experiment_not_enabled assembly noise and fails the run up front.
-      Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD}),
-      1 = below threshold, 2 = harness error."
+      Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD})
+      or the gate not in scope under --severity-filter (verdict SKIPPED,
+      pure-report mode), 1 = below threshold, 2 = harness error."
     );
 }
 
@@ -248,15 +251,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         }
         None => None,
     };
-    let mut canonical: Vec<PathBuf> = Vec::new();
-    for dir in &opts.corpus_dirs {
-        let canon = canonical_corpus(dir)?;
-        // Plan A preflight (docs/facts/version-skew.md §4): a stale corpus
-        // languageVersion re-enables experiment_not_enabled skew; fail before
-        // any oracle run so the noise can never reach a report.
-        corpus::check_language_version(&canon).map_err(Outcome::Error)?;
-        canonical.push(canon);
-    }
+    let canonical = canonical_corpus_dirs(&opts.corpus_dirs)?;
     let labels = corpus_labels(&canonical);
     let corpora: Vec<(Option<String>, PathBuf)> = labels.into_iter().zip(canonical).collect();
     let filters = Filters {
@@ -291,7 +286,11 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         .map(|(_, canon)| canon.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let passed = cmp.error_jaccard() >= opts.threshold;
+    let verdict = gate_verdict(
+        filters.error_in_scope(),
+        cmp.error_jaccard(),
+        opts.threshold,
+    );
     let meta = report::RunMeta {
         corpus_dir: corpus_display,
         oracle_cmd: format!("{} analyze {}", opts.oracle_dart, opts.oracle_format.flag()),
@@ -314,21 +313,20 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
             .map_or(String::new(), |p| p.display().to_string()),
     };
     let (json_path, md_path) =
-        report::write_reports(&cmp, &meta, passed, &opts.out).map_err(Outcome::Error)?;
+        report::write_reports(&cmp, &meta, verdict, &opts.out).map_err(Outcome::Error)?;
 
     let stats: Vec<String> = cmp
         .severities
         .iter()
         .map(|s| format!("{}={:.3}", s.severity.as_str(), s.jaccard))
         .collect();
-    let verdict = if passed { "PASS" } else { "FAIL" };
     let summary = format!(
         "corpus: {} (files with diagnostics: {})\n\
          oracle: {} diags | dartq: {} diags\n\
          jaccard: {} (threshold {} on ERROR)\n\
          diffs: oracle-only {} entries, dartq-only {} entries\n\
          reports: {} {}\n\
-         result: {verdict}",
+         result: {}",
         meta.corpus_dir,
         cmp.file_count,
         cmp.oracle_total,
@@ -339,8 +337,22 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         cmp.dartq_only.len(),
         json_path.display(),
         md_path.display(),
+        verdict.token(),
     );
-    Ok((summary, passed))
+    Ok((summary, verdict.exit_success()))
+}
+
+/// Map the ERROR gate to its verdict: judged against the threshold when the ERROR
+/// tier is in scope, otherwise skipped — a gate that never ran must not print
+/// PASS (or set `passed: true`) indistinguishably from a judged pass.
+fn gate_verdict(error_in_scope: bool, error_jaccard: f64, threshold: f64) -> report::Verdict {
+    if !error_in_scope {
+        report::Verdict::Skipped
+    } else if error_jaccard >= threshold {
+        report::Verdict::Pass
+    } else {
+        report::Verdict::Fail
+    }
 }
 
 fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
@@ -356,6 +368,27 @@ fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
             corpus_dir.display()
         ))
     })
+}
+
+/// Canonicalize every corpus dir in declaration order, failing fast on the Plan A
+/// languageVersion preflight (docs/facts/version-skew.md §4: a stale corpus
+/// languageVersion re-enables `experiment_not_enabled` skew; fail before any oracle
+/// run so the noise can never reach a report).
+///
+/// Duplicates — the same canonical dir passed twice, e.g. via differing spellings —
+/// are dropped: a repeated dir would run each driver twice and double every
+/// instance count in the merged sides.
+fn canonical_corpus_dirs(dirs: &[PathBuf]) -> Result<Vec<PathBuf>, Outcome> {
+    let mut canonical: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let canon = canonical_corpus(dir)?;
+        if canonical.contains(&canon) {
+            continue;
+        }
+        corpus::check_language_version(&canon).map_err(Outcome::Error)?;
+        canonical.push(canon);
+    }
+    Ok(canonical)
 }
 
 /// Key prefixes for multi-corpus merges: the corpus dir basename. Two corpora
@@ -1034,5 +1067,58 @@ mod tests {
         let b = args(&["--out"]);
         let mut j = 0;
         assert!(value(&b, &mut j).is_err());
+    }
+
+    /// Verdict mapping: judged against the threshold when the ERROR tier is in
+    /// scope; skipped (never PASS) when the severity filter drops it, even though
+    /// the empty-vs-empty jaccard rule scores 1.0 there.
+    #[test]
+    fn gate_verdict_skips_only_when_error_not_in_scope() {
+        use report::Verdict;
+        assert_eq!(gate_verdict(true, 1.0, 0.99), Verdict::Pass);
+        assert_eq!(gate_verdict(true, 0.99, 0.99), Verdict::Pass, "boundary meets the gate");
+        assert_eq!(gate_verdict(true, 0.5, 0.99), Verdict::Fail);
+        assert_eq!(
+            gate_verdict(false, 1.0, 0.99),
+            Verdict::Skipped,
+            "the informational 1.0 must not print as a judged pass"
+        );
+        assert_eq!(gate_verdict(false, 0.0, 0.99), Verdict::Skipped);
+        // Exit semantics: only a judged FAIL exits 1
+        assert!(Verdict::Pass.exit_success());
+        assert!(Verdict::Skipped.exit_success(), "pure-report mode is exit 0");
+        assert!(!Verdict::Fail.exit_success());
+    }
+
+    /// Duplicate `--corpus-dir` values (same canonical dir through differing
+    /// spellings) must collapse to one entry: a repeated dir would run each
+    /// driver twice and double every instance count in the merged sides.
+    #[test]
+    fn duplicate_corpus_dirs_dedup_by_canonical_path() {
+        let root = std::env::temp_dir().join(format!("dq_dedup_{}", std::process::id()));
+        let a = root.join("a").join("m0");
+        let b = root.join("b").join("m0");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir.join(".dart_tool")).expect("mkdir");
+            std::fs::write(dir.join("pubspec.yaml"), "name: corpus_m0\n").expect("pubspec");
+            let config = r#"{"configVersion":2,"packages":[{"name":"c","rootUri":"../","packageUri":"lib/","languageVersion":"3.13"}],"generator":"pub"}"#;
+            std::fs::write(dir.join(".dart_tool").join("package_config.json"), config)
+                .expect("package config");
+        }
+        // Second spelling of `a` via a `.` path segment: same canonical dir,
+        // different string form — dedup must key on the canonical path.
+        let a_via_dot = root.join("a").join(".").join("m0");
+        let canonical =
+            canonical_corpus_dirs(&[a.clone(), a_via_dot, b.clone()]).expect("canonical dirs");
+        assert_eq!(
+            canonical,
+            vec![a.canonicalize().expect("canon a"), b.canonicalize().expect("canon b")],
+            "duplicate dropped, order preserved"
+        );
+
+        // A nonexistent corpus still fails before dedup can matter
+        assert!(canonical_corpus_dirs(&[PathBuf::from("/nonexistent/corpus")]).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

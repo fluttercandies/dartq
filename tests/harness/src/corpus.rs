@@ -166,6 +166,8 @@ struct Stats {
 #[allow(clippy::naive_bytecount)] // naive wc -l-style counting, performance-insensitive (corpus ~200 files)
 fn copy_tree(dir: &Path, dest: &Path, stats: &mut Stats) -> Result<(), String> {
     for entry in sorted_entries(dir)? {
+        // lstat semantics: a symlink never matches is_dir/is_file below, so
+        // symlinked sources are neither copied nor descended.
         let ty = entry
             .file_type()
             .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
@@ -191,9 +193,22 @@ fn copy_tree(dir: &Path, dest: &Path, stats: &mut Stats) -> Result<(), String> {
                 .map_err(|e| format!("writing {}: {e}", target_file.display()))?;
             stats.files += 1;
             stats.loc += bytes.iter().filter(|&&b| b == b'\n').count();
+        } else if ty.is_symlink() && symlink_is_skippable(&entry) {
+            // A symlinked .dart file or a symlinked dir would have been a copy/
+            // descent candidate; both drivers must see identical corpora, so the
+            // link is dropped (copying it could escape or duplicate content) —
+            // accounted here, never silently.
+            stats.skipped += 1;
         }
     }
     Ok(())
+}
+
+/// Whether a symlink entry belongs to a would-be-copied class (`.dart` file or
+/// resolved dir): only those are counted in `skipped`; other symlinks are
+/// ignored like their plain non-`.dart` counterparts.
+fn symlink_is_skippable(entry: &std::fs::DirEntry) -> bool {
+    entry.path().extension().is_some_and(|e| e == "dart") || entry.path().is_dir()
 }
 
 #[allow(clippy::naive_bytecount)] // same as copy_tree
@@ -331,9 +346,47 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// `file_type()` is lstat semantics, so a symlinked `.dart` source is
+    /// invisible to the copy branch and a symlinked dir is invisible to the
+    /// descent branch. Both must be dropped (both drivers must see identical
+    /// corpora; copying a link could escape or duplicate content) but counted
+    /// in `skipped` -- never silently. Symlinks to non-`.dart` files are
+    /// ignored like their plain counterparts.
+    #[cfg(unix)]
     #[test]
-    fn self_contained_rules() {
-        assert!(is_self_contained("void f() {}"));
+    fn symlinks_are_neither_copied_nor_descended_but_counted_skipped() {
+        let root = std::env::temp_dir().join(format!("dq_symlink_{}", std::process::id()));
+        let src = root.join("src");
+        let tgt = root.join("tgt");
+        write(&src, "keep/plain.dart", "void f() {}\n");
+        write(&src, "keep/nested/inner.dart", "var x = 1;\n");
+        std::os::unix::fs::symlink(src.join("keep/plain.dart"), src.join("linked.dart"))
+            .expect("symlinked .dart file");
+        std::os::unix::fs::symlink(src.join("keep/nested"), src.join("linked_dir"))
+            .expect("symlinked dir");
+        std::os::unix::fs::symlink(src.join("keep/plain.dart"), src.join("notes.txt"))
+            .expect("symlinked non-dart file");
+
+        let report = build_corpus(&src, &tgt, true).expect("build");
+        assert_eq!(report.files, 2, "real .dart files copied");
+        assert_eq!(
+            report.skipped, 2,
+            "symlinked .dart file and symlinked dir accounted as skipped"
+        );
+        assert!(
+            !tgt.join("lib").join("linked.dart").exists(),
+            "symlinked source not copied"
+        );
+        assert!(
+            !tgt.join("lib").join("linked_dir").exists(),
+            "symlinked dir not descended"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn self_contained_rules() {        assert!(is_self_contained("void f() {}"));
         assert!(is_self_contained(
             "import 'dart:async';\nexport 'dart:math' show max;"
         ));
