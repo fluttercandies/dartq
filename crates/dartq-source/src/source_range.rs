@@ -625,7 +625,10 @@ mod tests {
         }
         assert!(utf16_offset <= units, "recipe offset out of range");
         let line = starts.partition_point(|&start| start <= utf16_offset) - 1;
-        (u32::try_from(line).unwrap() + 1, utf16_offset - starts[line] + 1)
+        (
+            u32::try_from(line).unwrap() + 1,
+            utf16_offset - starts[line] + 1,
+        )
     }
 
     /// The fused `line_col_utf16` must agree with the official recipe

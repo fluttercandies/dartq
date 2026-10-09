@@ -132,6 +132,12 @@ pub(crate) fn apply(
     });
 
     state.structure_dirty = true;
+    // Amortized store collection: this apply's replaced and removed
+    // residency contents are the new dead candidates (gate hits carry none
+    // — their put deduplicated); facts-cache evictions tallied themselves
+    // during the recompute. Runs after the residency rewrite above, so the
+    // replaced contents are already unreferenced if the sweep fires.
+    state.collect_garbage(changed.len() + removed.len());
     ApplyOutcome {
         changed: changed_files,
         removed,

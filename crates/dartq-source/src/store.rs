@@ -54,6 +54,22 @@ pub trait SourceStore {
         false
     }
 
+    /// Reclaims every content that `is_live` does not vouch for, returning
+    /// how many entries were removed.
+    ///
+    /// This is the batch form of [`SourceStore::remove`]: the caller owns the
+    /// liveness policy — which ids its residents and caches still reference —
+    /// and the store owns only the sweep. Content addressing keeps the sweep
+    /// safe by construction: an id evicted here that is later re-`put`
+    /// returns byte-identical under the same name.
+    ///
+    /// The default returns `0` and keeps everything, the same honest
+    /// no-reclamation posture as the [`SourceStore::remove`] default.
+    fn collect_garbage(&mut self, is_live: &dyn Fn(ContentId) -> bool) -> usize {
+        let _ = is_live;
+        0
+    }
+
     /// Number of distinct contents held.
     fn len(&self) -> usize;
 
@@ -74,10 +90,9 @@ pub trait SourceStore {
 
 /// In-memory [`SourceStore`]: a map from [`ContentId`] to the stored bytes.
 ///
-/// Tracks the running byte total on insertion/removal so [`len_bytes`] is
-/// O(1) instead of a scan over every entry.
-///
-/// [`len_bytes`]: SourceStore::len_bytes
+/// Tracks the running byte total on insertion, removal, and reclamation so
+/// [`len_bytes`](SourceStore::len_bytes) is O(1) instead of a scan over every
+/// entry.
 #[derive(Debug, Default)]
 pub struct MemorySourceStore {
     entries: FxHashMap<ContentId, Vec<u8>>,
@@ -122,6 +137,21 @@ impl SourceStore for MemorySourceStore {
             }
             None => false,
         }
+    }
+
+    fn collect_garbage(&mut self, is_live: &dyn Fn(ContentId) -> bool) -> usize {
+        let before = self.entries.len();
+        let mut reclaimed = 0u64;
+        self.entries.retain(|id, bytes| {
+            if is_live(*id) {
+                true
+            } else {
+                reclaimed += bytes.len() as u64;
+                false
+            }
+        });
+        self.total_bytes -= reclaimed;
+        before - self.entries.len()
     }
 
     fn len(&self) -> usize {
@@ -239,10 +269,46 @@ mod tests {
         assert_eq!(store.get(a), Some(&b"aaaa"[..]));
     }
 
+    /// Pin: `collect_garbage` keeps exactly the ids the liveness predicate
+    /// vouches for (resident contents and cache-referenced ids), drops the
+    /// rest with an exact byte-ledger adjustment, and re-putting a swept id
+    /// rebuilds the slot under the same content address.
+    #[test]
+    fn collect_garbage_keeps_live_drops_dead() {
+        let mut store = MemorySourceStore::new();
+        let live = store.put(b"live");
+        let cache_ref = store.put(b"cache-referenced");
+        let dead_a = store.put(b"dead-a");
+        let dead_b = store.put_owned(b"dead-b".to_vec());
+
+        let vouched: Vec<ContentId> = vec![live, cache_ref];
+        let is_live = |id: ContentId| vouched.contains(&id);
+        assert_eq!(store.collect_garbage(&is_live), 2);
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.len_bytes(), 4 + 16);
+        assert_eq!(store.get(live), Some(&b"live"[..]));
+        assert_eq!(store.get(cache_ref), Some(&b"cache-referenced"[..]));
+        assert_eq!(store.get(dead_a), None);
+        assert_eq!(store.get(dead_b), None);
+
+        // A sweep over an all-live store removes nothing.
+        assert_eq!(store.collect_garbage(&|_: ContentId| true), 0);
+
+        // Content addressing: the swept id returns byte-identical.
+        assert_eq!(store.put(b"dead-b"), dead_b);
+        assert_eq!(store.get(dead_b), Some(&b"dead-b"[..]));
+
+        // Sweeping everything empties the store exactly.
+        assert_eq!(store.collect_garbage(&|_: ContentId| false), 3);
+        assert!(store.is_empty());
+        assert_eq!(store.len_bytes(), 0);
+    }
+
     /// The trait defaults pin the honest semantics for backends that do not
     /// implement reclamation or byte tracking: `remove` reports nothing
-    /// removed, `len_bytes` reports zero, and `put_owned` still routes the
-    /// content through `put`.
+    /// removed, `collect_garbage` reclaims nothing, `len_bytes` reports
+    /// zero, and `put_owned` still routes the content through `put`.
     #[test]
     fn trait_defaults_cover_minimal_backends() {
         struct Minimal(Vec<(ContentId, Vec<u8>)>);
@@ -270,6 +336,7 @@ mod tests {
         let id = store.put_owned(b"owned by default".to_vec());
         assert_eq!(store.get(id), Some(&b"owned by default"[..]));
         assert!(!store.remove(id));
+        assert_eq!(store.collect_garbage(&|_: ContentId| false), 0);
         assert_eq!(store.len_bytes(), 0);
     }
 }

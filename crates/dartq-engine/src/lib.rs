@@ -340,6 +340,22 @@ impl Engine {
         self.state.store.get(facts.content)
     }
 
+    /// Distinct contents the store currently holds — the entry-count half of
+    /// the store's observable memory budget. Under steady editing the count
+    /// is bounded by residency + the facts-cache cap + the sweep threshold
+    /// (amortized mark-sweep; the daemon memory law).
+    #[must_use]
+    pub fn stored_contents(&self) -> usize {
+        self.state.store.len()
+    }
+
+    /// Total bytes the store currently holds — the byte-count half of the
+    /// store's observable memory budget.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        self.state.store.len_bytes()
+    }
+
     /// The library owning `file` (defining or part), if resident.
     #[must_use]
     pub fn library_of(&self, file: FileId) -> Option<LibraryId> {

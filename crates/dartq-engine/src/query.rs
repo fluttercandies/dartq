@@ -24,8 +24,7 @@
 //! it and stays correct against whatever analyzed state exists.
 
 use dartq_index::{
-    DeclRow, FileCapture, FileIndex, LibraryBuilder, LibraryIndex, SymbolDecl, SymbolIndex,
-    capture,
+    DeclRow, FileCapture, FileIndex, LibraryBuilder, LibraryIndex, SymbolDecl, SymbolIndex, capture,
 };
 use dartq_language::DEFAULT_LANGUAGE_VERSION;
 use dartq_parser::ParserFeatures;
@@ -85,7 +84,11 @@ pub struct RefHit {
 
 /// One fan-out job's output: the graph-library key of the finished
 /// reference surface plus the declaration surfaces to register.
-type BuiltLibrary = (dartq_resolution::LibraryId, LibraryIndex, Vec<(FileId, FileIndex)>);
+type BuiltLibrary = (
+    dartq_resolution::LibraryId,
+    LibraryIndex,
+    Vec<(FileId, FileIndex)>,
+);
 
 /// Answers a by-name symbol query over the analyzed state (module docs for
 /// the freshness and build contracts).
@@ -149,9 +152,13 @@ pub(crate) fn symbols<'a>(
     let mut targets: Vec<FileId> = Vec::new();
     for SymbolDecl { file, decl } in index.symbols(id) {
         let container = (decl.container != DeclRow::NONE).then(|| {
-            state
-                .strings
-                .resolve(index.file(file).expect("indexed file").row(decl.container).name)
+            state.strings.resolve(
+                index
+                    .file(file)
+                    .expect("indexed file")
+                    .row(decl.container)
+                    .name,
+            )
         });
         decls.push(DeclHit {
             file,
@@ -205,7 +212,10 @@ fn capture_file(state: &EngineState, file: FileId) -> FileCapture {
         .packages
         .containing(state.files.path(file).expect("interned path"))
         .and_then(|identity| identity.language_version)
-        .map_or(DEFAULT_LANGUAGE_VERSION, dartq_pub::LanguageVersion::into_inner);
+        .map_or(
+            DEFAULT_LANGUAGE_VERSION,
+            dartq_pub::LanguageVersion::into_inner,
+        );
     let (feature_set, scanned, _) = crate::l1::scan_unit(text, version, file);
     capture(
         file,

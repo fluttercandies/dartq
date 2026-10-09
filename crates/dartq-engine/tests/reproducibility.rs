@@ -47,7 +47,8 @@ use dartq_source::FileId;
 const MAIN: &str = "import 'alpha.dart';\nimport 'beta.dart';\nimport 'missing.dart';\n\nvoid main() {\n  print(shared());\n}\n";
 /// Provider A — `Item`/`shared` deliberately collide with beta (and delta's
 /// edit) across library boundaries; carries one syntax error.
-const ALPHA: &str = "import 'gamma.dart';\n\nclass Item {\n  int value = ~;\n}\n\nint shared() => gammaValue;\n";
+const ALPHA: &str =
+    "import 'gamma.dart';\n\nclass Item {\n  int value = ~;\n}\n\nint shared() => gammaValue;\n";
 /// Provider B — same names as alpha, different library (intern-order face).
 const BETA: &str = "import 'gamma.dart';\n\nclass Item {\n  String name = '';\n}\n\nint shared() => gammaValue + 1;\n";
 /// The diamond's base — both providers import it.

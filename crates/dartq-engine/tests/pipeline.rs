@@ -231,7 +231,10 @@ fn above_latest_override_warns_and_drops() {
     assert_eq!(warning.code.name, "invalid_language_version_override");
     assert!(matches!(warning.severity, Severity::Warning));
     assert_eq!(warning.range.offset, 0);
-    assert_eq!(warning.range.length, 14, "the whole `// @dart = 4.0` lexeme");
+    assert_eq!(
+        warning.range.length, 14,
+        "the whole `// @dart = 4.0` lexeme"
+    );
     assert_eq!(
         warning.message,
         format!(
@@ -286,7 +289,11 @@ fn capture_face_shares_the_override_settlement() {
         .try_file_id(&fixture.path("lib/main.dart"))
         .expect("main interned");
     let answer = engine.query_symbols("standalone");
-    assert_eq!(answer.decls.len(), 1, "the above-latest file still captures");
+    assert_eq!(
+        answer.decls.len(),
+        1,
+        "the above-latest file still captures"
+    );
     assert_eq!(answer.decls[0].file, main);
     assert_eq!(answer.decls[0].name, "standalone");
 }

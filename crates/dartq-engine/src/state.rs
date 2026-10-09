@@ -17,7 +17,7 @@ use dartq_semantic::FileElements;
 use dartq_source::{
     ContentId, FileId, FileTable, LineIndex, SourceRange, SourceStore, StringId, StringTable,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 /// Bumped with any engine-side change to what [`UnitFacts`] records
 /// (directive extraction, diagnostic baking); part of the facts cache key
@@ -41,6 +41,17 @@ pub(crate) const SDK_TARGET: &str = "vm";
 /// keeps the overhead a bounded fraction of input memory (memory law, PRD
 /// §14): insertion beyond the cap evicts oldest-first.
 const FACTS_CACHE_CAP: usize = 1024;
+
+/// Dead-content tally that triggers one content-store sweep (mark-sweep,
+/// the rust-analyzer vfs GC posture). Every apply orphans content ids —
+/// replaced or removed residency, evicted facts-cache entries — and sweeping
+/// per keystroke would cost O(residency + cache + entries) each time, so
+/// collection amortizes: one sweep runs once the tally crosses this bound.
+/// The timing never affects correctness (the sweep keeps everything
+/// referenced, a later trigger only delays reclamation), only the
+/// steady-state entry bound: residency + [`FACTS_CACHE_CAP`] + fewer than
+/// this many unswept dead versions.
+const GC_DEAD_THRESHOLD: usize = 64;
 
 /// The directive family of one [`DirectiveFacts`] entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +360,10 @@ pub(crate) struct EngineState {
     /// Memoized facts of previous contents (bounded, `FACTS_CACHE_CAP`).
     facts_cache: FxHashMap<FactsKey, Arc<UnitFacts>>,
     facts_order: VecDeque<FactsKey>,
+    /// Dead-content tally since the last store sweep — the amortization
+    /// signal of [`GC_DEAD_THRESHOLD`] (never a liveness decision; the sweep
+    /// itself checks real references).
+    gc_debt: usize,
 }
 
 impl EngineState {
@@ -386,6 +401,7 @@ impl EngineState {
             pending_order: Vec::new(),
             facts_cache: FxHashMap::default(),
             facts_order: VecDeque::new(),
+            gc_debt: 0,
         })
     }
 
@@ -395,7 +411,11 @@ impl EngineState {
     }
 
     /// Fact-cache insert with oldest-first cap eviction. Live residency
-    /// holds its own `Arc`s, so evicting a live entry costs nothing.
+    /// holds its own `Arc`s, so evicting a live entry costs nothing. Each
+    /// eviction tallies one dead-content candidate: the evicted key's
+    /// content may still be referenced elsewhere (residency, another cache
+    /// entry sharing the id), and the sweep — not this tally — resolves
+    /// that.
     pub(crate) fn cache_facts(&mut self, key: FactsKey, facts: Arc<UnitFacts>) {
         if self.facts_cache.len() >= FACTS_CACHE_CAP && !self.facts_cache.contains_key(&key) {
             while self.facts_cache.len() >= FACTS_CACHE_CAP {
@@ -403,11 +423,43 @@ impl EngineState {
                     break;
                 };
                 self.facts_cache.remove(&oldest);
+                self.gc_debt += 1;
             }
         }
         if self.facts_cache.insert(key, facts).is_none() {
             self.facts_order.push_back(key);
         }
+    }
+
+    /// Amortized content-store collection (mark-sweep): tallies the content
+    /// ids just orphaned and, once [`GC_DEAD_THRESHOLD`] is crossed, sweeps
+    /// every store entry that neither residency nor the facts cache still
+    /// references. This is the single place that knows both reference
+    /// holders, so the liveness rule lives here and nowhere else; the store
+    /// only sweeps what it is told is dead.
+    ///
+    /// The library identity arrays (`LibraryInfo::content`,
+    /// `LibraryResult::content`) hold `ContentId`s too, but only compare
+    /// them — no byte reads — so eviction under them is safe: content
+    /// addressing reproduces the same id if the bytes ever return.
+    ///
+    /// Called at the end of every non-empty apply (l1 `apply`), after
+    /// residency has been rewritten, so replaced contents are already
+    /// unreferenced when the sweep runs.
+    pub(crate) fn collect_garbage(&mut self, newly_dead: usize) {
+        self.gc_debt += newly_dead;
+        if self.gc_debt < GC_DEAD_THRESHOLD {
+            return;
+        }
+        self.gc_debt = 0;
+        let mut live: FxHashSet<ContentId> = FxHashSet::with_capacity_and_hasher(
+            self.residency.len() + self.facts_cache.len(),
+            FxBuildHasher,
+        );
+        live.extend(self.residency.values().map(|facts| facts.content));
+        live.extend(self.facts_cache.keys().map(|key| key.content));
+        self.store
+            .collect_garbage(&|id: ContentId| live.contains(&id));
     }
 
     /// A URI resolver over the engine's package table, SDK snapshot, and file
