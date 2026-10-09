@@ -1,15 +1,16 @@
 //! Member grammar (official `parseTopLevelMemberImpl` `parser_impl.dart:4181`,
 //! `parseClassOrMixinOrExtensionOrEnumMemberImpl` :5290, `parseFields` :4438,
 //! `parseTopLevelMethod` :4606, `parseMethod` :5799, `parseFactoryMethod`
-//! :6162, and the `ClassMemberParser` diet-body mode — `skipFunctionBody`
-//! :6465, `skipBlock`, `skipArgumentsOpt`).
+//! :6162, and the full-parser function bodies of #19 — the diet
+//! `ClassMemberParser` body mode is retired for everything but field
+//! initializers and constructor initializer entries).
 //!
-//! Function bodies parse in **diet mode** this milestone: the body shape
-//! (`;`, `=> expr;`, `{...}`) is consumed with the official diet events
-//! (`handleNoFunctionBody` / `handleFunctionBodySkipped`) while statement
-//! internals await #19. Field initializers and constructor initializers
-//! likewise skip their expression internals (the official diet mode emits no
-//! expression events either).
+//! Function bodies parse through `parse_function_body` (`statements.rs`,
+//! official `parseFunctionBody`): `{ ... }` bodies parse the statement
+//! grammar, `=> expr;` bodies parse their expression through the reduced
+//! engine, `;` bodies emit the official empty-body event. Field initializers
+//! and constructor initializers still diet-skip their expression internals
+//! (the official diet mode emits no expression events either).
 
 use dartiq_scanner::{Keyword, TokenKind};
 
@@ -334,7 +335,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::external_method_with_body(), self.peek_span());
         }
         let allow_abstract = is_external || self.features.augmentations_enabled;
-        let end = self.parse_function_body_diet(allow_abstract);
+        let end = self.parse_function_body(allow_abstract);
         self.async_state = saved_async;
         let begin_token = self.span_at_mark(before_start);
         self.listener
@@ -956,7 +957,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 || mods.external.is_some()
                 || self.features.augmentations_enabled)
                 && self.async_state == AsyncModifier::Sync;
-            self.parse_function_body_diet(allow_abstract)
+            self.parse_function_body(allow_abstract)
         };
         self.async_state = saved_async;
 
@@ -1084,9 +1085,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             if self.peek_kind() != TokenKind::Semicolon {
                 self.report(msg::external_factory_with_body(), self.peek_span());
             }
-            end = self.parse_function_body_diet(true);
+            end = self.parse_function_body(true);
         } else {
-            end = self.parse_function_body_diet(self.features.augmentations_enabled);
+            end = self.parse_function_body(self.features.augmentations_enabled);
         }
         match kind {
             DeclarationKind::Mixin => self.report(msg::mixin_declares_constructor(), factory),
@@ -1456,7 +1457,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseInitializersOpt` (constructor `: init, init` lists,
     /// entries diet-skipped).
-    fn parse_initializers_opt(&mut self) -> Option<TokenSpan> {
+    pub(crate) fn parse_initializers_opt(&mut self) -> Option<TokenSpan> {
         if self.peek_kind() != TokenKind::Colon {
             self.listener.handle_no_initializers();
             return None;
@@ -1519,7 +1520,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseAsyncModifierOpt`; updates and returns with the new
     /// [`AsyncModifier`] state.
-    fn parse_async_modifier_opt(&mut self) -> TokenSpan {
+    pub(crate) fn parse_async_modifier_opt(&mut self) -> TokenSpan {
         let mut async_kw: Option<TokenSpan> = None;
         let mut star: Option<TokenSpan> = None;
         self.async_state = AsyncModifier::Sync;
@@ -1560,71 +1561,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         end
     }
 
-    /// Diet function body (official `skipFunctionBody`, the
-    /// `ClassMemberParser` mode): `;` | `=> expr;` | `{...}` | `native ...`.
-    pub(crate) fn parse_function_body_diet(&mut self, allow_abstract: bool) -> TokenSpan {
-        if self.peek_kind() == TokenKind::Keyword(Keyword::Native) {
-            let native = self.peek_span();
-            let has_name = self.cursor.peek_kind_ahead(1) == TokenKind::String;
-            self.cursor.advance();
-            if has_name {
-                self.parse_literal_string();
-            }
-            self.listener.handle_native_clause(native, has_name);
-            self.report(msg::native_clause_should_be_annotation(), native);
-            if self.peek_kind() == TokenKind::Semicolon {
-                let semi = self.peek_span();
-                self.cursor.advance();
-                self.listener
-                    .handle_native_function_body_skipped(native, semi);
-                return semi;
-            }
-            self.listener
-                .handle_native_function_body_ignored(native, self.peek_span());
-        }
-        match self.peek_kind() {
-            TokenKind::Semicolon => {
-                let semi = self.peek_span();
-                if !allow_abstract {
-                    self.report(msg::expected_body(), semi);
-                }
-                self.cursor.advance();
-                self.listener.handle_no_function_body(semi);
-                semi
-            }
-            TokenKind::Function => {
-                let begin = self.peek_span();
-                self.cursor.advance();
-                self.skip_expression_diet();
-                if self.peek_kind() == TokenKind::Semicolon {
-                    self.cursor.advance();
-                }
-                let end = self.peek_span();
-                self.listener.handle_function_body_skipped(begin, end, true);
-                end
-            }
-            TokenKind::Eq => {
-                let begin = self.peek_span();
-                self.report(msg::expected_body(), begin);
-                self.cursor.advance();
-                self.skip_expression_diet();
-                if self.peek_kind() == TokenKind::Semicolon {
-                    self.cursor.advance();
-                }
-                let end = self.peek_span();
-                self.listener.handle_function_body_skipped(begin, end, true);
-                end
-            }
-            _ => {
-                let begin = self.peek_span();
-                let end = self.skip_block(crate::message::BlockKind::Body);
-                self.listener
-                    .handle_function_body_skipped(begin, end, false);
-                end
-            }
-        }
-    }
-
     /// Official `parsePrimaryConstructorBody` (`this : init, ... { ... }`
     /// members; primary constructors are on at 3.15).
     fn parse_primary_constructor_body(&mut self) {
@@ -1638,7 +1574,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::unexpected_token(self.cursor.lexeme(this.id)), this);
         }
         self.parse_async_modifier_opt();
-        self.parse_function_body_diet(self.async_state == AsyncModifier::Sync);
+        self.parse_function_body(self.async_state == AsyncModifier::Sync);
         self.listener
             .end_primary_constructor_body(this, this, None, self.peek_span());
     }

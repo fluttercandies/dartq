@@ -53,13 +53,15 @@
 //!
 //! Declarations (#18) cover the full top-level surface: classes, named
 //! mixin applications, mixins, enums, extensions, extension types, typedefs
-//! (both styles), top-level members, and class members with **diet function
-//! bodies** (the official `ClassMemberParser` mode: the body shape is
-//! consumed with `handleNoFunctionBody`/`handleFunctionBodySkipped` while
-//! statement internals await #19). Directives are consumed diet-style
-//! (group-aware skip to `;`) until the directive milestone. Until #20 lands,
-//! constant-pattern / default-value / annotation-argument operands parse
-//! through the reduced constant-expression engine (see `expr_const`).
+//! (both styles), top-level members, and class members with **full function
+//! bodies** (#19): `{ ... }` bodies parse the statement grammar
+//! (`statements.rs`, official `parseFunctionBody`), `=>` bodies parse their
+//! expression through the reduced constant-expression engine, and `;`
+//! bodies emit the official empty-body event. Constructor initializers and
+//! field initializers still diet-skip their expression internals. Directives
+//! are consumed diet-style (group-aware skip to `;`) until the directive
+//! milestone. Until #20 lands, statement/initializer expression operands
+//! parse through the reduced constant-expression engine (see `expr_const`).
 //!
 //! # Scanner interplay
 //!
@@ -87,6 +89,7 @@ mod metadata;
 mod parser;
 mod patterns;
 mod recovery;
+mod statements;
 mod token_id;
 mod type_args;
 mod type_parse;

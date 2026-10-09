@@ -379,6 +379,187 @@ impl ParserListener for Collector {
     fn handle_no_class_body(&mut self, _: Token) {
         self.log.push(("handle", "no_class_body"));
     }
+
+    // —— statements (#19) ————————————————————————————————————————————————
+    fn begin_block(&mut self, _: Token, _: crate::listener::BlockKind) {
+        self.log.push(("begin", "block"));
+    }
+    fn begin_formal_parameters(&mut self, _: Token, _: crate::listener::MemberKind) {
+        self.log.push(("begin", "formal_parameters"));
+    }
+    fn end_formal_parameters(
+        &mut self,
+        _: usize,
+        _: Token,
+        _: Token,
+        _: crate::listener::MemberKind,
+    ) {
+        self.log.push(("end", "formal_parameters"));
+    }
+    fn begin_function_name(&mut self, _: Token) {
+        self.log.push(("begin", "function_name"));
+    }
+    fn end_function_name(&mut self, _: Token, _: Token, _: bool) {
+        self.log.push(("end", "function_name"));
+    }
+    fn end_block(&mut self, _: usize, _: Token, _: Token, _: crate::listener::BlockKind) {
+        self.log.push(("end", "block"));
+    }
+    fn begin_block_function_body(&mut self, _: Token) {
+        self.log.push(("begin", "block_function_body"));
+    }
+    fn end_block_function_body(&mut self, _: usize, _: Token, _: Token) {
+        self.log.push(("end", "block_function_body"));
+    }
+    fn handle_empty_function_body(&mut self, _: Token) {
+        self.log.push(("handle", "empty_function_body"));
+    }
+    fn handle_expression_function_body(&mut self, _: Token, _: Option<Token>) {
+        self.log.push(("handle", "expression_function_body"));
+    }
+    fn handle_expression_statement(&mut self, _: Token, _: Token) {
+        self.log.push(("handle", "expression_statement"));
+    }
+    fn handle_empty_statement(&mut self, _: Token) {
+        self.log.push(("handle", "empty_statement"));
+    }
+    fn begin_if_statement(&mut self, _: Token) {
+        self.log.push(("begin", "if_statement"));
+    }
+    fn end_if_statement(&mut self, _: Token, _: Option<Token>, _: Token) {
+        self.log.push(("end", "if_statement"));
+    }
+    fn begin_for_statement(&mut self, _: Token) {
+        self.log.push(("begin", "for_statement"));
+    }
+    fn end_for_statement(&mut self, _: Token) {
+        self.log.push(("end", "for_statement"));
+    }
+    fn end_for_in(&mut self, _: Token) {
+        self.log.push(("end", "for_in"));
+    }
+    fn begin_while_statement(&mut self, _: Token) {
+        self.log.push(("begin", "while_statement"));
+    }
+    fn end_while_statement(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "while_statement"));
+    }
+    fn begin_do_while_statement(&mut self, _: Token) {
+        self.log.push(("begin", "do_while_statement"));
+    }
+    fn end_do_while_statement(&mut self, _: Token, _: Token, _: Token) {
+        self.log.push(("end", "do_while_statement"));
+    }
+    fn begin_return_statement(&mut self, _: Token) {
+        self.log.push(("begin", "return_statement"));
+    }
+    fn end_return_statement(&mut self, _: bool, _: Token, _: Token) {
+        self.log.push(("end", "return_statement"));
+    }
+    fn begin_yield_statement(&mut self, _: Token) {
+        self.log.push(("begin", "yield_statement"));
+    }
+    fn end_yield_statement(&mut self, _: Token, _: Option<Token>, _: Token) {
+        self.log.push(("end", "yield_statement"));
+    }
+    fn begin_labeled_statement(&mut self, _: Token, _: usize) {
+        self.log.push(("begin", "labeled_statement"));
+    }
+    fn end_labeled_statement(&mut self, _: usize) {
+        self.log.push(("end", "labeled_statement"));
+    }
+    fn begin_local_function_declaration(&mut self, _: Token) {
+        self.log.push(("begin", "local_function_declaration"));
+    }
+    fn end_local_function_declaration(&mut self, _: Token) {
+        self.log.push(("end", "local_function_declaration"));
+    }
+    fn begin_variables_declaration(&mut self, _: Token, _: Option<Token>, _: Option<Token>) {
+        self.log.push(("begin", "variables_declaration"));
+    }
+    fn end_variables_declaration(&mut self, _: usize, _: Option<Token>) {
+        self.log.push(("end", "variables_declaration"));
+    }
+    fn begin_initialized_identifier(&mut self, _: Token) {
+        self.log.push(("begin", "initialized_identifier"));
+    }
+    fn end_initialized_identifier(&mut self, _: Token) {
+        self.log.push(("end", "initialized_identifier"));
+    }
+    fn begin_try_statement(&mut self, _: Token) {
+        self.log.push(("begin", "try_statement"));
+    }
+    fn end_try_statement(&mut self, _: usize, _: Token, _: Option<Token>, _: Token) {
+        self.log.push(("end", "try_statement"));
+    }
+    fn begin_catch_clause(&mut self, _: Token) {
+        self.log.push(("begin", "catch_clause"));
+    }
+    fn end_catch_clause(&mut self, _: Token) {
+        self.log.push(("end", "catch_clause"));
+    }
+    fn begin_switch_statement(&mut self, _: Token) {
+        self.log.push(("begin", "switch_statement"));
+    }
+    fn end_switch_statement(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "switch_statement"));
+    }
+    fn begin_switch_block(&mut self, _: Token) {
+        self.log.push(("begin", "switch_block"));
+    }
+    fn end_switch_block(&mut self, _: usize, _: Token, _: Token) {
+        self.log.push(("end", "switch_block"));
+    }
+    fn begin_case_expression(&mut self, _: Token) {
+        self.log.push(("begin", "case_expression"));
+    }
+    fn end_case_expression(&mut self, _: Token, _: Option<Token>, _: Token) {
+        self.log.push(("end", "case_expression"));
+    }
+    fn begin_switch_case(&mut self, _: usize, _: usize, _: Token) {
+        self.log.push(("begin", "switch_case"));
+    }
+    fn end_switch_case(
+        &mut self,
+        _: usize,
+        _: usize,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: usize,
+        _: Token,
+        _: Token,
+    ) {
+        self.log.push(("end", "switch_case"));
+    }
+    fn handle_break_statement(&mut self, _: bool, _: Token, _: Token) {
+        self.log.push(("handle", "break_statement"));
+    }
+    fn handle_continue_statement(&mut self, _: bool, _: Token, _: Token) {
+        self.log.push(("handle", "continue_statement"));
+    }
+    fn begin_rethrow_statement(&mut self, _: Token) {
+        self.log.push(("begin", "rethrow_statement"));
+    }
+    fn end_rethrow_statement(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "rethrow_statement"));
+    }
+    fn begin_assert(&mut self, _: Token, _: crate::listener::AssertKind) {
+        self.log.push(("begin", "assert"));
+    }
+    fn end_assert(
+        &mut self,
+        _: Token,
+        _: crate::listener::AssertKind,
+        _: Token,
+        _: Option<Token>,
+        _: Token,
+    ) {
+        self.log.push(("end", "assert"));
+    }
+    fn handle_pattern_variable_declaration_statement(&mut self, _: Token, _: Token, _: Token) {
+        self.log
+            .push(("handle", "pattern_variable_declaration_statement"));
+    }
 }
 
 /// Builds a parser over `source` with a fresh [`Collector`].

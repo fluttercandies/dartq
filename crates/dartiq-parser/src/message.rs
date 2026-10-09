@@ -66,14 +66,18 @@ pub(crate) mod msg {
     };
     use dartiq_diagnostics::{
         ANNOTATION_ON_TYPE_ARGUMENT, ANNOTATION_WITH_TYPE_ARGUMENTS_UNINSTANTIATED,
+        BREAK_OUTSIDE_OF_LOOP, CATCH_SYNTAX, CATCH_SYNTAX_EXTRA_PARAMETERS, COLON_IN_PLACE_OF_IN,
+        CONTINUE_OUTSIDE_OF_LOOP, CONTINUE_WITHOUT_LABEL_IN_CASE,
         EMPTY_RECORD_TYPE_NAMED_FIELDS_LIST, EMPTY_RECORD_TYPE_WITH_COMMA,
         EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_TOKEN, EXPECTED_TYPE_NAME,
         ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME, ILLEGAL_PATTERN_IDENTIFIER_NAME,
-        ILLEGAL_PATTERN_VARIABLE_NAME, INVALID_CONSTANT_CONST_PREFIX,
-        INVALID_CONSTANT_PATTERN_BINARY, INVALID_INSIDE_UNARY_PATTERN, MISSING_IDENTIFIER,
-        MULTIPLE_VARIANCE_MODIFIERS, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
+        ILLEGAL_PATTERN_VARIABLE_NAME, INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR,
+        INVALID_CONSTANT_CONST_PREFIX, INVALID_CONSTANT_PATTERN_BINARY,
+        INVALID_INSIDE_UNARY_PATTERN, LATE_PATTERN_VARIABLE_DECLARATION, MISSING_CATCH_OR_FINALLY,
+        MISSING_IDENTIFIER, MULTIPLE_VARIANCE_MODIFIERS, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
         RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
-        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW, VAR_AND_TYPE,
+        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW,
+        SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
     };
     use dartiq_diagnostics::{CodeInfo, DARTIQ_INTERNAL_ERROR, DiagnosticType};
@@ -110,6 +114,15 @@ pub(crate) mod msg {
 
     pub(crate) fn missing_identifier() -> Message {
         Message::new(MISSING_IDENTIFIER, "Expected an identifier.")
+    }
+
+    /// `expectedIdentifier` (pseudo-shared `missingIdentifier`; the template
+    /// text carries the offending lexeme).
+    pub(crate) fn expected_identifier(lexeme: &str) -> Message {
+        Message::new(
+            MISSING_IDENTIFIER,
+            format!("Expected an identifier, but got '{lexeme}'."),
+        )
     }
 
     pub(crate) fn invalid_inside_unary_pattern() -> Message {
@@ -454,7 +467,9 @@ pub(crate) mod msg {
     }
 
     /// `expected{Class,Mixin,Enum,Extension,ExtensionType}Body` (shared-parser
-    /// own codes; not in the analyzer registry capture).
+    /// own codes; not in the analyzer registry capture) plus the
+    /// `Expected{Try,Catch,Finally}...Body` shared codes (same convention:
+    /// shared-parser own names, exact official texts).
     pub(crate) fn expected_block_body(kind: BlockKind, lexeme: &str) -> Message {
         if kind == BlockKind::Body {
             return expected_but_got("{");
@@ -485,6 +500,31 @@ pub(crate) mod msg {
                 "EXPECTED_EXTENSION_TYPE_BODY",
                 format!("Expected a extension type body, but got '{lexeme}'."),
             ),
+            BlockKind::TryStatement => (
+                "expected_try_statement_body",
+                "EXPECTED_TRY_STATEMENT_BODY",
+                "A try statement must have a body, even if it is empty.".to_owned(),
+            ),
+            BlockKind::CatchClause => (
+                "expected_catch_clause_body",
+                "EXPECTED_CATCH_CLAUSE_BODY",
+                "A catch clause must have a body, even if it is empty.".to_owned(),
+            ),
+            BlockKind::FinallyClause => (
+                "expected_finally_clause_body",
+                "EXPECTED_FINALLY_CLAUSE_BODY",
+                "A finally clause must have a body, even if it is empty.".to_owned(),
+            ),
+            BlockKind::SwitchStatement => (
+                "expected_switch_statement_body",
+                "EXPECTED_SWITCH_STATEMENT_BODY",
+                "A switch statement must have a body, even if it is empty.".to_owned(),
+            ),
+            // Never reported: statement blocks are only entered with `{`
+            // present.
+            BlockKind::Statement => {
+                return expected_but_got("{");
+            }
             BlockKind::Body => unreachable!("handled above"),
         };
         Message::new(local_code(name, machine), text)
@@ -1052,6 +1092,101 @@ pub(crate) mod msg {
             "Each class or mixin definition can have at most one implements clause.",
         )
     }
+
+    // —— statements (#19) ————————————————————————————————————————————————
+
+    /// `ExpectedFunctionBody` template (pseudo-shared `missingFunctionBody`;
+    /// the analyzer surfaces the registry `MISSING_FUNCTION_BODY` code).
+    pub(crate) fn expected_function_body(lexeme: &str) -> Message {
+        Message::new(
+            MISSING_FUNCTION_BODY,
+            format!("Expected a function body, but got '{lexeme}'."),
+        )
+    }
+
+    pub(crate) fn only_try() -> Message {
+        Message::new(
+            MISSING_CATCH_OR_FINALLY,
+            "A try block must be followed by an 'on', 'catch', or 'finally' clause.",
+        )
+    }
+
+    pub(crate) fn catch_syntax() -> Message {
+        Message::new(
+            CATCH_SYNTAX,
+            "'catch' must be followed by '(identifier)' or '(identifier, identifier)'.",
+        )
+    }
+
+    pub(crate) fn catch_syntax_extra_parameters() -> Message {
+        Message::new(
+            CATCH_SYNTAX_EXTRA_PARAMETERS,
+            "'catch' must be followed by '(identifier)' or '(identifier, identifier)'.",
+        )
+    }
+
+    pub(crate) fn switch_has_multiple_defaults() -> Message {
+        Message::new(
+            SWITCH_HAS_MULTIPLE_DEFAULT_CASES,
+            "The 'default' case can only be declared once.",
+        )
+    }
+
+    pub(crate) fn switch_has_case_after_default() -> Message {
+        Message::new(
+            SWITCH_HAS_CASE_AFTER_DEFAULT_CASE,
+            "The default case should be the last case in a switch statement.",
+        )
+    }
+
+    pub(crate) fn colon_in_place_of_in() -> Message {
+        Message::new(
+            COLON_IN_PLACE_OF_IN,
+            "For-in loops use 'in' rather than a colon.",
+        )
+    }
+
+    pub(crate) fn invalid_await_for() -> Message {
+        Message::new(
+            INVALID_AWAIT_IN_FOR,
+            "The keyword 'await' isn't allowed for a normal 'for' statement.",
+        )
+    }
+
+    pub(crate) fn initialized_variable_in_for_each() -> Message {
+        Message::new(
+            INITIALIZED_VARIABLE_IN_FOR_EACH,
+            "The loop variable in a for-each loop can't be initialized.",
+        )
+    }
+
+    pub(crate) fn late_pattern_variable_declaration() -> Message {
+        Message::new(
+            LATE_PATTERN_VARIABLE_DECLARATION,
+            "A pattern variable declaration may not use the `late` keyword.",
+        )
+    }
+
+    pub(crate) fn break_outside_of_loop() -> Message {
+        Message::new(
+            BREAK_OUTSIDE_OF_LOOP,
+            "A break statement can't be used outside of a loop or switch statement.",
+        )
+    }
+
+    pub(crate) fn continue_outside_of_loop() -> Message {
+        Message::new(
+            CONTINUE_OUTSIDE_OF_LOOP,
+            "A continue statement can't be used outside of a loop or switch statement.",
+        )
+    }
+
+    pub(crate) fn continue_without_label_in_case() -> Message {
+        Message::new(
+            CONTINUE_WITHOUT_LABEL_IN_CASE,
+            "A continue statement in a switch statement must have a label as a target.",
+        )
+    }
 }
 
 /// Block-shape expectations for `ensureBlock` recovery (official
@@ -1062,6 +1197,17 @@ pub(crate) enum BlockKind {
     /// Function/statement body (`skipBlock` with no declaration kind;
     /// reports `Expected '{' before this.`).
     Body,
+    /// A plain statement block (`parseBlock`, `BlockKind.statement`; never
+    /// reports — only entered with `{` present).
+    Statement,
+    /// The block after `try`.
+    TryStatement,
+    /// The block after `on`/`catch`.
+    CatchClause,
+    /// The block after `finally`.
+    FinallyClause,
+    /// A switch statement body.
+    SwitchStatement,
     Class,
     Mixin,
     Enum,

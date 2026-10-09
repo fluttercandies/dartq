@@ -16,7 +16,7 @@ use crate::token_id::{TokenId, TokenSpan};
 
 /// Maximum structural nesting before the parser forces unwinding (official
 /// `recoverFromStackOverflow` cap of 500, `parser_impl.dart:6709`).
-const MAX_DEPTH: u32 = 500;
+pub(crate) const MAX_DEPTH: u32 = 500;
 
 /// Per-file diagnostics cap (rust-analyzer parser-bailout practice). A
 /// recovery loop that cannot make progress must not stream unbounded
@@ -51,13 +51,18 @@ pub struct Parser<'s, 't, L: ParserListener> {
     pub(crate) is_last_pattern_allowed_inside_unary_pattern: bool,
     /// Structural nesting depth guard.
     depth: u32,
+    /// Statement nesting depth (official `statementDepth`, the separate
+    /// `parseStatement` counter with the same 500 cap).
+    pub(crate) statement_depth: u32,
     /// Diagnostics emitted so far, against [`MAX_DIAGNOSTICS`].
     diagnostics_emitted: u32,
     /// Terminal bailout latch (diagnostics cap or nesting cap): set once,
-    /// every grammar loop then unwinds without consuming.
+    /// every grammar loop then unwinds without consuming further tokens.
     bailed: bool,
     /// `asyncState`: modifier state for `inPlainSync` checks.
     pub(crate) async_state: AsyncModifier,
+    /// `loopState`: break/continue admissibility of the enclosing construct.
+    pub(crate) loop_state: crate::listener::LoopState,
     /// Augment token captured by a declaration-modifier walk, handed to the
     /// declaration parser (official `context.augmentToken`).
     pub(crate) pending_augment: Option<TokenSpan>,
@@ -79,9 +84,11 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             features,
             is_last_pattern_allowed_inside_unary_pattern: true,
             depth: 0,
+            statement_depth: 0,
             diagnostics_emitted: 0,
             bailed: false,
             async_state: AsyncModifier::Sync,
+            loop_state: crate::listener::LoopState::OutsideLoop,
             pending_augment: None,
         }
     }

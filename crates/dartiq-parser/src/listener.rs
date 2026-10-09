@@ -65,6 +65,47 @@ pub enum ConstantPatternContext {
     NumericLiteralOnly,
 }
 
+/// `BlockKind` (`block_kind.dart`), statement-scope kinds only — declaration
+/// bodies use `DeclarationKind`/member events instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    /// A plain `{ ... }` statement block.
+    Statement,
+    /// A function body block.
+    FunctionBody,
+    /// The block after `try`.
+    TryStatement,
+    /// The block after `on type` / `catch (...)`.
+    CatchClause,
+    /// The block after `finally`.
+    FinallyClause,
+    /// The block after a switch statement's condition.
+    SwitchStatement,
+}
+
+/// `Assert` (`assert.dart`): the position an assertion is parsed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertKind {
+    /// Constructor initializer `assert`.
+    Initializer,
+    /// An `assert;` statement.
+    Statement,
+    /// `assert` in expression position.
+    Expression,
+}
+
+/// `LoopState` (`loop_state.dart`): break/continue admissibility of the
+/// enclosing construct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopState {
+    /// Not inside a loop or switch.
+    OutsideLoop,
+    /// Inside a loop body.
+    InsideLoop,
+    /// Inside a switch statement (but not a loop).
+    InsideSwitch,
+}
+
 /// `ConstructorReferenceContext` (`constructor_reference_context.dart`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstructorReferenceContext {
@@ -221,6 +262,14 @@ pub enum IdentifierContext {
     ConstructorReferenceContinuationAfterTypeArguments,
     /// `primaryConstructorDeclaration`.
     PrimaryConstructorDeclaration,
+    /// `localFunctionDeclaration`.
+    LocalFunctionDeclaration,
+    /// `labelDeclaration`.
+    LabelDeclaration,
+    /// `labelReference`.
+    LabelReference,
+    /// `catchParameter`.
+    CatchParameter,
 }
 
 /// Experimental feature flag referenced by
@@ -901,6 +950,203 @@ pub trait ParserListener {
         kind: DeclarationKind,
         token: Token,
         const_keyword: Option<Token>,
+    ) {
+    }
+
+    // —— statements (#19) ————————————————————————————————————————————————
+    /// `beginBlock(token, blockKind)`.
+    fn begin_block(&mut self, token: Token, kind: BlockKind) {}
+    /// `endBlock(count, begin, end, blockKind)`.
+    fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {}
+    /// `beginBlockFunctionBody(token)`.
+    fn begin_block_function_body(&mut self, token: Token) {}
+    /// `endBlockFunctionBody(count, begin, end)`.
+    fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {}
+    /// `handleInvalidFunctionBody(token)`.
+    fn handle_invalid_function_body(&mut self, token: Token) {}
+    /// `handleExpressionFunctionBody(arrow, end)`; `end` is `None` for
+    /// function-expression bodies.
+    fn handle_expression_function_body(&mut self, arrow: Token, end: Option<Token>) {}
+    /// `handleExpressionStatement(begin, end)`.
+    fn handle_expression_statement(&mut self, begin: Token, end: Token) {}
+    /// `handleEmptyStatement(token)`.
+    fn handle_empty_statement(&mut self, token: Token) {}
+    /// `handleInvalidStatement(begin, message)`; the message is a
+    /// pseudo-shared (resolution-domain) code and is not a TSV emission.
+    fn handle_invalid_statement(&mut self, begin: Token) {}
+    /// `beginIfStatement(token)`.
+    fn begin_if_statement(&mut self, token: Token) {}
+    fn begin_then_statement(&mut self, token: Token) {}
+    fn end_then_statement(&mut self, begin: Token, end: Token) {}
+    fn begin_else_statement(&mut self, token: Token) {}
+    fn end_else_statement(&mut self, begin: Token, end: Token) {}
+    /// `endIfStatement(ifToken, elseToken, end)`.
+    fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {}
+    /// `beginForStatement(token)`.
+    fn begin_for_statement(&mut self, token: Token) {}
+    fn handle_for_initializer_empty_statement(&mut self, token: Token) {}
+    /// `handleForInitializerExpressionStatement(token, forIn)`.
+    fn handle_for_initializer_expression_statement(&mut self, token: Token, for_in: bool) {}
+    /// `handleForInitializerLocalVariableDeclaration(token, forIn)`.
+    fn handle_for_initializer_local_variable_declaration(&mut self, token: Token, for_in: bool) {}
+    /// `handleForInitializerPatternVariableAssignment(patternKeyword, equals)`.
+    fn handle_for_initializer_pattern_variable_assignment(
+        &mut self,
+        pattern_keyword: Token,
+        equals: Token,
+    ) {
+    }
+    fn begin_for_statement_body(&mut self, token: Token) {}
+    fn end_for_statement_body(&mut self, end: Token) {}
+    /// `endForStatement(endToken)` (the for-in counterpart is
+    /// [`ParserListener::end_for_in`]; exactly one of the two fires).
+    fn end_for_statement(&mut self, end: Token) {}
+    /// `handleForLoopParts(forToken, leftParen, leftSeparator,
+    /// rightSeparator, expressionCount)`.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_for_loop_parts(
+        &mut self,
+        for_kw: Token,
+        left_paren: Token,
+        left_separator: Token,
+        right_separator: Token,
+        expression_count: usize,
+    ) {
+    }
+    fn begin_for_in_body(&mut self, token: Token) {}
+    fn end_for_in_body(&mut self, end: Token) {}
+    /// `endForIn(endToken)`.
+    fn end_for_in(&mut self, end: Token) {}
+    /// `handleForInLoopParts(awaitToken, forToken, leftParen,
+    /// patternKeyword, inKeyword)`.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_for_in_loop_parts(
+        &mut self,
+        await_kw: Option<Token>,
+        for_kw: Token,
+        left_paren: Token,
+        pattern_keyword: Option<Token>,
+        in_kw: Token,
+    ) {
+    }
+    fn begin_for_in_expression(&mut self, token: Token) {}
+    fn end_for_in_expression(&mut self, end: Token) {}
+    fn begin_while_statement(&mut self, token: Token) {}
+    fn begin_while_statement_body(&mut self, token: Token) {}
+    fn end_while_statement_body(&mut self, end: Token) {}
+    fn end_while_statement(&mut self, token: Token, end: Token) {}
+    fn begin_do_while_statement(&mut self, token: Token) {}
+    fn begin_do_while_statement_body(&mut self, token: Token) {}
+    fn end_do_while_statement_body(&mut self, end: Token) {}
+    fn end_do_while_statement(&mut self, token: Token, while_kw: Token, end: Token) {}
+    /// `beginReturnStatement(token)`.
+    fn begin_return_statement(&mut self, token: Token) {}
+    /// `endReturnStatement(hasExpression, begin, end)`.
+    fn end_return_statement(&mut self, has_expression: bool, begin: Token, end: Token) {}
+    fn begin_yield_statement(&mut self, token: Token) {}
+    fn end_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {}
+    /// `endInvalidYieldStatement(begin, star, end, errorCode)`; the error
+    /// code is resolution-domain and never a TSV emission.
+    fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {}
+    fn begin_labeled_statement(&mut self, token: Token, label_count: usize) {}
+    fn end_labeled_statement(&mut self, label_count: usize) {}
+    /// `handleLabel(colon)`.
+    fn handle_label(&mut self, token: Token) {}
+    fn begin_local_function_declaration(&mut self, token: Token) {}
+    fn end_local_function_declaration(&mut self, end: Token) {}
+    fn begin_function_name(&mut self, token: Token) {}
+    fn end_function_name(&mut self, begin: Token, end: Token, is_function_expression: bool) {}
+    /// `beginVariablesDeclaration(name, lateToken, varFinalOrConst)`.
+    fn begin_variables_declaration(
+        &mut self,
+        token: Token,
+        late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+    ) {
+    }
+    /// `endVariablesDeclaration(count, end)`; `end` is `None` in for-parts
+    /// mode.
+    fn end_variables_declaration(&mut self, count: usize, end: Option<Token>) {}
+    fn begin_initialized_identifier(&mut self, token: Token) {}
+    fn end_initialized_identifier(&mut self, name: Token) {}
+    fn handle_no_variable_initializer(&mut self, token: Token) {}
+    fn begin_variable_initializer(&mut self, token: Token) {}
+    fn end_variable_initializer(&mut self, token: Token) {}
+    fn begin_try_statement(&mut self, token: Token) {}
+    fn end_try_statement(
+        &mut self,
+        count: usize,
+        begin: Token,
+        finally_kw: Option<Token>,
+        end: Token,
+    ) {
+    }
+    fn begin_catch_clause(&mut self, token: Token) {}
+    fn end_catch_clause(&mut self, token: Token) {}
+    /// `handleCatchBlock(onKeyword, catchKeyword, comma)`.
+    fn handle_catch_block(
+        &mut self,
+        on_kw: Option<Token>,
+        catch_kw: Option<Token>,
+        comma: Option<Token>,
+    ) {
+    }
+    fn handle_finally_block(&mut self, finally_kw: Token) {}
+    fn begin_switch_statement(&mut self, token: Token) {}
+    fn end_switch_statement(&mut self, token: Token, end: Token) {}
+    fn begin_switch_block(&mut self, token: Token) {}
+    fn end_switch_block(&mut self, count: usize, begin: Token, end: Token) {}
+    fn begin_case_expression(&mut self, case_kw: Token) {}
+    fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, colon: Token) {}
+    fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, token: Token) {}
+    /// `endSwitchCase(labelCount, expressionCount, defaultKeyword,
+    /// colonAfterDefault, statementCount, begin, end)`.
+    #[allow(clippy::too_many_arguments)]
+    fn end_switch_case(
+        &mut self,
+        label_count: usize,
+        expression_count: usize,
+        default_kw: Option<Token>,
+        colon_after_default: Option<Token>,
+        statement_count: usize,
+        begin: Token,
+        end: Token,
+    ) {
+    }
+    fn begin_switch_case_when_clause(&mut self, token: Token) {}
+    fn end_switch_case_when_clause(&mut self, token: Token) {}
+    fn handle_switch_case_no_when_clause(&mut self, token: Token) {}
+    fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {}
+    fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {}
+    fn begin_rethrow_statement(&mut self, token: Token) {}
+    fn end_rethrow_statement(&mut self, rethrow_kw: Token, end: Token) {}
+    fn begin_assert(&mut self, token: Token, kind: AssertKind) {}
+    fn end_assert(
+        &mut self,
+        begin: Token,
+        kind: AssertKind,
+        left_paren: Token,
+        comma: Option<Token>,
+        end: Token,
+    ) {
+    }
+    /// `handleParenthesizedCondition(begin, case, when)` (if/while/switch
+    /// conditions; `case`/`when` only under the patterns feature).
+    fn handle_parenthesized_condition(
+        &mut self,
+        begin: Token,
+        case_kw: Option<Token>,
+        when: Option<Token>,
+    ) {
+    }
+    fn begin_pattern_guard(&mut self, when: Token) {}
+    fn end_pattern_guard(&mut self, token: Token) {}
+    /// `handlePatternVariableDeclarationStatement(keyword, equals, semicolon)`.
+    fn handle_pattern_variable_declaration_statement(
+        &mut self,
+        keyword: Token,
+        equals: Token,
+        semicolon: Token,
     ) {
     }
 
