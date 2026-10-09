@@ -935,9 +935,16 @@ fn max_rss_bytes() -> Option<u64> {
 /// Canonical absolute path (the oracle prints symlink-resolved paths) plus
 /// strict UTF-8 source. A read/decode failure is an internal error (4), never
 /// a silently skipped file — lossy output would be format drift downstream.
+///
+/// Exactly one leading UTF-8 BOM is dropped (oracle read-layer parity: the
+/// analyzer read path strips it before scanning; spans are relative to the
+/// stripped text). A second BOM is content.
 fn read_source(path: &Path) -> io::Result<(PathBuf, String)> {
     let canonical = path.canonicalize()?;
-    let source = fs::read_to_string(&canonical)?;
+    let mut source = fs::read_to_string(&canonical)?;
+    if source.starts_with('\u{FEFF}') {
+        source.drain(..'\u{FEFF}'.len_utf8());
+    }
     Ok((canonical, source))
 }
 
@@ -1320,6 +1327,30 @@ mod tests {
             }),
             exit::CLEAN
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The CLI read face strips exactly one leading BOM, matching the oracle
+    /// read layer: single BOM gone, second BOM kept as content, BOM-only
+    /// file reads back empty.
+    #[test]
+    fn read_source_strips_one_leading_bom() {
+        let root = std::env::temp_dir().join(format!("dq_cli_bom_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("single.dart"), "\u{FEFF}var x;").expect("write");
+        fs::write(root.join("double.dart"), "\u{FEFF}\u{FEFF}x").expect("write");
+        fs::write(root.join("only.dart"), "\u{FEFF}").expect("write");
+        fs::write(root.join("plain.dart"), "var x;").expect("write");
+
+        let (_, single) = read_source(&root.join("single.dart")).expect("read");
+        assert_eq!(single, "var x;");
+        let (_, double) = read_source(&root.join("double.dart")).expect("read");
+        assert_eq!(double, "\u{FEFF}x");
+        let (_, only) = read_source(&root.join("only.dart")).expect("read");
+        assert!(only.is_empty(), "BOM-only file strips to the empty string");
+        let (_, plain) = read_source(&root.join("plain.dart")).expect("read");
+        assert_eq!(plain, "var x;");
 
         fs::remove_dir_all(&root).ok();
     }

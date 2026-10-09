@@ -45,8 +45,6 @@ pub(crate) struct Lexer<'s> {
     /// Lookahead register: the character at `self.pos`; `None` = EOF.
     next: Option<char>,
     pos: usize,
-    /// First content byte after the BOM (the script tag is only recognized at this offset).
-    content_start: usize,
     tokens: Vec<Token>,
     /// begin token index → close token index (grows in parallel with tokens).
     end_of: Vec<u32>,
@@ -68,14 +66,14 @@ pub(crate) struct Lexer<'s> {
 
 impl<'s> Lexer<'s> {
     pub(crate) fn new(src: &'s str, config: ScanConfig, file: FileId) -> Self {
-        let content_start = usize::from(src.starts_with('\u{FEFF}')) * 3;
+        // The decode faces (engine `set_content` / CLI `read_source`) strip a
+        // leading BOM, so the scanner always starts at the true file origin.
         let mut lex = Self {
             src,
             config,
             file,
             next: None,
-            pos: content_start,
-            content_start,
+            pos: 0,
             tokens: Vec::with_capacity(src.len() / 4 + 1),
             end_of: Vec::new(),
             groups: Vec::new(),
@@ -84,8 +82,7 @@ impl<'s> Lexer<'s> {
             version_override: None,
             version_override_span: None,
         };
-        lex.utf16_value = u32::from(content_start == 3); // the BOM takes 1 UTF-16 unit
-        lex.next = lex.peek_char(lex.pos);
+        lex.next = lex.peek_char(0);
         lex
     }
 
@@ -296,8 +293,10 @@ impl<'s> Lexer<'s> {
     // --- header: script tag and the @dart version comment window ---
 
     fn scan_header(&mut self) {
-        // script tag: only when `#!` is the file's first content byte sequence (official scanOffset==0).
-        if self.pos == self.content_start && self.peek() == Some('#') && self.peek2() == Some('!') {
+        // script tag: only when `#!` opens the file (official scanOffset==0).
+        // scan_header runs before any content is consumed, so the current
+        // position here is always the file origin.
+        if self.peek() == Some('#') && self.peek2() == Some('!') {
             let start = self.pos;
             self.bump();
             self.bump();

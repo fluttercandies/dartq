@@ -45,10 +45,11 @@
 //!
 //! Only version comments inside the **file-header comment window** are
 //! recognized (bigHeaderSwitch :1076 + `_scanHeaderLookingForLanguageVersion`
-//! :972): starting from the file origin (the first content byte after skipping
-//! the BOM), consecutive whitespace/comments (including nested block comments)
+//! :972): starting from the file origin (the decode faces strip a leading
+//! BOM, so the scanner text starts at the true content), consecutive
+//! whitespace/comments (including nested block comments)
 //! do not end the window; comments after an optional very-first script tag
-//! (`#!`, only when it is the file's first non-BOM byte sequence) are still
+//! (`#!`, only when it is the file's first byte sequence) are still
 //! inside the window. Emitting any real token closes the window. The syntax is
 //! strict: `//` + space* + `@dart` + space* + `=` + space* + digit+ + `.` +
 //! digit+ + space* + (LF|CR|EOF); `///`, tab indentation, and trailing garbage
@@ -80,11 +81,6 @@
 //!
 //! # Known divergences from the official scanner (recorded, revisit triggers)
 //!
-//! - BOM: dartq counts a leading BOM as 1 UTF-16 unit (and still recognizes
-//!   `#!` after it); the official UTF-8 decoder drops the BOM entirely (0
-//!   units). Internally consistent — every offset in the result shifts by the
-//!   same rule — only BOM-prefixed files are affected. Revisit byte-level
-//!   differential alignment if BOM corpus enters the machine-diff set.
 //! - The official `discardBeginGroupUntil` dual-strategy option tests are not
 //!   replicated: for pathological inputs the token-chain shape may differ
 //!   (intermediate unclosed begins), valid code always scans identically.
@@ -196,8 +192,9 @@ pub struct ScanResult {
     pub line_index: LineIndex,
 }
 
-/// Scans `source` (valid UTF-8, guaranteed by the caller; tolerates and skips a
-/// leading BOM).
+/// Scans `source` (valid UTF-8, guaranteed by the caller; BOM-less — the
+/// decode faces strip a leading U+FEFF, so a scanner-visible BOM is content
+/// and takes the ordinary illegal-character path).
 ///
 /// `file` is used for diagnostic attribution (see "Signature revision notes" in
 /// the module docs).

@@ -139,12 +139,17 @@ impl Engine {
     /// The bytes decode as UTF-8 eagerly (the whole pipeline downstream is
     /// `&str`); invalid sequences become U+FFFD. The oracle never feeds
     /// invalid UTF-8, so this is documented behavior, not a parity surface.
+    ///
+    /// Exactly one leading UTF-8 BOM is dropped before decode (oracle
+    /// read-layer parity: the analyzer read path strips it before scanning,
+    /// so all spans are relative to the stripped text). A second BOM is
+    /// content and reaches the scanner as an ordinary U+FEFF.
     pub fn set_content(&mut self, path: &Path, bytes: &[u8]) -> FileId {
         let file = self.state.files.intern(path);
         if !self.state.pending.contains_key(&file) {
             self.state.pending_order.push(file);
         }
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        let text = String::from_utf8_lossy(strip_one_bom(bytes)).into_owned();
         self.state
             .pending
             .insert(file, state::PendingChange::Set(text));
@@ -468,4 +473,38 @@ pub trait SemanticDiagnoser: Send + Sync {
 #[must_use]
 pub fn memory_store() -> Box<dyn SourceStore + Send + Sync> {
     Box::new(MemorySourceStore::new())
+}
+
+/// Drops exactly one leading UTF-8 BOM (`EF BB BF`, U+FEFF) — oracle
+/// read-layer parity (`.third/dart-sdk` `_fe_analyzer_shared` utf.dart
+/// Before-BOM state machine via the analyzer file read): the scanner runs on
+/// BOM-less text and every span is relative to the stripped text. Exactly
+/// one is dropped; a second BOM is content.
+fn strip_one_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bom_stripped_once() {
+        assert_eq!(strip_one_bom("\u{FEFF}var x;".as_bytes()), b"var x;");
+        // BOM-less input passes through untouched.
+        assert_eq!(strip_one_bom(b"var x;"), b"var x;");
+    }
+
+    #[test]
+    fn double_bom_leaves_second_as_content() {
+        assert_eq!(
+            strip_one_bom("\u{FEFF}\u{FEFF}x".as_bytes()),
+            "\u{FEFF}x".as_bytes()
+        );
+    }
+
+    #[test]
+    fn bom_only_strips_to_empty() {
+        assert_eq!(strip_one_bom("\u{FEFF}".as_bytes()), b"");
+    }
 }

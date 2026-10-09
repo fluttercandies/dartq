@@ -1,4 +1,4 @@
-//! Recovery strategies, diagnostic pinning, the @dart window, BOM/CRLF, dual-offset consistency.
+//! Recovery strategies, diagnostic pinning, the @dart window, CRLF, BOM-as-content, dual-offset consistency.
 
 use super::{assert_codes, assert_kinds, codes, scan_src};
 use crate::{Keyword, TokenKind as K};
@@ -45,13 +45,27 @@ fn line_comments_skipped() {
 }
 
 #[test]
-fn bom_skipped() {
+fn bom_is_content() {
+    // The engine/CLI decode faces strip a leading BOM, so a U+FEFF the
+    // scanner sees is ordinary content: a non-ASCII space character
+    // diagnostic (official error_token.dart case 0xFEFF), never a silent
+    // skip. Offsets stay natural — the oracle reports the same numbers for a
+    // double-BOM file (its read layer strips exactly one BOM).
     let src = "\u{FEFF}var x;";
     let r = scan_src(src);
     assert_kinds(&r, &[K::Keyword(Keyword::Var), K::Identifier, K::Semicolon]);
-    // After the BOM, `#!` is still a script tag (the official UTF-8 decoder drops the BOM).
+    assert_codes(&r, &["illegal_character"]);
+    assert_eq!(r.diagnostics[0].range.offset, 0);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    let t = r.tokens.first();
+    assert_eq!(t.byte_offset, 3);
+    assert_eq!(t.utf16_offset, 1);
+    assert_eq!(byte_offset_to_utf16(src, 3), 1);
+    // A content BOM also blocks script-tag recognition (`#!` is no longer
+    // the file's first byte sequence).
     let r = scan_src("\u{FEFF}#!/bin/dart");
-    assert_kinds(&r, &[K::ScriptTag]);
+    assert_codes(&r, &["illegal_character"]);
+    assert!(!r.tokens.as_slice().iter().any(|t| t.kind == K::ScriptTag));
 }
 
 #[test]
@@ -615,18 +629,6 @@ fn empty_block_comment_is_not_unterminated() {
     let r = scan_src("/***/x");
     assert_kinds(&r, &[K::Identifier]);
     assert!(r.diagnostics.is_empty());
-}
-
-#[test]
-fn bom_offsets_recorded_convention() {
-    // Recorded dartq convention (crate docs "Known divergences"): the BOM
-    // counts as 1 UTF-16 unit; all offsets stay internally consistent.
-    let src = "\u{FEFF}var x;";
-    let r = scan_src(src);
-    let t = r.tokens.first();
-    assert_eq!(t.byte_offset, 3);
-    assert_eq!(t.utf16_offset, 1);
-    assert_eq!(byte_offset_to_utf16(src, 3), 1);
 }
 
 #[test]
