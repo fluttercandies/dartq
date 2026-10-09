@@ -13,6 +13,9 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # Content pin for data/syntax-codes.tsv (tests/syntax_codes_tsv.rs)
 blake3 = { workspace = true }
+# Equality pin between the hand-written constants and the semantic table's
+# dual definitions (code.rs tests)
+dartq-semantic = { path = "../dartq-semantic" }
 
 [lints]
 workspace = true

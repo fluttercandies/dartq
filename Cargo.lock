@@ -212,6 +212,8 @@ dependencies = [
 name = "dartq-diagnostics"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "dartq-semantic",
  "dartq-source",
  "serde",
  "serde_json",
@@ -222,6 +224,7 @@ name = "dartq-engine"
 version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
+ "dartq-index",
  "dartq-language",
  "dartq-package",
  "dartq-parser",

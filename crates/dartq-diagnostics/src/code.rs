@@ -1,7 +1,7 @@
 //! Stable diagnostic codes: the official analyzer code set dartq aligns to,
 //! plus dartq's own `dartq/` namespace (PRD §13.2).
 //!
-//! The official set — 262 parser/scanner syntax codes plus the 3-code
+//! The official set — 255 parser/scanner syntax codes plus the 3-code
 //! `// @dart=` language-version family — is generated at build time from
 //! `data/syntax-codes.tsv`, the authoritative table captured in
 //! `docs/facts/syntax-codes.md` §9 (dart 3.13.1 oracle lock). To update it,
@@ -241,12 +241,13 @@ impl CodeRegistry {
 mod tests {
     use super::*;
 
-    /// Table shape: 262 syntax codes + 3 language-version codes, globally
+    /// Table shape: 255 syntax codes + 3 language-version codes (the 7
+    /// measured-dead rows were pruned from the snapshot, #222), globally
     /// unique names, machine forms are the uppercase names, and every row is
     /// reachable through the registry next to the hand-written own codes.
     #[test]
     fn generated_table_is_complete_and_wellformed() {
-        assert_eq!(OFFICIAL_CODES.len(), 265);
+        assert_eq!(OFFICIAL_CODES.len(), 258);
         assert_eq!(OFFICIAL_CODE_DATA.len(), OFFICIAL_CODES.len());
         let registry = CodeRegistry::builtin();
         for code in OFFICIAL_CODES {
@@ -438,7 +439,7 @@ mod tests {
         assert_eq!(message_template("dartq/internal_error"), None);
     }
 
-    /// Audit F1: exactly 15 published codes among the 265 table rows — the 13
+    /// Audit F1: exactly 15 published codes among the 258 table rows — the 13
     /// `hasPublishedDocs: true` syntax codes (analyzer-8.4.1
     /// `syntactic_errors.g.dart`) plus `invalid_language_version_override`
     /// (all 9 of its variants are published) and
@@ -489,6 +490,31 @@ mod tests {
             if code.name.starts_with("dartq/") {
                 assert!(!code.has_published_docs, "{}", code.name);
             }
+        }
+    }
+
+    /// The hand-written constants and the semantic table define the same
+    /// official codes independently (the constants feed the golden tests, the
+    /// semantic emit path builds its own descriptors), so nothing else ties
+    /// them together. Pin the shared-name pairs' string identity here — drift
+    /// on either side fails loudly. `DEAD_CODE` and `AWAIT_IN_WRONG_CONTEXT`
+    /// have no semantic counterpart: they sit outside the frozen M1 gate set.
+    #[test]
+    fn hand_written_constants_match_semantic_table() {
+        use dartq_semantic::codes::SemanticCode;
+
+        let pairs = [
+            (DUPLICATE_DEFINITION, SemanticCode::DuplicateDefinition),
+            (UNDEFINED_IDENTIFIER, SemanticCode::UndefinedIdentifier),
+            (
+                ARGUMENT_TYPE_NOT_ASSIGNABLE,
+                SemanticCode::ArgumentTypeNotAssignable,
+            ),
+        ];
+        for (constant, semantic) in pairs {
+            let info = semantic.code_info();
+            assert_eq!(constant.name, info.name, "{}", constant.machine);
+            assert_eq!(constant.machine, info.machine, "{}", constant.name);
         }
     }
 }

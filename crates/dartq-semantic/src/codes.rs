@@ -3,20 +3,23 @@
 //! oracle message per code.
 //!
 //! One variant per implemented frozen row. Every row was transcribed from
-//! the analyzer-8.4.1 registry (`lib/src/error/codes.g.dart`,
-//! `lib/src/dart/error/syntactic_errors.g.dart`, `DiagnosticCode.name` form;
-//! line anchors in the per-variant doc comments) and re-verified verbatim
-//! against the pinned live registry (`.third/dart-sdk`
-//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.13.1 — the
-//! 8.4.1 `codes.g.dart` does not exist in the pinned checkout; #121). Tier
-//! split:
+//! the analyzer-8.4.1 registry and re-verified verbatim against the pinned
+//! live registry (`.third/dart-sdk`
+//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.13.1) — that
+//! unified registry is also the line-anchor source for the per-variant doc
+//! comments and the tier split below: the 8.4.1 `codes.g.dart` /
+//! `syntactic_errors.g.dart` files do not exist in the pinned checkout, and
+//! the syntactic rows were absorbed into the unified registry (#121, #222).
+//! Tier split:
 //!
 //! * the `undefined_*` family, `duplicate_definition`, and the
 //!   `wrong_number_of_type_arguments*` / `..._parameters_for_operator`
-//!   rows are `CompileTimeErrorTemplate` (oracle severity ERROR);
+//!   rows are compile-time errors (oracle severity ERROR,
+//!   `DiagnosticType.COMPILE_TIME_ERROR`);
 //! * `wrong_number_of_parameters_for_setter` is a *syntactic* row
-//!   (`syntactic_errors.g.dart:2658`, fired from
-//!   `fasta/ast_builder.dart:6283-6291` in the oracle): the trigger lives
+//!   (`diagnostic.g.dart:18561-18571`, `SYNTACTIC_ERROR` at :18568; fired
+//!   from `pkg/analyzer/lib/src/fasta/ast_builder.dart:6477,6510` in the
+//!   oracle): the trigger lives
 //!   in the parser there, and dartq's parser does not emit it yet — the
 //!   semantic layer owns the check until the parser lands it (remove this
 //!   site then, or the code double-reports);
@@ -50,17 +53,23 @@
 //! semantic emit-side authority and produces the [`CodeInfo`] the
 //! diagnostic model consumes.
 //!
-//! Frozen rows this table deliberately does not carry (each under-reports,
-//! never false-positives; see the [`crate::diagnose`] module docs):
-//! `undefined_constructor_in_initializer` and `undefined_enum_constructor`
-//! (constructors are outside the M1 model), `undefined_referenced_parameter`
-//! (`@UseResult(unless:)`-specific check, `annotation_verifier.dart:519-541`),
-//! `undefined_hidden_name` / `undefined_shown_name` (`STATIC_WARNING` tier; the
-//! parser consumes directives diet-style and resolution's [`Combinators`]
-//! exposes no clause enumeration — both arrive with the directive milestone),
-//! and `wrong_number_of_type_arguments_element` (a main-registry row with no
-//! 8.4.1 template: at every shape it covers, the pinned oracle reports the
-//! base/function/method variants above).
+//! Frozen gate rows this table deliberately does not carry (each
+//! under-reports, never false-positives; see the [`crate::diagnose`] module
+//! docs): `undefined_constructor_in_initializer` and
+//! `undefined_enum_constructor` (constructors are outside the M1 model),
+//! `undefined_referenced_parameter` (`@UseResult(unless:)`-specific check,
+//! `annotation_verifier.dart:519-541`), `undefined_hidden_name` /
+//! `undefined_shown_name` (`STATIC_WARNING` tier; the parser consumes
+//! directives diet-style and resolution's [`Combinators`] exposes no clause
+//! enumeration — both arrive with the directive milestone), and
+//! `wrong_number_of_type_arguments_function` (the row exists above but has
+//! no emit site: the M1 [`crate::model::Ty`] cannot render the function-type
+//! display the template leads with — under-report). Every other frozen gate
+//! row is carried: the `wrong_number_of_type_arguments*` family (including
+//! `_element`, with emit sites in [`crate::diagnose`]) and
+//! `wrong_number_of_parameters_for_operator` are implemented above, and
+//! `uri_does_not_exist` lives in the M0 official registry
+//! (`dartq-diagnostics`), emitted by the resolution layer.
 
 use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
 
@@ -276,8 +285,8 @@ impl SemanticCode {
             Self::InvalidNullAwareOperator => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         };
-        // The function variant is the one wrong-number template without
-        // `hasPublishedDocs` (codes.g.dart:7911-7932).
+        // The function variant is the one wrong-number template without a
+        // `hasPublishedDocs` field (diagnostic.g.dart:18725-18744).
         let published = !matches!(self, Self::WrongNumberOfTypeArgumentsFunction);
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -547,10 +556,10 @@ mod tests {
         );
     }
 
-    /// Verbatim oracle texts (analyzer-8.4.1 `codes.g.dart` /
-    /// `syntactic_errors.g.dart`), including the no-argument await and
-    /// setter texts, the four `UNDEFINED_SUPER_MEMBER` shapes, and the
-    /// batch-2 wrong-number/nullability templates.
+    /// Verbatim oracle texts (pinned live registry `diagnostic.g.dart`),
+    /// including the no-argument await and setter texts, the four
+    /// `UNDEFINED_SUPER_MEMBER` shapes, and the batch-2 wrong-number and
+    /// nullability templates.
     #[test]
     fn messages_are_verbatim() {
         assert_eq!(

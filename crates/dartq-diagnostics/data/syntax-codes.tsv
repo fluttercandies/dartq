@@ -30,6 +30,18 @@
 # are true, ILLEGAL_ is false).
 # The oracle emits the JSON `documentation` URL only when this is true
 # (`_fe_analyzer_shared` errors.dart `url` getter).
+# Pruned 2026-10-09 (#222, adjudicating #220 over #217): removed 7
+#   measured-dead rows — invalid_operator_for_super,
+#   missing_terminator_for_parameter_group, multiple_variables_in_for_each,
+#   non_user_definable_operator, unable_get_content,
+#   unexpected_terminator_for_parameter_group,
+#   wrong_terminator_for_parameter_group. All seven have zero occurrences in
+#   the pinned checkout (pkg/analyzer + pkg/_fe_analyzer_shared sources), so
+#   the pinned oracle can never emit them; the generated registry is dartq's
+#   acceptance set and phantom rows would widen it with unemittable codes.
+#   The forensic record stays in docs/facts/syntax-codes.md section 9; the
+#   parser's never-emit pins (group_a_dead_codes_never_emitted) match code
+#   name strings and are unaffected by the removal.
 abstract_class_member	ABSTRACT_CLASS_MEMBER	ERROR	P	Members of classes can't be declared to be 'abstract'.	false
 abstract_external_field	ABSTRACT_EXTERNAL_FIELD	ERROR	P	Fields can't be declared both 'abstract' and 'external'.	false
 abstract_final_base_class	ABSTRACT_FINAL_BASE_CLASS	ERROR	P	An 'abstract' class can't be declared as both 'final' and 'base'.	false
@@ -162,7 +174,6 @@ invalid_initializer	INVALID_INITIALIZER	ERROR	P	Not a valid initializer.	false
 invalid_inside_unary_pattern	INVALID_INSIDE_UNARY_PATTERN	ERROR	P	This pattern cannot appear inside a unary pattern (cast pattern, null check pattern, or null assert pattern) without parentheses.	false
 invalid_literal_in_configuration	INVALID_LITERAL_IN_CONFIGURATION	ERROR	P	The literal in a configuration can't contain interpolation.	false
 invalid_operator	INVALID_OPERATOR	ERROR	P	The string '{0}' isn't a user-definable operator.	false
-invalid_operator_for_super	INVALID_OPERATOR_FOR_SUPER	ERROR	P	The operator '{0}' can't be used with 'super'.	false
 invalid_operator_questionmark_period_for_super	INVALID_OPERATOR_QUESTIONMARK_PERIOD_FOR_SUPER	ERROR	P	The operator '?.' cannot be used with 'super' because 'super' cannot be null.	false
 invalid_star_after_async	INVALID_STAR_AFTER_ASYNC	ERROR	P	The modifier 'async*' isn't allowed for an expression function body.	false
 invalid_super_in_initializer	INVALID_SUPER_IN_INITIALIZER	ERROR	P	Can only use 'super' in an initializer for calling the superclass constructor (e.g. 'super()' or 'super.namedConstructor()')	false
@@ -208,7 +219,6 @@ missing_primary_constructor_parameters	MISSING_PRIMARY_CONSTRUCTOR_PARAMETERS	ER
 missing_quote	MISSING_QUOTE	ERROR	S	Expected quote (' or ").	false
 missing_star_after_sync	MISSING_STAR_AFTER_SYNC	ERROR	P	The modifier 'sync' must be followed by a star ('*').	false
 missing_statement	MISSING_STATEMENT	ERROR	P	Expected a statement.	false
-missing_terminator_for_parameter_group	MISSING_TERMINATOR_FOR_PARAMETER_GROUP	ERROR	P	There is no '{0}' to close the parameter group.	false
 missing_typedef_parameters	MISSING_TYPEDEF_PARAMETERS	ERROR	P	Typedefs must have an explicit list of parameters.	false
 missing_variable_in_for_each	MISSING_VARIABLE_IN_FOR_EACH	ERROR	P	A loop variable must be declared in a for-each loop before the 'in', but none was found.	false
 mixed_parameter_groups	MIXED_PARAMETER_GROUPS	ERROR	P	Can't have both positional and named parameters in a single parameter list.	false
@@ -224,7 +234,6 @@ multiple_on_clauses	MULTIPLE_ON_CLAUSES	ERROR	P	Each mixin definition can have a
 multiple_part_of_directives	MULTIPLE_PART_OF_DIRECTIVES	ERROR	P	Only one part-of directive may be declared in a file.	false
 multiple_positional_parameter_groups	MULTIPLE_POSITIONAL_PARAMETER_GROUPS	ERROR	P	Can't have multiple groups of positional parameters in a single parameter list.	false
 multiple_representation_fields	MULTIPLE_REPRESENTATION_FIELDS	ERROR	P	Each extension type should have exactly one representation field.	false
-multiple_variables_in_for_each	MULTIPLE_VARIABLES_IN_FOR_EACH	ERROR	P	A single loop variable must be declared in a for-each loop before the 'in', but {0} were found.	false
 multiple_variance_modifiers	MULTIPLE_VARIANCE_MODIFIERS	ERROR	P	Each type parameter can have at most one variance modifier.	false
 multiple_with_clauses	MULTIPLE_WITH_CLAUSES	ERROR	P	Each class definition can have at most one with clause.	false
 named_function_expression	NAMED_FUNCTION_EXPRESSION	ERROR	P	Function expressions can't be named.	false
@@ -237,7 +246,6 @@ non_constructor_factory	NON_CONSTRUCTOR_FACTORY	ERROR	P	Only a constructor can b
 non_identifier_library_name	NON_IDENTIFIER_LIBRARY_NAME	ERROR	P	The name of a library must be an identifier.	false
 non_part_of_directive_in_part	NON_PART_OF_DIRECTIVE_IN_PART	ERROR	P	The part-of directive must be the only directive in a part.	false
 non_string_literal_as_uri	NON_STRING_LITERAL_AS_URI	ERROR	P	The URI must be a string literal.	false
-non_user_definable_operator	NON_USER_DEFINABLE_OPERATOR	ERROR	P	The operator '{0}' isn't user definable.	false
 normal_before_optional_parameters	NORMAL_BEFORE_OPTIONAL_PARAMETERS	ERROR	P	Normal parameters must occur before optional parameters.	false
 null_aware_cascade_out_of_order	NULL_AWARE_CASCADE_OUT_OF_ORDER	ERROR	P	The '?..' cascade operator must be first in the cascade sequence.	false
 out_of_order_clauses	OUT_OF_ORDER_CLAUSES	ERROR	P	The '{0}' clause must come before the '{1}' clause.	false
@@ -271,10 +279,8 @@ type_before_factory	TYPE_BEFORE_FACTORY	ERROR	P	Factory constructors cannot have
 type_parameter_on_constructor	TYPE_PARAMETER_ON_CONSTRUCTOR	ERROR	P	Constructors can't have type parameters.	false
 type_parameter_on_operator	TYPE_PARAMETER_ON_OPERATOR	ERROR	P	Types parameters aren't allowed when defining an operator.	false
 typedef_in_class	TYPEDEF_IN_CLASS	ERROR	P	Typedefs can't be declared inside classes.	false
-unable_get_content	UNABLE_GET_CONTENT	ERROR	S	Unable to get content of '{0}'.	false
 unexpected_dollar_in_string	UNEXPECTED_DOLLAR_IN_STRING	ERROR	S	A '$' has special meaning inside a string, and must be followed by an identifier or an expression in curly braces ({}).	false
 unexpected_separator_in_number	UNEXPECTED_SEPARATOR_IN_NUMBER	ERROR	S	Digit separators ('_') in a number literal can only be placed between two digits.	false
-unexpected_terminator_for_parameter_group	UNEXPECTED_TERMINATOR_FOR_PARAMETER_GROUP	ERROR	P	There is no '{0}' to open a parameter group.	false
 unexpected_token	UNEXPECTED_TOKEN	ERROR	P	Unexpected text '{0}'.	false
 unexpected_tokens	UNEXPECTED_TOKENS	ERROR	P	Unexpected tokens.	false
 unsupported_operator	UNSUPPORTED_OPERATOR	ERROR	S	The '{0}' operator is not supported.	false
@@ -291,7 +297,6 @@ void_with_type_arguments	VOID_WITH_TYPE_ARGUMENTS	ERROR	P	Type 'void' can't have
 with_before_extends	WITH_BEFORE_EXTENDS	ERROR	P	The extends clause must be before the with clause.	false
 wrong_number_of_parameters_for_setter	WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER	ERROR	P	Setters must declare exactly one required positional parameter.	true
 wrong_separator_for_positional_parameter	WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER	ERROR	P	The default value of a positional parameter should be preceded by '='.	false
-wrong_terminator_for_parameter_group	WRONG_TERMINATOR_FOR_PARAMETER_GROUP	ERROR	P	Expected '{0}' to close parameter group.	false
 illegal_language_version_override	ILLEGAL_LANGUAGE_VERSION_OVERRIDE	ERROR	C1	The language version must be {0}.	false
 inconsistent_language_version_override	INCONSISTENT_LANGUAGE_VERSION_OVERRIDE	ERROR	C1	Parts must have exactly the same language version override as the library.	true
 invalid_language_version_override	INVALID_LANGUAGE_VERSION_OVERRIDE	WARNING	W9	The Dart language version override number must begin with '@dart'.	true

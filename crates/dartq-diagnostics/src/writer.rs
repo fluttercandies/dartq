@@ -157,9 +157,10 @@ fn json_diagnostic_bytes(
 /// The oracle emits `documentation` only for codes its registry marks
 /// `hasPublishedDocs: true` (`errors.dart` `url` getter: published →
 /// `https://dart.dev/diagnostics/<name>`, else `null`); `dartq/`-namespace
-/// codes are never published, so they carry no URL either way.
+/// codes are never published (pinned by the registry tests in `code.rs`), so
+/// the flag alone decides.
 fn documentation_url(code: CodeInfo) -> Option<String> {
-    if code.has_published_docs && !code.name.starts_with("dartq/") {
+    if code.has_published_docs {
         Some(format!("https://dart.dev/diagnostics/{}", code.name))
     } else {
         None

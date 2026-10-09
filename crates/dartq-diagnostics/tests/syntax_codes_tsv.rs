@@ -2,14 +2,16 @@
 
 use std::path::Path;
 
-/// blake3 digest of the pinned 2026-10-08 TSV snapshot (dart 3.13.1 oracle;
-/// analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 registries). The table is
-/// byte-audited against those pinned registries (265/265 rows verified).
+/// blake3 digest of the pinned TSV snapshot (dart 3.13.1 oracle;
+/// analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 registries; 2026-10-08
+/// capture, 7 measured-dead rows pruned 2026-10-09 — #222). The surviving
+/// table is byte-audited against those pinned registries (258/258 rows
+/// verified).
 ///
 /// Any content edit changes the generated registry: re-verify the full table
 /// against the pinned registry sources first, then re-pin this digest
 /// deliberately. This test exists so a wrong text cannot ship green.
-const PINNED_BLAKE3: &str = "7bb37ac7b25228bed821d1752db47924e7cc332ab004004d6eefa1a66afaa078";
+const PINNED_BLAKE3: &str = "834e5bc1097d77526373e2b4dd862edf0d6474dc0b59e72ee66d5d7af5a563c5";
 
 #[test]
 fn syntax_codes_tsv_matches_pinned_blake3() {

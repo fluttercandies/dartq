@@ -227,7 +227,7 @@ fn emit(rows: &[Row]) {
 
     writeln!(
         out,
-        "/// All {} official codes (262 parser/scanner syntax codes plus the\n/// 3-code language-version family), in table order.",
+        "/// All {} official codes (255 parser/scanner syntax codes plus the\n/// 3-code language-version family), in table order.",
         rows.len()
     )
     .unwrap();
