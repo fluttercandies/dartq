@@ -116,14 +116,20 @@ pub(crate) fn apply(
     }
 
     // Steps 4–5: library reformation, reverse-edge rebuild, dirty seeds,
-    // importer closure. The closure joins the phase-2 work queue (state.rs:
-    // "post-closure dirty set of the last apply; consumed by analyze") — a
-    // cancelled earlier run may have left unfinished libraries queued, so
-    // this is a union, kept sorted and deduplicated like `close`'s output.
+    // importer closure. The closure output *replaces* the phase-2 work queue
+    // (state.rs: "post-closure dirty set of the last apply; consumed by
+    // analyze") — assignment, never a union. A cancelled analyze may leave
+    // unfinished libraries queued, but every still-invalid leftover is
+    // re-derived here: close() re-seeds from the result cache (no cached
+    // result or changed identity ⇒ dirty), and between the cancel and this
+    // close only the completed-slot insert writes results — by definition
+    // excluding the leftovers. (A leftover whose cached result matches its
+    // rebuilt identity is genuinely fresh, so dropping it is sound.)
+    // Assignment preserves the invariant `state.invalidated ⊆ live()`;
+    // a union would resurrect ids retired by an intervening remove, and
+    // analyze unwraps every queued id's info.
     let invalidated = reform_and_close(state);
-    state.invalidated.extend(invalidated.iter().copied());
-    state.invalidated.sort_unstable();
-    state.invalidated.dedup();
+    state.invalidated = invalidated.clone();
     on_event(EngineEvent::CascadeInvalidated {
         libraries: invalidated.clone(),
     });
@@ -811,11 +817,11 @@ fn unescape(body: &str) -> Option<String> {
 
 /// Rebuilds the library set from residency, recomputes reverse import edges,
 /// and derives the post-closure dirty set: seeds are libraries with no
-/// cached result or a changed content/dependency identity, closed along the
-/// reverse edges to fixpoint (§3.2 steps 3–5; the seed comparison subsumes
-/// surgical directive diffing — both old and new identities are exact
-/// `ContentId` lists, and any edge change shows up as a dependency-set
-/// difference on the library that lost or gained it).
+/// cached result or a changed identity — member contents, dependency set,
+/// and the unclaimed part targets (§3.2 steps 3–5). Old and new identities
+/// are exact lists, so every membership, edge, or part-target residency
+/// change shows up as a difference on the library that owns it; no separate
+/// directive diff is needed.
 fn reform_and_close(state: &mut EngineState) -> Vec<LibraryId> {
     reform_libraries(state);
     close(state)
@@ -925,6 +931,27 @@ fn reform_libraries(state: &mut EngineState) {
         }
         deps.sort_unstable();
         deps.dedup();
+        // Part directives resolving to a resident file outside membership:
+        // neither content (membership) nor deps (import/export only) sees
+        // them, so their residency flip is carried by the identity
+        // explicitly. Without it, removing such a target leaves the library
+        // clean while its cached result predates the URI going dangling —
+        // incremental diverges from a full recompute, which bakes
+        // `uri_does_not_exist` against the absent target.
+        let mut part_targets: Vec<FileId> = Vec::new();
+        for member in &members {
+            for directive in &state.residency[member].directives {
+                if directive.kind == DirectiveKind::Part
+                    && let ResolvedTarget::Resolved(target) = directive.target
+                    && state.residency.contains_key(&target)
+                    && !members.contains(&target)
+                {
+                    part_targets.push(target);
+                }
+            }
+        }
+        part_targets.sort_unstable_by_key(|file| file.index());
+        part_targets.dedup();
         infos.push((
             *lib,
             LibraryInfo {
@@ -933,6 +960,7 @@ fn reform_libraries(state: &mut EngineState) {
                 parts: parts.into(),
                 content,
                 deps,
+                part_targets: part_targets.into(),
             },
         ));
     }
@@ -975,7 +1003,11 @@ fn close(state: &mut EngineState) -> Vec<LibraryId> {
         let info = state.libraries.info(lib).expect("live library has info");
         let stale = match state.results.get(&lib) {
             None => true,
-            Some(result) => result.content != info.content || result.deps != info.deps,
+            Some(result) => {
+                result.content != info.content
+                    || result.deps != info.deps
+                    || result.part_targets != info.part_targets
+            }
         };
         if stale {
             dirty.insert(lib);

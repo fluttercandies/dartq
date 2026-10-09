@@ -92,6 +92,7 @@ pub(crate) fn analyze(
             LibraryResult {
                 content: info.content.clone(),
                 deps: info.deps.clone(),
+                part_targets: info.part_targets.clone(),
                 diagnostics: diagnostics.clone(),
             },
         );

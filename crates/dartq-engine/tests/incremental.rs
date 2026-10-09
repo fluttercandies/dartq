@@ -194,3 +194,51 @@ fn cancel_keeps_completed_libraries_and_stays_dirty() {
     assert!(diagnostics.is_empty(), "retry completes: {diagnostics:?}");
     assert_eq!(engine.libraries().len(), 2);
 }
+
+#[test]
+fn cancel_then_remove_then_analyze_does_not_panic() {
+    // Audit #230 regression: a cancelled analyze leaves its unfinished dirty
+    // set queued; retiring one of those libraries (removing its defining
+    // file) must drop the leftover, not resurrect it — analyze unwraps every
+    // queued id's info, and a retired id has none.
+    let fixture = Fixture::new(&[
+        ("lib/a.dart", "import 'b.dart';\nint f() => g();\n"),
+        ("lib/b.dart", "int g() => 1;\n"),
+    ]);
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("cold");
+
+    // Edit the importer: only its library goes stale, and a pre-cancelled
+    // analyze queues it as the unfinished leftover.
+    engine.set_content(
+        &fixture.path("lib/a.dart"),
+        b"import 'b.dart';\nint f() => g() + 0;\n",
+    );
+    let token = dartq_engine::CancellationToken::new();
+    token.cancel();
+    assert!(matches!(
+        engine.analyze(&[], &mut |_| {}, &token),
+        Err(dartq_engine::Cancelled)
+    ));
+
+    // Removing the importer retires its library id; the next apply's dirty
+    // set must not keep the dead id.
+    engine
+        .remove_file(&fixture.path("lib/a.dart"))
+        .expect("removal enqueued");
+    let report = engine.apply_pending(&mut |_| {});
+    assert!(
+        report.invalidated.is_empty(),
+        "the retired id left the dirty set: {:?}",
+        report.invalidated
+    );
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze after remove");
+    assert!(diagnostics.is_empty());
+    assert_eq!(engine.libraries().len(), 1, "only b's library remains");
+}

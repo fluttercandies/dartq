@@ -142,6 +142,13 @@ pub(crate) struct LibraryInfo {
     pub content: Box<[ContentId]>,
     /// Libraries this one imports/exports (sorted, deduplicated).
     pub deps: Vec<LibraryId>,
+    /// Resolved targets of the members' `part` directives that point at a
+    /// resident file this library does not own — neither a member (the claim
+    /// pass only attaches part files) nor a dependency edge (only
+    /// import/export count). Removing such a target changes no other
+    /// identity component, so the residency flip rides here explicitly.
+    /// Sorted by file index, deduplicated.
+    pub part_targets: Box<[FileId]>,
 }
 
 /// The per-library cached result (incremental-l1-spec §3.1 last row): the
@@ -151,6 +158,9 @@ pub(crate) struct LibraryInfo {
 pub(crate) struct LibraryResult {
     pub content: Box<[ContentId]>,
     pub deps: Vec<LibraryId>,
+    /// The [`LibraryInfo::part_targets`] snapshot this result was computed
+    /// from; `close` compares it against the rebuilt identity.
+    pub part_targets: Box<[FileId]>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -304,6 +314,9 @@ pub(crate) struct EngineState {
     /// Per-library result cache.
     pub results: FxHashMap<LibraryId, LibraryResult>,
     /// Post-closure dirty set of the last apply; consumed by analyze.
+    /// Invariant: every entry is a live library id — apply assigns `close`'s
+    /// output outright (a cancelled analyze's leftovers are re-derived or
+    /// dropped there, never unioned back).
     pub invalidated: Vec<LibraryId>,
     /// Whether residency/structure changed since the last resolution-graph
     /// build (rebuild gate for the analyze phase).

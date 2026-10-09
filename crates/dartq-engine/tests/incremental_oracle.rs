@@ -1011,3 +1011,82 @@ fn c7_delete_file_edge_cleanup_orphan_part() {
 fn c8_name_form_part_rename_orphan() {
     run_case(&CASE_C8);
 }
+
+/// `part 'b.dart';` whose target is a plain library: the target belongs to
+/// neither membership nor the dep set, so its residency flip is visible only
+/// through the part-target staleness identity. Removing it must dirty the
+/// owning library and surface the owed `uri_does_not_exist`, byte-identical
+/// to a full recompute; the re-add round-trip (fresh library id for the
+/// target, part-target flip for the owner) must settle back to the clean
+/// full recompute.
+#[test]
+fn unclaimed_part_target_removal_matches_full_recompute() {
+    const A: &str = "part 'b.dart';\nint f() => 1;\n";
+    const B: &str = "int g() => 2;\n";
+    let fixture = Fixture::new(&[("lib/a.dart", A), ("lib/b.dart", B)]);
+    let b_disk = fixture.path("lib/b.dart");
+    let mut engine = fixture.engine();
+
+    // Cold baseline: the part target resolves (on disk), nothing owed.
+    engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
+    engine.set_content(&b_disk, B.as_bytes());
+    engine.apply_pending(&mut |_| {});
+    let mut state: BTreeMap<String, String> = BTreeMap::from([
+        ("lib/a.dart".to_owned(), A.to_owned()),
+        ("lib/b.dart".to_owned(), B.to_owned()),
+    ]);
+    let mut log = RawLog::default();
+    let cold = analyze_all(&fixture, &mut engine, &state, &mut log);
+    assert!(
+        cold.is_empty(),
+        "cold baseline is clean: {:?}",
+        absolute_set(&fixture, &engine, &cold)
+    );
+
+    // Remove the target — from the overlay and the workspace, so the full
+    // arm re-parses against the same absent disk the ticket's scenario
+    // describes.
+    engine.remove_file(&b_disk).expect("removal enqueued");
+    std::fs::remove_file(&b_disk).expect("disk removal");
+    assert!(state.remove("lib/b.dart").is_some());
+    let report = engine.apply_pending(&mut |_| {});
+    assert_eq!(
+        sorted_defining(&fixture, &engine, &report.invalidated),
+        vec!["lib/a.dart".to_owned()],
+        "the part-target flip dirties the owning library"
+    );
+    let mut log = RawLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &CancellationToken::new())
+        .expect("analyze");
+    assert_eq!(
+        absolute_set(&fixture, &engine, &diagnostics),
+        code_file_set(&[("uri_does_not_exist", "lib/a.dart")]),
+        "the owed uri diagnostic appears"
+    );
+    assert_eq!(
+        machine_bytes(&engine, &diagnostics),
+        full_arm_bytes(&fixture, &state),
+        "A1 removal step"
+    );
+
+    // Re-add: a fresh library id for the target and an already-stale owner —
+    // both recompute and the pair settles back to the clean full recompute.
+    std::fs::write(&b_disk, B).expect("disk re-add");
+    engine.set_content(&b_disk, B.as_bytes());
+    state.insert("lib/b.dart".to_owned(), B.to_owned());
+    engine.apply_pending(&mut |_| {});
+    let mut log = RawLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &CancellationToken::new())
+        .expect("analyze");
+    assert!(
+        diagnostics.is_empty(),
+        "re-add settles clean: {diagnostics:?}"
+    );
+    assert_eq!(
+        machine_bytes(&engine, &diagnostics),
+        full_arm_bytes(&fixture, &state),
+        "A1 re-add step"
+    );
+}
