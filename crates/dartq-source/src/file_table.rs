@@ -177,7 +177,8 @@ impl FileTable {
 /// [`FileTable`] and [`Locator`](crate::Locator) consume the rule through
 /// [`PathMemo`], which memoizes both branches — see its doc for the caching
 /// policy.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+#[must_use]
+pub fn normalize_path(path: &Path) -> PathBuf {
     normalize_keyed(&lexical_key(path))
 }
 
