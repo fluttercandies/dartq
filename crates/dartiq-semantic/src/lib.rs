@@ -16,6 +16,14 @@
 //!   (#117): the public scope face ([`library::LibraryScopes`]), the
 //!   in-library scoped lookup ([`library::lookup_scoped`]), and the
 //!   superclass-aware member walk ([`library::member_lookup`]).
+//! * [`codes`] — the M1 semantic code table: the frozen `undefined_*` +
+//!   `duplicate_definition` family with tier and verbatim oracle message.
+//! * [`diagnose`] — the M1 diagnosis engine (#120): a reference-collecting
+//!   pass over the parser event stream that resolves every reference against
+//!   #117/#119 and emits the batch-1 codes (`undefined_identifier`,
+//!   `undefined_class`, `undefined_function`, `duplicate_definition`),
+//!   recording every other miss as the index names-table rows
+//!   ([`diagnose::FileReport::names`], index-design-spec §8).
 //!
 //! # What the `undefined_*` / `wrong_number_*` tickets (#120/#121) can
 //!   assume
@@ -84,14 +92,18 @@
 //! diagnostic tickets; when the parser's directive milestone lands, the
 //! fold moves behind this API without changing its shape.
 
+pub mod codes;
 pub mod collector;
+pub mod diagnose;
 pub mod library;
 pub mod model;
 
 pub use collector::collect;
+pub use diagnose::{FileReport, NameRow, NameUse, diagnose};
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,
 };
 pub use model::{
-    Container, ContainerKind, FileElements, MemberEntry, MemberKind, MicroKind, TopDecl,
+    Container, ContainerKind, DuplicateDecl, FileElements, MemberEntry, MemberKind, MicroKind,
+    TopDecl,
 };

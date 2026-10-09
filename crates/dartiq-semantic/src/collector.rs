@@ -59,12 +59,17 @@ use dartiq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 use crate::model::{
-    Container, ContainerKind, FileElements, MemberEntry, MemberKind, MicroKind, TopDecl,
+    Container, ContainerKind, DuplicateDecl, FileElements, MemberEntry, MemberKind, MicroKind,
+    TopDecl,
 };
+
+use dartiq_source::SourceRange;
 
 /// An open container on the capture stack.
 struct OpenContainer {
-    name: Option<StringId>,
+    /// Lookup spelling with the name token's span (the duplicate log's
+    /// location surface; the spelling is what the model keeps).
+    name: Option<(StringId, SourceRange)>,
     kind: ContainerKind,
     superclass: Option<StringId>,
     members: FxHashMap<StringId, MemberEntry>,
@@ -72,8 +77,9 @@ struct OpenContainer {
 
 /// A class member executable between `begin_method` and `end_method`.
 struct PendingMember {
-    /// Lookup spelling and kind; `None` when the name is unrecoverable.
-    shape: Option<(StringId, MemberKind)>,
+    /// Lookup spelling, kind, and the name token's span; `None` when the name
+    /// is unrecoverable.
+    shape: Option<(StringId, MemberKind, SourceRange)>,
     is_static: bool,
     formals: Option<Box<[StringId]>>,
 }
@@ -81,7 +87,7 @@ struct PendingMember {
 /// A top-level executable between `begin_top_level_method` and its end; the
 /// name arrives from the identifier event, get-or-set from the end event.
 struct PendingTop {
-    name: Option<StringId>,
+    name: Option<(StringId, SourceRange)>,
     formals: Option<Box<[StringId]>>,
 }
 
@@ -98,10 +104,13 @@ struct Builder<'src, 'tab> {
     super_pending: Option<StringId>,
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
-    pending_typedef: Option<StringId>,
+    pending_typedef: Option<(StringId, SourceRange)>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
     named_formals: Vec<StringId>,
+    /// The current type-parameter list's names (`duplicate_definition`
+    /// compares per list, `duplicate_definition_verifier.dart:124-135`).
+    type_var_group: Vec<StringId>,
 }
 
 impl<'src, 'tab> Builder<'src, 'tab> {
@@ -120,6 +129,30 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_typedef: None,
             formal_depth: 0,
             named_formals: Vec::new(),
+            type_var_group: Vec::new(),
+        }
+    }
+
+    /// The token's name and span, `None` for parser-inserted synthetic tokens
+    /// (which are not in the table and carry no honest name).
+    fn capture_name(&self, token: Token) -> Option<(StringId, SourceRange)> {
+        let range = token.range;
+        self.name_of(token).map(|name| (name, range))
+    }
+
+    /// Records a duplicate (second) declaration; the name maps keep the
+    /// first entry, this log is the `duplicate_definition` surface.
+    fn record_duplicate(&mut self, name: StringId, range: SourceRange) {
+        self.file.duplicates.push(DuplicateDecl { name, range });
+    }
+
+    /// Declares a top-level name, logging a duplicate when taken.
+    fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
+        match self.file.decls.entry(name) {
+            std::collections::hash_map::Entry::Occupied(_) => self.record_duplicate(name, range),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(decl);
+            }
         }
     }
 
@@ -136,12 +169,21 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.strings.intern(&setter)
     }
 
-    fn open_container(&mut self, kind: ContainerKind, name: Option<StringId>, tag: MicroKind) {
-        if let Some(name) = name {
-            self.file.decls.entry(name).or_insert(TopDecl {
-                kind: tag,
-                named_formals: None,
-            });
+    fn open_container(
+        &mut self,
+        kind: ContainerKind,
+        name: Option<(StringId, SourceRange)>,
+        tag: MicroKind,
+    ) {
+        if let Some((name, range)) = name {
+            self.declare_top(
+                name,
+                range,
+                TopDecl {
+                    kind: tag,
+                    named_formals: None,
+                },
+            );
         }
         self.containers.push(OpenContainer {
             name,
@@ -174,7 +216,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                     .or_insert_with(|| entry.clone());
             }
         }
-        if let Some(name) = open.name {
+        if let Some((name, _range)) = open.name {
             self.file.containers.entry(name).or_insert(Container {
                 kind: open.kind,
                 superclass: open.superclass,
@@ -295,7 +337,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = builder.name_of(name);
+        let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
     }
 
@@ -316,7 +358,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = builder.name_of(name);
+        let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
         // The head type (`class C = A with B;`) is the superclass edge.
         builder.super_armed = true;
@@ -343,7 +385,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = builder.name_of(name);
+        let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Mixin, name, MicroKind::Mixin);
     }
 
@@ -359,7 +401,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = builder.name_of(name);
+        let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Enum, name, MicroKind::Enum);
     }
 
@@ -381,7 +423,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Option<Token>,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = name.and_then(|token| builder.name_of(token));
+        let name = name.and_then(|token| builder.capture_name(token));
         builder.open_container(ContainerKind::Extension, name, MicroKind::Extension);
     }
 
@@ -402,7 +444,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
-        let name = builder.name_of(name);
+        let name = builder.capture_name(name);
         builder.open_container(ContainerKind::ExtensionType, name, MicroKind::Extension);
     }
 
@@ -435,9 +477,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
         let mut builder = self.builder.borrow_mut();
-        // Resolve the name up front: the branches below hold borrows into
-        // the builder's state.
-        let name = builder.name_of(token);
+        // Resolve the name and its span up front: the branches below hold
+        // borrows into the builder's state.
+        let name_with_range = builder.capture_name(token);
+        let name = name_with_range.map(|(name, _)| name);
         match context {
             IdentifierContext::TypeReference => {
                 if builder.super_armed && builder.super_pending.is_none() {
@@ -452,50 +495,93 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 if let Some(pending) = &mut builder.pending_top {
-                    pending.name = name;
+                    pending.name = name_with_range;
                 }
             }
             IdentifierContext::TopLevelVariableDeclaration => {
-                if let Some(name) = name {
-                    builder.file.decls.entry(name).or_insert(TopDecl {
-                        kind: MicroKind::TopLevelVar,
-                        named_formals: None,
-                    });
+                if let Some((name, range)) = name_with_range {
+                    builder.declare_top(
+                        name,
+                        range,
+                        TopDecl {
+                            kind: MicroKind::TopLevelVar,
+                            named_formals: None,
+                        },
+                    );
                 }
             }
             IdentifierContext::FieldDeclaration => {
-                if let Some(name) = name {
+                if let Some((name, range)) = name_with_range {
                     let is_static = builder.field_static.unwrap_or(false);
                     if let Some(open) = builder.containers.last_mut() {
-                        open.members.entry(name).or_insert(MemberEntry {
-                            kind: MemberKind::Field,
-                            is_static,
-                            named_formals: None,
-                        });
+                        match open.members.entry(name) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(MemberEntry {
+                                    kind: MemberKind::Field,
+                                    is_static,
+                                    named_formals: None,
+                                });
+                            }
+                            // Same-bit collision: the second field is a
+                            // duplicate. Keep-first; a cross-bit coexistence
+                            // is `conflicting_static_and_instance`'s
+                            // business, not a duplicate.
+                            std::collections::hash_map::Entry::Occupied(existing)
+                                if existing.get().is_static == is_static =>
+                            {
+                                builder.record_duplicate(name, range);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
             IdentifierContext::EnumValueDeclaration => {
-                if let (Some(open), Some(name)) = (builder.containers.last_mut(), name)
+                if let (Some(open), Some((name, range))) =
+                    (builder.containers.last_mut(), name_with_range)
                     && open.kind == ContainerKind::Enum
                 {
-                    open.members.entry(name).or_insert(MemberEntry {
-                        kind: MemberKind::Field,
-                        is_static: true,
-                        named_formals: None,
-                    });
+                    // Enum constants are static fields; a collision is a
+                    // same-bit duplicate.
+                    match open.members.entry(name) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(MemberEntry {
+                                kind: MemberKind::Field,
+                                is_static: true,
+                                named_formals: None,
+                            });
+                        }
+                        std::collections::hash_map::Entry::Occupied(existing)
+                            if existing.get().is_static =>
+                        {
+                            builder.record_duplicate(name, range);
+                        }
+                        _ => {}
+                    }
                 }
             }
             IdentifierContext::TypedefDeclaration if builder.pending_typedef.is_some() => {
-                builder.pending_typedef = name.or(builder.pending_typedef);
+                builder.pending_typedef = name_with_range.or(builder.pending_typedef);
             }
             _ => {}
         }
     }
 
+    fn begin_type_variables(&mut self, _token: Token) {
+        self.builder.borrow_mut().type_var_group.clear();
+    }
+
     fn begin_type_variable(&mut self, token: Token) {
         let mut builder = self.builder.borrow_mut();
-        if let Some(name) = builder.name_of(token) {
+        if let Some((name, range)) = builder.capture_name(token) {
+            // `duplicate_definition` compares type parameters per list
+            // (`duplicate_definition_verifier.dart:124-135`); the unit-wide
+            // name set keeps its first entry only.
+            if builder.type_var_group.contains(&name) {
+                builder.record_duplicate(name, range);
+            } else {
+                builder.type_var_group.push(name);
+            }
             builder.file.decls.entry(name).or_insert(TopDecl {
                 kind: MicroKind::TypeParam,
                 named_formals: None,
@@ -567,8 +653,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     ) {
         let mut builder = self.builder.borrow_mut();
         let shape = builder
-            .name_of(name)
-            .map(|n| builder.member_shape(get_or_set, n));
+            .capture_name(name)
+            .map(|(n, range)| (builder.member_shape(get_or_set, n), range))
+            .map(|((spelling, kind), range)| (spelling, kind, range));
         builder.pending_member = Some(PendingMember {
             shape,
             is_static: static_kw.is_some(),
@@ -587,14 +674,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     ) {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_member.take()
-            && let Some((name, kind)) = pending.shape
+            && let Some((name, kind, range)) = pending.shape
             && let Some(open) = builder.containers.last_mut()
         {
-            open.members.entry(name).or_insert(MemberEntry {
-                kind,
-                is_static: pending.is_static,
-                named_formals: pending.formals,
-            });
+            match open.members.entry(name) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(MemberEntry {
+                        kind,
+                        is_static: pending.is_static,
+                        named_formals: pending.formals,
+                    });
+                }
+                // Same-bit collisions are duplicates; cross-bit ones are not.
+                std::collections::hash_map::Entry::Occupied(existing)
+                    if existing.get().is_static == pending.is_static =>
+                {
+                    builder.record_duplicate(name, range);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -613,7 +711,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, _end: Token) {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_top.take()
-            && let Some(name) = pending.name
+            && let Some((name, range)) = pending.name
         {
             let spelling = if get_or_set.is_some() {
                 // Setter or getter: setters live under `name=`; getters keep
@@ -631,10 +729,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             } else {
                 name
             };
-            builder.file.decls.entry(spelling).or_insert(TopDecl {
-                kind: MicroKind::TopLevelFn,
-                named_formals: pending.formals,
-            });
+            builder.declare_top(
+                spelling,
+                range,
+                TopDecl {
+                    kind: MicroKind::TopLevelFn,
+                    named_formals: pending.formals,
+                },
+            );
         }
     }
 
@@ -650,11 +752,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         let mut builder = self.builder.borrow_mut();
-        if let Some(name) = builder.pending_typedef.take() {
-            builder.file.decls.entry(name).or_insert(TopDecl {
-                kind: MicroKind::TypeAlias,
-                named_formals: None,
-            });
+        if let Some((name, range)) = builder.pending_typedef.take() {
+            builder.declare_top(
+                name,
+                range,
+                TopDecl {
+                    kind: MicroKind::TypeAlias,
+                    named_formals: None,
+                },
+            );
         }
     }
 
@@ -701,9 +807,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
         let mut builder = self.builder.borrow_mut();
         if builder.formal_depth == 1
-            && let Some(name) = builder.name_of(name)
+            && let Some((name, range)) = builder.capture_name(name)
         {
-            builder.named_formals.push(name);
+            // Duplicate named formals are `duplicate_definition`s
+            // (`checkParameters`, duplicate_definition_verifier.dart:71-90).
+            if builder.named_formals.contains(&name) {
+                builder.record_duplicate(name, range);
+            } else {
+                builder.named_formals.push(name);
+            }
         }
     }
 }

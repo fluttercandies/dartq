@@ -35,7 +35,7 @@
 //!   are declaration-scoped in truth; consumers must not treat them as
 //!   top-level declarations.
 
-use dartiq_source::StringId;
+use dartiq_source::{SourceRange, StringId};
 use rustc_hash::FxHashMap;
 
 /// The micro-kind tag of a name in a library scope (adjudicated closed set).
@@ -125,6 +125,21 @@ pub struct TopDecl {
     pub named_formals: Option<Box<[StringId]>>,
 }
 
+/// A second declaration whose name was already taken in its scope, recorded
+/// at capture time (analyzer `duplicate_definition` granularity:
+/// `duplicate_definition_verifier.dart` — top-level and class-member scopes
+/// keep getters and setters apart, class members compare within their
+/// static/instance bit, type parameters compare per list, and a duplicate is
+/// diagnosed at the *second* declaration). The model keeps the first entry;
+/// this log is the diagnostic surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DuplicateDecl {
+    /// The colliding name (lookup spelling: setters under `name=`).
+    pub name: StringId,
+    /// Source span of the duplicate (second) declaration's name token.
+    pub range: SourceRange,
+}
+
 /// Everything one compilation unit contributes to the semantic model.
 ///
 /// Built by [`crate::collector::collect`]; queried per library through
@@ -134,6 +149,7 @@ pub struct FileElements {
     pub(crate) decls: FxHashMap<StringId, TopDecl>,
     pub(crate) containers: FxHashMap<StringId, Container>,
     pub(crate) extension_members: FxHashMap<StringId, MemberEntry>,
+    pub(crate) duplicates: Vec<DuplicateDecl>,
 }
 
 impl FileElements {
@@ -172,5 +188,13 @@ impl FileElements {
     /// Every named container with its name, in arbitrary order.
     pub fn containers(&self) -> impl Iterator<Item = (StringId, &Container)> {
         self.containers.iter().map(|(name, c)| (*name, c))
+    }
+
+    /// Every duplicate (second) declaration captured in this unit, in source
+    /// order. The keep-first rule of the name maps is unchanged; this log is
+    /// what `duplicate_definition` is emitted from.
+    #[must_use]
+    pub fn duplicates(&self) -> &[DuplicateDecl] {
+        &self.duplicates
     }
 }

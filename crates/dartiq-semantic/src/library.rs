@@ -199,7 +199,11 @@ pub fn lookup_scoped<'a>(
 /// Resolves a container by name: the file's own declarations first, then the
 /// library namespace. Returns the container and the file that owns it (for
 /// the superclass walk's next hop).
-fn resolve_container<'a>(
+///
+/// Crate-visible so the diagnostic engine's member walk can tell a cleanly
+/// walked chain (member genuinely absent) from a broken one (a superclass
+/// name that resolves to nothing — suppression territory, never a report).
+pub(crate) fn resolve_container<'a>(
     graph: &LibraryGraph,
     namespaces: &Namespaces,
     index: &'a ElementIndex,

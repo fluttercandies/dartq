@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+dartiq-diagnostics = { path = "../dartiq-diagnostics" }
 dartiq-parser = { path = "../dartiq-parser" }
 dartiq-resolution = { path = "../dartiq-resolution" }
 dartiq-scanner = { path = "../dartiq-scanner" }
