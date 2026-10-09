@@ -324,8 +324,15 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // header flag bits, #174).
         FormalParameter => 5,
         // ModSet → header bits (#174): class/extends/with/implements and
-        // kind/(new|get_set)/param/initializers remain.
-        ClassDeclaration | NamedMixinApplication | Method | Constructor => 4,
+        // kind/(new|get_set)/param/initializers remain. ExpressionBody:
+        // arrow/end plus async/star back-filled from AsyncModifierHandle —
+        // no derivable word (collapse map §3.9 ExpressionFunctionBodyHandle
+        // row and §6 fat-10 table: 4 words).
+        ClassDeclaration
+        | NamedMixinApplication
+        | Method
+        | Constructor
+        | ExpressionBody => 4,
         // ForParts/ForInParts: the `for` token is the span head (map §3.4:
         // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived;
         // lparen/left_sep/right_sep + update_count, and
@@ -337,7 +344,6 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | ExtensionDeclaration
         // Assert: `assert` is the span head, derived.
         | Assert
-        | ExpressionBody
         | PrimaryConstructor
         | PrimaryConstructorBody
         | SwitchCase
