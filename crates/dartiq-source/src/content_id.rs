@@ -119,12 +119,21 @@ mod serde_impl {
 mod tests {
     use super::*;
 
-    /// Official BLAKE3 test vector (empty input, hash mode), truncated to the
-    /// first 16 bytes; guards against wiring the wrong hash or truncation.
+    /// Official BLAKE3 test vectors (hash mode), truncated to the first 16
+    /// bytes; guard against wiring the wrong hash or truncation. The empty
+    /// input is the canonical published vector; the non-empty one is pinned
+    /// by the blake3 crate's own test suite (`test_hex_encoding_decoding` in
+    /// blake3 1.8.7, the locked version): blake3 of `b"foo"`.
     #[test]
-    fn known_blake3_vector() {
-        let id = content_hash(b"");
-        assert_eq!(id.to_string(), "af1349b9f5f9a1a6a0404dea36dcc949");
+    fn known_blake3_vectors() {
+        assert_eq!(
+            content_hash(b"").to_string(),
+            "af1349b9f5f9a1a6a0404dea36dcc949"
+        );
+        assert_eq!(
+            content_hash(b"foo").to_string(),
+            "04e0bb39f30b1a3feb89f536c93be150"
+        );
     }
 
     #[test]

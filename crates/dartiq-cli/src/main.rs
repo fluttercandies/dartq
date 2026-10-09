@@ -299,17 +299,9 @@ impl FileLayoutProvider for FileSet {
 
     fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
         let index = file.index() as usize;
-        let source = &self.sources[index];
-        let index = &self.indexes[index];
-        // Diagnostic offsets are UTF-16; LineIndex works in bytes.
-        let byte = index.utf16_to_byte(source, utf16_offset);
-        let (line, col_bytes) = index.byte_to_line_col(byte);
-        let line_start = byte - (col_bytes - 1);
-        // Column counts UTF-16 code units within the line (official
-        // `LineInfo.getLocation` semantics).
-        let column =
-            index.byte_to_utf16(source, byte) - index.byte_to_utf16(source, line_start) + 1;
-        (line, column)
+        // Diagnostic offsets are UTF-16; the fused conversion reports the
+        // official `LineInfo.getLocation` (line, UTF-16 column) directly.
+        self.indexes[index].line_col_utf16(&self.sources[index], utf16_offset)
     }
 }
 

@@ -45,8 +45,10 @@ impl SourceRange {
 /// offsets — [`LineIndex::byte_to_line_col`] reports columns in bytes within
 /// the line. Converting to the external UTF-16 convention is the job of
 /// [`LineIndex::byte_to_utf16`] / [`LineIndex::utf16_to_byte`] (the indexed,
-/// hot-path entry points) or the free functions [`byte_offset_to_utf16`] /
-/// [`utf16_offset_to_byte`] / [`utf16_len_of`] (the semantic fallback for
+/// hot-path entry points), [`LineIndex::line_col_utf16`] (the fused
+/// diagnostics position entry point), or the free functions
+/// [`byte_offset_to_utf16`] / [`utf16_offset_to_byte`] / [`utf16_len_of`]
+/// (the semantic fallback for
 /// callers that hold no index); both faces agree by construction and the
 /// free functions stay the single source of truth for the conversion.
 #[derive(Clone, Debug)]
@@ -127,7 +129,9 @@ impl LineIndex {
     /// and never occur inside multi-byte sequences.
     ///
     /// Allocation profile: the line-start count is computed in a first
-    /// allocation-free pass so the vector is allocated exactly once at its
+    /// allocation-free pass (SIMD `memchr2`, candidate-by-candidate since a
+    /// `\r` only counts when not followed by `\n`) so the vector is
+    /// allocated exactly once at its
     /// final size (audit #99 F5: growth reallocations previously cost
     /// 4.66 allocs per file, 17 on a 65k-line file). Non-ASCII characters are
     /// recorded sparsely per line, so pure-ASCII sources allocate nothing
@@ -141,15 +145,18 @@ impl LineIndex {
     pub fn new(source: &str) -> Self {
         let source_len = u32::try_from(source.len()).expect("source exceeds u32::MAX bytes");
         let bytes = source.as_bytes();
-        let line_start_count = bytes
-            .iter()
-            .enumerate()
-            .filter(|&(i, &byte)| match byte {
-                b'\n' => true,
-                b'\r' => bytes.get(i + 1) != Some(&b'\n'),
-                _ => false,
-            })
-            .count();
+        let mut line_start_count = 0usize;
+        let mut pos = 0usize;
+        while let Some(found) = memchr::memchr2(b'\n', b'\r', &bytes[pos..]) {
+            let i = pos + found;
+            // A `\r\n` pair is one break, counted by its `\n`; skip the `\r`.
+            pos = if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                i + 1
+            } else {
+                line_start_count += 1;
+                i + 1
+            };
+        }
         let mut line_starts = Vec::with_capacity(line_start_count + 1);
         line_starts.push(0);
         let mut wide_lines = Vec::new();
@@ -205,11 +212,58 @@ impl LineIndex {
     /// # Panics
     ///
     /// Panics when `byte_offset` is greater than the source length — an
-    /// out-of-range offset is an engine bug and must surface, not clamp.
+    /// out-of-range offset is an engine bug and must surface, not clamp —
+    /// or when the resulting line or column overflows [`u32`]. The
+    /// overflow check mirrors [`SourceRange::end`]: the crate-wide contract
+    /// is to surface broken offsets in every build profile, and a plain `+`
+    /// only panicked in debug builds.
     #[must_use]
     pub fn byte_to_line_col(&self, byte_offset: u32) -> (u32, u32) {
         let line = u32::try_from(self.line_at(byte_offset)).expect("line number exceeds u32::MAX");
-        (line + 1, byte_offset - self.line_starts[line as usize] + 1)
+        (
+            line.checked_add(1).expect("line number overflows u32"),
+            (byte_offset - self.line_starts[line as usize])
+                .checked_add(1)
+                .expect("column overflows u32"),
+        )
+    }
+
+    /// 1-based `(line, column)` for a 0-based UTF-16 code unit offset, where
+    /// the column counts UTF-16 code units within the line (official
+    /// `LineInfo.getLocation` semantics). This is the diagnostics position
+    /// entry point: the equivalent external recipe (UTF-16 → byte, byte →
+    /// line/col, then two byte → UTF-16 conversions for the column) costs
+    /// four line searches, this locates the line once and applies the
+    /// in-line wide-character deficit directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `utf16_offset` is greater than the source's UTF-16
+    /// length, or when the resulting line or column overflows [`u32`]
+    /// (same profile-independent contract as [`Self::byte_to_line_col`]).
+    #[must_use]
+    pub fn line_col_utf16(&self, source: &str, utf16_offset: u32) -> (u32, u32) {
+        let byte = self.utf16_to_byte(source, utf16_offset);
+        let line = u32::try_from(self.line_at(byte)).expect("line number exceeds u32::MAX");
+        let col = byte - self.line_starts[line as usize];
+        let (_, wide_chars) = self.wide_line(line as usize);
+        // The UTF-16 column is the byte column minus the deficits of the
+        // wide characters fully before it; the enclosing lines' deficits
+        // cancel because both ends of the difference share them.
+        let mut column = col.checked_add(1).expect("column overflows u32");
+        if let Some(chars) = wide_chars {
+            for c in chars {
+                if c.end <= col {
+                    column -= c.deficit();
+                } else {
+                    break;
+                }
+            }
+        }
+        (
+            line.checked_add(1).expect("line number overflows u32"),
+            column,
+        )
     }
 
     /// Converts a byte offset into a 0-based UTF-16 code unit offset.
@@ -272,18 +326,25 @@ impl LineIndex {
             "UTF-16 offset {utf16_offset} out of range (source has {total} UTF-16 code units)"
         );
         // Locate the line in the UTF-16 domain: a line's UTF-16 start is its
-        // byte start minus the deficit of the preceding lines.
-        let mut lo = 0usize;
-        let mut hi = self.line_starts.len();
-        while lo < hi {
-            let mid = usize::midpoint(lo, hi);
-            if self.line_starts[mid] - self.wide_line(mid).0 <= utf16_offset {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        // byte start minus the deficit of the preceding lines. Pure-ASCII
+        // sources have no wide lines, so UTF-16 offsets are byte offsets and
+        // the search is one plain binary search; the general loop otherwise
+        // pays a nested `wide_lines` search at every step.
+        let line = if self.wide_lines.is_empty() {
+            self.line_at(utf16_offset)
+        } else {
+            let mut lo = 0usize;
+            let mut hi = self.line_starts.len();
+            while lo < hi {
+                let mid = usize::midpoint(lo, hi);
+                if self.line_starts[mid] - self.wide_line(mid).0 <= utf16_offset {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
-        }
-        let line = lo - 1;
+            lo - 1
+        };
         let (before, wide_chars) = self.wide_line(line);
         let line_start = self.line_starts[line];
         let target = utf16_offset - (line_start - before); // in-line UTF-16 offset
@@ -493,6 +554,9 @@ mod tests {
             "\u{FEFF}a\u{1F600}b\n\u{1F600}\r\nx",
             "汉字测试\n日本語テキスト\r\n한국어\n",
             "\u{1F600}\u{1F601}\u{1F602}",
+            // U+2028/U+2029 are wide characters, not line breaks (pinned
+            // directly by `u2028_u2029_are_not_line_breaks`).
+            "\u{2028}a\u{2029}b\nc\n",
         ];
         for source in sources {
             let index = LineIndex::new(source);
@@ -519,6 +583,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fused `line_col_utf16` must agree with the external recipe
+    /// (`utf16_to_byte` → `byte_to_line_col` → two `byte_to_utf16` calls for
+    /// the column) on every UTF-16 offset of wide-character sources — hanzi,
+    /// astral emoji, BOM — plus an ASCII control. The diagnostics goldens
+    /// are pinned through that recipe, so parity here is what keeps golden
+    /// outputs byte-identical across the hoist.
+    #[test]
+    fn line_col_utf16_matches_external_recipe() {
+        let sources = [
+            "汉字测试\n日本語テキスト\r\n한국어\n",
+            "\u{FEFF}a\u{1F600}b\n\u{1F600}\r\nx",
+            "ascii\nlines\nonly\n",
+        ];
+        for source in sources {
+            let index = LineIndex::new(source);
+            let total = utf16_len_of(source);
+            for units in 0..=total {
+                let byte = index.utf16_to_byte(source, units);
+                let (line, col_bytes) = index.byte_to_line_col(byte);
+                let line_start = byte - (col_bytes - 1);
+                let expected = (
+                    line,
+                    index.byte_to_utf16(source, byte) - index.byte_to_utf16(source, line_start) + 1,
+                );
+                assert_eq!(
+                    index.line_col_utf16(source, units),
+                    expected,
+                    "utf16 {units} of {source:?}"
+                );
+            }
+        }
+    }
+
+    /// U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) are ordinary wide
+    /// characters, not line terminators — the official scanner breaks only
+    /// on `\n`, `\r\n`, and `\r`. Negative pin: the round-trip parity test
+    /// cannot distinguish a breaker from a non-breaker, so the line count is
+    /// asserted directly.
+    #[test]
+    fn u2028_u2029_are_not_line_breaks() {
+        let source = "a\u{2028}b\u{2029}c\n";
+        let index = LineIndex::new(source);
+        assert_eq!(index.line_count(), 2);
+        assert_eq!(
+            index.byte_to_line_col(u32::try_from(source.len()).unwrap()),
+            (2, 1)
+        );
+        let recorded: usize = index.wide_lines.iter().map(|wl| wl.chars.len()).sum();
+        assert_eq!(recorded, 2, "both separators are recorded as wide chars");
     }
 
     /// End-to-end values across lines with astral text and `\r\n` breaks:

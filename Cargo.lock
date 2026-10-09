@@ -192,6 +192,14 @@ dependencies = [
 [[package]]
 name = "dartiq-semantic"
 version = "0.1.0"
+dependencies = [
+ "dartiq-language",
+ "dartiq-parser",
+ "dartiq-resolution",
+ "dartiq-scanner",
+ "dartiq-source",
+ "rustc-hash",
+]
 
 [[package]]
 name = "dartiq-snapshot"
@@ -203,6 +211,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
+ "memchr",
  "rustc-hash",
  "serde",
  "serde_json",

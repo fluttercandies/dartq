@@ -20,7 +20,7 @@ use crate::file_table::PathMemo;
 /// share a single entry. Like the file table, the memo applies only to
 /// canonicalize successes: spellings with no canonical identity (missing
 /// files) are re-resolved on every call, so this structure never grows for
-/// them.
+/// them, and [`Locator::forget`] retracts a forgotten spelling's memo entry.
 ///
 /// Path residency note: the locator stores its own normalized copy of each
 /// path, separate from the one copy [`FileTable`](crate::FileTable) keeps.
@@ -41,10 +41,19 @@ impl Locator {
     }
 
     /// Records (or overwrites) the `(mtime, content)` pair for `path`.
+    ///
+    /// Re-recording an already-known path — the every-pass hot case —
+    /// updates the pair in place and allocates nothing; a first-time path
+    /// inserts a fresh key.
     pub fn record(&mut self, path: &Path, mtime: SystemTime, content_id: ContentId) {
         let normalized = self.memo.normalize(path);
-        self.entries
-            .insert(normalized.as_ref().to_path_buf(), (mtime, content_id));
+        match self.entries.get_mut(normalized.as_ref()) {
+            Some(entry) => *entry = (mtime, content_id),
+            None => {
+                self.entries
+                    .insert(normalized.as_ref().to_path_buf(), (mtime, content_id));
+            }
+        }
     }
 
     /// The recorded `(mtime, content id)` for `path`, or `None` when the
@@ -57,8 +66,12 @@ impl Locator {
 
     /// Removes the entry for `path`, returning whether one was present.
     ///
-    /// The engine calls this when a file is deleted, so its mtime record and
-    /// path string are reclaimed instead of leaking for the session.
+    /// The engine calls this when a file is deleted, so its mtime record,
+    /// path string, and the memo entry for this exact spelling are
+    /// reclaimed instead of leaking for the session. Entries for other
+    /// spellings that canonicalize to the same file stay until their own
+    /// forget — the memo is keyed by spelling and keeps no
+    /// canonical-to-spellings index (see [`PathMemo::retract`]).
     ///
     /// Deletion is a two-structure obligation: the engine must also call
     /// [`FileTable::forget`](crate::FileTable::forget) for the same path.
@@ -66,7 +79,8 @@ impl Locator {
     /// a resolvable id or an mtime entry — for a file that no longer
     /// exists. Pinned by `forget_same_spelling_on_both_sides`.
     pub fn forget(&mut self, path: &Path) -> bool {
-        let normalized = self.memo.normalize(path);
+        let normalized = self.memo.get_or_normalize(path);
+        self.memo.retract(path);
         self.entries.remove(normalized.as_ref()).is_some()
     }
 
@@ -81,6 +95,10 @@ impl Locator {
     /// walk happened to produce. Comparing against non-canonicalized
     /// spellings therefore misses every entry and sweeps the whole table;
     /// build the keep-set through the same normalization.
+    ///
+    /// The memo is not swept: it keys spellings while the predicate sees
+    /// canonical paths, and there is no canonical-to-spellings index.
+    /// Spellings are reclaimed through [`Locator::forget`], not `retain`.
     pub fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) {
         self.entries.retain(|path, _| keep(path));
     }
@@ -158,6 +176,32 @@ mod tests {
         assert_eq!(locator.lookup(p2), Some((t0, id)));
         assert!(!locator.forget(p1), "already forgotten");
         assert!(!locator.forget(Path::new("/work/pkg/never.dart")));
+    }
+
+    /// Pin for the type-doc claim: missing paths take the uncached lexical
+    /// fallback on every call, so record/lookup/forget cycles never grow
+    /// either the entries map or the memo.
+    #[test]
+    fn missing_paths_never_grow_the_locator() {
+        let mut locator = Locator::new();
+        let missing = Path::new("/work/pkg/never-created.dart");
+        let t0 = SystemTime::UNIX_EPOCH;
+        let id = content_hash(b"bytes");
+
+        for _ in 0..10 {
+            locator.record(missing, t0, id);
+            assert_eq!(locator.lookup(missing), Some((t0, id)));
+            assert!(
+                locator.memo.get(missing).is_none(),
+                "the lexical fallback must stay unmemoized"
+            );
+            assert!(locator.forget(missing));
+            assert!(
+                locator.memo.get(missing).is_none(),
+                "the forget itself must not memoize"
+            );
+        }
+        assert_eq!(locator.lookup(missing), None, "entries reclaimed");
     }
 
     #[test]

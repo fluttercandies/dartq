@@ -27,9 +27,11 @@ impl FileId {
 /// `intern` is idempotent: the same normalized path always yields the same
 /// [`FileId`], and ids are handed out from 0 in first-intern order.
 ///
-/// The path string is stored once per resident path: the map key, the id
-/// slot, and the [`PathMemo`] entry share one allocation, so residency costs
-/// a single string copy plus bookkeeping.
+/// The canonical path string is stored once per resident path: the map key
+/// and the id slot share one allocation. The [`PathMemo`] additionally holds
+/// the original spelling as its cache key — a second, owned copy per
+/// canonicalize-success spelling — which [`forget`] retracts together with
+/// the path resolution.
 ///
 /// [`forget`] severs path resolution but never reclaims ids — the
 /// immortal-`FileId` contract: ids already recorded in diagnostics, caches,
@@ -103,8 +105,16 @@ impl FileTable {
     /// spellings normalizing to the severed key stay dead. Pinned by
     /// `forget_after_existence_transition_leaves_sibling_id_live`.
     /// Forgetting a path that is not currently interned returns `None`.
+    ///
+    /// The memo entry for this exact spelling is retracted (and never
+    /// re-filled by the forget itself), so forgotten spellings stop
+    /// occupying memo space and churn cycles do not grow the memo. Entries
+    /// for other spellings of the same file stay until their own `forget` —
+    /// see [`PathMemo::retract`] for the exact boundary. Pinned by
+    /// `intern_forget_delete_reintern_cycles_do_not_grow_the_memo`.
     pub fn forget(&mut self, path: &Path) -> Option<FileId> {
-        let normalized = self.memo.normalize(path);
+        let normalized = self.memo.get_or_normalize(path);
+        self.memo.retract(path);
         let id = self.ids_by_path.remove(normalized.as_ref())?;
         self.paths[id.index() as usize] = None;
         Some(id)
@@ -188,9 +198,13 @@ fn lexical_fallback(path: &Path) -> PathBuf {
 /// exists and again after must yield two ids) depend on that existence
 /// check being live. Caching fallbacks would fuse those two ids into one.
 ///
-/// Cached entries have no TTL, no watcher, and no eviction: they live as
-/// long as the owning structure and are bounded by the set of distinct
-/// spellings seen — the same order of growth as the immortal-`FileId` table
+/// Cached entries have no TTL, no watcher, and no time-based eviction; the
+/// only retraction is the owning structure's `forget`, which removes the
+/// forgotten spelling's own entry (other spellings of the same file keep
+/// theirs — the memo is keyed by spelling and keeps no
+/// canonical-to-spellings index). Remaining entries live as long as the
+/// owning structure and are bounded by the set of distinct spellings seen —
+/// the same order of growth as the immortal-`FileId` table
 /// itself. A cached mapping may go stale if the file system changes after
 /// caching (a symlink is retargeted, or the file is deleted); this is
 /// accepted for the session and is consistent with the immortal-`FileId`
@@ -235,6 +249,20 @@ impl PathMemo {
             }
             None => Arc::from(lexical_fallback(path)),
         }
+    }
+
+    /// Removes the memoized entry for the exact spelling `path`, if any.
+    ///
+    /// [`FileTable::forget`] and [`Locator::forget`](crate::Locator::forget)
+    /// call this so forgotten spellings stop occupying memo space. Only the
+    /// given spelling is retracted: memo keys are owned copies of one
+    /// spelling each, and the canonical [`Arc`] values are refcounted, so
+    /// removal is invisible to every other holder — but there is no
+    /// canonical-to-spellings index, so sibling spellings that canonicalize
+    /// to the same file keep their entries (each holding its own key while
+    /// sharing the canonical value) until their own forget.
+    pub(crate) fn retract(&mut self, path: &Path) {
+        self.canonical.remove(path);
     }
 }
 
@@ -338,6 +366,20 @@ mod tests {
 
         let id = table.intern(&missing);
         assert_eq!(table.path(id), Some(missing.as_path()));
+    }
+
+    /// The fallback's relative branch: a missing relative path is joined
+    /// onto the current working directory (the absolute branches are pinned
+    /// by `missing_paths_fall_back_to_lexical_absolutization` and
+    /// `missing_path_with_dotdot_stays_lexical`).
+    #[test]
+    fn missing_relative_path_joins_onto_cwd() {
+        let mut table = FileTable::new();
+        let relative = Path::new("dartiq-source-never-created-relative-pin.txt");
+
+        let id = table.intern(relative);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(table.path(id), Some(cwd.join(relative).as_path()));
     }
 
     /// Audit A3: one path spelling interned before the file exists (lexical
@@ -464,13 +506,13 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// T2 pin (`PathMemo` caching policy): canonicalize successes are cached
-    /// for the session with no invalidation, so re-interning a spelling
-    /// after `forget` + file deletion hits the memo, carries the deleted
-    /// file's old canonical path, and mints a fresh id under that stale
-    /// key. Accepted by design — content freshness is the engine's job.
+    /// Memo-retraction pin: re-interning a spelling after `forget` + file
+    /// deletion takes the uncached lexical fallback — the fresh id is stored
+    /// under the spelling itself, not the deleted file's stale canonical
+    /// path (the pre-retraction behavior resurrected the stale canonical key
+    /// from the memo; `forget` now retracts it).
     #[test]
-    fn reintern_after_forget_and_delete_keeps_stale_canonical_by_design() {
+    fn reintern_after_forget_and_delete_takes_the_lexical_fallback() {
         let base = temp_dir("stale-canonical");
         let path = base.join("gone.txt");
         fs::write(&path, b"x").expect("create the file");
@@ -488,10 +530,54 @@ mod tests {
         assert_eq!(table.path(first), None, "the first id stays a hole");
         assert_eq!(
             table.path(second),
-            Some(canonical.as_path()),
-            "the memo hit carries the deleted file's canonical path"
+            Some(path.as_path()),
+            "the retracted memo sends the re-intern to the lexical spelling"
         );
         assert_eq!(table.try_file_id(&path), Some(second));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Memo-retraction churn pin: intern → forget → delete → re-intern
+    /// cycles never grow the memo. The forget retracts the spelling's entry
+    /// (and fills nothing itself); the deleted-file re-intern takes the
+    /// uncached lexical fallback; a re-created file re-canonicalizes back
+    /// into the single entry it held before.
+    #[test]
+    fn intern_forget_delete_reintern_cycles_do_not_grow_the_memo() {
+        let base = temp_dir("memo-retract");
+        let path = base.join("churn.txt");
+        fs::write(&path, b"x").expect("write");
+
+        let mut table = FileTable::new();
+        table.intern(&path);
+        assert_eq!(table.memo.canonical.len(), 1, "intern fills the memo");
+
+        assert!(table.forget(&path).is_some());
+        assert_eq!(
+            table.memo.canonical.len(),
+            0,
+            "forget retracts the spelling's entry"
+        );
+
+        let _ = fs::remove_file(&path);
+        table.intern(&path);
+        assert_eq!(
+            table.memo.canonical.len(),
+            0,
+            "the deleted-file re-intern takes the uncached fallback"
+        );
+
+        for _ in 0..3 {
+            fs::write(&path, b"y").expect("re-create");
+            table.intern(&path);
+            assert_eq!(table.memo.canonical.len(), 1, "one entry per spelling");
+            assert!(table.forget(&path).is_some());
+            assert_eq!(table.memo.canonical.len(), 0, "retracted again");
+            let _ = fs::remove_file(&path);
+            table.intern(&path);
+            assert_eq!(table.memo.canonical.len(), 0);
+        }
 
         let _ = fs::remove_dir_all(&base);
     }
