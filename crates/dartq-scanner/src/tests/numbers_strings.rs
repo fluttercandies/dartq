@@ -495,7 +495,11 @@ fn deep_nested_unterminated_interpolation() {
     assert_eq!(r.diagnostics.len(), 10_000);
     // The cap fills with the unwound string recoveries; the synthetic group
     // closers come after and overflow it.
-    assert!(codes(&r).iter().all(|c| *c == "unterminated_string_literal"));
+    assert!(
+        codes(&r)
+            .iter()
+            .all(|c| *c == "unterminated_string_literal")
+    );
     let eof = r.tokens.get(r.tokens.len() - 1).unwrap();
     assert_eq!(eof.kind, K::Eof);
 }

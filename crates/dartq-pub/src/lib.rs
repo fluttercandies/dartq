@@ -38,9 +38,7 @@ pub use graph::{
 };
 pub use lock::{DependencyKind, LockDescription, LockFile, LockedPackage, SourceKind};
 pub use pubspec::{DependencySpec, Environment, Pubspec, Resolution};
-pub use version::{
-    LanguageVersion, Version, VersionConstraint, VersionRange,
-};
+pub use version::{LanguageVersion, Version, VersionConstraint, VersionRange};
 pub use workspace::{WorkspaceLayout, find_workspace_root, normalize, workspace_ref_mismatches};
 
 /// Errors from parsing or consuming pub artifacts.
