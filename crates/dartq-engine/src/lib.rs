@@ -248,8 +248,16 @@ impl Engine {
 
     /// PRD §17.2 discovery face: package roots (from the identity table)
     /// plus `lib`/`bin`/`test`/`tool` per root and root-level `*.dart`
-    /// files; never a blind tree walk (hidden dirs and
-    /// `.git`/`build`/`node_modules`/`.dart_tool` always excluded).
+    /// files; never a blind tree walk. The only built-in exclusion is the
+    /// oracle's dot rule, checked on every child path — directories and
+    /// files alike (context_root.dart:146-166 `_isExcluded`; the same rule
+    /// the CLI walk ships). `build`/`node_modules` are `analysis_options`
+    /// concerns (excluded globs), not walk-level ones: the official server
+    /// reports *unexcluded* `node_modules` dirs as a performance warning
+    /// and advises adding them to the options exclude list
+    /// (performance_page.dart:272-354), so they are demonstrably not
+    /// excluded by default. The dot rule is not options-overridable — the
+    /// oracle checks it before the globs; options excludes compose on top.
     /// Symlink rule, both halves: a symlinked `.dart` file is included when
     /// its target stats as a regular file (dangling links are skipped — the
     /// oracle analyzes linked files too, so skipping them would flood the
@@ -263,7 +271,6 @@ impl Engine {
     /// Propagates I/O errors from reading discovered files.
     pub fn discover_workspace(&mut self) -> std::io::Result<DiscoveryStats> {
         const SURFACES: [&str; 4] = ["lib", "bin", "test", "tool"];
-        const EXCLUDED: [&str; 4] = [".git", "build", "node_modules", ".dart_tool"];
 
         let mut roots: Vec<PathBuf> = self
             .state
@@ -305,6 +312,12 @@ impl Engine {
                         continue;
                     };
                     let path = entry.path();
+                    // The dot rule covers files too: the oracle's
+                    // `_isExcluded` checks the basename of the path itself
+                    // before its parent components.
+                    if entry.file_name().as_encoded_bytes().starts_with(b".") {
+                        continue;
+                    }
                     if path.extension().is_some_and(|ext| ext == "dart")
                         && (file_type.is_file()
                             || (file_type.is_symlink()
@@ -327,14 +340,15 @@ impl Engine {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
                     if file_type.is_dir() {
-                        if name.starts_with('.') || EXCLUDED.contains(&name.as_ref()) {
-                            continue;
-                        }
-                        if is_excluded(&path) {
+                        if name.starts_with('.') || is_excluded(&path) {
                             continue;
                         }
                         queue.push(path);
                     } else if path.extension().is_some_and(|ext| ext == "dart")
+                        // The dot rule covers files too: the oracle's
+                        // `_isExcluded` rejects `.hidden.dart` like any dot
+                        // path.
+                        && !name.starts_with('.')
                         // `entry.file_type()` reports link-host facts (it does
                         // not follow symlinks): a symlinked `.dart` file is
                         // neither `is_dir` nor `is_file` there, yet the
