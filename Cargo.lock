@@ -391,6 +391,14 @@ dependencies = [
 [[package]]
 name = "dartq-snapshot"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "filetime",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "dartq-source"
