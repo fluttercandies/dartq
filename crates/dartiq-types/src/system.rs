@@ -20,8 +20,10 @@ use crate::ty::{PoolRange, Type, TypeKind, UninternedFunction, UninternedRecord,
 
 /// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
 /// mechanism with the same limit (`type_system.dart:85`); exceeding it makes
-/// `is_subtype` return `false` (`subtype.dart:37-41`).
-const DEPTH_LIMIT: u32 = 100;
+/// `is_subtype` return `false` (`subtype.dart:37-41`). Shared with the
+/// hierarchy's precomputed depths and the LUB closure walk so every
+/// type-operation recursion carries the same termination bound.
+pub(crate) const DEPTH_LIMIT: u32 = 100;
 
 /// Visited set over interned ids: an epoch-stamp vector instead of a hash
 /// set. Ids are dense `u32` pool indexes, so membership is a direct slot
@@ -62,6 +64,10 @@ impl StampSet {
         true
     }
 
+    /// Clears the set in O(1): the epoch bump alone expires every stamp. On
+    /// `u32` wraparound the stamps are refilled with 0 and the epoch restarts
+    /// at 1 — slot value 0 never matches a live epoch, so stale entries
+    /// cannot survive the reset.
     fn clear(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -427,13 +433,18 @@ impl<'a> TypeSystem<'a> {
 
     /// The core subtype walk; `depth` guards runaway instantiation chains.
     fn subtype_impl(&self, t0: TypeId, t1: TypeId, depth: u32) -> bool {
+        // Depth guard before any rule (subtype.dart:33-41): the oracle's
+        // `enterTypeOperation` (type_system.dart:372-378) runs before
+        // `_isSubtypeOf` consults reflexivity, so identical pairs beyond the
+        // limit answer `false` too. Top-level queries start at depth 0 and
+        // never trip it.
+        if depth >= DEPTH_LIMIT {
+            return false;
+        }
         // 0a Reflexivity (subtype.dart:264-266). Interned ids make this a
         // structural comparison in O(1).
         if t0 == t1 {
             return true;
-        }
-        if depth >= DEPTH_LIMIT {
-            return false;
         }
         let a = self.table.get(t0);
         let b = self.table.get(t1);
@@ -830,5 +841,128 @@ fn unintern(kind: TypeKind) -> UninternedType {
         TypeKind::Interface { .. } | TypeKind::Function { .. } | TypeKind::Record { .. } => {
             unreachable!("compound kinds are rebuilt by `TypeSystem::with_nullability`")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{TypeDeclId, TypeParamId};
+
+    const OBJECT: TypeDeclId = TypeDeclId::from_raw(1);
+    const FUTURE: TypeDeclId = TypeDeclId::from_raw(2);
+    const FUNCTION: TypeDeclId = TypeDeclId::from_raw(3);
+    const NUM: TypeDeclId = TypeDeclId::from_raw(4);
+    const INT: TypeDeclId = TypeDeclId::from_raw(5);
+    const STRING: TypeDeclId = TypeDeclId::from_raw(6);
+    const ITERABLE: TypeDeclId = TypeDeclId::from_raw(7);
+    const LIST: TypeDeclId = TypeDeclId::from_raw(8);
+
+    fn itf(table: &TypeTable, decl: TypeDeclId, args: &[TypeId]) -> TypeId {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: args.to_vec(),
+            },
+            false,
+        )
+    }
+
+    fn fixture() -> (TypeTable, TypeHierarchy) {
+        let table = TypeTable::new();
+        let (iterable_e, list_e) = (TypeParamId::from_raw(1), TypeParamId::from_raw(2));
+        let list_of_e = table.intern(UninternedType::TypeParameter { parameter: list_e }, false);
+        let hierarchy = TypeHierarchy::builder(CoreDecls {
+            object: OBJECT,
+            future: FUTURE,
+            function: FUNCTION,
+            record: None,
+        })
+        .decl(OBJECT, Vec::new())
+        .decl(FUTURE, vec![iterable_e])
+        .decl(FUNCTION, Vec::new())
+        .decl(NUM, Vec::new())
+        .decl(INT, Vec::new())
+        .decl(STRING, Vec::new())
+        .decl(ITERABLE, vec![iterable_e])
+        .decl(LIST, vec![list_e])
+        .supertype(NUM, itf(&table, OBJECT, &[]))
+        .supertype(INT, itf(&table, NUM, &[]))
+        .supertype(STRING, itf(&table, OBJECT, &[]))
+        .supertype(ITERABLE, itf(&table, OBJECT, &[]))
+        .supertype(LIST, itf(&table, ITERABLE, &[list_of_e]))
+        .build(&table)
+        .expect("fixture hierarchy is valid");
+        (table, hierarchy)
+    }
+
+    /// The re-entrant walk: `List<int> <: Iterable<num>` reaches rule 12 for
+    /// `int <: num` while the outer interface walk still owns the scratch,
+    /// so the inner query runs on fresh local containers. The pinned
+    /// contract: the fallback answers exactly what the flat query answers.
+    #[test]
+    fn reentrant_walk_matches_the_flat_answer() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let num = itf(&table, NUM, &[]);
+        let string = itf(&table, STRING, &[]);
+        let list_int = itf(&table, LIST, &[int]);
+        let iterable_num = itf(&table, ITERABLE, &[num]);
+        let iterable_string = itf(&table, ITERABLE, &[string]);
+
+        // Flat: the outer walk owns the scratch, so the inner `int <: num`
+        // rule-12 query takes the re-entrant fallback.
+        assert!(sys.is_subtype(list_int, iterable_num));
+        assert!(!sys.is_subtype(list_int, iterable_string));
+
+        // Externally holding the scratch forces *every* walk onto the
+        // fallback; answers must not change.
+        let forced = {
+            let _held = sys.walk.try_borrow_mut().expect("scratch is free here");
+            (
+                sys.is_subtype(list_int, iterable_num),
+                sys.is_subtype(list_int, iterable_string),
+            )
+        };
+        assert_eq!(forced, (true, false));
+    }
+
+    #[test]
+    fn stamp_set_epoch_reuse() {
+        let mut stamps = StampSet::new();
+        let a = TypeId::from_raw(3);
+        assert!(stamps.insert(a));
+        assert!(!stamps.insert(a));
+        // A clear must make previously stamped ids unseen again without
+        // rewriting their slots.
+        stamps.clear();
+        assert!(stamps.insert(a));
+    }
+
+    #[test]
+    fn stamp_set_grows_lazily_and_keeps_old_stamps() {
+        let mut stamps = StampSet::new();
+        assert!(stamps.insert(TypeId::from_raw(0)));
+        // Growth past the current length (the walk interns new ids).
+        assert!(stamps.insert(TypeId::from_raw(10)));
+        assert!(!stamps.insert(TypeId::from_raw(0)));
+        assert!(!stamps.insert(TypeId::from_raw(10)));
+        assert!(stamps.insert(TypeId::from_raw(11)));
+    }
+
+    #[test]
+    fn stamp_set_wraparound_resets_stamps() {
+        let mut stamps = StampSet::new();
+        let id = TypeId::from_raw(0);
+        assert!(stamps.insert(id));
+        // Drive the epoch to the wraparound point: the next clear must
+        // refill the slots instead of reusing epoch 0 (which would alias
+        // the zero-initialized slots and resurrect stale entries).
+        stamps.epoch = u32::MAX;
+        stamps.clear();
+        assert_eq!(stamps.epoch, 1);
+        assert!(stamps.insert(id));
+        assert!(!stamps.insert(id));
     }
 }

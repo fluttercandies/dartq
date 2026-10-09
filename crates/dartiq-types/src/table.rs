@@ -574,8 +574,11 @@ impl TableState {
                         named_changed = true;
                     }
                 }
-                if positional_changed || named_changed {
-                    let return_type = self.substitute(sig.return_type, map);
+                // The return type substitutes unconditionally: a mapped
+                // parameter can appear *only* there (`T Function()`), so the
+                // fast path must observe it too.
+                let return_type = self.substitute(sig.return_type, map);
+                if positional_changed || named_changed || return_type != sig.return_type {
                     let type_parameters = self.fn_type_parameters[sig.type_parameters.offset()
                         ..sig.type_parameters.offset() + sig.type_parameters.len()]
                         .to_vec();
@@ -758,4 +761,31 @@ fn mix_u64(h: u64, value: u64) -> u64 {
     z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
     (h ^ z).wrapping_mul(FNV_PRIME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real 64-bit structural collisions are impractical to construct from
+    /// the outside, so the test fabricates the exact state one produces:
+    /// the primary slot for a hash is stolen by a structurally different
+    /// type and the true owner moves to the overflow bucket. Re-interning
+    /// that owner must miss on the primary slot, disambiguate through the
+    /// bucket scan, and dedup instead of appending a twin.
+    #[test]
+    fn structural_hash_collision_resolves_through_the_overflow_bucket() {
+        let mut st = TableState::default();
+        let never = st.intern_kind(UninternedType::Never, false);
+        let dynamic = st.intern_kind(UninternedType::Dynamic, false);
+        let hash = st.hash_type(never.raw());
+        st.interner.insert(hash, dynamic.raw());
+        st.collisions.insert(hash, vec![never.raw()]);
+
+        let again = st.intern_kind(UninternedType::Never, false);
+        assert_eq!(again, never);
+        assert_eq!(st.types.len(), 2);
+        // The dedup hit must not append to the bucket.
+        assert_eq!(st.collisions.get(&hash).map(Vec::len), Some(1));
+    }
 }

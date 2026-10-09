@@ -181,6 +181,61 @@ fn cyclic_hierarchy_is_rejected() {
     assert!(cycle.contains(&a) && cycle.contains(&b));
 }
 
+#[test]
+fn object_supertype_edge_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let other = TypeDeclId::from_raw(10);
+    // An edge *owned by* `Object` would put a class above the hierarchy
+    // root and break the LUB unique-depth-1 anchor
+    // (least_upper_bound.dart:327-357). Edges *to* `Object` stay fine.
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(other, Vec::new())
+    .supertype(object, itf(&table, other, &[]))
+    .build(&table)
+    .expect_err("supertype edge owned by `Object`");
+    assert_eq!(err, TypeError::ObjectSupertype(object));
+}
+
+#[test]
+fn nullable_supertype_edge_is_rejected() {
+    let table = TypeTable::new();
+    let (object, future, function) = core();
+    let (a, animal) = (TypeDeclId::from_raw(10), TypeDeclId::from_raw(11));
+    // A `?` edge would leak a nullable id into the LUB supertype closures
+    // and break the max-unique-depth invariant.
+    let animal_question = table.intern(
+        UninternedType::Interface {
+            decl: animal,
+            args: Vec::new(),
+        },
+        true,
+    );
+    let err = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(a, Vec::new())
+    .decl(animal, Vec::new())
+    .supertype(a, animal_question)
+    .build(&table)
+    .expect_err("nullable supertype edge");
+    assert_eq!(err, TypeError::NullableSupertype(a));
+}
+
 fn core() -> (TypeDeclId, TypeDeclId, TypeDeclId) {
     (
         TypeDeclId::from_raw(1),

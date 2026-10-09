@@ -156,6 +156,58 @@ fn function_types_fall_back_to_bare_function() {
 }
 
 #[test]
+fn tied_max_depths_walk_down_to_the_unique_candidate() {
+    // Diamond: X and Y both extend M1 and M2. The supertype intersection is
+    // {M1, M2, Object} with M1/M2 tied at depth 2, so the rule walks down a
+    // level to the unique depth-1 candidate, `Object`
+    // (`_computeTypeAtMaxUniqueDepth`, least_upper_bound.dart:327-357).
+    let table = TypeTable::new();
+    let (object, future, function) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+    );
+    let (m1, m2, x, y) = (
+        TypeDeclId::from_raw(4),
+        TypeDeclId::from_raw(5),
+        TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
+    );
+    let itf = |decl: TypeDeclId| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            false,
+        )
+    };
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![TypeParamId::from_raw(1)])
+    .decl(function, Vec::new())
+    .decl(m1, Vec::new())
+    .decl(m2, Vec::new())
+    .decl(x, Vec::new())
+    .decl(y, Vec::new())
+    .supertype(m1, itf(object))
+    .supertype(m2, itf(object))
+    .supertype(x, itf(m1))
+    .supertype(x, itf(m2))
+    .supertype(y, itf(m1))
+    .supertype(y, itf(m2))
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = TypeSystem::new(&table, &hierarchy);
+    assert_eq!(sys.least_upper_bound(itf(x), itf(y)), itf(object));
+}
+
+#[test]
 fn records_fall_back_to_object() {
     let fx = fixture();
     let sys = fx.system();

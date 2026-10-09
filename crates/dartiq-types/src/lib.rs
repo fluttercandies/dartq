@@ -52,7 +52,9 @@
 //! ## M1 boundaries (spec §5)
 //!
 //! Implemented: `T?` syntax and the two-state suffix, the subtype rules
-//! 0a/0c/1-7/10-13 of `subtype.dart:262-523`, `isAssignableTo`
+//! 0a/0c/1-7/10-13 of `subtype.dart:262-523` (rule 14 ships as the record
+//! stub: every non-identical record/record pair is `false`,
+//! subtype.dart:512-519), `isAssignableTo`
 //! (type_system.dart:891-925) with the `strict-casts` gate, the `FutureOr`
 //! rules (subtype.dart:372-385/418-449), the interface walk with invariant
 //! arity/covariant arguments (subtype.dart:44-83, class parameters are

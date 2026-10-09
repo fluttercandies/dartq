@@ -64,6 +64,20 @@ pub enum TypeError {
         param: TypeParamId,
     },
 
+    /// The core `Object` declaration received a supertype edge. `Object` is
+    /// the hierarchy root — it must reach `build` without supertypes so the
+    /// LUB rule can anchor `Object` at unique depth 1
+    /// (`least_upper_bound.dart:327-357`).
+    #[error("core `Object` declaration #{0} cannot declare a supertype")]
+    ObjectSupertype(TypeDeclId),
+
+    /// A supertype edge carried the `?` projection. Edges feed the LUB
+    /// supertype closures verbatim, and a nullable id there would break the
+    /// unique-depth invariant the max-unique-depth rule relies on
+    /// (`least_upper_bound.dart:327-357`).
+    #[error("supertype of declaration #{0} must not be nullable (`?`)")]
+    NullableSupertype(TypeDeclId),
+
     /// The supertype graph contains a cycle; subtype walks and
     /// longest-inheritance-path computation would not terminate.
     #[error("supertype graph contains a cycle: {0:?}")]

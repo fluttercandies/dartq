@@ -4,7 +4,10 @@
 mod common;
 
 use common::{Fixture, fixture, named};
-use dartiq_types::{TypeId, UninternedType};
+use dartiq_types::{
+    CoreDecls, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeTable, UninternedFunction,
+    UninternedType,
+};
 
 #[test]
 fn rule0a_reflexivity() {
@@ -228,6 +231,81 @@ fn rule12_interface_walk() {
 }
 
 #[test]
+fn rule12_instantiation_substitutes_into_function_typed_supertype_arguments() {
+    // `class Supplier<S>` / `class C<T> implements Supplier<T Function()>`:
+    // instantiating `C<int>` walks C's supertype edge, and the substitution
+    // step (subtype.dart:213-214) must reach *inside* the function-typed
+    // argument of the template — `T` sits only in the function's return
+    // type.
+    let table = TypeTable::new();
+    let (object, future, function) = (
+        TypeDeclId::from_raw(1),
+        TypeDeclId::from_raw(2),
+        TypeDeclId::from_raw(3),
+    );
+    let (supplier, class_c, int_d, string_d) = (
+        TypeDeclId::from_raw(4),
+        TypeDeclId::from_raw(5),
+        TypeDeclId::from_raw(6),
+        TypeDeclId::from_raw(7),
+    );
+    let (s, t) = (TypeParamId::from_raw(1), TypeParamId::from_raw(2));
+    let itf = |decl: TypeDeclId, args: &[TypeId]| {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: args.to_vec(),
+            },
+            false,
+        )
+    };
+    let return_fn = |ret: TypeId| {
+        table
+            .intern_function(
+                UninternedFunction {
+                    return_type: ret,
+                    type_parameters: Vec::new(),
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                    required_positional: 0,
+                },
+                false,
+            )
+            .expect("valid fixture signature")
+    };
+
+    let object_none = itf(object, &[]);
+    let int = itf(int_d, &[]);
+    let t_param = table.intern(UninternedType::TypeParameter { parameter: t }, false);
+    let hierarchy = TypeHierarchy::builder(CoreDecls {
+        object,
+        future,
+        function,
+        record: None,
+    })
+    .decl(object, Vec::new())
+    .decl(future, vec![s])
+    .decl(function, Vec::new())
+    .decl(supplier, vec![s])
+    .decl(class_c, vec![t])
+    .decl(int_d, Vec::new())
+    .decl(string_d, Vec::new())
+    .supertype(int_d, object_none)
+    .supertype(string_d, object_none)
+    .supertype(class_c, itf(supplier, &[return_fn(t_param)]))
+    .build(&table)
+    .expect("fixture hierarchy is valid");
+    let sys = dartiq_types::TypeSystem::new(&table, &hierarchy);
+
+    let c_of_int = itf(class_c, &[int]);
+    // `C<int> <: Supplier<int Function()>`: the walk instantiates the
+    // template's `T Function()` to `int Function()` and compares it.
+    assert!(sys.is_subtype(c_of_int, itf(supplier, &[return_fn(int)])));
+    // A different return type breaks the match.
+    assert!(!sys.is_subtype(c_of_int, itf(supplier, &[return_fn(itf(string_d, &[]))])));
+}
+
+#[test]
 fn rule13_function_type_vs_bare_function() {
     let fx = fixture();
     let sys = fx.system();
@@ -279,9 +357,50 @@ fn recursion_depth_limit_aborts_the_walk() {
     // `false` (subtype.dart:37-41) even though the chains are structurally
     // related.
     assert!(!sys.is_subtype(nest(fx.int(), 101), nest(fx.num(), 101)));
-    // Reflexivity (rule 0a) short-circuits before the depth check.
+    // Top-level reflexivity survives the swap: the guard runs first but
+    // top-level queries start at depth 0, so rule 0a answers.
     let deep = nest(fx.int(), 101);
     assert!(sys.is_subtype(deep, deep));
+}
+
+#[test]
+fn depth_guard_precedes_reflexivity_beyond_the_limit() {
+    // The oracle enters the type operation before consulting any rule
+    // (subtype.dart:33-41, type_system.dart:372-378), so a *reflexive* pair
+    // arriving beyond the limit also answers `false`. Drive one: two
+    // alpha-equivalent generic functions correlate positionally, and the
+    // correlated return check compares identical types one level deeper —
+    // nesting 99 `List`s puts it at depth 100, past the guard. Before the
+    // guard swapped ahead of rule 0a this query answered `true`.
+    let fx = fixture();
+    let sys = fx.system();
+    let identity_t = fx.fn_sig(UninternedFunction {
+        return_type: fx.type_param(fx.d.iterable_t),
+        type_parameters: vec![fx.d.iterable_t],
+        positional: vec![fx.type_param(fx.d.iterable_t)],
+        named: Vec::new(),
+        required_positional: 1,
+    });
+    let identity_s = fx.fn_sig(UninternedFunction {
+        return_type: fx.type_param(fx.d.list_e),
+        type_parameters: vec![fx.d.list_e],
+        positional: vec![fx.type_param(fx.d.list_e)],
+        named: Vec::new(),
+        required_positional: 1,
+    });
+    let nest = |seed: TypeId, depth: u32| {
+        let mut ty = seed;
+        for _ in 0..depth {
+            ty = fx.list_of(ty, false);
+        }
+        ty
+    };
+    // Flat, the pair is related (the existing generic-correlation test
+    // pins `true`); one List shy of the limit it still is.
+    assert!(sys.is_subtype(identity_t, identity_s));
+    assert!(sys.is_subtype(nest(identity_t, 98), nest(identity_s, 98)));
+    // At the limit the guard fires before rule 0a can.
+    assert!(!sys.is_subtype(nest(identity_t, 99), nest(identity_s, 99)));
 }
 
 fn function_question(fx: &Fixture) -> TypeId {

@@ -177,6 +177,35 @@ fn substitute_rewrites_type_parameters() {
 }
 
 #[test]
+fn substitute_reaches_a_parameter_that_appears_only_in_a_return_type() {
+    let fx = fixture();
+    let t = fx.type_param(fx.d.iterable_t);
+    let int = fx.int();
+    // `T Function()`: the parameter appears only in the return type, so
+    // neither the positional nor the named section changes.
+    let f = fx.fn_type(&[], t);
+    assert_eq!(
+        fx.table.substitute(f, &[(fx.d.iterable_t, int)]),
+        fx.fn_type(&[], int)
+    );
+
+    // Nested: `T Function() Function()` — the parameter sits two return
+    // levels deep, inside the outer signature's return type.
+    let outer = fx.fn_type(&[], fx.fn_type(&[], t));
+    assert_eq!(
+        fx.table.substitute(outer, &[(fx.d.iterable_t, int)]),
+        fx.fn_type(&[], fx.fn_type(&[], int))
+    );
+
+    // No occurrence anywhere keeps the original id (fast path).
+    let untouched = fx.fn_type(&[], fx.void_());
+    assert_eq!(
+        fx.table.substitute(untouched, &[(fx.d.iterable_t, int)]),
+        untouched
+    );
+}
+
+#[test]
 fn function_type_identity_includes_its_own_type_parameters() {
     let fx = fixture();
     // Alpha-equivalent but distinct declarations are distinct types, matching

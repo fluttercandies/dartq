@@ -14,6 +14,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::error::TypeError;
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
+use crate::system::DEPTH_LIMIT;
 use crate::table::TypeTable;
 use crate::ty::{TypeKind, UninternedType};
 
@@ -66,8 +67,9 @@ pub struct TypeHierarchy {
     core: CoreDecls,
     decls: FxHashMap<TypeDeclId, DeclInfo>,
     sentinels: Sentinels,
-    /// Longest supertype-chain depth to `Object` per declaration (class
-    /// edges only), precomputed at build time for the LUB
+    /// Longest supertype-chain depth to `Object` per declaration, counted
+    /// over *all* direct supertype edges exactly like the oracle's
+    /// superinterface walk, precomputed at build time for the LUB
     /// max-unique-depth rule (`least_upper_bound.dart:327-357`).
     depths: FxHashMap<TypeDeclId, u32>,
 }
@@ -152,7 +154,8 @@ impl TypeHierarchyBuilder {
     ///
     /// # Errors
     /// [`TypeError::DuplicateDecl`], [`TypeError::UndeclaredDecl`],
-    /// [`TypeError::SupertypeNotInterface`], [`TypeError::ArityMismatch`],
+    /// [`TypeError::SupertypeNotInterface`], [`TypeError::ObjectSupertype`],
+    /// [`TypeError::NullableSupertype`], [`TypeError::ArityMismatch`],
     /// [`TypeError::ForeignTypeParameter`], [`TypeError::CyclicHierarchy`].
     pub fn build(self, table: &TypeTable) -> Result<TypeHierarchy, TypeError> {
         let core = self.core;
@@ -178,8 +181,19 @@ impl TypeHierarchyBuilder {
 
         let mut edges: Vec<(TypeDeclId, TypeDeclId, TypeId)> = Vec::with_capacity(self.edges.len());
         for (owner, supertype) in self.edges {
-            let target = validate_edge(table, &decls, owner, supertype)?;
+            let target = validate_edge(table, &decls, core, owner, supertype)?;
             edges.push((owner, target, supertype));
+        }
+
+        // One adjacency index — `owner → positions in `edges`` — built once
+        // and extended as implicit edges land; every pass below reads it
+        // instead of rescanning the edge list, O(V+E) in total. Positions
+        // are appended in edge-insertion order, so each consumer observes
+        // exactly the per-owner order the former full scans produced.
+        let mut adjacency: FxHashMap<TypeDeclId, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(decls.len(), FxBuildHasher);
+        for (index, &(owner, _, _)) in edges.iter().enumerate() {
+            adjacency.entry(owner).or_default().push(index);
         }
 
         // Implicit `Object` inheritance for every class except `Object`.
@@ -194,42 +208,49 @@ impl TypeHierarchyBuilder {
             if decl == core.object {
                 continue;
             }
-            let has_object_edge = edges
-                .iter()
-                .any(|&(owner, target, _)| owner == decl && target == core.object);
+            let has_object_edge = adjacency
+                .get(&decl)
+                .is_some_and(|slots| slots.iter().any(|&index| edges[index].1 == core.object));
             if !has_object_edge {
+                adjacency.entry(decl).or_default().push(edges.len());
                 edges.push((decl, core.object, object_none));
             }
         }
 
-        detect_cycles(&decls, &edges)?;
+        debug_assert!(
+            edges.iter().all(|&(owner, _, supertype)| {
+                owner != core.object && !table.get(supertype).is_nullable()
+            }),
+            "validated edges must keep `Object` uniquely at depth 1 for the LUB rule"
+        );
+
+        detect_cycles(&decls, &edges, &adjacency)?;
 
         let mut infos: FxHashMap<TypeDeclId, DeclInfo> = FxHashMap::default();
         for (decl, params) in &decls {
+            let supertypes = adjacency
+                .get(decl)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|&index| edges[index].2)
+                .collect();
             infos.insert(
                 *decl,
                 DeclInfo {
                     type_parameters: params.clone(),
-                    supertypes: edges
-                        .iter()
-                        .filter(|&&(owner, _, _)| owner == *decl)
-                        .map(|&(_, _, supertype)| supertype)
-                        .collect(),
+                    supertypes,
                 },
             );
         }
 
         // Precompute inheritance depths (LUB max-unique-depth rule). The
-        // graph is acyclic (validated above), so the memoized DFS terminates.
-        let mut targets: FxHashMap<TypeDeclId, Vec<TypeDeclId>> =
-            FxHashMap::with_capacity_and_hasher(decls.len(), FxBuildHasher);
-        for &(owner, target, _) in &edges {
-            targets.entry(owner).or_default().push(target);
-        }
+        // graph is acyclic (validated above); the recursion is additionally
+        // capped at `DEPTH_LIMIT`, so validated-but-pathologically-deep
+        // chains saturate at the cap instead of overflowing the stack.
         let mut depths: FxHashMap<TypeDeclId, u32> =
             FxHashMap::with_capacity_and_hasher(decls.len(), FxBuildHasher);
         for &decl in decls.keys() {
-            class_depth(decl, &targets, &mut depths);
+            class_depth(decl, &edges, &adjacency, DEPTH_LIMIT, &mut depths);
         }
 
         let object_question = table.intern(
@@ -253,26 +274,35 @@ impl TypeHierarchyBuilder {
     }
 }
 
-/// Longest supertype-chain depth to `Object` over the declared class edges
-/// (`computeLongestInheritancePathToObject`, least_upper_bound.dart:204-323).
-/// Every edge targets a validated interface declaration, so the recursion
-/// mirrors the LUB helper's filter over supertype kinds; the memoized DFS
-/// expects an acyclic graph.
+/// Longest supertype-chain depth to `Object` over all direct supertype
+/// edges (`computeLongestInheritancePathToObject`,
+/// least_upper_bound.dart:204-323): every edge targets a validated interface
+/// declaration, so the recursion covers the oracle's superinterface walk
+/// without kind filtering. The memoized DFS expects the acyclic graph
+/// validated at build time; `remaining` caps recursion at [`DEPTH_LIMIT`] so
+/// hostile-deep chains saturate at the cap instead of overflowing the stack.
 fn class_depth(
     decl: TypeDeclId,
-    targets: &FxHashMap<TypeDeclId, Vec<TypeDeclId>>,
+    edges: &[(TypeDeclId, TypeDeclId, TypeId)],
+    adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
+    remaining: u32,
     memo: &mut FxHashMap<TypeDeclId, u32>,
 ) -> u32 {
     if let Some(&depth) = memo.get(&decl) {
         return depth;
     }
-    let depth = 1 + targets.get(&decl).map_or(0, |children| {
-        children
+    let depth = if remaining == 0 {
+        DEPTH_LIMIT
+    } else {
+        let max_child = adjacency
+            .get(&decl)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
-            .map(|&child| class_depth(child, targets, memo))
+            .map(|&index| class_depth(edges[index].1, edges, adjacency, remaining - 1, memo))
             .max()
-            .unwrap_or(0)
-    });
+            .unwrap_or(0);
+        (1 + max_child).min(DEPTH_LIMIT)
+    };
     memo.insert(decl, depth);
     depth
 }
@@ -281,6 +311,7 @@ fn class_depth(
 fn validate_edge(
     table: &TypeTable,
     decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    core: CoreDecls,
     owner: TypeDeclId,
     supertype: TypeId,
 ) -> Result<TypeDeclId, TypeError> {
@@ -290,6 +321,16 @@ fn validate_edge(
             actual: table.get(supertype).kind(),
         });
     };
+    // `Object` is the hierarchy root: an edge above it would break the LUB
+    // unique-depth-1 anchor (least_upper_bound.dart:327-357).
+    if owner == core.object {
+        return Err(TypeError::ObjectSupertype(owner));
+    }
+    // Edges feed the LUB supertype closures verbatim, so they must carry the
+    // `?`-free projection (same invariant).
+    if table.get(supertype).is_nullable() {
+        return Err(TypeError::NullableSupertype(owner));
+    }
     let Some(owner_params) = decls.get(&owner) else {
         return Err(TypeError::UndeclaredDecl(owner));
     };
@@ -327,13 +368,14 @@ enum Visit {
 fn detect_cycles(
     decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],
+    adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
 ) -> Result<(), TypeError> {
     let mut state: FxHashMap<TypeDeclId, Visit> =
         decls.keys().map(|&decl| (decl, Visit::Unvisited)).collect();
     let mut path: Vec<TypeDeclId> = Vec::new();
 
     for &root in decls.keys() {
-        dfs(root, edges, &mut state, &mut path)?;
+        dfs(root, edges, adjacency, &mut state, &mut path)?;
     }
     Ok(())
 }
@@ -342,6 +384,7 @@ fn detect_cycles(
 fn dfs(
     decl: TypeDeclId,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],
+    adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
     state: &mut FxHashMap<TypeDeclId, Visit>,
     path: &mut Vec<TypeDeclId>,
 ) -> Result<(), TypeError> {
@@ -360,13 +403,79 @@ fn dfs(
     }
     state.insert(decl, Visit::InProgress);
     path.push(decl);
-    for &(owner, target, _) in edges {
-        if owner != decl {
-            continue;
-        }
-        dfs(target, edges, state, path)?;
+    for &index in adjacency.get(&decl).map_or(&[][..], Vec::as_slice) {
+        dfs(edges[index].1, edges, adjacency, state, path)?;
     }
     state.insert(decl, Visit::Done);
     path.pop();
     Ok(())
+}
+
+#[cfg(test)]
+mod depth_fallback {
+    //! Termination pin for `pick_max_unique_depth` (lub.rs). The test lives
+    //! here because only this module can corrupt a snapshot's private depth
+    //! table, simulating the malformed snapshot the saturating fallback
+    //! exists for (a frozen host incident made termination repo law).
+
+    use super::*;
+    use crate::system::TypeSystem;
+
+    #[test]
+    fn lub_terminates_when_no_depth_is_unique() {
+        let table = TypeTable::new();
+        let (object, future, function) = (
+            TypeDeclId::from_raw(1),
+            TypeDeclId::from_raw(2),
+            TypeDeclId::from_raw(3),
+        );
+        let (m, a, b) = (
+            TypeDeclId::from_raw(4),
+            TypeDeclId::from_raw(5),
+            TypeDeclId::from_raw(6),
+        );
+        let itf = |decl: TypeDeclId| {
+            table.intern(
+                UninternedType::Interface {
+                    decl,
+                    args: Vec::new(),
+                },
+                false,
+            )
+        };
+        let mut hierarchy = TypeHierarchy::builder(CoreDecls {
+            object,
+            future,
+            function,
+            record: None,
+        })
+        .decl(object, Vec::new())
+        .decl(future, vec![TypeParamId::from_raw(1)])
+        .decl(function, Vec::new())
+        .decl(m, Vec::new())
+        .decl(a, Vec::new())
+        .decl(b, Vec::new())
+        .supertype(m, itf(object))
+        .supertype(a, itf(m))
+        .supertype(b, itf(m))
+        .build(&table)
+        .expect("fixture hierarchy is valid");
+
+        // Sanity on the sound table: the shared supertype wins.
+        assert_eq!(
+            TypeSystem::new(&table, &hierarchy).least_upper_bound(itf(a), itf(b)),
+            itf(m)
+        );
+
+        // Corrupt every depth to the same value: the supertype intersection
+        // {m, Object} is tied at every level, so no candidate is ever unique
+        // and the walk can only end in the saturating `Object` fallback.
+        for depth in hierarchy.depths.values_mut() {
+            *depth = 5;
+        }
+        assert_eq!(
+            TypeSystem::new(&table, &hierarchy).least_upper_bound(itf(a), itf(b)),
+            itf(object)
+        );
+    }
 }

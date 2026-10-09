@@ -13,7 +13,7 @@
 use rustc_hash::FxHashSet;
 
 use crate::ids::TypeId;
-use crate::system::{TypeSystem, WalkScratch};
+use crate::system::{DEPTH_LIMIT, TypeSystem, WalkScratch};
 use crate::ty::{Type, TypeKind, UninternedType};
 
 impl TypeSystem<'_> {
@@ -262,16 +262,16 @@ impl TypeSystem<'_> {
             } = &mut *scratch;
             set_a.clear();
             set_b.clear();
-            self.supertype_closure(a, set_a);
-            self.supertype_closure(b, set_b);
+            self.supertype_closure(a, DEPTH_LIMIT, set_a);
+            self.supertype_closure(b, DEPTH_LIMIT, set_b);
             candidates.clear();
             candidates.extend(set_a.intersection(set_b).copied());
             self.pick_max_unique_depth(candidates)
         } else {
             let mut si = FxHashSet::default();
             let mut sj = FxHashSet::default();
-            self.supertype_closure(a, &mut si);
-            self.supertype_closure(b, &mut sj);
+            self.supertype_closure(a, DEPTH_LIMIT, &mut si);
+            self.supertype_closure(b, DEPTH_LIMIT, &mut sj);
             let candidates: Vec<TypeId> = si.intersection(&sj).copied().collect();
             self.pick_max_unique_depth(&candidates)
         }
@@ -279,9 +279,15 @@ impl TypeSystem<'_> {
 
     /// The supertype set including the type itself
     /// (least_upper_bound.dart:167-172). Canonical interning makes `TypeId` a
-    /// sound set key across differently substituted paths.
-    fn supertype_closure(&self, t: TypeId, out: &mut FxHashSet<TypeId>) {
+    /// sound set key across differently substituted paths. `remaining` caps
+    /// recursion at [`DEPTH_LIMIT`]: a validated-but-pathologically-deep
+    /// chain stops expanding instead of overflowing the stack (the truncated
+    /// closure still resolves through the intersection fallback).
+    fn supertype_closure(&self, t: TypeId, remaining: u32, out: &mut FxHashSet<TypeId>) {
         if !out.insert(t) {
+            return;
+        }
+        if remaining == 0 {
             return;
         }
         let TypeKind::Interface { decl, args } = self.table().get(t).kind() else {
@@ -294,7 +300,7 @@ impl TypeSystem<'_> {
             .type_parameters;
         if params.is_empty() {
             for &edge in self.hierarchy().supertypes(decl) {
-                self.supertype_closure(edge, out);
+                self.supertype_closure(edge, remaining - 1, out);
             }
         } else {
             let map: Vec<_> = params
@@ -303,21 +309,22 @@ impl TypeSystem<'_> {
                 .zip(self.table().args(args))
                 .collect();
             for &edge in self.hierarchy().supertypes(decl) {
-                self.supertype_closure(self.table().substitute(edge, &map), out);
+                self.supertype_closure(self.table().substitute(edge, &map), remaining - 1, out);
             }
         }
     }
 
     /// `_computeTypeAtMaxUniqueDepth` (least_upper_bound.dart:327-357).
-    /// Termination is guaranteed: the intersection always contains `Object`
-    /// (implicit inheritance, depth 1), and every other declaration has
-    /// strictly larger depth.
+    /// Termination is guaranteed: a validated snapshot's intersection always
+    /// contains `Object` (implicit inheritance, depth 1), so the walk finds a
+    /// unique candidate before the depth runs out; a malformed snapshot
+    /// saturates at 0 and falls back to `Object` instead of looping.
     fn pick_max_unique_depth(&self, candidates: &[TypeId]) -> TypeId {
         let mut max = candidates
             .iter()
             .map(|&t| self.depth_of(t))
             .max()
-            .expect("intersection is non-empty: both sides include `Object`");
+            .unwrap_or(0);
         loop {
             let mut unique = None;
             let mut count = 0;
@@ -330,14 +337,22 @@ impl TypeSystem<'_> {
             if count == 1 {
                 return unique.expect("exactly one candidate at this depth");
             }
-            max -= 1;
+            let next = max.saturating_sub(1);
+            if next == max {
+                // Saturated at 0 with no unique candidate — unreachable for
+                // validated snapshots, so the input is malformed: return the
+                // safe upper bound instead of looping.
+                return self.core_object_none();
+            }
+            max = next;
         }
     }
 
     /// Longest inheritance path to `Object`
     /// (`computeLongestInheritancePathToObject`, least_upper_bound.dart:204-323,
-    /// class edges only). Precomputed per declaration when the hierarchy
-    /// snapshot was built; the graph was validated acyclic at build time.
+    /// over all direct supertype edges). Precomputed per declaration when the
+    /// hierarchy snapshot was built; the graph was validated acyclic at build
+    /// time.
     fn depth_of(&self, t: TypeId) -> u32 {
         match self.table().get(t).kind() {
             TypeKind::Interface { decl, .. } => self.hierarchy().depth(decl),
