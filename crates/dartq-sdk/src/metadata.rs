@@ -233,7 +233,9 @@ impl AllowedExperiments {
     }
 }
 
-/// Applies `experiments` on top of the version-derived baseline.
+/// Applies `experiments` on top of the version-derived baseline, each grant
+/// re-restricted to `version` (`FeatureSet::restrictToVersion` semantics:
+/// a grant only sticks when the flag's official gate passes at `version`).
 fn feature_set_with_experiments(
     version: LanguageVersion,
     experiments: &BTreeSet<String>,
@@ -242,7 +244,7 @@ fn feature_set_with_experiments(
     let mut unknown = Vec::new();
     for name in experiments {
         match Feature::try_from(name.as_str()) {
-            Ok(feature) => set = set.with_experiment(feature),
+            Ok(feature) => set = set.with_experiment_for_version(version, feature),
             Err(_) => unknown.push(name.clone()),
         }
     }

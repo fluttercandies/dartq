@@ -9,7 +9,7 @@
 //! shapes (patch lists, include chains, target scoping, the
 //! `allowed_experiments.json` grant layout).
 
-use dartq_language::{Feature, FeatureSet, LanguageVersion};
+use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_sdk::{Importability, SdkSnapshot, SdkUriError};
 
 /// Loads the vendored fixture (the directory is the dart-sdk root).
@@ -193,12 +193,32 @@ fn allowed_experiments_map_to_feature_sets() {
             "{library} maps to the version baseline"
         );
     }
-    // The real `json` package grant turns on both macros experiments.
-    let granted = sdk
-        .platform_metadata
-        .feature_set_for_package("json", version)
-        .expect("feature set");
+    // The real `json` package grant carries both macros experiments
+    // (macros: release 3.3, enhanced-parts: release 3.6), so each grant
+    // sticks only where the official release gate passes at the effective
+    // language version.
+    let json = |v: LanguageVersion| {
+        sdk.platform_metadata
+            .feature_set_for_package("json", v)
+            .expect("feature set")
+    };
+
+    // At the SDK's own version (3.13) both releases have shipped: both on.
+    let granted = json(version);
     assert!(granted.is_enabled(Feature::Macros));
     assert!(granted.is_enabled(Feature::EnhancedParts));
     assert!(!baseline.is_enabled(Feature::Macros));
+
+    // Below both releases (package-config language 2.19) the grant is a
+    // no-op: the result is the pure 2.19 baseline.
+    let old_version = LanguageVersion::new(2, 19);
+    let old = json(old_version);
+    assert!(!old.is_enabled(Feature::Macros));
+    assert!(!old.is_enabled(Feature::EnhancedParts));
+    assert_eq!(old, FeatureSet::for_language_version(old_version));
+
+    // At the current SDK version both gates pass again.
+    let current = json(DEFAULT_LANGUAGE_VERSION);
+    assert!(current.is_enabled(Feature::Macros));
+    assert!(current.is_enabled(Feature::EnhancedParts));
 }

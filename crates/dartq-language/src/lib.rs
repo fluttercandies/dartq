@@ -237,9 +237,11 @@ impl FeatureSet {
     ///
     /// Bypasses the official release-version gate: the bit is set
     /// unconditionally, whatever language version this set was derived from.
-    /// Internal construction only (SDK allowed-experiment wiring, tests) —
-    /// flag-decode sites must use [`FeatureSet::with_experiment_for_version`],
-    /// which implements the official expired/release-gate contract.
+    /// For genuine internal construction and tests only — SDK
+    /// allowed-experiment grants must use
+    /// [`FeatureSet::with_experiment_for_version`], which re-restricts
+    /// grants to the effective language version under the official
+    /// expired/release-gate contract.
     #[must_use]
     pub fn with_experiment(mut self, feature: Feature) -> Self {
         self.0 |= 1 << feature as usize;

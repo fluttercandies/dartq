@@ -312,8 +312,10 @@ fn feature_set_mapping_adds_whitelisted_experiments() {
         baseline
     );
 
-    // The `json` package grant enables both macros experiments, which are
-    // opt-in (not version-gated).
+    // The `json` package grant enables both macros experiments at 3.13:
+    // both clear their official release gates there (macros 3.3,
+    // enhanced-parts 3.6). Grant re-restriction across versions is pinned
+    // end-to-end in tests/vendored_sdk.rs.
     let granted = experiments
         .feature_set_for_package("json", version)
         .unwrap();
