@@ -45,11 +45,11 @@ use dartq_diagnostics::{
     AnalysisOutput, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity, SourceRange,
     write_json, write_machine,
 };
+use dartq_engine::semdiag;
 use dartq_engine::{
     CancellationToken, Cancelled, DeclHit, DeclKind, Engine, EngineConfig, EngineEvent, RefHit,
     RefKind, SymbolAnswer, memory_store,
 };
-use dartq_engine::semdiag;
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
 };
@@ -72,6 +72,7 @@ mod exit {
 }
 
 mod compat;
+mod fix;
 mod impact;
 
 fn main() -> ExitCode {
@@ -101,6 +102,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
+        Ok(Cli {
+            command: Some(Command::Fix(fix_args)),
+        }) => fix::run_entry(&fix_args),
         // Bare `dartq` and `dartq version` land here; `--version` short-
         // circuits in `try_parse_from` as a DisplayVersion error (routed to
         // stdout + exit 0 by the arm below).
@@ -139,6 +143,9 @@ enum Command {
     /// Serve the LSP daemon over stdin/stdout (one client; overlay + full
     /// diagnostics, PRD §16.3).
     Daemon(DaemonArgs),
+    /// Emit or apply anchored fix patches (PRD §15.6); `--dry-run` only
+    /// outputs them.
+    Fix(fix::FixArgs),
     /// Assess what a change to one file would affect (PRD §15.4).
     Impact(impact::ImpactArgs),
     /// Query the analyzed workspace's symbol index (PRD §20.3).
@@ -505,6 +512,21 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 /// print on stderr and return the usage tier (64); stdout stays empty. The
 /// canonical directory comes back for the caller's discovery phase.
 fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), u8> {
+    let (config, dir) = engine_config(dir, sdk)?;
+    let engine = match Engine::new(config) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("error: engine context unusable: {error}");
+            return Err(exit::USAGE);
+        }
+    };
+    Ok((engine, dir))
+}
+
+/// The assembled [`EngineConfig`] behind [`open_engine`], plus the
+/// canonicalized package directory. The daemon face consumes the config
+/// directly (`Session::new` owns its engine lifetime, #328).
+fn engine_config(dir: &Path, sdk: Option<&Path>) -> Result<(EngineConfig, PathBuf), u8> {
     let sdk_root = sdk
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
@@ -561,24 +583,19 @@ fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), u8> 
             return Err(exit::USAGE);
         }
     };
-
-    let engine = match Engine::new(EngineConfig {
-        store: memory_store(),
-        sdk: sdk_snapshot,
-        packages,
-        pub_config: config,
-        config_dir,
-        // The semantic families are part of the analyze contract (#236):
-        // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
-        semdiag: Some(semdiag::diagnoser()),
-    }) {
-        Ok(engine) => engine,
-        Err(error) => {
-            eprintln!("error: engine context unusable: {error}");
-            return Err(exit::USAGE);
-        }
-    };
-    Ok((engine, dir))
+    Ok((
+        EngineConfig {
+            store: memory_store(),
+            sdk: sdk_snapshot,
+            packages,
+            pub_config: config,
+            config_dir,
+            // The semantic families are part of the analyze contract (#236):
+            // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
+            semdiag: Some(semdiag::diagnoser()),
+        },
+        dir,
+    ))
 }
 
 /// One analyze run over a real package directory: pub faces → engine →
@@ -676,11 +693,17 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
 /// `initialized`, so the client sees full diagnostics immediately after the
 /// handshake.
 fn daemon(args: &DaemonArgs) -> u8 {
-    let (engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+    let (config, _dir) = match engine_config(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(code) => return code,
     };
-    let session = dartq_daemon::Session::new(engine);
+    let session = match dartq_daemon::Session::new(config) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("dartq: internal error: daemon session unusable: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
     // The reader thread owns stdin; only the main loop writes stdout, so the
     // buffer needs no lock. The `Stdin` handle (not `StdinLock`) is what is
     // `Send`. On `exit` the reader may still be blocked on the next read —
@@ -847,7 +870,10 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         eprintln!("dartq: internal error: analysis cancelled");
         return exit::INTERNAL_ERROR;
     }
-    let SymbolAnswer { mut decls, mut refs } = engine.query_symbols(&args.name);
+    let SymbolAnswer {
+        mut decls,
+        mut refs,
+    } = engine.query_symbols(&args.name);
     let layout = EngineLayout::over(
         &engine,
         decls
@@ -1380,7 +1406,11 @@ mod tests {
         assert_eq!(warnings.len(), 1);
 
         let (version, _, warnings) = scan_file("// @dart = 3.13\nvar x = 1;\n", file);
-        assert_eq!(version, LanguageVersion::new(3, 13), "oracle latest accepted");
+        assert_eq!(
+            version,
+            LanguageVersion::new(3, 13),
+            "oracle latest accepted"
+        );
         assert!(warnings.is_empty());
 
         let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
@@ -1986,7 +2016,10 @@ mod tests {
         assert_eq!(json["declarations"][0]["column"], 7);
         assert_eq!(json["references"].as_array().expect("array").len(), 2);
         assert_eq!(json["references"][0]["kind"], "reference");
-        assert_eq!(json["references"][0]["target_file"], a.display().to_string());
+        assert_eq!(
+            json["references"][0]["target_file"],
+            a.display().to_string()
+        );
         assert_eq!(json["references"][0]["qualified"], false);
         assert_eq!(json["references"][0]["offset"], 33);
         assert_eq!(json["references"][1]["kind"], "invoked");

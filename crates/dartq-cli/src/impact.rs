@@ -30,8 +30,8 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use dartq_ai::impact::{self as query, content_hash, FileSnapshot, LibraryChange};
-use dartq_engine::{Cancelled, CancellationToken, Engine, EngineEvent, LibraryId};
+use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
+use dartq_engine::{CancellationToken, Cancelled, Engine, EngineEvent, LibraryId};
 use dartq_index::{TestGraph, capture};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
 use dartq_parser::ParserFeatures;
@@ -69,10 +69,9 @@ pub(crate) struct ImpactArgs {
 /// stdout kept empty, because [`run`] writes only after the query fully
 /// succeeded.
 pub(crate) fn run_entry(args: &ImpactArgs) -> u8 {
-    let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(args, &mut BufWriter::new(io::stdout().lock()))
-        }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -85,7 +84,10 @@ pub(crate) fn run_entry(args: &ImpactArgs) -> u8 {
 fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
     let mut idents: IdentTable = vec![None; libraries.len()];
     for (library, files) in libraries {
-        let Some(path) = files.first().and_then(|&file| engine.file_table().path(file)) else {
+        let Some(path) = files
+            .first()
+            .and_then(|&file| engine.file_table().path(file))
+        else {
             continue;
         };
         idents[library.index() as usize] = Some((
@@ -102,11 +104,7 @@ fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -
 /// library-face declaration names from the capture pass (parse-surface
 /// capture proceeds through scan diagnostics — the under-report bias; this
 /// face produces no diagnostics of its own).
-fn seed_snapshot(
-    engine: &Engine,
-    members: &[FileId],
-    strings: &StringTable,
-) -> FileSnapshot {
+fn seed_snapshot(engine: &Engine, members: &[FileId], strings: &StringTable) -> FileSnapshot {
     let mut names: Vec<StringId> = Vec::new();
     let mut folded = Vec::with_capacity(members.len() * 32);
     for &file in members {
@@ -154,7 +152,10 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
 
     // The seed: the target file's owning library.
     let Ok(target) = args.path.canonicalize() else {
-        eprintln!("error: Directory or file doesn't exist: {}", args.path.display());
+        eprintln!(
+            "error: Directory or file doesn't exist: {}",
+            args.path.display()
+        );
         return exit::USAGE;
     };
     let Some(seed_file) = engine.file_table().try_file_id(&target) else {
@@ -196,19 +197,18 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     let report = query::impact(
         count,
         neighbors,
-        |library| -> &str {
-            &idents[library as usize]
-                .as_ref()
-                .expect("live library")
-                .0
-        },
+        |library| -> &str { &idents[library as usize].as_ref().expect("live library").0 },
         &tests,
         &strings,
         &[change],
     );
 
     let written = out
-        .write_all(serde_json::to_string(&report).expect("ImpactReport serializes").as_bytes())
+        .write_all(
+            serde_json::to_string(&report)
+                .expect("ImpactReport serializes")
+                .as_bytes(),
+        )
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush());
     if let Err(error) = written {
@@ -228,8 +228,7 @@ mod tests {
     /// [`dartq_sdk::SdkSnapshot::load`] needs), a lib pair, and the
     /// convention-placed test that reaches the lib through its package URI.
     fn fixture(tag: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("dq_cli_impact_{tag}_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dq_cli_impact_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let write = |relative: &str, content: &str| {
             let path = root.join(relative);
@@ -258,7 +257,10 @@ mod tests {
             r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
         );
         write("lib/a.dart", "class Foo {}\nvoid foo() {}\n");
-        write("lib/b.dart", "import 'a.dart';\nvoid use() {\n  Foo? f = Foo();\n  foo();\n}\n");
+        write(
+            "lib/b.dart",
+            "import 'a.dart';\nvoid use() {\n  Foo? f = Foo();\n  foo();\n}\n",
+        );
         write(
             "test/a_test.dart",
             "import 'package:fixture/a.dart';\nimport 'package:test/test.dart';\nvoid main() {\n  test('hits foo', () {\n    foo();\n  });\n}\n",

@@ -20,6 +20,7 @@ dartq-diagnostics = { path = "../dartq-diagnostics" }
 dartq-engine = { path = "../dartq-engine" }
 dartq-index = { path = "../dartq-index" }
 dartq-language = { path = "../dartq-language" }
+dartq-lints = { path = "../dartq-lints" }
 dartq-package = { path = "../dartq-package" }
 dartq-parser = { path = "../dartq-parser" }
 dartq-pub = { path = "../dartq-pub" }
