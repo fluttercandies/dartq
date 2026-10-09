@@ -5,6 +5,7 @@
 
 use dartq_scanner::{Keyword, TokenKind};
 
+use crate::cursor::CursorMark;
 use crate::listener::IdentifierContext;
 use crate::listener::ParserListener;
 use crate::message::msg;
@@ -327,6 +328,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if self.kind_at(scan) == TokenKind::At {
                 let metadata_len = self.metadata_skip_len(scan);
                 if metadata_len == 0 {
+                    eprintln!("DBG scan None: metadata");
                     return None;
                 }
                 scan += metadata_len;
@@ -525,6 +527,30 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             // The group length covers only the `<...>` tail;
                             // the identifier (or `id.id`) prefix stays.
                             n += len;
+                            // A compound closer whose surplus closers belong
+                            // to the enclosing groups ends the type here
+                            // (the official scan splits the compound at the
+                            // inner group): the successor reads the split
+                            // remainder — never a `?`, never a `Function`
+                            // intro — so the type ends on the compound and
+                            // the GFT chain below stays off
+                            // (`List<List<int>> Function()` keeps its GFT on
+                            // the OUTER type).
+                            let tail = self.kind_at(offset + n - 1);
+                            let shared = is_compound_closer(tail) && {
+                                let mut opens = 0usize;
+                                let mut closed = 0usize;
+                                for i in offset..offset + n - 1 {
+                                    match self.kind_at(i) {
+                                        TokenKind::Lt => opens += 1,
+                                        kind => closed += closer_units(kind),
+                                    }
+                                }
+                                closer_units(tail) > opens.saturating_sub(closed)
+                            };
+                            if shared {
+                                return n;
+                            }
                             if self.kind_at(offset + n) == TokenKind::Question {
                                 n += 1;
                             }
@@ -533,6 +559,33 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     }
                 } else if self.kind_at(offset + n) == TokenKind::Question {
                     n += 1;
+                }
+                // Generalized-function-type suffixes: `computeType` classifies
+                // `id Function(...)` (and chained suffixes) as one Complex
+                // type whose `skipType` is the GFT's end (`computeRest`,
+                // type_info_impl.dart:1016+; the official group scan is
+                // compute-driven, type_info_impl.dart:1363-1388), so the skip
+                // length covers each `<...>? (...)` suffix exactly when it is
+                // GFT-shaped.
+                while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+                    let mut probe = n + 1;
+                    if self.kind_at(offset + probe) == TokenKind::Lt {
+                        match self.gt_group_len(offset + probe) {
+                            Some(len) => probe += len,
+                            None => break,
+                        }
+                    }
+                    if self.kind_at(offset + probe) != TokenKind::OpenParen {
+                        break;
+                    }
+                    let Some(close) = self.cursor.table_matching_end(self.real_id(offset + probe))
+                    else {
+                        break;
+                    };
+                    n = self.offset_of(close) - offset + 1;
+                    if self.kind_at(offset + n) == TokenKind::Question {
+                        n += 1;
+                    }
                 }
                 n
             }
@@ -758,20 +811,48 @@ impl ComplexTypeParamOrArg {
             .listener
             .handle_type_variables_defined(*starts.first().unwrap_or(&begin), count);
 
-        // Type variables complete in reverse declaration order.
+        // Type variables complete in reverse declaration order. Each bound
+        // re-parses anchored at its own `extends` token (official
+        // `typeInfo.ensureTypeNotVoid(next2, parser)` with
+        // `next2 = typeStarts.head.next`, `type_info_impl.dart:1571`) — the
+        // forward loop above only *skipped* the bound, so the live cursor
+        // rewinds per bound. `closer_state` snapshots the first completion
+        // step (= right after the last variable, the official `token3`
+        // anchor, type_info_impl.dart:1565) so the group's closer handling
+        // below reads the position the official parseCloser consumes from.
+        let mut closer_state: Option<CursorMark> = None;
         for i in (0..count).rev() {
             let start = starts[i];
             let mut extends_or_super = None;
             match &supers[i] {
                 Some((extends_span, info)) => {
                     extends_or_super = Some(*extends_span);
+                    // Bounds sit earlier in the stream than anything a previous
+                    // (later-variable) completion step queued, so the pending
+                    // remainders detach for the rewind and re-attach after this
+                    // bound's own splits.
+                    let pending = if closer_state.is_some() {
+                        Some(parser.cursor.detach_queue())
+                    } else {
+                        None
+                    };
+                    parser.cursor.rewind_to(extends_span.id + 1);
                     info.ensure_type_not_void(parser);
+                    if let Some(pending) = pending {
+                        parser.cursor.attach_queue(pending);
+                    }
                 }
                 None => parser.listener.handle_no_type(start),
+            }
+            if closer_state.is_none() {
+                closer_state = Some(parser.cursor.mark());
             }
             parser
                 .listener
                 .end_type_variable(start, count - 1 - i, extends_or_super, variances[i]);
+        }
+        if let Some(mark) = closer_state {
+            parser.cursor.reset(mark);
         }
 
         let end = if parser.cursor.peek_is_closer() {

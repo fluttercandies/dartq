@@ -277,6 +277,41 @@ impl<'s, 't> TokenCursor<'s, 't> {
         self.pos = target;
     }
 
+    /// Backward jump for an anchored re-parse: the official completion passes
+    /// replay already-skipped tokens from a stored anchor (type-variable
+    /// bounds, `type_info_impl.dart:1571`). Queue must be empty — detach
+    /// first ([`Self::detach_queue`]) when a previous re-parse may have left
+    /// split remainders pending.
+    pub(crate) fn rewind_to(&mut self, id: TokenId) {
+        debug_assert!(self.head == QUEUE_EMPTY);
+        let target = id as usize;
+        debug_assert!(target < self.table.len());
+        self.pos = target;
+    }
+
+    /// Detaches pending inserted tokens (closer-split remainders), hiding
+    /// them from peeks; re-attach with [`Self::attach_queue`] after an
+    /// intervening re-parse. The detached ids become garbage — the caller
+    /// must not hold references across the detach.
+    pub(crate) fn detach_queue(&mut self) -> Vec<InsertedToken> {
+        if self.head == QUEUE_EMPTY {
+            return Vec::new();
+        }
+        let pending = self.inserted[self.head..].to_vec();
+        self.inserted.truncate(self.head);
+        self.head = QUEUE_EMPTY;
+        pending
+    }
+
+    /// Re-attaches tokens detached by [`Self::detach_queue`], after any
+    /// tokens the intervening re-parse queued — the order stays positional
+    /// (the re-parse's own splits sit earlier in the stream).
+    pub(crate) fn attach_queue(&mut self, pending: Vec<InsertedToken>) {
+        for token in pending {
+            self.queue(token);
+        }
+    }
+
     /// Matching close index for a real begin-group id (`TokenTable::matching_end`).
     pub(crate) fn table_matching_end(&self, id: TokenId) -> Option<TokenId> {
         let index = id as usize;

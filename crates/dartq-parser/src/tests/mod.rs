@@ -6,6 +6,7 @@ mod declarations;
 mod directives;
 mod expressions;
 mod features;
+mod gate_m0;
 mod goldens;
 mod patterns;
 mod recovery;

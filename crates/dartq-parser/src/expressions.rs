@@ -83,14 +83,17 @@ fn is_assignment_kind(kind: TokenKind) -> bool {
 /// (used by the written-out-operator candidate levels, and as the official
 /// `Token.isOperator` notion in initializer-entry recovery).
 pub(crate) fn kind_precedence(kind: TokenKind) -> Option<u8> {
-    crate::expr_const::binary_level(kind).or(Some(match kind {
+    if let Some(level) = crate::expr_const::binary_level(kind) {
+        return Some(level);
+    }
+    Some(match kind {
         k if is_assignment_kind(k) => ASSIGNMENT_PRECEDENCE,
         TokenKind::PeriodPeriod | TokenKind::QuestionPeriodPeriod => CASCADE_PRECEDENCE,
         TokenKind::Question => CONDITIONAL_PRECEDENCE,
         TokenKind::Bang | TokenKind::PlusPlus | TokenKind::MinusMinus => POSTFIX_PRECEDENCE,
         TokenKind::Period | TokenKind::QuestionPeriod => SELECTOR_PRECEDENCE,
         _ => return None,
-    }))
+    })
 }
 
 /// The written-out binary operators of
