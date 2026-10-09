@@ -127,7 +127,7 @@
 
 use dartiq_diagnostics::Diagnostic;
 use dartiq_language::LanguageVersion;
-use dartiq_source::{FileId, LineIndex};
+use dartiq_source::{FileId, LineIndex, SourceRange};
 
 mod diag;
 mod keyword;
@@ -167,6 +167,15 @@ pub struct ScanResult {
     /// docs: a differing override obliges the consumer to re-issue
     /// [`ScanConfig`] and rescan).
     pub language_version_override: Option<LanguageVersion>,
+    /// UTF-16 range of the whole version comment lexeme behind
+    /// [`ScanResult::language_version_override`] — from the `//` through the
+    /// last character before the line terminator (trailing spaces included,
+    /// CR excluded), isomorphic to the official `LanguageVersionToken`
+    /// offset/length that the analyzer's above-latest warning pins at
+    /// (`analyzer/lib/src/dart/scanner/scanner.dart:124`). `None` exactly when
+    /// `language_version_override` is `None`; with multiple matches it points
+    /// at the first (winning) one.
+    pub language_version_override_span: Option<SourceRange>,
     /// Line index (authoritative dartiq-source implementation).
     pub line_index: LineIndex,
 }

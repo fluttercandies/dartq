@@ -18,7 +18,7 @@ use crate::token::{Token, TokenKind, TokenTable};
 use crate::{ScanConfig, ScanResult};
 use dartiq_diagnostics::{CodeInfo, EXPECTED_TOKEN};
 use dartiq_language::LanguageVersion;
-use dartiq_source::{FileId, LineIndex};
+use dartiq_source::{FileId, LineIndex, SourceRange};
 
 /// Flow-control signals of `code_step`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +51,9 @@ pub(crate) struct Lexer<'s> {
     /// start value — avoiding a second full-source cursor pass).
     utf16_value: u32,
     version_override: Option<LanguageVersion>,
+    /// UTF-16 span of the comment lexeme behind `version_override` (set and
+    /// cleared together with it; first-match only, same block).
+    version_override_span: Option<SourceRange>,
 }
 
 impl<'s> Lexer<'s> {
@@ -69,6 +72,7 @@ impl<'s> Lexer<'s> {
             diags: Vec::new(),
             utf16_value: 0,
             version_override: None,
+            version_override_span: None,
         };
         lex.utf16_value = u32::from(content_start == 3); // the BOM takes 1 UTF-16 unit
         lex.next = lex.peek_char(lex.pos);
@@ -89,6 +93,7 @@ impl<'s> Lexer<'s> {
             tokens: TokenTable::new(tokens, end_of),
             diagnostics: crate::diag::finish(diags, self.src, self.file),
             language_version_override: self.version_override,
+            language_version_override_span: self.version_override_span,
             line_index: LineIndex::new(self.src),
         }
     }
@@ -304,6 +309,7 @@ impl<'s> Lexer<'s> {
     /// `tokenizeLanguageVersionOrSingleLineComment`); any step failing to match
     /// treats the whole line as a plain comment.
     fn scan_line_comment_header(&mut self) {
+        let comment_start = self.pos;
         self.bump(); // '/'
         self.bump(); // '/'
         if self.peek() == Some('/') {
@@ -336,6 +342,25 @@ impl<'s> Lexer<'s> {
         // → return`, source_compilation_unit.dart:486); later matches do not override.
         if self.version_override.is_none() {
             self.version_override = Some(version);
+            // The span mirrors the official LanguageVersionToken: the whole
+            // comment lexeme from the `//` through the last character before
+            // the line terminator (trailing spaces included, CR excluded —
+            // createLanguageVersionToken at the comment start,
+            // abstract_scanner.dart:1909; the analyzer's above-latest warning
+            // reuses it verbatim, scanner.dart:124
+            // `.atOffset(versionToken.offset, versionToken.length)`). The
+            // cursor sits at the terminator/EOF, so `utf16_value` is the
+            // comment's UTF-16 end.
+            let lexeme = &self.src[comment_start..self.pos];
+            let utf16_len = if lexeme.is_ascii() {
+                lexeme.len() as u32
+            } else {
+                lexeme.chars().map(|c| c.len_utf16() as u32).sum()
+            };
+            self.version_override_span = Some(SourceRange {
+                offset: self.utf16_value - utf16_len,
+                length: utf16_len,
+            });
         }
     }
 

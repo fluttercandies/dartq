@@ -424,6 +424,42 @@ fn eof_after_version_comment_only() {
 }
 
 #[test]
+fn dart_version_comment_span() {
+    fn span_of(src: &str) -> Option<(u32, u32)> {
+        let r = scan_src(src);
+        r.language_version_override_span
+            .map(|s| (s.offset, s.length))
+    }
+
+    // Whole comment lexeme: `//` start, 15 units (oracle Dart 3.13.1
+    // `dart analyze --format=machine`: `1|1|15`; official test
+    // invalid_language_override_greater_test.dart: `[column 1][length 15]`).
+    assert_eq!(span_of("// @dart = 2.19\nvar x;"), Some((0, 15)));
+    // Leading indentation shifts the start (oracle: `1|3|15`).
+    assert_eq!(span_of("  // @dart = 2.19\nx"), Some((2, 15)));
+    // Comments after other comments stay in the window (oracle: `2|1|15`).
+    assert_eq!(span_of("// lead\n// @dart = 2.19\nx"), Some((8, 15)));
+    // Trailing spaces belong to the comment token (oracle: length 18 for
+    // `// @dart = 99.9   `).
+    assert_eq!(span_of("//@dart=3.15  \nx"), Some((0, 14)));
+    // CRLF: the CR is the terminator, not comment content (oracle: `1|1|15`).
+    assert_eq!(span_of("// @dart = 2.19\r\nx"), Some((0, 15)));
+    // After a script tag (window stays open).
+    assert_eq!(
+        span_of("#!/usr/bin/env dart\n// @dart = 2.19\nx"),
+        Some((20, 15))
+    );
+    // UTF-16 offsets: `é` on the leading line counts 1 unit, 3 bytes.
+    assert_eq!(span_of("// é\n// @dart = 2.19\nx"), Some((5, 15)));
+    // First match wins, span follows the version.
+    assert_eq!(span_of("// @dart = 2.1\n// @dart = 2.19\nx"), Some((0, 14)));
+    // No override → no span.
+    let r = scan_src("var x; // @dart = 2.19");
+    assert_eq!(r.language_version_override, None);
+    assert_eq!(r.language_version_override_span, None);
+}
+
+#[test]
 fn del_merges_into_identifier() {
     // DEL (0x7F) takes the official default arm (error_token.dart:17-47 →
     // NonAsciiIdentifierToken): merges with the adjacent identifier, message

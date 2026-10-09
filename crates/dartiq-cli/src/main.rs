@@ -358,12 +358,18 @@ fn scan_file(source: &str, file: FileId) -> (LanguageVersion, ScanResult, Vec<Di
         );
         match result.language_version_override {
             Some(override_version) if override_version.is_above_latest() => {
-                // The scanner exposes no comment span; the (code, file) key
-                // the differential compares is unaffected. Range pinned at
-                // 1:1:0 until the scanner hands out the header span.
+                // The warning pins at the version comment — the whole
+                // `// @dart = x.y` lexeme, isomorphic to the official
+                // `LanguageVersionToken` (`analyzer scanner.dart:124`
+                // `.atOffset(versionToken.offset, versionToken.length)`; oracle
+                // `dart analyze --format=machine` on a line-1 comment:
+                // `1|1|15`).
                 let code = CodeRegistry::builtin()
                     .get("invalid_language_version_override")
                     .expect("official registry pins invalid_language_version_override");
+                let span = result
+                    .language_version_override_span
+                    .expect("scanner records the comment span with every override");
                 let warning = Diagnostic::new(
                     Severity::Warning,
                     code,
@@ -372,10 +378,7 @@ fn scan_file(source: &str, file: FileId) -> (LanguageVersion, ScanResult, Vec<Di
                          the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
                     ),
                     file,
-                    SourceRange {
-                        offset: 0,
-                        length: 0,
-                    },
+                    span,
                     None,
                 );
                 return (version, result, vec![warning]);
@@ -556,12 +559,84 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code.name, "invalid_language_version_override");
         assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(warnings[0].range.offset, 0, "span at the comment");
+        assert_eq!(warnings[0].range.length, 14, "whole comment lexeme");
 
         let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
         assert_eq!(version, LanguageVersion::new(2, 12), "first match wins");
 
         let (version, ..) = scan_file("var x = 1;\n", file);
         assert_eq!(version, DEFAULT_LANGUAGE_VERSION);
+    }
+
+    /// The above-latest warning emits the oracle-matching machine line: the
+    /// span is the whole `@dart` comment lexeme (oracle Dart 3.13.1,
+    /// `dart analyze --format=machine` on `// @dart = 99.9`:
+    /// `WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|<file>|1|1|15|…`;
+    /// indented: `1|3|15`).
+    #[test]
+    fn override_warning_machine_span() {
+        fn machine_line(source: &str, path: &str) -> String {
+            let mut set = FileSet::default();
+            let file = set.push(source, Path::new(path));
+            let (_, _, diags) = scan_file(source, file);
+            assert_eq!(diags.len(), 1);
+            let mut out = Vec::new();
+            write_machine(
+                &mut out,
+                &AnalysisOutput {
+                    diagnostics: &diags,
+                    files: &set,
+                },
+            )
+            .expect("write");
+            String::from_utf8(out).unwrap()
+        }
+
+        let expected = format!(
+            "The language version override can't specify a version greater than \
+             the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
+        );
+        assert_eq!(
+            machine_line("// @dart = 99.9\nvar x = 1;\n", "/c/lib/a.dart"),
+            format!(
+                "WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|/c/lib/a.dart|\
+                 1|1|15|{expected}\n"
+            )
+        );
+        assert_eq!(
+            machine_line("  // @dart = 9.9\n", "/c/lib/b.dart"),
+            format!(
+                "WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|/c/lib/b.dart|\
+                 1|3|14|{expected}\n"
+            )
+        );
+    }
+
+    /// Above-latest override alone → the warning tier (2), cleared by
+    /// `--no-fatal-warnings`; no other check behavior changes.
+    #[test]
+    fn check_exit_tiers_for_above_latest_override() {
+        let root = std::env::temp_dir().join(format!("dq_cli_override_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("override.dart"), "// @dart = 99.9\nvar ok = 1;\n").expect("write");
+
+        let args = CheckArgs {
+            format: Format::Machine,
+            fatal_warnings: true,
+            fatal_infos: false,
+            paths: vec![root.clone()],
+        };
+        assert_eq!(check(&args), exit::FATAL_WARNINGS);
+        assert_eq!(
+            check(&CheckArgs {
+                fatal_warnings: false,
+                ..args
+            }),
+            exit::CLEAN
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// Byte-shape parity with the harness machine parser
