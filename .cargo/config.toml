@@ -9,10 +9,13 @@ jobs = 2
 # parallel lanes). Incremental invocations pass through uncached; correctness
 # is unaffected. Requires `sccache` on PATH (brew install sccache).
 rustc-wrapper = "sccache"
-# Incremental rustc invocations cannot be cached by sccache (passed through
-# uncached), which would gut the wrapper's value for the dominant workload
-# here: seven parallel lanes re-running cargo check over mostly-unchanged
-# crates. Content-addressed cache hits across lanes/sessions outweigh
-# within-crate incremental reuse; an edited crate recompiles in full either
-# way, while its whole dependency graph turns into cache hits.
+# Incremental rustc invocations are not cacheable — the official Rust
+# caching notes REQUIRE disabling incremental (docs/Rust.md:10 in the
+# .third/sccache reference checkout), and the stats breakdown confirms
+# incremental calls pass straight through. Disabling it makes every
+# compilation content-addressed: the dominant workload here (seven
+# parallel lanes re-running cargo check over mostly-unchanged crates)
+# turns whole dependency graphs into cross-lane cache hits. Note bin/
+# proc-macro crates still miss (link step is never cached, Rust.md:11);
+# their lib deps remain cacheable.
 incremental = false
