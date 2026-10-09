@@ -249,6 +249,7 @@ version = "0.1.0"
 dependencies = [
  "dartiq-pub",
  "dartiq-source",
+ "rustc-hash",
  "thiserror",
 ]
 

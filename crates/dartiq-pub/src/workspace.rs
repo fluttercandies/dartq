@@ -438,14 +438,25 @@ fn inclusion_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(&normalized).unwrap_or(normalized)
 }
 
-/// Lexically normalizes a path: collapses `.` and inner `..` components
-/// without touching the filesystem, so two spellings of one directory
-/// compare equal and symlinked temp dirs (/tmp -> /private/tmp) never skew
-/// comparisons. A `..` pops only a plain trailing component; at a relative
-/// root (or past an absolute root) it is kept verbatim, so leading `..`
-/// runs survive. Windows prefixes and the absolute root pass through
-/// untouched. Public because downstream identity layers must normalize
-/// with the same discipline — one normalizer, one behavior.
+/// Lexically normalizes a path: collapses `.` and `..` components without
+/// touching the filesystem, so two spellings of one directory compare equal
+/// and symlinked temp dirs (/tmp -> /private/tmp) never skew comparisons.
+/// A `..` pops a plain trailing component; on a relative path a leading `..`
+/// run is kept verbatim, while `..` past an absolute root clamps at the
+/// root. Windows prefixes and the absolute root pass through untouched.
+/// Public because downstream identity layers must normalize with the same
+/// discipline — one normalizer, one behavior.
+///
+/// The `..`-past-root discipline is the oracle's drop semantics: RFC 3986
+/// §5.2.4 `remove_dot_segments` clamps absolute paths at their root, and so
+/// do Dart (`Uri.normalizePath`, `tests/corelib/uri_normalize_path_test.dart`)
+/// and package:path's `Context.normalize` — pub's `p.normalize`, the only
+/// path tooling its workspace walk uses (`package.dart:199`,
+/// `entrypoint.dart` relative-root writes). No pub call site keeps `..`
+/// past an absolute root: pubspec `workspace:` entries reject `..` ascent
+/// at parse time (pubspec.dart:97-101), and `workspace_ref.json` values are
+/// compared normalize-vs-normalize here, so the shared discipline is
+/// self-consistent. Relative paths keep leading `..` in every discipline.
 #[must_use]
 pub fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -453,12 +464,14 @@ pub fn normalize(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                // Pop only a plain trailing component; `..` at a relative
-                // root — or past an absolute root — stays verbatim.
+                // Pop a plain trailing component; clamp at an absolute root
+                // (nothing before it to pop); keep leading runs on relative
+                // paths.
                 match normalized.components().next_back() {
                     Some(Component::Normal(_)) => {
                         normalized.pop();
                     }
+                    Some(Component::RootDir | Component::Prefix(_)) => {}
                     _ => normalized.push(".."),
                 }
             }
@@ -498,6 +511,10 @@ mod tests {
         // Leading `..` runs survive: they climb past a relative root.
         assert_eq!(normalize(Path::new("../up")), PathBuf::from("../up"));
         assert_eq!(normalize(Path::new("../../..")), PathBuf::from("../../.."));
+        // `..` past an absolute root clamps at the root (RFC 3986 §5.2.4,
+        // `Uri.normalizePath`, package:path `Context.normalize`).
+        assert_eq!(normalize(Path::new("/a/../..")), PathBuf::from("/"));
+        assert_eq!(normalize(Path::new("/../a")), PathBuf::from("/a"));
     }
 
     #[test]

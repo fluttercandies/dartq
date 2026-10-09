@@ -363,6 +363,11 @@ fn collect_edges(
 
 /// blake3-128 over the canonical (config, lock) pair — the M1 graph
 /// identity (see the module docs for what this intentionally excludes).
+///
+/// The serialization is serde's snake_case struct-field form, an internal
+/// canonical-hash dialect only — it is not package_config.json (camelCase
+/// `rootUri`/`generatorVersion`) and must never be used to write one; see
+/// the derive docs in `config.rs`.
 fn graph_id(config: &PackageConfig, lock: &LockFile) -> Result<PackageGraphId, PubError> {
     let mut bytes = serde_json::to_vec(config).map_err(|e| PubError::Graph(e.to_string()))?;
     bytes.push(0);

@@ -46,8 +46,7 @@ use std::sync::Arc;
 
 use dartiq_diagnostics::Diagnostic;
 use dartiq_package::PackageTable;
-use dartiq_pub::PackageConfig;
-use dartiq_resolution::uri::PackageTableError;
+use dartiq_pub::{PackageConfig, PubError};
 use dartiq_sdk::SdkSnapshot;
 use dartiq_source::{FileId, FileTable, LineIndex, MemorySourceStore, SourceStore};
 use rustc_hash::FxHashMap;
@@ -90,9 +89,12 @@ pub enum EngineError {
     /// incremental-l1-spec §1.2: dartiq reports explicitly).
     #[error("unknown path: {0}")]
     UnknownPath(PathBuf),
-    /// The pub package config cannot back the URI-resolution table.
-    #[error("package config unusable")]
-    PackageConfig(#[from] PackageTableError),
+    /// The pub package config cannot back the URI-resolution table
+    /// (dartiq-pub's shared `resolve` face rejected it: a broken `rootUri`,
+    /// duplicate names, a name outside the reader grammar, or a
+    /// `packageUri` escaping its root).
+    #[error("package config unusable: {0}")]
+    PackageConfig(#[from] PubError),
 }
 
 /// The analysis driver (§1).

@@ -6,13 +6,14 @@
 //! contract), and `rootUri` resolution treats the config's own directory
 //! (`.dart_tool/`) as the relative base — never the package root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::PubError;
 use crate::version::{LanguageVersion, Version};
+use crate::workspace::normalize;
 
 /// Top-level keys owned by the package_config schema; everything else lands
 /// in [`PackageConfig::additional_properties`].
@@ -25,6 +26,12 @@ const RESERVED_KEYS: [&str; 5] = [
 ];
 
 /// A parsed `package_config.json` (config version 2).
+///
+/// The `Serialize` derive feeds exactly one consumer: [`crate::graph`]'s
+/// `graph_id`, which hashes the canonical re-serialization. That form uses
+/// snake_case struct-field keys (`root_uri`, `generator_version`) — it is
+/// **not** the package_config.json dialect (camelCase `rootUri`,
+/// `generatorVersion`) and must never be used to write a config file.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PackageConfig {
     /// Entries in file order (lock packages sorted by name, then workspace
@@ -41,6 +48,10 @@ pub struct PackageConfig {
 }
 
 /// One `packages[]` entry.
+///
+/// Like [`PackageConfig`], the `Serialize` form exists only for `graph_id`'s
+/// canonical hash: snake_case keys (`root_uri`, `package_uri`), never the
+/// camelCase package_config.json spelling — never write a config from it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PackageConfigEntry {
     pub name: String,
@@ -133,9 +144,11 @@ impl PackageConfig {
     /// Duplicates are never rejected at parse time — parity with
     /// package:package_config's reader, which tolerates repeated names in
     /// the file (pub's writer cannot produce them: workspace name collisions
-    /// fail in `validateWorkspace`). A hand-edited config with duplicate
-    /// names therefore only surfaces late, as whichever entry this finds
-    /// first.
+    /// fail in `validateWorkspace`). They are rejected by [`Self::resolve`],
+    /// the build-time face both package tables go through, with pub's
+    /// constructor sanity check (`package_config.dart:44-51`); this lookup
+    /// still answers with the first entry, its only caller being
+    /// duplicate-free inputs.
     #[must_use]
     pub fn entry(&self, name: &str) -> Option<&PackageConfigEntry> {
         self.packages.iter().find(|entry| entry.name == name)
@@ -199,6 +212,117 @@ impl PackageConfigEntry {
             Ok(config_dir.join(percent_decode(uri)?))
         }
     }
+}
+
+/// One config entry resolved to its normalized filesystem directories — the
+/// single root/lib-dir face both package tables consume (dartiq-package's
+/// identity table, dartiq-resolution's `package:` face), so the two never
+/// grow diverging copies of the policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPackage {
+    /// The entry's name (validated against [`is_valid_config_name`]).
+    pub name: String,
+    /// `rootUri` resolved against the config's directory and lexically
+    /// normalized ([`crate::workspace::normalize`]).
+    pub root: PathBuf,
+    /// The `packageUri` directory joined onto [`Self::root`], normalized the
+    /// same way, and validated to stay inside the root.
+    pub lib_dir: PathBuf,
+    /// The entry's declared language version, if any.
+    pub language_version: Option<LanguageVersion>,
+}
+
+impl PackageConfig {
+    /// Resolves every entry to its normalized, subtree-validated
+    /// directories — the one policy per question, enforced once:
+    ///
+    /// - **Duplicate names are a hard error** — pub's constructor sanity
+    ///   check throws `ArgumentError` on a repeated name
+    ///   (`package_config.dart:44-51`); the reader grammar tolerates them in
+    ///   the file, so they surface here, at build, never as a silent
+    ///   last-wins.
+    /// - **Name grammar is the loose reader charset** — every
+    ///   `_validPackageNameCharacters` character with at least one non-`.`
+    ///   (`package_config-3.0.0` `util.dart:12-36`), so config-written names
+    ///   like `1abc`/`-foo` are consumed as pub wrote them. Deliberately
+    ///   looser than the pubspec layer's strict grammar
+    ///   (`pubspec.rs`, `is_valid_package_name`): the config is read, not
+    ///   re-published.
+    /// - **`lib_dir` is normalized and subtree-validated** — a normalized
+    ///   `packageUri` directory must stay inside its package root
+    ///   (`package_config-3.0.0` `package_config.dart:838`); after
+    ///   normalization a `../lib` spelling escapes and is rejected loudly
+    ///   instead of silently mis-resolving.
+    ///
+    /// `config_dir` must be absolute — the engine's assembly step passes the
+    /// absolute `.dart_tool/` directory, and a relative one would silently
+    /// produce wrong roots (build is one-shot; no later step could recover).
+    ///
+    /// # Errors
+    ///
+    /// [`PubError::PackageConfig`] for a relative `config_dir`, a name
+    /// outside the reader grammar, a duplicate name, an unresolvable
+    /// `rootUri`, or a `packageUri` directory escaping its root.
+    pub fn resolve(&self, config_dir: &Path) -> Result<Vec<ResolvedPackage>, PubError> {
+        if !config_dir.is_absolute() {
+            return Err(PubError::PackageConfig(format!(
+                "config_dir must be absolute, got `{}`",
+                config_dir.display()
+            )));
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut resolved = Vec::with_capacity(self.packages.len());
+        for entry in &self.packages {
+            if !is_valid_config_name(&entry.name) {
+                return Err(PubError::PackageConfig(format!(
+                    "invalid package name `{name}`: expected characters \
+                     `!$&'()*+,-.0-9;=@A-Z_a-z~` with at least one non-dot character",
+                    name = entry.name
+                )));
+            }
+            if !seen.insert(entry.name.as_str()) {
+                return Err(PubError::PackageConfig(format!(
+                    "Duplicate name `{}` in package config",
+                    entry.name
+                )));
+            }
+            let root = normalize(&entry.resolve_root(config_dir)?);
+            let lib_dir = normalize(&root.join(&entry.package_uri));
+            if lib_dir.strip_prefix(&root).is_err() {
+                return Err(PubError::PackageConfig(format!(
+                    "package `{name}`: the package URI root `{lib}` is not below \
+                     the package root `{root}`",
+                    name = entry.name,
+                    lib = lib_dir.display(),
+                    root = root.display(),
+                )));
+            }
+            resolved.push(ResolvedPackage {
+                name: entry.name.clone(),
+                root,
+                lib_dir,
+                language_version: entry.language_version,
+            });
+        }
+        Ok(resolved)
+    }
+}
+
+/// The package_config reader's loose name grammar — every character in
+/// the reader charset with at least one non-`.` character
+/// (`package_config-3.0.0` `util.dart:12-36`, `_validPackageNameCharacters`
+/// + `checkPackageName`).
+fn is_valid_config_name(name: &str) -> bool {
+    const CHARSET: &str =
+        "!$&'()*+,-.;=@0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    let mut non_dot = false;
+    for c in name.chars() {
+        if !CHARSET.contains(c) {
+            return false;
+        }
+        non_dot |= c != '.';
+    }
+    non_dot
 }
 
 fn parse_entry(entry: &serde_json::Value) -> Result<PackageConfigEntry, PubError> {
@@ -474,5 +598,103 @@ mod tests {
             {"name": "a", "rootUri": "file://host/cache/a-1.0.0"}]}"#;
         let config = PackageConfig::parse(bad_host).expect("ok");
         assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
+    }
+
+    fn resolve_ok(json: &str) -> Vec<ResolvedPackage> {
+        PackageConfig::parse(json)
+            .expect("valid config")
+            .resolve(Path::new("/proj/.dart_tool"))
+            .expect("resolves")
+    }
+
+    #[test]
+    fn resolve_normalizes_root_and_lib_dirs() {
+        let resolved = resolve_ok(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../", "languageVersion": "3.5"},
+                {"name": "dep", "rootUri": "../deps/../deps/dep", "packageUri": "src/"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        assert_eq!(resolved[0].root, PathBuf::from("/proj"));
+        assert_eq!(resolved[0].lib_dir, PathBuf::from("/proj/lib"));
+        assert_eq!(
+            resolved[0].language_version,
+            Some(LanguageVersion::new(3, 5))
+        );
+        // Dot segments in rootUri and the trailing slash in packageUri
+        // collapse lexically.
+        assert_eq!(resolved[1].root, PathBuf::from("/proj/deps/dep"));
+        assert_eq!(resolved[1].lib_dir, PathBuf::from("/proj/deps/dep/src"));
+    }
+
+    #[test]
+    fn resolve_rejects_duplicate_names_with_pubs_throw() {
+        // pub's constructor sanity check: "Duplicate name ... in generated
+        // package config" (package_config.dart:44-51) — the parse layer
+        // tolerates them, build does not.
+        let duplicated = r#"{"configVersion": 2, "packages": [
+            {"name": "app", "rootUri": "../"},
+            {"name": "app", "rootUri": "../other"}]}"#;
+        let error = PackageConfig::parse(duplicated)
+            .expect("parses fine at the config layer")
+            .resolve(Path::new("/proj/.dart_tool"))
+            .expect_err("duplicate name");
+        assert!(
+            error.to_string().contains("Duplicate name `app`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_names_outside_the_reader_grammar() {
+        // A space is outside even the reader's loose charset
+        // (package_config-3.0.0 util.dart:12-36).
+        let invalid = r#"{"configVersion": 2, "packages": [
+            {"name": "foo bar", "rootUri": "../"}]}"#;
+        let error = PackageConfig::parse(invalid)
+            .expect("parses fine at the config layer")
+            .resolve(Path::new("/proj/.dart_tool"))
+            .expect_err("invalid name");
+        assert!(
+            error.to_string().contains("invalid package name `foo bar`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_package_uri_outside_root() {
+        // A `../lib` packageUri escapes the package root after
+        // normalization (package_config-3.0.0 package_config.dart:838).
+        let escaping = r#"{"configVersion": 2, "packages": [
+            {"name": "app", "rootUri": "../", "packageUri": "../lib"}]}"#;
+        let error = PackageConfig::parse(escaping)
+            .expect("parses fine at the config layer")
+            .resolve(Path::new("/proj/.dart_tool"))
+            .expect_err("escaping packageUri");
+        let text = error.to_string();
+        assert!(text.contains("not below the package root"), "{text}");
+        assert!(text.contains("`/lib`"), "{text}");
+        assert!(text.contains("`/proj`"), "{text}");
+    }
+
+    #[test]
+    fn resolve_rejects_relative_config_dir() {
+        let config = PackageConfig::parse(
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../"}]}"#,
+        )
+        .expect("valid config");
+        let error = config
+            .resolve(Path::new(".dart_tool"))
+            .expect_err("relative config dir");
+        assert!(
+            error
+                .to_string()
+                .contains("config_dir must be absolute, got `.dart_tool`"),
+            "unexpected error: {error}"
+        );
     }
 }

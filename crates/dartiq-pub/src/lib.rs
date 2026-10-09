@@ -30,7 +30,7 @@ pub mod pubspec;
 pub mod version;
 pub mod workspace;
 
-pub use config::{PackageConfig, PackageConfigEntry};
+pub use config::{PackageConfig, PackageConfigEntry, ResolvedPackage};
 pub use freshness::{EnvSnapshot, Freshness, FreshnessReport, ResolutionBaseline, StaleReason};
 pub use graph::{
     DepKind, PackageEdge, PackageGraphId, PackageInstance, PackageInstanceId, ResolvedPackageGraph,

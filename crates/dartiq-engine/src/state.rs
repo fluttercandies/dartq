@@ -324,7 +324,8 @@ impl EngineState {
     /// # Errors
     ///
     /// [`crate::EngineError::PackageConfig`] when the pub package config
-    /// cannot back the URI-resolution table (a broken `rootUri`).
+    /// cannot back the URI-resolution table (the shared `resolve` face
+    /// rejected it).
     pub(crate) fn new(
         packages: IdentityTable,
         pub_config: &PackageConfig,
@@ -332,8 +333,7 @@ impl EngineState {
         sdk: SdkSnapshot,
         store: Box<dyn SourceStore + Send + Sync>,
     ) -> Result<Self, crate::EngineError> {
-        let uri_packages = UriPackageTable::new(pub_config, config_dir)
-            .map_err(crate::EngineError::PackageConfig)?;
+        let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
         Ok(Self {
             packages,
             uri_packages,

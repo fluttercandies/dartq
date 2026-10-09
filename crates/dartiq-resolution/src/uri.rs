@@ -21,7 +21,7 @@
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
-use dartiq_pub::{PackageConfig, PubError};
+use dartiq_pub::{PackageConfig, PubError, normalize};
 use dartiq_sdk::SdkSnapshot;
 use dartiq_source::{FileId, FileTable};
 use rustc_hash::FxHashMap;
@@ -121,24 +121,19 @@ pub enum DirectiveKind {
     DocImport,
 }
 
-/// Failure of [`PackageTable::new`]: one `rootUri` in the package config
-/// cannot be turned into a filesystem path.
-#[derive(Debug, thiserror::Error)]
-#[error("package `{package}`: {source}")]
-pub struct PackageTableError {
-    /// The offending package name.
-    pub package: String,
-    /// The underlying `dartiq-pub` error.
-    #[source]
-    pub source: PubError,
-}
-
 /// The `package:` resolution face of a parsed package config: package name →
 /// lib dir (§5 interface table, `dartiq-pub` row).
 ///
 /// Built once per analysis context; lookups are [`FxHashMap`] hits on the
 /// per-directive hot path. Also owns the generated-file face the analyzer
 /// layers onto `package:` targets (`.dart_tool/build/generated`).
+///
+/// Root/lib-dir resolution is [`PackageConfig::resolve`], dartiq-pub's
+/// single shared face — duplicate names are a hard error (pub's
+/// `package_config.dart:44-51` throw, not a silent last-wins), names follow
+/// the loose reader grammar, `packageUri` directories are normalized and
+/// subtree-validated — exactly the policies the identity table applies, so
+/// the two tables can never diverge.
 #[derive(Debug)]
 pub struct PackageTable {
     lib_dirs: FxHashMap<Box<str>, PathBuf>,
@@ -155,25 +150,19 @@ pub struct PackageTable {
 }
 
 impl PackageTable {
-    /// Indexes `config` whose `rootUri`s resolve against `config_dir`, the
+    /// Indexes `config` whose entries resolve against `config_dir`, the
     /// directory holding the `package_config.json` (normally `.dart_tool/`).
     ///
     /// # Errors
     ///
-    /// [`PackageTableError`] when any entry's `rootUri` is not a resolvable
-    /// `file:` URI or relative path — a broken config, reported loudly.
-    pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PackageTableError> {
+    /// [`PubError`] when [`PackageConfig::resolve`] rejects the config — a
+    /// broken `rootUri`, duplicate names, a name outside the reader
+    /// grammar, or a `packageUri` escaping its root; a broken config,
+    /// reported loudly.
+    pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
         let mut lib_dirs: FxHashMap<Box<str>, PathBuf> = FxHashMap::default();
-        for entry in &config.packages {
-            let root = entry
-                .resolve_root(config_dir)
-                .map_err(|source| PackageTableError {
-                    package: entry.name.clone(),
-                    source,
-                })?;
-            let root = normalize_lexical(&root);
-            let lib_dir = normalize_lexical(&root.join(&entry.package_uri));
-            lib_dirs.insert(Box::from(entry.name.as_str()), lib_dir);
+        for resolved in config.resolve(config_dir)? {
+            lib_dirs.insert(Box::from(resolved.name.as_str()), resolved.lib_dir);
         }
         let mut by_depth: Vec<_> = lib_dirs
             .iter()
@@ -428,7 +417,7 @@ impl<'a> UriResolver<'a> {
                         code: Some(ResolutionCode::UriDoesNotExist),
                     };
                 };
-                let path = normalize_lexical(Path::new(&text));
+                let path = normalize(Path::new(&text));
                 let code = (!path.exists()).then(|| missing_file_code(&path));
                 let id = self.files.intern(&path);
                 UriResolution {
@@ -455,7 +444,7 @@ impl<'a> UriResolver<'a> {
         let Some(decoded) = decode_uri_path(rel) else {
             return unresolvable();
         };
-        let file = normalize_lexical(&join_rel(lib_dir, &decoded));
+        let file = normalize(&join_rel(lib_dir, &decoded));
         if !file.exists() {
             // Generated-file face: `.dart_tool/build/generated/<pkg>/lib/`
             // + the raw (undecoded) rel path, verbatim from the resolver
@@ -996,39 +985,6 @@ fn join_rel(dir: &Path, rel: &str) -> PathBuf {
         joined.push(segment);
     }
     joined
-}
-
-/// Lexical path normalization (`path.Context.normalize`): collapses `.`,
-/// `..`, and empty segments; absoluteness is preserved. No symlink
-/// resolution — the [`FileTable`] owns canonical identity on intern.
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    let absolute = text.starts_with('/');
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in text.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                let poppable = if absolute {
-                    !segments.is_empty()
-                } else {
-                    segments.last().is_some_and(|last| *last != "..")
-                };
-                if poppable {
-                    segments.pop();
-                } else if !absolute {
-                    segments.push("..");
-                }
-            }
-            other => segments.push(other),
-        }
-    }
-    let joined = segments.join("/");
-    if absolute {
-        PathBuf::from(format!("/{joined}"))
-    } else {
-        PathBuf::from(joined)
-    }
 }
 
 #[cfg(test)]
@@ -1793,6 +1749,28 @@ mod tests {
         .expect("parses");
         let error = PackageTable::new(&config, Path::new("/p/.dart_tool"))
             .expect_err("unsupported scheme is a hard error");
-        assert_eq!(error.package, "a");
+        assert!(
+            error.to_string().contains("unsupported rootUri scheme"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The shared dartiq-pub face applies to this table too: duplicate
+    /// config names are pub's hard error (`package_config.dart:44-51`),
+    /// never a silent last-wins over the lib-dir index.
+    #[test]
+    fn duplicate_names_fail_loudly() {
+        let config = PackageConfig::parse(
+            r#"{"configVersion": 2, "packages": [
+                {"name": "a", "rootUri": "../x"},
+                {"name": "a", "rootUri": "../y"}]}"#,
+        )
+        .expect("parses");
+        let error =
+            PackageTable::new(&config, Path::new("/p/.dart_tool")).expect_err("duplicate name");
+        assert!(
+            error.to_string().contains("Duplicate name `a`"),
+            "unexpected error: {error}"
+        );
     }
 }

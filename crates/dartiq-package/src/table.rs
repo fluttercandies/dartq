@@ -3,15 +3,21 @@
 //! [`PackageTable::build`] composes the two `dartiq-pub` artifacts —
 //! [`PackageConfig`] (which carries each package's local `rootUri`) and
 //! [`ResolvedPackageGraph`] (which carries the instance identities) — into
-//! the map resolution consumes. Entries present in one artifact but missing
+//! the map resolution consumes. Root/lib-dir resolution and the shared
+//! entry policies (duplicate names, reader name grammar, `packageUri`
+//! subtree validation) come from [`PackageConfig::resolve`], dartiq-pub's
+//! single face; this crate adds only resolution-specific composition and
+//! file→package attribution. Entries present in one artifact but missing
 //! from the other are an error, never a silent drop: lock-only stragglers
 //! and the implicit SDK instance have no config root and are excluded by
 //! construction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
-use dartiq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
+use dartiq_pub::{PackageConfig, ResolvedPackageGraph};
+use rustc_hash::FxHashMap;
 
 use crate::SourceCategory;
 use crate::identity::PackageIdentity;
@@ -23,39 +29,73 @@ use crate::name::PackageName;
 /// A successful [`PackageTable::build`] always contains the resolution's
 /// root package — it errors with [`crate::PackageError::MissingFromConfig`]
 /// otherwise — so a built table is never empty.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct PackageTable {
     packages: BTreeMap<PackageName, PackageIdentity>,
-    /// Package names ordered by root depth, deepest first —
-    /// [`PackageTable::containing`]'s scan index (depths are computed once
-    /// here, never per query).
+    /// Exact normalized root → name: the ancestor walk's membership test
+    /// (every config member root is the pubspec directory pub wrote, so the
+    /// nearest exact-root ancestor is the nearest pubspec ancestor that is a
+    /// config member — no filesystem probe needed).
+    by_root: FxHashMap<PathBuf, PackageName>,
+    /// Package names ordered by root depth, deepest first — the fallback
+    /// prefix scan for content outside the workspace bound (the pub-cache
+    /// tier; depths are computed once here, never per query).
     by_depth: Vec<PackageName>,
     root: PackageName,
     /// Workspace members when the root is a pub workspace, root excluded;
     /// `None` outside workspaces (mirrors
     /// [`ResolvedPackageGraph::workspace_members`]).
     workspace_members: Option<BTreeSet<PackageName>>,
+    /// The workspace root: the directory holding the config's `.dart_tool/`.
+    /// The ancestor walk never ascends past it (oracle
+    /// `pub.dart:334-358`: `isWithin(root, filePath)` then
+    /// `folder.withAncestors`, the `current.path == root` stop).
+    workspace_root: PathBuf,
+    /// Memoized per-directory attribution (oracle `_workspacePackages`,
+    /// `pub.dart:187`, backfilled over the walked chain):
+    /// directory → owning package, `None` recording "walked, found nothing
+    /// in bound; the fallback also owns the chain". Interior mutability
+    /// because attribution is a query over shared immutable state; callers
+    /// are the engine's sequential pre-fanout pass, so the lock is
+    /// uncontended.
+    ancestor_memo: Mutex<FxHashMap<Box<Path>, Option<PackageName>>>,
+}
+
+impl Clone for PackageTable {
+    fn clone(&self) -> Self {
+        Self {
+            packages: self.packages.clone(),
+            by_root: self.by_root.clone(),
+            by_depth: self.by_depth.clone(),
+            root: self.root.clone(),
+            workspace_members: self.workspace_members.clone(),
+            workspace_root: self.workspace_root.clone(),
+            // The memo is a pure cache; a clone starts cold.
+            ancestor_memo: Mutex::new(FxHashMap::default()),
+        }
+    }
 }
 
 impl PackageTable {
     /// Composes the table from the config and its resolved graph.
     ///
-    /// Package roots are resolved from the config's `rootUri` against
-    /// `config_dir` (the `.dart_tool/` directory) and lexically normalized;
-    /// each entry's `packageUri` is joined onto its root and normalized the
-    /// same way. Source categories come from the graph instances' source
-    /// references.
+    /// Root/lib-dir resolution — `rootUri` against `config_dir`, lexical
+    /// normalization, `packageUri` join, and the shared entry policies
+    /// (duplicate names are pub's hard error at
+    /// `package_config.dart:44-51`, names against the reader's loose
+    /// grammar, `packageUri` subtree validation) — is
+    /// [`PackageConfig::resolve`], dartiq-pub's single face shared with the
+    /// resolution layer's `package:` table. This build adds what is
+    /// resolution-specific: source categories from the graph instances'
+    /// source references, and the attribution-unique-root invariant.
     ///
-    /// `config_dir` must be absolute — the engine's assembly step
-    /// (engine-api-spec) passes the absolute `.dart_tool/` directory. A
-    /// relative one would silently produce wrong roots, and build is
-    /// one-shot (no later step could recover), so the violation is a hard
-    /// [`crate::PackageError::RelativeConfigDir`], not a debug-only assert.
+    /// `config_dir` must be absolute (enforced by
+    /// [`PackageConfig::resolve`] — the engine's assembly step passes the
+    /// absolute `.dart_tool/` directory; a relative one would silently
+    /// produce wrong roots, and build is one-shot).
     ///
-    /// Two more root invariants are enforced at build, mirroring the
-    /// oracle reader: a normalized `packageUri` directory must stay inside
-    /// its package root ([`crate::PackageError::LibDirOutsideRoot`]), and
-    /// two entries must not resolve to the same normalized root
+    /// One more root invariant is enforced here: two entries must not
+    /// resolve to the same normalized root
     /// ([`crate::PackageError::DuplicateRoot`] — file→package attribution
     /// could not pick an owner).
     ///
@@ -63,19 +103,17 @@ impl PackageTable {
     ///
     /// Returns [`crate::PackageError`] when the artifacts disagree (a config
     /// entry without a graph instance, the root or a workspace member
-    /// without a config entry, duplicate entries), when a config name is
-    /// outside the reader's loose grammar, when a `rootUri` cannot be
-    /// resolved, or when a root invariant above is violated.
+    /// without a config entry), when [`PackageConfig::resolve`] rejects the
+    /// config (duplicate names, grammar, subtree, relative dir), or when two
+    /// entries resolve to the same normalized root.
     pub fn build(
         config: &PackageConfig,
         graph: &ResolvedPackageGraph,
         config_dir: &Path,
     ) -> Result<PackageTable, crate::PackageError> {
-        if !config_dir.is_absolute() {
-            return Err(crate::PackageError::RelativeConfigDir {
-                path: config_dir.display().to_string(),
-            });
-        }
+        let resolved = config
+            .resolve(config_dir)
+            .map_err(crate::PackageError::Pub)?;
 
         // Last-wins when the graph carries two instances of one name —
         // unreachable through `build_graph` (it rejects duplicate config
@@ -89,55 +127,30 @@ impl PackageTable {
         let mut packages = BTreeMap::new();
         // Normalized root -> the first config entry claiming it.
         let mut root_owners: BTreeMap<PathBuf, PackageName> = BTreeMap::new();
-        for entry in &config.packages {
-            // Config entries use the reader's loose grammar — stricter
-            // pubspec names never reach here as entries (see
-            // `is_valid_config_name`).
-            if !is_valid_config_name(&entry.name) {
-                return Err(crate::PackageError::InvalidConfigName {
-                    name: entry.name.clone(),
-                });
-            }
-            let name = PackageName::new_unchecked(entry.name.clone());
-            if packages.contains_key(&name) {
-                return Err(crate::PackageError::DuplicateEntry {
-                    name: entry.name.clone(),
-                });
-            }
-            let instance = instances.get(entry.name.as_str()).ok_or_else(|| {
+        for package in &resolved {
+            // `resolve` validated the name against the reader grammar.
+            let name = PackageName::new_unchecked(package.name.clone());
+            let instance = instances.get(package.name.as_str()).ok_or_else(|| {
                 crate::PackageError::MissingFromGraph {
-                    name: entry.name.clone(),
+                    name: package.name.clone(),
                 }
             })?;
-            let root = normalize(&entry.resolve_root(config_dir)?);
-            let lib_dir = normalize(&root.join(lib_dir_name(&entry.package_uri)));
-            // The `packageUri` directory must be the root or below it
-            // (`package_config-3.0.0` `package_config.dart:838`); after
-            // normalization a `../lib` spelling escapes and is rejected
-            // loudly instead of silently mis-resolving.
-            if lib_dir.strip_prefix(&root).is_err() {
-                return Err(crate::PackageError::LibDirOutsideRoot {
-                    name: entry.name.clone(),
-                    lib_dir: lib_dir.display().to_string(),
-                    root: root.display().to_string(),
-                });
-            }
             // Duplicate normalized roots make file→package attribution
             // ambiguous (analyzer analog: `package_map_resolver.dart:33-52`
             // scans every root per file, where two equal roots race).
-            if let Some(first) = root_owners.get(&root) {
+            if let Some(first) = root_owners.get(&package.root) {
                 return Err(crate::PackageError::DuplicateRoot {
                     first: first.to_string(),
-                    name: entry.name.clone(),
-                    root: root.display().to_string(),
+                    name: package.name.clone(),
+                    root: package.root.display().to_string(),
                 });
             }
-            root_owners.insert(root.clone(), name.clone());
+            root_owners.insert(package.root.clone(), name.clone());
             let identity = PackageIdentity {
-                lib_dir,
+                lib_dir: package.lib_dir.clone(),
                 name,
-                root,
-                language_version: entry.language_version,
+                root: package.root.clone(),
+                language_version: package.language_version,
                 category: SourceCategory::of(&instance.source_ref),
             };
             packages.insert(identity.name.clone(), identity);
@@ -166,8 +179,14 @@ impl PackageTable {
             }
         };
 
-        // Deepest-first root index for `containing`: roots are sorted by
-        // component depth once, so each query stops at the first prefix
+        // The attribution walk's two indexes, both derived from `packages`
+        // here at build (never mutated afterwards — rebuild with the table).
+        let by_root = packages
+            .values()
+            .map(|identity| (identity.root.clone(), identity.name.clone()))
+            .collect();
+        // Deepest-first root index for the fallback scan: roots are sorted
+        // by component depth once, so each query stops at the first prefix
         // hit instead of scoring every package.
         let mut by_depth: Vec<(&PackageName, usize)> = packages
             .iter()
@@ -176,11 +195,18 @@ impl PackageTable {
         by_depth.sort_by_key(|&(_, depth)| std::cmp::Reverse(depth));
         let by_depth = by_depth.into_iter().map(|(name, _)| name.clone()).collect();
 
+        let workspace_root = config_dir
+            .parent()
+            .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
+
         Ok(PackageTable {
             packages,
+            by_root,
             by_depth,
             root: root_name,
             workspace_members,
+            workspace_root,
+            ancestor_memo: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -196,29 +222,101 @@ impl PackageTable {
         self.packages.get(name)
     }
 
-    /// The package whose root directory contains `path` — the engine's
-    /// file→package attribution entry point, and the single source of truth
-    /// for that mapping.
+    /// The package that owns `path` — the engine's file→package attribution
+    /// entry point, and the single source of truth for that mapping.
     ///
-    /// Matching is a lexical, component-boundary prefix over the normalized
-    /// roots (`Path::strip_prefix` semantics): `/projx/lib.dart` does not
-    /// match a `/proj` package. When roots nest — a path dependency inside
-    /// the root package's tree — the deepest matching root wins, so a file
-    /// under `/proj/deps/local_dep` attributes to `local_dep`, not to the
-    /// root package at `/proj`.
+    /// The oracle's two-tier face (`pub.dart:334-358` +
+    /// `feature_set_provider.dart`'s `_findPackage`):
     ///
-    /// Roots are scanned deepest-first (the `by_depth` index), with an
-    /// early exit on the first hit: a nested root always has strictly more
-    /// components than any root it is contained by, and two distinct roots
-    /// of equal depth can never both prefix one path, so the first hit is
-    /// the deepest — no full-table scan, which matters because the engine
-    /// calls this per file.
+    /// 1. **The ancestor walk**, bounded by the workspace root: from `path`
+    ///    upward, the first directory that is exactly a member root wins.
+    ///    Pub writes every config member's `rootUri` as its pubspec
+    ///    directory, so the nearest member-root ancestor is the nearest
+    ///    pubspec ancestor that is a config member — the memoized walk of
+    ///    `PubWorkspace.findPackageFor` without a filesystem probe, the same
+    ///    purely lexical membership the version face consults
+    ///    (`packages.dart` `packageForPath`, `rootFolder.contains`).
+    ///    A nested member therefore owns its own tree, and a directory with
+    ///    a pubspec but no config entry is skipped (in workspaces such a
+    ///    stray is already a discovery error, dartiq-pub's
+    ///    `check_stray_pubspecs`).
+    /// 2. **The fallback**, for content outside the bound (pub-cache
+    ///    packages, path deps above the workspace): the config's innermost
+    ///    containing root, scanned deepest-first over `by_depth` with
+    ///    component-boundary prefix semantics (`Path::strip_prefix`).
+    ///
+    /// The memo (oracle `_workspacePackages`, `pub.dart:187`) records the
+    /// owner of every directory the walk passed, so repeated queries over a
+    /// shared tree are one hash hit per directory.
     #[must_use]
     pub fn containing(&self, path: &Path) -> Option<&PackageIdentity> {
+        let mut memo = self
+            .ancestor_memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = memo.get(path) {
+            return hit.as_ref().map(|name| &self.packages[name]);
+        }
+        let mut trail: Vec<Box<Path>> = Vec::new();
+        let mut owner: Option<PackageName> = None;
+        for dir in path.ancestors() {
+            if let Some(hit) = memo.get(dir) {
+                owner.clone_from(hit);
+                break;
+            }
+            // The bound is inclusive: the workspace root itself is checked
+            // (it is the root package's member root), its parent is not.
+            if !(dir == self.workspace_root || dir.starts_with(&self.workspace_root)) {
+                break;
+            }
+            trail.push(dir.into());
+            if let Some(name) = self.by_root.get(dir) {
+                owner = Some(name.clone());
+                break;
+            }
+        }
+        if owner.is_none() {
+            match self.fallback_owner(path) {
+                Some(name) => {
+                    // Backfill only the directories inside the matched root:
+                    // prefix membership holds downward from a root, but an
+                    // ancestor above it (e.g. the pub cache root over one
+                    // package's checkout) is owned by nobody or by a
+                    // shallower root, never by this package. The walked
+                    // trail needs no filtering: a fallback hit is always a
+                    // root outside the bound (an in-bound one would have
+                    // ended the walk), so every walked dir sits inside it.
+                    let root = &self.packages[&name].root;
+                    for dir in path.ancestors() {
+                        if !dir.starts_with(root) {
+                            break; // strictly above the root, and so are the rest
+                        }
+                        trail.push(dir.into());
+                    }
+                    owner = Some(name);
+                }
+                None => {
+                    // No root contains the path, so none contains any
+                    // ancestor either (a root prefixing an ancestor would
+                    // prefix the path).
+                    trail.extend(path.ancestors().map(Box::from));
+                }
+            }
+        }
+        for dir in &trail {
+            memo.insert(dir.clone(), owner.clone());
+        }
+        owner.as_ref().map(|name| &self.packages[name])
+    }
+
+    /// The fallback tier: the innermost config root containing `path`
+    /// (deepest-first prefix scan), or `None` above every root.
+    fn fallback_owner(&self, path: &Path) -> Option<PackageName> {
         self.by_depth
             .iter()
             .map(|name| &self.packages[name])
             .find(|package| path.strip_prefix(&package.root).is_ok())
+            .map(|package| package.name.clone())
     }
 
     /// All packages, ordered by name.
@@ -250,32 +348,6 @@ impl PackageTable {
     pub fn workspace_members(&self) -> Option<&BTreeSet<PackageName>> {
         self.workspace_members.as_ref()
     }
-}
-
-/// The `lib/`-style directory name from a config entry's `packageUri`
-/// (already slash-normalized by the parser).
-fn lib_dir_name(package_uri: &str) -> &str {
-    package_uri.trim_end_matches('/')
-}
-
-/// The package_config reader's loose name grammar — every character in
-/// the reader charset with at least one non-`.` character
-/// (`package_config-3.0.0` `util.dart:12-36`, `_validPackageNameCharacters`
-/// + `checkPackageName`), so config-written names like `1abc`/`-foo` are
-/// consumed as pub wrote them. Deliberately looser than the pubspec layer's
-/// `is_valid_package_name` (dartiq-pub `pubspec.rs:368`), which keeps its
-/// strict grammar: the config file is read, not re-published.
-fn is_valid_config_name(name: &str) -> bool {
-    const CHARSET: &str =
-        "!$&'()*+,-.;=@0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
-    let mut non_dot = false;
-    for c in name.chars() {
-        if !CHARSET.contains(c) {
-            return false;
-        }
-        non_dot |= c != '.';
-    }
-    non_dot
 }
 
 #[cfg(test)]
@@ -489,17 +561,21 @@ sdks:
 
     #[test]
     fn invalid_and_duplicate_names_are_rejected() {
-        // A space is outside even the reader's loose charset, so the
-        // config layer rejects it with the config-grammar error.
+        // Both policies are the shared dartiq-pub face now: a name outside
+        // even the reader's loose charset, and a duplicate name — pub's
+        // constructor sanity check (`package_config.dart:44-51`) — are hard
+        // errors, never a silent last-wins.
         let invalid = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "foo bar", "rootUri": "../"}]}"#,
         )
         .expect("parses fine at the config layer");
         let graph = graph_for(&PackageConfig::parse(CONFIG).expect("valid config"));
-        assert!(matches!(
-            PackageTable::build(&invalid, &graph, Path::new("/proj/.dart_tool")),
-            Err(crate::PackageError::InvalidConfigName { name }) if name == "foo bar"
-        ));
+        let error = PackageTable::build(&invalid, &graph, Path::new("/proj/.dart_tool"))
+            .expect_err("invalid name");
+        assert!(
+            error.to_string().contains("invalid package name `foo bar`"),
+            "unexpected error: {error}"
+        );
 
         let duplicated = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [
@@ -507,11 +583,12 @@ sdks:
                 {"name": "app", "rootUri": "../"}]}"#,
         )
         .expect("parses fine at the config layer");
-        let graph = graph_for(&PackageConfig::parse(CONFIG).expect("valid config"));
-        assert!(matches!(
-            PackageTable::build(&duplicated, &graph, Path::new("/proj/.dart_tool")),
-            Err(crate::PackageError::DuplicateEntry { name }) if name == "app"
-        ));
+        let error = PackageTable::build(&duplicated, &graph, Path::new("/proj/.dart_tool"))
+            .expect_err("duplicate name");
+        assert!(
+            error.to_string().contains("Duplicate name `app`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -540,7 +617,8 @@ sdks:
     fn package_uri_outside_root_is_an_error() {
         // A `../lib` packageUri escapes the package root after
         // normalization — rejected loudly instead of silently
-        // mis-resolving (`package_config-3.0.0` `package_config.dart:838`).
+        // mis-resolving (`package_config-3.0.0` `package_config.dart:838`),
+        // by the shared dartiq-pub face.
         let config = PackageConfig::parse(
             r#"{
               "configVersion": 2,
@@ -550,18 +628,12 @@ sdks:
         )
         .expect("valid config");
         let graph = plain_graph(&config);
-        match PackageTable::build(&config, &graph, Path::new("/proj/.dart_tool")) {
-            Err(crate::PackageError::LibDirOutsideRoot {
-                name,
-                lib_dir,
-                root,
-            }) => {
-                assert_eq!(name, "app");
-                assert_eq!(lib_dir, "/lib");
-                assert_eq!(root, "/proj");
-            }
-            other => panic!("expected LibDirOutsideRoot, got {other:?}"),
-        }
+        let error = PackageTable::build(&config, &graph, Path::new("/proj/.dart_tool"))
+            .expect_err("escaping packageUri");
+        let text = error.to_string();
+        assert!(text.contains("not below the package root"), "{text}");
+        assert!(text.contains("`/lib`"), "{text}");
+        assert!(text.contains("`/proj`"), "{text}");
     }
 
     #[test]
@@ -595,10 +667,12 @@ sdks:
         )
         .expect("valid config");
         let graph = plain_graph(&all_dots);
-        assert!(matches!(
-            PackageTable::build(&all_dots, &graph, Path::new("/proj/.dart_tool")),
-            Err(crate::PackageError::InvalidConfigName { name }) if name == ".."
-        ));
+        let error = PackageTable::build(&all_dots, &graph, Path::new("/proj/.dart_tool"))
+            .expect_err("all-dot name");
+        assert!(
+            error.to_string().contains("invalid package name `..`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -671,14 +745,19 @@ sdks:
 
     #[test]
     fn relative_config_dir_is_an_error() {
-        // The absolute-`config_dir` contract is a hard error: build is
-        // one-shot and a relative dir would silently produce wrong roots.
+        // The absolute-`config_dir` contract is a hard error (the shared
+        // resolve face): build is one-shot and a relative dir would
+        // silently produce wrong roots.
         let config = PackageConfig::parse(CONFIG).expect("valid config");
         let graph = graph_for(&config);
-        assert!(matches!(
-            PackageTable::build(&config, &graph, Path::new(".dart_tool")),
-            Err(crate::PackageError::RelativeConfigDir { path }) if path == ".dart_tool"
-        ));
+        let error =
+            PackageTable::build(&config, &graph, Path::new(".dart_tool")).expect_err("relative");
+        assert!(
+            error
+                .to_string()
+                .contains("config_dir must be absolute, got `.dart_tool`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -705,6 +784,204 @@ sdks:
             dartiq_pub::normalize(Path::new("../../..")),
             PathBuf::from("../../..")
         );
+        // `..` past an absolute root clamps at the root (RFC 3986 §5.2.4) —
+        // the oracle's drop semantics the normalizer converged on.
+        assert_eq!(
+            dartiq_pub::normalize(Path::new("/a/../..")),
+            PathBuf::from("/")
+        );
+    }
+
+    /// The oracle attribution walk: an `example/` sub-package that is a
+    /// config member carries its own language version on every file under
+    /// it, while plain members inherit the enclosing package's version.
+    #[test]
+    fn attribution_walk_member_subpackage_gets_own_version() {
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../", "languageVersion": "3.5"},
+                {"name": "example", "rootUri": "../example", "languageVersion": "3.9"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        let version_at = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.language_version.map(|v| v.to_string()))
+                .expect("attributed")
+        };
+        // Hand-trace (walk over `/proj/example/lib/a.dart`): ancestor
+        // `/proj/example/lib/a.dart` — not a member root; `/proj/example/lib`
+        // — not a member root; `/proj/example` — exact member root →
+        // `example`, own 3.9. Every dir on the chain is memoized.
+        assert_eq!(
+            version_at("/proj/example/lib/a.dart"),
+            Some("3.9".to_owned())
+        );
+        // Hand-trace (`/proj/lib/m.dart`): `/proj/lib` — miss; `/proj` —
+        // member root → `app`, 3.5.
+        assert_eq!(version_at("/proj/lib/m.dart"), Some("3.5".to_owned()));
+        // The root directory itself belongs to its package.
+        assert_eq!(version_at("/proj"), Some("3.5".to_owned()));
+        // A memo-hit chain: a later query under an already-attributed dir
+        // resolves identically (`/proj/example` memoized from the first
+        // query).
+        assert_eq!(
+            version_at("/proj/example/tool/x.dart"),
+            Some("3.9".to_owned())
+        );
+    }
+
+    /// Content outside the workspace bound — pub-cache packages — falls
+    /// back to the config's innermost containing root (the oracle's
+    /// `packageForPath` face), and ancestors above the matched root are
+    /// never mis-attributed by the memo.
+    #[test]
+    fn attribution_outside_workspace_falls_back_to_config_root() {
+        let table = table_for(&PackageConfig::parse(CONFIG).expect("valid config"));
+        let owner_at = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.name.to_string())
+        };
+        // Hand-trace (`/cache/hosted/pub.dev/hosted_dep-1.4.0/lib/h.dart`):
+        // first ancestor is outside the bound `/proj` → walk yields nothing
+        // → fallback scan finds the deepest prefixing root, the hosted
+        // package. Its version rides along.
+        let hosted = table.containing(Path::new(
+            "/cache/hosted/pub.dev/hosted_dep-1.4.0/lib/h.dart",
+        ));
+        assert_eq!(
+            hosted.map(|identity| identity.name.to_string()),
+            Some("hosted_dep".to_owned())
+        );
+        assert_eq!(
+            hosted
+                .expect("hosted")
+                .language_version
+                .map(|v| v.to_string()),
+            Some("3.2".to_owned())
+        );
+        // The package root directory itself: attributed.
+        assert_eq!(
+            owner_at("/cache/hosted/pub.dev/hosted_dep-1.4.0"),
+            Some("hosted_dep".to_owned())
+        );
+        // Ancestors above the matched root must not inherit its owner (the
+        // memo backfill stops at the root): the shared cache dirs are owned
+        // by nobody.
+        assert_eq!(owner_at("/cache/hosted"), None);
+        assert_eq!(owner_at("/cache"), None);
+        // And a sibling package under the same cache tree still resolves to
+        // itself, proving no wrong `None` was cached above either.
+        assert_eq!(
+            owner_at("/cache/hosted/pub.dev/other-1.0.0/lib/x.dart"),
+            None,
+            "not a config member"
+        );
+    }
+
+    /// A directory with a pubspec but no config entry is not a member: the
+    /// walk skips it and attributes to the enclosing package. Outside pub
+    /// workspaces such strays are legal layouts (pub only rejects them
+    /// between workspace members, dartiq-pub's `check_stray_pubspecs`),
+    /// and the oracle's version face lands on the same owner — its
+    /// `PubPackage` there carries no language version
+    /// (`workspace.dart:94`), so the config lookup decides.
+    #[test]
+    fn non_member_pubspec_dir_is_skipped_by_the_walk() {
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../", "languageVersion": "3.5"},
+                {"name": "example", "rootUri": "../example", "languageVersion": "3.9"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        // `example` is a member (3.9); `example/stray` has a pubspec on
+        // disk in the real layout but no config entry — its files inherit
+        // the nearest member ancestor's version. (No fixture on disk: the
+        // walk is purely lexical over config membership.)
+        let version = table
+            .containing(Path::new("/proj/example/stray/lib/s.dart"))
+            .map(|identity| identity.language_version.map(|v| v.to_string()))
+            .expect("attributed");
+        assert_eq!(version, Some("3.9".to_owned()));
+    }
+
+    /// Repeated queries — the memo-hit path — return identical owners to
+    /// the direct walk, including for the `None` face.
+    #[test]
+    fn memoized_queries_match_the_walk() {
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../", "languageVersion": "3.5"},
+                {"name": "lvl1", "rootUri": "../lvl1", "languageVersion": "3.6"},
+                {"name": "inner", "rootUri": "../lvl1/lvl2/inner", "languageVersion": "3.7"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        let owner = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.name.to_string())
+        };
+        // First pass: cold walk.
+        let cold: Vec<Option<String>> = [
+            "/proj/lvl1/lvl2/inner/lib/a.dart",
+            "/proj/lvl1/lib/b.dart",
+            "/proj/lib/c.dart",
+            "/elsewhere/lib/f.dart",
+        ]
+        .iter()
+        .map(|path| owner(path))
+        .collect();
+        assert_eq!(
+            cold,
+            [
+                Some("inner".to_owned()),
+                Some("lvl1".to_owned()),
+                Some("app".to_owned()),
+                None,
+            ]
+        );
+        // Second pass: every query now rides the memo (or re-walks over
+        // memoized ancestors) and must land identically.
+        let warm: Vec<Option<String>> = [
+            "/proj/lvl1/lvl2/inner/lib/a.dart",
+            "/proj/lvl1/lvl2/inner/lib/sub/deep.dart",
+            "/proj/lvl1/lib/b.dart",
+            "/proj/lvl1/lib/sub/b.dart",
+            "/proj/lib/c.dart",
+            "/proj/tool/d.dart",
+            "/elsewhere/lib/f.dart",
+        ]
+        .iter()
+        .map(|path| owner(path))
+        .collect();
+        assert_eq!(
+            warm,
+            [
+                Some("inner".to_owned()),
+                Some("inner".to_owned()),
+                Some("lvl1".to_owned()),
+                Some("lvl1".to_owned()),
+                Some("app".to_owned()),
+                Some("app".to_owned()),
+                None,
+            ]
+        );
+        // Component boundary: `lvl10` shares a string prefix with `lvl1`
+        // but is not inside it.
+        assert_eq!(owner("/proj/lvl10/lib/e.dart"), Some("app".to_owned()));
     }
 
     #[test]
