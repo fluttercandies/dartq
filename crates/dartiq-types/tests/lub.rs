@@ -3,10 +3,10 @@
 
 mod common;
 
-use common::fixture;
+use common::{Fixture, fixture};
 use dartiq_types::{
-    CoreDecls, TypeDeclId, TypeHierarchy, TypeParamId, TypeSystem, TypeTable, UninternedRecord,
-    UninternedType,
+    CoreDecls, TypeDeclId, TypeHierarchy, TypeId, TypeParamId, TypeSystem, TypeTable,
+    UninternedRecord, UninternedType,
 };
 
 #[test]
@@ -297,4 +297,90 @@ fn record_vs_record_class_returns_the_record_class() {
 
     // Record vs an unrelated class never sees the Record-class rule.
     assert_eq!(sys.least_upper_bound(pair, int_ty), bare_object);
+}
+
+#[test]
+fn both_object_types_pick_by_more_top() {
+    // OBJECT(T1) && OBJECT(T2) dispatches ahead of the single-object rules
+    // (least_upper_bound.dart:526-560): `FutureOr<Object>` is an object type
+    // (`isObject(FutureOr<T>) = isObject(T)`, type_system.dart:1236-1254), so
+    // the pair resolves by MORETOP to plain `Object` instead of returning the
+    // first object operand.
+    let fx = fixture();
+    let sys = fx.system();
+    let object = fx.itf(fx.d.object, &[], false);
+    let future_or_object = fx.future_or_of(object, false);
+    assert_eq!(sys.least_upper_bound(future_or_object, object), object);
+    assert_eq!(sys.least_upper_bound(object, future_or_object), object);
+}
+
+/// One fixture build observed end to end: the whole-hierarchy debug dump
+/// (supertype edges plus the crate-private precomputed depth map) and a LUB
+/// matrix over the interned ids. Two builds of the same declarations in the
+/// same order must produce identical values.
+fn build_observation(fx: &Fixture) -> (String, Vec<(TypeId, TypeId, TypeId)>) {
+    let sys = fx.system();
+    let object = fx.itf(fx.d.object, &[], false);
+    let matrix = vec![
+        // Resolves through the supertype-set intersection and the
+        // depth-ranked candidate walk (cat/dog meet at Animal, not Object).
+        (
+            fx.cat(),
+            fx.dog(),
+            sys.least_upper_bound(fx.cat(), fx.dog()),
+        ),
+        (
+            fx.future_or_of(object, false),
+            object,
+            sys.least_upper_bound(fx.future_or_of(object, false), object),
+        ),
+        (
+            fx.int(),
+            fx.string_question(),
+            sys.least_upper_bound(fx.int(), fx.string_question()),
+        ),
+        (
+            fx.cat_question(),
+            fx.dog(),
+            sys.least_upper_bound(fx.cat_question(), fx.dog()),
+        ),
+        (
+            fx.list_of(fx.int(), false),
+            fx.iterable_of(fx.int(), false),
+            sys.least_upper_bound(fx.list_of(fx.int(), false), fx.iterable_of(fx.int(), false)),
+        ),
+    ];
+    (format!("{:?}", fx.hierarchy), matrix)
+}
+
+#[test]
+fn identical_hierarchy_builds_are_byte_identical() {
+    // Pins the #154 determinism claim: building the identical hierarchy twice
+    // (same declaration order) yields the same snapshot and the same interned
+    // ids, so `supertypes()` slices agree per declaration, the debug dump
+    // (which includes the depth map `depth()` feeds) matches byte-for-byte,
+    // and the LUB matrix answers identically on both builds.
+    let fx1 = fixture();
+    let fx2 = fixture();
+    for d in [
+        fx1.d.object,
+        fx1.d.future,
+        fx1.d.function,
+        fx1.d.num,
+        fx1.d.int,
+        fx1.d.double,
+        fx1.d.string,
+        fx1.d.boolean,
+        fx1.d.iterable,
+        fx1.d.list,
+        fx1.d.animal,
+        fx1.d.cat,
+        fx1.d.dog,
+    ] {
+        assert_eq!(fx1.hierarchy.supertypes(d), fx2.hierarchy.supertypes(d));
+    }
+    let (dump1, matrix1) = build_observation(&fx1);
+    let (dump2, matrix2) = build_observation(&fx2);
+    assert_eq!(dump1, dump2);
+    assert_eq!(matrix1, matrix2);
 }

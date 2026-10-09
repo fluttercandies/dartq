@@ -59,15 +59,24 @@ impl TypeSystem<'_> {
             return self.null_case(a);
         }
 
-        // OBJECT (least_upper_bound.dart:526-560).
-        if self.is_object(a) {
+        // OBJECT (least_upper_bound.dart:526-560). The both-object rule runs
+        // first: `FutureOr<Object>` is an object type
+        // (`isObject(FutureOr<T>) = isObject(T)`, type_system.dart:1236-1254),
+        // so `UP(FutureOr<Object>, Object)` must resolve by MORETOP instead
+        // of returning the first single-object hit.
+        let a_is_object = self.is_object(a);
+        let b_is_object = self.is_object(b);
+        if a_is_object && b_is_object {
+            return if self.is_more_top(a, b) { a } else { b };
+        }
+        if a_is_object {
             return if self.is_non_nullable(b) {
                 a
             } else {
                 self.make_nullable(a)
             };
         }
-        if self.is_object(b) {
+        if b_is_object {
             return if self.is_non_nullable(a) {
                 b
             } else {
