@@ -108,10 +108,9 @@ impl TypeParamOrArg {
                 let begin = parser.peek_span(); // `<`
                 parser.listener.begin_type_arguments(begin);
                 parser.cursor.advance(); // `<`
-                let name = parser.peek_span();
-                parser
-                    .listener
-                    .handle_identifier(name, IdentifierContext::TypeReference);
+                // Official `ensureIdentifier(token, typeReference)` — the
+                // name token is consumed, not merely read.
+                let name = parser.ensure_identifier(IdentifierContext::TypeReference);
                 parser.listener.handle_type(name, None);
                 debug_assert!(parser.cursor.peek_is_closer());
                 let closer_id = parser.cursor.consume_closer();

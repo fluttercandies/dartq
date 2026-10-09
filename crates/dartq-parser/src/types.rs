@@ -107,8 +107,7 @@ pub(crate) fn is_valid_non_record_type_reference(kind: TokenKind, next: TokenKin
         TokenKind::Identifier => true,
         TokenKind::Keyword(kw) => {
             kw.style() == dartq_scanner::KeywordStyle::Pseudo
-                || (kw.style() == dartq_scanner::KeywordStyle::BuiltIn
-                    && next == TokenKind::Period)
+                || (kw.style() == dartq_scanner::KeywordStyle::BuiltIn && next == TokenKind::Period)
                 || matches!(kw, Keyword::Dynamic | Keyword::Function | Keyword::Void)
         }
         _ => false,

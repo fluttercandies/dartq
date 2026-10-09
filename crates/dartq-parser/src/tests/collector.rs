@@ -400,6 +400,12 @@ impl ParserListener for Collector {
     ) {
         self.log.push(("end", "body"));
     }
+    fn begin_enum_body(&mut self, _: Token) {
+        self.log.push(("begin", "body"));
+    }
+    fn end_enum_body(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "body"));
+    }
     fn handle_no_class_body(&mut self, _: Token) {
         self.log.push(("handle", "no_class_body"));
     }
@@ -484,6 +490,11 @@ impl ParserListener for Collector {
         self.log.push(("begin", "yield_statement"));
     }
     fn end_yield_statement(&mut self, _: Token, _: Option<Token>, _: Token) {
+        self.log.push(("end", "yield_statement"));
+    }
+    /// The invalid yield completes the statement event pair (official
+    /// `endInvalidYieldStatement`; the error code is resolution-domain).
+    fn end_invalid_yield_statement(&mut self, _: Token, _: Option<Token>, _: Token) {
         self.log.push(("end", "yield_statement"));
     }
     fn begin_labeled_statement(&mut self, _: Token, _: usize) {

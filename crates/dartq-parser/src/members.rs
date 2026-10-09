@@ -109,8 +109,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             name_is_recovered = true;
         }
 
-        // Name-or-special-form dispatch.
-        if !self.peek_is_identifier() {
+        // Name-or-special-form dispatch (official `next.type !=
+        // TokenType.IDENTIFIER` — a strict identifier-token check, so the
+        // built-in-introducer keywords below are still seen).
+        if !matches!(self.peek_kind(), TokenKind::Identifier) {
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Factory | Keyword::Operator) => {
                     // `factory`/`operator` may be plain identifiers; only
@@ -159,11 +161,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
-        // Dispatch: method-shaped (`(`, `{`, `<`, `.`, `=>`, get/set) vs
-        // fields.
+        // Dispatch: the token AFTER the name decides method vs fields
+        // (official parser_impl.dart:3946-3953 — a `!` right after the name
+        // is skipped for the decision, then `next = next.next!` and the
+        // follower value `(`/`{`/`<`/`.`/`=>` selects the method path; the
+        // `!` itself is consumed later by `parse_method_type_var`). The
+        // cursor stays on the name: `parse_top_level_method` consumes it.
+        let follower = if self.cursor.look_kind(1) == TokenKind::Bang {
+            self.cursor.look_kind(2)
+        } else {
+            self.cursor.look_kind(1)
+        };
         let is_method = get_or_set.is_some()
             || matches!(
-                self.peek_kind(),
+                follower,
                 TokenKind::OpenParen
                     | TokenKind::OpenCurly
                     | TokenKind::Lt
@@ -303,6 +314,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
         let name = match get_or_set {
             Some(get_set) => {
+                // Official `token = getOrSet; ensureIdentifierPotentiallyRecovered`:
+                // the identifier event is the name AFTER the `get`/`set`
+                // introducer.
+                self.cursor.advance();
                 self.ensure_identifier_recovered(IdentifierContext::TopLevelFunctionDeclaration);
                 get_set
             }
@@ -408,7 +423,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
             new_kw = Some(self.peek_span());
             self.cursor.advance();
-        } else if !self.peek_is_identifier() {
+        } else if !matches!(self.peek_kind(), TokenKind::Identifier) {
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Get | Keyword::Set) => {
                     if is_identifier(self.cursor.look_kind(1)) {
@@ -549,11 +564,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
-        // Method vs fields.
+        // Method vs fields: the token AFTER the name decides (official
+        // parser_impl.dart:5214-5225 — `next = next.next!` past the name,
+        // then the follower value `(`/`{`/`<`/`.`/`=>`; no `!` recovery
+        // here, unlike the top-level dispatch). The cursor stays on the
+        // name: `parse_method` consumes it.
+        let follower = self.cursor.look_kind(1);
         let is_method = get_or_set.is_some()
             || new_kw.is_some()
             || matches!(
-                self.peek_kind(),
+                follower,
                 TokenKind::OpenParen
                     | TokenKind::OpenCurly
                     | TokenKind::Lt
@@ -845,7 +865,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.cursor.reset(before_type);
         type_info.parse_type(self);
         if let Some(gs) = get_or_set {
-            self.cursor.jump_to(gs.id);
+            // Official `token = getOrSet; ensureIdentifierPotentiallyRecovered`:
+            // the identifier event is the name AFTER the `get`/`set`
+            // introducer. With no return type the cursor already sits on the
+            // introducer (`jump_to` requires strictly-forward movement).
+            if (gs.id as usize) > self.cursor.real_pos() {
+                self.cursor.jump_to(gs.id);
+            }
+            self.cursor.advance();
         }
 
         let mut has_qualified_name = false;

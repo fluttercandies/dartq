@@ -215,6 +215,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     ) -> TokenSpan {
         let had_open = self.peek_kind() == TokenKind::OpenCurly;
         let (begin, close) = self.ensure_block(message_kind);
+        if had_open {
+            // Official `ensureBlock` consumes the real `{`; for a synthetic
+            // block nothing is consumed here (the `!had_open` path drains
+            // the inserted pair below).
+            self.cursor.advance();
+        }
         self.listener.begin_block(begin, kind);
         if !had_open {
             // Synthetic empty block: drain the inserted `{`/`}` pair; the
@@ -478,14 +484,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.parse_metadata_star();
             }
             let start_next = self.span_of(self.real_id(TokenCursor::mark_pos(before_type)));
+            // Compute-only: the group is parsed (from the `<`) inside
+            // `parse_named_function_rest`, after the name — the engine is a
+            // rewind-and-reparse parser, so consuming it here would not
+            // survive the `reset(before_type)` reparse below (official
+            // `beforeFormals` is likewise parsed in `parseNamedFunctionRest`).
             let before_formals = self.compute_type_param_or_arg(true);
-            let _ = before_formals.parse_variables(self, false);
-            let after_type_params = self.cursor.mark();
             self.listener.begin_local_function_declaration(start_next);
             self.cursor.reset(before_type);
             let _ = type_info.parse_type(self);
-            self.cursor.reset(after_type_params);
-            self.parse_named_function_rest();
+            self.parse_named_function_rest(&before_formals);
             return ExprStmtOrDecl::Parsed;
         }
 
@@ -519,9 +527,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
-        if self.cursor.progress() == TokenCursor::progress_at(before_type) {
-            // No annotation, modifier, or type: an expression statement (or
-            // nothing, in for-parts mode).
+        // No annotation, modifier, or type: an expression statement (official
+        // gate `varFinalOrConst == null && beforeType == start` — a consumed
+        // `var`/`final`/`const` always heads a declaration, never an
+        // expression).
+        if var_final_or_const.is_none()
+            && self.cursor.progress() == TokenCursor::progress_at(before_type)
+        {
             if for_parts {
                 return ExprStmtOrDecl::NotDecl;
             }
@@ -571,20 +583,34 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let missing_type_name = self.peek_kind() == TokenKind::Lt
             && self.cursor.progress() == TokenCursor::progress_at(before_type);
         if missing_type_name {
+            // Official `insertSyntheticIdentifier` + `computeType` over the
+            // linked list `id <...>`. This engine's `compute_type` requires a
+            // clean cursor (queued tokens break its raw lookahead), so the
+            // fixed shape is consumed directly: the synthetic name, then the
+            // `<...>` group — mirroring `parseComplexPlainType`'s events.
             let at = self.peek_span();
             self.report(msg::expected_identifier(self.cursor.lexeme(at.id)), at);
-            // The synthetic name queues ahead of `<`; the required type
-            // compute below sees `id <...>`.
             let id = self
                 .cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
-            let _ = id;
+            let name = self.span_of(id);
+            self.listener
+                .handle_identifier(name, IdentifierContext::TypeReference);
+            self.cursor.advance(); // drain the queued synthetic; cursor on `<`
+            let type_args = self.compute_type_param_or_arg_on_lt(true);
+            if !matches!(type_args, TypeParamOrArg::None) {
+                type_args.parse_arguments(self);
+            }
+            self.listener.handle_type(name, None);
+            let name = self.peek_span();
+            self.listener
+                .begin_variables_declaration(name, late_kw, var_final_or_const);
+            if for_parts {
+                return ExprStmtOrDecl::DeclHead;
+            }
+            self.parse_variables_declaration_rest(true);
+            return ExprStmtOrDecl::Parsed;
         }
-        let type_info = if missing_type_name {
-            self.compute_type(true, true)
-        } else {
-            type_info
-        };
         let _ = type_info.parse_type(self);
         let name = self.peek_span();
         self.listener
@@ -648,13 +674,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseNamedFunctionRest` (statement flavor): name, formals,
     /// (recovery) initializers, async modifier, body.
-    fn parse_named_function_rest(&mut self) {
+    fn parse_named_function_rest(&mut self, type_vars: &TypeParamOrArg) {
         let begin = self.peek_span();
         self.listener.begin_function_name(begin);
         let name = self.ensure_identifier(IdentifierContext::LocalFunctionDeclaration);
         let _ = name;
         let name_end = self.peek_span();
         self.listener.end_function_name(begin, name_end, false);
+        // Official `parseNamedFunctionRest`: the precomputed type-variable
+        // group parses here, from the `<` after the name.
+        if !matches!(type_vars, TypeParamOrArg::None) {
+            type_vars.parse_variables(self, false);
+        }
         let _ = self.parse_formal_parameters_required_opt(crate::listener::MemberKind::Local);
         let _ = self.parse_initializers_opt();
         let saved_async = self.async_state;
@@ -862,7 +893,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.cursor.advance();
         self.listener.begin_for_statement(for_kw);
         let left_paren = if self.peek_kind() == TokenKind::OpenParen {
-            self.peek_span()
+            let paren = self.peek_span();
+            // Official `parseForLoopPartsStart` consumes the `(` before the
+            // initializer (`token = token.next!`); the rest arms expect it
+            // consumed and only close the group.
+            self.cursor.advance();
+            paren
         } else {
             // Official `parseForLoopPartsStart` recovery: a fully synthetic
             // `(...)` group plus a synthetic variable declaration.
@@ -895,6 +931,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             ExprStmtOrDecl::PatternHead { pattern_keyword } => {
+                // Official `parseExpressionStatementOrDeclarationAfterModifiers`
+                // parses the pattern (PatternContext.declaration) before
+                // returning; both the `=` and `in` continuations start after
+                // it.
+                let _ = self.parse_pattern(PatternContext::Declaration);
                 if self.peek_kind() == TokenKind::Eq {
                     let equals = self.peek_span();
                     self.cursor.advance();
@@ -955,6 +996,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     .handle_for_initializer_local_variable_declaration(end, for_in);
             }
             _ if self.peek_kind() == TokenKind::Semicolon => {
+                // Official `parseForLoopPartsMid` reports the event without
+                // consuming: the `;` is consumed by `parseForLoopPartsRest`'s
+                // leading `ensureSemicolon`.
                 let at = self.peek_span();
                 self.listener.handle_for_initializer_empty_statement(at);
             }
@@ -1026,13 +1070,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             self.cursor.advance();
         }
-        if let Some(close) = self.cursor.table_matching_end(left_paren.id) {
-            if self.cursor.peek_id() != close {
-                let at = self.peek_span();
-                self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
-                self.skip_to_token(close);
-            }
-        }
+        // Close the group (consume at the closer, jump + report when
+        // distant — official `ensureCloseParen`).
+        let _ = self.ensure_close_paren(left_paren);
         self.listener.handle_for_loop_parts(
             for_kw,
             left_paren,
@@ -1375,6 +1415,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let close_id = self.cursor.table_matching_end(open.id);
         let open_group_synthetic = close_id.map_or(true, |close| self.cursor.resolve(close).1);
         let scan_mark = self.cursor.mark();
+        self.cursor.advance(); // `(`
         let name_synthetic = if !self.peek_is_identifier() {
             let _ = self.ensure_identifier(IdentifierContext::CatchParameter);
             true
@@ -1452,6 +1493,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     fn parse_switch_block(&mut self) -> TokenSpan {
         let had_open = self.peek_kind() == TokenKind::OpenCurly;
         let (begin, close) = self.ensure_block(crate::message::BlockKind::SwitchStatement);
+        if had_open {
+            // Consume the real `{` so the case loop starts on the first
+            // case (official `parseSwitchBlock` reads cases from
+            // `token.next` with `token` on the `{`).
+            self.cursor.advance();
+        }
         self.listener.begin_switch_block(begin);
         let mut case_count = 0usize;
         let mut default_kw: Option<TokenSpan> = None;
@@ -1684,6 +1731,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
                 let begin = self.peek_span();
                 self.listener.begin_block_function_body(begin);
+                // The `{` is guaranteed here (happy path or after the stray
+                // skip above); official `parseFunctionBody` consumes it via
+                // `ensureBlock` before the statement loop.
+                self.cursor.advance();
                 let saved_loop = self.loop_state;
                 self.loop_state = LoopState::OutsideLoop;
                 let count = self.parse_statements_until_close();
