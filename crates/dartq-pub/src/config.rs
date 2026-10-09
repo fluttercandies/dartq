@@ -282,7 +282,7 @@ impl PackageConfig {
             }
             if !seen.insert(entry.name.as_str()) {
                 return Err(PubError::PackageConfig(format!(
-                    "Duplicate name `{}` in package config",
+                    "Duplicate name {} in generated package config",
                     entry.name
                 )));
             }
@@ -644,7 +644,9 @@ mod tests {
             .resolve(Path::new("/proj/.dart_tool"))
             .expect_err("duplicate name");
         assert!(
-            error.to_string().contains("Duplicate name `app`"),
+            error
+                .to_string()
+                .contains("Duplicate name app in generated package config"),
             "unexpected error: {error}"
         );
     }

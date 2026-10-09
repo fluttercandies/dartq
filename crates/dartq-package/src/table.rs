@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use dartq_pub::{PackageConfig, ResolvedPackageGraph};
+use dartq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
 use rustc_hash::FxHashMap;
 
 use crate::SourceCategory;
@@ -54,7 +54,9 @@ pub struct PackageTable {
     /// Memoized per-directory attribution (oracle `_workspacePackages`,
     /// `pub.dart:187`, backfilled over the walked chain):
     /// directory → owning package, `None` recording "walked, found nothing
-    /// in bound; the fallback also owns the chain". Interior mutability
+    /// in bound; the fallback also owns the chain". Keys are directories
+    /// only — file queries are never memoized, so entries are bounded by
+    /// the walked directory count, not the file count. Interior mutability
     /// because attribution is a query over shared immutable state; callers
     /// are the engine's sequential pre-fanout pass, so the lock is
     /// uncontended.
@@ -97,7 +99,11 @@ impl PackageTable {
     /// One more root invariant is enforced here: two entries must not
     /// resolve to the same normalized root
     /// ([`crate::PackageError::DuplicateRoot`] — file→package attribution
-    /// could not pick an owner).
+    /// could not pick an owner). The walk's inclusive bound additionally
+    /// assumes the workspace root (the `config_dir` parent) is itself a
+    /// config root — pub always writes the root package's `rootUri` so —
+    /// and a divergent hand-config violating that fails loudly via
+    /// `debug_assert` rather than mis-attributing the bound's own tree.
     ///
     /// # Errors
     ///
@@ -181,7 +187,7 @@ impl PackageTable {
 
         // The attribution walk's two indexes, both derived from `packages`
         // here at build (never mutated afterwards — rebuild with the table).
-        let by_root = packages
+        let by_root: FxHashMap<PathBuf, PackageName> = packages
             .values()
             .map(|identity| (identity.root.clone(), identity.name.clone()))
             .collect();
@@ -195,9 +201,18 @@ impl PackageTable {
         by_depth.sort_by_key(|&(_, depth)| std::cmp::Reverse(depth));
         let by_depth = by_depth.into_iter().map(|(name, _)| name.clone()).collect();
 
-        let workspace_root = config_dir
-            .parent()
-            .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
+        // Normalized so the walk's inclusive bound compares
+        // spelling-canonical against the normalized query and roots (a
+        // dot-segment `config_dir` would otherwise strand the bound
+        // mid-chain while the roots resolved past it).
+        let workspace_root = normalize(config_dir.parent().unwrap_or(config_dir));
+        debug_assert!(
+            by_root.contains_key(&workspace_root),
+            "workspace root `{}` must be one of the config roots: the \
+             attribution walk treats it as the inclusive bound and the \
+             root package's owner",
+            workspace_root.display()
+        );
 
         Ok(PackageTable {
             packages,
@@ -225,6 +240,14 @@ impl PackageTable {
     /// The package that owns `path` — the engine's file→package attribution
     /// entry point, and the single source of truth for that mapping.
     ///
+    /// `path` is normalized lexically on entry, once and with zero
+    /// syscalls: the indexes are built from normalized roots, so the memo
+    /// key and every walk comparison are spelling-canonical —
+    /// `/proj/./lib/a.dart` attributes identically to `/proj/lib/a.dart`.
+    /// Symlink-alias *resolution* deliberately stays upstream
+    /// (dartq-source's FileTable canonicalizes on existence); this method
+    /// is purely lexical.
+    ///
     /// The oracle's two-tier face (`pub.dart:334-358` +
     /// `feature_set_provider.dart`'s `_findPackage`):
     ///
@@ -245,21 +268,41 @@ impl PackageTable {
     ///    containing root, scanned deepest-first over `by_depth` with
     ///    component-boundary prefix semantics (`Path::strip_prefix`).
     ///
-    /// The memo (oracle `_workspacePackages`, `pub.dart:187`) records the
-    /// owner of every directory the walk passed, so repeated queries over a
-    /// shared tree are one hash hit per directory.
+    /// The memo (oracle `_workspacePackages`, `pub.dart:187`) is keyed by
+    /// directories only: it records the owner of every directory the walk
+    /// passed, so repeated queries over a shared tree are one hash hit per
+    /// directory. A file query is never memoized — per-file entries would
+    /// grow without bound over a full analyze — so a sibling file in an
+    /// already-walked directory resolves from the memoized parent after one
+    /// ancestor step.
     #[must_use]
     pub fn containing(&self, path: &Path) -> Option<&PackageIdentity> {
+        let path = normalize(path);
+        // Structural file/directory class: the engine's face is per-file
+        // and file paths carry an extension, so such queries skip the
+        // memoization of the query itself; extension-less queries
+        // (directories — including the workspace root) are legitimate memo
+        // keys. Misclassification is harmless: a directory with an
+        // extension just costs a re-walk, never a wrong owner.
+        let file_query = path.extension().is_some();
         let mut memo = self
             .ancestor_memo
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(hit) = memo.get(path) {
+        if let Some(hit) = memo.get(path.as_path()) {
             return hit.as_ref().map(|name| &self.packages[name]);
         }
         let mut trail: Vec<Box<Path>> = Vec::new();
         let mut owner: Option<PackageName> = None;
-        for dir in path.ancestors() {
+        // Resumable: the fallback backfill continues at the exact point
+        // the walk stopped, so directories already in `trail` are never
+        // re-pushed. A file query skips its own step first — the file is
+        // never a root and never memoized.
+        let mut walk = path.ancestors();
+        if file_query {
+            walk.next();
+        }
+        for dir in walk.by_ref() {
             if let Some(hit) = memo.get(dir) {
                 owner.clone_from(hit);
                 break;
@@ -276,18 +319,16 @@ impl PackageTable {
             }
         }
         if owner.is_none() {
-            match self.fallback_owner(path) {
+            match self.fallback_owner(&path) {
                 Some(name) => {
-                    // Backfill only the directories inside the matched root:
-                    // prefix membership holds downward from a root, but an
+                    // Backfill only the directories inside the matched
+                    // root, resuming where the walk stopped: prefix
+                    // membership holds downward from a root, but an
                     // ancestor above it (e.g. the pub cache root over one
                     // package's checkout) is owned by nobody or by a
-                    // shallower root, never by this package. The walked
-                    // trail needs no filtering: a fallback hit is always a
-                    // root outside the bound (an in-bound one would have
-                    // ended the walk), so every walked dir sits inside it.
+                    // shallower root, never by this package.
                     let root = &self.packages[&name].root;
-                    for dir in path.ancestors() {
+                    for dir in walk {
                         if !dir.starts_with(root) {
                             break; // strictly above the root, and so are the rest
                         }
@@ -299,7 +340,7 @@ impl PackageTable {
                     // No root contains the path, so none contains any
                     // ancestor either (a root prefixing an ancestor would
                     // prefix the path).
-                    trail.extend(path.ancestors().map(Box::from));
+                    trail.extend(walk.map(Box::from));
                 }
             }
         }
@@ -317,6 +358,21 @@ impl PackageTable {
             .map(|name| &self.packages[name])
             .find(|package| path.strip_prefix(&package.root).is_ok())
             .map(|package| package.name.clone())
+    }
+
+    /// Memo keys, sorted — test-only view asserting the per-directory
+    /// memo discipline (files never enter, directories do).
+    #[cfg(test)]
+    fn memo_keys(&self) -> Vec<PathBuf> {
+        let mut keys: Vec<PathBuf> = self
+            .ancestor_memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .map(|dir| dir.to_path_buf())
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// All packages, ordered by name.
@@ -586,7 +642,9 @@ sdks:
         let error = PackageTable::build(&duplicated, &graph, Path::new("/proj/.dart_tool"))
             .expect_err("duplicate name");
         assert!(
-            error.to_string().contains("Duplicate name `app`"),
+            error
+                .to_string()
+                .contains("Duplicate name app in generated package config"),
             "unexpected error: {error}"
         );
     }
@@ -987,6 +1045,91 @@ sdks:
         // Component boundary: `lvl10` shares a string prefix with `lvl1`
         // but is not inside it.
         assert_eq!(owner("/proj/lvl10/lib/e.dart"), Some("app".to_owned()));
+    }
+
+    /// Spelling-canonical attribution: non-normal spellings of a path
+    /// (dot segments, `..` round-trips) attribute identically to their
+    /// canonical form — both inside the bound and in the fallback tier —
+    /// and a path outside every root stays `None` in any spelling. This
+    /// is the entry-side half of the normalize contract (the indexes are
+    /// built from normalized roots).
+    #[test]
+    fn containing_is_spelling_canonical() {
+        let table = table_for(&PackageConfig::parse(CONFIG).expect("valid config"));
+        let owner = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.name.to_string())
+        };
+        assert_eq!(owner("/proj/lib/a.dart"), Some("app".to_owned()));
+        assert_eq!(owner("/proj/./lib/a.dart"), Some("app".to_owned()));
+        assert_eq!(owner("/proj/lib/../lib/a.dart"), Some("app".to_owned()));
+        assert_eq!(
+            owner("/proj/.dart_tool/../lib/a.dart"),
+            Some("app".to_owned())
+        );
+        // The fallback tier aligns too.
+        assert_eq!(
+            owner("/cache/hosted/pub.dev/hosted_dep-1.4.0/./lib/h.dart"),
+            Some("hosted_dep".to_owned())
+        );
+        assert_eq!(owner("/elsewhere/lib/f.dart"), None);
+        assert_eq!(owner("/elsewhere/./lib/f.dart"), None);
+    }
+
+    /// The memo is keyed by directories only: querying a file memoizes
+    /// its parent directory and the walked ancestors, never the file
+    /// itself — so two files in one directory cost no per-file entries
+    /// and the memo cannot grow with the file count.
+    #[test]
+    fn memo_is_keyed_by_directories_not_files() {
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [{"name": "app", "rootUri": "../"}],
+              "generator": "pub"
+            }"#,
+        );
+        let owner = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.name.to_string())
+        };
+        assert_eq!(owner("/proj/lib/a.dart"), Some("app".to_owned()));
+        let keys = table.memo_keys();
+        assert!(
+            !keys.contains(&PathBuf::from("/proj/lib/a.dart")),
+            "the file itself must not be memoized: {keys:?}"
+        );
+        assert!(
+            keys.contains(&PathBuf::from("/proj/lib")),
+            "the parent directory must be memoized: {keys:?}"
+        );
+        assert!(
+            keys.contains(&PathBuf::from("/proj")),
+            "the workspace root must be memoized: {keys:?}"
+        );
+
+        // A sibling file rides the memoized parent: same owner, zero new
+        // memo entries.
+        assert_eq!(owner("/proj/lib/b.dart"), Some("app".to_owned()));
+        assert_eq!(table.memo_keys(), keys);
+    }
+
+    /// The walk's inclusive bound assumes the workspace root (the config
+    /// dir's parent) is itself a config root — pub always writes the root
+    /// package's `rootUri` so. A divergent hand-config fails loudly in
+    /// debug builds instead of mis-attributing the bound's own tree.
+    #[test]
+    #[should_panic(expected = "must be one of the config roots")]
+    fn workspace_root_not_among_config_roots_fails_loudly() {
+        // The only entry roots at /proj/app; nothing owns /proj, the
+        // walk's inclusive bound.
+        let config = PackageConfig::parse(
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../app"}]}"#,
+        )
+        .expect("valid config");
+        let _ = PackageTable::build(&config, &plain_graph(&config), Path::new("/proj/.dart_tool"));
     }
 
     #[test]
