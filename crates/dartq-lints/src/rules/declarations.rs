@@ -1,12 +1,14 @@
 //! The declaration-shape family: `avoid_return_types_on_setters`,
 //! `unnecessary_late`, `use_function_type_syntax_for_parameters`,
-//! `prefer_typing_uninitialized_variables`.
+//! `prefer_typing_uninitialized_variables`,
+//! `prefer_generic_function_type_aliases`, `unnecessary_constructor_name`,
+//! `hash_and_equals`.
 
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
-use crate::rules::{first_child, member_name, type_before, NONE_TOKEN};
+use crate::rules::{NONE_TOKEN, first_child, member_name, type_before};
 
 pub(crate) mod avoid_return_types_on_setters {
     use super::{Check, Group, NodeKind, RuleSpec};
@@ -89,9 +91,7 @@ pub(crate) mod unnecessary_late {
         // Every variable must have an initializer (:51-54: any missing
         // initializer skips the report).
         for var in c.direct_children(node).iter().copied() {
-            if c.kind(var) == NodeKind::InitializedIdentifier
-                && !has_initializer(c, var)
-            {
+            if c.kind(var) == NodeKind::InitializedIdentifier && !has_initializer(c, var) {
                 return;
             }
         }
@@ -199,6 +199,334 @@ pub(crate) mod prefer_typing_uninitialized_variables {
     }
 }
 
+pub(crate) mod prefer_generic_function_type_aliases {
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_generic_function_type_aliases.dart:44-64`
+    /// — every old-form `typedef` (no `=`; the analyzer's `FunctionTypeAlias`,
+    /// vs the `GenericTypeAlias` that carries `=`) reports at its name with the
+    /// generic-function-type rewrite spelled in the message. The replacement
+    /// is assembled from source slices in the official order
+    /// (`returnType + ' ' + 'Function' + typeParameters + parameters`);
+    /// slices instead of `toSource()` differ only when a comment sits inside
+    /// the typedef tail (message-text blind spot, no report-position
+    /// impact). A synthetic semicolon (recovery) skips (:48-49). Message:
+    /// `diagnostic.g.dart` `preferGenericFunctionTypeAliases`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_generic_function_type_aliases",
+        group: Group::Core,
+        problem: "Use the generic function type syntax in 'typedef's.",
+        correction: "Try using the generic function type syntax ('{0}').",
+        kinds: &[NodeKind::Typedef],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // Old form ⟺ no `=` token (collapse map §3.2 Typedef row).
+        if c.payload(node).get(1).copied() != Some(NONE_TOKEN) {
+            return;
+        }
+        // `node.semicolon.isSynthetic` bails (:48-49).
+        if c.token_is_synthetic(crate::rules::tail_token(c, node)) {
+            return;
+        }
+        let kids = c.collect_direct(node);
+        let mut return_type = None;
+        let mut name = None;
+        let mut type_variables = None;
+        let mut parameters = None;
+        for kid in kids {
+            match c.kind(kid) {
+                NodeKind::Type | NodeKind::NoType if return_type.is_none() => {
+                    return_type = Some(kid);
+                }
+                NodeKind::Identifier if name.is_none() => name = Some(kid),
+                NodeKind::TypeVariables => type_variables = Some(kid),
+                NodeKind::FormalParameters => parameters = Some(kid),
+                _ => {}
+            }
+        }
+        let Some(name) = name else {
+            return;
+        };
+        let Some(parameters) = parameters else {
+            return;
+        };
+        let slice = |id: u32| -> &str {
+            let bytes = c.byte_span(id);
+            &c.unit.source[bytes]
+        };
+        // `'${returnTypeSource}Function$typeParameterSource$parameterSource'`
+        // (:53-62) — `returnType == null` (our `NoType`) contributes nothing.
+        let mut replacement = String::new();
+        if let Some(rt) = return_type.filter(|rt| c.kind(*rt) != NodeKind::NoType) {
+            replacement.push_str(slice(rt));
+            replacement.push(' ');
+        }
+        replacement.push_str("Function");
+        if let Some(tv) = type_variables {
+            replacement.push_str(slice(tv));
+        }
+        replacement.push_str(slice(parameters));
+        let name_token = c.head_token(name);
+        let start = c
+            .unit
+            .tokens
+            .get(name_token as usize)
+            .expect("name token")
+            .utf16_offset;
+        c.report(start..start, &[&replacement]);
+    }
+}
+
+pub(crate) mod unnecessary_constructor_name {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_constructor_name.dart:41-72`
+    /// — a constructor (or instance-creation) `.new` name reports at the
+    /// name token. Two element-based guards are approximated syntactically:
+    /// the duplicate-unnamed-constructor bail counts unnamed constructors
+    /// among the enclosing `DeclarationBody` siblings (each `Constructor`
+    /// with at most one `Identifier` child is unnamed), and the
+    /// extension-type primary-constructor exemption is skipped (primary
+    /// constructors are outside the current substrate). The instance-creation
+    /// face dispatches on `Send` with a `Qualified` callee — a syntax-only
+    /// proxy for `InstanceCreationExpression` (a non-creation `X.new` access
+    /// is not expressible Dart). Message: `diagnostic.g.dart`
+    /// `unnecessaryConstructorName`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_constructor_name",
+        group: Group::Recommended,
+        problem: "Unnecessary '.new' constructor name.",
+        correction: "Try removing the '.new'.",
+        kinds: &[NodeKind::Constructor, NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        match c.kind(node) {
+            NodeKind::Constructor => check_declaration(c, node),
+            NodeKind::Send => check_creation(c, node),
+            _ => {}
+        }
+    }
+
+    /// The constructor-name `Identifier` (the second one; the first names
+    /// the enclosing type), or `None` when unnamed.
+    fn constructor_name(c: &Check<'_>, node: u32) -> Option<u32> {
+        c.direct_children(node)
+            .iter()
+            .copied()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .nth(1)
+    }
+
+    fn check_declaration(c: &mut Check<'_>, node: u32) {
+        // The constructor name is the second `Identifier` child (the first
+        // names the enclosing type, collapse map §3.3).
+        let Some(name) = constructor_name(c, node) else {
+            return; // unnamed constructor: `node.name == null`
+        };
+        if c.lexeme(c.head_token(name)) != "new" {
+            return;
+        }
+        // Duplicate unnamed constructors already error (:45-52) — an
+        // unnamed constructor is one without a name `Identifier` or one
+        // explicitly spelled `new` (the canonical name of the unnamed
+        // form). The owner is the enclosing `DeclarationBody`.
+        let body = c.ancestor(1).expect("constructor has an owner");
+        // Collect first: the count re-enters `direct_children` per member
+        // and the scratch RefCell forbids a live outer guard.
+        let members: Vec<u32> = c.direct_children(body).iter().copied().collect();
+        let unnamed = members
+            .into_iter()
+            .filter(|&member| {
+                c.kind(member) != NodeKind::Constructor
+                    || match constructor_name(c, member) {
+                        None => true,
+                        Some(name) => c.lexeme(c.head_token(name)) == "new",
+                    }
+            })
+            .count();
+        if unnamed > 1 {
+            return;
+        }
+        let token = c.head_token(name);
+        let start = c
+            .unit
+            .tokens
+            .get(token as usize)
+            .expect("name token")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+
+    fn check_creation(c: &mut Check<'_>, node: u32) {
+        let callee = c.direct_children(node).iter().copied().find(|&kid| {
+            !matches!(
+                c.kind(kid),
+                NodeKind::Arguments | NodeKind::NoArguments | NodeKind::TypeApplication
+            )
+        });
+        let Some(callee) = callee else {
+            return;
+        };
+        if c.kind(callee) != NodeKind::Qualified {
+            return;
+        }
+        let Some(name) = c
+            .direct_children(callee)
+            .iter()
+            .copied()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .nth(1)
+        else {
+            return;
+        };
+        if c.lexeme(c.head_token(name)) != "new" {
+            return;
+        }
+        let token = c.head_token(name);
+        let start = c
+            .unit
+            .tokens
+            .get(token as usize)
+            .expect("name token")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+}
+
+pub(crate) mod hash_and_equals {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/hash_and_equals.dart:45-80` — a
+    /// class defining exactly one of `==` / `hashCode` reports at the
+    /// defined member's name. The member scan runs over the
+    /// `DeclarationBody` children: `==` is a `Method` whose `OperatorName`
+    /// payload token lexemes to `==`, `hashCode` a `Method` name or a field
+    /// variable of that name. The element re-checks
+    /// (`node.hasMethod('==')` etc.) collapse into the same scan — the blind
+    /// spot is members the syntax shape misclassifies (none today). Message:
+    /// `diagnostic.g.dart` `hashAndEquals`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "hash_and_equals",
+        group: Group::Core,
+        problem: "Missing a corresponding override of '{0}'.",
+        correction: "Try overriding '{0}' or removing '{1}'.",
+        kinds: &[NodeKind::ClassDeclaration],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(body) = c
+            .direct_children(node)
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
+        else {
+            return;
+        };
+        let mut eq = None;
+        let mut hash = None;
+        // Collect first: the members scan re-enters `direct_children` for
+        // each member, and the scratch RefCell forbids a live outer guard.
+        let members: Vec<u32> = c.direct_children(body).iter().copied().collect();
+        for member in members {
+            if is_equals(c, member) {
+                eq = Some(member);
+            } else if is_hash_code(c, member) {
+                hash = Some(member);
+            }
+        }
+        let (eq, hash) = match (eq, hash) {
+            (None, None) => return,
+            pair => pair,
+        };
+        if eq.is_none() {
+            let hash = hash.expect("one side is defined past the pair match");
+            if let Some(name) = member_or_field_name(c, hash) {
+                report_at(c, name, &["==", "hashCode"]);
+            }
+        }
+        if hash.is_none() {
+            let eq = eq.expect("one side is defined past the pair match");
+            if let Some(name) = member_name_of(c, eq) {
+                report_at(c, name, &["hashCode", "=="]);
+            }
+        }
+    }
+
+    /// `isEquals` (`ast.dart`): a `Method` whose operator name lexemes `==`.
+    fn is_equals(c: &Check<'_>, member: u32) -> bool {
+        c.kind(member) == NodeKind::Method
+            && c.direct_children(member).iter().copied().any(|kid| {
+                c.kind(kid) == NodeKind::OperatorName
+                    && c.lexeme(c.payload(kid).first().copied().unwrap_or(u32::MAX)) == "=="
+            })
+    }
+
+    /// `isHashCode` (`ast.dart`): a `Method` named `hashCode` or a `Fields`
+    /// declaring a `hashCode` variable.
+    fn is_hash_code(c: &Check<'_>, member: u32) -> bool {
+        match c.kind(member) {
+            NodeKind::Method => member_name_of(c, member).is_some_and(|name| {
+                c.kind(name) == NodeKind::Identifier && c.lexeme(c.head_token(name)) == "hashCode"
+            }),
+            NodeKind::Fields => c.children(member).any(|descendant| {
+                c.kind(descendant) == NodeKind::InitializedIdentifier
+                    && c.lexeme(c.head_token(descendant)) == "hashCode"
+            }),
+            _ => false,
+        }
+    }
+
+    /// The report position: a `Method` reports at its name, a `Fields` at
+    /// its `hashCode` variable (the official `getFieldName` fallback).
+    fn member_or_field_name(c: &Check<'_>, member: u32) -> Option<u32> {
+        match c.kind(member) {
+            NodeKind::Method => member_name_of(c, member),
+            NodeKind::Fields => c.children(member).find(|&descendant| {
+                c.kind(descendant) == NodeKind::InitializedIdentifier
+                    && c.lexeme(c.head_token(descendant)) == "hashCode"
+            }),
+            _ => None,
+        }
+    }
+
+    /// The report position token: an `OperatorName` names through its
+    /// payload token (the `==` itself — `head_token` would hit the
+    /// `operator` keyword), an `Identifier`/variable through its span head.
+    fn report_at(c: &mut Check<'_>, name: u32, args: &[&str]) {
+        let token = if c.kind(name) == NodeKind::OperatorName {
+            c.payload(name)
+                .first()
+                .copied()
+                .expect("operator name payload")
+        } else {
+            c.head_token(name)
+        };
+        let start = c
+            .unit
+            .tokens
+            .get(token as usize)
+            .expect("name token")
+            .utf16_offset;
+        c.report(start..start, args);
+    }
+
+    /// The name child of a `Method` (`Identifier` or `OperatorName`).
+    fn member_name_of(c: &Check<'_>, member: u32) -> Option<u32> {
+        c.direct_children(member)
+            .iter()
+            .copied()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::OperatorName))
+    }
+}
+
 // —— shared helpers ———————————————————————————————————————————————————————
 
 /// The `get`/`set` keyword token of a member declaration, by lexeme.
@@ -220,7 +548,7 @@ fn get_set_token<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
 mod tests {
     use dartq_ast::NodeKind;
 
-    use crate::testsupport::{identifier, NONE, one_rule, tok, utf16_at, Fixture, unit_of};
+    use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
     use dartq_parser::MemberKind;
 
     /// `test/rules/avoid_return_types_on_setters_test.dart` `test_typedSet`.
@@ -228,17 +556,20 @@ mod tests {
     fn avoid_return_types_reports_a_typed_setter() {
         let source = "void set x(v) {}";
         // void0 set1 x2 (3 v4 )5 {6 }7
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::TopLevelMethod, 0);
-            b.patch(0, tok(source, t, "set", 0));
-            b.leaf_span(NodeKind::Type, 0, 1);
-            identifier(b, 2, 3);
-            b.begin(NodeKind::FormalParameters, 3);
-            b.end(NodeKind::FormalParameters, 6);
-            b.begin(NodeKind::Block, 6);
-            b.end(NodeKind::Block, 8);
-            b.end(NodeKind::TopLevelMethod, 8);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "set", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::Block, 6);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::TopLevelMethod, 8);
+            }),
+        );
         let lints = f.run(&one_rule("avoid_return_types_on_setters"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary return type on a setter.");
@@ -249,21 +580,21 @@ mod tests {
     #[test]
     fn avoid_return_types_untyped_setter_passes() {
         let source = "set x(v) {}";
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::TopLevelMethod, 0);
-            b.patch(0, tok(source, t, "set", 0));
-            b.leaf(NodeKind::NoType, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::FormalParameters, 2);
-            b.end(NodeKind::FormalParameters, 5);
-            b.begin(NodeKind::Block, 5);
-            b.end(NodeKind::Block, 7);
-            b.end(NodeKind::TopLevelMethod, 7);
-        }));
-        assert!(
-            f.run(&one_rule("avoid_return_types_on_setters"))
-                .is_empty()
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "set", 0));
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 5);
+                b.begin(NodeKind::Block, 5);
+                b.end(NodeKind::Block, 7);
+                b.end(NodeKind::TopLevelMethod, 7);
+            }),
         );
+        assert!(f.run(&one_rule("avoid_return_types_on_setters")).is_empty());
     }
 
     /// Getters never report — only the `set` keyword qualifies.
@@ -271,18 +602,18 @@ mod tests {
     fn avoid_return_types_getter_passes() {
         let source = "int get x => 1;";
         // int0 get1 x2 =>3 14 ;5
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::TopLevelMethod, 0);
-            b.patch(0, tok(source, t, "get", 0));
-            b.leaf_span(NodeKind::Type, 0, 1);
-            identifier(b, 2, 3);
-            b.leaf(NodeKind::LiteralInt, 4);
-            b.end(NodeKind::TopLevelMethod, 6);
-        }));
-        assert!(
-            f.run(&one_rule("avoid_return_types_on_setters"))
-                .is_empty()
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "get", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                b.end(NodeKind::TopLevelMethod, 6);
+            }),
         );
+        assert!(f.run(&one_rule("avoid_return_types_on_setters")).is_empty());
     }
 
     /// `test/rules/unnecessary_late_test.dart` `test_topLevelVariable`.
@@ -290,18 +621,21 @@ mod tests {
     fn unnecessary_late_reports_a_top_level_variable() {
         let source = "late var x = 1;";
         // late0 var1 x2 =3 14 ;5 — `late` is the span head (#174)
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::TopLevelFields, 0);
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, tok(source, t, "var", 0));
-            b.begin(NodeKind::InitializedIdentifier, 2);
-            b.begin(NodeKind::VariableInitializer, 3);
-            b.leaf(NodeKind::LiteralInt, 4);
-            b.end(NodeKind::VariableInitializer, 5);
-            b.end(NodeKind::InitializedIdentifier, 5);
-            b.end(NodeKind::VariablesDeclaration, 6);
-            b.end(NodeKind::TopLevelFields, 6);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelFields, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 2);
+                b.begin(NodeKind::VariableInitializer, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                b.end(NodeKind::VariableInitializer, 5);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 6);
+                b.end(NodeKind::TopLevelFields, 6);
+            }),
+        );
         let lints = f.run(&one_rule("unnecessary_late"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary 'late' modifier.");
@@ -312,15 +646,18 @@ mod tests {
     #[test]
     fn unnecessary_late_uninitialized_passes() {
         let source = "late var x;";
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::TopLevelFields, 0);
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, tok(source, t, "var", 0));
-            b.begin(NodeKind::InitializedIdentifier, 2);
-            b.end(NodeKind::InitializedIdentifier, 3);
-            b.end(NodeKind::VariablesDeclaration, 3);
-            b.end(NodeKind::TopLevelFields, 3);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelFields, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 2);
+                b.end(NodeKind::InitializedIdentifier, 3);
+                b.end(NodeKind::VariablesDeclaration, 3);
+                b.end(NodeKind::TopLevelFields, 3);
+            }),
+        );
         assert!(f.run(&one_rule("unnecessary_late")).is_empty());
     }
 
@@ -329,30 +666,33 @@ mod tests {
     fn unnecessary_late_instance_field_passes() {
         let source = "class A { late var x = 1; }";
         // class0 A1 {2 late3 var4 x5 =6 17 ;8 }9
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TopLevelDeclaration, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Fields, 2);
-            b.patch(0, MemberKind::NonStaticField as u32);
-            b.begin(NodeKind::VariablesDeclaration, 3);
-            b.patch(0, 4);
-            b.begin(NodeKind::InitializedIdentifier, 5);
-            b.begin(NodeKind::VariableInitializer, 6);
-            b.leaf(NodeKind::LiteralInt, 7);
-            b.end(NodeKind::VariableInitializer, 8);
-            b.end(NodeKind::InitializedIdentifier, 8);
-            b.end(NodeKind::VariablesDeclaration, 9);
-            b.end(NodeKind::Fields, 9);
-            b.end(NodeKind::DeclarationBody, 10);
-            b.end(NodeKind::ClassDeclaration, 10);
-            b.end(NodeKind::TopLevelDeclaration, 10);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, 4);
+                b.begin(NodeKind::InitializedIdentifier, 5);
+                b.begin(NodeKind::VariableInitializer, 6);
+                b.leaf(NodeKind::LiteralInt, 7);
+                b.end(NodeKind::VariableInitializer, 8);
+                b.end(NodeKind::InitializedIdentifier, 8);
+                b.end(NodeKind::VariablesDeclaration, 9);
+                b.end(NodeKind::Fields, 9);
+                b.end(NodeKind::DeclarationBody, 10);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 10);
+            }),
+        );
         assert!(f.run(&one_rule("unnecessary_late")).is_empty());
     }
 
@@ -360,30 +700,33 @@ mod tests {
     #[test]
     fn unnecessary_late_static_field_reports() {
         let source = "class A { late var x = 1; }";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TopLevelDeclaration, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Fields, 2);
-            b.patch(0, MemberKind::StaticField as u32);
-            b.begin(NodeKind::VariablesDeclaration, 3);
-            b.patch(0, 4);
-            b.begin(NodeKind::InitializedIdentifier, 5);
-            b.begin(NodeKind::VariableInitializer, 6);
-            b.leaf(NodeKind::LiteralInt, 7);
-            b.end(NodeKind::VariableInitializer, 8);
-            b.end(NodeKind::InitializedIdentifier, 8);
-            b.end(NodeKind::VariablesDeclaration, 9);
-            b.end(NodeKind::Fields, 9);
-            b.end(NodeKind::DeclarationBody, 10);
-            b.end(NodeKind::ClassDeclaration, 10);
-            b.end(NodeKind::TopLevelDeclaration, 10);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::StaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, 4);
+                b.begin(NodeKind::InitializedIdentifier, 5);
+                b.begin(NodeKind::VariableInitializer, 6);
+                b.leaf(NodeKind::LiteralInt, 7);
+                b.end(NodeKind::VariableInitializer, 8);
+                b.end(NodeKind::InitializedIdentifier, 8);
+                b.end(NodeKind::VariablesDeclaration, 9);
+                b.end(NodeKind::Fields, 9);
+                b.end(NodeKind::DeclarationBody, 10);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 10);
+            }),
+        );
         let lints = f.run(&one_rule("unnecessary_late"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 3));
@@ -395,24 +738,27 @@ mod tests {
     fn function_type_syntax_reports_the_old_form() {
         let source = "f(void g()) {}";
         // f0 (1 void2 g3 (4 )5 )6 {7 }8
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TopLevelMethod, 0);
-            b.patch(0, NONE);
-            b.leaf(NodeKind::NoType, 0);
-            identifier(b, 0, 1);
-            b.begin(NodeKind::FormalParameters, 1);
-            b.begin(NodeKind::FunctionTypedFormalParameter, 2);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Type, 2, 3);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::FormalParameters, 4);
-            b.end(NodeKind::FormalParameters, 6);
-            b.end(NodeKind::FunctionTypedFormalParameter, 6);
-            b.end(NodeKind::FormalParameters, 7);
-            b.begin(NodeKind::Block, 7);
-            b.end(NodeKind::Block, 9);
-            b.end(NodeKind::TopLevelMethod, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::FunctionTypedFormalParameter, 2);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 2, 3);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.end(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FunctionTypedFormalParameter, 6);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::Block, 7);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::TopLevelMethod, 9);
+            }),
+        );
         let lints = f.run(&one_rule("use_function_type_syntax_for_parameters"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -426,25 +772,28 @@ mod tests {
     fn function_type_syntax_generic_form_passes() {
         let source = "f(void Function() g) {}";
         // f0 (1 void2 Function3 (4 )5 g6 )7 {8 }9
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TopLevelMethod, 0);
-            b.patch(0, NONE);
-            b.leaf(NodeKind::NoType, 0);
-            identifier(b, 0, 1);
-            b.begin(NodeKind::FormalParameters, 1);
-            b.begin(NodeKind::FormalParameter, 6);
-            b.patch(0, NONE);
-            b.patch(1, 6);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.patch(4, 0);
-            b.leaf_span(NodeKind::Type, 2, 6);
-            b.end(NodeKind::FormalParameter, 7);
-            b.end(NodeKind::FormalParameters, 8);
-            b.begin(NodeKind::Block, 8);
-            b.end(NodeKind::Block, 10);
-            b.end(NodeKind::TopLevelMethod, 10);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::FormalParameter, 6);
+                b.patch(0, NONE);
+                b.patch(1, 6);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 2, 6);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::FormalParameters, 8);
+                b.begin(NodeKind::Block, 8);
+                b.end(NodeKind::Block, 10);
+                b.end(NodeKind::TopLevelMethod, 10);
+            }),
+        );
         assert!(
             f.run(&one_rule("use_function_type_syntax_for_parameters"))
                 .is_empty()
@@ -457,16 +806,19 @@ mod tests {
     fn prefer_typing_reports_an_untyped_local() {
         let source = "var x;";
         // var0 x1 ;2
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::Block, 0);
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, 0);
-            b.leaf(NodeKind::NoType, 0);
-            b.begin(NodeKind::InitializedIdentifier, 1);
-            b.end(NodeKind::InitializedIdentifier, 2);
-            b.end(NodeKind::VariablesDeclaration, 2);
-            b.end(NodeKind::Block, 3);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, 0);
+                b.leaf(NodeKind::NoType, 0);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.end(NodeKind::InitializedIdentifier, 2);
+                b.end(NodeKind::VariablesDeclaration, 2);
+                b.end(NodeKind::Block, 3);
+            }),
+        );
         let lints = f.run(&one_rule("prefer_typing_uninitialized_variables"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -482,28 +834,31 @@ mod tests {
     fn prefer_typing_reports_an_untyped_field_with_field_text() {
         let source = "class A { var x; }";
         // class0 A1 {2 var3 x4 ;5 }6
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TopLevelDeclaration, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Fields, 2);
-            b.patch(0, MemberKind::NonStaticField as u32);
-            b.begin(NodeKind::VariablesDeclaration, 3);
-            b.patch(0, 3);
-            b.leaf(NodeKind::NoType, 3);
-            b.begin(NodeKind::InitializedIdentifier, 4);
-            b.end(NodeKind::InitializedIdentifier, 5);
-            b.end(NodeKind::VariablesDeclaration, 6);
-            b.end(NodeKind::Fields, 6);
-            b.end(NodeKind::DeclarationBody, 7);
-            b.end(NodeKind::ClassDeclaration, 7);
-            b.end(NodeKind::TopLevelDeclaration, 7);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, 3);
+                b.leaf(NodeKind::NoType, 3);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 6);
+                b.end(NodeKind::Fields, 6);
+                b.end(NodeKind::DeclarationBody, 7);
+                b.end(NodeKind::ClassDeclaration, 7);
+                b.end(NodeKind::TopLevelDeclaration, 7);
+            }),
+        );
         let lints = f.run(&one_rule("prefer_typing_uninitialized_variables"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -516,16 +871,19 @@ mod tests {
     fn prefer_typing_typed_declaration_passes() {
         let source = "int x;";
         // int0 x1 ;2
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::Block, 0);
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Type, 0, 1);
-            b.begin(NodeKind::InitializedIdentifier, 1);
-            b.end(NodeKind::InitializedIdentifier, 2);
-            b.end(NodeKind::VariablesDeclaration, 2);
-            b.end(NodeKind::Block, 3);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 0, 1);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.end(NodeKind::InitializedIdentifier, 2);
+                b.end(NodeKind::VariablesDeclaration, 2);
+                b.end(NodeKind::Block, 3);
+            }),
+        );
         assert!(
             f.run(&one_rule("prefer_typing_uninitialized_variables"))
                 .is_empty()
@@ -536,22 +894,545 @@ mod tests {
     fn prefer_typing_initialized_variable_passes() {
         let source = "var x = 1;";
         // var0 x1 =2 13 ;4
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::Block, 0);
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, 0);
-            b.leaf(NodeKind::NoType, 0);
-            b.begin(NodeKind::InitializedIdentifier, 1);
-            b.begin(NodeKind::VariableInitializer, 2);
-            b.leaf(NodeKind::LiteralInt, 3);
-            b.end(NodeKind::VariableInitializer, 4);
-            b.end(NodeKind::InitializedIdentifier, 4);
-            b.end(NodeKind::VariablesDeclaration, 5);
-            b.end(NodeKind::Block, 5);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, 0);
+                b.leaf(NodeKind::NoType, 0);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.leaf(NodeKind::LiteralInt, 3);
+                b.end(NodeKind::VariableInitializer, 4);
+                b.end(NodeKind::InitializedIdentifier, 4);
+                b.end(NodeKind::VariablesDeclaration, 5);
+                b.end(NodeKind::Block, 5);
+            }),
+        );
         assert!(
             f.run(&one_rule("prefer_typing_uninitialized_variables"))
                 .is_empty()
         );
+    }
+
+    // —— prefer_generic_function_type_aliases —————————————————————————————
+
+    /// `test/rules/prefer_generic_function_type_aliases_test.dart`
+    /// `test_typedef_genericFunctionType` — the rewrite is spelled in the
+    /// correction.
+    #[test]
+    fn generic_function_alias_reports_the_old_form() {
+        let source = "typedef int F(int x);";
+        // typedef0 int1 F2 (3 int4 x5 )6 ;7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Typedef, 0);
+                b.patch(0, tok(source, t, "typedef", 0));
+                b.patch(1, NONE); // old form: no `=`
+                b.leaf_span(NodeKind::Type, 1, 2);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.end(NodeKind::FormalParameters, 7);
+                b.end(NodeKind::Typedef, 8);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_generic_function_type_aliases"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use the generic function type syntax in 'typedef's."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using the generic function type syntax ('int Function(int x)').".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+    }
+
+    /// A missing return type contributes nothing to the rewrite
+    /// (`returnType == null` → `''`).
+    #[test]
+    fn generic_function_alias_without_return_type() {
+        let source = "typedef F(int x);";
+        // typedef0 F1 (2 int3 x4 )5 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Typedef, 0);
+                b.patch(0, tok(source, t, "typedef", 0));
+                b.patch(1, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::Typedef, 7);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_generic_function_type_aliases"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using the generic function type syntax ('Function(int x)').".to_owned())
+        );
+    }
+
+    /// Type parameters carry into the rewrite after `Function`.
+    #[test]
+    fn generic_function_alias_with_type_parameters() {
+        let source = "typedef F<T>(T x);";
+        // typedef0 F1 <2 T3 >4 (5 T6 x7 )8 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Typedef, 0);
+                b.patch(0, tok(source, t, "typedef", 0));
+                b.patch(1, NONE);
+                identifier(b, 1, 2);
+                b.leaf_span(NodeKind::TypeVariables, 2, 5);
+                b.begin(NodeKind::FormalParameters, 5);
+                b.end(NodeKind::FormalParameters, 9);
+                b.end(NodeKind::Typedef, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_generic_function_type_aliases"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using the generic function type syntax ('Function<T>(T x)').".to_owned())
+        );
+    }
+
+    /// The `=` form is the recommended syntax — it never dispatches.
+    #[test]
+    fn generic_function_alias_new_form_passes() {
+        let source = "typedef F = void Function();";
+        // typedef0 F1 =2 void3 Function4 (5 )6 ;7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Typedef, 0);
+                b.patch(0, tok(source, t, "typedef", 0));
+                b.patch(1, tok(source, t, "=", 0));
+                identifier(b, 1, 2);
+                b.leaf_span(NodeKind::Type, 3, 7);
+                b.end(NodeKind::Typedef, 8);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_generic_function_type_aliases"))
+                .is_empty()
+        );
+    }
+
+    // —— unnecessary_constructor_name —————————————————————————————————————
+
+    /// `test/rules/unnecessary_constructor_name_test.dart` `test_withNew`.
+    #[test]
+    fn constructor_name_reports_new() {
+        let source = "class A { A.new(); }";
+        // class0 A1 {2 A3 .4 new5 (6 )7 ;8 }9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FormalParameters, 8);
+                b.end(NodeKind::Constructor, 9);
+                b.end(NodeKind::DeclarationBody, 10);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_constructor_name"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary '.new' constructor name.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// An unnamed constructor has no name token to check.
+    #[test]
+    fn constructor_name_unnamed_passes() {
+        let source = "class A { A(); }";
+        // class0 A1 {2 A3 (4 )5 ;6 }7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.end(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::Constructor, 7);
+                b.end(NodeKind::DeclarationBody, 8);
+                b.end(NodeKind::ClassDeclaration, 8);
+                b.end(NodeKind::TopLevelDeclaration, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+    }
+
+    /// A named constructor other than `new` passes.
+    #[test]
+    fn constructor_name_named_other_passes() {
+        let source = "class A { A.named(); }";
+        // class0 A1 {2 A3 .4 named5 (6 )7 ;8 }9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FormalParameters, 8);
+                b.end(NodeKind::Constructor, 9);
+                b.end(NodeKind::DeclarationBody, 10);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 10);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+    }
+
+    /// Duplicate unnamed constructors already error (:45-52) — no report
+    /// (`A.new()` and `A()` are both the unnamed constructor).
+    #[test]
+    fn constructor_name_duplicate_unnamed_bails() {
+        let source = "class A { A.new(); A(); }";
+        // class0 A1 {2 A3 .4 new5 (6 )7 ;8 A9 (10 )11 ;12 }13
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FormalParameters, 8);
+                b.end(NodeKind::Constructor, 9);
+                b.begin(NodeKind::Constructor, 9);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 9, 10);
+                b.begin(NodeKind::FormalParameters, 10);
+                b.end(NodeKind::FormalParameters, 12);
+                b.end(NodeKind::Constructor, 13);
+                b.end(NodeKind::DeclarationBody, 14);
+                b.end(NodeKind::ClassDeclaration, 14);
+                b.end(NodeKind::TopLevelDeclaration, 14);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+    }
+
+    /// The instance-creation face: `A.new()` reports at `.new`'s name.
+    #[test]
+    fn constructor_name_creation_reports_new() {
+        let source = "A.new();";
+        // A0 .1 new2 (3 )4 ;5
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::Send, 5);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_constructor_name"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+    }
+
+    // —— hash_and_equals ——————————————————————————————————————————————————
+
+    /// `test/rules/hash_and_equals_test.dart` `test_onlyEquals` — the
+    /// missing `hashCode` reports at `==`.
+    #[test]
+    fn hash_and_equals_reports_missing_hash_code() {
+        let source = "class A { bool operator ==(o) => true; }";
+        // class0 A1 {2 bool3 operator4 ==5 (6 o7 )8 =>9 true10 ;11 }12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::OperatorName, 4);
+                b.patch(0, 5);
+                b.patch(1, 0);
+                b.end(NodeKind::OperatorName, 6);
+                b.begin(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::ExpressionBody, 9);
+                b.patch(0, 9);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::LiteralBool, 10);
+                b.end(NodeKind::ExpressionBody, 12);
+                b.end(NodeKind::Method, 12);
+                b.end(NodeKind::DeclarationBody, 13);
+                b.end(NodeKind::ClassDeclaration, 13);
+                b.end(NodeKind::TopLevelDeclaration, 13);
+            }),
+        );
+        let lints = f.run(&one_rule("hash_and_equals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Missing a corresponding override of 'hashCode'."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try overriding 'hashCode' or removing '=='.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// `test_onlyHashCode` — the getter form reports at the name.
+    #[test]
+    fn hash_and_equals_reports_missing_equals() {
+        let source = "class A { int get hashCode => 0; }";
+        // class0 A1 {2 int3 get4 hashCode5 =>6 07 ;8 }9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::ExpressionBody, 6);
+                b.patch(0, 6);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::LiteralInt, 7);
+                b.end(NodeKind::ExpressionBody, 9);
+                b.end(NodeKind::Method, 9);
+                b.end(NodeKind::DeclarationBody, 10);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("hash_and_equals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Missing a corresponding override of '=='."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// `test_onlyGetHashCodeDeclaration` — the field form reports at the
+    /// variable name (the official `getFieldName` fallback).
+    #[test]
+    fn hash_and_equals_field_form_reports() {
+        let source = "class A { final hashCode = 0; }";
+        // class0 A1 {2 final3 hashCode4 =5 06 ;7 }8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, 3);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 9);
+                b.end(NodeKind::TopLevelDeclaration, 9);
+            }),
+        );
+        let lints = f.run(&one_rule("hash_and_equals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    #[test]
+    fn hash_and_equals_both_present_passes() {
+        let source = "class A { bool operator ==(o) => true; int get hashCode => 0; }";
+        // class0 A1 {2 bool3 operator4 ==5 (6 o7 )8 =>9 true10 ;11 int12
+        // get13 hashCode14 =>15 016 ;17 }18
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::OperatorName, 4);
+                b.patch(0, 5);
+                b.patch(1, 0);
+                b.end(NodeKind::OperatorName, 6);
+                b.begin(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::ExpressionBody, 9);
+                b.patch(0, 9);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::LiteralBool, 10);
+                b.end(NodeKind::ExpressionBody, 12);
+                b.end(NodeKind::Method, 12);
+                b.begin(NodeKind::Method, 12);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 12, 13);
+                identifier(b, 14, 15);
+                b.begin(NodeKind::ExpressionBody, 15);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::LiteralInt, 16);
+                b.end(NodeKind::ExpressionBody, 18);
+                b.end(NodeKind::Method, 18);
+                b.end(NodeKind::DeclarationBody, 19);
+                b.end(NodeKind::ClassDeclaration, 19);
+                b.end(NodeKind::TopLevelDeclaration, 19);
+            }),
+        );
+        assert!(f.run(&one_rule("hash_and_equals")).is_empty());
+    }
+
+    #[test]
+    fn hash_and_equals_neither_present_passes() {
+        let source = "class A { int x = 0; }";
+        // class0 A1 {2 int3 x4 =5 06 ;7 }8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, 3);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 9);
+                b.end(NodeKind::TopLevelDeclaration, 9);
+            }),
+        );
+        assert!(f.run(&one_rule("hash_and_equals")).is_empty());
     }
 }

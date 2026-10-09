@@ -4,13 +4,13 @@
 
 #![cfg(test)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dartq_ast::{AstBuilder, NodeKind, TOKEN_NONE};
-use dartq_scanner::{scan, ScanConfig, TokenTable};
+use dartq_scanner::{ScanConfig, TokenTable, scan};
 use dartq_source::{FileTable, LineIndex};
 
-use crate::engine::{run, Lint, Unit};
+use crate::engine::{Features, Lint, Unit, run};
 use crate::registry::EnableSet;
 
 pub const CONFIG: ScanConfig = ScanConfig {
@@ -24,6 +24,10 @@ pub struct Fixture {
     pub tokens: TokenTable,
     pub ast: dartq_ast::SyntaxTable,
     pub lines: LineIndex,
+    /// The file path the run reports (defaults to a valid lint name; the
+    /// `file_names` tests overwrite it).
+    pub path: PathBuf,
+    pub features: Features,
     _files: FileTable,
 }
 
@@ -31,11 +35,7 @@ impl Fixture {
     /// Scans `source` and builds `tree` over the resulting token table.
     pub fn build(source: &str, tree: impl FnOnce(&mut AstBuilder, &TokenTable)) -> Self {
         let mut files = FileTable::default();
-        let result = scan(
-            source,
-            CONFIG,
-            files.intern(Path::new("lint_fixture.dart")),
-        );
+        let result = scan(source, CONFIG, files.intern(Path::new("lint_fixture.dart")));
         let tokens = result.tokens;
         let mut builder = AstBuilder::new();
         tree(&mut builder, &tokens);
@@ -46,6 +46,8 @@ impl Fixture {
             tokens,
             ast,
             lines,
+            path: PathBuf::from("lint_fixture.dart"),
+            features: Features::default(),
             _files: files,
         }
     }
@@ -57,6 +59,8 @@ impl Fixture {
             tokens: &self.tokens,
             ast: &self.ast,
             lines: &self.lines,
+            path: Some(&self.path),
+            features: self.features,
         };
         run(&unit, rules)
     }

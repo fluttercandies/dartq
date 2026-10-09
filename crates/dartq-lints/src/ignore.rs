@@ -63,8 +63,7 @@ impl IgnoreInfo {
     pub fn parse(source: &str, comments: &Comments) -> Self {
         let mut info = Self::default();
         for comment in comments.all() {
-            let lexeme =
-                &source[comment.range.start as usize..comment.range.end as usize];
+            let lexeme = &source[comment.range.start as usize..comment.range.end as usize];
             if !(is_ignore_comment(lexeme) || is_ignore_for_file_comment(lexeme)) {
                 continue;
             }
@@ -72,8 +71,8 @@ impl IgnoreInfo {
                 // Own line (only whitespace before the `//`) -> next line
                 // (ignore_info.dart:126-133); trailing -> same line.
                 let line = line_of(source, comment.range.start);
-                let alone = source[line_start_of(source, comment.range.start)
-                    ..comment.range.start as usize]
+                let alone = source
+                    [line_start_of(source, comment.range.start)..comment.range.start as usize]
                     .trim()
                     .is_empty();
                 let target = if alone { line + 1 } else { line };

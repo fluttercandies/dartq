@@ -101,7 +101,9 @@ pub(crate) mod empty_constructor_bodies {
         }
         // `block.endToken.precedingComments == null`
         // (empty_constructor_bodies.dart:42).
-        if c.comments.has_attached(super::last_token_of(c, body) as usize) {
+        if c.comments
+            .has_attached(super::last_token_of(c, body) as usize)
+        {
             return;
         }
         let range = c.utf16_span(body);
@@ -121,8 +123,7 @@ pub(crate) mod empty_catches {
         name: "empty_catches",
         group: Group::Core,
         problem: "Empty catch block.",
-        correction:
-            "Try adding statements to the block, adding a comment to the block, or removing the 'catch' clause.",
+        correction: "Try adding statements to the block, adding a comment to the block, or removing the 'catch' clause.",
         kinds: &[NodeKind::CatchClause],
         check,
     };
@@ -150,7 +151,9 @@ pub(crate) mod empty_catches {
         if span.start < span.end {
             return;
         }
-        if c.comments.has_attached(super::last_token_of(c, body) as usize) {
+        if c.comments
+            .has_attached(super::last_token_of(c, body) as usize)
+        {
             return;
         }
         let range = c.utf16_span(body);
@@ -196,7 +199,7 @@ pub(crate) mod avoid_empty_else {
 
 #[cfg(test)]
 mod tests {
-    use crate::testsupport::{identifier, NONE, tok, utf16_at, Fixture, one_rule, unit_of};
+    use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
     use dartq_ast::NodeKind;
 
     /// Official cases: `test/rules/avoid_empty_else_test.dart`
@@ -205,17 +208,20 @@ mod tests {
     fn avoid_empty_else_reports_the_else_semicolon() {
         let source = "if (b) ; else ;";
         // if0 (1 b2 )3 ;4 else5 ;6
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::IfStatement, 0);
-            b.patch(0, tok(source, t, "else", 0));
-            b.begin(NodeKind::ParenthesizedCondition, 1);
-            b.patch(0, 1);
-            b.patch(1, 3);
-            b.end(NodeKind::ParenthesizedCondition, 4);
-            b.leaf(NodeKind::EmptyStatement, 4);
-            b.leaf(NodeKind::EmptyStatement, tok(source, t, ";", 1));
-            b.end(NodeKind::IfStatement, 7);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::IfStatement, 0);
+                b.patch(0, tok(source, t, "else", 0));
+                b.begin(NodeKind::ParenthesizedCondition, 1);
+                b.patch(0, 1);
+                b.patch(1, 3);
+                b.end(NodeKind::ParenthesizedCondition, 4);
+                b.leaf(NodeKind::EmptyStatement, 4);
+                b.leaf(NodeKind::EmptyStatement, tok(source, t, ";", 1));
+                b.end(NodeKind::IfStatement, 7);
+            }),
+        );
         let lints = f.run(&one_rule("avoid_empty_else"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -228,17 +234,20 @@ mod tests {
     #[test]
     fn avoid_empty_else_ignores_block_else() {
         let source = "if (b) ; else {}";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::IfStatement, 0);
-            b.patch(0, 5);
-            b.begin(NodeKind::ParenthesizedCondition, 1);
-            b.patch(0, 1);
-            b.patch(1, 3);
-            b.end(NodeKind::ParenthesizedCondition, 4);
-            b.leaf(NodeKind::EmptyStatement, 4);
-            b.leaf_span(NodeKind::Block, 6, 8);
-            b.end(NodeKind::IfStatement, 8);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::IfStatement, 0);
+                b.patch(0, 5);
+                b.begin(NodeKind::ParenthesizedCondition, 1);
+                b.patch(0, 1);
+                b.patch(1, 3);
+                b.end(NodeKind::ParenthesizedCondition, 4);
+                b.leaf(NodeKind::EmptyStatement, 4);
+                b.leaf_span(NodeKind::Block, 6, 8);
+                b.end(NodeKind::IfStatement, 8);
+            }),
+        );
         assert!(f.run(&one_rule("avoid_empty_else")).is_empty());
     }
 
@@ -246,12 +255,15 @@ mod tests {
     #[test]
     fn empty_statements_reports_a_bare_semicolon() {
         let source = "while (b) ;";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::WhileStatement, 0);
-            identifier(b, 2, 3);
-            b.leaf(NodeKind::EmptyStatement, 4);
-            b.end(NodeKind::WhileStatement, 5);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::WhileStatement, 0);
+                identifier(b, 2, 3);
+                b.leaf(NodeKind::EmptyStatement, 4);
+                b.end(NodeKind::WhileStatement, 5);
+            }),
+        );
         let lints = f.run(&one_rule("empty_statements"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary empty statement.");
@@ -264,19 +276,22 @@ mod tests {
     fn empty_statements_case_last_semicolon_defines_semantics() {
         let source = "switch (x) { case 1: ; }";
         // switch0 (1 x2 )3 {4 case5 16 :7 ;8 }9
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::SwitchStatement, 0);
-            b.begin(NodeKind::SwitchBlock, 4);
-            b.begin(NodeKind::SwitchCase, 5);
-            b.patch(0, NONE);
-            b.patch(1, 7);
-            b.patch(2, 1); // one matched expression
-            b.leaf(NodeKind::LiteralInt, 6);
-            b.leaf(NodeKind::EmptyStatement, 8);
-            b.end(NodeKind::SwitchCase, 9);
-            b.end(NodeKind::SwitchBlock, 9);
-            b.end(NodeKind::SwitchStatement, 10);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1); // one matched expression
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.leaf(NodeKind::EmptyStatement, 8);
+                b.end(NodeKind::SwitchCase, 9);
+                b.end(NodeKind::SwitchBlock, 9);
+                b.end(NodeKind::SwitchStatement, 10);
+            }),
+        );
         assert!(f.run(&one_rule("empty_statements")).is_empty());
     }
 
@@ -284,20 +299,23 @@ mod tests {
     #[test]
     fn empty_statements_case_non_last_semicolon_reports() {
         let source = "switch (x) { case 1: ; ; }";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::SwitchStatement, 0);
-            b.begin(NodeKind::SwitchBlock, 4);
-            b.begin(NodeKind::SwitchCase, 5);
-            b.patch(0, NONE);
-            b.patch(1, 7);
-            b.patch(2, 1);
-            b.leaf(NodeKind::LiteralInt, 6);
-            b.leaf(NodeKind::EmptyStatement, 8);
-            b.leaf(NodeKind::EmptyStatement, 9);
-            b.end(NodeKind::SwitchCase, 10);
-            b.end(NodeKind::SwitchBlock, 10);
-            b.end(NodeKind::SwitchStatement, 11);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.leaf(NodeKind::EmptyStatement, 8);
+                b.leaf(NodeKind::EmptyStatement, 9);
+                b.end(NodeKind::SwitchCase, 10);
+                b.end(NodeKind::SwitchBlock, 10);
+                b.end(NodeKind::SwitchStatement, 11);
+            }),
+        );
         let lints = f.run(&one_rule("empty_statements"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 8));
@@ -308,28 +326,31 @@ mod tests {
     fn empty_constructor_bodies_reports_an_empty_block() {
         let source = "class A { A() {} }";
         // class0 A1 {2 A3 (4 )5 {6 }7 }8
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Constructor, 3);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, 4);
-            b.patch(3, NONE);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::FormalParameters, 4);
-            b.end(NodeKind::FormalParameters, 6);
-            b.begin(NodeKind::Block, 6);
-            b.end(NodeKind::Block, 8);
-            b.end(NodeKind::Constructor, 8);
-            b.end(NodeKind::DeclarationBody, 9);
-            b.end(NodeKind::ClassDeclaration, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, 4);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::Block, 6);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::Constructor, 8);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 9);
+            }),
+        );
         let lints = f.run(&one_rule("empty_constructor_bodies"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -344,59 +365,65 @@ mod tests {
     #[test]
     fn empty_constructor_bodies_comment_keeps_the_block() {
         let source = "class A { A() { /* c */ } }";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Constructor, 3);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, 4);
-            b.patch(3, NONE);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::FormalParameters, 4);
-            b.end(NodeKind::FormalParameters, 6);
-            b.begin(NodeKind::Block, 6);
-            b.end(NodeKind::Block, 8);
-            b.end(NodeKind::Constructor, 8);
-            b.end(NodeKind::DeclarationBody, 9);
-            b.end(NodeKind::ClassDeclaration, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, 4);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::Block, 6);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::Constructor, 8);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 9);
+            }),
+        );
         assert!(f.run(&one_rule("empty_constructor_bodies")).is_empty());
     }
 
     #[test]
     fn empty_constructor_bodies_non_empty_block_passes() {
         let source = "class A { A() { x; } }";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Constructor, 3);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, 4);
-            b.patch(3, NONE);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::FormalParameters, 4);
-            b.end(NodeKind::FormalParameters, 6);
-            b.begin(NodeKind::Block, 6);
-            b.begin(NodeKind::ExpressionStatement, 7);
-            b.leaf_span(NodeKind::Send, 7, 9);
-            b.end(NodeKind::ExpressionStatement, 9);
-            b.end(NodeKind::Block, 10);
-            b.end(NodeKind::Constructor, 10);
-            b.end(NodeKind::DeclarationBody, 11);
-            b.end(NodeKind::ClassDeclaration, 11);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, 4);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::Block, 6);
+                b.begin(NodeKind::ExpressionStatement, 7);
+                b.leaf_span(NodeKind::Send, 7, 9);
+                b.end(NodeKind::ExpressionStatement, 9);
+                b.end(NodeKind::Block, 10);
+                b.end(NodeKind::Constructor, 10);
+                b.end(NodeKind::DeclarationBody, 11);
+                b.end(NodeKind::ClassDeclaration, 11);
+            }),
+        );
         assert!(f.run(&one_rule("empty_constructor_bodies")).is_empty());
     }
 
@@ -405,25 +432,28 @@ mod tests {
     fn empty_catches_reports_an_empty_catch_block() {
         let source = "try {} catch (e) {}";
         // try0 {1 }2 catch3 (4 e5 )6 {7 }8
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TryStatement, 0);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Block, 1, 3);
-            b.begin(NodeKind::CatchClause, 3);
-            b.patch(0, 3);
-            b.patch(1, NONE);
-            b.begin(NodeKind::FormalParameter, 5);
-            b.patch(0, NONE);
-            b.patch(1, 5);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.patch(4, 0);
-            b.end(NodeKind::FormalParameter, 6);
-            b.begin(NodeKind::Block, 7);
-            b.end(NodeKind::Block, 9);
-            b.end(NodeKind::CatchClause, 9);
-            b.end(NodeKind::TryStatement, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::CatchClause, 9);
+                b.end(NodeKind::TryStatement, 9);
+            }),
+        );
         let lints = f.run(&one_rule("empty_catches"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Empty catch block.");
@@ -434,25 +464,28 @@ mod tests {
     #[test]
     fn empty_catches_underscore_exception_passes() {
         let source = "try {} catch (_) {}";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TryStatement, 0);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Block, 1, 3);
-            b.begin(NodeKind::CatchClause, 3);
-            b.patch(0, 3);
-            b.patch(1, NONE);
-            b.begin(NodeKind::FormalParameter, 5);
-            b.patch(0, NONE);
-            b.patch(1, 5);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.patch(4, 0);
-            b.end(NodeKind::FormalParameter, 6);
-            b.begin(NodeKind::Block, 7);
-            b.end(NodeKind::Block, 9);
-            b.end(NodeKind::CatchClause, 9);
-            b.end(NodeKind::TryStatement, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::CatchClause, 9);
+                b.end(NodeKind::TryStatement, 9);
+            }),
+        );
         assert!(f.run(&one_rule("empty_catches")).is_empty());
     }
 
@@ -460,25 +493,28 @@ mod tests {
     #[test]
     fn empty_catches_comment_keeps_the_block() {
         let source = "try {} catch (e) { /* c */ }";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::TryStatement, 0);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Block, 1, 3);
-            b.begin(NodeKind::CatchClause, 3);
-            b.patch(0, 3);
-            b.patch(1, NONE);
-            b.begin(NodeKind::FormalParameter, 5);
-            b.patch(0, NONE);
-            b.patch(1, 5);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.patch(4, 0);
-            b.end(NodeKind::FormalParameter, 6);
-            b.begin(NodeKind::Block, 7);
-            b.end(NodeKind::Block, 9);
-            b.end(NodeKind::CatchClause, 9);
-            b.end(NodeKind::TryStatement, 9);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::CatchClause, 9);
+                b.end(NodeKind::TryStatement, 9);
+            }),
+        );
         assert!(f.run(&one_rule("empty_catches")).is_empty());
     }
 }

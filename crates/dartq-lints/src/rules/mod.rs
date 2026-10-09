@@ -7,11 +7,15 @@
 //! analysis (#278), no type inference, no element model. Rules needing those
 //! are listed in the crate docs with their blocker.
 
+pub(crate) mod collections;
 pub(crate) mod declarations;
+pub(crate) mod docs;
 pub(crate) mod empty;
 pub(crate) mod expressions;
 pub(crate) mod flow;
 pub(crate) mod names;
+pub(crate) mod strings;
+pub(crate) mod types;
 
 use dartq_ast::NodeKind;
 
@@ -49,12 +53,7 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
     c.direct_children(parent)
         .iter()
         .copied()
-        .find(|&child| {
-            matches!(
-                c.kind(child),
-                NodeKind::Identifier | NodeKind::OperatorName
-            )
-        })
+        .find(|&child| matches!(c.kind(child), NodeKind::Identifier | NodeKind::OperatorName))
 }
 
 /// The type node directly before the name among the declaration's direct
@@ -62,11 +61,7 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
 /// when the grammar allows its absence — collapse map §3.3/§3.8). `name`'s
 /// subtree ends at the previous direct sibling, so the sibling is O(1) to
 /// read. `None` when the name is the first child (nothing recovered).
-pub(crate) fn type_before<'a>(
-    c: &'a Check<'_>,
-    parent: u32,
-    name: u32,
-) -> Option<(u32, NodeKind)> {
+pub(crate) fn type_before<'a>(c: &'a Check<'_>, parent: u32, name: u32) -> Option<(u32, NodeKind)> {
     let window = c.children(parent);
     let subtree_start = c.children(name).start;
     (subtree_start > window.start).then(|| {
@@ -112,7 +107,9 @@ pub(crate) fn is_upper_camel_case(name: &str) -> bool {
         // quirk included — utils.dart:40), then the tail class.
         k < b.len()
             && matches!(b[k], b'$' | b'?' | b'A'..=b'Z')
-            && b[k + 1..].iter().all(|&ch| ch.is_ascii_alphanumeric() || ch == b'$' || ch == b'?')
+            && b[k + 1..]
+                .iter()
+                .all(|&ch| ch.is_ascii_alphanumeric() || ch == b'$' || ch == b'?')
     })
 }
 
@@ -121,9 +118,10 @@ pub(crate) fn is_upper_camel_case(name: &str) -> bool {
 /// `^_*[?$a-z][a-z\d?$]*(?:(?:[A-Z]|_\d)[a-z\d?$]*)*_?$`.
 pub(crate) fn is_lower_camel_case(name: &str) -> bool {
     let b = name.as_bytes();
-    if b.len() == 1 {
-        // utils.dart:32-33: a single uppercase code unit passes.
-        return matches!(b[0], b'@'..=b'Z');
+    // utils.dart:67-70 — the single-uppercase / `_` cases pass, everything
+    // else (including other single chars) falls through to the regex.
+    if b.len() == 1 && matches!(b[0], b'@'..=b'Z') {
+        return true;
     }
     if b == b"_" {
         return true;
@@ -141,10 +139,7 @@ pub(crate) fn is_lower_camel_case(name: &str) -> bool {
         // Middle run: [a-z\d?$]* — stops at `_`/uppercase, which force the
         // separator or the end.
         while i < b.len()
-            && (b[i].is_ascii_lowercase()
-                || b[i].is_ascii_digit()
-                || b[i] == b'$'
-                || b[i] == b'?')
+            && (b[i].is_ascii_lowercase() || b[i].is_ascii_digit() || b[i] == b'$' || b[i] == b'?')
         {
             i += 1;
         }
@@ -199,11 +194,33 @@ pub(crate) fn is_field_name_shortcut(c: &Check<'_>, pattern: u32) -> bool {
     }
     c.collect_direct(parent).into_iter().any(|field| {
         c.kind(field) == NodeKind::NamedRecordField
-            && c.collect_direct(field)
-                .into_iter()
-                .any(|id| c.kind(id) == NodeKind::Identifier && c.lexeme(c.head_token(id)) == c.lexeme(name))
+            && c.collect_direct(field).into_iter().any(|id| {
+                c.kind(id) == NodeKind::Identifier && c.lexeme(c.head_token(id)) == c.lexeme(name)
+            })
     })
 }
 
 /// The `TOKEN_NONE` sentinel as stored in payload words.
 pub(crate) const NONE_TOKEN: u32 = dartq_ast::TOKEN_NONE;
+
+/// The last token of `id`'s span (the span's `end` is exclusive).
+pub(crate) fn tail_token(c: &Check<'_>, id: u32) -> u32 {
+    c.unit.ast.token_range(id).end - 1
+}
+
+/// Whether two nodes have the same token-lexeme sequence — the anchored
+/// stand-in for the official `toSource()`/`toString()` comparisons
+/// (`prefer_conditional_assignment` / `prefer_if_null_operators` /
+/// `prefer_null_aware_operators`): comments and whitespace are dropped, token
+/// lexemes are compared in order. Synthetic (recovery-inserted) tokens never
+/// match real source on both sides unless mirrored, so they participate as
+/// written — identical recovery on both sides compares equal.
+pub(crate) fn token_seq_equal(c: &Check<'_>, a: u32, b: u32) -> bool {
+    let ra = c.unit.ast.token_range(a);
+    let rb = c.unit.ast.token_range(b);
+    if ra.len() != rb.len() {
+        return false;
+    }
+    ra.zip(rb)
+        .all(|(ta, tb)| ta == tb || c.lexeme(ta) == c.lexeme(tb))
+}

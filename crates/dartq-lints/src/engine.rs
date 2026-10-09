@@ -7,6 +7,7 @@
 //! ancestor path so parent questions (`!(x is T)`, else-branch shape) cost
 //! one slice read, never the arena's forward-walk `parent`.
 
+use std::path::Path;
 use std::sync::LazyLock;
 
 use dartq_ast::{NodeKind, SyntaxTable, byte_span, utf16_span};
@@ -15,7 +16,27 @@ use dartq_source::LineIndex;
 
 use crate::comments::Comments;
 use crate::ignore::IgnoreInfo;
-use crate::registry::{EnableSet, RuleId, RULES};
+use crate::registry::{EnableSet, RULES, RuleId};
+
+/// The language-feature bits a rule may query. Features the caller does not
+/// know are treated as enabled (the Dart 3.7+ shipped defaults); the caller
+/// pins the bits it wants to control (e.g. from `// @dart=` / experiment
+/// config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Features {
+    /// `wildcard_variables` (shipped in Dart 3.7): a lone `_` parameter name
+    /// is exempt from `avoid_shadowing_type_parameters`
+    /// (avoid_shadowing_type_parameters.dart:34-37).
+    pub wildcard_variables: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            wildcard_variables: true,
+        }
+    }
+}
 
 /// The substrate facts one run reads. All references must stay alive for the
 /// whole run; the AST/token table must be the unified post-parse pair (the
@@ -26,6 +47,12 @@ pub struct Unit<'a> {
     pub ast: &'a SyntaxTable,
     /// Byte↔line mapping used by suppression line attribution.
     pub lines: &'a LineIndex,
+    /// The analyzed file path — borrowed, never copied. `file_names` reads
+    /// the basename (official `source.shortName`,
+    /// file_names.dart:31-41). `None` (a run without a path) skips the
+    /// path-dependent rules, mirroring the official `element != null` guard.
+    pub path: Option<&'a Path>,
+    pub features: Features,
 }
 
 /// One reported lint.
@@ -47,8 +74,7 @@ const MAX_LINTS_PER_FILE: usize = 10_000;
 /// Kind -> rule dispatch. Built once from the static table; a node whose
 /// kind has no registered rules costs one empty-Vec test.
 static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock::new(|| {
-    let mut table: [Vec<u16>; NodeKind::KIND_COUNT as usize] =
-        std::array::from_fn(|_| Vec::new());
+    let mut table: [Vec<u16>; NodeKind::KIND_COUNT as usize] = std::array::from_fn(|_| Vec::new());
     for (i, spec) in RULES.iter().enumerate() {
         for kind in spec.kinds {
             table[*kind as usize].push(i as u16);
@@ -298,7 +324,10 @@ impl<'a> Check<'a> {
         args: &[&str],
     ) {
         let name = RULES[self.rule.0 as usize].name;
-        let (line, _) = self.unit.lines.line_col_utf16(self.unit.source, range.start);
+        let (line, _) = self
+            .unit
+            .lines
+            .line_col_utf16(self.unit.source, range.start);
         if self.ignore.ignored(line, name) {
             return;
         }
@@ -306,8 +335,7 @@ impl<'a> Check<'a> {
             rule: self.rule,
             range,
             message: crate::registry::render(problem, args),
-            correction: (!correction.is_empty())
-                .then(|| crate::registry::render(correction, args)),
+            correction: (!correction.is_empty()).then(|| crate::registry::render(correction, args)),
         });
     }
 }
@@ -316,7 +344,7 @@ impl<'a> Check<'a> {
 mod tests {
     use super::*;
     use crate::registry::rule_by_name;
-    use crate::testsupport::{unit_of, Fixture, CONFIG};
+    use crate::testsupport::{CONFIG, Fixture, unit_of};
     use dartq_ast::{AstBuilder, NodeKind};
     use dartq_scanner::scan;
     use dartq_source::FileTable;
@@ -363,6 +391,8 @@ mod tests {
             tokens: &tokens,
             ast: &ast,
             lines: &lines,
+            path: None,
+            features: Features::default(),
         };
         let id = rule_by_name("avoid_empty_else").unwrap();
         let mut enabled = EnableSet::none();

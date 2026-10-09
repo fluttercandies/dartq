@@ -1,12 +1,15 @@
 //! The expression-shape family: `unnecessary_new`,
 //! `unnecessary_null_in_if_null_operators`, `prefer_is_not_operator`,
 //! `prefer_adjacent_string_concatenation`,
-//! `avoid_single_cascade_in_expression_statements`.
+//! `avoid_single_cascade_in_expression_statements`,
+//! `prefer_conditional_assignment`, `prefer_if_null_operators`,
+//! `prefer_null_aware_operators`.
 
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
+use crate::rules::{NONE_TOKEN, first_child, token_seq_equal};
 
 pub(crate) mod unnecessary_new {
     use super::{Check, Group, NodeKind, RuleSpec};
@@ -224,11 +227,266 @@ pub(crate) mod avoid_single_cascade_in_expression_statements {
     }
 }
 
+pub(crate) mod prefer_conditional_assignment {
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, first_child, token_seq_equal};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_conditional_assignment.dart:23-88`
+    /// — an `if` without `else` whose condition is a null check `x == null`
+    /// (either side null) and whose then-statement assigns to `x` reports at
+    /// the `if`. The equality operand identity is the anchored token-lexeme
+    /// sequence comparison (the official
+    /// `canonicalElementsFromIdentifiersAreEqual` is element-based; the
+    /// difference is confined to renames across scopes a lint cannot see
+    /// either). Message: `diagnostic.g.dart` `preferConditionalAssignment`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_conditional_assignment",
+        group: Group::Recommended,
+        problem: "The 'if' statement could be replaced by a null-aware assignment.",
+        correction: "Try using the '??=' operator to conditionally assign a value.",
+        kinds: &[NodeKind::IfStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.elseStatement != null` bails (:70-72).
+        if c.payload(node).first().copied() != Some(NONE_TOKEN) {
+            return;
+        }
+        let Some(operand) = condition_null_operand(c, node) else {
+            return;
+        };
+        // The then arm is the direct child after the condition wrapper
+        // (collapse map §3.4: ParenthesizedCondition delimits the condition
+        // segment, ThenStatementEnd D1).
+        let then = c.collect_direct(node).get(1).copied();
+        let Some(then) = then else {
+            return;
+        };
+        if !assigns_to(c, then, operand) {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+
+    /// `_getExpressionCondition` (:48-61): the condition (unparenthesized)
+    /// must be `==` with one null side; the other side is the operand.
+    fn condition_null_operand(c: &Check<'_>, if_node: u32) -> Option<u32> {
+        let cond_wrapper = first_child(c, if_node)?;
+        let mut condition = first_child(c, cond_wrapper)?;
+        while c.kind(condition) == NodeKind::ParenthesizedExpression {
+            condition = first_child(c, condition)?;
+        }
+        if c.kind(condition) != NodeKind::BinaryExpression {
+            return None;
+        }
+        if c.lexeme(op_token(c, condition)) != "==" {
+            return None;
+        }
+        let kids = c.collect_direct(condition);
+        if kids.len() < 2 {
+            return None;
+        }
+        if c.kind(kids[1]) == NodeKind::LiteralNull {
+            Some(kids[0])
+        } else if c.kind(kids[0]) == NodeKind::LiteralNull {
+            Some(kids[1])
+        } else {
+            None
+        }
+    }
+
+    /// `_checkStatement` (:33-45): an expression statement assigning to
+    /// `operand`, unwrapping single-statement blocks.
+    fn assigns_to(c: &Check<'_>, statement: u32, operand: u32) -> bool {
+        match c.kind(statement) {
+            NodeKind::ExpressionStatement => {
+                let Some(expr) = first_child(c, statement) else {
+                    return false;
+                };
+                if c.kind(expr) != NodeKind::Assignment {
+                    return false;
+                }
+                if c.lexeme(op_token(c, expr)) != "=" {
+                    return false;
+                }
+                let Some(lhs) = first_child(c, expr) else {
+                    return false;
+                };
+                token_seq_equal(c, lhs, operand)
+            }
+            NodeKind::Block => {
+                let kids = c.collect_direct(statement);
+                kids.len() == 1 && assigns_to(c, kids[0], operand)
+            }
+            _ => false,
+        }
+    }
+
+    fn op_token(c: &Check<'_>, node: u32) -> u32 {
+        c.payload(node)
+            .first()
+            .copied()
+            .expect("binary/assignment payload carries the operator")
+    }
+}
+
+pub(crate) mod prefer_if_null_operators {
+    use super::{Check, Group, NodeKind, RuleSpec, token_seq_equal};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_if_null_operators.dart:22-63`
+    /// — `x == null ? a : x` (or the `!=`/then mirror) reports at the
+    /// conditional when the null-check operand and the non-null arm have the
+    /// same token-lexeme sequence (the official `toString()` comparison).
+    /// Message: `diagnostic.g.dart` `preferIfNullOperators`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_if_null_operators",
+        group: Group::Recommended,
+        problem: "Use the '??' operator rather than '?:' when testing for 'null'.",
+        correction: "Try rewriting the code to use '??'.",
+        kinds: &[NodeKind::Conditional],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some((op, operand, arms)) = null_check_parts(c, node) else {
+            return;
+        };
+        // `==` tests the else arm, `!=` the then arm (:49-52).
+        let arm = if op == "==" { arms.1 } else { arms.0 };
+        if token_seq_equal(c, arm, operand) {
+            let range = c.utf16_span(node);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The `(operator, non-null operand, (then, else))` of a null-check
+    /// condition, or `None`.
+    pub(super) fn null_check_parts<'a>(
+        c: &'a Check<'a>,
+        node: u32,
+    ) -> Option<(&'a str, u32, (u32, u32))> {
+        let kids = c.collect_direct(node);
+        if kids.len() < 3 {
+            return None;
+        }
+        let condition = kids[0];
+        if c.kind(condition) != NodeKind::BinaryExpression {
+            return None;
+        }
+        let op = c.lexeme(
+            c.payload(condition)
+                .first()
+                .copied()
+                .expect("binary payload"),
+        );
+        if op != "==" && op != "!=" {
+            return None;
+        }
+        let operands = c.collect_direct(condition);
+        if operands.len() < 2 {
+            return None;
+        }
+        let operand = if c.kind(operands[1]) == NodeKind::LiteralNull {
+            operands[0]
+        } else if c.kind(operands[0]) == NodeKind::LiteralNull {
+            operands[1]
+        } else {
+            return None;
+        };
+        Some((op, operand, (kids[1], kids[2])))
+    }
+}
+
+pub(crate) mod prefer_null_aware_operators {
+    use super::{Check, Group, NodeKind, RuleSpec, token_seq_equal};
+    use dartq_scanner::TokenKind;
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_null_aware_operators.dart:22-76`
+    /// — `a == null ? null : a.b` (`!=` mirrors to the then arm) reports when
+    /// peeling accesses off the result expression reaches the null-check
+    /// operand. The peel and the comparison are the anchored token-lexeme
+    /// sequence form of the official `toString()` walk. Message:
+    /// `diagnostic.g.dart` `preferNullAwareOperators`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_null_aware_operators",
+        group: Group::Recommended,
+        problem: "Use the null-aware operator '?.' rather than an explicit 'null' comparison.",
+        correction: "Try using '?.'.",
+        kinds: &[NodeKind::Conditional],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some((op, operand, arms)) = super::prefer_if_null_operators::null_check_parts(c, node)
+        else {
+            return;
+        };
+        // `x == null ? null : y` / `x != null ? y : null` (:47-60).
+        let result = match op {
+            "==" if c.kind(arms.0) == NodeKind::LiteralNull => arms.1,
+            "!=" if c.kind(arms.1) == NodeKind::LiteralNull => arms.0,
+            _ => return,
+        };
+        // Peel one access at a time; compare only after a peel (:61-74 — the
+        // bare `a == null ? null : a` form never matches).
+        let mut current = result;
+        while let Some(stripped) = peel(c, current) {
+            if token_seq_equal(c, stripped, operand) {
+                let range = c.utf16_span(node);
+                c.report(range, &[]);
+                return;
+            }
+            current = stripped;
+        }
+    }
+
+    /// One peel step (the official switch, :63-72): an access receiver, the
+    /// target of a prefixed invocation, or a `!` operand.
+    fn peel(c: &Check<'_>, node: u32) -> Option<u32> {
+        match c.kind(node) {
+            // `a.b`, `a?.b` → `a`.
+            NodeKind::DotAccess | NodeKind::Qualified => {
+                let kids = c.collect_direct(node);
+                kids.first().copied()
+            }
+            // `a.b()` → the invocation target behind the callee's last dot.
+            NodeKind::Send => {
+                let kids = c.collect_direct(node);
+                let callee = kids.iter().copied().find(|&kid| {
+                    !matches!(
+                        c.kind(kid),
+                        NodeKind::Arguments | NodeKind::NoArguments | NodeKind::TypeApplication
+                    )
+                })?;
+                match c.kind(callee) {
+                    NodeKind::DotAccess | NodeKind::Qualified => {
+                        c.collect_direct(callee).first().copied()
+                    }
+                    _ => None,
+                }
+            }
+            // `a!` → `a`.
+            NodeKind::UnaryPostfix => {
+                let op = c.payload(node).first().copied()?;
+                if c.unit.tokens.get(op as usize)?.kind != TokenKind::Bang {
+                    return None;
+                }
+                c.collect_direct(node).first().copied()
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
 
-    use crate::testsupport::{identifier, one_rule, tok, utf16_at, Fixture, unit_of};
+    use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
 
     /// `test/rules/unnecessary_new_test.dart` `test_new` — the keyword
     /// reports, zero-width at its start.
@@ -236,16 +494,19 @@ mod tests {
     fn unnecessary_new_reports_the_keyword() {
         let source = "new B();";
         // new0 B1 (2 )3 ;4
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::NewExpression, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::Arguments, 2);
-            
-            b.end(NodeKind::Arguments, 4);
-            b.end(NodeKind::NewExpression, 4);
-            b.end(NodeKind::ExpressionStatement, 5);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::NewExpression, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::Arguments, 2);
+
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::NewExpression, 4);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
         let lints = f.run(&one_rule("unnecessary_new"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary 'new' keyword.");
@@ -256,11 +517,14 @@ mod tests {
     #[test]
     fn unnecessary_new_implicit_creation_passes() {
         let source = "B();";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.leaf_span(NodeKind::Send, 0, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.leaf_span(NodeKind::Send, 0, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         assert!(f.run(&one_rule("unnecessary_new")).is_empty());
     }
 
@@ -270,21 +534,24 @@ mod tests {
     fn if_null_right_null_reports() {
         let source = "var a = b ?? null;";
         // var0 a1 =2 b3 ??4 null5 ;6
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::VariablesDeclaration, 0);
-            b.patch(0, tok(source, t, "var", 0));
-            b.begin(NodeKind::InitializedIdentifier, 1);
-            
-            b.begin(NodeKind::VariableInitializer, 2);
-            b.begin(NodeKind::BinaryExpression, 3);
-            b.patch(0, tok(source, t, "??", 0));
-            identifier(b, 3, 4);
-            b.leaf(NodeKind::LiteralNull, 5);
-            b.end(NodeKind::BinaryExpression, 6);
-            b.end(NodeKind::VariableInitializer, 6);
-            b.end(NodeKind::InitializedIdentifier, 6);
-            b.end(NodeKind::VariablesDeclaration, 7);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::BinaryExpression, 3);
+                b.patch(0, tok(source, t, "??", 0));
+                identifier(b, 3, 4);
+                b.leaf(NodeKind::LiteralNull, 5);
+                b.end(NodeKind::BinaryExpression, 6);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 7);
+            }),
+        );
         let lints = f.run(&one_rule("unnecessary_null_in_if_null_operators"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary use of '??' with 'null'.");
@@ -297,15 +564,18 @@ mod tests {
     fn if_null_left_null_reports() {
         let source = "null ?? b;";
         // null0 ??1 b2 ;3
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::BinaryExpression, 0);
-            b.patch(0, tok(source, t, "??", 0));
-            b.leaf(NodeKind::LiteralNull, 0);
-            identifier(b, 2, 3);
-            b.end(NodeKind::BinaryExpression, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "??", 0));
+                b.leaf(NodeKind::LiteralNull, 0);
+                identifier(b, 2, 3);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         let lints = f.run(&one_rule("unnecessary_null_in_if_null_operators"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 0));
@@ -314,15 +584,18 @@ mod tests {
     #[test]
     fn if_null_without_null_passes() {
         let source = "b ?? c;";
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::BinaryExpression, 0);
-            b.patch(0, tok(source, t, "??", 0));
-            identifier(b, 0, 1);
-            identifier(b, 2, 3);
-            b.end(NodeKind::BinaryExpression, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "??", 0));
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         assert!(
             f.run(&one_rule("unnecessary_null_in_if_null_operators"))
                 .is_empty()
@@ -335,19 +608,22 @@ mod tests {
     fn prefer_is_not_reports_the_prefix() {
         let source = "!(a is int);";
         // !0 (1 a2 is3 int4 )5 ;6
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::UnaryPrefix, 0);
-            b.begin(NodeKind::ParenthesizedExpression, 1);
-            b.begin(NodeKind::IsExpression, 1);
-            b.patch(0, 0); // `is`, not `is!`
-            identifier(b, 2, 3);
-            b.leaf_span(NodeKind::Type, 4, 5);
-            b.end(NodeKind::IsExpression, 5);
-            b.end(NodeKind::ParenthesizedExpression, 6);
-            b.end(NodeKind::UnaryPrefix, 6);
-            b.end(NodeKind::ExpressionStatement, 7);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::UnaryPrefix, 0);
+                b.begin(NodeKind::ParenthesizedExpression, 1);
+                b.begin(NodeKind::IsExpression, 1);
+                b.patch(0, 0); // `is`, not `is!`
+                identifier(b, 2, 3);
+                b.leaf_span(NodeKind::Type, 4, 5);
+                b.end(NodeKind::IsExpression, 5);
+                b.end(NodeKind::ParenthesizedExpression, 6);
+                b.end(NodeKind::UnaryPrefix, 6);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
         let lints = f.run(&one_rule("prefer_is_not_operator"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -361,19 +637,22 @@ mod tests {
     #[test]
     fn prefer_is_not_bare_is_bang_passes() {
         let source = "!(a is! int);";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::UnaryPrefix, 0);
-            b.begin(NodeKind::ParenthesizedExpression, 1);
-            b.begin(NodeKind::IsExpression, 1);
-            b.patch(0, 1); // `is!`
-            identifier(b, 2, 3);
-            b.leaf_span(NodeKind::Type, 4, 5);
-            b.end(NodeKind::IsExpression, 5);
-            b.end(NodeKind::ParenthesizedExpression, 6);
-            b.end(NodeKind::UnaryPrefix, 6);
-            b.end(NodeKind::ExpressionStatement, 7);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::UnaryPrefix, 0);
+                b.begin(NodeKind::ParenthesizedExpression, 1);
+                b.begin(NodeKind::IsExpression, 1);
+                b.patch(0, 1); // `is!`
+                identifier(b, 2, 3);
+                b.leaf_span(NodeKind::Type, 4, 5);
+                b.end(NodeKind::IsExpression, 5);
+                b.end(NodeKind::ParenthesizedExpression, 6);
+                b.end(NodeKind::UnaryPrefix, 6);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
         assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
     }
 
@@ -382,15 +661,18 @@ mod tests {
     #[test]
     fn prefer_is_not_unwrapped_is_passes() {
         let source = "a is int;";
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::IsExpression, 0);
-            b.patch(0, 0);
-            identifier(b, 0, 1);
-            b.leaf_span(NodeKind::Type, 2, 3);
-            b.end(NodeKind::IsExpression, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::IsExpression, 0);
+                b.patch(0, 0);
+                identifier(b, 0, 1);
+                b.leaf_span(NodeKind::Type, 2, 3);
+                b.end(NodeKind::IsExpression, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
     }
 
@@ -400,15 +682,18 @@ mod tests {
     fn adjacent_strings_reports_the_plus() {
         let source = "'a' + 'b';";
         // 'a'0 +1 'b'2 ;3
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::BinaryExpression, 0);
-            b.patch(0, tok(source, t, "+", 0));
-            b.leaf_span(NodeKind::StringLiteral, 0, 1);
-            b.leaf_span(NodeKind::StringLiteral, 2, 3);
-            b.end(NodeKind::BinaryExpression, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "+", 0));
+                b.leaf_span(NodeKind::StringLiteral, 0, 1);
+                b.leaf_span(NodeKind::StringLiteral, 2, 3);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         let lints = f.run(&one_rule("prefer_adjacent_string_concatenation"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -421,15 +706,18 @@ mod tests {
     #[test]
     fn adjacent_strings_mixed_operands_passes() {
         let source = "'a' + b;";
-        let f = Fixture::build(source, unit_of(|b, t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            b.begin(NodeKind::BinaryExpression, 0);
-            b.patch(0, tok(source, t, "+", 0));
-            b.leaf_span(NodeKind::StringLiteral, 0, 1);
-            identifier(b, 2, 3);
-            b.end(NodeKind::BinaryExpression, 3);
-            b.end(NodeKind::ExpressionStatement, 4);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "+", 0));
+                b.leaf_span(NodeKind::StringLiteral, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
         assert!(
             f.run(&one_rule("prefer_adjacent_string_concatenation"))
                 .is_empty()
@@ -443,22 +731,25 @@ mod tests {
         let source = "a..b();";
         // a0 ..1 b2 (3 )4 ;5 — the target precedes the cascade node; the
         // cascade's children are its sections (collapse map §3.5 CascadeEnd).
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            identifier(b, 0, 1);
-            b.begin(NodeKind::Cascade, 1);
-            b.begin(NodeKind::CascadeAccess, 2);
-            b.patch(0, 2);
-            b.patch(1, 0);
-            b.begin(NodeKind::Send, 3);
-            b.begin(NodeKind::Arguments, 3);
-            
-            b.end(NodeKind::Arguments, 5);
-            b.end(NodeKind::Send, 5);
-            b.end(NodeKind::CascadeAccess, 5);
-            b.end(NodeKind::Cascade, 5);
-            b.end(NodeKind::ExpressionStatement, 6);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Cascade, 1);
+                b.begin(NodeKind::CascadeAccess, 2);
+                b.patch(0, 2);
+                b.patch(1, 0);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::Arguments, 3);
+
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::Send, 5);
+                b.end(NodeKind::CascadeAccess, 5);
+                b.end(NodeKind::Cascade, 5);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
         let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary cascade expression.");
@@ -474,22 +765,25 @@ mod tests {
     fn single_null_aware_cascade_suggests_qmark_dot() {
         let source = "a?..b();";
         // a0 ?..1 b2 (3 )4 ;5
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            identifier(b, 0, 1);
-            b.begin(NodeKind::Cascade, 1);
-            b.begin(NodeKind::CascadeAccess, 2);
-            b.patch(0, 2);
-            b.patch(1, 1);
-            b.begin(NodeKind::Send, 3);
-            b.begin(NodeKind::Arguments, 3);
-            
-            b.end(NodeKind::Arguments, 5);
-            b.end(NodeKind::Send, 5);
-            b.end(NodeKind::CascadeAccess, 5);
-            b.end(NodeKind::Cascade, 5);
-            b.end(NodeKind::ExpressionStatement, 6);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Cascade, 1);
+                b.begin(NodeKind::CascadeAccess, 2);
+                b.patch(0, 2);
+                b.patch(1, 1);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::Arguments, 3);
+
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::Send, 5);
+                b.end(NodeKind::CascadeAccess, 5);
+                b.end(NodeKind::Cascade, 5);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
         let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -502,34 +796,337 @@ mod tests {
     fn multi_section_cascade_passes() {
         let source = "a..b()..c();";
         // a0 ..1 b2 (3 )4 ..5 c6 (7 )8 ;9
-        let f = Fixture::build(source, unit_of(|b, _t| {
-            b.begin(NodeKind::ExpressionStatement, 0);
-            identifier(b, 0, 1);
-            b.begin(NodeKind::Cascade, 1);
-            b.begin(NodeKind::CascadeAccess, 2);
-            b.patch(0, 2);
-            b.patch(1, 0);
-            b.begin(NodeKind::Send, 3);
-            b.begin(NodeKind::Arguments, 3);
-            
-            b.end(NodeKind::Arguments, 5);
-            b.end(NodeKind::Send, 5);
-            b.end(NodeKind::CascadeAccess, 5);
-            b.begin(NodeKind::CascadeAccess, 5);
-            b.patch(0, 5);
-            b.patch(1, 0);
-            b.begin(NodeKind::Send, 6);
-            b.begin(NodeKind::Arguments, 7);
-            
-            b.end(NodeKind::Arguments, 9);
-            b.end(NodeKind::Send, 9);
-            b.end(NodeKind::CascadeAccess, 9);
-            b.end(NodeKind::Cascade, 9);
-            b.end(NodeKind::ExpressionStatement, 10);
-        }));
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Cascade, 1);
+                b.begin(NodeKind::CascadeAccess, 2);
+                b.patch(0, 2);
+                b.patch(1, 0);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::Arguments, 3);
+
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::Send, 5);
+                b.end(NodeKind::CascadeAccess, 5);
+                b.begin(NodeKind::CascadeAccess, 5);
+                b.patch(0, 5);
+                b.patch(1, 0);
+                b.begin(NodeKind::Send, 6);
+                b.begin(NodeKind::Arguments, 7);
+
+                b.end(NodeKind::Arguments, 9);
+                b.end(NodeKind::Send, 9);
+                b.end(NodeKind::CascadeAccess, 9);
+                b.end(NodeKind::Cascade, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
         assert!(
             f.run(&one_rule("avoid_single_cascade_in_expression_statements"))
                 .is_empty()
         );
+    }
+
+    // —— prefer_conditional_assignment ———————————————————————————————————
+
+    /// `test/rules/prefer_conditional_assignment_test.dart` `test_ifNullAssign`.
+    #[test]
+    fn conditional_assignment_reports_the_if() {
+        let source = "var x;\nif (x == null) x = 1;";
+        // var0 x1 ;2 if3 (4 x5 ==6 null7 )8 x9 =10 111 ;12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, 0);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.end(NodeKind::InitializedIdentifier, 2);
+                b.end(NodeKind::VariablesDeclaration, 3);
+                b.begin(NodeKind::IfStatement, 3);
+                b.patch(0, NONE); // no else
+                b.begin(NodeKind::ParenthesizedCondition, 4);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::BinaryExpression, 5);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 5, 6);
+                b.leaf(NodeKind::LiteralNull, 7);
+                b.end(NodeKind::BinaryExpression, 8);
+                b.end(NodeKind::ParenthesizedCondition, 9);
+                b.begin(NodeKind::ExpressionStatement, 9);
+                b.begin(NodeKind::Assignment, 9);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 9, 10);
+                b.leaf(NodeKind::LiteralInt, 11);
+                b.end(NodeKind::Assignment, 12);
+                b.end(NodeKind::ExpressionStatement, 13);
+                b.end(NodeKind::IfStatement, 13);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_conditional_assignment"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The 'if' statement could be replaced by a null-aware assignment."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 3));
+    }
+
+    /// An else arm disqualifies (:70-72).
+    #[test]
+    fn conditional_assignment_with_else_passes() {
+        let source = "if (x == null) x = 1; else ;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::IfStatement, 0);
+                b.patch(0, tok(source, t, "else", 0));
+                b.begin(NodeKind::ParenthesizedCondition, 1);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::BinaryExpression, 2);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 2, 3);
+                b.leaf(NodeKind::LiteralNull, 4);
+                b.end(NodeKind::BinaryExpression, 5);
+                b.end(NodeKind::ParenthesizedCondition, 6);
+                b.begin(NodeKind::ExpressionStatement, 6);
+                b.begin(NodeKind::Assignment, 6);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 6, 7);
+                b.leaf(NodeKind::LiteralInt, 8);
+                b.end(NodeKind::Assignment, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+                b.leaf(NodeKind::EmptyStatement, 11);
+                b.end(NodeKind::IfStatement, 12);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_conditional_assignment")).is_empty());
+    }
+
+    /// A non-assignment then arm passes.
+    #[test]
+    fn conditional_assignment_other_then_passes() {
+        let source = "if (x == null) y = 1;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::IfStatement, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::ParenthesizedCondition, 1);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::BinaryExpression, 2);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 2, 3);
+                b.leaf(NodeKind::LiteralNull, 4);
+                b.end(NodeKind::BinaryExpression, 5);
+                b.end(NodeKind::ParenthesizedCondition, 6);
+                b.begin(NodeKind::ExpressionStatement, 6);
+                b.begin(NodeKind::Assignment, 6);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 6, 7);
+                b.leaf(NodeKind::LiteralInt, 8);
+                b.end(NodeKind::Assignment, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+                b.end(NodeKind::IfStatement, 10);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_conditional_assignment")).is_empty());
+    }
+
+    // —— prefer_if_null_operators ————————————————————————————————————————
+
+    /// `test/rules/prefer_if_null_operators_test.dart` `test_usedElse`.
+    #[test]
+    fn if_null_reports_the_else_mirror() {
+        let source = "a == null ? 1 : a;";
+        // a0 ==1 null2 ?3 14 :5 a6 ;7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 3);
+                b.patch(0, tok(source, t, "?", 0));
+                b.patch(1, tok(source, t, ":", 0));
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                identifier(b, 6, 7);
+                b.end(NodeKind::Conditional, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use the '??' operator rather than '?:' when testing for 'null'."
+        );
+    }
+
+    /// The `!=` form tests the then arm (`test_usedThen`).
+    #[test]
+    fn if_null_reports_the_then_mirror() {
+        let source = "a != null ? a : 1;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 3);
+                b.patch(0, tok(source, t, "?", 0));
+                b.patch(1, tok(source, t, ":", 0));
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "!=", 0));
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::BinaryExpression, 3);
+                identifier(b, 4, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::Conditional, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+    }
+
+    /// Divergent arms pass (`test_different`).
+    #[test]
+    fn if_null_divergent_arms_pass() {
+        let source = "a == null ? 1 : b;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 3);
+                b.patch(0, tok(source, t, "?", 0));
+                b.patch(1, tok(source, t, ":", 0));
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                identifier(b, 6, 7);
+                b.end(NodeKind::Conditional, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_if_null_operators")).is_empty());
+    }
+
+    // —— prefer_null_aware_operators —————————————————————————————————————
+
+    /// `x == null ? null : x.b` reports (`test_prefixedIdentifier` family).
+    #[test]
+    fn null_aware_reports_the_access_form() {
+        let source = "a.b == null ? null : a.b.c;";
+        // a0 .1 b2 ==3 null4 ?5 null6 :7 a8 .9 b10 .11 c12 ;13
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 5);
+                b.patch(0, tok(source, t, "?", 0));
+                b.patch(1, tok(source, t, ":", 0));
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "==", 0));
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.leaf(NodeKind::LiteralNull, 4);
+                b.end(NodeKind::BinaryExpression, 5);
+                b.leaf(NodeKind::LiteralNull, 6);
+                b.begin(NodeKind::DotAccess, 8);
+                b.patch(0, 9);
+                b.patch(1, 0);
+                b.begin(NodeKind::DotAccess, 8);
+                b.patch(0, 9);
+                b.patch(1, 0);
+                identifier(b, 8, 9);
+                identifier(b, 10, 11);
+                b.end(NodeKind::DotAccess, 11);
+                identifier(b, 12, 13);
+                b.end(NodeKind::DotAccess, 13);
+                b.end(NodeKind::Conditional, 13);
+                b.end(NodeKind::ExpressionStatement, 14);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_null_aware_operators"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use the null-aware operator '?.' rather than an explicit 'null' comparison."
+        );
+    }
+
+    /// A result with no peelable access passes (`a == null ? null : a`).
+    #[test]
+    fn null_aware_bare_identifier_passes() {
+        let source = "a == null ? null : a;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 3);
+                b.patch(0, tok(source, t, "?", 0));
+                b.patch(1, tok(source, t, ":", 0));
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "==", 0));
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.leaf(NodeKind::LiteralNull, 4);
+                identifier(b, 6, 7);
+                b.end(NodeKind::Conditional, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_null_aware_operators")).is_empty());
+    }
+
+    /// The `!=` mirror reports on the then arm (`test_notEqual`).
+    #[test]
+    fn null_aware_not_equal_reports() {
+        // The official walk peels the result before the comparison
+        // (:76-93), so the matching shape is `a != null ? a.b : null` —
+        // `a.b != null ? a.b : null` peels `a.b` to `a` and never matches.
+        let source = "a != null ? a.b : null;";
+        // a0 !=1 null2 ?3 a4 .5 b6 :7 null8 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Conditional, 3);
+                b.patch(0, 3);
+                b.patch(1, 7);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::BinaryExpression, 3);
+                b.begin(NodeKind::DotAccess, 4);
+                b.patch(0, 5);
+                b.patch(1, 0);
+                identifier(b, 4, 5);
+                identifier(b, 6, 7);
+                b.end(NodeKind::DotAccess, 7);
+                b.leaf(NodeKind::LiteralNull, 8);
+                b.end(NodeKind::Conditional, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_null_aware_operators"));
+        assert_eq!(lints.len(), 1);
     }
 }

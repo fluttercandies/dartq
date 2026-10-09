@@ -6,7 +6,7 @@
 //! AGENTS.md fact-source discipline). When the snapshot re-pins, update the
 //! lists here in the same change as the registry.
 
-use dartq_lints::{rule_by_name, EnableSet, Group, RULES};
+use dartq_lints::{EnableSet, Group, RULES, rule_by_name};
 
 /// `.third/lints/lib/core.yaml` — the critical set, pinned verbatim.
 const OFFICIAL_CORE: &[&str] = &[
@@ -164,6 +164,12 @@ fn registry_fits_the_enable_set_word_count() {
     );
 }
 
+/// The wave-2 slice pin: 18 wave-1 rules + 18 wave-2 rules = 36 registered.
+#[test]
+fn registry_holds_the_pinned_wave_two_count() {
+    assert_eq!(RULES.len(), 36);
+}
+
 #[test]
 fn rule_by_name_round_trips() {
     for (i, spec) in RULES.iter().enumerate() {
@@ -192,7 +198,11 @@ fn enable_set_all_and_resolve_agree() {
 #[test]
 fn templates_are_well_formed() {
     for spec in RULES {
-        assert!(!spec.problem.is_empty(), "{} has no problemMessage", spec.name);
+        assert!(
+            !spec.problem.is_empty(),
+            "{} has no problemMessage",
+            spec.name
+        );
         let rendered = spec.render_problem(&["X"]);
         assert!(!rendered.contains("{0}"), "{} left a raw slot", spec.name);
         if !spec.correction.is_empty() {
