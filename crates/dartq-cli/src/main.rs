@@ -89,6 +89,9 @@ fn run(args: &[String]) -> u8 {
         }) => match query_args.face {
             QueryFace::Symbol(symbol_args) => query_symbol(&symbol_args),
         },
+        Ok(Cli {
+            command: Some(Command::Daemon(daemon_args)),
+        }) => daemon(&daemon_args),
         // Bare `dartq`, `dartq version`, and `--version` all land here.
         Ok(Cli { command: _ }) => {
             println!("dartq {}", env!("CARGO_PKG_VERSION"));
@@ -118,6 +121,9 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Scan + parse only (the M0 differential face, engine-api-spec §4.1).
     Check(CheckArgs),
+    /// Serve the LSP daemon over stdin/stdout (one client; overlay + full
+    /// diagnostics, PRD §16.3).
+    Daemon(DaemonArgs),
     /// Query the analyzed workspace's symbol index (PRD §20.3).
     Query(QueryArgs),
     /// Print the version.
@@ -177,6 +183,16 @@ enum AnalyzeFormat {
     Machine,
     /// Human-readable, grouped by file, severity-sorted.
     Human,
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    /// Package directory holding `pubspec.yaml` and
+    /// `.dart_tool/package_config.json`.
+    dir: PathBuf,
+    /// Dart SDK root; defaults to `$DART_SDK`.
+    #[arg(long)]
+    sdk: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -635,6 +651,32 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         }
     }
     severity_exit(&diags, !args.no_fatal_warnings, args.fatal_infos)
+}
+
+/// The LSP daemon face: assemble the engine context, hand it to the daemon
+/// session, and serve stdin/stdout until `shutdown`+`exit` or EOF. The
+/// workspace sweep (discovery + first analysis) runs inside the session at
+/// `initialized`, so the client sees full diagnostics immediately after the
+/// handshake.
+fn daemon(args: &DaemonArgs) -> u8 {
+    let (engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(code) => return code,
+    };
+    let session = dartq_daemon::Session::new(engine);
+    // The reader thread owns stdin; only the main loop writes stdout, so the
+    // buffer needs no lock. The `Stdin` handle (not `StdinLock`) is what is
+    // `Send`. On `exit` the reader may still be blocked on the next read —
+    // process exit reaps it.
+    let stdin = io::BufReader::new(io::stdin());
+    let stdout = io::BufWriter::new(io::stdout().lock());
+    match dartq_daemon::run(stdin, stdout, session) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("dartq: internal error: daemon transport failed: {error}");
+            exit::INTERNAL_ERROR
+        }
+    }
 }
 
 /// The three pub faces the engine's context derives from (the same assembly

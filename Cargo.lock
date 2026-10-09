@@ -195,6 +195,7 @@ name = "dartq-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dartq-daemon",
  "dartq-diagnostics",
  "dartq-engine",
  "dartq-language",
@@ -206,6 +207,21 @@ dependencies = [
  "dartq-source",
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "dartq-daemon"
+version = "0.1.0"
+dependencies = [
+ "dartq-diagnostics",
+ "dartq-engine",
+ "dartq-package",
+ "dartq-pub",
+ "dartq-sdk",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -242,6 +258,13 @@ dependencies = [
 [[package]]
 name = "dartq-flow"
 version = "0.1.0"
+dependencies = [
+ "dartq-language",
+ "dartq-parser",
+ "dartq-scanner",
+ "dartq-source",
+ "rustc-hash",
+]
 
 [[package]]
 name = "dartq-incremental"
@@ -271,6 +294,14 @@ dependencies = [
 [[package]]
 name = "dartq-lints"
 version = "0.1.0"
+dependencies = [
+ "dartq-ast",
+ "dartq-parser",
+ "dartq-scanner",
+ "dartq-source",
+ "memchr",
+ "rustc-hash",
+]
 
 [[package]]
 name = "dartq-package"
