@@ -616,17 +616,16 @@ impl<'s> Lexer<'s> {
 
     fn unexpected_char(&mut self, c: char, start: usize) -> Flow {
         if c == '\u{FFFD}' {
-            // U+FFFD: officially an encoding error — reported as `encoding` and
-            // skipped, never merged into an identifier (official
-            // buildUnexpectedCharacterToken → EncodingErrorToken,
-            // error_token.dart:25-26; translated to `encoding`,
-            // translate_error_token.dart:33-35).
-            self.diag(
-                dartq_diagnostics::ENCODING,
-                msg::ENCODING.to_owned(),
-                start,
-                start + c.len_utf8(),
-            );
+            // U+FFFD: skip silently. The official scanner has an
+            // EncodingErrorToken path (error_token.dart:25-26 →
+            // translate_error_token.dart:33-35), but the pinned oracle emits
+            // ZERO diagnostics for both reachable U+FFFD classes: a raw
+            // undecodable byte (the read layer tolerates it) and a literal
+            // U+FFFD in valid UTF-8 — measured against
+            // `dart analyze --format=machine` (docs/facts
+            // corpus-expansion-plan.md §7). Measured-cull doctrine governs:
+            // dartq emits nothing here. The character is still consumed
+            // (never merged into an identifier), preserving termination.
             self.bump();
             return Flow::Next;
         }

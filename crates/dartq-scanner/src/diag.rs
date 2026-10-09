@@ -182,5 +182,4 @@ pub(crate) mod msg {
     pub const UNSUPPORTED_OPERATOR: &str = "The '===' is not a valid operator.";
     pub const MISSING_IDENTIFIER: &str = "Expected an identifier.";
     pub const UNSUPPORTED_NEQ: &str = "The '!==' is not a valid operator.";
-    pub const ENCODING: &str = "Unable to decode bytes as UTF-8.";
 }

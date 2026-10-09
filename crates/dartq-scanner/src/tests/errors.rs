@@ -493,20 +493,20 @@ fn del_merges_into_identifier() {
 }
 
 #[test]
-fn replacement_char_is_encoding_error_skipped() {
-    // U+FFFD: official EncodingErrorToken — `encoding` diagnostic and skip,
-    // never merged into an identifier (error_token.dart:25-26,
-    // translate_error_token.dart:33-35).
+fn replacement_char_is_skipped_silently() {
+    // U+FFFD: zero diagnostics. The official scanner has an EncodingErrorToken
+    // path, but the pinned oracle emits nothing for either reachable U+FFFD
+    // class — a raw undecodable byte (read-layer tolerance) and a literal
+    // U+FFFD in valid UTF-8 — so the measured-cull doctrine governs
+    // (docs/facts corpus-expansion-plan.md §7). The character is consumed,
+    // never merged into an identifier.
     let r = scan_src("a\u{FFFD}b");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);
-    assert_codes(&r, &["encoding"]);
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, 1);
-    assert_eq!(d.range.length, 1);
-    // Consecutive U+FFFD: one diagnostic each, no token merging.
+    assert!(r.diagnostics.is_empty());
+    // Consecutive U+FFFD: still silent, no token merging.
     let r = scan_src("\u{FFFD}\u{FFFD}x");
     assert_kinds(&r, &[K::Identifier]);
-    assert_codes(&r, &["encoding", "encoding"]);
+    assert!(r.diagnostics.is_empty());
 }
 
 #[test]
