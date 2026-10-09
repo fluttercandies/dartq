@@ -9,7 +9,7 @@
 //! construction.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dartiq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
 
@@ -26,6 +26,10 @@ use crate::name::PackageName;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageTable {
     packages: BTreeMap<PackageName, PackageIdentity>,
+    /// Package names ordered by root depth, deepest first —
+    /// [`PackageTable::containing`]'s scan index (depths are computed once
+    /// here, never per query).
+    by_depth: Vec<PackageName>,
     root: PackageName,
     /// Workspace members when the root is a pub workspace, root excluded;
     /// `None` outside workspaces (mirrors
@@ -37,32 +41,41 @@ impl PackageTable {
     /// Composes the table from the config and its resolved graph.
     ///
     /// Package roots are resolved from the config's `rootUri` against
-    /// `config_dir` (the `.dart_tool/` directory) and lexically normalized.
-    /// Source categories come from the graph instances' source references.
+    /// `config_dir` (the `.dart_tool/` directory) and lexically normalized;
+    /// each entry's `packageUri` is joined onto its root and normalized the
+    /// same way. Source categories come from the graph instances' source
+    /// references.
     ///
     /// `config_dir` must be absolute — the engine's assembly step
-    /// (engine-api-spec) passes the absolute `.dart_tool/` directory. That
-    /// contract is enforced with `debug_assert!` rather than prose alone:
-    /// a violation is an engine-side bug that would silently produce wrong
-    /// roots, so it should fail loudly in debug builds and tests at the
-    /// boundary where it is introduced.
+    /// (engine-api-spec) passes the absolute `.dart_tool/` directory. A
+    /// relative one would silently produce wrong roots, and build is
+    /// one-shot (no later step could recover), so the violation is a hard
+    /// [`crate::PackageError::RelativeConfigDir`], not a debug-only assert.
+    ///
+    /// Two more root invariants are enforced at build, mirroring the
+    /// oracle reader: a normalized `packageUri` directory must stay inside
+    /// its package root ([`crate::PackageError::LibDirOutsideRoot`]), and
+    /// two entries must not resolve to the same normalized root
+    /// ([`crate::PackageError::DuplicateRoot`] — file→package attribution
+    /// could not pick an owner).
     ///
     /// # Errors
     ///
     /// Returns [`crate::PackageError`] when the artifacts disagree (a config
     /// entry without a graph instance, the root or a workspace member
-    /// without a config entry, duplicate entries), when a name is outside
-    /// pub's grammar, or when a `rootUri` cannot be resolved.
+    /// without a config entry, duplicate entries), when a config name is
+    /// outside the reader's loose grammar, when a `rootUri` cannot be
+    /// resolved, or when a root invariant above is violated.
     pub fn build(
         config: &PackageConfig,
         graph: &ResolvedPackageGraph,
         config_dir: &Path,
     ) -> Result<PackageTable, crate::PackageError> {
-        debug_assert!(
-            config_dir.is_absolute(),
-            "config_dir must be absolute, got `{}`",
-            config_dir.display()
-        );
+        if !config_dir.is_absolute() {
+            return Err(crate::PackageError::RelativeConfigDir {
+                path: config_dir.display().to_string(),
+            });
+        }
 
         // Last-wins when the graph carries two instances of one name —
         // unreachable through `build_graph` (it rejects duplicate config
@@ -74,8 +87,18 @@ impl PackageTable {
             .collect();
 
         let mut packages = BTreeMap::new();
+        // Normalized root -> the first config entry claiming it.
+        let mut root_owners: BTreeMap<PathBuf, PackageName> = BTreeMap::new();
         for entry in &config.packages {
-            let name = PackageName::new(&entry.name)?;
+            // Config entries use the reader's loose grammar — stricter
+            // pubspec names never reach here as entries (see
+            // `is_valid_config_name`).
+            if !is_valid_config_name(&entry.name) {
+                return Err(crate::PackageError::InvalidConfigName {
+                    name: entry.name.clone(),
+                });
+            }
+            let name = PackageName::new_unchecked(entry.name.clone());
             if packages.contains_key(&name) {
                 return Err(crate::PackageError::DuplicateEntry {
                     name: entry.name.clone(),
@@ -87,8 +110,31 @@ impl PackageTable {
                 }
             })?;
             let root = normalize(&entry.resolve_root(config_dir)?);
+            let lib_dir = normalize(&root.join(lib_dir_name(&entry.package_uri)));
+            // The `packageUri` directory must be the root or below it
+            // (`package_config-3.0.0` `package_config.dart:838`); after
+            // normalization a `../lib` spelling escapes and is rejected
+            // loudly instead of silently mis-resolving.
+            if lib_dir.strip_prefix(&root).is_err() {
+                return Err(crate::PackageError::LibDirOutsideRoot {
+                    name: entry.name.clone(),
+                    lib_dir: lib_dir.display().to_string(),
+                    root: root.display().to_string(),
+                });
+            }
+            // Duplicate normalized roots make file→package attribution
+            // ambiguous (analyzer analog: `package_map_resolver.dart:33-52`
+            // scans every root per file, where two equal roots race).
+            if let Some(first) = root_owners.get(&root) {
+                return Err(crate::PackageError::DuplicateRoot {
+                    first: first.to_string(),
+                    name: entry.name.clone(),
+                    root: root.display().to_string(),
+                });
+            }
+            root_owners.insert(root.clone(), name.clone());
             let identity = PackageIdentity {
-                lib_dir: root.join(lib_dir_name(&entry.package_uri)),
+                lib_dir,
                 name,
                 root,
                 language_version: entry.language_version,
@@ -120,8 +166,19 @@ impl PackageTable {
             }
         };
 
+        // Deepest-first root index for `containing`: roots are sorted by
+        // component depth once, so each query stops at the first prefix
+        // hit instead of scoring every package.
+        let mut by_depth: Vec<(&PackageName, usize)> = packages
+            .iter()
+            .map(|(name, identity)| (name, identity.root.components().count()))
+            .collect();
+        by_depth.sort_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+        let by_depth = by_depth.into_iter().map(|(name, _)| name.clone()).collect();
+
         Ok(PackageTable {
             packages,
+            by_depth,
             root: root_name,
             workspace_members,
         })
@@ -149,12 +206,19 @@ impl PackageTable {
     /// the root package's tree — the deepest matching root wins, so a file
     /// under `/proj/deps/local_dep` attributes to `local_dep`, not to the
     /// root package at `/proj`.
+    ///
+    /// Roots are scanned deepest-first (the `by_depth` index), with an
+    /// early exit on the first hit: a nested root always has strictly more
+    /// components than any root it is contained by, and two distinct roots
+    /// of equal depth can never both prefix one path, so the first hit is
+    /// the deepest — no full-table scan, which matters because the engine
+    /// calls this per file.
     #[must_use]
     pub fn containing(&self, path: &Path) -> Option<&PackageIdentity> {
-        self.packages
-            .values()
-            .filter(|package| path.strip_prefix(&package.root).is_ok())
-            .max_by_key(|package| package.root.components().count())
+        self.by_depth
+            .iter()
+            .map(|name| &self.packages[name])
+            .find(|package| path.strip_prefix(&package.root).is_ok())
     }
 
     /// All packages, ordered by name.
@@ -192,6 +256,26 @@ impl PackageTable {
 /// (already slash-normalized by the parser).
 fn lib_dir_name(package_uri: &str) -> &str {
     package_uri.trim_end_matches('/')
+}
+
+/// The package_config reader's loose name grammar — every character in
+/// the reader charset with at least one non-`.` character
+/// (`package_config-3.0.0` `util.dart:12-36`, `_validPackageNameCharacters`
+/// + `checkPackageName`), so config-written names like `1abc`/`-foo` are
+/// consumed as pub wrote them. Deliberately looser than the pubspec layer's
+/// `is_valid_package_name` (dartiq-pub `pubspec.rs:368`), which keeps its
+/// strict grammar: the config file is read, not re-published.
+fn is_valid_config_name(name: &str) -> bool {
+    const CHARSET: &str =
+        "!$&'()*+,-.;=@0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    let mut non_dot = false;
+    for c in name.chars() {
+        if !CHARSET.contains(c) {
+            return false;
+        }
+        non_dot |= c != '.';
+    }
+    non_dot
 }
 
 #[cfg(test)]
@@ -262,6 +346,31 @@ dependencies:
     fn table_for(config: &PackageConfig) -> PackageTable {
         PackageTable::build(config, &graph_for(config), Path::new("/proj/.dart_tool"))
             .expect("table")
+    }
+
+    /// A graph over `config` without workspace or extra-pubspec plumbing —
+    /// the minimal fixture for table-build-only scenarios.
+    fn plain_graph(config: &PackageConfig) -> ResolvedPackageGraph {
+        let lock = LockFile::parse(LOCK).expect("valid lock");
+        build_graph(
+            config,
+            &lock,
+            &root_pubspec(),
+            &BTreeMap::new(),
+            None,
+            Path::new("/proj/.dart_tool"),
+        )
+        .expect("graph")
+    }
+
+    fn plain_table(config_text: &str) -> PackageTable {
+        let config = PackageConfig::parse(config_text).expect("valid config");
+        PackageTable::build(
+            &config,
+            &plain_graph(&config),
+            Path::new("/proj/.dart_tool"),
+        )
+        .expect("table")
     }
 
     #[test]
@@ -380,6 +489,8 @@ sdks:
 
     #[test]
     fn invalid_and_duplicate_names_are_rejected() {
+        // A space is outside even the reader's loose charset, so the
+        // config layer rejects it with the config-grammar error.
         let invalid = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "foo bar", "rootUri": "../"}]}"#,
         )
@@ -387,7 +498,7 @@ sdks:
         let graph = graph_for(&PackageConfig::parse(CONFIG).expect("valid config"));
         assert!(matches!(
             PackageTable::build(&invalid, &graph, Path::new("/proj/.dart_tool")),
-            Err(crate::PackageError::InvalidName { .. })
+            Err(crate::PackageError::InvalidConfigName { name }) if name == "foo bar"
         ));
 
         let duplicated = PackageConfig::parse(
@@ -400,6 +511,173 @@ sdks:
         assert!(matches!(
             PackageTable::build(&duplicated, &graph, Path::new("/proj/.dart_tool")),
             Err(crate::PackageError::DuplicateEntry { name }) if name == "app"
+        ));
+    }
+
+    #[test]
+    fn normalizes_package_uri_directory() {
+        // `./` segments and trailing slashes in `packageUri` collapse —
+        // `lib_dir` is normalized exactly like `root`.
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../", "packageUri": "./lib"},
+                {"name": "local_dep", "rootUri": "../deps/local_dep", "packageUri": "src/"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        let app = table.get("app").expect("app entry");
+        assert_eq!(app.root, PathBuf::from("/proj"));
+        assert_eq!(app.lib_dir, PathBuf::from("/proj/lib"));
+        let local = table.get("local_dep").expect("local entry");
+        assert_eq!(local.root, PathBuf::from("/proj/deps/local_dep"));
+        assert_eq!(local.lib_dir, PathBuf::from("/proj/deps/local_dep/src"));
+    }
+
+    #[test]
+    fn package_uri_outside_root_is_an_error() {
+        // A `../lib` packageUri escapes the package root after
+        // normalization — rejected loudly instead of silently
+        // mis-resolving (`package_config-3.0.0` `package_config.dart:838`).
+        let config = PackageConfig::parse(
+            r#"{
+              "configVersion": 2,
+              "packages": [{"name": "app", "rootUri": "../", "packageUri": "../lib"}],
+              "generator": "pub"
+            }"#,
+        )
+        .expect("valid config");
+        let graph = plain_graph(&config);
+        match PackageTable::build(&config, &graph, Path::new("/proj/.dart_tool")) {
+            Err(crate::PackageError::LibDirOutsideRoot {
+                name,
+                lib_dir,
+                root,
+            }) => {
+                assert_eq!(name, "app");
+                assert_eq!(lib_dir, "/lib");
+                assert_eq!(root, "/proj");
+            }
+            other => panic!("expected LibDirOutsideRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_config_reader_loose_names() {
+        // The reader grammar (`package_config-3.0.0` `util.dart:12-36`)
+        // accepts names the pubspec grammar rejects — config entries are
+        // read as pub wrote them, not re-published.
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "1abc", "rootUri": "../one"},
+                {"name": "-foo", "rootUri": "../-foo"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        assert_eq!(table.len(), 3);
+        assert!(table.get("1abc").is_some());
+        assert!(table.get("-foo").is_some());
+
+        // All-dot names fail the non-dot rule even though `.` is
+        // in-charset.
+        let all_dots = PackageConfig::parse(
+            r#"{
+              "configVersion": 2,
+              "packages": [{"name": "..", "rootUri": "../"}],
+              "generator": "pub"
+            }"#,
+        )
+        .expect("valid config");
+        let graph = plain_graph(&all_dots);
+        assert!(matches!(
+            PackageTable::build(&all_dots, &graph, Path::new("/proj/.dart_tool")),
+            Err(crate::PackageError::InvalidConfigName { name }) if name == ".."
+        ));
+    }
+
+    #[test]
+    fn duplicate_normalized_roots_are_rejected() {
+        // Distinct spellings, one directory: `../deps/..` normalizes to
+        // `/proj` like `../` — file→package attribution could not pick an
+        // owner (`package_map_resolver.dart:33-52` analog).
+        let config = PackageConfig::parse(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "alias", "rootUri": "../deps/.."}
+              ],
+              "generator": "pub"
+            }"#,
+        )
+        .expect("valid config");
+        let graph = plain_graph(&config);
+        match PackageTable::build(&config, &graph, Path::new("/proj/.dart_tool")) {
+            Err(crate::PackageError::DuplicateRoot { first, name, root }) => {
+                assert_eq!(first, "app");
+                assert_eq!(name, "alias");
+                assert_eq!(root, "/proj");
+            }
+            other => panic!("expected DuplicateRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn containing_prefers_deepest_root() {
+        // Three nested roots: a file attributes to the deepest containing
+        // package, at component boundaries.
+        let table = plain_table(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "lvl1", "rootUri": "../lvl1"},
+                {"name": "inner", "rootUri": "../lvl1/lvl2/inner"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        let expect_owner = |path: &str, package: &str| {
+            assert_eq!(
+                table
+                    .containing(Path::new(path))
+                    .map(|identity| identity.name.as_str()),
+                Some(package),
+                "`{path}` must attribute to `{package}`"
+            );
+        };
+        expect_owner("/proj/lvl1/lvl2/inner/lib/a.dart", "inner");
+        // The root directory itself belongs to its package.
+        expect_owner("/proj/lvl1/lvl2/inner", "inner");
+        expect_owner("/proj/lvl1/lib/b.dart", "lvl1");
+        expect_owner("/proj/lib/c.dart", "app");
+        expect_owner("/proj/lvl1/lvl2_other/lib/d.dart", "lvl1");
+        // Component boundary: `lvl10` shares a string prefix with `lvl1`
+        // but is not inside it.
+        expect_owner("/proj/lvl10/lib/e.dart", "app");
+        // Above every root.
+        assert!(
+            table
+                .containing(Path::new("/elsewhere/lib/f.dart"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn relative_config_dir_is_an_error() {
+        // The absolute-`config_dir` contract is a hard error: build is
+        // one-shot and a relative dir would silently produce wrong roots.
+        let config = PackageConfig::parse(CONFIG).expect("valid config");
+        let graph = graph_for(&config);
+        assert!(matches!(
+            PackageTable::build(&config, &graph, Path::new(".dart_tool")),
+            Err(crate::PackageError::RelativeConfigDir { path }) if path == ".dart_tool"
         ));
     }
 

@@ -42,9 +42,11 @@ pub use dartiq_pub::{PackageInstance, PackageInstanceId, SourceKind, SourceRef};
 
 /// Errors from the package identity layer.
 ///
-/// Two shapes: a name outside pub's package-name grammar, and a
-/// config/graph pair that disagrees. Underlying artifact errors surface as
-/// [`PackageError::Pub`] unchanged.
+/// Two shapes: a name outside its layer's grammar (pubspec-produced names
+/// follow pub's grammar, `package_config.json` entries only the reader's
+/// looser charset), and a config/graph pair that disagrees — including
+/// package roots that overlap or a `packageUri` that escapes its root.
+/// Underlying artifact errors surface as [`PackageError::Pub`] unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackageError {
     /// Underlying pub artifact handling failed (rootUri resolution, YAML,
@@ -57,6 +59,13 @@ pub enum PackageError {
          with identifier [a-zA-Z_][a-zA-Z0-9_]*"
     )]
     InvalidName { name: String },
+    /// A `package_config.json` entry name is outside even the reader's
+    /// loose grammar (`package_config-3.0.0` `util.dart:12-36`).
+    #[error(
+        "invalid package_config name `{name}`: expected characters \
+         `!$&'()*+,-.0-9;=@A-Z_a-z~` with at least one non-dot character"
+    )]
+    InvalidConfigName { name: String },
     /// A config entry has no instance in the resolved graph.
     #[error("package `{name}` is missing from the resolved graph")]
     MissingFromGraph { name: String },
@@ -66,4 +75,34 @@ pub enum PackageError {
     /// The config lists the same package name twice.
     #[error("duplicate package_config entry for `{name}`")]
     DuplicateEntry { name: String },
+    /// A package's `packageUri` directory resolves outside the package's
+    /// own `rootUri` directory (oracle: "The package URI root is not below
+    /// the package root", `package_config-3.0.0` `package_config.dart:838`).
+    #[error(
+        "package `{name}` has packageUri directory `{lib_dir}` outside its \
+         root `{root}`"
+    )]
+    LibDirOutsideRoot {
+        name: String,
+        lib_dir: String,
+        root: String,
+    },
+    /// Two config entries resolve to the same normalized package root —
+    /// file→package attribution could not pick an owner (analyzer analog:
+    /// `package_map_resolver.dart:33-52` scans every root per file, where
+    /// duplicates make the deepest match ambiguous).
+    #[error(
+        "packages `{first}` and `{name}` resolve to the same package root \
+         `{root}`"
+    )]
+    DuplicateRoot {
+        first: String,
+        name: String,
+        root: String,
+    },
+    /// The engine passed a relative `config_dir`; the assembly contract is
+    /// the absolute `.dart_tool/` directory, and a relative one would
+    /// silently produce wrong roots.
+    #[error("config_dir must be absolute, got `{path}`")]
+    RelativeConfigDir { path: String },
 }

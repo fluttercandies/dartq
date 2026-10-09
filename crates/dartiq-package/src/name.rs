@@ -4,14 +4,18 @@ use std::borrow::Borrow;
 
 use crate::PackageError;
 
-/// A package name that satisfies pub's grammar.
+/// A package name usable as a map key, validated against its layer's
+/// grammar.
 ///
-/// The consumption-side grammar (`pubspec_parse.dart:17-19`) is
-/// dot-separated Dart identifiers: `identifier(.identifier)*` where an
-/// identifier is `[a-zA-Z_][a-zA-Z0-9_]*`. Names are matched exactly
-/// everywhere pub keys packages (config entries, lock packages) — no case
-/// folding; `pub.dev`'s stricter lowercase publish rule does not apply to
-/// consuming a resolution.
+/// The grammars are deliberately layered: pubspec-produced names (graph
+/// root, workspace members) follow the consumption-side pub grammar
+/// (`pubspec_parse.dart:17-19`, dot-separated Dart identifiers via
+/// [`PackageName::new`]), while `package_config.json` entry names only
+/// follow the reader's looser charset (see
+/// `table::is_valid_config_name`) — the config file is consumed as pub
+/// wrote it, not re-validated as if published. Both wrap this type; names
+/// are matched exactly everywhere (no case folding; `pub.dev`'s stricter
+/// lowercase publish rule does not apply to consuming a resolution).
 ///
 /// `sdk:dart`-style instance names contain `:` and cannot be package names,
 /// which keeps the implicit SDK instance out of name-keyed maps by type.
@@ -33,6 +37,14 @@ impl PackageName {
                 name: name.to_owned(),
             })
         }
+    }
+
+    /// Wraps a name the caller already validated against its layer's
+    /// grammar — the table's config reader checks entries with the loose
+    /// reader grammar before calling this. Crate-internal: public
+    /// construction must go through [`PackageName::new`].
+    pub(crate) fn new_unchecked(name: String) -> PackageName {
+        PackageName(name)
     }
 
     #[must_use]
