@@ -185,17 +185,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 break;
             }
             let mut colon: Option<TokenSpan> = None;
-            if kind == TokenKind::Colon {
-                // `(:` — named field without a name.
-                was_record = true;
-                was_valid_record = true;
-                self.listener.handle_no_name(self.peek_span());
-                colon = Some(self.peek_span());
-                self.cursor.advance();
-            } else if kind != TokenKind::OpenParen
-                && self.cursor.peek_kind_ahead(1) == TokenKind::Colon
+            if kind != TokenKind::OpenParen
+                && (kind == TokenKind::Colon || self.cursor.peek_kind_ahead(1) == TokenKind::Colon)
             {
-                // Named field `id:`.
+                // Named field `id:`; `(:` is recovery through the same path
+                // (official :7685-7693 — one condition, no handleNoName on
+                // the record-literal path): ensureIdentifier reports
+                // missing_identifier on the `:` and synthesizes the name.
                 was_record = true;
                 was_valid_record = true;
                 let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
@@ -349,14 +345,29 @@ mod tests {
     #[derive(Default)]
     struct LiteralLog {
         errors: Vec<String>,
+        identifiers: usize,
         int_literals: usize,
         map_entries: usize,
         set_or_map: Vec<bool>,
+        no_name: usize,
+        named_record_fields: usize,
     }
 
     impl crate::listener::ParserListener for LiteralLog {
         fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
             self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_identifier(&mut self, _: TokenSpan, _: IdentifierContext) {
+            self.identifiers += 1;
+        }
+
+        fn handle_no_name(&mut self, _: TokenSpan) {
+            self.no_name += 1;
+        }
+
+        fn handle_named_record_field(&mut self, _: TokenSpan) {
+            self.named_record_fields += 1;
         }
 
         fn handle_literal_int(&mut self, _: TokenSpan) {
@@ -416,6 +427,29 @@ mod tests {
         let _ = p.parse_set_or_map_literal(None);
         assert_eq!(p.listener.set_or_map, vec![false]);
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn record_literal_colon_prefix_reports_missing_identifier() {
+        // Official :7685-7693: `(:` takes the named-field path, where
+        // ensureIdentifier(namedRecordFieldReference) reports
+        // missing_identifier on the `:` and emits a synthetic name — the
+        // record-literal path never emits handleNoName (that is record
+        // *pattern* recovery, official :11568).
+        let mut p = literal_parser("(: 1)");
+        let _ = p.parse_parenthesized_or_record_literal(None);
+        assert_eq!(p.listener.errors, vec!["missing_identifier".to_string()]);
+        assert_eq!(p.listener.no_name, 0);
+        assert_eq!(p.listener.identifiers, 1);
+        assert_eq!(p.listener.named_record_fields, 1);
+
+        // A well-formed named field parses without diagnostics.
+        let mut p = literal_parser("(a: 1)");
+        let _ = p.parse_parenthesized_or_record_literal(None);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+        assert_eq!(p.listener.no_name, 0);
+        assert_eq!(p.listener.identifiers, 1);
+        assert_eq!(p.listener.named_record_fields, 1);
     }
 
     #[test]
