@@ -10,5 +10,9 @@ dartq-source = { path = "../dartq-source" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Content pin for data/syntax-codes.tsv (tests/syntax_codes_tsv.rs)
+blake3 = { workspace = true }
+
 [lints]
 workspace = true
