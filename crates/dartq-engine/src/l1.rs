@@ -264,6 +264,7 @@ fn compute_unit(
         ParserFeatures::from_feature_set(feature_set),
         strings,
     );
+    diagnostics.extend(duplicate_diagnostics(file, &elements, strings));
 
     UnitFacts {
         content,
@@ -296,6 +297,16 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
     // (`internalMapDartUri` parses the `dart:` prefix as the library name and
     // finds no such library).
     for directive in &mut facts.directives {
+        // A name-form `part of a.b;` carries its target in `name`, never in
+        // a URI: the oracle binds it by library-name matching (analyzer
+        // `PartOfNameFileKind`, file_state.dart:2162+), so the URI layer has
+        // nothing to resolve and emits nothing — pushing the null URI
+        // through `resolve` would code a bogus `uri_with_interpolation` at
+        // offset 0. The interpolation-split string form still goes through
+        // (that is exactly the `uri_with_interpolation` face).
+        if directive.kind == DirectiveKind::PartOf && directive.name.is_some() {
+            continue;
+        }
         if matches!(
             directive.kind,
             DirectiveKind::Import
@@ -402,6 +413,37 @@ impl ParserListener for DiagCollector {
             None,
         ));
     }
+}
+
+/// Folds the collector's capture-time duplicate log into the unit's baked
+/// diagnostics as the frozen `duplicate_definition` row: ERROR at the second
+/// declaration's name token, setters named by their bare identifier (the
+/// same construction `dartq_semantic::diagnose` uses — one source of truth
+/// is the log, both faces render it identically). The log is a pure function
+/// of the unit's content and feature set, so it bakes beside the syntax
+/// diagnostics; a wired `SemanticDiagnoser` that runs `diagnose` must not
+/// re-fold the same entries (its adapter owes the dedup to this face).
+fn duplicate_diagnostics(
+    file: FileId,
+    elements: &dartq_semantic::FileElements,
+    strings: &StringTable,
+) -> Vec<Diagnostic> {
+    elements
+        .duplicates()
+        .iter()
+        .map(|duplicate| {
+            let text = strings.resolve(duplicate.name);
+            let display = text.strip_suffix('=').unwrap_or(text);
+            Diagnostic::new(
+                dartq_semantic::codes::SemanticCode::DuplicateDefinition.severity(),
+                dartq_semantic::codes::SemanticCode::DuplicateDefinition.code_info(),
+                dartq_semantic::codes::SemanticCode::DuplicateDefinition.message(display, ""),
+                file,
+                duplicate.range,
+                None,
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -863,10 +905,20 @@ fn reform_libraries(state: &mut EngineState) {
         }
     }
 
-    // Pass B: attach parts (directive order, first claim wins).
+    // Pass B: attach parts (directive order, first claim wins). Belonging
+    // follows the part-of form (analyzer file_state.dart:2087-2266): a
+    // URI-form part file belongs to the includer its `part of` URI resolves
+    // to (`PartOfUriKnownFileKind`); a name-form part file joins an includer
+    // only when the includer's declared library name equals the part-of name
+    // (`PartOfNameFileKind::isPartOf`, file_state.dart:2222-2225), bounded to
+    // one package — the M1 stand-in for the oracle's sibling-directory
+    // candidate discovery (incremental-l1-spec §7.1). A name-form file with
+    // no qualifying includer stays unclaimed and falls through to the orphan
+    // singletons of Pass C (the oracle's `library` = null face).
     let mut claims: FxHashMap<FileId, LibraryId> = FxHashMap::default();
     let mut parts_of: FxHashMap<LibraryId, Vec<FileId>> = FxHashMap::default();
     for (defining_file, lib) in &defining {
+        let library_name = declared_library_name(&state.residency[defining_file]);
         for directive in &state.residency[defining_file].directives {
             if directive.kind != DirectiveKind::Part {
                 continue;
@@ -875,6 +927,7 @@ fn reform_libraries(state: &mut EngineState) {
                 && is_part.contains(&target)
                 && state.residency.contains_key(&target)
                 && !claims.contains_key(&target)
+                && may_claim(state, *defining_file, library_name, target)
             {
                 claims.insert(target, *lib);
                 parts_of.entry(*lib).or_default().push(target);
@@ -992,6 +1045,52 @@ fn reform_libraries(state: &mut EngineState) {
     }
     state.library_of_file = library_of_file;
     state.importers = importers;
+}
+
+/// The name a defining file's `library` directive declares, `None` when the
+/// directive is absent or unnamed — the oracle's `LibraryFileKind.name`
+/// (file_state.dart:1831-1834). An unnamed library matches no name-form part.
+fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
+    facts.directives.iter().find_map(|directive| {
+        if directive.kind == DirectiveKind::Library {
+            directive.name.as_deref().filter(|name| !name.is_empty())
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `defining_file`'s `part` directive may claim the part file
+/// `target`: a URI-form part file belongs to its includer outright, while a
+/// name-form part file requires the includer's declared library name to
+/// equal the part-of name and both files to live in the same package (the
+/// analyzer matches names globally over sibling-directory discovery; the M1
+/// engine bounds the scan to one package, incremental-l1-spec §7.1).
+fn may_claim(
+    state: &EngineState,
+    defining_file: FileId,
+    library_name: Option<&str>,
+    target: FileId,
+) -> bool {
+    let Some(part_of_name) = state.residency[&target]
+        .part_of()
+        .and_then(|directive| directive.name.as_deref())
+    else {
+        return true; // URI-form (or shapeless): the resolved include is the proof.
+    };
+    library_name == Some(part_of_name) && same_package(state, defining_file, target)
+}
+
+/// Whether both files carry the same package identity (or both none — the
+/// bound keeps a part-of name from claiming across packages).
+fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
+    let owner = |file: FileId| {
+        state
+            .files
+            .path(file)
+            .and_then(|path| state.packages.containing(path))
+    };
+    owner(a) == owner(b)
 }
 
 /// The post-closure dirty set: libraries with no cached result or changed

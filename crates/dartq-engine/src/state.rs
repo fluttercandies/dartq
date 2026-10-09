@@ -22,8 +22,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// Bumped with any engine-side change to what [`UnitFacts`] records
 /// (directive extraction, diagnostic baking); part of the facts cache key
 /// (the `AstKey.parser_version` component, PRD §5.6
-/// `EngineSemanticVersion`).
-pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 1;
+/// `EngineSemanticVersion`). v2: name-form `part of` directives skip URI
+/// resolution, and the capture-time duplicate log bakes as
+/// `duplicate_definition`.
+pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 2;
 
 /// The SDK target segment M1 resolves `dart:` URIs against. Context-level
 /// target selection is an M2 milestone (engine-api-spec §1.1); M1 pins the

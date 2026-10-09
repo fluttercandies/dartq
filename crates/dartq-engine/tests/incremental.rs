@@ -242,3 +242,86 @@ fn cancel_then_remove_then_analyze_does_not_panic() {
     assert!(diagnostics.is_empty());
     assert_eq!(engine.libraries().len(), 1, "only b's library remains");
 }
+
+/// Name-form `part of` belonging (incremental-l1-spec §7.1): a name-form
+/// part file joins the same-package library whose declared library name
+/// matches, and stays an orphan singleton when none does — the URI include
+/// (`part 'pn.dart';`) alone must not claim it. Diagnostics stay empty
+/// throughout: a name-form directive resolves by name, never through the URI
+/// layer, and the clean contents bake nothing.
+#[test]
+fn name_form_part_bounded_name_scan() {
+    const N_P8: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
+    const N_P9: &str = "library p9;\npart 'pn.dart';\nint f() => 1;\n";
+    const PN_P9: &str = "part of p9;\nint g() => 1;\n";
+    const PN_P8: &str = "part of p8;\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/n.dart", N_P8), ("lib/pn.dart", PN_P9)]);
+    let n_path = fixture.path("lib/n.dart");
+    let pn_path = fixture.path("lib/pn.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&n_path, N_P8.as_bytes());
+    engine.set_content(&pn_path, PN_P9.as_bytes());
+    let n = engine.file_table().try_file_id(&n_path).expect("interned");
+    let pn = engine.file_table().try_file_id(&pn_path).expect("interned");
+
+    // Cold: p9 names no library — pn stays its own singleton even though
+    // n's URI-resolved include points at it (no force-claim).
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("cold");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(engine.libraries().len(), 2, "n plus the pn orphan singleton");
+    assert_ne!(
+        engine.library_of(n),
+        engine.library_of(pn),
+        "the unmatched name-form part is no member of n"
+    );
+
+    // The part-of name now matches n's declared name: pn joins via the
+    // bounded name scan, and only n's library dirties (the retired singleton
+    // id must not ride the cascade).
+    engine.set_content(&pn_path, PN_P8.as_bytes());
+    let mut log = EventLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &Default::default())
+        .expect("join");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(engine.library_of(n), engine.library_of(pn), "pn joined n");
+    let joined = engine.library_of(n).expect("live");
+    assert_eq!(
+        engine
+            .libraries()
+            .into_iter()
+            .find(|(id, _)| *id == joined)
+            .map(|(_, members)| members)
+            .expect("live"),
+        vec![n, pn],
+        "pn is a member, not an unclaimed part target"
+    );
+    let joined = engine.library_of(n).expect("live");
+    assert_eq!(
+        log.cascades,
+        vec![vec![joined]],
+        "the join dirties exactly n"
+    );
+
+    // n renames its library away from the part-of name: pn leaves to a fresh
+    // singleton (the C8 step-2 shape), and both libraries dirty.
+    engine.set_content(&n_path, N_P9.as_bytes());
+    let mut log = EventLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &Default::default())
+        .expect("leave");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(engine.libraries().len(), 2, "n plus the fresh pn singleton");
+    assert_ne!(
+        engine.library_of(n),
+        engine.library_of(pn),
+        "the stale name-form part is no member of n"
+    );
+    let orphan = engine.library_of(pn).expect("live");
+    assert_eq!(log.cascades.len(), 1, "one cascade");
+    assert_eq!(log.cascades[0].len(), 2, "n and the fresh singleton dirty");
+    assert!(log.cascades[0].contains(&orphan), "the new singleton dirties");
+}
