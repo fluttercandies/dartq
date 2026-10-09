@@ -88,10 +88,12 @@ impl TypeParamOrArg {
     /// Official `parseArguments`: consumes type arguments, emitting
     /// `begin/end_type_arguments` (or `handle_no_type_arguments`).
     ///
-    /// Entry contract (both arms): the cursor sits on the `<` (`self.start`),
-    /// matching the `SimpleTypeArgument1`/`ComplexTypeParamOrArgInfo` shapes
-    /// (`type_info_impl.dart:1185/:1428`); the fast-shape guard guarantees
-    /// exactly one nameish token before the `>`-family closer.
+    /// Entry contract (both arms): the cursor sits on the `<` or on the
+    /// official caller-pointer token one before it (the callee crosses the
+    /// pointer / re-anchors, matching the official
+    /// `beginGroup = token.next` / `Token next = start` bodies,
+    /// `type_info_impl.dart:1192/:1430-1432`); the fast-shape guard
+    /// guarantees exactly one nameish token before the `>`-family closer.
     pub(crate) fn parse_arguments(
         &self,
         parser: &mut Parser<'_, '_, impl ParserListener>,
@@ -103,6 +105,19 @@ impl TypeParamOrArg {
                 next
             }
             TypeParamOrArg::Simple1 { .. } => {
+                // Official entry: `beginGroup = token.next!` with
+                // `beginGroup.isA(LT)` (`type_info_impl.dart:1192-1193`) —
+                // the caller's pointer sits one before the `<`, and the
+                // recovery paths that reach us deliver exactly that pointer
+                // position as the live cursor (e.g. `parseMethodTypeArgs`
+                // computes the group at `bangToken` and parses from
+                // `bangToken.next`, `parser_impl.dart:7094-7102`). Cross the
+                // pointer token when the cursor carries it so the `<` is
+                // current either way.
+                if parser.peek_kind() != TokenKind::Lt {
+                    parser.cursor.advance();
+                }
+                debug_assert_eq!(parser.peek_kind(), TokenKind::Lt, "beginGroup.isA(LT)");
                 if !parser.enter_depth() {
                     return parser.peek_span();
                 }
@@ -113,6 +128,8 @@ impl TypeParamOrArg {
                 // name token is consumed, not merely read.
                 let name = parser.ensure_identifier(IdentifierContext::TypeReference);
                 parser.listener.handle_type(name, None);
+                // Official `parseEndGroup` asserts the scan-guaranteed
+                // `>`-family closer (type_info_impl.dart:1243).
                 debug_assert!(parser.cursor.peek_is_closer());
                 let closer_id = parser.cursor.consume_closer();
                 let closer = parser.span_of(closer_id);
@@ -137,12 +154,18 @@ impl TypeParamOrArg {
                 next
             }
             TypeParamOrArg::Simple1 { .. } => {
+                // Official `SimpleTypeArgument1.parseVariables`
+                // (`type_info_impl.dart:1204`): `<`, metadata star over the
+                // name, the single variable, then the closer. Entry anchoring
+                // mirrors the `parseArguments` arm above
+                // (`beginGroup = token.next!`, :1204-1205).
+                if parser.peek_kind() != TokenKind::Lt {
+                    parser.cursor.advance();
+                }
+                debug_assert_eq!(parser.peek_kind(), TokenKind::Lt, "beginGroup.isA(LT)");
                 if !parser.enter_depth() {
                     return parser.peek_span();
                 }
-                // Official `SimpleTypeArgument1.parseVariables`
-                // (`type_info_impl.dart:1204`): `<`, metadata star over the
-                // name, the single variable, then the closer.
                 let begin = parser.peek_span(); // `<`
                 parser.listener.begin_type_variables(begin);
                 parser.cursor.advance(); // `<`
@@ -328,7 +351,6 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if self.kind_at(scan) == TokenKind::At {
                 let metadata_len = self.metadata_skip_len(scan);
                 if metadata_len == 0 {
-                    eprintln!("DBG scan None: metadata");
                     return None;
                 }
                 scan += metadata_len;
@@ -630,13 +652,21 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
 impl ComplexTypeParamOrArg {
     /// Official `ComplexTypeParamOrArgInfo.parseArguments`
-    /// (`type_info_impl.dart:1428`). Cursor sits before the `<`.
+    /// (`type_info_impl.dart:1428`). The body anchors on the scanned `start`
+    /// (`assert(identical(token.next!, start))`, then
+    /// `Token next = start;` — :1430-1432): the caller's `token` pointer is
+    /// only ever asserted, never navigated. Recovery paths may deliver the
+    /// live cursor still sitting on the pre-`<` pointer token, so re-anchor
+    /// onto `start` before reading the group.
     pub(crate) fn parse_arguments(
         self,
         parser: &mut Parser<'_, '_, impl ParserListener>,
     ) -> TokenSpan {
+        if parser.cursor.peek_id() != self.start {
+            parser.cursor.rewind_to(self.start);
+        }
+        debug_assert_eq!(parser.cursor.peek_id(), self.start); // cursor on `<`
         let begin = parser.peek_span(); // `<`
-        debug_assert_eq!(parser.cursor.peek_id(), self.start); // entry invariant: cursor on `<`
         if !parser.enter_depth() {
             return begin;
         }

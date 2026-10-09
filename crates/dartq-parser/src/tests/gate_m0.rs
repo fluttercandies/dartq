@@ -1,6 +1,6 @@
-//! M0-gate panic regressions (#322): the five corpus files that crashed the
-//! first dartiq-vs-oracle smoke (docs/audits/gate-m0/smoke-141/report.json)
-//! must flow through `parse_unit` without panicking.
+//! M0-gate panic regressions (#322, #326): corpus files that crashed the
+//! dartiq-vs-oracle smoke waves (docs/audits/gate-m0/smoke-141{,-r2}/
+//! report.json) must flow through `parse_unit` without panicking.
 //!
 //! Three root-cause families, pinned verbatim (the files are official SDK
 //! test corpus members, BSD-licensed, copied unmodified from tests/corpus/):
@@ -15,6 +15,13 @@
 //! * `gate_m0_issue_26810{,_and,_or}.dart` — the written-out-operator
 //!   recovery family (`and`/`or`/`xor` at binary positions), which used to
 //!   panic inside the candidate-level lookup.
+//! * `gate_m0_r2_*.dart` (#326) — the second smoke wave: type-argument
+//!   group parses reached with the live cursor still on the official
+//!   caller-pointer position (one before `<`), firing the Simple1 closer
+//!   assert and the Complex entry assert. The official callee navigates
+//!   from `beginGroup`/`start` regardless of the caller pointer
+//!   (`type_info_impl.dart:1192/:1204/:1430-1432`); the port now anchors
+//!   the same way.
 //!
 //! Contract per file: no panic, the whole stream is consumed, every
 //! diagnostic stays inside the source's UTF-16 bounds, and the diagnostic
@@ -35,6 +42,16 @@ const FUNCTION_BOUNDED: &str =
 const ISSUE_26810: &str = include_str!("fixtures/gate_m0_issue_26810.dart");
 const ISSUE_26810_AND: &str = include_str!("fixtures/gate_m0_issue_26810_and.dart");
 const ISSUE_26810_OR: &str = include_str!("fixtures/gate_m0_issue_26810_or.dart");
+
+// Panic batch r2 (#326): second smoke wave (docs/audits/gate-m0/smoke-141-r2/
+// report.json). All five are valid corpus Dart; the parser used to panic in
+// type-argument recovery paths instead of recovering like the official parser.
+const R2_ISSUE_60264: &str = include_str!("fixtures/gate_m0_r2_issue60264.dart");
+const R2_LIST: &str = include_str!("fixtures/gate_m0_r2_list.dart");
+const R2_MAP: &str = include_str!("fixtures/gate_m0_r2_map.dart");
+const R2_PERIOD_MISSING_NAME: &str = include_str!("fixtures/gate_m0_r2_period_missing_name.dart");
+const R2_FUNCTION_REFERENCE: &str =
+    include_str!("fixtures/gate_m0_r2_function_reference_following_token.dart");
 
 /// Parses a whole fixture with `parse_unit` and checks the survival
 /// contract: EOF reached, diagnostics inside the source bounds.
@@ -123,5 +140,51 @@ fn issue_26810_or_recovery_without_panic() {
     assert_issue_26810_recovery(
         &parse_unit_survives(ISSUE_26810_OR, "issue_26810_or"),
         "issue_26810_or",
+    );
+}
+
+/// Panic batch r2 (#326): every file must parse to EOF without panicking
+/// (the old `debug_assert`s in `type_args.rs` fired on the recovery entry
+/// paths). The two m0-syntax files are error-recovery input and must report
+/// diagnostics; the three exhaustiveness-data files are valid Dart whose
+/// remaining diagnostics come from the pattern/switch-expression surface
+/// (`[]`/`<int>[...]` list patterns, `Map<int, B>()` constructor patterns,
+/// `<T>(...)` generic function literals) whose recovery paths the panics
+/// used to mask — later gate batches eat those, this one owns the two
+/// assert sites.
+#[test]
+fn r2_issue60264_parses_without_panic() {
+    parse_unit_survives(R2_ISSUE_60264, "r2_issue60264");
+}
+
+#[test]
+fn r2_list_patterns_parse_without_panic() {
+    parse_unit_survives(R2_LIST, "r2_list");
+}
+
+#[test]
+fn r2_map_patterns_parse_without_panic() {
+    parse_unit_survives(R2_MAP, "r2_map");
+}
+
+#[test]
+fn r2_period_missing_name_recovers_without_panic() {
+    let codes = parse_unit_survives(R2_PERIOD_MISSING_NAME, "r2_period_missing_name");
+    assert!(
+        !codes.is_empty(),
+        "period_missing_name is an error-recovery file; expected diagnostics"
+    );
+}
+
+#[test]
+fn r2_function_reference_following_token_recovers_without_panic() {
+    let codes = parse_unit_survives(
+        R2_FUNCTION_REFERENCE,
+        "r2_function_reference_following_token",
+    );
+    assert!(
+        !codes.is_empty(),
+        "function_reference_following_token is an error-recovery file; \
+         expected diagnostics"
     );
 }
