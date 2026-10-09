@@ -1460,6 +1460,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     ) {
         self.listener
             .begin_extension_declaration_prelude(extension_keyword);
+        // Consume `extension` (official `parseExtension` reads `token.next`
+        // from here on, so both sub-parsers start after the keyword).
+        self.cursor.advance();
         if self.peek_kind() == TokenKind::Identifier && self.cursor.lexeme(self.peek_id()) == "type"
         {
             let type_keyword = self.peek_span();
