@@ -57,17 +57,19 @@ fn string_table_per_entry_overhead() {
     let delta = NET_LIVE.load(Ordering::Relaxed) - before;
 
     let per_entry = (delta - N * PAYLOAD_LEN) as f64 / N as f64;
-    println!(
-        "StringTable per-entry overhead over {N} entries of {PAYLOAD_LEN}B payload: {per_entry:.1} bytes/entry (net live bytes, incl. growth slack)"
-    );
     assert!(
         per_entry < 128.0,
         "per-entry overhead ballooned: {per_entry:.1} bytes/entry"
     );
     // The leaked text stays live after the handle is gone: re-resolving is a
     // pure read, and the net byte count does not move on repeated interning.
+    // The println below stays outside this window: writing through the
+    // harness's captured stdout allocates, which would pollute the snapshot.
     let id = table.intern("id0000000000");
     assert_eq!(table.resolve(id), "id0000000000");
     let after = NET_LIVE.load(Ordering::Relaxed);
     assert_eq!(after, delta + before, "intern hits allocate nothing");
+    println!(
+        "StringTable per-entry overhead over {N} entries of {PAYLOAD_LEN}B payload: {per_entry:.1} bytes/entry (net live bytes, incl. growth slack)"
+    );
 }
