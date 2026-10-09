@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::event::{EngineEvent, RevalidateGate};
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, LibraryId,
-    LibraryInfo, PendingChange, UnitFacts,
+    LibraryInfo, PendingChange, SDK_TARGET, UnitFacts,
 };
 
 /// The outcome of one apply (engine-api-spec §1.2 `AffectedReport` payload).
@@ -224,7 +224,20 @@ fn recompute_facts(
     // resolves for its own file, then each sibling derives from the
     // pre-resolution template — diagnostics re-attributed, directives
     // re-resolved — under the same sequential pass (resolution interns).
-    let mut resolver = state.uri_resolver();
+    // The existence face is the post-batch world: files already in
+    // residency plus this batch (whose facts insert into residency only
+    // after this pass; removals left it at the drain). Field borrows stay
+    // disjoint: the closure reads residency, the resolver writes files.
+    let batch: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
+    let resident =
+        |id: FileId| state.residency.contains_key(&id) || batch.contains(&id);
+    let mut resolver = UriResolver::new(
+        &state.uri_packages,
+        &state.sdk,
+        SDK_TARGET,
+        &mut state.files,
+        &resident,
+    );
     let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
     for (index, key, mut facts) in computed {
         for sibling in siblings.remove(&index).unwrap_or_default() {
@@ -962,7 +975,10 @@ fn reform_libraries(state: &mut EngineState) {
                 .files
                 .path(*file)
                 .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
-            let uri = state.uri_resolver().canonical_uri(&path);
+            // canonical_uri never probes existence (state.rs face contract):
+            // the resident filter is inert here, pass the documented no-probe
+            // closure (pre-#287 this call site had no filter at all).
+            let uri = state.uri_resolver(&|_| false).canonical_uri(&path);
             state.canonical_uris.insert(*file, uri);
         }
     }

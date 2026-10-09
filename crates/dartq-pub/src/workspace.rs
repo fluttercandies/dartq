@@ -18,7 +18,7 @@
 //! `.dart_tool/pub/workspace_ref.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::PubError;
 use crate::glob::{Glob, has_glob_wildcards};
@@ -444,8 +444,9 @@ fn inclusion_key(path: &Path) -> PathBuf {
 /// A `..` pops a plain trailing component; on a relative path a leading `..`
 /// run is kept verbatim, while `..` past an absolute root clamps at the
 /// root. Windows prefixes and the absolute root pass through untouched.
-/// Public because downstream identity layers must normalize with the same
-/// discipline — one normalizer, one behavior.
+/// Delegates to dartq-source's [`normalize_lexical`](dartq_source) — one
+/// implementation of the discipline, shared with the FileTable rule so the
+/// package universe and the file universe clean spellings identically.
 ///
 /// The `..`-past-root discipline is the oracle's drop semantics: RFC 3986
 /// §5.2.4 `remove_dot_segments` clamps absolute paths at their root, and so
@@ -459,26 +460,7 @@ fn inclusion_key(path: &Path) -> PathBuf {
 /// self-consistent. Relative paths keep leading `..` in every discipline.
 #[must_use]
 pub fn normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Pop a plain trailing component; clamp at an absolute root
-                // (nothing before it to pop); keep leading runs on relative
-                // paths.
-                match normalized.components().next_back() {
-                    Some(Component::Normal(_)) => {
-                        normalized.pop();
-                    }
-                    Some(Component::RootDir | Component::Prefix(_)) => {}
-                    _ => normalized.push(".."),
-                }
-            }
-            other => normalized.push(other),
-        }
-    }
-    normalized
+    dartq_source::normalize_lexical(path)
 }
 
 #[cfg(test)]

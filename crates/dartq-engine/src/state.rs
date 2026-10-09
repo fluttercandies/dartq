@@ -481,7 +481,20 @@ impl EngineState {
     /// A URI resolver over the engine's package table, SDK snapshot, and file
     /// table; `dart:` URIs dispatch against [`SDK_TARGET`]. Resolution interns
     /// directive targets into [`Self::files`], hence the exclusive borrow.
-    pub(crate) fn uri_resolver(&mut self) -> UriResolver<'_> {
-        UriResolver::new(&self.uri_packages, &self.sdk, SDK_TARGET, &mut self.files)
+    /// `resident` is the file-state existence face — which interned ids hold
+    /// content in the analyzed world (disk files and declared overlays);
+    /// resolution codes missing-target diagnostics only against it. Faces
+    /// that never probe existence (e.g. `canonical_uri`) pass `&|_| false`.
+    pub(crate) fn uri_resolver<'a>(
+        &'a mut self,
+        resident: &'a dyn Fn(FileId) -> bool,
+    ) -> UriResolver<'a> {
+        UriResolver::new(
+            &self.uri_packages,
+            &self.sdk,
+            SDK_TARGET,
+            &mut self.files,
+            resident,
+        )
     }
 }

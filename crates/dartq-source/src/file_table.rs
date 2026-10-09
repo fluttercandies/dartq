@@ -1,6 +1,20 @@
 //! Workspace paths interned to small stable integers (PRD §10.4).
+//!
+//! # The path-universe invariant
+//!
+//! Every path the engine compares — [`FileTable`] keys, [`Locator`] entries,
+//! resolver-composed targets, canonicalized package roots — is expressed in
+//! one canonical form: the canonicalized longest existing ancestor of the
+//! lexically cleaned spelling, plus the remaining components. A path's
+//! identity therefore never depends on whether the path itself is on disk:
+//! an overlay-only file interns under the same canonical spelling the
+//! resolver composes for it, lexical-prefix package attribution sees one
+//! spelling, and interning a path before or after its creation yields the
+//! same id. Pinned by
+//! `intern_across_existence_transition_holds_one_id`.
 
-use std::path::{Path, PathBuf};
+use std::borrow::Cow;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -29,9 +43,9 @@ impl FileId {
 ///
 /// The canonical path string is stored once per resident path: the map key
 /// and the id slot share one allocation. The [`PathMemo`] additionally holds
-/// the original spelling as its cache key — a second, owned copy per
-/// canonicalize-success spelling — which [`forget`] retracts together with
-/// the path resolution.
+/// the cleaned spelling as its cache key — a second, owned copy per
+/// normalized spelling — which [`forget`] retracts together with the path
+/// resolution.
 ///
 /// [`forget`] severs path resolution but never reclaims ids — the
 /// immortal-`FileId` contract: ids already recorded in diagnostics, caches,
@@ -98,12 +112,12 @@ impl FileTable {
     /// id is never reused; see the immortal-`FileId` contract in the type
     /// docs.
     ///
-    /// One key, not one file: under the two-id existence transition (see
-    /// [`normalize_path`]), a sibling id for the same file can stay live
-    /// under a different key, and spellings that normalize to that key keep
-    /// resolving to it — including after the file is deleted, while
-    /// spellings normalizing to the severed key stay dead. Pinned by
-    /// `forget_after_existence_transition_leaves_sibling_id_live`.
+    /// One spelling per logical path: since the unified rule derives every
+    /// spelling's identity through the same canonical-ancestor walk (see
+    /// [`normalize_path`]), all spellings of one path resolve to one key and
+    /// one id, and `forget` through any of them severs that id for all —
+    /// including after the file is deleted. Pinned by
+    /// `forget_through_any_spelling_severs_the_shared_identity`.
     /// Forgetting a path that is not currently interned returns `None`.
     ///
     /// The memo entry for this exact spelling is retracted (and never
@@ -121,63 +135,110 @@ impl FileTable {
     }
 }
 
-/// Single normalization rule for path keys, shared by [`FileTable`] and
-/// [`Locator`](crate::Locator):
+/// The single normalization rule for path keys, shared by [`FileTable`] and
+/// [`Locator`](crate::Locator). It realizes the path-universe invariant (see
+/// the module docs): the result is the canonicalized longest existing
+/// ancestor of the cleaned spelling, plus the remaining components.
 ///
-/// 1. If the path exists, `std::path::canonicalize` wins: the result is
-///    absolute with symlinks and `..` resolved. This is the canonical
-///    identity — the same file reached through a symlink, a `.`/`..` spelling,
-///    or a relative path interns to one id.
+/// 1. The spelling is absolutized (relative paths join the current working
+///    directory) and cleaned under the lexical dot-segment discipline of
+///    [`normalize_lexical`] — `.` dropped, `..` popped or clamped at an
+///    absolute root.
+/// 2. Walking upward from the cleaned path, the first ancestor that
+///    canonicalizes wins. For an existing path the first iteration is plain
+///    `std::path::canonicalize` — the physical truth, with symlinks
+///    (`/var` → `/private/var` on macOS) and `..` resolved. For a missing
+///    path the nearest existing ancestor canonicalizes instead, so the
+///    derived spelling lives in the same symlink-resolved universe as the
+///    disk files around it; the missing tail itself carries no symlink
+///    truth to resolve.
 ///
 ///    Platform note: on Windows `canonicalize` returns `\\?\C:\...`
 ///    verbatim (extended-length) paths, and this crate does not strip the
 ///    prefix — it makes no cross-platform claim today (the oracle lock is
 ///    macOS). Any future Windows oracle-parity work must strip the prefix
 ///    here, or emitted paths diverge byte-wise from `dart analyze`.
-/// 2. Otherwise (path does not exist yet or is not accessible) fall back to
-///    lexical absolutization: absolute paths are kept as-is, relative paths
-///    are joined onto the current working directory; no symlink resolution is
-///    attempted.
+/// 3. If nothing up to the root canonicalizes (no reachable file system),
+///    the cleaned spelling is kept as-is.
 ///
-/// Consequence: two spellings of a not-yet-existing file may intern to
-/// different ids; once the file exists, both spellings canonicalize to the
-/// same path on the next `intern`. The same single spelling can also change
-/// identity across the existence transition: interning it before creation
-/// stores the lexical spelling under one id, and interning it again after
-/// creation stores the canonical spelling under a second id. Both ids stay
-/// live with `path(X) == path(Y)`, and `try_file_id` resolves to the newer
-/// (canonical) one — a pass that interns early can therefore attribute later
-/// diagnostics to a different id than an earlier pass did. Pinned by
-/// `intern_across_existence_transition_holds_two_ids`.
+/// Consequence: one logical path — one key — one id, independent of its
+/// existence bit. The pre-#287 rule kept non-existent spellings lexical, so
+/// an overlay-only file interned under the literal workspace spelling while
+/// the resolver composed the same file from a library's canonicalized
+/// directory: one logical file, two ids, and the part claim missed
+/// residency. Lexical `..` in a *dirty* spelling is resolved textually
+/// before the walk, matching the analyzer's lexical path discipline
+/// (package:path `normalize`); a `..` that crosses a symlink in an existing
+/// prefix of a dirty spelling is the one corner where the derived identity
+/// can differ from the physical resolution — unobservable for cleaned
+/// workspace spellings, which is the only input shape the engine and the
+/// oracle produce.
 ///
 /// [`FileTable`] and [`Locator`](crate::Locator) consume the rule through
-/// [`PathMemo`], which memoizes the canonicalize branch — see its doc for
-/// the caching policy.
+/// [`PathMemo`], which memoizes both branches — see its doc for the caching
+/// policy.
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    match canonicalize_existing(path) {
-        Some(canonical) => canonical,
-        None => lexical_fallback(path),
-    }
+    normalize_keyed(&lexical_key(path))
 }
 
-/// Rule half 1 of [`normalize_path`]: the canonical identity of an existing
-/// path, or `None` when the path does not exist (or is not accessible).
-fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
-    path.canonicalize().ok()
+/// The walk of [`normalize_path`] over an already-cleaned absolute key.
+fn normalize_keyed(cleaned: &Path) -> PathBuf {
+    for ancestor in cleaned.ancestors() {
+        if let Ok(base) = ancestor.canonicalize() {
+            let remainder = cleaned
+                .strip_prefix(ancestor)
+                .expect("ancestors are prefixes");
+            return base.join(remainder);
+        }
+    }
+    cleaned.to_path_buf()
 }
 
-/// Rule half 2 of [`normalize_path`]: lexical absolutization of a path that
-/// has no canonical identity — absolute paths are kept as-is (including any
-/// lexical `..`), relative paths are joined onto the current working
-/// directory; no symlink resolution is attempted.
-fn lexical_fallback(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
+/// The lexical dot-segment discipline, shared with dartq-pub (its
+/// `normalize` delegates here — one implementation of the RFC 3986
+/// `remove_dot_segments` face pub's workspace walk and the oracle's
+/// package:path `normalize` agree on): `.` components drop, `..` pops a
+/// trailing plain component or clamps at an absolute root; a leading `..`
+/// run on a relative path survives.
+#[must_use]
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(".."),
+            },
+            other => normalized.push(other),
+        }
     }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(path),
-        Err(_) => path.to_path_buf(),
+    normalized
+}
+
+/// The memo key of a spelling: absolutized and dot-segment cleaned, so
+/// aliased spellings (`a/./b`, `a/../b`, relative vs absolute) of one
+/// logical path share one memo entry. The common case — an absolute spelling
+/// with no dot segments — borrows instead of allocating.
+fn lexical_key(path: &Path) -> Cow<'_, Path> {
+    let dotted = path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    if path.is_absolute() && !dotted {
+        return Cow::Borrowed(path);
     }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    Cow::Owned(normalize_lexical(&absolute))
 }
 
 /// Memoized spelling-to-canonical-path cache backing [`FileTable`] and
@@ -186,17 +247,19 @@ fn lexical_fallback(path: &Path) -> PathBuf {
 /// Each structure owns one memo; both consume the single rule in
 /// [`normalize_path`], and the memo removes the repeated `canonicalize`
 /// syscall cost when the same spelling recurs. The engine re-walks the same
-/// files every pass, so the memoized hit is the hot path.
+/// files every pass, so the memoized hit is the hot path — for overlay-only
+/// files (never on disk, re-interned every batch) the walk would otherwise
+/// re-probe the ancestor chain each time.
 ///
 /// # Caching policy
 ///
-/// Only [`canonicalize`](std::path::Path::canonicalize) successes are
-/// cached. The lexical fallback (rule half 2) is recomputed on every call:
-/// it depends on the path's existence bit and the current working
-/// directory, either of which can flip between calls, and the pinned
-/// existence-transition semantics (one spelling interned before its file
-/// exists and again after must yield two ids) depend on that existence
-/// check being live. Caching fallbacks would fuse those two ids into one.
+/// Both rule branches memoize, keyed by the cleaned spelling (see
+/// [`lexical_key`]): canonicalize successes and derived missing-path
+/// identities alike. Pre-#287 only canonicalize successes were cached,
+/// because a missing path's identity flipped with its existence bit and
+/// caching would have fused the two ids; the unified rule wants exactly that
+/// stability — a spelling's identity is the same before and after its file
+/// appears — so the old rationale is gone and both branches cache.
 ///
 /// Cached entries have no TTL, no watcher, and no time-based eviction; the
 /// only retraction is the owning structure's `forget`, which removes the
@@ -217,10 +280,11 @@ pub(crate) struct PathMemo {
 }
 
 impl PathMemo {
-    /// The cached normalization for `path`, if this spelling was
-    /// canonicalized here before. Read-only: fills nothing.
+    /// The cached normalization for `path`, if this cleaned spelling was
+    /// normalized here before. Read-only: fills nothing.
     pub(crate) fn get(&self, path: &Path) -> Option<Arc<Path>> {
-        self.canonical.get(path).cloned()
+        let key = lexical_key(path);
+        self.canonical.get(key.as_ref()).cloned()
     }
 
     /// Like [`PathMemo::get`], but falls back to a fresh (uncached)
@@ -233,36 +297,32 @@ impl PathMemo {
         }
     }
 
-    /// Normalizes `path` under the single rule, caching canonicalize
-    /// successes. Lexical fallbacks stay uncached — see the caching policy
-    /// in the type docs.
+    /// Normalizes `path` under the single rule, caching the result under the
+    /// cleaned spelling — both rule branches memoize (see the caching policy
+    /// in the type docs).
     pub(crate) fn normalize(&mut self, path: &Path) -> Arc<Path> {
-        if let Some(cached) = self.get(path) {
-            return cached;
+        let key = lexical_key(path);
+        if let Some(cached) = self.canonical.get(key.as_ref()) {
+            return Arc::clone(cached);
         }
-        match canonicalize_existing(path) {
-            Some(canonical) => {
-                let shared: Arc<Path> = Arc::from(canonical);
-                self.canonical
-                    .insert(path.to_path_buf(), Arc::clone(&shared));
-                shared
-            }
-            None => Arc::from(lexical_fallback(path)),
-        }
+        let shared: Arc<Path> = Arc::from(normalize_keyed(key.as_ref()));
+        self.canonical.insert(key.into_owned(), Arc::clone(&shared));
+        shared
     }
 
-    /// Removes the memoized entry for the exact spelling `path`, if any.
+    /// Removes the memoized entry for the cleaned spelling of `path`, if any.
     ///
     /// [`FileTable::forget`] and [`Locator::forget`](crate::Locator::forget)
     /// call this so forgotten spellings stop occupying memo space. Only the
     /// given spelling is retracted: memo keys are owned copies of one
     /// spelling each, and the canonical [`Arc`] values are refcounted, so
     /// removal is invisible to every other holder — but there is no
-    /// canonical-to-spellings index, so sibling spellings that canonicalize
-    /// to the same file keep their entries (each holding its own key while
+    /// canonical-to-spellings index, so sibling spellings that normalize to
+    /// the same file keep their entries (each holding its own key while
     /// sharing the canonical value) until their own forget.
     pub(crate) fn retract(&mut self, path: &Path) {
-        self.canonical.remove(path);
+        let key = lexical_key(path);
+        self.canonical.remove(key.as_ref());
     }
 }
 
@@ -339,39 +399,57 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The missing-path face of the universe invariant: a path with no disk
+    /// identity derives its spelling from the nearest existing ancestor, so
+    /// it lands in the same canonical universe (symlinks resolved) as the
+    /// disk files around it.
     #[test]
-    fn missing_paths_fall_back_to_lexical_absolutization() {
-        let mut table = FileTable::new();
-        let missing =
-            std::env::temp_dir().join(format!("dartq-source-missing-{}.txt", std::process::id()));
+    fn missing_paths_resolve_through_their_existing_ancestor() {
+        let base = temp_dir("missing-ancestor");
+        let missing = base.join("never-created.txt");
 
+        let mut table = FileTable::new();
         let id = table.intern(&missing);
-        assert_eq!(table.path(id), Some(missing.as_path()));
+        let expected = base
+            .canonicalize()
+            .expect("the ancestor exists")
+            .join("never-created.txt");
+        assert_eq!(table.path(id), Some(expected.as_path()));
         assert_eq!(table.intern(&missing), id, "same missing path stays one id");
 
-        let other = table.intern(&std::env::temp_dir().join("dartq-source-missing-other.txt"));
+        let other = table.intern(&base.join("also-missing.txt"));
         assert_ne!(id, other);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
-    /// Audit A7: the documented fallback keeps `..` lexically — a nonexistent
-    /// absolute path is stored as-is, with no lexical `..` resolution.
+    /// Dot segments resolve lexically before the ancestor walk: `a/..`
+    /// cancels, so the walk starts from the cleaned path and the derived
+    /// spelling stays in the canonical universe of the existing prefix.
     #[test]
-    fn missing_path_with_dotdot_stays_lexical() {
-        let mut table = FileTable::new();
-        let missing = std::env::temp_dir()
-            .join("dartq-source-dotdot-a")
+    fn missing_path_dot_segments_resolve_before_the_ancestor_walk() {
+        let base = temp_dir("dotdot");
+        let missing = base
+            .join("a")
             .join("..")
-            .join("dartq-source-dotdot-b")
+            .join("b")
             .join("never-created.txt");
 
+        let mut table = FileTable::new();
         let id = table.intern(&missing);
-        assert_eq!(table.path(id), Some(missing.as_path()));
+        let expected = base
+            .canonicalize()
+            .expect("the ancestor exists")
+            .join("b")
+            .join("never-created.txt");
+        assert_eq!(table.path(id), Some(expected.as_path()));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// The fallback's relative branch: a missing relative path is joined
-    /// onto the current working directory (the absolute branches are pinned
-    /// by `missing_paths_fall_back_to_lexical_absolutization` and
-    /// `missing_path_with_dotdot_stays_lexical`).
+    /// onto the current working directory, then normalized like any other —
+    /// the derived spelling carries the cwd's canonical identity.
     #[test]
     fn missing_relative_path_joins_onto_cwd() {
         let mut table = FileTable::new();
@@ -379,28 +457,32 @@ mod tests {
 
         let id = table.intern(relative);
         let cwd = std::env::current_dir().expect("cwd");
-        assert_eq!(table.path(id), Some(cwd.join(relative).as_path()));
+        let expected = cwd.canonicalize().expect("cwd exists").join(relative);
+        assert_eq!(table.path(id), Some(expected.as_path()));
     }
 
-    /// Audit A3: one path spelling interned before the file exists (lexical
-    /// key) and again after creation (canonical key) yields two live ids for
-    /// that spelling; lookups resolve to the newer canonical id. This pins
-    /// the transition case the doc consequence declares.
+    /// The path-universe invariant itself: interning a spelling before its
+    /// file exists (derived canonical-ancestor spelling) and again after
+    /// creation (canonicalize success) yields the SAME id under the SAME
+    /// canonical spelling. This is the overlay-only residency contract the
+    /// resolver's composed targets depend on (#287).
     #[test]
-    fn intern_across_existence_transition_holds_two_ids() {
+    fn intern_across_existence_transition_holds_one_id() {
         let base = temp_dir("transition");
         let path = base.join("late.txt");
 
         let mut table = FileTable::new();
-        let before = table.intern(&path); // missing: lexical spelling kept
+        let before = table.intern(&path); // missing: derived canonical spelling
+        let derived = table.path(before).expect("interned").to_path_buf();
         fs::write(&path, b"x").expect("create the file");
-        let after = table.intern(&path); // exists: canonical spelling kept
+        let after = table.intern(&path); // exists: canonicalize success
 
-        assert_ne!(before, after);
-        assert_eq!(table.path(before), Some(path.as_path()));
+        assert_eq!(before, after, "identity does not flip with existence");
+        let canonical = path.canonicalize().expect("file exists now");
+        assert_eq!(table.path(after), Some(canonical.as_path()));
         assert_eq!(
-            table.path(after),
-            Some(path.canonicalize().expect("file exists now").as_path())
+            derived, canonical,
+            "the derived spelling was already canonical"
         );
         assert_eq!(table.try_file_id(&path), Some(after));
 
@@ -459,63 +541,50 @@ mod tests {
         assert_eq!(table.forget(Path::new("/never/interned.txt")), None);
     }
 
-    /// T1 pin: after the two-id existence transition, `forget` severs only
-    /// the key under the normalization it is given — the lexical sibling id
-    /// stays live, and once the file is deleted it resolves again through a
-    /// spelling that normalizes to its key (memo miss + lexical fallback),
-    /// while spellings hitting the memo's severed canonical entry stay dead.
+    /// Unified-identity pin: all spellings of one path share one id, so
+    /// `forget` through any of them — here a dot-segment alias while the
+    /// file exists — severs the shared identity for every spelling, and a
+    /// re-intern mints a fresh id under the same canonical key.
     #[test]
-    fn forget_after_existence_transition_leaves_sibling_id_live() {
-        let base = temp_dir("forget-sibling");
+    fn forget_through_any_spelling_severs_the_shared_identity() {
+        let base = temp_dir("forget-shared");
         fs::create_dir(base.join("sub")).expect("create sub dir");
         let path = base.join("late.txt");
-        // A second spelling of the same file with different components, so
-        // it keys the memo separately from `path` yet canonicalizes to the
-        // same file while it exists.
         let aliased = base.join("sub").join("..").join("late.txt");
 
         let mut table = FileTable::new();
-        let before = table.intern(&path); // missing: lexical key
+        let first = table.intern(&path); // missing: derived canonical spelling
         fs::write(&path, b"x").expect("create the file");
-        let after = table.intern(&aliased); // exists: canonical key, second id
+        assert_eq!(table.intern(&aliased), first, "aliased spelling, one id");
 
-        assert_ne!(before, after);
-        assert_eq!(table.path(before), Some(path.as_path()));
-        assert_eq!(
-            table.path(after),
-            Some(path.canonicalize().expect("file exists now").as_path())
-        );
-
-        assert_eq!(table.forget(&aliased), Some(after));
-        assert_eq!(table.path(after), None);
-        assert_eq!(
-            table.try_file_id(&aliased),
-            None,
-            "the canonical key is severed"
-        );
-
-        let _ = fs::remove_file(&path);
-
+        assert_eq!(table.forget(&aliased), Some(first));
+        assert_eq!(table.path(first), None);
         assert_eq!(
             table.try_file_id(&path),
-            Some(before),
-            "the lexical sibling id stays live and resolvable"
+            None,
+            "every spelling of the severed key is dead"
         );
-        assert_eq!(table.path(before), Some(path.as_path()));
+
+        let again = table.intern(&path);
+        assert_ne!(again, first, "ids are never reused");
+        assert_eq!(
+            table.path(again),
+            Some(path.canonicalize().expect("file exists now").as_path())
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
 
     /// Memo-retraction pin: re-interning a spelling after `forget` + file
-    /// deletion takes the uncached lexical fallback — the fresh id is stored
-    /// under the spelling itself, not the deleted file's stale canonical
-    /// path (the pre-retraction behavior resurrected the stale canonical key
-    /// from the memo; `forget` now retracts it).
+    /// deletion re-derives the canonical spelling from the still-existing
+    /// ancestor — the same key the file held while it existed, so
+    /// delete/re-create cycles keep one stable identity (pre-#287 this fell
+    /// back to the literal spelling and forked the identity).
     #[test]
-    fn reintern_after_forget_and_delete_takes_the_lexical_fallback() {
+    fn reintern_after_forget_and_delete_rederives_the_canonical_spelling() {
         let base = temp_dir("stale-canonical");
         let path = base.join("gone.txt");
-        fs::write(&path, b"x").expect("create the file");
+        fs::write(&path, b"x").expect("write");
         let canonical: PathBuf = path.canonicalize().expect("file exists");
 
         let mut table = FileTable::new();
@@ -530,8 +599,8 @@ mod tests {
         assert_eq!(table.path(first), None, "the first id stays a hole");
         assert_eq!(
             table.path(second),
-            Some(path.as_path()),
-            "the retracted memo sends the re-intern to the lexical spelling"
+            Some(canonical.as_path()),
+            "the re-intern re-derives the canonical spelling from the live ancestor"
         );
         assert_eq!(table.try_file_id(&path), Some(second));
 
@@ -539,10 +608,9 @@ mod tests {
     }
 
     /// Memo-retraction churn pin: intern → forget → delete → re-intern
-    /// cycles never grow the memo. The forget retracts the spelling's entry
-    /// (and fills nothing itself); the deleted-file re-intern takes the
-    /// uncached lexical fallback; a re-created file re-canonicalizes back
-    /// into the single entry it held before.
+    /// cycles never grow the memo beyond one entry per spelling. The forget
+    /// retracts the spelling's entry; every re-intern — of an existing or a
+    /// deleted file — refills exactly that one entry.
     #[test]
     fn intern_forget_delete_reintern_cycles_do_not_grow_the_memo() {
         let base = temp_dir("memo-retract");
@@ -564,8 +632,8 @@ mod tests {
         table.intern(&path);
         assert_eq!(
             table.memo.canonical.len(),
-            0,
-            "the deleted-file re-intern takes the uncached fallback"
+            1,
+            "the deleted-file re-intern re-derives and refills one entry"
         );
 
         for _ in 0..3 {
@@ -576,7 +644,7 @@ mod tests {
             assert_eq!(table.memo.canonical.len(), 0, "retracted again");
             let _ = fs::remove_file(&path);
             table.intern(&path);
-            assert_eq!(table.memo.canonical.len(), 0);
+            assert_eq!(table.memo.canonical.len(), 1);
         }
 
         let _ = fs::remove_dir_all(&base);

@@ -543,14 +543,12 @@ fn relative(fixture: &Fixture, file: FileId, engine: &Engine) -> String {
         .file_table()
         .path(file)
         .expect("event file is resident");
-    // dartq-pub canonicalizes package roots, so on macOS interned paths live
-    // under /private/var while temp_dir() spells /var. Overlay-only files
-    // (never on disk) keep the literal temp_dir spelling — FileTable
-    // canonicalizes existing paths only — so strip against whichever root
-    // spelling the interned path carries.
+    // The path-universe invariant (#287): every interned path — disk or
+    // overlay-only — carries the canonical root spelling (dartq-pub
+    // canonicalizes package roots, and FileTable derives the same universe
+    // for missing paths), so the canonical root is the one strip base.
     let canonical = fixture.root.canonicalize().expect("fixture root resolves");
     path.strip_prefix(&canonical)
-        .or_else(|_| path.strip_prefix(&fixture.root))
         .expect("fixture-relative path")
         .to_string_lossy()
         .into_owned()

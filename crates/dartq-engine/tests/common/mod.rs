@@ -82,6 +82,13 @@ impl Fixture {
             write(relative, content);
         }
 
+        // Mirror the CLI assembly (dartq-cli main.rs): canonicalize the
+        // workspace root before the pub faces resolve it, so package roots
+        // inherit the canonical spelling — the same universe the engine's
+        // FileTable interns every path into (the #287 path-universe
+        // invariant). A literal-spelled table (macOS /var vs /private/var)
+        // would attribute no canonical-spelled file to any package.
+        let root = root.canonicalize().expect("fixture root resolves");
         let config_dir = root.join(".dart_tool");
         let config = Arc::new(
             PackageConfig::parse(

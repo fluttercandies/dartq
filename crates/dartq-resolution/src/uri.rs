@@ -205,7 +205,8 @@ impl PackageTable {
 }
 
 /// The resolution context: package table, SDK snapshot with its target
-/// segment, and the [`FileTable`] targets are interned into.
+/// segment, the [`FileTable`] targets are interned into, and the engine's
+/// file-residency view.
 ///
 /// The containing file's canonical base URI is memoized per [`FileId`], so
 /// each file pays one package scan and every directive afterwards is hash
@@ -215,6 +216,12 @@ pub struct UriResolver<'a> {
     sdk: &'a SdkSnapshot,
     target: Box<str>,
     files: &'a mut FileTable,
+    /// The engine's file-state existence face (`FileState.exists`): which
+    /// interned ids hold content in the analyzed world. A target the engine
+    /// declares resident exists even though it never hit disk — the oracle's
+    /// overlay semantics — so the missing-target codes only fire for paths
+    /// outside residency.
+    resident: &'a dyn Fn(FileId) -> bool,
     bases: FxHashMap<FileId, BaseUri>,
 }
 
@@ -280,20 +287,35 @@ fn package_of<'p>(packages: &'p PackageTable, path: &Path) -> Option<(&'p str, S
 impl<'a> UriResolver<'a> {
     /// Creates a resolver over `packages` and `sdk`, dispatching `dart:` URIs
     /// against the SDK target segment `target` (e.g. `"vm"`) and interning
-    /// file targets into `files`.
+    /// file targets into `files`. `resident` reports which interned ids hold
+    /// content in the analyzed world (disk files and declared overlays
+    /// alike); a target it accepts never codes `uri_does_not_exist`.
     pub fn new(
         packages: &'a PackageTable,
         sdk: &'a SdkSnapshot,
         target: &str,
         files: &'a mut FileTable,
+        resident: &'a dyn Fn(FileId) -> bool,
     ) -> Self {
         Self {
             packages,
             sdk,
             target: Box::from(target),
             files,
+            resident,
             bases: FxHashMap::default(),
         }
+    }
+
+    /// Whether the analyzed world holds `path`: on disk, or resident in the
+    /// engine (an id the owner of [`Self::resident`] declared content for —
+    /// a declared overlay the disk has never seen).
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+            || match self.files.try_file_id(path) {
+                Some(id) => (self.resident)(id),
+                None => false,
+            }
     }
 
     /// The [`FileTable`] targets were interned into.
@@ -436,7 +458,7 @@ impl<'a> UriResolver<'a> {
                     };
                 };
                 let path = normalize(Path::new(&text));
-                let code = (!path.exists()).then(|| missing_file_code(&path));
+                let code = (!self.exists(&path)).then(|| missing_file_code(&path));
                 let id = self.files.intern(&path);
                 UriResolution {
                     uri: ResolvedUri::File(path),
@@ -463,10 +485,11 @@ impl<'a> UriResolver<'a> {
             return unresolvable();
         };
         let file = normalize(&join_rel(lib_dir, &decoded));
-        if !file.exists() {
+        if !self.exists(&file) {
             // Generated-file face: `.dart_tool/build/generated/<pkg>/lib/`
             // + the raw (undecoded) rel path, verbatim from the resolver
-            // chain; used only when present.
+            // chain; used only when present (build output, never an overlay
+            // — the probe stays disk-only).
             let built = join_rel(
                 &self
                     .packages
@@ -1358,8 +1381,9 @@ mod tests {
 
     /// Builds a resolver over the fixture, interning into `files` (kept by the
     /// test so fixture reads stay possible while the resolver is alive).
+    /// Disk-only existence: no residency beyond the fixture's real files.
     fn resolver<'a>(fixture: &'a Fixture, files: &'a mut FileTable) -> UriResolver<'a> {
-        UriResolver::new(&fixture.packages, &fixture.snapshot, "vm", files)
+        UriResolver::new(&fixture.packages, &fixture.snapshot, "vm", files, &|_| false)
     }
 
     /// Interns a fixture-relative path as a container file.

@@ -17,10 +17,9 @@ use crate::file_table::PathMemo;
 /// Pure data structure on purpose — all file system IO (`stat`, read, hash)
 /// belongs to the callers. Paths are normalized with the same memoized rule
 /// as [`FileTable`](crate::FileTable), so aliased spellings of one file
-/// share a single entry. Like the file table, the memo applies only to
-/// canonicalize successes: spellings with no canonical identity (missing
-/// files) are re-resolved on every call, so this structure never grows for
-/// them, and [`Locator::forget`] retracts a forgotten spelling's memo entry.
+/// share a single entry — including missing paths, whose identities derive
+/// from the nearest existing ancestor (the path-universe invariant, see the
+/// file table module docs).
 ///
 /// Path residency note: the locator stores its own normalized copy of each
 /// path, separate from the one copy [`FileTable`](crate::FileTable) keeps.
@@ -178,11 +177,12 @@ mod tests {
         assert!(!locator.forget(Path::new("/work/pkg/never.dart")));
     }
 
-    /// Pin for the type-doc claim: missing paths take the uncached lexical
-    /// fallback on every call, so record/lookup/forget cycles never grow
-    /// either the entries map or the memo.
+    /// Pin for the churn face of the caching policy: missing paths derive
+    /// and memoize one entry per spelling (the universe invariant), and
+    /// record/lookup/forget cycles keep both the entries map and the memo
+    /// bounded — the forget retracts the spelling's memo entry each cycle.
     #[test]
-    fn missing_paths_never_grow_the_locator() {
+    fn missing_paths_stay_bounded_across_cycles() {
         let mut locator = Locator::new();
         let missing = Path::new("/work/pkg/never-created.dart");
         let t0 = SystemTime::UNIX_EPOCH;
@@ -192,13 +192,13 @@ mod tests {
             locator.record(missing, t0, id);
             assert_eq!(locator.lookup(missing), Some((t0, id)));
             assert!(
-                locator.memo.get(missing).is_none(),
-                "the lexical fallback must stay unmemoized"
+                locator.memo.get(missing).is_some(),
+                "the derived identity memoizes"
             );
             assert!(locator.forget(missing));
             assert!(
                 locator.memo.get(missing).is_none(),
-                "the forget itself must not memoize"
+                "the forget retracts it"
             );
         }
         assert_eq!(locator.lookup(missing), None, "entries reclaimed");
