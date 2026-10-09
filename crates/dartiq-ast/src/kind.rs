@@ -277,23 +277,41 @@ impl NodeKind {
 /// error was marked inside it, directly or through propagation from a
 /// descendant at end-event time; "does this declaration contain errors" is
 /// then a flag read, not a diagnostics join (layout spec §3).
+///
+/// Bits 1..=7 carry the kind's modifier set (`ModSet`, collapse map §1) —
+/// #174 eliminated the two-word `ModSet` payload by moving its `flags: u16`
+/// here and deriving its `first` token (`flags != 0` ⇒ the first modifier is
+/// the node's span head: the official parser always computes declaration
+/// begin tokens as the first token after metadata, so a non-empty modifier
+/// set starts the span; `flags == 0` ⇒ absent, [`crate::TOKEN_NONE`]
+/// semantics). Bit *semantics* are the modifier families of collapse map §1
+/// (class: augment/abstract/sealed/base/interface/final/mixin; member:
+/// augment/external/static/covariant/late/varFinalOrConst) — the parser lane
+/// assigns bit values inside the mask.
 pub(crate) mod flags {
     pub(crate) const ERROR: u16 = 1 << 0;
+    /// Low bit of the `ModSet` field inside `NodeHeader.flags`.
+    pub(crate) const MOD_SHIFT: u16 = 1;
+    /// Mask of the 7 modifier bits (bits 1..=7); the rest of the `u16` stays
+    /// spare.
+    pub(crate) const MOD_MASK: u16 = 0b0111_1111 << MOD_SHIFT;
 }
 
 /// Number of shared-pool `u32` words the kind's payload occupies (zero for
 /// span-only and token-leaf kinds — the span token pair lives in the header,
 /// and a token leaf's token *is* its span head, so both store no payload
 /// word; layout spec §1.3, #151). Per-variant fields are the collapse map §3
-/// payload columns minus the span words and minus span-head words dropped as
-/// derivable; the widest kind is [`NodeKind::FormalParameter`] at 7 words,
-/// the single tolerated outlier of the ≤30 B/node average (layout spec
-/// §1.5).
+/// payload columns minus every derivable word: the #151 span-head pass, then
+/// the #174 second pass (span-head tokens, end-of-span `;`/bracket tokens,
+/// head-when-present keywords, `ModSet` into [`flags`], the nullable `?`),
+/// each with its SDK citation in `docs/facts/ast-collapse-map.md` §1/§3. The
+/// widest kind is [`NodeKind::FormalParameter`] at 5 words, the single
+/// tolerated outlier of the ≤30 B/node average (layout spec §1.5).
 ///
-/// Width 0 by shape: every kind whose map payload had no fields, plus the
-/// former width-1 kinds whose single word was the span-head token (~64 of
-/// them — literals, keyword/sentinel leaves, and head-token containers), plus
-/// `Send`/`ExpressionStatement` whose two words were the span endpoints.
+/// Width 0 by shape: fieldless kinds, the ~64 #151 span-head eliminations
+/// (map §1), and the #174 eliminations `TopLevelFields` (ModSet),
+/// `Type` (`?`), `MapPattern`/`ListPattern` (braces), `NativeFunctionBody`
+/// (native + `;`), `ConstantPattern` (`const`).
 ///
 /// Exhaustive over the enum on purpose: adding a variant without declaring
 /// its payload width is a compile error (R4 tables-lockstep guard).
@@ -302,64 +320,85 @@ pub(crate) mod flags {
 pub(crate) fn payload_len(kind: NodeKind) -> u8 {
     use NodeKind::*;
     match kind {
-        // ModSet-bearing declaration kinds: { flags: u16, first token } is
-        // 2 words (collapse map §1).
-        FormalParameter => 7,
-        ClassDeclaration | NamedMixinApplication | Method | Constructor => 6,
-        MixinDeclaration | ExtensionTypeDeclaration | EnumDeclaration | ForParts | ForInParts => 5,
-        ExtensionDeclaration | Typedef | Factory | Assert | ExpressionBody => 4,
-        ConditionalUri
-        | TopLevelMethod
-        | Fields
+        // Widest kind: receiver/name/init range/kind (ModSet moved into the
+        // header flag bits, #174).
+        FormalParameter => 5,
+        // ModSet → header bits (#174): class/extends/with/implements and
+        // kind/(new|get_set)/param/initializers remain.
+        ClassDeclaration | NamedMixinApplication | Method | Constructor => 4,
+        MixinDeclaration
+        | ExtensionTypeDeclaration
+        | EnumDeclaration
+        | ExtensionDeclaration
+        // ForParts/ForInParts: the `for` token is the span head (map §3.4:
+        // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived.
+        | ForParts
+        | ForInParts
+        // Assert: `assert` is the span head, derived.
+        | Assert
+        | ExpressionBody
         | PrimaryConstructor
         | PrimaryConstructorBody
         | SwitchCase
+        | MapEntry
+        | ObjectPattern => 3,
+        Typedef
+        | Factory
+        // ConditionalUri: `if` is the span head; CatchClause: `on` is
+        // head-when-present; ConstructorReference: `start` is the span head;
+        // OperatorName: `operator` is the span head; ForControlFlow: `for`
+        // follows `await` (both #174, map §3).
+        | ConditionalUri
         | CatchClause
-        | Break
-        | Continue
-        | PatternVarDeclStatement
-        | Indexed
         | ConstructorReference
         | OperatorName
-        | MapEntry
-        | ObjectPattern
         | ForControlFlow
-        | SkippedBody => 3,
-        // ParenthesizedCondition: case_/when only — the former span-head
-        // `token` word is derivable from `header.first_token` (#151).
-        LibraryAugmentation
+        | LibraryAugmentation
         | PartOf
         | Import
         | EnumElement
-        | TopLevelFields
-        | VariablesDeclaration
-        | YieldStatement
-        | InvalidYieldStatement
         | Conditional
         | CascadeAccess
         | DotAccess
         | SetOrMapLiteral
         | AnonymousMethodInvocation
-        | Identifier
         | BlockBody
-        | MapPattern
-        | ListPattern
-        | DeclaredVariablePattern
-        | WildcardPattern
         | RestPattern
-        | Type
         | FunctionType
         | RecordType
         | TypeVariable
-        | NativeFunctionBody
         | UnescapeError
         | SwitchExpressionCase
         | CaseExpression
-        | TryStatement
         | ParenthesizedCondition => 2,
+        TopLevelMethod
+        | Fields
+        // Break/Continue: keyword = span head, `;` = last span token;
+        // has_target is not derivable (`break 123;` recovery keeps a
+        // non-identifier between keyword and `;`, map §3.4).
+        | Break
+        | Continue
+        // PatternVarDeclStatement: keyword = span head, `;` = last token,
+        // `=` kept. SkippedBody: begin/end = span endpoints, is_expression
+        // kept. Indexed: `open` follows the optional `?`, `close` is the last
+        // token. VariablesDeclaration: `late` is head-when-present.
+        // YieldStatement/InvalidYieldStatement: keyword/begin = span head.
+        // Identifier: token = span head, ctx kept (#174).
+        // DeclaredVariablePattern/WildcardPattern: `final`/`var` is
+        // head-when-present. TryStatement: `try` is the span head.
+        | PatternVarDeclStatement
+        | Indexed
+        | SkippedBody
+        | VariablesDeclaration
+        | YieldStatement
+        | InvalidYieldStatement
+        | Identifier
+        | DeclaredVariablePattern
+        | WildcardPattern
+        | TryStatement
         // Kinds whose single field is real data: bool / Option / k:u8 / a
         // non-head token (colon-like). All Fielded — built via begin/patch/end.
-        LibraryName
+        | LibraryName
         | RecoverImport
         | NoPrimaryConstructor
         | RecoverDeclarationHeader
@@ -381,18 +420,19 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | FunctionName
         | Qualified
         | BinaryPattern
-        | ConstantPattern
         | CastPattern
         | MapPatternEntry
         | PatternField
         | NamedRecordField
         | ExperimentNotEnabled => 1,
-        // Span-only and token-leaf kinds: no payload words. The first block
-        // is the original fieldless set; the second is the #151
-        // derivable-word0 elimination — former `token: T` width-1 kinds whose
-        // word was the span head (read it from `header.first_token`), and
-        // `Send`/`ExpressionStatement` whose two words were the span
-        // endpoints.
+        // Span-only and token-leaf kinds: no payload words. First block: the
+        // original fieldless set plus the #151 derivable-word0 eliminations
+        // and `Send`/`ExpressionStatement` (span endpoints). Second block:
+        // the #174 eliminations — `TopLevelFields` (ModSet → header bits),
+        // `Type` (`?` = last span token, map §3.8), `MapPattern`/
+        // `ListPattern` (braces = span endpoints), `NativeFunctionBody`
+        // (native = span head, `;` = last token), `ConstantPattern`
+        // (`const` = head-when-present, map §3.7).
         CompilationUnit
         | TopLevelDeclaration
         | Part
@@ -495,7 +535,13 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | EmptyBody
         | NoBody
         | Send
-        | ExpressionStatement => 0,
+        | ExpressionStatement
+        | TopLevelFields
+        | Type
+        | MapPattern
+        | ListPattern
+        | NativeFunctionBody
+        | ConstantPattern => 0,
     }
 }
 
@@ -520,22 +566,23 @@ pub enum LeafShape {
     /// Carries real payload words (bool / Option / count / k:u8 / non-head
     /// token fields). Built only through `begin`/`patch`/`end` — `patch`
     /// reaches open nodes, so a leaf-emitted Fielded kind could never fill
-    /// its slot. The pattern (every word written explicitly; zero-fill is
-    /// never a value):
+    /// its slot. The pattern (every word written explicitly; debug builds
+    /// poison-fill the slot at `begin` and sweep it at `end`, so a missed
+    /// write fails there — release trusts the parser):
     ///
     /// ```
     /// use dartiq_ast::{AstBuilder, NodeKind};
     ///
-    /// // Identifier { token, ctx } — token == span head, ctx is word 1.
+    /// // Identifier { ctx } — the token was eliminated as the span head
+    /// // (#174); ctx is word 0.
     /// let mut b = AstBuilder::new();
     /// b.begin(NodeKind::CompilationUnit, 0);
     /// b.begin(NodeKind::Identifier, 7);
-    /// b.patch(0, 7); // word 0: the token (explicit, even when == first_token)
-    /// b.patch(1, 3); // word 1: IdentifierContext discriminant
+    /// b.patch(0, 3); // word 0: IdentifierContext discriminant
     /// b.end(NodeKind::Identifier, 8);
     /// b.end(NodeKind::CompilationUnit, 8);
     /// let ast = b.finish();
-    /// assert_eq!(ast.payload(0), &[7, 3]);
+    /// assert_eq!(ast.payload(0), &[3]);
     /// ```
     Fielded,
 }

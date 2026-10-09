@@ -8,9 +8,10 @@
 
 use std::path::Path;
 
-use dartiq_scanner::{ScanConfig, scan};
+use dartiq_scanner::{Keyword, ScanConfig, TokenKind, scan};
 use dartiq_source::FileTable;
 
+use super::derived;
 use super::kind::{accepts_begin, leaf_shape, payload_len};
 use crate::{
     AstBuilder, LeafShape, Marker, NodeKind, SyntaxTable, TOKEN_NONE, byte_span, utf16_span,
@@ -68,20 +69,30 @@ fn post_order_layout_and_accessors() {
 fn payload_slot_patch_and_read() {
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    // ClassDeclaration: 6 pool words (ModSet 2 + class/extends/with/implements).
+    // ClassDeclaration: 4 pool words (class/extends/with/implements — the
+    // ModSet moved into the header flag bits, #174).
     b.begin(NodeKind::ClassDeclaration, 0);
-    b.patch(2, 7); // class keyword token
-    b.patch(3, 9); // extends clause anchor
+    b.set_modifiers(0b10); // abstract bit (lane-owned semantics)
+    b.patch(0, 7); // class keyword token
+    b.patch(1, 9); // extends clause anchor
+    b.patch(2, TOKEN_NONE); // with absent
+    b.patch(3, TOKEN_NONE); // implements absent
     b.end(NodeKind::ClassDeclaration, 10);
     b.end(NodeKind::CompilationUnit, 10);
     let ast = b.finish();
 
     let payload = ast.payload(ast.root().unwrap() - 1);
-    assert_eq!(payload.len(), 6);
-    assert_eq!(payload[2], 7);
-    assert_eq!(payload[3], 9);
-    assert_eq!(payload[0], 0, "unpatched fields stay zero");
+    assert_eq!(payload.len(), 4);
+    assert_eq!(payload[0], 7);
+    assert_eq!(payload[1], 9);
+    assert_eq!(payload[2], TOKEN_NONE);
     assert!(ast.payload(ast.root().unwrap()).is_empty());
+    assert_eq!(
+        derived::mod_flags(&ast, ast.root().unwrap() - 1),
+        0b10,
+        "modifier bits live in the header flags"
+    );
+    assert!(!ast.is_error(ast.root().unwrap() - 1));
 }
 
 #[test]
@@ -100,14 +111,13 @@ fn token_leaf_carries_no_payload() {
 #[test]
 fn fielded_leaf_patterns() {
     // Fielded kinds never go through leaf(): begin reserves the slot, patch
-    // fills every word explicitly, end seals (#151).
+    // fills every word explicitly (a missed write trips the poison sweep at
+    // seal time in debug builds).
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    // Identifier { token, ctx } — token == span head, patched explicitly
-    // (zero-fill is never a value).
+    // Identifier { ctx } — the token was eliminated as the span head (#174).
     b.begin(NodeKind::Identifier, 1);
-    b.patch(0, 1);
-    b.patch(1, 2);
+    b.patch(0, 2);
     b.end(NodeKind::Identifier, 2);
     // CascadeAccess { token, null_aware } — bool bit set.
     b.begin(NodeKind::CascadeAccess, 2);
@@ -116,7 +126,7 @@ fn fielded_leaf_patterns() {
     b.end(NodeKind::CascadeAccess, 3);
     b.end(NodeKind::CompilationUnit, 3);
     let ast = b.finish();
-    assert_eq!(ast.payload(0), &[1, 2]);
+    assert_eq!(ast.payload(0), &[2]);
     assert_eq!(ast.payload(1), &[2, 1]);
 }
 
@@ -234,14 +244,14 @@ fn canonical_begin_is_never_narrower_than_its_ends() {
 #[test]
 fn payload_width_ceiling() {
     use NodeKind::*;
-    // The spec tolerates exactly one fat outlier (7 pool words, layout spec
-    // §1.5); no other kind may reach it.
+    // The spec tolerates exactly one fat outlier (layout spec §1.5); no
+    // other kind may reach it. #174 brought the outlier down from 7 to 5.
     let mut max = 0u8;
     for raw in 0..NodeKind::KIND_COUNT {
         max = max.max(payload_len(NodeKind::from_raw(raw)));
     }
-    assert_eq!(max, 7);
-    assert_eq!(payload_len(FormalParameter), 7);
+    assert_eq!(max, 5);
+    assert_eq!(payload_len(FormalParameter), 5);
 }
 
 #[test]
@@ -268,6 +278,10 @@ fn leaf_shape_width_lockstep() {
     assert_eq!(leaf_shape(ThisExpression), LeafShape::TokenLeaf);
     assert_eq!(leaf_shape(StringLiteral), LeafShape::SpanOnly);
     assert_eq!(leaf_shape(Send), LeafShape::SpanOnly);
+    // #174 width-0 flips stay SpanOnly (containers/multi-token handles).
+    assert_eq!(leaf_shape(Type), LeafShape::SpanOnly);
+    assert_eq!(leaf_shape(TopLevelFields), LeafShape::SpanOnly);
+    assert_eq!(leaf_shape(ConstantPattern), LeafShape::SpanOnly);
     assert_eq!(leaf_shape(Identifier), LeafShape::Fielded);
     assert_eq!(leaf_shape(ParenthesizedCondition), LeafShape::Fielded);
 }
@@ -275,14 +289,13 @@ fn leaf_shape_width_lockstep() {
 #[test]
 fn narrow_seal_paths() {
     // Shared-begin groups open as the canonical (widest) kind and may seal
-    // as a narrower end — including the width-0 ends (#151).
+    // as a narrower end — including the width-0 ends (#151/#174).
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    // Fields (3 words: ModSet + kind) → TopLevelFields (2 words: ModSet).
+    // Fields (1 word: kind) → TopLevelFields (0 words: the ModSet lives in
+    // the header flag bits).
     b.begin(NodeKind::Fields, 0);
-    b.patch(0, 1);
-    b.patch(1, 9);
-    b.patch(2, 0);
+    b.patch(0, 0);
     b.leaf(NodeKind::LiteralInt, 1);
     b.end(NodeKind::TopLevelFields, 2);
     // AwaitExpression (width 0) → InvalidAwaitExpression (width 0): the
@@ -294,7 +307,10 @@ fn narrow_seal_paths() {
     let ast = b.finish();
     // Post-order: [leaf, TopLevelFields, leaf, InvalidAwaitExpression, unit].
     assert_eq!(ast.kind(1), NodeKind::TopLevelFields);
-    assert_eq!(ast.payload(1).len(), 2, "slot narrowed to the sealed width");
+    assert!(
+        ast.payload(1).is_empty(),
+        "slot narrowed to the width-0 end"
+    );
     assert_eq!(ast.kind(3), NodeKind::InvalidAwaitExpression);
     assert!(ast.payload(3).is_empty());
 }
@@ -327,18 +343,162 @@ fn root_sealed_last() {
 }
 
 #[test]
-fn payload_bearing_constructions() {
-    // Representative Fielded kinds across domains: every word written
-    // explicitly; absent Options read back TOKEN_NONE, never zero (#151).
+#[cfg(debug_assertions)]
+fn leaf_rejects_fielded_kind() {
+    // Fielded kinds reserve their slot at begin and fill it via patch — a
+    // leaf emission could never back-fill it (#151/#174 contract).
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.leaf(NodeKind::Identifier, 0);
+    });
+    assert!(result.is_err(), "leaf must reject Fielded kinds");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn leaf_span_rejects_token_leaf_kind() {
+    // TokenLeaf spans are forced to [token, token + 1) — leaf_span would
+    // let a malformed span through.
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.leaf_span(NodeKind::LiteralInt, 0, 1);
+    });
+    assert!(result.is_err(), "leaf_span must reject TokenLeaf kinds");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn leaf_span_rejected_after_root_seal() {
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.end(NodeKind::CompilationUnit, 1);
+        b.leaf_span(NodeKind::StringLiteral, 0, 1);
+    });
+    assert!(result.is_err(), "leaf_span after the root must fail");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn poison_sweep_catches_missed_patch() {
+    // Every Fielded word must be written explicitly: begin poison-fills the
+    // slot, end sweeps it — a missed patch fails at seal time, never reads
+    // back as token 0.
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.begin(NodeKind::Break, 0); // width 1: has_target
+        b.end(NodeKind::Break, 1); // no patch
+    });
+    assert!(result.is_err(), "a missed patch must fail at seal time");
+}
+
+#[test]
+fn derived_accessors_read_eliminated_words() {
+    // ModSet (#174): header flag bits + derived first modifier.
+    let source = "abstract class A {}";
+    let mut files = FileTable::new();
+    let result = scan_of(source, &mut files, "a.dart");
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    // ForParts { for, lparen, left_sep, right_sep, update_count }.
+    b.begin(NodeKind::ClassDeclaration, 0);
+    b.set_modifiers(0b10); // abstract bit (lane-owned semantics)
+    b.patch(0, 1); // class keyword
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, TOKEN_NONE);
+    b.patch(3, TOKEN_NONE);
+    b.end(NodeKind::ClassDeclaration, result.tokens.len() as u32);
+    b.end(NodeKind::CompilationUnit, result.tokens.len() as u32);
+    let ast = b.finish();
+    let class_id = ast.root().unwrap() - 1;
+    assert_eq!(derived::mod_flags(&ast, class_id), 0b10);
+    assert_eq!(derived::first_modifier(&ast, class_id), Some(0));
+    assert!(derived::head_is(
+        &result.tokens,
+        &ast,
+        class_id,
+        Keyword::Abstract
+    ));
+
+    // Type `?` (#174): nullable ⟺ the last span token is `?`.
+    let mut files = FileTable::new();
+    let nullable = scan_of("T? x;", &mut files, "b.dart");
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Type, 0);
+    b.end(NodeKind::Type, 2);
+    b.end(NodeKind::CompilationUnit, 4);
+    let ast = b.finish();
+    assert!(derived::question(&nullable.tokens, &ast, 0));
+
+    let mut files = FileTable::new();
+    let plain = scan_of("T x;", &mut files, "c.dart");
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Type, 0);
+    b.end(NodeKind::Type, 1);
+    b.end(NodeKind::CompilationUnit, 3);
+    let ast = b.finish();
+    assert!(!derived::question(&plain.tokens, &ast, 0));
+
+    // Closing-token derivation: `break;` — the `;` is the last span token.
+    let mut files = FileTable::new();
+    let brk = scan_of("break;", &mut files, "d.dart");
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Break, 0);
+    b.patch(0, 0);
+    b.end(NodeKind::Break, brk.tokens.len() as u32);
+    b.end(NodeKind::CompilationUnit, brk.tokens.len() as u32);
+    let ast = b.finish();
+    let semi = derived::last_token(&brk.tokens, &ast, 0).unwrap();
+    assert_eq!(
+        brk.tokens.get(semi as usize).unwrap().kind,
+        TokenKind::Semicolon
+    );
+
+    // `Indexed` open bracket after the null-aware `?`.
+    let mut files = FileTable::new();
+    let idx = scan_of("a?[0]", &mut files, "e.dart");
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Indexed, 1); // span head is the `?`
+    b.patch(0, 1); // question word
+    b.end(NodeKind::Indexed, idx.tokens.len() as u32);
+    b.end(NodeKind::CompilationUnit, idx.tokens.len() as u32);
+    let ast = b.finish();
+    assert_eq!(derived::indexed_open(&ast, 0, ast.payload(0)[0]), 2);
+
+    // Head-when-present keyword: `late var x;` — `late` is the head.
+    let mut files = FileTable::new();
+    let late = scan_of("late var x;", &mut files, "f.dart");
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::VariablesDeclaration, 0);
+    b.patch(0, 1); // modifier word: `var`
+    b.end(NodeKind::VariablesDeclaration, late.tokens.len() as u32);
+    b.end(NodeKind::CompilationUnit, late.tokens.len() as u32);
+    let ast = b.finish();
+    assert!(derived::head_is(&late.tokens, &ast, 0, Keyword::Late));
+    assert!(!derived::head_is(&late.tokens, &ast, 0, Keyword::Var));
+}
+
+#[test]
+fn payload_bearing_constructions() {
+    // Representative Fielded kinds across domains: every word written
+    // explicitly; absent Options read back TOKEN_NONE, never zero
+    // (#151/#174; the derivation accessors recompute the eliminated words).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // ForParts { lparen, left_sep, right_sep, update_count } — the `for`
+    // token is the span head (#174).
     b.begin(NodeKind::ForParts, 1);
-    b.patch(0, 1);
-    b.patch(1, 2);
-    b.patch(2, 4);
-    b.patch(3, 6);
-    b.patch(4, 2);
+    b.patch(0, 2);
+    b.patch(1, 4);
+    b.patch(2, 6);
+    b.patch(3, 2);
     b.leaf(NodeKind::LiteralInt, 3);
     b.leaf(NodeKind::LiteralInt, 5);
     b.end(NodeKind::ForParts, 7);
@@ -349,28 +509,23 @@ fn payload_bearing_constructions() {
     b.patch(2, 1);
     b.leaf(NodeKind::LiteralInt, 7);
     b.end(NodeKind::SwitchCase, 8);
-    // Break { has_target, break, end } — unlabeled.
+    // Break { has_target } / Continue { has_target } — keyword (span head)
+    // and `;` (last span token) are derived (#174).
     b.begin(NodeKind::Break, 8);
     b.patch(0, 0);
-    b.patch(1, 8);
-    b.patch(2, 9);
     b.end(NodeKind::Break, 9);
-    // Continue { has_target, continue, end } — labeled.
     b.begin(NodeKind::Continue, 9);
     b.patch(0, 1);
-    b.patch(1, 9);
-    b.patch(2, 10);
     b.end(NodeKind::Continue, 10);
-    // CatchClause { on: O, catch: O, comma: O } — `on` present.
+    // CatchClause { catch: O, comma: O } — `on` is head-when-present; here
+    // the `on` form: head is `on`, catch/comma absent.
     b.begin(NodeKind::CatchClause, 10);
-    b.patch(0, 10);
+    b.patch(0, TOKEN_NONE);
     b.patch(1, TOKEN_NONE);
-    b.patch(2, TOKEN_NONE);
     b.end(NodeKind::CatchClause, 11);
-    // TryStatement { try: T, finally: O } — finally absent.
+    // TryStatement { finally: O } — the `try` head is derived; finally absent.
     b.begin(NodeKind::TryStatement, 12);
-    b.patch(0, 12);
-    b.patch(1, TOKEN_NONE);
+    b.patch(0, TOKEN_NONE);
     b.end(NodeKind::TryStatement, 13);
     // Conditional { question: T, colon: T }.
     b.begin(NodeKind::Conditional, 13);
@@ -380,30 +535,30 @@ fn payload_bearing_constructions() {
     b.leaf(NodeKind::LiteralInt, 14);
     b.leaf(NodeKind::LiteralInt, 15);
     b.end(NodeKind::Conditional, 16);
-    // Assert { assert: T, kind, lparen: T, comma: O } — comma absent.
+    // Assert { kind, lparen: T, comma: O } — the `assert` head is derived;
+    // comma absent.
     b.begin(NodeKind::Assert, 16);
-    b.patch(0, 16);
-    b.patch(1, 2); // AssertKind discriminant
-    b.patch(2, 17);
-    b.patch(3, TOKEN_NONE);
+    b.patch(0, 2); // AssertKind discriminant
+    b.patch(1, 17);
+    b.patch(2, TOKEN_NONE);
     b.end(NodeKind::Assert, 18);
     b.end(NodeKind::CompilationUnit, 18);
     let ast = b.finish();
 
     // Post-order ids: ForParts 2, SwitchCase 4, Break 5, Continue 6,
     // CatchClause 7, TryStatement 8, Conditional 12, Assert 13.
-    assert_eq!(ast.payload(2), &[1, 2, 4, 6, 2]);
+    assert_eq!(ast.payload(2), &[2, 4, 6, 2]);
     assert_eq!(
         ast.payload(4),
         &[u32::MAX, u32::MAX, 1],
         "absent Options read as TOKEN_NONE, not zero"
     );
-    assert_eq!(ast.payload(5), &[0, 8, 9]);
-    assert_eq!(ast.payload(6), &[1, 9, 10]);
-    assert_eq!(ast.payload(7), &[10, u32::MAX, u32::MAX]);
-    assert_eq!(ast.payload(8), &[12, u32::MAX]);
+    assert_eq!(ast.payload(5), &[0]);
+    assert_eq!(ast.payload(6), &[1]);
+    assert_eq!(ast.payload(7), &[u32::MAX, u32::MAX]);
+    assert_eq!(ast.payload(8), &[u32::MAX]);
     assert_eq!(ast.payload(12), &[13, 14]);
-    assert_eq!(ast.payload(13), &[16, 2, 17, u32::MAX]);
+    assert_eq!(ast.payload(13), &[2, 17, u32::MAX]);
 }
 
 #[test]
@@ -435,6 +590,9 @@ fn rollback_truncates_nodes_pool_and_error_bits() {
     let marker: Marker = b.mark();
     b.begin(NodeKind::ClassDeclaration, 1);
     b.patch(0, 42);
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, TOKEN_NONE);
+    b.patch(3, TOKEN_NONE);
     b.mark_error();
     b.leaf(NodeKind::LiteralInt, 1);
     b.end(NodeKind::ClassDeclaration, 2);
@@ -471,10 +629,10 @@ fn spans_derive_from_token_table() {
 
     let mut b = AstBuilder::new();
     b.begin(NodeKind::CompilationUnit, 0);
-    // Fielded Identifier: the begin/patch/end pattern (#151 contract).
+    // Fielded Identifier: the begin/patch/end pattern (#151/#174 contract);
+    // ctx is word 0, the token is the span head.
     b.begin(NodeKind::Identifier, 0);
     b.patch(0, 0);
-    b.patch(1, 0);
     b.end(NodeKind::Identifier, 1);
     b.end(NodeKind::CompilationUnit, result.tokens.len() as u32);
     let ast = b.finish();
@@ -525,7 +683,7 @@ fn ast_key_equality() {
     assert_eq!(a, key(b"x", &latest));
     assert_ne!(a, key(b"y", &latest));
     assert_ne!(a, key(b"x", &dart3), "feature fingerprint participates");
-    assert_eq!(a.parser_version.raw(), 2);
+    assert_eq!(a.parser_version.raw(), 3);
     assert_eq!(
         a.feature_set.raw(),
         latest.fingerprint(),

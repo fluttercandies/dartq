@@ -31,11 +31,14 @@ impl FeatureSetId {
 pub struct ParserVersion(u32);
 
 impl ParserVersion {
-    /// The current parser version. 2: #151 payload-layout semantics changed
-    /// (token-leaf words eliminated into `first_token`, explicit
-    /// `Option`-word encoding, ParenthesizedCondition/Send/
-    /// ExpressionStatement widths) — v1 tables must not be reused as v2.
-    pub const CURRENT: Self = Self(2);
+    /// The current parser version. 3: #174 second derivable-word elimination
+    /// (span-head/end-of-span token derivations, head-when-present keywords,
+    /// `ModSet` moved into the `NodeHeader.flags` modifier bits, `Type` `?`
+    /// derivation) plus the debug poison-fill contract — v2 tables must not
+    /// be reused as v3. 2 was #151 (token-leaf words eliminated into
+    /// `first_token`, explicit `Option`-word encoding,
+    /// ParenthesizedCondition/Send/ExpressionStatement widths).
+    pub const CURRENT: Self = Self(3);
 
     /// The underlying number.
     #[must_use]

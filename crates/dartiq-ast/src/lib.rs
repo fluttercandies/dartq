@@ -5,13 +5,17 @@
 //!
 //! # Layout
 //!
-//! One flat `Vec<NodeHeader>` of uniform 24-byte rows (kind, error flag,
-//! token pair, contiguous child range, payload index) plus one shared
-//! append-only `u32` payload pool addressed by that index. Every node pays
-//! only for the payload width its kind declares; parents are not stored but
-//! derived by a short forward walk. Targets pinned by the spec and asserted
-//! at compile time and by the corpus metrics test: 24 B header, ≤30 B average
-//! per node, ≤1.5 MB of AST per MB of source.
+//! One flat `Vec<NodeHeader>` of uniform 24-byte rows (kind, flags — error
+//! bit + modifier bits — token pair, contiguous child range, payload index)
+//! plus one shared append-only `u32` payload pool addressed by that index.
+//! Every node pays only for the payload width its kind declares; words
+//! derivable from the row's own tokens (span head, closing `;`/bracket,
+//! head-when-present keyword, nullable `?`, `ModSet` first token) are not
+//! stored at all — the derived-field accessors recompute them (map §1, #151
+//! + #174). Parents are not stored but derived by a short forward walk.
+//! Targets pinned by the spec and asserted at compile time and by the corpus
+//! metrics test: 24 B header, ≤30 B average per node, ≤1.5 MB of AST per MB
+//! of source.
 //!
 //! # Faces
 //!
@@ -20,6 +24,8 @@
 //!   This crate never depends on the parser; nothing depends back on it.
 //! - [`SyntaxTable`] — the immutable result: `root`, `kind`, `is_error`,
 //!   `token_range`, `children`, `parent`, `payload`.
+//! - The derived-field accessors for eliminated payload words (`question`,
+//!   `mod_flags`, `last_token`, …) — #174.
 //! - [`AstKey`] — content-addressed cache identity; identical keys share one
 //!   unit across workspaces/contexts.
 //! - Traversal is `match node.kind` + an explicit stack — deliberately no
@@ -33,6 +39,7 @@
 //! to the diagnostics channel.
 
 mod builder;
+mod derived;
 mod key;
 mod kind;
 mod span;
@@ -41,6 +48,9 @@ mod table;
 mod tests;
 
 pub use builder::{AstBuilder, Marker};
+pub use derived::{
+    first_modifier, for_token, head_is, indexed_open, last_token, mod_flags, question,
+};
 pub use key::{AstKey, FeatureSetId, ParserVersion};
 pub use kind::{LeafShape, NodeKind, leaf_shape};
 pub use span::{byte_span, utf16_span};
@@ -64,9 +74,15 @@ pub type TokenRef = u32;
 /// Payload-word sentinel for an absent optional token — the
 /// `Option<TokenRef>` encoding (collapse map §1 notation, #151). Every
 /// optional word is written explicitly (`patch`ed with a real token or
-/// [`TOKEN_NONE`]); zero-fill is never `None` because 0 is a valid token
-/// index. Same bit pattern as the pool's internal `DATA_NONE` (different
-/// role: absent field vs empty slot).
+/// [`TOKEN_NONE`]); a missed write is impossible to miss in debug builds
+/// (the slot is poison-filled and swept at seal time) and release trusts the
+/// parser — zero-fill is never `None` because 0 is a valid token index. Same
+/// bit pattern as the pool's internal `DATA_NONE` (different role: absent
+/// field vs empty slot).
+///
+/// The payload pool itself is `u32`-addressed like the token table: a unit's
+/// pool is contract-bound below 2³² words (16 GB of payload; overflow is a
+/// parser/engine contract violation, not a runtime case).
 pub const TOKEN_NONE: TokenRef = u32::MAX;
 
 const _: () = assert!(

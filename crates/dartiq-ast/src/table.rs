@@ -82,6 +82,14 @@ impl SyntaxTable {
         self.nodes[id as usize].flags & flags::ERROR != 0
     }
 
+    /// The node's raw flag bits (error bit + modifier-set bits, see
+    /// [`crate::kind::flags`]). The derived-field accessors
+    /// ([`crate::derived`]) read their field out of here.
+    #[must_use]
+    pub(crate) fn header_flags(&self, id: u32) -> u16 {
+        self.nodes[id as usize].flags
+    }
+
     /// The half-open token-index range `[first, end)` backing the node's
     /// span. Derive offsets via [`crate::span`]; the compilation unit's span
     /// is a special case handled there.
@@ -114,8 +122,10 @@ impl SyntaxTable {
     /// The node's shared-pool payload words (empty for span-only and
     /// token-leaf kinds — a token leaf's token is its span head,
     /// [`Self::token_range`] `.start`). The per-field layout of each kind is
-    /// owned by the parser lanes that write it; the run length is
-    /// [`payload_len`] of the kind.
+    /// pinned by `docs/facts/ast-collapse-map.md` §3; words eliminated as
+    /// derivable (#174) come back through the crate-root derived accessors
+    /// (`question`, `mod_flags`, `last_token`, …), not this slice. The run
+    /// length is [`payload_len`] of the kind.
     #[must_use]
     pub fn payload(&self, id: u32) -> &[u32] {
         let h = &self.nodes[id as usize];

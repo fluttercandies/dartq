@@ -7,10 +7,11 @@
 //! push on every `end`, so child ranges are contiguous; begin/end pairs
 //! checked against the collapse-map pairing table; payload slots reserved at
 //! `begin` and back-filled by member events (the official class-like builder
-//! pattern); the compilation unit root sealed last (events after the root
-//! seal are refused in debug builds). Leaf construction follows the
-//! [`LeafShape`] contract: `leaf`/`leaf_span` carry no payload words —
-//! Fielded kinds build via `begin`/`patch`/`end`.
+//! pattern; debug builds poison-fill the slot and sweep it at `end` so a
+//! missed write fails at seal time); the compilation unit root sealed last
+//! (events after the root seal are refused in debug builds). Leaf
+//! construction follows the [`LeafShape`] contract: `leaf`/`leaf_span` carry
+//! no payload words — Fielded kinds build via `begin`/`patch`/`end`.
 //!
 //! This crate never depends on the parser: `dartiq-parser` implements its
 //! `ParserListener` trait over these event families (layout spec §1.3 end).
@@ -32,8 +33,20 @@ struct OpenNode {
     /// completed while it stays open is its child, contiguously.
     first_child: u32,
     payload_start: u32,
+    /// Modifier-set bits (`ModSet`, collapse map §1) collected before sealing
+    /// — stored into the header by `end` (`set_modifiers`, #174).
+    mod_flags: u16,
     errored: bool,
 }
+
+/// Debug-only payload poison: `begin` fills the reserved slot with it and
+/// `end` sweeps, so a Fielded word the parser forgot to `patch` fails loudly
+/// at seal time instead of silently reading as token 0 (which is a valid
+/// index — zero-fill is never a value). Release keeps zero-fill and trusts
+/// the parser; a payload value that legitimately equals this bit pattern is
+/// indistinguishable in debug builds — accepted (the pool is u32 token refs
+/// and small counters, none of which reach 3.7 billion).
+const POISON: u32 = 0xDEAD_BEEF;
 
 /// Restoration point for parser speculation: `rollback` truncates the open
 /// stack, the arena, the pool, and every error-flag bit set since the mark.
@@ -68,7 +81,7 @@ impl AstBuilder {
     }
 
     /// Opens a container node anchored at `first_token` and reserves its
-    /// payload slot.
+    /// payload slot (poison-filled in debug builds — see [`POISON`]).
     ///
     /// For shared-begin pairs (collapse map §2) the parser opens the kind it
     /// can name up front; the payload width of that kind must be at least the
@@ -78,15 +91,39 @@ impl AstBuilder {
     pub fn begin(&mut self, kind: NodeKind, first_token: u32) {
         debug_assert!(!self.root_sealed, "begin after the root was sealed");
         let payload_start = self.pool.len() as u32;
+        let fill = if cfg!(debug_assertions) { POISON } else { 0 };
         self.pool
-            .resize(self.pool.len() + payload_len(kind) as usize, 0);
+            .resize(self.pool.len() + payload_len(kind) as usize, fill);
         self.open.push(OpenNode {
             kind,
             first_token,
             first_child: self.nodes.len() as u32,
             payload_start,
+            mod_flags: 0,
             errored: false,
         });
+    }
+
+    /// Sets the innermost open node's modifier-set bits (`ModSet`, collapse
+    /// map §1) — the header-flag home of the payload words eliminated in
+    /// #174. `bits` must already be positioned inside the `MOD_MASK` mask
+    /// (bits 1..=7); repeated calls OR into the set. The derived read side
+    /// is the crate-root `mod_flags`/`first_modifier` accessors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no node is open. Debug builds additionally assert that
+    /// `bits` stays inside the modifier mask.
+    pub fn set_modifiers(&mut self, bits: u16) {
+        let node = self
+            .open
+            .last_mut()
+            .expect("set_modifiers without an open node");
+        debug_assert!(
+            bits & !flags::MOD_MASK == 0,
+            "modifier bits outside the mask"
+        );
+        node.mod_flags |= bits;
     }
 
     /// Seals the innermost open node as `end_kind`, spanning
@@ -99,8 +136,9 @@ impl AstBuilder {
     /// Panics when no node is open (parser bug, surfaces in any build).
     /// Debug builds additionally assert that `end_token` is not before the
     /// node's `first_token`, that `end_kind` accepts the open kind (pairing
-    /// table), and that the sealed kind's payload fits the slot reserved at
-    /// `begin`; release builds trust the parser.
+    /// table), that the sealed kind's payload fits the slot reserved at
+    /// `begin`, and that no payload word is still [`POISON`] (a missed
+    /// `patch`); release builds trust the parser.
     pub fn end(&mut self, end_kind: NodeKind, end_token: u32) {
         let node = self.open.pop().expect("end without a matching begin");
         debug_assert!(
@@ -118,6 +156,12 @@ impl AstBuilder {
             node.payload_start as usize + width as usize <= self.pool.len(),
             "payload slot narrower than the sealed kind's width"
         );
+        #[cfg(debug_assertions)]
+        for word in
+            &self.pool[node.payload_start as usize..node.payload_start as usize + width as usize]
+        {
+            debug_assert!(*word != POISON, "unpatched payload word in {end_kind:?}");
+        }
         let errored = node.errored;
         if errored {
             self.propagate_error();
@@ -125,7 +169,7 @@ impl AstBuilder {
         self.root_sealed = self.open.is_empty();
         self.nodes.push(NodeHeader {
             kind: end_kind,
-            flags: if errored { flags::ERROR } else { 0 },
+            flags: node.mod_flags | if errored { flags::ERROR } else { 0 },
             first_token: node.first_token,
             end_token,
             first_child: node.first_child,
