@@ -231,10 +231,14 @@ impl LineIndex {
     /// 1-based `(line, column)` for a 0-based UTF-16 code unit offset, where
     /// the column counts UTF-16 code units within the line (official
     /// `LineInfo.getLocation` semantics). This is the diagnostics position
-    /// entry point: the equivalent external recipe (UTF-16 → byte, byte →
-    /// line/col, then two byte → UTF-16 conversions for the column) costs
-    /// four line searches, this locates the line once and applies the
-    /// in-line wide-character deficit directly.
+    /// entry point: the line is located directly in the UTF-16 domain — one
+    /// binary search, no intermediate byte offset, no allocation.
+    ///
+    /// Unlike the byte-domain converters ([`Self::utf16_to_byte`],
+    /// [`utf16_offset_to_byte`]) there is **no mid-surrogate snap**: the
+    /// oracle is pure arithmetic (`offset - lineStart + 1` in UTF-16 units),
+    /// so an offset between the surrogates of an astral character reports
+    /// the LOW surrogate's position.
     ///
     /// # Panics
     ///
@@ -242,27 +246,41 @@ impl LineIndex {
     /// length, or when the resulting line or column overflows [`u32`]
     /// (same profile-independent contract as [`Self::byte_to_line_col`]).
     #[must_use]
-    pub fn line_col_utf16(&self, source: &str, utf16_offset: u32) -> (u32, u32) {
-        let byte = self.utf16_to_byte(source, utf16_offset);
-        let line = u32::try_from(self.line_at(byte)).expect("line number exceeds u32::MAX");
-        let col = byte - self.line_starts[line as usize];
-        let (_, wide_chars) = self.wide_line(line as usize);
-        // The UTF-16 column is the byte column minus the deficits of the
-        // wide characters fully before it; the enclosing lines' deficits
-        // cancel because both ends of the difference share them.
-        let mut column = col.checked_add(1).expect("column overflows u32");
-        if let Some(chars) = wide_chars {
-            for c in chars {
-                if c.end <= col {
-                    column -= c.deficit();
+    pub fn line_col_utf16(&self, _source: &str, utf16_offset: u32) -> (u32, u32) {
+        let total = self.source_len - self.wide_lines.last().map_or(0, |wl| wl.utf16_deficit);
+        assert!(
+            utf16_offset <= total,
+            "UTF-16 offset {utf16_offset} out of range (source has {total} UTF-16 code units)"
+        );
+        // Locate the line in the UTF-16 domain — the same locate as
+        // `utf16_to_byte`'s general branch, minus the snap. A line's UTF-16
+        // start is its byte start minus the deficit of the preceding lines;
+        // pure-ASCII sources have no wide lines, so UTF-16 offsets are byte
+        // offsets and the search is one plain binary search.
+        let (line, line_start_utf16) = if self.wide_lines.is_empty() {
+            let line = self.line_at(utf16_offset);
+            (line, self.line_starts[line])
+        } else {
+            let mut lo = 0usize;
+            let mut hi = self.line_starts.len();
+            while lo < hi {
+                let mid = usize::midpoint(lo, hi);
+                if self.line_starts[mid] - self.wide_line(mid).0 <= utf16_offset {
+                    lo = mid + 1;
                 } else {
-                    break;
+                    hi = mid;
                 }
             }
-        }
+            let line = lo - 1;
+            let (before, _) = self.wide_line(line);
+            (line, self.line_starts[line] - before)
+        };
+        let line = u32::try_from(line).expect("line number exceeds u32");
         (
             line.checked_add(1).expect("line number overflows u32"),
-            column,
+            (utf16_offset - line_start_utf16)
+                .checked_add(1)
+                .expect("column overflows u32"),
         )
     }
 
@@ -585,37 +603,85 @@ mod tests {
         }
     }
 
-    /// The fused `line_col_utf16` must agree with the external recipe
-    /// (`utf16_to_byte` → `byte_to_line_col` → two `byte_to_utf16` calls for
-    /// the column) on every UTF-16 offset of wide-character sources — hanzi,
-    /// astral emoji, BOM — plus an ASCII control. The diagnostics goldens
-    /// are pinned through that recipe, so parity here is what keeps golden
-    /// outputs byte-identical across the hoist.
+    /// The official recipe (`LineInfo.fromContent` + `getLocation`), computed
+    /// independently in the UTF-16 domain — Dart string offsets are UTF-16
+    /// code units, so its line starts and columns are pure UTF-16 arithmetic
+    /// with no byte-domain round-trip and no mid-surrogate snap.
+    fn official_line_col(source: &str, utf16_offset: u32) -> (u32, u32) {
+        let mut starts = vec![0u32];
+        let mut units = 0u32;
+        let mut chars = source.chars().peekable();
+        while let Some(ch) = chars.next() {
+            units += u32::try_from(ch.len_utf16()).unwrap();
+            let breaks = match ch {
+                // A `\r\n` pair is one break, counted at its `\n`.
+                '\r' => chars.peek() != Some(&'\n'),
+                '\n' => true,
+                _ => false,
+            };
+            if breaks {
+                starts.push(units);
+            }
+        }
+        assert!(utf16_offset <= units, "recipe offset out of range");
+        let line = starts.partition_point(|&start| start <= utf16_offset) - 1;
+        (u32::try_from(line).unwrap() + 1, utf16_offset - starts[line] + 1)
+    }
+
+    /// The fused `line_col_utf16` must agree with the official recipe
+    /// (`official_line_col` above: UTF-16 line starts, `offset - lineStart
+    /// + 1` pure arithmetic) on every UTF-16 offset of wide-character
+    /// sources — hanzi, astral emoji, BOM — plus an ASCII control and the
+    /// audit's astral-final unterminated-comment shape, whose eof-pinned
+    /// diagnostics land between the surrogates of the final character.
     #[test]
     fn line_col_utf16_matches_external_recipe() {
         let sources = [
             "汉字测试\n日本語テキスト\r\n한국어\n",
             "\u{FEFF}a\u{1F600}b\n\u{1F600}\r\nx",
             "ascii\nlines\nonly\n",
+            "a /* \u{1F600}",
         ];
         for source in sources {
             let index = LineIndex::new(source);
             let total = utf16_len_of(source);
             for units in 0..=total {
-                let byte = index.utf16_to_byte(source, units);
-                let (line, col_bytes) = index.byte_to_line_col(byte);
-                let line_start = byte - (col_bytes - 1);
-                let expected = (
-                    line,
-                    index.byte_to_utf16(source, byte) - index.byte_to_utf16(source, line_start) + 1,
-                );
                 assert_eq!(
                     index.line_col_utf16(source, units),
-                    expected,
+                    official_line_col(source, units),
                     "utf16 {units} of {source:?}"
                 );
             }
         }
+    }
+
+    /// A UTF-16 offset between the surrogates of an astral character must
+    /// report the LOW surrogate's column: the official `getLocation` is pure
+    /// UTF-16 arithmetic with no snap. Audit #221 — the previous byte-domain
+    /// round-trip snapped such offsets to the character's first byte and
+    /// reported the HIGH surrogate's column, one short on every pin-style
+    /// diagnostic ending in an astral character (`a /* 😀`: offset 6 gave
+    /// column 6 instead of 7).
+    #[test]
+    fn line_col_utf16_mid_surrogate_reports_low_surrogate_column() {
+        // `a /* 😀`: the emoji spans UTF-16 units 5..7; unit 5 is the high
+        // surrogate's position (the character start), unit 6 the low one.
+        let source = "a /* \u{1F600}";
+        let index = LineIndex::new(source);
+        assert_eq!(index.line_col_utf16(source, 5), (1, 6));
+        assert_eq!(index.line_col_utf16(source, 6), (1, 7)); // low surrogate
+        assert_eq!(index.line_col_utf16(source, 7), (1, 8)); // eof
+
+        // Astral chars mid-line, offsets probed on both surrogate halves.
+        // Units: emoji 0..2, a 2, b 3, emoji 4..6, c 6, d 7.
+        let source = "\u{1F600}ab\u{1F601}cd";
+        let index = LineIndex::new(source);
+        assert_eq!(index.line_col_utf16(source, 0), (1, 1));
+        assert_eq!(index.line_col_utf16(source, 1), (1, 2)); // low surrogate
+        assert_eq!(index.line_col_utf16(source, 2), (1, 3));
+        assert_eq!(index.line_col_utf16(source, 4), (1, 5)); // high surrogate
+        assert_eq!(index.line_col_utf16(source, 5), (1, 6)); // low surrogate
+        assert_eq!(index.line_col_utf16(source, 6), (1, 7));
     }
 
     /// U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) are ordinary wide
