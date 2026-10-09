@@ -1,7 +1,10 @@
-//! dartq-side driver: invokes `dartq check` as an external command (machine output, PRD P6 superset contract).
-//! dartq's check subcommand is not implemented yet; the driver is parameterized by a command template,
-//! so integration only requires swapping the template. The process invocation and machine parsing paths
-//! are fully implemented in this task -- mock executables appear only in tests.
+//! dartq-side driver: invokes the dartq CLI as an external command and parses its machine-format
+//! output (PRD P6 superset contract). The command line comes from the `--dartq-cmd` template
+//! (see [`DartqDriver::from_template`]); process invocation, timeout handling, and machine parsing
+//! are shared with the oracle side via [`crate::oracle::run_driver`]. Exit-code contract (facts §3,
+//! dartdev): {0,1,2,3} are valid analysis exits (0 clean / 1 infos / 2 warnings / 3 errors) and the
+//! parsed lines are the Jaccard input; 64 is a usage error and 4 a crash — both fail the harness
+//! instead of producing a diagnostic set.
 
 use std::path::Path;
 

@@ -22,6 +22,11 @@ pub(crate) struct Side {
     pub(crate) entries: BTreeSet<EntryKey>,
     pub(crate) per_severity: BTreeMap<Severity, BTreeSet<EntryKey>>,
     samples: BTreeMap<EntryKey, Sample>,
+    /// Instance count per (severity, key). `samples` totals all instances of a key regardless of
+    /// tier, so per-tier instance aggregation ([`distribution`]`::code_by_severity`) sources its
+    /// counts from here: a key spanning two tiers must not leak its cross-tier total into either
+    /// tier's count.
+    tier_samples: BTreeMap<(Severity, EntryKey), usize>,
 }
 
 pub(crate) struct Sample {
@@ -50,6 +55,7 @@ pub(crate) fn build_side_labeled(
         entries: BTreeSet::new(),
         per_severity: BTreeMap::new(),
         samples: BTreeMap::new(),
+        tier_samples: BTreeMap::new(),
     };
     let mut keys = EntryKeyBuilder::new(corpus_root);
     for d in diags {
@@ -67,6 +73,10 @@ pub(crate) fn build_side_labeled(
             .entry(d.severity)
             .or_default()
             .insert(key.clone());
+        *side
+            .tier_samples
+            .entry((d.severity, key.clone()))
+            .or_default() += 1;
         let sample = side.samples.entry(key).or_insert_with(|| Sample {
             count: 0,
             dtype: d.dtype.clone(),
@@ -107,6 +117,9 @@ pub(crate) fn merge_sides(sides: Vec<Side>) -> Side {
                     merged.samples.insert(key, sample);
                 }
             }
+        }
+        for (tier_key, count) in side.tier_samples {
+            *merged.tier_samples.entry(tier_key).or_default() += count;
         }
     }
     merged
@@ -207,15 +220,13 @@ pub(crate) struct Distribution {
 /// filtered side, so the distribution scope follows the filters.
 pub(crate) fn distribution(side: &Side) -> Distribution {
     let mut dist = Distribution::default();
-    for (severity, keys) in &side.per_severity {
-        for key in keys {
-            *dist
-                .code_by_severity
-                .entry(*severity)
-                .or_default()
-                .entry(key.0.clone())
-                .or_default() += side.samples[key].count;
-        }
+    for ((severity, key), count) in &side.tier_samples {
+        *dist
+            .code_by_severity
+            .entry(*severity)
+            .or_default()
+            .entry(key.0.clone())
+            .or_default() += count;
     }
     // files_by_code counts distinct (code, file) pairs: a key can appear in
     // more than one severity tier, so counting from the per-tier loops above
