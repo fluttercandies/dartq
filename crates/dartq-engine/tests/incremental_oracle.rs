@@ -1,4 +1,4 @@
-//! Dual-arm incremental oracle — first-run subset C1/C2/C4/C6 (goal #88; the
+//! Dual-arm incremental oracle — the full eight-case set C1–C8 (the
 //! executable form of `incremental-oracle-cases.md` §1–§3, PRD §19.4's gate:
 //! every step of an edit sequence, incremental result == full-recompute
 //! result, byte-identical except internal IDs).
@@ -12,10 +12,22 @@
 //! `analyze()` per step; bytes identical, event stream identical to the
 //! combined apply+analyze stream).
 //!
-//! First-run form: the manifests and expectations live as in-test tables.
-//! Hoisting them into `tests/cases/<case>/{manifest.json, expectations.json}`
-//! (§4 placement) is mechanical and happens at execution bring-up together
-//! with C3/C5/C7/C8 (which need the M1 semantic codes).
+//! C8 is doc-faithful and currently RED on substance, for two engine-side
+//! reasons: the engine builds part-of belonging edges from URI-resolved
+//! targets only, so a name-form `part of p8;` file never joins library n,
+//! and the URI layer mis-resolves the name-form directive itself (it emits a
+//! bogus `uri_with_interpolation` at offset 0). C3/C5/C7 are red only on
+//! their `undefined_function` entries: the fixture's engine has
+//! `semdiag: None`, and no `SemanticDiagnoser` adapter can be written
+//! test-side yet because `LibraryView` exposes neither the source text nor
+//! the token table `dartq_semantic::diagnose` needs. Their URI-layer halves
+//! are verified green (C7 step 1 fires exactly the contracted
+//! `uri_does_not_exist` pair over a green A2 + A1). Faithful red over fake
+//! green; see the case comments.
+//!
+//! The manifests and expectations live as in-test tables. Hoisting them into
+//! `tests/cases/<case>/{manifest.json, expectations.json}` (§4 placement) is
+//! mechanical and deferred until a consumer needs the files.
 
 mod common;
 
@@ -51,6 +63,29 @@ const C6_W: &str = "int w = ;\n";
 const C6_Z0: &str = "int f() => 1;\nint y = ;\n";
 const C6_Z1: &str = "int f() => 2;\nint y = ;\n";
 
+// C3 reuses C1_A0 for a and C1_B0 for the import-bearing step-1/step-4
+// content (the case doc spells step 1 as exactly that text).
+const C3_B0: &str = "int g() => f();\n";
+const C3_B3: &str = "import 'missing.dart';\nimport 'a.dart';\nint g() => f();\n";
+
+const C5_A0: &str = "part 'p1.dart';\nint u = r();\nint f() => q();\n";
+const C5_A1: &str = "part 'p1.dart';\npart 'p2.dart';\nint u = r();\nint f() => q();\n";
+const C5_P1: &str = "part of 'a.dart';\nint q() => 1;\n";
+const C5_P2: &str = "part of 'a.dart';\nint r() => 2;\n";
+
+const C7_A: &str =
+    "import 'util.dart';\npart 'pa.dart';\npart 'pb.dart';\nint h() => u() + pa() + pb();\n";
+const C7_B: &str = "import 'a.dart';\nimport 'util.dart';\nint g() => h() + u();\n";
+const C7_PA: &str = "part of 'a.dart';\nint pa() => 1;\n";
+const C7_PB: &str = "part of 'a.dart';\nint pb() => 1;\n";
+const C7_UTIL: &str = "int u() => 1;\n";
+
+const C8_M: &str = "import 'n.dart';\nint v = g();\n";
+const C8_N0: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
+const C8_N1: &str = "library p9;\npart 'pn.dart';\nint f() => 1;\n";
+const C8_PN0: &str = "part of p8;\nint g() => 1;\nint g() => 2;\n";
+const C8_PN1: &str = "part of p8;\nint g() => 3;\n";
+
 /// One manifest batch entry: `Some(bytes)` = `set_content`, `None` =
 /// `remove_file` (incremental-oracle-cases §1.1).
 type Batch = &'static [(&'static str, Option<&'static str>)];
@@ -62,11 +97,15 @@ struct Step {
     invalidated: &'static [&'static str],
 }
 
-/// A3 policy: empty (code, file) set at every step, or the step-0 set held
-/// constant (C6's syntax errors are constant by construction).
+/// A3 policy: empty (code, file) set at every step, the step-0 set held
+/// constant (C6's syntax errors are constant by construction), or an
+/// explicit per-step set — index 0 is step 0, k is step k (the case docs
+/// for C3/C5/C7/C8 list step-0 diagnostics, so Explicit asserts the
+/// baseline too).
 enum Absolute {
     Empty,
     Constant,
+    Explicit(&'static [&'static [(&'static str, &'static str)]]),
 }
 
 struct Case {
@@ -177,6 +216,202 @@ static CASE_C6: Case = Case {
     stable_bytes: &[],
     mode_b: true,
     order_pin: Some(1),
+};
+
+/// C3 — directive add/remove: import (l1-spec ③): the add fixes
+/// `undefined_function`, the remove re-breaks it, a second import to an
+/// unresolvable target adds `uri_does_not_exist`, and dropping it heals
+/// again. b's directive changes rebuild b's outgoing edges only, so a is
+/// never invalidated. KNOWN RED (shared with C5/C7): the
+/// `undefined_function` entries need a wired `SemanticDiagnoser`, which no
+/// `LibraryView` consumer can provide yet.
+static CASE_C3: Case = Case {
+    id: "C3",
+    initial: &[("lib/a.dart", C1_A0), ("lib/b.dart", C3_B0)],
+    steps: &[
+        Step {
+            batch: &[("lib/b.dart", Some(C1_B0))],
+            changed: &["lib/b.dart"],
+            removed: &[],
+            invalidated: &["lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/b.dart", Some(C3_B0))],
+            changed: &["lib/b.dart"],
+            removed: &[],
+            invalidated: &["lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/b.dart", Some(C3_B3))],
+            changed: &["lib/b.dart"],
+            removed: &[],
+            invalidated: &["lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/b.dart", Some(C1_B0))],
+            changed: &["lib/b.dart"],
+            removed: &[],
+            invalidated: &["lib/b.dart"],
+        },
+    ],
+    absolute: Absolute::Explicit(&[
+        &[("undefined_function", "lib/b.dart")],
+        &[],
+        &[("undefined_function", "lib/b.dart")],
+        &[("uri_does_not_exist", "lib/b.dart")],
+        &[],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+/// C5 — part add/remove: library shape change (l1-spec ⑤). One batch edits a
+/// and interns p2; the membership churn rebuilds a's content identity (part
+/// directive order, §7.4) and step 2 must round-trip it — over-cascade to b
+/// is L1 definition behavior. KNOWN RED: see CASE_C3 (the `r()` miss at
+/// steps 0/2 needs the unwired semantic diagnoser).
+static CASE_C5: Case = Case {
+    id: "C5",
+    initial: &[
+        ("lib/a.dart", C5_A0),
+        ("lib/b.dart", C1_B0),
+        ("lib/p1.dart", C5_P1),
+    ],
+    steps: &[
+        Step {
+            batch: &[("lib/a.dart", Some(C5_A1)), ("lib/p2.dart", Some(C5_P2))],
+            changed: &["lib/a.dart", "lib/p2.dart"],
+            removed: &[],
+            invalidated: &["lib/a.dart", "lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/a.dart", Some(C5_A0)), ("lib/p2.dart", None)],
+            changed: &["lib/a.dart"],
+            removed: &["lib/p2.dart"],
+            invalidated: &["lib/a.dart", "lib/b.dart"],
+        },
+    ],
+    absolute: Absolute::Explicit(&[
+        &[("undefined_function", "lib/a.dart")],
+        &[],
+        &[("undefined_function", "lib/a.dart")],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+/// C7 — delete file, edge cleanup, orphan part (l1-spec ⑦). Removals are
+/// overlay-only; the residency-gap rule at analysis time (a directive whose
+/// target left residency carries `uri_does_not_exist`) is what surfaces the
+/// deletions in both arms. Step 3: library a ceases, pa's `part of 'a.dart'`
+/// dangles, and pa reappears in `invalidated` as a newly-formed singleton —
+/// the engine-api-spec §1.2 orphan rule, observed. KNOWN RED: the
+/// `undefined_function` entries need the unwired semantic diagnoser (see
+/// CASE_C3); the URI half is verified green.
+static CASE_C7: Case = Case {
+    id: "C7",
+    initial: &[
+        ("lib/a.dart", C7_A),
+        ("lib/b.dart", C7_B),
+        ("lib/pa.dart", C7_PA),
+        ("lib/pb.dart", C7_PB),
+        ("lib/util.dart", C7_UTIL),
+    ],
+    steps: &[
+        Step {
+            batch: &[("lib/util.dart", None)],
+            changed: &[],
+            removed: &["lib/util.dart"],
+            invalidated: &["lib/a.dart", "lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/pb.dart", None)],
+            changed: &[],
+            removed: &["lib/pb.dart"],
+            invalidated: &["lib/a.dart", "lib/b.dart"],
+        },
+        Step {
+            batch: &[("lib/a.dart", None)],
+            changed: &[],
+            removed: &["lib/a.dart"],
+            invalidated: &["lib/b.dart", "lib/pa.dart"],
+        },
+    ],
+    absolute: Absolute::Explicit(&[
+        &[],
+        // util gone: both importers lose u() and gain the URI error.
+        &[
+            ("undefined_function", "lib/a.dart"),
+            ("uri_does_not_exist", "lib/a.dart"),
+            ("undefined_function", "lib/b.dart"),
+            ("uri_does_not_exist", "lib/b.dart"),
+        ],
+        // pb gone: a's new part-gap URI error and pb() miss collapse into
+        // the same (code, file) set entries as step 1.
+        &[
+            ("undefined_function", "lib/a.dart"),
+            ("uri_does_not_exist", "lib/a.dart"),
+            ("undefined_function", "lib/b.dart"),
+            ("uri_does_not_exist", "lib/b.dart"),
+        ],
+        // a gone: b loses h() (its util errors persist); pa is an orphan
+        // singleton whose `part of 'a.dart'` now dangles.
+        &[
+            ("undefined_function", "lib/b.dart"),
+            ("uri_does_not_exist", "lib/b.dart"),
+            ("uri_does_not_exist", "lib/pa.dart"),
+        ],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+/// C8 — name-form `part of` + rename orphan (l1-spec §7.1, engine-api-spec
+/// §5.3). KNOWN RED on substance, two engine-side causes. First, the URI
+/// layer mis-resolves the name-form directive: `walk_part` records
+/// `uri: None`, `resolve_unit` still pushes it through `resolve`, and the
+/// null-URI branch codes it `uri_with_interpolation` at offset 0 — pn's only
+/// step-0 diagnostic, where the contract expects `duplicate_definition`.
+/// Second, belonging edges claim URI-resolved `part` targets only
+/// (`reform_libraries` matches `ResolvedTarget::Resolved`), so pn stays an
+/// orphan singleton: g never enters n's scope and step 1's cascade cannot
+/// reach [m, n]. Expectations stay doc-faithful (faithful red over fake
+/// green); the pins flip when URI resolution skips name-form part-of and
+/// the §7.1 bounded same-package name scan lands.
+static CASE_C8: Case = Case {
+    id: "C8",
+    initial: &[
+        ("lib/m.dart", C8_M),
+        ("lib/n.dart", C8_N0),
+        ("lib/pn.dart", C8_PN0),
+    ],
+    steps: &[
+        Step {
+            batch: &[("lib/pn.dart", Some(C8_PN1))],
+            changed: &["lib/pn.dart"],
+            removed: &[],
+            invalidated: &["lib/m.dart", "lib/n.dart"],
+        },
+        Step {
+            batch: &[("lib/n.dart", Some(C8_N1))],
+            changed: &["lib/n.dart"],
+            removed: &[],
+            invalidated: &["lib/m.dart", "lib/n.dart", "lib/pn.dart"],
+        },
+    ],
+    absolute: Absolute::Explicit(&[
+        &[("duplicate_definition", "lib/pn.dart")],
+        &[],
+        // The §5.4-TBD orphan-part entry is deferred (no code landed for a
+        // name-form orphan); m's loss of g is the pinned remainder.
+        &[("undefined_function", "lib/m.dart")],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -292,10 +527,7 @@ fn relative(fixture: &Fixture, file: FileId, engine: &Engine) -> String {
     // dartq-pub canonicalizes package roots, so on macOS interned paths live
     // under /private/var while temp_dir() spells /var: strip against the
     // canonical root, not the literal one.
-    let root = fixture
-        .root
-        .canonicalize()
-        .expect("fixture root resolves");
+    let root = fixture.root.canonicalize().expect("fixture root resolves");
     path.strip_prefix(&root)
         .expect("fixture-relative path")
         .to_string_lossy()
@@ -405,6 +637,34 @@ fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
                 from_cache: true,
             },
         ]),
+        // C8.1: intended-world golden — with the name-form edge, pn is a
+        // member of library n, so the cascade dirties n and its importer m
+        // (id order: m interned first) and both reanalyze in topological
+        // order (n before m). Unreachable while CASE_C8's A3/A2 gaps stand;
+        // written to the §3 contract so the pin activates with the fix.
+        ("C8", 1) => Some(vec![
+            GoldenEvent::Overlay {
+                changed: vec!["lib/pn.dart".into()],
+                removed: vec![],
+            },
+            GoldenEvent::Revalidated {
+                path: "lib/pn.dart".into(),
+                gate: RevalidateGate::Parsed {
+                    ast_cache_hit: false,
+                },
+            },
+            GoldenEvent::Cascade {
+                libraries: vec!["lib/m.dart".into(), "lib/n.dart".into()],
+            },
+            GoldenEvent::Analyzed {
+                defining: "lib/n.dart".into(),
+                from_cache: false,
+            },
+            GoldenEvent::Analyzed {
+                defining: "lib/m.dart".into(),
+                from_cache: false,
+            },
+        ]),
         _ => None,
     }
 }
@@ -431,7 +691,9 @@ fn sorted_defining(fixture: &Fixture, engine: &Engine, libraries: &[LibraryId]) 
     paths
 }
 
-/// A3's absolute (code, file) set.
+/// A3's absolute (code, file) set. Paths go through `relative` so the set
+/// carries fixture-relative names under the canonical root (the same #229
+/// discipline as every other projection here).
 fn absolute_set(
     fixture: &Fixture,
     engine: &Engine,
@@ -440,18 +702,19 @@ fn absolute_set(
     diagnostics
         .iter()
         .map(|diagnostic| {
-            let path = engine
-                .file_table()
-                .path(diagnostic.file)
-                .map(|path| {
-                    path.strip_prefix(&fixture.root)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default();
-            (diagnostic.code.name.to_owned(), path)
+            (
+                diagnostic.code.name.to_owned(),
+                relative(fixture, diagnostic.file, engine),
+            )
         })
+        .collect()
+}
+
+/// The `Explicit` A3 table entry as a comparable set.
+fn code_file_set(entries: &[(&'static str, &'static str)]) -> BTreeSet<(String, String)> {
+    entries
+        .iter()
+        .map(|(code, path)| ((*code).to_owned(), (*path).to_owned()))
         .collect()
 }
 
@@ -488,12 +751,11 @@ fn analyze_all(
     engine: &mut Engine,
     state: &BTreeMap<String, String>,
     log: &mut RawLog,
-) -> Vec<u8> {
+) -> Vec<Diagnostic> {
     let targets = live_targets(fixture, engine, state);
-    let diagnostics = engine
+    engine
         .analyze(&targets, &mut log.sink(), &CancellationToken::new())
-        .expect("analyze");
-    machine_bytes(engine, &diagnostics)
+        .expect("analyze")
 }
 
 fn live_targets(
@@ -520,7 +782,8 @@ fn full_arm_bytes(fixture: &Fixture, state: &BTreeMap<String, String>) -> Vec<u8
         engine.set_content(&fixture.path(path), source.as_bytes());
     }
     let mut log = RawLog::default();
-    analyze_all(fixture, &mut engine, state, &mut log)
+    let diagnostics = analyze_all(fixture, &mut engine, state, &mut log);
+    machine_bytes(&engine, &diagnostics)
 }
 
 fn run_case(case: &'static Case) {
@@ -552,14 +815,31 @@ fn run_case(case: &'static Case) {
         "{} step 0",
         case.id
     );
-    let bytes_a = analyze_all(&fixture, &mut engine_a, &state, &mut log_a);
+    let diagnostics_a = analyze_all(&fixture, &mut engine_a, &state, &mut log_a);
+    let bytes_a = machine_bytes(&engine_a, &diagnostics_a);
     let full = full_arm_bytes(&fixture, &state);
     assert_eq!(bytes_a, full, "A1 {} step 0", case.id);
     let mut baseline = BTreeSet::new();
+    match case.absolute {
+        // Explicit contracts list step-0 diagnostics; assert the baseline.
+        Absolute::Explicit(expected) => {
+            assert_eq!(
+                absolute_set(&fixture, &engine_a, &diagnostics_a),
+                code_file_set(expected[0]),
+                "A3 {} step 0",
+                case.id
+            );
+        }
+        Absolute::Constant => {
+            baseline = absolute_set(&fixture, &engine_a, &diagnostics_a);
+        }
+        Absolute::Empty => {}
+    }
     let mut previous_bytes = Some(bytes_a);
     if let (Some(engine_b), true) = (engine_b.as_mut(), case.mode_b) {
         let mut log_b = RawLog::default();
-        let bytes_b = analyze_all(&fixture, engine_b, &state, &mut log_b);
+        let diagnostics_b = analyze_all(&fixture, engine_b, &state, &mut log_b);
+        let bytes_b = machine_bytes(engine_b, &diagnostics_b);
         assert_eq!(
             bytes_b,
             previous_bytes.as_deref().expect("step 0 bytes"),
@@ -603,12 +883,7 @@ fn run_case(case: &'static Case) {
             "A2 invalidated {} step {k}",
             case.id,
         );
-        let diagnostics_a = {
-            let targets = live_targets(&fixture, &engine_a, &state);
-            engine_a
-                .analyze(&targets, &mut log_a.sink(), &CancellationToken::new())
-                .expect("analyze")
-        };
+        let diagnostics_a = analyze_all(&fixture, &mut engine_a, &state, &mut log_a);
         let bytes_a = machine_bytes(&engine_a, &diagnostics_a);
 
         // A1: dual-arm byte equality.
@@ -622,10 +897,10 @@ fn run_case(case: &'static Case) {
                 assert!(set.is_empty(), "A3 {} step {k}: {set:?}", case.id);
             }
             Absolute::Constant => {
-                if k == 1 {
-                    baseline = set.clone();
-                }
                 assert_eq!(set, baseline, "A3 {} step {k}", case.id);
+            }
+            Absolute::Explicit(expected) => {
+                assert_eq!(set, code_file_set(expected[k]), "A3 {} step {k}", case.id);
             }
         }
 
@@ -644,7 +919,8 @@ fn run_case(case: &'static Case) {
         if let (Some(engine_b), true) = (engine_b.as_mut(), case.mode_b) {
             enqueue(&fixture, engine_b, &mut state_b, step.batch);
             let mut log_b = RawLog::default();
-            let bytes_b = analyze_all(&fixture, engine_b, &state_b, &mut log_b);
+            let diagnostics_b = analyze_all(&fixture, engine_b, &state_b, &mut log_b);
+            let bytes_b = machine_bytes(engine_b, &diagnostics_b);
             assert_eq!(bytes_b, full, "A5 {} step {k}", case.id);
             assert_eq!(
                 project(&fixture, engine_b, &log_b),
@@ -714,4 +990,24 @@ fn c4_part_content_change_belonging_cascade() {
 #[test]
 fn c6_transitive_closure_dual_order_pin() {
     run_case(&CASE_C6);
+}
+
+#[test]
+fn c3_directive_add_remove_import() {
+    run_case(&CASE_C3);
+}
+
+#[test]
+fn c5_part_add_remove_library_shape() {
+    run_case(&CASE_C5);
+}
+
+#[test]
+fn c7_delete_file_edge_cleanup_orphan_part() {
+    run_case(&CASE_C7);
+}
+
+#[test]
+fn c8_name_form_part_rename_orphan() {
+    run_case(&CASE_C8);
 }
