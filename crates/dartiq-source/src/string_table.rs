@@ -213,9 +213,11 @@ mod tests {
             "origin variants dedup together"
         );
 
+        // All interning must happen before locking: the mutex is not
+        // reentrant, so an intern call under the guard would self-deadlock.
+        let plain = table.intern("plain");
         let inner = table.inner.lock().expect("unpoisoned in test");
         assert_eq!(inner.origins[id.index() as usize], Some(origin));
-        let plain = table.intern("plain");
         assert_eq!(inner.origins[plain.index() as usize], None);
     }
 
