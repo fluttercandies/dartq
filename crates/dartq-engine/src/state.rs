@@ -109,8 +109,8 @@ pub struct DirectiveFacts {
 /// collect, then sequential URI resolution) and shared as an `Arc` between
 /// residency, the facts cache, and the semantic-diagnosis seam. The
 /// batch-internal dedupe clones a member's facts from its same-key
-/// template's pre-resolution state (all fields are cheap data: interned
-/// ids, spans, diagnostics).
+/// template's pre-resolution state (every field copies cheap: interned
+/// ids, spans, diagnostics — the element model moves by `Arc` refcount).
 #[derive(Clone, Debug)]
 pub struct UnitFacts {
     /// The content the facts were computed from.
@@ -122,8 +122,10 @@ pub struct UnitFacts {
     pub(crate) api_signature: dartq_semantic::ApiSignature,
     /// Directives in source order.
     pub directives: Vec<DirectiveFacts>,
-    /// The semantic element model (dartq-semantic `collect`).
-    pub elements: FileElements,
+    /// The semantic element model (dartq-semantic `collect`), shared so
+    /// every consumer — the batch dedupe, the facts cache, the semdiag
+    /// fold — pays a refcount bump, never a deep clone (#308).
+    pub elements: Arc<FileElements>,
     /// Syntax (scan + parse recovery) and URI-layer diagnostics, all
     /// attributed to this file — a pure function of content, feature set,
     /// and the immutable analysis context.

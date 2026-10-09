@@ -355,12 +355,15 @@ fn compute_unit(
 ) -> UnitFacts {
     let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file);
     diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
-    let elements = dartq_semantic::collect(
+    // The single allocation of the element model: every later consumer
+    // (duplicate bake, api signature, facts clones, the semdiag fold)
+    // shares this `Arc` (#308).
+    let elements = Arc::new(dartq_semantic::collect(
         text,
         &scanned.tokens,
         ParserFeatures::from_feature_set(feature_set),
         strings,
-    );
+    ));
     diagnostics.extend(duplicate_diagnostics(file, &elements, strings));
     let (directives, directive_region) = extract_directives(text, &scanned.tokens, strings);
     let face = directive_face(text, &scanned.tokens, directive_region);
