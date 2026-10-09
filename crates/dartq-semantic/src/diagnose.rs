@@ -2102,7 +2102,11 @@ impl<'a> Engine<'a> {
     }
 
     /// Opens a switch context; the scrutinee's push-time row is the last
-    /// one on the row stack when the block opens.
+    /// one on the row stack when the block opens. No row — the shape a
+    /// complex scrutinee leaves — latches `Ty::Unknown`, and
+    /// [`Self::report_switch`] skips the entire check for that (the
+    /// oracle's `InvalidType` gate), so the latch gap suppresses instead
+    /// of mis-answering.
     fn open_switch(&mut self, is_expression: bool, kw: SourceRange) {
         let scrutinee = self.rows.last().map_or(Ty::Unknown, |row| row.ty);
         self.switches.push(SwitchCtx {
@@ -2121,6 +2125,17 @@ impl<'a> Engine<'a> {
         let Some(ctx) = self.switches.pop() else {
             return;
         };
+        // An unresolvable scrutinee is the oracle's `InvalidType`
+        // (constant_verifier.dart:1035): the entire exhaustiveness pass —
+        // reachability and covering alike — gates off behind
+        // `hasInvalidType` (:1095). Mapping it to the nullable top would
+        // drop every case row and false-positive the covering gap. (The
+        // push-time latch leaves `Unknown` exactly here: no row, or a row
+        // whose declared type never resolved — the "complex scrutinee"
+        // blind spot, now a clean whole-check suppression.)
+        if ctx.scrutinee == Ty::Unknown {
+            return;
+        }
         let world = NameWorld {
             index: self.index,
             file: self.file,
@@ -2162,7 +2177,18 @@ impl<'a> Engine<'a> {
             self.emit(SemanticCode::UnreachableSwitchCase, anchor, "", "");
         }
         if let Exhaustiveness::NonExhaustive(_) = report.exhaustiveness {
-            let must_be_exhaustive = ctx.is_expression || Self::is_always_exhaustive(&world, value);
+            // A cross-file scrutinee name is opaque to the file-scoped
+            // world ([`NameWorld::name_resolvable`]): its sealedness and
+            // subclass set are unknowable in-file, so the covering verdict
+            // may be falsely negative and the expression face — always
+            // must-be-exhaustive — suppresses (under-report direction).
+            // The statement face is already gated on in-file sealed facts.
+            let expression_face_decides = match value {
+                NameTy::Named(name, _) => world.name_resolvable(name),
+                _ => true,
+            };
+            let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
+                || Self::is_always_exhaustive(&world, value);
             if must_be_exhaustive && !ctx.default_seen {
                 let code = if ctx.is_expression {
                     SemanticCode::NonExhaustiveSwitchExpression
@@ -4039,8 +4065,11 @@ fn use_kind_of(intent: &Intent) -> NameUse {
 /// The static type the semantic-level exhaustiveness walk uses: the M1
 /// [`Ty`] lattice plus the restriction leaves the case patterns produce
 /// (enum constants, `bool` values). Names resolve through the unit's
-/// element model — cross-unit sealed hierarchies under-report (documented
-/// M2 blind spot).
+/// element model, which is file-scoped — the cross-unit-sealed blind spot
+/// is no longer a silent under-report: an unresolvable scrutinee name
+/// suppresses the expression-face covering emit outright
+/// ([`NameWorld::name_resolvable`]), and a cyclic in-file sealed
+/// hierarchy terminates through the walk's visited set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum NameTy {
     Never,
@@ -4397,6 +4426,23 @@ impl NameWorld<'_> {
             .is_some_and(|c| c.sealed || c.kind == ContainerKind::Enum)
     }
 
+    /// Whether the unit's own facts decide `name`'s sealedness and
+    /// subclass set: the declaration lives in this file, or the name is a
+    /// core sealed type (`bool`). A cross-file name is opaque to the
+    /// file-scoped index — its sealed classes and enum constants are
+    /// invisible here, so a non-exhaustive verdict over it may be false.
+    ///
+    /// Interim under-report seam: the expression-face covering emit
+    /// suppresses while this answers false. The oracle resolves
+    /// cross-library facts through the whole library graph, down to the
+    /// private-enum variant rows (`diagnostic.g.dart`
+    /// `non_exhaustive_switch_expression_private`); feeding sealed and
+    /// subclass facts from the library graph is future work, deferred
+    /// together with those variants.
+    fn name_resolvable(&self, name: StringId) -> bool {
+        self.container(name).is_some() || self.is_sealed_name(name)
+    }
+
     /// The closed subtype set of a sealed class or enum, in declaration
     /// order (types/sealed.dart, types/enum.dart).
     fn name_subtypes(&self, name: StringId) -> Vec<NameTy> {
@@ -4418,6 +4464,12 @@ impl NameWorld<'_> {
         }
         let mut subtypes = Vec::new();
         for &decl in self.container_order() {
+            // A well-founded closed set never contains its root: a
+            // self-edge (`sealed S extends S`) drops here, before the
+            // walk's cycle guard would discard it.
+            if decl == name {
+                continue;
+            }
             let Some(declared) = self.container(decl) else {
                 continue;
             };
@@ -5981,6 +6033,72 @@ mod tests {
     fn single_type_case_covers_non_sealed_scrutinee() {
         let report = report("class C {} void f(C c) { var x = switch (c) { C v => 1 }; }");
         assert_eq!(report.diagnostics.len(), 0);
+    }
+
+    /// A cyclic sealed hierarchy terminates: the covering search walks the
+    /// subclass closure through the file-scoped facts, which cannot reject
+    /// `sealed S extends S` (self-edge dropped at the source) or a mutual
+    /// `A`/`B` cycle (dropped by the walk's visited set) — without the
+    /// guard the FIFO expansion re-enqueues the same type forever.
+    ///
+    /// Hand-trace: the `1` constant is the unknown space (never a
+    /// must-match), so the sealed walk must expand its subtypes — the
+    /// exact shape the cycle breaks. Both verdicts are exhaustive (no
+    /// witness over a sealed closure), so nothing emits.
+    #[test]
+    fn cyclic_sealed_hierarchy_terminates_without_false_positive() {
+        let self_cycle =
+            report("sealed class S extends S {} void f(S s) { var x = switch (s) { 1 => 2 }; }");
+        assert_eq!(
+            self_cycle.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&self_cycle)
+        );
+        let mutual_cycle = report(
+            "sealed class A extends B {} sealed class B extends A {} void f(A a) { var x = switch (a) { 1 => 2 }; }",
+        );
+        assert_eq!(
+            mutual_cycle.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&mutual_cycle)
+        );
+    }
+
+    /// An unresolvable scrutinee skips the whole exhaustiveness check (the
+    /// oracle's `InvalidType` gate at `constant_verifier.dart:1035` and
+    /// `:1095`): a switch expression over a call whose type never resolves
+    /// emits nothing — mapping it to the nullable top would drop every row
+    /// and false-positive the covering gap.
+    #[test]
+    fn unknown_scrutinee_switch_expression_emits_nothing() {
+        let report = report("void g() {} void f() { var x = switch (g()) { _ => 0 }; }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A switch expression over a name declared outside the file emits no
+    /// covering gap: the file-scoped world cannot decide the name's
+    /// sealedness, so the expression face suppresses (the cross-file-sealed
+    /// interim seam) instead of false-positiving off an opaque non-sealed
+    /// reading.
+    ///
+    /// Hand-trace: `S`/`A`/`B` have no in-file containers, so pre-fix the
+    /// scrutinee read as non-sealed with rows that never must-match it —
+    /// a witness over any `S` value, emitted as
+    /// `non_exhaustive_switch_expression`. The one remaining `undefined_class`
+    /// is the unresolved parameter type itself (oracle-matching, see
+    /// `type_positions_report_undefined_class`); the object patterns
+    /// `A()`/`B()` stay silent.
+    #[test]
+    fn cross_file_sealed_scrutinee_expression_emits_no_covering_gap() {
+        let report = report("void f(S s) { var x = switch (s) { A() => 1, B() => 2 }; }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_class"],
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A switch expression's duplicate case is `unreachable_switch_case`

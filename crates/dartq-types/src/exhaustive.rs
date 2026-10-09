@@ -12,7 +12,12 @@
 //!   filter-and-expand recursion of `_filterByType` (:271-365). The
 //!   `returnMultipleWitnesses` policy is load-bearing: the top-level
 //!   witness search collects multiple witnesses while every nested probe
-//!   stops at the first (the shortest-witness contract, :140-188).
+//!   stops at the first (the shortest-witness contract, :140-188). One
+//!   deviation: the queue walk carries a visited set — the official
+//!   hierarchy is cycle-validated upstream, a weaker fact source (an
+//!   in-file index) is not, so a revisited type is dropped to keep the
+//!   walk terminating (a revisit would only reproduce its earlier
+//!   answer).
 //! * `space.dart` — `Space` as a union of `SingleSpace`s (:64-131) with
 //!   the construction merges: empty singles dropped, duplicates deduped,
 //!   and a `Null|T` pair folded to `T?` (:93-120).
@@ -47,7 +52,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ids::{TypeDeclId, TypeId};
 use crate::system::TypeSystem;
@@ -508,11 +513,30 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
     let first = &value_patterns[0];
 
     let mut witnesses: Option<Vec<Witness<M>>> = None;
+    // Cycle guard, reused across the singles' walks (`clear` keeps the
+    // allocation; visits are not shared between walks because a type's
+    // expansion depends on `single`). `subtypes` feeds a FIFO expansion,
+    // and a fact source whose sealed closure is not well-founded (an
+    // in-file `sealed S extends S`, or a mutual A/B cycle a file-scoped
+    // index cannot reject) would re-enqueue the same type forever. The
+    // official walk (exhaustive.dart:209-228) needs no guard because the
+    // oracle's hierarchy is cycle-validated upstream; this one guards
+    // itself. Dropping a revisit is observationally free: within one
+    // walk a type's expansion is a pure function of fixed inputs (rows,
+    // single, predicates), so the repeated visit would only reproduce
+    // its earlier answer. Progress: every iteration either processes a
+    // fresh type or stops — the walk is bounded by the finite reachable
+    // type set.
+    let mut visited: FxHashSet<M> = FxHashSet::default();
     for single in first.first_singles() {
         let context_ty = single.ty.clone();
         let mut stack: VecDeque<M> = VecDeque::new();
         stack.push_back(context_ty.clone());
+        visited.clear();
         while let Some(ty) = stack.pop_front() {
+            if !visited.insert(ty.clone()) {
+                continue;
+            }
             if world.is_bottom(&ty) {
                 // Don't try to exhaust the Never type (exhaustive.dart:205-208).
                 continue;
