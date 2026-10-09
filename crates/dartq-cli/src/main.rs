@@ -71,6 +71,7 @@ mod exit {
     pub const USAGE: u8 = 64;
 }
 
+mod compat;
 mod impact;
 
 fn main() -> ExitCode {
@@ -94,6 +95,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Impact(impact_args)),
         }) => impact::run_entry(&impact_args),
+        Ok(Cli {
+            command: Some(Command::Compat(compat_args)),
+        }) => compat::run_entry(&compat_args),
         Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
@@ -129,6 +133,9 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Scan + parse only (the M0 differential face, engine-api-spec §4.1).
     Check(CheckArgs),
+    /// Assess the workspace under several SDK roots — a per-axis ✓/✗
+    /// compatibility matrix (PRD §15.5).
+    Compat(compat::CompatArgs),
     /// Serve the LSP daemon over stdin/stdout (one client; overlay + full
     /// diagnostics, PRD §16.3).
     Daemon(DaemonArgs),
