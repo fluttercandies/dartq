@@ -1,18 +1,18 @@
 //! Statement grammar (official `parseStatement`/`parseStatementX`
-//! `parser_impl.dart:6708`, `parseBlock` :10523, `parseExpressionStatement`
-//! :6925, the `parseExpressionStatementOrDeclaration` family :9807-10096,
-//! `parseVariablesDeclarationRest` :10096, `parseLabeledStatement` :6899,
-//! `parseLocalFunctionDeclaration` via `looksLikeLocalFunction` :9739 and
-//! `parseNamedFunctionRest` :6364, and the full-parser `parseFunctionBody`
-//! :6537 that replaces the #18 diet-body mode for `{ ... }` bodies).
+//! `parser_impl.dart:6187`, `parseBlock` :9976, `parseExpressionStatement`
+//! :6403, the `parseExpressionStatementOrDeclaration` family :9180-9460,
+//! `parseVariablesDeclarationRest` :9461, `parseLabeledStatement` :6377,
+//! `parseLocalFunctionDeclaration` via `looksLikeLocalFunction` :9283 and
+//! `parseNamedFunctionRest` :5854, and the full-parser `parseFunctionBody`
+//! :6016 that replaces the #18 diet-body mode for `{ ... }` bodies).
 //!
-//! Expression internals parse through the reduced constant-expression engine
-//! (`expr_const`) until #20 lands the full precedence engine: assignment
-//! operators, conditionals, cascades, function literals, and pattern
-//! assignments in expression position are #20 scope. The statement-side
+//! Expressions parse through the full precedence engine (`expressions.rs`,
+//! the official `parseExpression` family) since #20: assignment operators,
+//! conditionals, cascades, function literals, dot shorthands, and pattern
+//! assignments in expression position all live there; the statement-side
 //! dispatch (including the `{`-group + `=` pattern-assignment check) mirrors
-//! the official control flow exactly, so #20 replaces the expression entry
-//! point without touching this module.
+//! the official control flow and calls the shared expression entry point.
+//! Patterns keep the reduced constant-expression engine (`expr_const`).
 //!
 //! Diagnostics follow the pinned-oracle emission table
 //! (docs/facts/corpus-expansion-plan.md §7): the eight Group A statement
@@ -36,11 +36,11 @@ use crate::token_id::TokenSpan;
 use crate::type_args::TypeParamOrArg;
 use crate::types::TypeInfo;
 
-/// `AwaitOrYieldContext` (`parser_impl.dart:10621`): the position an
+/// `AwaitOrYieldContext` (`parser_impl.dart:10621`... pinned :9907): the position an
 /// `await`/`yield` lookalike was seen in, deciding how greedy the
 /// expression-lookahead is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AwaitYieldCtx {
+pub(crate) enum AwaitYieldCtx {
     /// Statement position (`await`/`yield` followed by `;` or `,` can be a
     /// variable declaration).
     Statement,
@@ -50,7 +50,7 @@ enum AwaitYieldCtx {
 
 /// What [`Parser::parse_expression_statement_or_declaration`] decided (the
 /// official `ForPartsContext` split between statement and for-parts modes).
-enum ExprStmtOrDecl {
+pub(crate) enum ExprStmtOrDecl {
     /// Statement mode: a complete statement was parsed.
     Parsed,
     /// For-parts mode: no declaration head; the cursor did not move and the
@@ -176,9 +176,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 {
                     self.parse_expression_statement_or_declaration(false);
                 } else {
-                    // Fall through to the expression statement; the reduced
-                    // await parse reports the sync-context misuse (#20 owns
-                    // the full check).
+                    // Fall through to the expression statement; the full
+                    // engine's await parse shapes the sync-context misuse
+                    // (events only, official parseAwaitExpression).
                     self.parse_expression_statement();
                 }
             }
@@ -261,14 +261,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     // expression statements
     // ------------------------------------------------------------------
 
-    /// The statement-layer expression entry: the reduced engine at its
-    /// lowest binary floor (`IF_NULL_PRECEDENCE`) until #20 lands the full
-    /// `parseExpression`.
-    pub(crate) fn parse_expression(&mut self) -> TokenSpan {
-        self.parse_precedence_floor(crate::expr_const::IF_NULL_PRECEDENCE)
-    }
-
-    /// Official `parseExpressionStatement`: `expression? ';'`.
+    /// Official `parseExpressionStatement`: `expression? ';'`. The
+    /// expression itself parses through the full engine (`expressions.rs`,
+    /// official `parseExpression`).
     pub(crate) fn parse_expression_statement(&mut self) -> TokenSpan {
         let begin = self.peek_span();
         let _ = self.parse_expression();
@@ -316,7 +311,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseExpressionStatementOrDeclaration` (both modes): the
     /// metadata + modifier walk, then the shared after-modifiers decision.
-    fn parse_expression_statement_or_declaration(&mut self, for_parts: bool) -> ExprStmtOrDecl {
+    pub(crate) fn parse_expression_statement_or_declaration(
+        &mut self,
+        for_parts: bool,
+    ) -> ExprStmtOrDecl {
         let entry = self.cursor.mark();
         let mut metadata_done = false;
         if self.peek_kind() == TokenKind::At {
@@ -661,7 +659,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let _ = self.parse_initializers_opt();
         let saved_async = self.async_state;
         let _ = self.parse_async_modifier_opt();
-        let end = self.parse_function_body(false);
+        let end = self.parse_function_body(false, false);
         self.async_state = saved_async;
         self.listener.end_local_function_declaration(end);
     }
@@ -743,7 +741,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `ensureParenthesizedCondition` +
     /// `parseExpressionInParenthesisRest`.
-    fn ensure_parenthesized_condition(&mut self, allow_case: bool) {
+    pub(crate) fn ensure_parenthesized_condition(&mut self, allow_case: bool) {
         let open = self.peek_span();
         if self.peek_kind() != TokenKind::OpenParen {
             // Recovery: `insertParens(includeIdentifier: false)`.
@@ -941,7 +939,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseForLoopPartsMid`: completes the initializer part and
     /// checks the separators.
-    fn parse_for_loop_parts_mid(&mut self, await_kw: Option<TokenSpan>, outcome: ExprStmtOrDecl) {
+    pub(crate) fn parse_for_loop_parts_mid(
+        &mut self,
+        await_kw: Option<TokenSpan>,
+        outcome: ExprStmtOrDecl,
+    ) {
         match outcome {
             ExprStmtOrDecl::DeclHead => {
                 let end = self.parse_variables_declaration_rest(false);
@@ -1001,7 +1003,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseForLoopPartsRest`.
-    fn parse_for_loop_parts_rest(&mut self, for_kw: TokenSpan, left_paren: TokenSpan) {
+    pub(crate) fn parse_for_loop_parts_rest(&mut self, for_kw: TokenSpan, left_paren: TokenSpan) {
         let left_separator = self.ensure_semicolon();
         if self.peek_kind() == TokenKind::Semicolon {
             self.parse_empty_statement();
@@ -1068,7 +1070,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseForInLoopPartsRest`.
-    fn parse_for_in_loop_parts_rest(
+    pub(crate) fn parse_for_in_loop_parts_rest(
         &mut self,
         await_kw: Option<TokenSpan>,
         for_kw: TokenSpan,
@@ -1233,8 +1235,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseAssert` (`assert.dart` kinds; expression/initializer
-    /// kinds are #20 call sites).
-    pub(crate) fn parse_assert(&mut self, kind: AssertKind) {
+    /// kinds are #20 call sites). Returns the closing `)` (the official
+    /// return token, consumed by `endInitializer` in initializer position).
+    pub(crate) fn parse_assert(&mut self, kind: AssertKind) -> TokenSpan {
         let assert_kw = self.peek_span();
         self.cursor.advance();
         self.listener.begin_assert(assert_kw, kind);
@@ -1272,6 +1275,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.ensure_semicolon();
         }
         self.listener.end_assert(assert_kw, kind, open, comma, end);
+        end
     }
 
     // ------------------------------------------------------------------
@@ -1597,11 +1601,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     // function bodies (full parser; replaces the #18 diet mode)
     // ------------------------------------------------------------------
 
-    /// Official `parseFunctionBody` (`parser_impl.dart:6537`): `;` |
+    /// Official `parseFunctionBody` (`parser_impl.dart:6016`): `;` |
     /// `=>` expression `;` | `{ statements }`, with the official recovery
-    /// family. The `=>` expression parses through the reduced engine until
-    /// #20.
-    pub(crate) fn parse_function_body(&mut self, allow_abstract: bool) -> TokenSpan {
+    /// family. `of_function_expression` selects the function-expression
+    /// flavor (`=> expression` without the trailing semicolon, the
+    /// `handle_expression_function_body` end token left `None`).
+    pub(crate) fn parse_function_body(
+        &mut self,
+        of_function_expression: bool,
+        allow_abstract: bool,
+    ) -> TokenSpan {
         if self.peek_kind() == TokenKind::Keyword(Keyword::Native) {
             let native = self.peek_span();
             let has_name = self.cursor.peek_kind_ahead(1) == TokenKind::String;
@@ -1631,14 +1640,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.listener.handle_empty_function_body(semi);
                 semi
             }
-            TokenKind::Function => self.parse_expression_function_body(),
+            TokenKind::Function => self.parse_expression_function_body(of_function_expression),
             TokenKind::Eq => {
                 // Recover from a bad factory method.
                 let at = self.peek_span();
                 self.report(msg::expected_body(), at);
                 let arrow = self.synthetic(TokenKind::Function, at.range.offset);
                 self.cursor.advance();
-                self.finish_expression_function_body(arrow)
+                self.finish_expression_function_body(arrow, of_function_expression)
             }
             _ => {
                 let next = self.peek_kind();
@@ -1648,7 +1657,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.report(msg::expected_body(), at);
                     let arrow = self.synthetic(TokenKind::Function, at.range.offset);
                     self.cursor.advance();
-                    return self.finish_expression_function_body(arrow);
+                    return self.finish_expression_function_body(arrow, of_function_expression);
                 }
                 // Stray keyword/identifier before `=>` (user is typing).
                 if is_keyword_or_identifier(next)
@@ -1657,7 +1666,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     let at = self.peek_span();
                     self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
                     self.force_advance();
-                    return self.parse_expression_function_body();
+                    return self.parse_expression_function_body(of_function_expression);
                 }
                 // Stray keyword/identifier before `{`: skip and fall through.
                 if is_keyword_or_identifier(next)
@@ -1691,17 +1700,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `parseExpressionFunctionBody` (member flavor: the semicolon
     /// is required).
-    fn parse_expression_function_body(&mut self) -> TokenSpan {
+    fn parse_expression_function_body(&mut self, of_function_expression: bool) -> TokenSpan {
         let arrow = self.peek_span();
         self.cursor.advance();
-        self.finish_expression_function_body(arrow)
+        self.finish_expression_function_body(arrow, of_function_expression)
     }
 
-    fn finish_expression_function_body(&mut self, arrow: TokenSpan) -> TokenSpan {
+    fn finish_expression_function_body(
+        &mut self,
+        arrow: TokenSpan,
+        of_function_expression: bool,
+    ) -> TokenSpan {
         let _ = self.parse_expression();
-        let end = self.ensure_semicolon();
-        self.listener
-            .handle_expression_function_body(arrow, Some(end));
+        // The member flavor requires `;`; the function-expression flavor
+        // leaves the end token `None` (official parseExpressionFunctionBody
+        // :6117).
+        let end = (!of_function_expression).then(|| self.ensure_semicolon());
+        self.listener.handle_expression_function_body(arrow, end);
         if matches!(
             self.async_state,
             AsyncModifier::SyncStar | AsyncModifier::AsyncStar
@@ -1709,7 +1724,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             // `generatorReturnsValue` is resolution-domain: event only.
             self.listener.handle_invalid_statement(arrow);
         }
-        end
+        end.unwrap_or(arrow)
     }
 
     /// `ensureBlock` with the `ExpectedFunctionBody` template (official
@@ -1804,7 +1819,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `looksLikeExpressionAfterAwaitOrYield` (`parser_impl.dart:
     /// 10621`) at cursor-relative offset `n` (the `await`/`yield` token).
-    fn looks_like_await_or_yield_expression(&self, ctx: AwaitYieldCtx, n: usize) -> bool {
+    pub(crate) fn looks_like_await_or_yield_expression(
+        &self,
+        ctx: AwaitYieldCtx,
+        n: usize,
+    ) -> bool {
         let first = self.cursor.look_kind(n + 1);
         if first == TokenKind::Keyword(Keyword::Null) {
             return true;

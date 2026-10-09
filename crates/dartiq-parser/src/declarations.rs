@@ -894,7 +894,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             );
         }
         if self.peek_kind() == TokenKind::OpenParen || has_type_arguments_or_dot {
-            self.parse_arguments();
+            self.parse_arguments_rest();
         } else {
             let at = self.peek_span();
             self.listener.handle_no_arguments(at);

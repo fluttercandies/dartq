@@ -2,20 +2,22 @@
 //! `parseClassOrMixinOrExtensionOrEnumMemberImpl` :5290, `parseFields` :4438,
 //! `parseTopLevelMethod` :4606, `parseMethod` :5799, `parseFactoryMethod`
 //! :6162, and the full-parser function bodies of #19 — the diet
-//! `ClassMemberParser` body mode is retired for everything but field
-//! initializers and constructor initializer entries).
+//! `ClassMemberParser` body mode is fully retired).
 //!
 //! Function bodies parse through `parse_function_body` (`statements.rs`,
 //! official `parseFunctionBody`): `{ ... }` bodies parse the statement
-//! grammar, `=> expr;` bodies parse their expression through the reduced
+//! grammar, `=> expr;` bodies parse their expression through the full
 //! engine, `;` bodies emit the official empty-body event. Field initializers
-//! and constructor initializers still diet-skip their expression internals
-//! (the official diet mode emits no expression events either).
+//! and constructor initializer entries parse through the full engine too
+//! (official `parseFieldInitializerOpt`/`parseInitializer`), with the
+//! official `mayParseFunctionExpressions = false` rider while the
+//! initializer list parses.
 
 use dartiq_scanner::{Keyword, TokenKind};
 
 use crate::listener::{
-    ConstructorReferenceContext, DeclarationKind, IdentifierContext, MemberKind, ParserListener,
+    AssertKind, ConstructorReferenceContext, DeclarationKind, IdentifierContext, MemberKind,
+    ParserListener,
 };
 use crate::message::msg;
 use crate::parser::{AsyncModifier, Parser};
@@ -335,7 +337,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::external_method_with_body(), self.peek_span());
         }
         let allow_abstract = is_external || self.features.augmentations_enabled;
-        let end = self.parse_function_body(allow_abstract);
+        let end = self.parse_function_body(false, allow_abstract);
         self.async_state = saved_async;
         let begin_token = self.span_at_mark(before_start);
         self.listener
@@ -957,7 +959,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 || mods.external.is_some()
                 || self.features.augmentations_enabled)
                 && self.async_state == AsyncModifier::Sync;
-            self.parse_function_body(allow_abstract)
+            self.parse_function_body(false, allow_abstract)
         };
         self.async_state = saved_async;
 
@@ -1085,9 +1087,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             if self.peek_kind() != TokenKind::Semicolon {
                 self.report(msg::external_factory_with_body(), self.peek_span());
             }
-            end = self.parse_function_body(true);
+            end = self.parse_function_body(false, true);
         } else {
-            end = self.parse_function_body(self.features.augmentations_enabled);
+            end = self.parse_function_body(false, self.features.augmentations_enabled);
         }
         match kind {
             DeclarationKind::Mixin => self.report(msg::mixin_declares_constructor(), factory),
@@ -1360,8 +1362,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             let assignment = self.peek_span();
             self.listener.begin_field_initializer(assignment);
             self.cursor.advance();
-            self.skip_expression_diet();
-            let end = self.peek_span();
+            let end = self.parse_expression();
             self.listener.end_field_initializer(assignment, end);
         } else {
             if let Some(vfc) = mods.var_final_or_const {
@@ -1455,8 +1456,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
     }
 
-    /// Official `parseInitializersOpt` (constructor `: init, init` lists,
-    /// entries diet-skipped).
+    /// Official `parseInitializersOpt` (constructor `: init, init` lists).
     pub(crate) fn parse_initializers_opt(&mut self) -> Option<TokenSpan> {
         if self.peek_kind() != TokenKind::Colon {
             self.listener.handle_no_initializers();
@@ -1465,57 +1465,212 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let begin = self.peek_span();
         self.listener.begin_initializers(begin);
         self.cursor.advance();
+        // `mayParseFunctionExpressions = false` (:4756): `(a) {}` in an
+        // initializer is not a function literal.
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = false;
         let mut count = 0usize;
+        let mut last_end = begin;
         loop {
+            last_end = self.parse_initializer(last_end);
             count += 1;
-            self.skip_initializer_entry();
-            if self.peek_kind() == TokenKind::Comma {
-                self.cursor.advance();
-                let next = self.peek_kind();
-                if matches!(
-                    next,
-                    TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon
-                ) || matches!(next, TokenKind::Keyword(Keyword::Async | Keyword::Sync))
-                    || next == TokenKind::Eof
-                {
-                    break;
+            if self.peek_kind() != TokenKind::Comma {
+                // Recovery (:4770-4798): the head looks like another entry
+                // (`assert(`, `this`/`super` + `(`/`.`, `name =`) — a comma
+                // went missing; report and insert one.
+                if self.initializer_head_continues() {
+                    self.report(msg::expected_after_but_got(","), last_end);
+                    let at = self.peek_span().range.offset;
+                    self.synthetic(TokenKind::Comma, at);
+                    self.cursor.advance();
+                    continue;
                 }
-                continue;
+                break;
             }
-            break;
+            self.cursor.advance();
         }
-        let end = self.peek_span();
-        self.listener.end_initializers(count, begin, end);
+        self.may_parse_function_expressions = saved;
+        self.listener.end_initializers(count, begin, last_end);
         Some(begin)
     }
 
-    /// One initializer entry, diet-skipped (official `parseInitializer` with
-    /// expression internals suppressed).
-    fn skip_initializer_entry(&mut self) {
-        let before = self.cursor.progress();
-        loop {
-            if self.cursor.at_eof() {
-                return;
+    /// Whether the token at the cursor starts another initializer entry
+    /// (the missing-comma lookahead of [`Self::parse_initializers_opt`]).
+    fn initializer_head_continues(&self) -> bool {
+        match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Assert) => self.cursor.look_kind(1) == TokenKind::OpenParen,
+            TokenKind::Keyword(Keyword::This | Keyword::Super) => matches!(
+                self.cursor.look_kind(1),
+                TokenKind::OpenParen | TokenKind::Period
+            ),
+            kind if is_identifier(kind) => self.cursor.look_kind(1) == TokenKind::Eq,
+            _ => false,
+        }
+    }
+
+    /// Official `parseInitializer` (:4815): `super (...|.name ...)`,
+    /// `assert(...)`, `this.name = ...`/`this(...)`, `name = expr`, with the
+    /// official synthetic-assignment recoveries. `previous` is the token
+    /// before the entry head (the official `token`/`beforeExpression`; the
+    /// report anchors and the expression re-read start there).
+    fn parse_initializer(&mut self, previous: TokenSpan) -> TokenSpan {
+        let head = self.peek_span();
+        self.listener.begin_initializer(head);
+        if self.peek_kind() == TokenKind::Keyword(Keyword::Assert) {
+            let end = self.parse_assert(AssertKind::Initializer);
+            self.listener.end_initializer(end);
+            return end;
+        }
+        if self.peek_kind() == TokenKind::Keyword(Keyword::Super) {
+            return self.parse_super_initializer_expression();
+        }
+        if self.peek_kind() == TokenKind::Keyword(Keyword::This) {
+            let next = self.cursor.look_kind(1);
+            if next == TokenKind::Period {
+                // `this.name = ...`: lookahead only — the expression re-read
+                // reparses the `this.name` head natively (`.new` included).
+                let name = self.cursor.look_kind(2);
+                if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
+                    // Official `insertSyntheticIdentifier(dot, fieldInitializer)`
+                    // (:4841): the context recovery template.
+                    let at = self.peek_span_at(2);
+                    self.report(msg::missing_identifier(), at);
+                    self.synthetic(TokenKind::Identifier, at.range.offset);
+                }
+                let follower = self.cursor.look_kind(3);
+                if follower == TokenKind::Eq {
+                    return self.parse_initializer_expression_rest();
+                }
+                if follower == TokenKind::OpenParen {
+                    return self.finish_redirecting_initializer();
+                }
+                // Fall through to the synthetic-assignment recovery, with
+                // `this.name` (or the synthetic name) left unconsumed.
+                self.report(msg::missing_assignment_in_initializer(), head);
+                self.synthetic(TokenKind::Identifier, head.range.offset);
+                self.synthetic(TokenKind::Eq, head.range.offset);
+                return self.parse_initializer_expression_rest();
             }
-            let kind = self.peek_kind();
-            match kind {
-                TokenKind::Comma
-                | TokenKind::OpenCurly
-                | TokenKind::Function
-                | TokenKind::Semicolon
-                | TokenKind::Keyword(Keyword::Async | Keyword::Sync) => return,
-                _ => {}
+            if next == TokenKind::OpenParen {
+                return self.finish_redirecting_initializer();
             }
-            if let Some(end) = self.current_matching_end() {
-                self.skip_to_token(end);
-                self.cursor.advance();
-                continue;
+            // Recovery (:4873-4881): `expectedButGot('.')`, then the official
+            // queues a synthetic `.` + name *after* `this` and falls through
+            // to the synthetic assignment (re-read `<name> = this . <name>`).
+            // The queue splices at a single point, so the pair cannot land
+            // between `this` and the follower while the head re-read starts
+            // before `this`; we emit the same two reports and parse
+            // `<name> = this`, leaving the follower to the initializer loop
+            // at the same break point as the oracle.
+            let at = self.peek_span_at(1);
+            self.report(msg::expected_but_got("."), at);
+            self.report(msg::missing_assignment_in_initializer(), head);
+            self.synthetic(TokenKind::Identifier, head.range.offset);
+            self.synthetic(TokenKind::Eq, head.range.offset);
+            return self.parse_initializer_expression_rest();
+        }
+        let head_kind = self.peek_kind();
+        if is_identifier(head_kind) {
+            if self.cursor.look_kind(1) == TokenKind::Eq {
+                return self.parse_initializer_expression_rest();
             }
-            self.cursor.advance();
-            if self.no_progress(before) {
-                self.force_advance();
+            // Recovery (:4890-4903): a non-operator follower means the name
+            // is the assignment target — insert `= <synthetic name>` after
+            // it. `Token.isOperator` covers real operators; group punctuation
+            // and `.` are excluded (`kind_precedence` is `Some` for `.`,
+            // matching the explicit `!next2.isA(PERIOD)` rider).
+            let follower = self.cursor.look_kind(1);
+            if crate::expressions::kind_precedence(follower).is_none() {
+                self.report(msg::missing_assignment_in_initializer(), head);
+                let at = self.peek_span_at(1);
+                self.synthetic(TokenKind::Eq, at.range.offset);
+                self.synthetic(TokenKind::Identifier, at.range.offset);
+                return self.parse_initializer_expression_rest();
+            }
+            // Operator/`.` follower: fall through to the synthetic-assignment
+            // recovery with the head untouched.
+        } else {
+            // Recovery (:4905-4915): no entry head at all — insert a
+            // synthetic assignment `<name> = <name>`; the report anchors on
+            // the token before the entry (official `messageOnToken: token`).
+            self.report(msg::expected_an_initializer(), previous);
+            let at = head.range.offset;
+            self.synthetic(TokenKind::Identifier, at);
+            self.synthetic(TokenKind::Eq, at);
+            self.synthetic(TokenKind::Identifier, at);
+            return self.parse_initializer_expression_rest();
+        }
+        self.report(msg::missing_assignment_in_initializer(), head);
+        self.synthetic(TokenKind::Identifier, head.range.offset);
+        self.synthetic(TokenKind::Eq, head.range.offset);
+        self.parse_initializer_expression_rest()
+    }
+
+    /// Parses `this(...)`/`this.name(...)` as a redirecting initializer and
+    /// checks the body that follows (:4860-4866).
+    fn finish_redirecting_initializer(&mut self) -> TokenSpan {
+        let end = self.parse_initializer_expression_rest();
+        let after = self.peek_kind();
+        if after == TokenKind::OpenCurly || after == TokenKind::Function {
+            self.report(msg::redirecting_constructor_with_body(), self.peek_span());
+        }
+        end
+    }
+
+    /// Official `parseSuperInitializerExpression` (:4918): lookahead over
+    /// `super (. name)?` to validate the shape, then the expression re-read.
+    fn parse_super_initializer_expression(&mut self) -> TokenSpan {
+        let mut n = 1;
+        if self.cursor.look_kind(n) == TokenKind::Period {
+            n += 1;
+            let name = self.cursor.look_kind(n);
+            if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
+                // Official `expressionContinuation.ensureIdentifier`.
+                let at = self.peek_span_at(n);
+                self.report(msg::missing_identifier(), at);
+                self.synthetic(TokenKind::Identifier, at.range.offset);
+            }
+            n += 1;
+        }
+        let next = self.cursor.look_kind(n);
+        if next != TokenKind::OpenParen {
+            if next == TokenKind::QuestionPeriod {
+                // `super?.` — the error itself is reported by the
+                // `parseSuperExpression` re-read; only a missing member name
+                // gets the synthetic here (:4936-4944).
+                let name = self.cursor.look_kind(n + 1);
+                if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
+                    let at = self.peek_span_at(n + 1);
+                    self.synthetic(TokenKind::Identifier, at.range.offset);
+                }
+            } else if next == TokenKind::Eq {
+                let before_eq = self.cursor.look_kind(n - 1);
+                if before_eq != TokenKind::Keyword(Keyword::Super) {
+                    // `super.name = ...` — parseExpression reports the
+                    // assignment itself; this is the declaring-class rider.
+                    self.report(
+                        msg::field_initialized_outside_declaring_class(),
+                        self.peek_span_at(n - 1),
+                    );
+                }
+            } else {
+                // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
+                // false)` (:4948-4952): wrap the follower in empty parens.
+                let at = self.peek_span_at(n);
+                self.report(msg::expected_after_but_got("("), at);
+                self.synthetic(TokenKind::OpenParen, at.range.offset);
+                self.synthetic(TokenKind::CloseParen, at.range.offset);
             }
         }
+        self.parse_initializer_expression_rest()
+    }
+
+    /// Official `parseInitializerExpressionRest` (:4957): the entry
+    /// expression through the full engine, then `endInitializer`.
+    fn parse_initializer_expression_rest(&mut self) -> TokenSpan {
+        let end = self.parse_expression();
+        self.listener.end_initializer(end);
+        end
     }
 
     /// Official `parseAsyncModifierOpt`; updates and returns with the new
@@ -1574,7 +1729,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::unexpected_token(self.cursor.lexeme(this.id)), this);
         }
         self.parse_async_modifier_opt();
-        self.parse_function_body(self.async_state == AsyncModifier::Sync);
+        self.parse_function_body(false, self.async_state == AsyncModifier::Sync);
         self.listener
             .end_primary_constructor_body(this, this, None, self.peek_span());
     }

@@ -1,8 +1,8 @@
 //! Metadata grammar (official `parseMetadataStar` `parser_impl.dart:1361` and
 //! `parseMetadata` :1410).
 //!
-//! Annotation arguments parse through the reduced constant-expression
-//! engine (`expr_const`) until #20 lands the full engine; everything else
+//! Annotation arguments parse through the full engine
+//! (`parse_arguments_rest`, official `parseArgumentsRest`); everything else
 //! (shape, events, `@`-loop, type-argument + `(` requirements) mirrors the
 //! official productions.
 
@@ -84,6 +84,6 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.listener.handle_no_arguments(next);
             return next;
         }
-        self.parse_arguments()
+        self.parse_arguments_rest()
     }
 }

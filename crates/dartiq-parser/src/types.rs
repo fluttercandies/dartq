@@ -512,12 +512,63 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         type_info
     }
 
-    /// Official `computeTypeAfterIsOrAs` (`parser_impl.dart:9658)`: required,
-    /// with the nullable-`?` conditional disambiguation reduced to keeping
-    /// the `?` when a hard follower follows (the full speculation lands with
-    /// #20's conditional engine).
+    /// Official `computeTypeAfterIsOrAs` (`parser_impl.dart:9318`): required,
+    /// with the nullable-`?` conditional disambiguation — a `?` followed by
+    /// a hard follower keeps the nullable type, a `? {`/`? when` decides by
+    /// conditional speculation, everything else drops the `?` so the
+    /// conditional parses. Compute-only: the cursor is restored.
     pub(crate) fn compute_type_after_is_or_as(&mut self) -> TypeInfo {
-        self.compute_type(true, false)
+        let before = self.cursor.mark();
+        let type_info = self.compute_type(true, false);
+        if !type_info.is_nullable() {
+            return type_info;
+        }
+        let skip_end = type_info.skip_type(self);
+        let follower = self.kind_at(self.offset_of(skip_end) + 1);
+        let keep_nullable = matches!(
+            follower,
+            TokenKind::CloseParen
+                | TokenKind::CloseCurly
+                | TokenKind::CloseSquare
+                | TokenKind::Question
+                | TokenKind::QuestionQuestion
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::Colon
+                | TokenKind::Keyword(Keyword::Is | Keyword::As)
+                | TokenKind::PeriodPeriod
+                | TokenKind::BarBar
+                | TokenKind::AmpersandAmpersand
+                | TokenKind::Eof
+        );
+        let decide_conditional = matches!(follower, TokenKind::OpenCurly)
+            || follower == TokenKind::Keyword(Keyword::When);
+        let result = if keep_nullable {
+            type_info
+        } else if decide_conditional && !self.can_parse_as_conditional_after(skip_end) {
+            type_info
+        } else {
+            // `asNonNullable`; the complex shapes keep their `?` (documented
+            // reduction — the fast shapes cover the pinned-corpus forms).
+            match type_info {
+                TypeInfo::SimpleNullable => TypeInfo::Simple,
+                other => other,
+            }
+        };
+        self.cursor.reset(before);
+        result
+    }
+
+    /// `canParseAsConditional` from an absolute token id (the `?`): a
+    /// mark/reset walk so the compute-only contract of this module holds.
+    fn can_parse_as_conditional_after(&mut self, question: TokenId) -> bool {
+        let before = self.cursor.mark();
+        while self.cursor.peek_id() != question && !self.cursor.at_eof() {
+            self.cursor.advance();
+        }
+        let result = self.can_parse_as_conditional();
+        self.cursor.reset(before);
+        result
     }
 
     /// `ComplexTypeInfo(beforeStart, typeArguments)` (`type_info_impl.dart:562`):

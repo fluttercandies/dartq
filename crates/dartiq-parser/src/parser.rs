@@ -61,11 +61,17 @@ pub struct Parser<'s, 't, L: ParserListener> {
     bailed: bool,
     /// `asyncState`: modifier state for `inPlainSync` checks.
     pub(crate) async_state: AsyncModifier,
+    /// Whether function-literal detection is active at the primary level
+    /// (official `mayParseFunctionExpressions`, `parser_impl.dart:276`).
+    pub(crate) may_parse_function_expressions: bool,
     /// `loopState`: break/continue admissibility of the enclosing construct.
     pub(crate) loop_state: crate::listener::LoopState,
     /// Augment token captured by a declaration-modifier walk, handed to the
     /// declaration parser (official `context.augmentToken`).
     pub(crate) pending_augment: Option<TokenSpan>,
+    /// Official `_currentlyRecovering` (`parser_impl.dart:7008`): suppresses
+    /// nested written-out-operator recovery while one is being speculated.
+    pub(crate) currently_recovering: bool,
 }
 
 impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
@@ -88,8 +94,10 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             diagnostics_emitted: 0,
             bailed: false,
             async_state: AsyncModifier::Sync,
+            may_parse_function_expressions: true,
             loop_state: crate::listener::LoopState::OutsideLoop,
             pending_augment: None,
+            currently_recovering: false,
         }
     }
 
@@ -274,5 +282,32 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     /// `parsePattern`, `parser_impl.dart:11582`).
     pub fn parse_pattern_entry(&mut self, context: crate::listener::PatternContext) -> TokenSpan {
         self.parse_pattern(context)
+    }
+
+    /// Builds an independent speculative parser over a snapshot of this
+    /// parser's token stream (official `canParseAsConditional`'s listener +
+    /// rewriter swap): events and diagnostics of the speculation are dropped
+    /// into a [`crate::listener::SpeculationListener`], and insertions stay
+    /// in the fork's own cursor side table. The real parser is untouched.
+    pub(crate) fn fork_for_speculation(
+        &self,
+    ) -> Parser<'s, 't, crate::listener::SpeculationListener> {
+        Parser {
+            table: self.table,
+            cursor: self.cursor.fork(),
+            listener: crate::listener::SpeculationListener { errors: 0 },
+            features: self.features,
+            is_last_pattern_allowed_inside_unary_pattern: self
+                .is_last_pattern_allowed_inside_unary_pattern,
+            depth: self.depth,
+            statement_depth: self.statement_depth,
+            diagnostics_emitted: self.diagnostics_emitted,
+            bailed: self.bailed,
+            async_state: self.async_state,
+            may_parse_function_expressions: self.may_parse_function_expressions,
+            loop_state: self.loop_state,
+            pending_augment: self.pending_augment,
+            currently_recovering: self.currently_recovering,
+        }
     }
 }

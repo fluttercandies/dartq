@@ -1,22 +1,223 @@
-//! Literal collection/string/symbol parsing (reduced
-//! `parseLiteralListSuffix` / `parseLiteralSetOrMapSuffix` /
-//! `parseParenthesizedOrRecordLiteral` / string interpolation / symbols).
-//! Control-flow elements (if/for/spread) are milestone #20.
+//! Literal collection/string/symbol parsing (official
+//! `parseLiteralListSuffix` :8520 / `parseLiteralSetOrMapSuffix` :7893 /
+//! `parseParenthesizedExpressionOrRecordLiteral` :7628 / string
+//! interpolation :8732 / symbols :8932), plus the collection control-flow
+//! element machinery (`literal_entry_info.dart` +
+//! `literal_entry_info_impl.dart`: if/else, for/for-in, spread, null-aware
+//! elements). Elements parse full expressions through the #20 engine
+//! (official parity: the collection suffixes call `parseExpression`).
 
-use dartiq_scanner::TokenKind;
+use dartiq_scanner::{Keyword, TokenKind};
 
-use crate::expr_const::ConstantPatternContext;
 use crate::expr_const::is_user_definable_operator;
 use crate::listener::{IdentifierContext, ParserListener};
 use crate::message::msg;
 use crate::parser::Parser;
 use crate::token_id::TokenSpan;
 
+/// A pending collection control-flow completer (the official
+/// `ForComplete`/`IfComplete`/`IfElseComplete` chain, linearized).
+enum Pending {
+    If,
+    IfElse,
+    For { for_in: bool },
+}
+
+/// Result of unwinding pending completers: done (the entry ended), or an
+/// `else` was consumed and the machine continues with the else body.
+enum Unwind {
+    Done(TokenSpan),
+    Else,
+}
+
 impl<L: ParserListener> Parser<'_, '_, L> {
-    /// elements (if/for/spread) are milestone #20).
+    /// One collection element: a plain entry, or an if/for/spread/null-aware
+    /// control-flow shape and its body chain
+    /// (`literal_entry_info_impl.dart`, `computeLiteralEntry` :61 +
+    /// the per-state `parse`/`computeNext` steps). Returns the last consumed
+    /// span and the accumulated `ifConditionDelta` (for the
+    /// `expected_else_or_comma` recovery message).
+    fn parse_collection_entry(
+        &mut self,
+        set_map: bool,
+        has_set_entry: &mut Option<bool>,
+    ) -> (TokenSpan, i32) {
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut if_count = 0i32;
+        'outer: loop {
+            // `?.` at an entry start splits into `?` + `.` (official
+            // `_splitFollowingQuestionPeriod` :8237 at the entry
+            // boundaries): the null-aware element reading wins over a
+            // dot-shorthand start.
+            if self.peek_kind() == TokenKind::QuestionPeriod {
+                self.split_question_period();
+            }
+            match self.peek_kind() {
+                TokenKind::Keyword(Keyword::If) => {
+                    if_count += 1;
+                    pending.push(Pending::If);
+                    let if_kw = self.peek_span();
+                    self.cursor.advance();
+                    self.listener.begin_if_control_flow(if_kw);
+                    self.ensure_parenthesized_condition(self.features.patterns_enabled);
+                    self.listener.handle_then_control_flow(self.peek_span());
+                    continue 'outer;
+                }
+                kind if matches!(kind, TokenKind::Keyword(Keyword::For))
+                    || (kind == TokenKind::Keyword(Keyword::Await)
+                        && self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::For)) =>
+                {
+                    let await_kw = if kind == TokenKind::Keyword(Keyword::Await) {
+                        let a = self.peek_span();
+                        self.cursor.advance();
+                        Some(a)
+                    } else {
+                        None
+                    };
+                    let for_kw = self.peek_span();
+                    self.cursor.advance();
+                    let for_in = self.parse_for_control_flow_parts(await_kw, for_kw);
+                    pending.push(Pending::For { for_in });
+                    continue 'outer;
+                }
+                TokenKind::PeriodPeriodPeriod | TokenKind::PeriodPeriodPeriodQuestion => {
+                    // `SpreadOperator.parse` :314-328.
+                    let operator = self.peek_span();
+                    self.cursor.advance();
+                    let _ = self.parse_expression();
+                    self.listener.handle_spread_expression(operator);
+                }
+                TokenKind::Question => {
+                    // `NullAwareEntry` :350-352 with the set/map key
+                    // disambiguation (:7980-8012).
+                    let marker = self.peek_span();
+                    self.cursor.advance();
+                    let _ = self.parse_expression();
+                    if set_map && self.peek_kind() == TokenKind::Colon {
+                        let (colon, value_marker) = self.parse_map_entry_rest();
+                        self.listener.handle_literal_map_entry(
+                            colon,
+                            self.peek_span(),
+                            Some(marker),
+                            value_marker,
+                        );
+                    } else {
+                        self.listener.handle_null_aware_element(marker);
+                    }
+                }
+                _ => {
+                    // Simple entry (official `simpleEntry`): expression,
+                    // then the map-entry split in set/map mode (:7921-7965).
+                    let _ = self.parse_expression();
+                    if set_map {
+                        if self.peek_kind() == TokenKind::Colon {
+                            has_set_entry.get_or_insert(false);
+                            let (colon, value_marker) = self.parse_map_entry_rest();
+                            self.listener.handle_literal_map_entry(
+                                colon,
+                                self.peek_span(),
+                                None,
+                                value_marker,
+                            );
+                        } else {
+                            has_set_entry.get_or_insert(true);
+                        }
+                    }
+                }
+            }
+            // A body leaf finished: unwind the pending completers.
+            loop {
+                match self.unwind_pending(&mut pending) {
+                    Unwind::Done(end) => return (end, if_count),
+                    Unwind::Else => continue 'outer,
+                }
+            }
+        }
+    }
+
+    /// The `: value` tail of a map entry, with the null-aware value marker
+    /// (`?v`, or `?.v` split into a marker + dot-shorthand value,
+    /// :7950-7956).
+    fn parse_map_entry_rest(&mut self) -> (TokenSpan, Option<TokenSpan>) {
+        let colon = self.peek_span();
+        self.cursor.advance();
+        let value_marker = if self.peek_kind() == TokenKind::QuestionPeriod {
+            self.split_question_period();
+            let marker = self.peek_span();
+            self.cursor.advance();
+            Some(marker)
+        } else {
+            self.cursor
+                .opt_kind(TokenKind::Question)
+                .map(|id| self.span_of(id))
+        };
+        let _ = self.parse_expression();
+        (colon, value_marker)
+    }
+
+    /// The pending-completer unwind (`ForComplete` :164-182,
+    /// `IfComplete` :237-252, `IfElse` :255-283, `IfElseComplete`
+    /// :303-311). An `If` completer stays open across an `else`, handing
+    /// control back to the element step for the else body.
+    fn unwind_pending(&mut self, pending: &mut Vec<Pending>) -> Unwind {
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Pending::For { for_in } => {
+                    if for_in {
+                        self.listener.end_for_in_control_flow(self.peek_span());
+                    } else {
+                        self.listener.end_for_control_flow(self.peek_span());
+                    }
+                }
+                Pending::If => {
+                    if self.peek_kind() == TokenKind::Keyword(Keyword::Else) {
+                        // `IfComplete.computeNext` → `IfElse` :248-251.
+                        let else_kw = self.peek_span();
+                        self.cursor.advance();
+                        self.listener.handle_else_control_flow(else_kw);
+                        pending.push(Pending::IfElse);
+                        return Unwind::Else;
+                    }
+                    self.listener.end_if_control_flow(self.peek_span());
+                }
+                Pending::IfElse => {
+                    self.listener.end_if_else_control_flow(self.peek_span());
+                }
+            }
+        }
+        Unwind::Done(self.peek_span())
+    }
+
+    /// The `[]`-token arm of `parseLiteralListSuffix` (:8541-8549): an
+    /// empty list literal parsed from the combined token.
+    pub(crate) fn parse_list_literal_index_arm(
+        &mut self,
+        const_keyword: Option<TokenSpan>,
+    ) -> TokenSpan {
+        let offset = self.peek_span().range.offset;
+        self.cursor.advance();
+        let open = self.synthetic(TokenKind::OpenSquare, offset);
+        let close = self.synthetic(TokenKind::CloseSquare, offset);
+        self.cursor.advance();
+        self.cursor.advance();
+        self.listener
+            .handle_literal_list(0, open, const_keyword, close);
+        close
+    }
+
+    /// This method parses the portion of a list literal starting with the
+    /// left square bracket (official `parseLiteralListSuffix` :8520). The
+    /// cursor sits on `[` (or the combined `[]`).
     pub(crate) fn parse_list_literal(&mut self, const_keyword: Option<TokenSpan>) -> TokenSpan {
         let left = self.peek_span();
+        let was_index = self.peek_kind() == TokenKind::Index;
         self.cursor.advance();
+        if was_index {
+            // `[]` arm (:8541-8549): an empty list literal.
+            return self.finish_list_literal_index(left, const_keyword);
+        }
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let mut count = 0usize;
         let end;
         loop {
@@ -29,7 +230,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 end = self.peek_span();
                 break;
             }
-            self.parse_constant_expression(ConstantPatternContext::None);
+            let (_, if_count) = self.parse_collection_entry(false, &mut None);
             count += 1;
             match self.peek_kind() {
                 TokenKind::Comma => {
@@ -45,12 +246,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 _ => {
-                    // Recovery (`parseLiteralListSuffix` :8545-8560): an
-                    // expression-looking token means a missing comma — report
-                    // and continue; otherwise jump to the group's closer,
+                    // Recovery (:8569-8595): an entry-looking token means a
+                    // missing comma (`expected_else_or_comma` after an `if`
+                    // condition); otherwise jump to the group's closer,
                     // silently when the scanner synthesized it.
                     if crate::patterns::looks_like_literal_entry(self, self.cursor.real_pos()) {
-                        self.report(msg::expected_but_got(","), self.peek_span());
+                        let message = if if_count > 0 {
+                            msg::expected_else_or_comma()
+                        } else {
+                            msg::expected_but_got(",")
+                        };
+                        self.report(message, self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
                         continue;
                     }
@@ -71,12 +277,31 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
         }
+        self.may_parse_function_expressions = saved;
         self.listener
             .handle_literal_list(count, left, const_keyword, end);
         end
     }
 
-    /// Set/map literal (reduced `parseLiteralSetOrMapSuffix` :8568).
+    /// Event shape of the `[]` arm when the bracket token was already
+    /// consumed by [`Self::parse_list_literal`].
+    fn finish_list_literal_index(
+        &mut self,
+        index: TokenSpan,
+        const_keyword: Option<TokenSpan>,
+    ) -> TokenSpan {
+        let offset = index.range.offset;
+        let open = self.synthetic(TokenKind::OpenSquare, offset);
+        let close = self.synthetic(TokenKind::CloseSquare, offset);
+        self.cursor.advance();
+        self.cursor.advance();
+        self.listener
+            .handle_literal_list(0, open, const_keyword, close);
+        close
+    }
+
+    /// Set/map literal (official `parseLiteralSetOrMapSuffix` :7893). The
+    /// cursor sits on `{`.
     pub(crate) fn parse_set_or_map_literal(
         &mut self,
         const_keyword: Option<TokenSpan>,
@@ -84,9 +309,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let left = self.peek_span();
         self.cursor.advance();
         let mut count = 0usize;
-        // Official `hasSetEntry ??=` (:8596): FIRST-wins — only the first
-        // entry decides whether `{...}` leans set.
+        // Official `hasSetEntry ??=` (:7926): FIRST-wins, and only the
+        // simple (non-control-flow) entries decide — the unified-collection
+        // TODO in the official source keeps this shape.
         let mut has_set_entry: Option<bool> = None;
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let end;
         loop {
             if self.peek_kind() == TokenKind::CloseCurly {
@@ -98,20 +326,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 end = self.peek_span();
                 break;
             }
-            // Entry vs element in a single pass (official :8589-8618): parse
-            // the expression once, then branch on `:`.
-            self.parse_constant_expression(ConstantPatternContext::None);
-            if self.peek_kind() == TokenKind::Colon {
-                let colon = self.peek_span();
-                self.cursor.advance();
-                self.parse_constant_expression(ConstantPatternContext::None);
-                let entry_end = self.peek_span();
-                self.listener
-                    .handle_literal_map_entry(colon, entry_end, None, None);
-                has_set_entry.get_or_insert(false);
-            } else {
-                has_set_entry.get_or_insert(true);
-            }
+            let (_, if_count) = self.parse_collection_entry(true, &mut has_set_entry);
             count += 1;
             match self.peek_kind() {
                 TokenKind::Comma => {
@@ -127,12 +342,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 _ => {
-                    // Recovery (`parseLiteralSetOrMapSuffix` :8629-8660): an
-                    // expression-looking token means a missing comma — report,
-                    // insert it and continue; otherwise report and jump to
-                    // where the scanner guaranteed the `}`.
+                    // Recovery (:8041-8066): an entry-looking token means a
+                    // missing comma; otherwise report and jump to where the
+                    // scanner guaranteed the `}`.
                     if crate::patterns::looks_like_literal_entry(self, self.cursor.real_pos()) {
-                        self.report(msg::expected_but_got(","), self.peek_span());
+                        let message = if if_count > 0 {
+                            msg::expected_else_or_comma()
+                        } else {
+                            msg::expected_but_got(",")
+                        };
+                        self.report(message, self.peek_span());
                         self.synthetic(TokenKind::Comma, self.peek_span().range.offset);
                         continue;
                     }
@@ -149,6 +368,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
         }
+        self.may_parse_function_expressions = saved;
         self.listener.handle_literal_set_or_map(
             count,
             left,
@@ -159,8 +379,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         end
     }
 
-    /// Parenthesized expression or record literal (reduced
-    /// `parseParenthesizedExpressionOrRecordLiteral` :8307).
+    /// Parenthesized expression or record literal (official
+    /// `parseParenthesizedExpressionOrRecordLiteral` :7628). Function
+    /// literals are dispatched by the caller
+    /// (`parse_parenthesized_expression_function_literal_or_record_literal`).
+    /// `record_literal_zero_fields_with_trailing_comma` and the empty-record
+    /// constant-pattern report have no non-pattern surface at the pin, so
+    /// `(,)` parses with events only.
     pub(crate) fn parse_parenthesized_or_record_literal(
         &mut self,
         const_keyword: Option<TokenSpan>,
@@ -170,57 +395,56 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.listener
             .begin_parenthesized_expression_or_record_literal(begin);
         let mut count = 0usize;
-        let mut was_record = false;
+        let mut was_record = const_keyword.is_some();
         let mut was_valid_record = false;
+        // `(,)` marks the empty record (the dedicated report is culled at
+        // the pin); the marker itself needs no further use.
+        let mut _illegal_trailing_comma: Option<TokenSpan> = None;
         let end;
         loop {
-            let kind = self.peek_kind();
-            if kind == TokenKind::Eof {
-                end = self.peek_span();
+            if self.peek_kind() == TokenKind::CloseParen {
+                if count == 0 {
+                    was_record = true;
+                }
+                end = self.ensure_close_paren(begin);
                 break;
             }
-            if (count > 0 || was_record) && kind == TokenKind::CloseParen {
-                end = self.peek_span();
+            if count == 0
+                && self.peek_kind() == TokenKind::Comma
+                && self.cursor.look_kind(1) == TokenKind::CloseParen
+            {
+                // Empty record literal with a comma `(,)` (:7649-7655).
+                _illegal_trailing_comma = Some(self.peek_span());
+                was_record = true;
                 self.cursor.advance();
+                end = self.ensure_close_paren(begin);
                 break;
             }
             let mut colon: Option<TokenSpan> = None;
-            if kind != TokenKind::OpenParen
-                && (kind == TokenKind::Colon || self.cursor.peek_kind_ahead(1) == TokenKind::Colon)
+            if self.cursor.look_kind(1) == TokenKind::Colon || self.peek_kind() == TokenKind::Colon
             {
-                // Named field `id:`; `(:` is recovery through the same path
-                // (official :7685-7693 — one condition, no handleNoName on
-                // the record-literal path): ensureIdentifier reports
-                // missing_identifier on the `:` and synthesizes the name.
+                // Record with named expression (:7662-7670); `(:` takes the
+                // same path (ensure_identifier reports the missing name).
                 was_record = true;
-                was_valid_record = true;
                 let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
-                colon = Some(name);
-                self.cursor.advance();
-            }
-            if self.peek_kind() == TokenKind::CloseParen && count == 0 && !was_record {
-                // `()`: empty record literal.
-                was_record = true;
-            }
-            self.parse_constant_expression(ConstantPatternContext::None);
-            count += 1;
-            if self.peek_kind() == TokenKind::Comma {
-                // A comma makes it a record.
-                was_record = true;
+                let colon_token = self.expect_lexeme_but_got(":");
+                let _ = name;
+                colon = Some(colon_token);
                 was_valid_record = true;
-                self.cursor.advance();
-            } else {
-                let close = self.ensure_close_paren(begin);
-                end = close;
-                if was_record || colon.is_some() {
-                    if let Some(c) = colon {
-                        self.listener.handle_named_record_field(c);
-                    } else {
-                        self.listener.handle_positional_record_field(close);
-                    }
-                }
+            }
+            let _ = self.parse_expression();
+            if let Some(colon) = colon {
+                self.listener.handle_named_record_field(colon);
+            }
+            count += 1;
+            if self.peek_kind() != TokenKind::Comma {
+                end = self.ensure_close_paren(begin);
                 break;
             }
+            // It is a comma, i.e. it's a record (:7684-7689).
+            was_record = true;
+            was_valid_record = true;
+            self.cursor.advance();
         }
         if was_record {
             if count == 1 && !was_valid_record {
@@ -237,6 +461,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// String literal with adjacent merging and interpolation (C21).
     pub(crate) fn parse_literal_string(&mut self) -> TokenSpan {
         let start = self.peek_span();
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let mut literal_count = 0usize;
         let mut end;
         loop {
@@ -250,11 +476,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.listener
                 .handle_adjacent_string_literals(start, literal_count);
         }
+        self.may_parse_function_expressions = saved;
         end
     }
 
-    /// One string token, consuming `${...}` interpolation groups (the linear
-    /// flow from the scanner: `String` + `${` group + `}` + `String`...).
+    /// One string token, consuming `${...}` interpolation groups (official
+    /// `parseSingleLiteralString` :8732: the expression parses in full and
+    /// must stop at the paired `}`).
     fn parse_single_literal_string(&mut self) -> TokenSpan {
         let begin = self.peek_span();
         self.listener.begin_literal_string(begin);
@@ -266,17 +494,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let left_id = self.peek_id();
                     let left = self.peek_span();
                     self.cursor.advance();
-                    self.parse_constant_expression(ConstantPatternContext::None);
-                    // The scanner pairs `${` with its `}`.
-                    let right = if let Some(id) = self.cursor.table_matching_end(left_id) {
-                        self.skip_to_token(id);
-                        let span = self.span_of(id);
-                        self.cursor.advance();
-                        span
+                    let _ = self.parse_expression();
+                    let right = if self.peek_kind() == TokenKind::CloseCurly {
+                        self.peek_span()
                     } else {
-                        let at = self.peek_span();
-                        self.synthetic(TokenKind::CloseCurly, at.range.offset)
+                        // Recovery (:8745-8750): report and jump to the
+                        // scanner-paired `}`.
+                        self.report(msg::expected_but_got("}"), self.peek_span());
+                        match self.cursor.table_matching_end(left_id) {
+                            Some(id) => {
+                                self.skip_to_token(id);
+                                self.span_of(id)
+                            }
+                            None => self.synthetic(TokenKind::CloseCurly, left.range.offset),
+                        }
                     };
+                    self.cursor.advance();
                     self.listener
                         .handle_interpolation_expression(left, Some(right));
                     interpolation_count += 1;
@@ -301,7 +534,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         begin
     }
 
-    /// Symbol body (official `parseLiteralSymbol` :9244-9268): a
+    /// Symbol body (official `parseLiteralSymbol` :8932-8956): a
     /// user-definable operator, `void`, or `(id .)* id`. Operator membership
     /// is `isUserDefinableOperator` — not the binary-level table — so `#is`
     /// / `#as` are rejected while `#~` / `#[]` are accepted.
@@ -335,6 +568,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
+// SENTINEL-ENTRY-MACHINE
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +586,11 @@ mod tests {
         set_or_map: Vec<bool>,
         no_name: usize,
         named_record_fields: usize,
+        spreads: usize,
+        if_control_flow: usize,
+        end_if: usize,
+        end_if_else: usize,
+        for_control_flow: usize,
     }
 
     impl crate::listener::ParserListener for LiteralLog {
@@ -394,6 +634,26 @@ mod tests {
         ) {
             self.set_or_map.push(has_set_entry);
         }
+
+        fn handle_spread_expression(&mut self, _: TokenSpan) {
+            self.spreads += 1;
+        }
+
+        fn begin_if_control_flow(&mut self, _: TokenSpan) {
+            self.if_control_flow += 1;
+        }
+
+        fn end_if_control_flow(&mut self, _: TokenSpan) {
+            self.end_if += 1;
+        }
+
+        fn end_if_else_control_flow(&mut self, _: TokenSpan) {
+            self.end_if_else += 1;
+        }
+
+        fn end_for_control_flow(&mut self, _: TokenSpan) {
+            self.for_control_flow += 1;
+        }
     }
 
     fn literal_parser(source: &'static str) -> crate::Parser<'static, 'static, LiteralLog> {
@@ -414,7 +674,7 @@ mod tests {
 
     #[test]
     fn set_entry_wins_over_later_map_entry() {
-        // F4: `hasSetEntry ??=` is first-wins (official :8596) — `{1, 2: 3}`
+        // F4: `hasSetEntry ??=` is first-wins (official :7926) — `{1, 2: 3}`
         // leans set even though a map entry follows.
         let mut p = literal_parser("{1, 2: 3}");
         let _ = p.parse_set_or_map_literal(None);
@@ -430,8 +690,47 @@ mod tests {
     }
 
     #[test]
+    fn control_flow_entries_leave_has_set_entry_unset() {
+        // Official :7921-8040: only *simple* entries touch hasSetEntry, so
+        // `{if (b) 1}` reports the set-or-map with hasSetEntry=false.
+        let mut p = literal_parser("{if (b) 1}");
+        let _ = p.parse_set_or_map_literal(None);
+        assert_eq!(p.listener.if_control_flow, 1);
+        assert_eq!(p.listener.end_if, 1);
+        assert_eq!(p.listener.set_or_map, vec![false]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn if_else_and_spread_elements_event_in_order() {
+        let mut p = literal_parser("[if (b) 1 else 2, ...xs]");
+        let _ = p.parse_list_literal(None);
+        assert_eq!(p.listener.end_if_else, 1);
+        assert_eq!(p.listener.spreads, 1);
+        assert_eq!(p.listener.int_literals, 2);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn for_control_flow_collection_element() {
+        let mut p = literal_parser("[for (var i = 0; i < 3; i++) i]");
+        let _ = p.parse_list_literal(None);
+        assert_eq!(p.listener.for_control_flow, 1);
+        assert_eq!(p.listener.identifiers, 4);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn for_in_control_flow_collection_element() {
+        let mut p = literal_parser("[for (final x in xs) x]");
+        let _ = p.parse_list_literal(None);
+        assert_eq!(p.listener.for_control_flow, 0);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
     fn record_literal_colon_prefix_reports_missing_identifier() {
-        // Official :7685-7693: `(:` takes the named-field path, where
+        // Official :7662-7670: `(:` takes the named-field path, where
         // ensureIdentifier(namedRecordFieldReference) reports
         // missing_identifier on the `:` and emits a synthetic name — the
         // record-literal path never emits handleNoName (that is record
@@ -454,12 +753,24 @@ mod tests {
 
     #[test]
     fn list_literal_missing_comma_splits_elements() {
-        // F10 (official :8549-8560): `[1 2]` splits into two elements with
+        // F10 (official :8569-8580): `[1 2]` splits into two elements with
         // exactly one expected-`,` report.
         let mut p = literal_parser("[1 2]");
         let _ = p.parse_list_literal(None);
         assert_eq!(p.listener.int_literals, 2);
         assert_eq!(p.listener.errors, vec!["expected_token".to_string()]);
+    }
+
+    #[test]
+    fn list_literal_missing_comma_after_if_reports_else_or_comma() {
+        // Official :8576-8580: a missing comma after an if-element's
+        // condition reports expected_else_or_comma.
+        let mut p = literal_parser("[if (b) 1 2]");
+        let _ = p.parse_list_literal(None);
+        assert_eq!(
+            p.listener.errors,
+            vec!["expected_else_or_comma".to_string()]
+        );
     }
 
     /// Local listener capturing symbol membership and identifier events.
@@ -505,7 +816,7 @@ mod tests {
 
     #[test]
     fn symbol_operator_membership_is_user_definable_operator() {
-        // F11 (official :9244-9268): `~` is a member (count 1); keywords
+        // F11 (official :8932-8956): `~` is a member (count 1); keywords
         // `is`/`as` are not — they take the identifier path and report
         // missing_identifier exactly like the oracle.
         let p = parse_symbol("#~");

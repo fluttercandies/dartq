@@ -66,6 +66,7 @@ pub(crate) struct CursorMark {
     pos: usize,
     head: usize,
     inserted_len: usize,
+    last_consumed: Option<TokenId>,
 }
 
 /// Linear token cursor: pending-insertion queue first, then the scanned
@@ -79,6 +80,10 @@ pub struct TokenCursor<'s, 't> {
     /// Inserted tokens not yet consumed start at `head`.
     inserted: Vec<InsertedToken>,
     head: usize,
+    /// The id consumed by the latest [`Self::advance`] — the official
+    /// `token` variable (the anchor `reportRecoverableError(token, ...)`
+    /// sites report on).
+    last_consumed: Option<TokenId>,
 }
 
 /// Queue-empty sentinel (`usize::MAX`); no inserted token index can collide.
@@ -92,7 +97,13 @@ impl<'s, 't> TokenCursor<'s, 't> {
             pos: 0,
             inserted: Vec::new(),
             head: QUEUE_EMPTY,
+            last_consumed: None,
         }
+    }
+
+    /// The token consumed by the latest [`Self::advance`], if any.
+    pub(crate) fn last_consumed_id(&self) -> Option<TokenId> {
+        self.last_consumed
     }
 
     // --- marks / speculation -------------------------------------------------
@@ -108,6 +119,23 @@ impl<'s, 't> TokenCursor<'s, 't> {
             pos: self.pos,
             head: self.head,
             inserted_len: self.inserted.len(),
+            last_consumed: self.last_consumed,
+        }
+    }
+
+    /// Independent copy for speculative parsing (official
+    /// `canParseAsConditional`'s `UndoableTokenStreamRewriter` swap): the
+    /// fork shares the immutable table/source and starts from this cursor's
+    /// state; insertions made while parsing the fork land in its own side
+    /// table and never reach the real stream.
+    pub(crate) fn fork(&self) -> TokenCursor<'s, 't> {
+        TokenCursor {
+            table: self.table,
+            source: self.source,
+            pos: self.pos,
+            inserted: self.inserted.clone(),
+            head: self.head,
+            last_consumed: self.last_consumed,
         }
     }
 
@@ -118,6 +146,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
         self.pos = mark.pos;
         self.head = mark.head;
         self.inserted.truncate(mark.inserted_len);
+        self.last_consumed = mark.last_consumed;
     }
 
     /// Real-stream position stored in a mark (for span re-derivation after
@@ -261,6 +290,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// idempotent (the cursor stays pinned at the end).
     pub(crate) fn advance(&mut self) -> TokenId {
         let id = self.peek_id();
+        self.last_consumed = Some(id);
         if self.head != QUEUE_EMPTY {
             self.head += 1;
             if self.head >= self.inserted.len() {

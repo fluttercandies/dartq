@@ -44,19 +44,21 @@ pub(crate) mod msg {
         EXTENSION_DECLARES_CONSTRUCTOR, EXTENSION_TYPE_EXTENDS, EXTENSION_TYPE_WITH,
         EXTERNAL_CONSTRUCTOR_WITH_INITIALIZER, EXTERNAL_FACTORY_REDIRECTION,
         EXTERNAL_FACTORY_WITH_BODY, EXTERNAL_METHOD_WITH_BODY, FACTORY_TOP_LEVEL_DECLARATION,
-        FINAL_AND_COVARIANT, FINAL_AND_COVARIANT_LATE_WITH_INITIALIZER, FINAL_AND_VAR, FINAL_ENUM,
-        FINAL_MIXIN, FINAL_MIXIN_CLASS, GETTER_CONSTRUCTOR, GETTER_WITH_PARAMETERS,
-        IMPLEMENTS_BEFORE_EXTENDS, IMPLEMENTS_BEFORE_ON, IMPLEMENTS_BEFORE_WITH, INTERFACE_ENUM,
-        INTERFACE_MIXIN, INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME, MEMBER_WITH_CLASS_NAME,
+        FIELD_INITIALIZED_OUTSIDE_DECLARING_CLASS, FINAL_AND_COVARIANT,
+        FINAL_AND_COVARIANT_LATE_WITH_INITIALIZER, FINAL_AND_VAR, FINAL_ENUM, FINAL_MIXIN,
+        FINAL_MIXIN_CLASS, GETTER_CONSTRUCTOR, GETTER_WITH_PARAMETERS, IMPLEMENTS_BEFORE_EXTENDS,
+        IMPLEMENTS_BEFORE_ON, IMPLEMENTS_BEFORE_WITH, INTERFACE_ENUM, INTERFACE_MIXIN,
+        INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME, MEMBER_WITH_CLASS_NAME,
         MISSING_CONST_FINAL_VAR_OR_TYPE, MISSING_FUNCTION_BODY, MISSING_FUNCTION_PARAMETERS,
         MISSING_METHOD_PARAMETERS, MISSING_PRIMARY_CONSTRUCTOR,
         MISSING_PRIMARY_CONSTRUCTOR_PARAMETERS, MISSING_STAR_AFTER_SYNC,
         MISSING_TYPEDEF_PARAMETERS, MIXIN_DECLARES_CONSTRUCTOR, MODIFIER_OUT_OF_ORDER,
         MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NATIVE_CLAUSE_SHOULD_BE_ANNOTATION,
-        OUT_OF_ORDER_CLAUSES, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM, SEALED_MIXIN,
-        SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
-        TOP_LEVEL_OPERATOR, TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN,
-        VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
+        OUT_OF_ORDER_CLAUSES, REDIRECTING_CONSTRUCTOR_WITH_BODY,
+        REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM, SEALED_MIXIN, SEALED_MIXIN_CLASS,
+        SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR, TOP_LEVEL_OPERATOR,
+        TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN, VAR_RETURN_TYPE,
+        WITH_BEFORE_EXTENDS,
     };
     use dartiq_diagnostics::{
         ABSTRACT_FINAL_BASE_CLASS, ABSTRACT_FINAL_INTERFACE_CLASS, ABSTRACT_SEALED_CLASS,
@@ -66,16 +68,20 @@ pub(crate) mod msg {
     };
     use dartiq_diagnostics::{
         ANNOTATION_ON_TYPE_ARGUMENT, ANNOTATION_WITH_TYPE_ARGUMENTS_UNINSTANTIATED,
-        BREAK_OUTSIDE_OF_LOOP, CATCH_SYNTAX, CATCH_SYNTAX_EXTRA_PARAMETERS, COLON_IN_PLACE_OF_IN,
-        CONTINUE_OUTSIDE_OF_LOOP, CONTINUE_WITHOUT_LABEL_IN_CASE,
+        BINARY_OPERATOR_WRITTEN_OUT, BREAK_OUTSIDE_OF_LOOP, CATCH_SYNTAX,
+        CATCH_SYNTAX_EXTRA_PARAMETERS, COLON_IN_PLACE_OF_IN, CONTINUE_OUTSIDE_OF_LOOP,
+        CONTINUE_WITHOUT_LABEL_IN_CASE, DEFAULT_IN_SWITCH_EXPRESSION,
         EMPTY_RECORD_TYPE_NAMED_FIELDS_LIST, EMPTY_RECORD_TYPE_WITH_COMMA,
-        EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_TOKEN, EXPECTED_TYPE_NAME,
-        ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME, ILLEGAL_PATTERN_IDENTIFIER_NAME,
-        ILLEGAL_PATTERN_VARIABLE_NAME, INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR,
-        INVALID_CONSTANT_CONST_PREFIX, INVALID_CONSTANT_PATTERN_BINARY,
-        INVALID_INSIDE_UNARY_PATTERN, LATE_PATTERN_VARIABLE_DECLARATION, MISSING_CATCH_OR_FINALLY,
-        MISSING_IDENTIFIER, MULTIPLE_VARIANCE_MODIFIERS, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
-        RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
+        EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_ELSE_OR_COMMA, EXPECTED_TOKEN,
+        EXPECTED_TYPE_NAME, ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME,
+        ILLEGAL_PATTERN_IDENTIFIER_NAME, ILLEGAL_PATTERN_VARIABLE_NAME,
+        INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR, INVALID_CONSTANT_CONST_PREFIX,
+        INVALID_CONSTANT_PATTERN_BINARY, INVALID_INSIDE_UNARY_PATTERN,
+        LATE_PATTERN_VARIABLE_DECLARATION, LITERAL_WITH_CLASS, LITERAL_WITH_CLASS_AND_NEW,
+        LITERAL_WITH_NEW, MISSING_ASSIGNMENT_IN_INITIALIZER, MISSING_CATCH_OR_FINALLY,
+        MISSING_EXPRESSION_IN_THROW, MISSING_IDENTIFIER, MISSING_INITIALIZER,
+        MULTIPLE_VARIANCE_MODIFIERS, NAMED_FUNCTION_EXPRESSION, NULL_AWARE_CASCADE_OUT_OF_ORDER,
+        PATTERN_ASSIGNMENT_DECLARES_VARIABLE, RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
         RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW,
         SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
@@ -520,6 +526,11 @@ pub(crate) mod msg {
                 "EXPECTED_SWITCH_STATEMENT_BODY",
                 "A switch statement must have a body, even if it is empty.".to_owned(),
             ),
+            BlockKind::SwitchExpression => (
+                "expected_switch_expression_body",
+                "EXPECTED_SWITCH_EXPRESSION_BODY",
+                "A switch expression must have a body, even if it is empty.".to_owned(),
+            ),
             // Never reported: statement blocks are only entered with `{`
             // present.
             BlockKind::Statement => {
@@ -567,6 +578,35 @@ pub(crate) mod msg {
         Message::new(
             EXTERNAL_CONSTRUCTOR_WITH_INITIALIZER,
             "An external constructor can't have any initializers.",
+        )
+    }
+
+    /// `fieldInitializedOutsideDeclaringClass` (`C() : super.x = 42;`).
+    pub(crate) fn field_initialized_outside_declaring_class() -> Message {
+        Message::new(
+            FIELD_INITIALIZED_OUTSIDE_DECLARING_CLASS,
+            "A field can only be initialized in its declaring class",
+        )
+    }
+
+    /// `expectedAnInitializer` (analyzer code `missingInitializer`).
+    pub(crate) fn expected_an_initializer() -> Message {
+        Message::new(MISSING_INITIALIZER, "Expected an initializer.")
+    }
+
+    /// `missingAssignmentInInitializer` (`C() : x(3) {}`).
+    pub(crate) fn missing_assignment_in_initializer() -> Message {
+        Message::new(
+            MISSING_ASSIGNMENT_IN_INITIALIZER,
+            "Expected an assignment after the field name.",
+        )
+    }
+
+    /// `redirectingConstructorWithBody` (`C() : this.x() {}`).
+    pub(crate) fn redirecting_constructor_with_body() -> Message {
+        Message::new(
+            REDIRECTING_CONSTRUCTOR_WITH_BODY,
+            "Redirecting constructors can't have a body.",
         )
     }
 
@@ -1187,6 +1227,69 @@ pub(crate) mod msg {
             "A continue statement in a switch statement must have a label as a target.",
         )
     }
+
+    // —— expression engine (#20) ——————————————————————————————————————————
+    // Registry-backed templates against the same 3.13.1 oracle lock (texts
+    // from the pinned `messages.yaml`).
+
+    pub(crate) fn missing_expression_in_throw() -> Message {
+        Message::new(
+            MISSING_EXPRESSION_IN_THROW,
+            "Missing expression after 'throw'.",
+        )
+    }
+
+    pub(crate) fn expected_else_or_comma() -> Message {
+        Message::new(EXPECTED_ELSE_OR_COMMA, "Expected 'else' or comma.")
+    }
+
+    pub(crate) fn null_aware_cascade_out_of_order() -> Message {
+        Message::new(
+            NULL_AWARE_CASCADE_OUT_OF_ORDER,
+            "The '?..' cascade operator must be first in the cascade sequence.",
+        )
+    }
+
+    pub(crate) fn literal_with_class(class: &str, prefix: &str) -> Message {
+        Message::new(
+            LITERAL_WITH_CLASS,
+            format!("A {class} literal can't be prefixed by '{prefix}'."),
+        )
+    }
+
+    pub(crate) fn literal_with_class_and_new(class: &str, lexeme: &str) -> Message {
+        Message::new(
+            LITERAL_WITH_CLASS_AND_NEW,
+            format!("A {class} literal can't be prefixed by 'new {lexeme}'."),
+        )
+    }
+
+    pub(crate) fn literal_with_new() -> Message {
+        Message::new(LITERAL_WITH_NEW, "A literal can't be prefixed by 'new'.")
+    }
+
+    pub(crate) fn default_in_switch_expression() -> Message {
+        Message::new(
+            DEFAULT_IN_SWITCH_EXPRESSION,
+            "A switch expression may not use the `default` keyword.",
+        )
+    }
+
+    pub(crate) fn named_function_expression() -> Message {
+        Message::new(
+            NAMED_FUNCTION_EXPRESSION,
+            "A function expression can't have a name.",
+        )
+    }
+
+    pub(crate) fn binary_operator_written_out(written: &str, operator: &str) -> Message {
+        Message::new(
+            BINARY_OPERATOR_WRITTEN_OUT,
+            format!(
+                "Binary operator '{written}' is written as '{operator}' instead of the written out word."
+            ),
+        )
+    }
 }
 
 /// Block-shape expectations for `ensureBlock` recovery (official
@@ -1208,6 +1311,14 @@ pub(crate) enum BlockKind {
     FinallyClause,
     /// A switch statement body.
     SwitchStatement,
+    /// A switch expression body (`BlockKind.switchExpression`; official
+    /// `expectedSwitchExpressionBody` — a shared-parser own code, absent
+    /// from the syntax-codes capture, so `local_code`). Emit-vs-cull
+    /// decision (pinned oracle, block_kind.dart:58 + parser_impl.dart
+    /// :12433): EMIT — `ensureBlock` reports it live on `switch (n);`
+    /// (script in messages.yaml), with the report anchored on the token
+    /// before the missing `{`.
+    SwitchExpression,
     Class,
     Mixin,
     Enum,

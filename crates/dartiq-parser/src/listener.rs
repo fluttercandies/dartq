@@ -425,7 +425,63 @@ pub trait ParserListener {
     }
     fn begin_await_expression(&mut self, token: Token) {}
     fn end_await_expression(&mut self, begin: Token, end: Token) {}
+    /// `endInvalidAwaitExpression(begin, end, errorCode)`; the error code is
+    /// resolution-domain and never a TSV emission (`await` in a sync
+    /// function), mirroring `endInvalidYieldStatement`.
+    fn end_invalid_await_expression(&mut self, begin: Token, end: Token) {}
     fn handle_throw_expression(&mut self, throw: Token, end: Token) {}
+    /// `handleAssignmentExpression(operator, end)` (C7).
+    fn handle_assignment_expression(&mut self, operator: Token, end: Token) {}
+    /// `beginCascade(operator)` / `handleCascadeAccess(operator, end,
+    /// isNullAware)` / `endCascade` (C8).
+    fn begin_cascade(&mut self, operator: Token) {}
+    fn handle_cascade_access(&mut self, operator: Token, end: Token, is_null_aware: bool) {}
+    fn end_cascade(&mut self) {}
+    /// `beginConditionalExpression(question)` /
+    /// `handleConditionalExpressionColon` /
+    /// `endConditionalExpression(question, colon, end)` (C9).
+    fn begin_conditional_expression(&mut self, question: Token) {}
+    fn handle_conditional_expression_colon(&mut self) {}
+    fn end_conditional_expression(&mut self, question: Token, colon: Token, end: Token) {}
+    /// Prefix `++`/`--` (`handleUnaryPrefixAssignmentExpression`); the plain
+    /// unary prefixes `-`/`!`/`~` use [`ParserListener::handle_unary_prefix_expression`].
+    fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {}
+    /// Postfix `++`/`--` (`handleUnaryPostfixAssignmentExpression`).
+    fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {}
+    /// `beginFunctionExpression(token)` / `endFunctionExpression(begin, end)`:
+    /// an anonymous function literal `(...) { ... }` (C22).
+    fn begin_function_expression(&mut self, token: Token) {}
+    fn end_function_expression(&mut self, begin: Token, end: Token) {}
+    /// `beginNamedFunctionExpression(token)` /
+    /// `endNamedFunctionExpression(end)`: the named-function-expression
+    /// recovery shape `T name(...) { ... }` (C23).
+    fn begin_named_function_expression(&mut self, token: Token) {}
+    fn end_named_function_expression(&mut self, end: Token) {}
+    /// Implicit-creation constructor invocation `C<T>(...)` (C17).
+    fn begin_implicit_creation_expression(&mut self, token: Token) {}
+    fn end_implicit_creation_expression(&mut self, begin: Token, open_angle: Token) {}
+    /// `handleAugmentSuperExpression(augment, super, context)`.
+    fn handle_augment_super_expression(
+        &mut self,
+        augment: Token,
+        super_kw: Token,
+        context: IdentifierContext,
+    ) {
+    }
+    /// Dot-shorthand events (`.name` static-access shorthands):
+    /// `handleDotShorthandHead(dot)` / `handleDotShorthandContext(dot)`;
+    /// `const .name` brackets both with `begin/endConstDotShorthand`.
+    fn handle_dot_shorthand_head(&mut self, dot: Token) {}
+    fn handle_dot_shorthand_context(&mut self, dot: Token) {}
+    fn begin_const_dot_shorthand(&mut self, const_keyword: Token) {}
+    fn end_const_dot_shorthand(&mut self, const_keyword: Token) {}
+    /// `handleInvalidTypeArguments(token)`: type arguments in a constructor
+    /// invocation position (event only — the paired diagnostic is culled at
+    /// the pinned oracle).
+    fn handle_invalid_type_arguments(&mut self, token: Token) {}
+    /// `handlePatternAssignment(equals)` (C46): the `=` of an outer-pattern
+    /// assignment.
+    fn handle_pattern_assignment(&mut self, equals: Token) {}
     /// `is` / `is!` type check (C33): begin/end bracket the type operand.
     fn begin_is_operator_type(&mut self, operator: Token) {}
     fn end_is_operator_type(&mut self, operator: Token) {}
@@ -1130,6 +1186,10 @@ pub trait ParserListener {
         end: Token,
     ) {
     }
+    /// `beginInitializer`/`endInitializer(end)` (one `: init` entry; `end`
+    /// is the last consumed token of the entry).
+    fn begin_initializer(&mut self, token: Token) {}
+    fn end_initializer(&mut self, end: Token) {}
     /// `handleParenthesizedCondition(begin, case, when)` (if/while/switch
     /// conditions; `case`/`when` only under the patterns feature).
     fn handle_parenthesized_condition(
@@ -1150,6 +1210,48 @@ pub trait ParserListener {
     ) {
     }
 
+    // —— collection control-flow elements (#20) ————————————————————————————
+    /// `beginIfControlFlow(ifToken)` / `handleThenControlFlow(token)` /
+    /// `handleElseControlFlow(elseToken)` / `endIfControlFlow(token)` /
+    /// `endIfElseControlFlow(token)` (C24).
+    fn begin_if_control_flow(&mut self, token: Token) {}
+    fn handle_then_control_flow(&mut self, token: Token) {}
+    fn handle_else_control_flow(&mut self, token: Token) {}
+    fn end_if_control_flow(&mut self, token: Token) {}
+    fn end_if_else_control_flow(&mut self, token: Token) {}
+    /// `beginForControlFlow(awaitToken, forToken)` /
+    /// `endForControlFlow(token)` / `endForInControlFlow(token)` (C25).
+    fn begin_for_control_flow(&mut self, await_kw: Option<Token>, for_kw: Token) {}
+    fn end_for_control_flow(&mut self, token: Token) {}
+    fn end_for_in_control_flow(&mut self, token: Token) {}
+    /// `handleSpreadExpression(operator)` (`...`/`...?` elements, C26).
+    fn handle_spread_expression(&mut self, operator: Token) {}
+    /// `handleNullAwareElement(token)` (`?e` elements, C27).
+    fn handle_null_aware_element(&mut self, token: Token) {}
+
+    // —— switch expressions (#20) ————————————————————————————————————————
+    /// `beginSwitchExpression(switchKeyword)` /
+    /// `endSwitchExpression(switchKeyword, end)`.
+    fn begin_switch_expression(&mut self, token: Token) {}
+    fn end_switch_expression(&mut self, token: Token, end: Token) {}
+    /// `beginSwitchExpressionBlock(token)` /
+    /// `endSwitchExpressionBlock(caseCount, begin, end)`.
+    fn begin_switch_expression_block(&mut self, token: Token) {}
+    fn end_switch_expression_block(&mut self, count: usize, begin: Token, end: Token) {}
+    /// `beginSwitchExpressionCase()` /
+    /// `handleSwitchExpressionCasePattern(patternEnd)` /
+    /// `endSwitchExpressionCase(begin, when, arrow, end)`.
+    fn begin_switch_expression_case(&mut self) {}
+    fn handle_switch_expression_case_pattern(&mut self, token: Token) {}
+    fn end_switch_expression_case(
+        &mut self,
+        begin: Token,
+        when: Option<Token>,
+        arrow: Token,
+        end: Token,
+    ) {
+    }
+
     // —— recovery ——————————————————————————————————————————————————————
     /// The only error channel: official `handleRecoverableError`
     /// (listener.dart:2375). `start`/`end` delimit the reported span.
@@ -1166,3 +1268,17 @@ pub trait ParserListener {
 pub struct NullListener;
 
 impl ParserListener for NullListener {}
+
+/// Error-counting listener for speculative parses (the `hasErrors` half of
+/// the official `canParseAsConditional`'s swapped-in `NullListener`): all
+/// events are dropped, recovery reports are counted.
+pub(crate) struct SpeculationListener {
+    /// Recovery reports seen so far.
+    pub(crate) errors: u32,
+}
+
+impl ParserListener for SpeculationListener {
+    fn handle_recoverable_error(&mut self, _: Message, _: Token, _: Token) {
+        self.errors += 1;
+    }
+}

@@ -3,6 +3,7 @@
 mod collector;
 
 mod declarations;
+mod expressions;
 mod features;
 mod goldens;
 mod patterns;

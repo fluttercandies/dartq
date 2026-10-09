@@ -360,6 +360,30 @@ impl ParserListener for Collector {
     ) {
         self.log.push(("end", "fields"));
     }
+    fn begin_field_initializer(&mut self, _: Token) {
+        self.log.push(("begin", "field_initializer"));
+    }
+    fn end_field_initializer(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "field_initializer"));
+    }
+    fn begin_initializers(&mut self, _: Token) {
+        self.log.push(("begin", "initializers"));
+    }
+    fn end_initializers(&mut self, _: usize, _: Token, _: Token) {
+        self.log.push(("end", "initializers"));
+    }
+    fn begin_initializer(&mut self, _: Token) {
+        self.log.push(("begin", "initializer"));
+    }
+    fn end_initializer(&mut self, _: Token) {
+        self.log.push(("end", "initializer"));
+    }
+    fn begin_binary_expression(&mut self, _: Token) {
+        self.log.push(("begin", "binary_expression"));
+    }
+    fn end_binary_expression(&mut self, _: Token, _: Token) {
+        self.log.push(("end", "binary_expression"));
+    }
     fn begin_class_or_mixin_or_extension_body(
         &mut self,
         _: crate::listener::DeclarationKind,

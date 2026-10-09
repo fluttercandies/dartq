@@ -89,7 +89,7 @@ pub(crate) fn looks_like_literal_entry(
 
 /// `looksLikeExpressionStart` (`identifier_context.dart:340`) reduced to the
 /// token-kind part (statement-start keywords are #19's surface).
-fn looks_like_expression_start(
+pub(crate) fn looks_like_expression_start(
     parser: &Parser<'_, '_, impl ParserListener>,
     offset: usize,
 ) -> bool {

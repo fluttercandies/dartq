@@ -217,10 +217,25 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 return (open, close);
             }
         }
-        let at = self.peek_span();
-        let lexeme = self.cursor.lexeme(at.id).to_owned();
+        // Message-carrying kinds report on the token BEFORE the missing `{`
+        // (official ensureBlock: `reportRecoverableError(token, message)`).
+        // The switch-expression lane pins this anchor (`switch (n)` reports
+        // on the `)`); the other message kinds keep the follower anchor of
+        // their own lanes (#18/#19) pending their differential passes. The
+        // synthetic `{}` still lands at the follower (insertBlock uses
+        // `next.charOffset`).
+        let follower = self.peek_span();
+        let at = if kind == crate::message::BlockKind::SwitchExpression {
+            self.cursor
+                .last_consumed_id()
+                .map(|id| self.span_of(id))
+                .unwrap_or(follower)
+        } else {
+            follower
+        };
+        let lexeme = self.cursor.lexeme(follower.id).to_owned();
         self.report(msg::expected_block_body(kind, &lexeme), at);
-        let offset = at.range.offset;
+        let offset = follower.range.offset;
         let open = self.synthetic(TokenKind::OpenCurly, offset);
         let close = self.synthetic(TokenKind::CloseCurly, offset);
         (open, close)

@@ -56,12 +56,13 @@
 //! (both styles), top-level members, and class members with **full function
 //! bodies** (#19): `{ ... }` bodies parse the statement grammar
 //! (`statements.rs`, official `parseFunctionBody`), `=>` bodies parse their
-//! expression through the reduced constant-expression engine, and `;`
-//! bodies emit the official empty-body event. Constructor initializers and
-//! field initializers still diet-skip their expression internals. Directives
-//! are consumed diet-style (group-aware skip to `;`) until the directive
-//! milestone. Until #20 lands, statement/initializer expression operands
-//! parse through the reduced constant-expression engine (see `expr_const`).
+//! expression through the full expression engine, and `;`
+//! bodies emit the official empty-body event. Directives are consumed
+//! diet-style (group-aware skip to `;`) until the directive milestone.
+//! Statement, initializer, and default-value expression operands parse
+//! through the full expression engine (`expressions.rs`, official
+//! `parseExpression` family, #20); patterns keep the reduced
+//! constant-expression engine (see `expr_const`).
 //!
 //! # Scanner interplay
 //!
@@ -79,6 +80,7 @@ use dartiq_scanner::TokenTable;
 mod cursor;
 mod declarations;
 mod expr_const;
+mod expressions;
 mod features;
 mod formal_params;
 mod listener;

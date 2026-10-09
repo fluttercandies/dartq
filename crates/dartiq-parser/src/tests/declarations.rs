@@ -290,3 +290,116 @@ fn empty_unit_is_two_events() {
     let c = parse("");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
 }
+
+// —— field and constructor initializers (#20 full-engine wiring) —————————
+
+#[test]
+fn field_initializer_parses_full_expression() {
+    let c = parse("class C { int x = 1 + 2 * 3; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    // The binary events prove the expression went through the full
+    // engine (the retired diet skip emitted no expression events).
+    c.assert_sequence(&[
+        ("begin", "field_initializer"),
+        ("begin", "binary_expression"),
+        ("end", "binary_expression"),
+        ("end", "field_initializer"),
+    ]);
+}
+
+/// Drives [`Parser::parse_initializers_opt`] directly on a `:`-led source
+/// (the production entry once the constructor head is consumed; the
+/// class-member head itself is another lane's surface).
+fn initializers(source: &'static str) -> super::collector::Collector {
+    let mut p = setup(source);
+    p.parse_initializers_opt();
+    p.listener
+}
+
+#[test]
+fn constructor_initializers_parse_entries() {
+    let c = initializers(": x = 1, assert(y > 0), super.z(2);");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "initializers"),
+        ("begin", "initializer"),
+        ("end", "initializer"),
+        ("begin", "initializer"),
+        ("end", "initializer"),
+        ("begin", "initializer"),
+        ("end", "initializer"),
+        ("end", "initializers"),
+    ]);
+}
+
+#[test]
+fn missing_comma_between_initializers_reports_expected_after() {
+    // `: x = 1 y = 2;` — the report anchors on the `1` (the last consumed
+    // token of the first entry, official :4791).
+    let c = initializers(": x = 1 y = 2;");
+    assert_eq!(c.error_codes(), ["expected_token"]);
+    assert_eq!(c.errors[0].1, 6);
+    assert_eq!(c.errors[0].2, 7);
+}
+
+#[test]
+fn initializer_without_entry_reports_expected_an_initializer() {
+    // `: {}` — the expectedAnInitializer script; the report anchors on the
+    // token before the entry (official `messageOnToken: token`).
+    let c = initializers(": {}");
+    assert_eq!(c.error_codes(), ["missing_initializer"]);
+    assert_eq!(c.errors[0].1, 0);
+    assert_eq!(c.errors[0].2, 1);
+}
+
+#[test]
+fn initializer_head_without_assignment_reports_missing_assignment() {
+    // `: x(3) {}` — the missingAssignmentInInitializer script; the report
+    // anchors on the head `x`. KNOWN DIVERGENCE (first-lane engine): the
+    // oracle emits only the one report — its re-read consumes the queued
+    // synthetic `<syn>(3)` as the assignment RHS (parser_impl.dart:4894,
+    // issue_31192) — while the engine emits a trailing `missing_identifier`
+    // at the `(` because the queued synthetic identifier is not consumed as
+    // a primary. Left red as the repair pin; the primary report and its
+    // anchor match the oracle.
+    let c = initializers(": x(3) {}");
+    assert_eq!(c.error_codes(), ["missing_assignment_in_initializer"]);
+    assert_eq!(c.errors[0].1, 2);
+    assert_eq!(c.errors[0].2, 3);
+}
+
+#[test]
+fn redirecting_initializer_with_body_reports() {
+    // `: this.x() {}` — the redirectingConstructorWithBody script; the
+    // report anchors on the `{`.
+    let c = initializers(": this.x() {}");
+    assert_eq!(c.error_codes(), ["redirecting_constructor_with_body"]);
+    assert_eq!(c.errors[0].1, 11);
+    assert_eq!(c.errors[0].2, 12);
+}
+
+#[test]
+fn super_field_assignment_outside_declaring_class_reports() {
+    // `: super.x = 42;` — the fieldInitializedOutsideDeclaringClass script;
+    // the report anchors on the member name (the assignment itself is
+    // resolution-domain, outside the parser surface).
+    let c = initializers(": super.x = 42;");
+    assert_eq!(
+        c.error_codes(),
+        ["field_initialized_outside_declaring_class"]
+    );
+}
+
+#[test]
+fn switch_expression_missing_body_reports_on_close_paren() {
+    // `switch (n);` — the expectedSwitchExpressionBody script shape (live
+    // pinned-oracle code, block_kind.dart:58 + parser_impl.dart:12433): the
+    // report anchors on the `)` (last consumed), never on the `;`, and the
+    // synthetic empty body terminates the case list at zero cases.
+    let mut p = setup("switch (n);");
+    let _ = p.parse_expression();
+    let c = p.listener;
+    assert_eq!(c.error_codes(), ["expected_switch_expression_body"]);
+    assert_eq!(c.errors[0].1, 9);
+    assert_eq!(c.errors[0].2, 10);
+}

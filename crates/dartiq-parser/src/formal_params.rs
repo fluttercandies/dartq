@@ -12,9 +12,7 @@
 
 use dartiq_scanner::{Keyword, TokenKind};
 
-use crate::listener::{
-    ConstantPatternContext, FormalParameterKind, IdentifierContext, MemberKind, ParserListener,
-};
+use crate::listener::{FormalParameterKind, IdentifierContext, MemberKind, ParserListener};
 use crate::message::msg;
 use crate::parser::Parser;
 use crate::recovery::is_identifier;
@@ -485,7 +483,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener
                     .begin_formal_parameter_default_value_expression(equals);
                 initializer_start = Some(self.peek_span());
-                self.parse_constant_expression(ConstantPatternContext::None);
+                self.parse_expression();
                 initializer_end = Some(self.peek_span());
                 self.listener
                     .end_formal_parameter_default_value_expression(self.peek_span());
