@@ -164,10 +164,11 @@ fn registry_fits_the_enable_set_word_count() {
     );
 }
 
-/// The wave-2 slice pin: 18 wave-1 rules + 18 wave-2 rules = 36 registered.
+/// The slice pin: 18 wave-1 + 18 wave-2 rules + 6 directive-milestone rules
+/// = 42 registered.
 #[test]
-fn registry_holds_the_pinned_wave_two_count() {
-    assert_eq!(RULES.len(), 36);
+fn registry_holds_the_pinned_count() {
+    assert_eq!(RULES.len(), 42);
 }
 
 #[test]

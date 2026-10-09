@@ -9,6 +9,7 @@
 
 pub(crate) mod collections;
 pub(crate) mod declarations;
+pub(crate) mod directives;
 pub(crate) mod docs;
 pub(crate) mod empty;
 pub(crate) mod expressions;

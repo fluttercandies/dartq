@@ -69,12 +69,13 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through wave 2. Order is registry order ([`RuleId`]
-/// assignment), grouped core-first then alphabetically within each group —
-/// keep the pin test in `tests/registry_pin.rs` in sync.
+/// All rules through the directive milestone. Order is registry order
+/// ([`RuleId`] assignment), grouped core-first then alphabetically within
+/// each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
+    &crate::rules::directives::avoid_relative_lib_imports::SPEC,
     &crate::rules::types::avoid_shadowing_type_parameters::SPEC,
     &crate::rules::names::camel_case_extensions::SPEC,
     &crate::rules::names::camel_case_types::SPEC,
@@ -83,10 +84,12 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::empty::empty_catches::SPEC,
     &crate::rules::names::file_names::SPEC,
     &crate::rules::declarations::hash_and_equals::SPEC,
+    &crate::rules::directives::library_annotations::SPEC,
     &crate::rules::names::non_constant_identifier_names::SPEC,
     &crate::rules::declarations::prefer_generic_function_type_aliases::SPEC,
     &crate::rules::declarations::prefer_typing_uninitialized_variables::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
+    &crate::rules::directives::use_string_in_part_of_directives::SPEC,
     // —— recommended (`.third/lints/lib/recommended.yaml`) ——
     &crate::rules::declarations::avoid_return_types_on_setters::SPEC,
     &crate::rules::expressions::avoid_single_cascade_in_expression_statements::SPEC,
@@ -94,7 +97,9 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::flow::control_flow_in_finally::SPEC,
     &crate::rules::empty::empty_constructor_bodies::SPEC,
     &crate::rules::empty::empty_statements::SPEC,
+    &crate::rules::directives::library_prefixes::SPEC,
     &crate::rules::types::library_private_types_in_public_api::SPEC,
+    &crate::rules::directives::no_leading_underscores_for_library_prefixes::SPEC,
     &crate::rules::names::no_leading_underscores_for_local_identifiers::SPEC,
     &crate::rules::expressions::prefer_adjacent_string_concatenation::SPEC,
     &crate::rules::expressions::prefer_conditional_assignment::SPEC,
@@ -107,6 +112,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::strings::unnecessary_brace_in_string_interps::SPEC,
     &crate::rules::declarations::unnecessary_constructor_name::SPEC,
     &crate::rules::declarations::unnecessary_late::SPEC,
+    &crate::rules::directives::unnecessary_library_name::SPEC,
     &crate::rules::expressions::unnecessary_new::SPEC,
     &crate::rules::expressions::unnecessary_null_in_if_null_operators::SPEC,
     &crate::rules::strings::unnecessary_string_escapes::SPEC,

@@ -19,21 +19,33 @@ use crate::ignore::IgnoreInfo;
 use crate::registry::{EnableSet, RULES, RuleId};
 
 /// The language-feature bits a rule may query. Features the caller does not
-/// know are treated as enabled (the Dart 3.7+ shipped defaults); the caller
-/// pins the bits it wants to control (e.g. from `// @dart=` / experiment
-/// config).
+/// know are treated per their shipped defaults; the caller pins the bits it
+/// wants to control (e.g. from `// @dart=` / experiment config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Features {
     /// `wildcard_variables` (shipped in Dart 3.7): a lone `_` parameter name
     /// is exempt from `avoid_shadowing_type_parameters`
-    /// (avoid_shadowing_type_parameters.dart:34-37).
+    /// (avoid_shadowing_type_parameters.dart:34-37) and from the library
+    /// prefix rules (library_prefixes.dart:36-39,
+    /// no_leading_underscores_for_library_prefixes.dart:46-50).
     pub wildcard_variables: bool,
+    /// `enhanced_parts` (experimental, unshipped — `enhanced-parts` has no
+    /// `enabledIn`, `tools/experimental_features.yaml:150-152`):
+    /// `use_string_in_part_of_directives` registers only without it
+    /// (use_string_in_part_of_directives.dart:32-34).
+    pub enhanced_parts: bool,
+    /// `unnamed_libraries` (shipped in 2.19, `experimental_features.yaml:397-400`):
+    /// `unnecessary_library_name` registers only with it
+    /// (unnecessary_library_name.dart:32-34).
+    pub unnamed_libraries: bool,
 }
 
 impl Default for Features {
     fn default() -> Self {
         Self {
             wildcard_variables: true,
+            enhanced_parts: false,
+            unnamed_libraries: true,
         }
     }
 }

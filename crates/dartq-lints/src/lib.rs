@@ -25,7 +25,7 @@
 //! `pkg/linter/lib/src/rules/` and its message template in
 //! `pkg/linter/lib/src/diagnostic.g.dart`.
 //!
-//! Implemented (36):
+//! Implemented (42):
 //! - wave 1 (18): `avoid_empty_else`, `camel_case_extensions`,
 //!   `camel_case_types`, `curly_braces_in_flow_control_structures`,
 //!   `empty_catches`, `prefer_typing_uninitialized_variables` (core);
@@ -51,6 +51,16 @@
 //!   carries the file path (`file_names` checks its basename) and the
 //!   feature query (`avoid_shadowing_type_parameters` gates `_` parameters
 //!   on the `wildcard_variables` feature, defaulting enabled for Dart 3.7+).
+//! - directive milestone (6): `avoid_relative_lib_imports`,
+//!   `library_annotations`, `use_string_in_part_of_directives` (core);
+//!   `library_prefixes`,
+//!   `no_leading_underscores_for_library_prefixes`,
+//!   `unnecessary_library_name` (recommended). The #300 parser milestone
+//!   landed the directive nodes (collapse map §3.1), so these read the
+//!   [`Unit`] AST directly: `Import` prefix/URI children,
+//!   `LibraryName.has_name`, `PartOf.has_name`, and the `MetadataStar` /
+//!   annotated-sibling pair. The substrate grew two [`Features`] bits for
+//!   the gated rules (`enhanced_parts`, `unnamed_libraries`).
 //!
 //! Excluded for now, with the blocker:
 //! - **Needs the element model (resolution)**: `avoid_print` (dart:core
@@ -59,8 +69,10 @@
 //!   `unnecessary_this`, `use_rethrow_when_possible` (canonical element
 //!   identity of the rethrown name), `type_init_formals` (field type
 //!   comparison), `avoid_init_to_null` (declared-type nullability,
-//!   `avoid_init_to_null.dart:59-67`), `avoid_relative_lib_imports` /
-//!   `library_prefixes` (directive structure, diet-parsed today).
+//!   `avoid_init_to_null.dart:59-67`). Within `library_annotations`, the
+//!   `targetKinds` branch (an annotation declaration's `@Target` metadata,
+//!   library_annotations.dart:66-73) is likewise resolution-blocked and not
+//!   ported; the pragma branch is.
 //! - **Needs flow analysis (#278)**: `prefer_final_locals`,
 //!   `prefer_final_fields`, `prefer_function_declarations_over_variables`
 //!   (`isPotentiallyMutatedInScope`,
