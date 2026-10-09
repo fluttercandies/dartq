@@ -105,6 +105,17 @@ impl SymbolIndex {
         self.libraries.insert(lib, index);
     }
 
+    /// Drops `file`'s declaration surface — the file left the analyzed set
+    /// (deleted, or evicted by the Engine); returns the removed surface.
+    pub fn remove_file(&mut self, file: FileId) -> Option<FileIndex> {
+        self.files.remove(&file)
+    }
+
+    /// Drops `lib`'s reference surface; returns the removed surface.
+    pub fn remove_library(&mut self, lib: LibraryId) -> Option<LibraryIndex> {
+        self.libraries.remove(&lib)
+    }
+
     /// The declaration surface of `file`, if analyzed.
     #[must_use]
     pub fn file(&self, file: FileId) -> Option<&FileIndex> {

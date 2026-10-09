@@ -35,6 +35,7 @@ impl ImportCsr {
     pub fn build(graph: &LibraryGraph, libs: &[LibraryId]) -> Self {
         let mut libs = libs.to_vec();
         libs.sort_unstable();
+        libs.dedup();
         let mut edges = Vec::new();
         let mut offsets = Vec::with_capacity(libs.len() + 1);
         offsets.push(0u32);
@@ -269,6 +270,22 @@ mod tests {
         );
         assert_eq!(imports.neighbors(lib_r), &[] as &[u32]);
         assert_eq!(imports.edges().len(), 1);
+    }
+
+    /// Duplicate library ids collapse to one node: the node list is a set,
+    /// so a caller repeating an id neither duplicates nodes nor edges.
+    #[test]
+    fn duplicate_libraries_dedup_to_one_node() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_l = builder.intern("package:t/l.dart");
+        let lib_r = builder.intern("package:t/r.dart");
+        let graph = builder.finish();
+
+        let imports = ImportCsr::build(&graph, &[lib_r, lib_l, lib_r]);
+        assert_eq!(imports.libs(), &[lib_l, lib_r], "duplicates collapse");
+        assert_eq!(imports.node_count(), 2);
+        assert_eq!(imports.offsets().len(), 3);
     }
 
     /// The CSR faces over the two-file fixture: flat `&[u32]` arrays with

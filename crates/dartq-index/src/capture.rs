@@ -35,9 +35,12 @@
 //! [`RefKind::Read`]), then three parser-marked refinements upgrade kinds
 //! in place, all sound (parser-decided, no lookahead heuristics):
 //!
-//! * `handle_send` marks an invocation — unless `handle_no_arguments` fired
-//!   for the same send (official `parseSend` covers both the `f(...)` and
-//!   the bare-identifier shape; only the former invokes);
+//! * `handle_send` marks an invocation — unless it ends on the very token
+//!   `handle_no_arguments` fired for (official `parseSend` covers both the
+//!   `f(...)` and the bare-identifier shape; only the former invokes, and
+//!   the bare shape's send ends on exactly the no-arguments token, so the
+//!   unpaired firings — enum constants, bare annotations, const patterns —
+//!   never poison a later send);
 //! * `end_constructor_reference` marks `new C(...)`/`const C(...)`/
 //!   implicit-creation heads (which do not travel through `handle_send`);
 //! * `handle_assignment_expression` marks the identifier nearest before the
@@ -159,6 +162,18 @@ impl FileIndex {
     #[must_use]
     pub fn has(&self, name: StringId) -> bool {
         self.by_name(name).is_some()
+    }
+
+    /// Whether the file declares `name` at library scope: a top-level row
+    /// that is not a type parameter. Members and type parameters are not
+    /// library faces — the filter the graph declarer and the bare-name
+    /// resolver's local hop share.
+    #[must_use]
+    pub fn has_library_face(&self, name: StringId) -> bool {
+        self.by_name(name).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.container == DeclRow::NONE && row.kind != DeclKind::TypeParam)
+        })
     }
 
     /// The row at `index` (container anchors point here).
@@ -286,15 +301,32 @@ struct Builder<'src, 'tab> {
     /// extensions).
     containers: Vec<u32>,
     supers: Vec<SuperEdge>,
-    super_armed: bool,
+    /// The supertype name the type events last stored: the name travels
+    /// with the events that carry it, and the clause completion events
+    /// commit it (see [`Builder::commit_superclass`]).
     super_pending: Option<StringId>,
+    /// Token id of the last prefixed type-reference identifier. A qualified
+    /// type's trailing `handle_type` carries that same token (the parser
+    /// passes the head, not the tail), and the stored continuation name
+    /// must survive it.
+    prefixed_type: Option<u32>,
+    /// A named mixin application's head type is due: set at
+    /// `begin_named_mixin_application`, discharged by the with list's
+    /// `begin_type_list` — the first event after the head type parse.
+    super_head_armed: bool,
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTop>,
     sites: RawSites,
-    /// `handle_no_arguments` fired since the last send — the next
-    /// `handle_send` is a bare identifier (a read), not an invocation.
-    no_args_since: bool,
+    /// The token `handle_no_arguments` last fired for. A send is the bare
+    /// identifier shape only when it ends on that same token; unpaired
+    /// firings (enum constants, bare annotations, const patterns) are never
+    /// followed by a matching send, so they cannot poison later ones.
+    no_args_at: Option<u32>,
+    /// Open type-argument lists: `handle_type` events inside them name type
+    /// arguments (`extends B<int>` must not store `int`), never the
+    /// supertype itself.
+    type_arg_depth: usize,
     /// Furthest end so far of a bracket/cascade access chain; assignment
     /// candidates ending before it are inside the chain, not write targets.
     access_chain_end: u32,
@@ -324,13 +356,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             decls: Vec::new(),
             containers: Vec::new(),
             supers: Vec::new(),
-            super_armed: false,
             super_pending: None,
+            prefixed_type: None,
+            super_head_armed: false,
             pending_member: None,
             pending_top: None,
             pending_typedef: None,
             sites: RawSites::default(),
-            no_args_since: false,
+            no_args_at: None,
+            type_arg_depth: 0,
             access_chain_end: 0,
         }
     }
@@ -387,24 +421,30 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             crate::narrow(self.decls.len() - 1)
         });
         self.containers.push(row);
-        self.super_armed = false;
         self.super_pending = None;
+        self.super_head_armed = false;
     }
 
     fn close_container(&mut self) {
-        self.super_armed = false;
         self.super_pending = None;
+        self.super_head_armed = false;
         self.containers.pop();
     }
 
-    /// Commits the armed superclass edge to the open container (the armed
-    /// flag makes this one-shot; the first type after `extends` or the head
-    /// type of a named mixin application wins).
+    /// Consumes the pending supertype name into an edge for the open
+    /// container.
+    ///
+    /// The name is stored where the parser hands it over — `handle_type`
+    /// for a plain name, the `TypeReferenceContinuation` identifier for a
+    /// qualified `p.S` tail — and committed by the clause completion
+    /// events, which the parser fires right after the supertype parse:
+    /// `handle_class_extends` (`crates/dartq-parser/src/declarations.rs`
+    /// `parse_class_extends_seen`) for the extends clause, and the with
+    /// list's `begin_type_list` for a named mixin application's head type
+    /// (`parse_mixin_application_rest` parses the mixin list before its own
+    /// completion event, so the list's first event is the head's commit
+    /// point).
     fn commit_superclass(&mut self) {
-        if !self.super_armed {
-            return;
-        }
-        self.super_armed = false;
         if let (Some(name), container) = (self.super_pending.take(), self.container())
             && container != DeclRow::NONE
         {
@@ -574,10 +614,9 @@ impl ParserListener for Capturer<'_, '_> {
         name: Token,
     ) {
         self.open_container(name, DeclKind::Class);
-        // The head type (`class C = A with B;`) is the superclass edge.
-        let mut builder = self.builder.borrow_mut();
-        builder.super_armed = true;
-        builder.super_pending = None;
+        // The head type (`class C = A with B;`) is the superclass edge: arm
+        // the commit at the with list (see `commit_superclass`).
+        self.builder.borrow_mut().super_head_armed = true;
     }
 
     fn end_named_mixin_application(
@@ -669,19 +708,46 @@ impl ParserListener for Capturer<'_, '_> {
     }
 
     fn handle_class_extends(&mut self, extends: Option<Token>, _count: usize) {
+        // The event follows the supertype parse (`parse_class_extends_seen`
+        // parses the type first), so whatever the type events stored is the
+        // supertype's name.
         if extends.is_some() {
-            let mut builder = self.builder.borrow_mut();
-            builder.super_armed = true;
-            builder.super_pending = None;
+            self.builder.borrow_mut().commit_superclass();
         }
     }
 
-    fn handle_qualified(&mut self, _period: Token) {
-        self.builder.borrow_mut().commit_superclass();
+    fn begin_type_list(&mut self, _token: Token) {
+        // First event of a `,`-separated type list. Only role here: the
+        // named mixin application's with list opens right after the head
+        // type — commit the armed head before the mixin names write over
+        // the pending name. Every other type list (class with-clauses,
+        // enum with-clauses, recovery) arrives disarmed.
+        let mut builder = self.builder.borrow_mut();
+        if builder.super_head_armed {
+            builder.super_head_armed = false;
+            builder.commit_superclass();
+        }
     }
 
-    fn handle_type(&mut self, _name: Token, _question: Option<Token>) {
-        self.builder.borrow_mut().commit_superclass();
+    fn begin_type_arguments(&mut self, _token: Token) {
+        self.builder.borrow_mut().type_arg_depth += 1;
+    }
+
+    fn end_type_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
+        let mut builder = self.builder.borrow_mut();
+        // Saturate: a bail can leave the bracket unpaired, and the depth is
+        // only a guard — an underflow must not kill the capture.
+        builder.type_arg_depth = builder.type_arg_depth.saturating_sub(1);
+    }
+
+    fn handle_type(&mut self, name: Token, _question: Option<Token>) {
+        let mut builder = self.builder.borrow_mut();
+        // Type arguments never name the supertype; a qualified type's
+        // trailing event carries the prefix token, not the tail already
+        // stored by the continuation identifier.
+        if builder.type_arg_depth == 0 && builder.prefixed_type != Some(name.id) {
+            builder.super_pending = builder.name_of(name);
+        }
     }
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
@@ -707,7 +773,18 @@ impl ParserListener for Capturer<'_, '_> {
             _ => None,
         };
         if let Some((family, kind)) = site {
-            self.builder.borrow_mut().site(token, family, kind);
+            let mut builder = self.builder.borrow_mut();
+            // Supertype name carriers: a qualified `extends p.S` hands over
+            // its tail as the continuation identifier (fired immediately
+            // before `handle_qualified`), and the prefix token ids the
+            // type's trailing `handle_type` so it cannot overwrite the
+            // tail.
+            match context {
+                C::TypeReferenceContinuation => builder.super_pending = builder.name_of(token),
+                C::PrefixedTypeReference => builder.prefixed_type = Some(token.id),
+                _ => {}
+            }
+            builder.site(token, family, kind);
             return;
         }
         let mut builder = self.builder.borrow_mut();
@@ -822,13 +899,17 @@ impl ParserListener for Capturer<'_, '_> {
         }
     }
 
-    fn handle_no_arguments(&mut self, _token: Token) {
-        self.builder.borrow_mut().no_args_since = true;
+    fn handle_no_arguments(&mut self, token: Token) {
+        self.builder.borrow_mut().no_args_at = Some(token.id);
     }
 
-    fn handle_send(&mut self, begin: Token, _end: Token) {
+    fn handle_send(&mut self, begin: Token, end: Token) {
         let mut builder = self.builder.borrow_mut();
-        let bare = std::mem::take(&mut builder.no_args_since);
+        // Bare shape: the send ends exactly on the no-arguments token (the
+        // official parseArgumentsOpt peeks it and the send returns it). The
+        // unpaired firings — enum constants, bare annotations, const
+        // patterns — carry other tokens and never match a later end.
+        let bare = builder.no_args_at.take() == Some(end.id);
         if !bare {
             builder.mark_invoked(begin);
         }
@@ -901,6 +982,29 @@ mod tests {
         assert!(
             result.diagnostics.is_empty(),
             "scanner diagnostics: {result:?}"
+        );
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        capture(file, source, &result.tokens, features, strings)
+    }
+
+    /// [`build`] for sources whose scanner recovery diagnostics are
+    /// expected: the bailed-parse fixtures close no braces, and the
+    /// scanner's EOF recovery inserts synthetic closers with
+    /// `expected_token` diagnostics by design (official
+    /// `unmatchedBeginGroup`). What the test asserts is the capture, not
+    /// scan cleanliness.
+    fn build_recovered(source: &str, strings: &StringTable) -> FileCapture {
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("test.dart"));
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
         );
         let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
             LanguageVersion::new(3, 15),
@@ -1056,13 +1160,98 @@ mod tests {
         assert!(sites.names.iter().all(|&n| n != id(&strings, "main")));
     }
 
+    /// Superclass name edges across the supertype's shapes: a plain name,
+    /// a qualified name (the continuation tail wins, not the prefix), a
+    /// generic name (the type argument is not the edge), a named mixin
+    /// application's head type — and the shapes that must not fabricate
+    /// edges (no extends clause; an enum's with-clause list).
+    #[test]
+    fn captures_superclass_name_edges() {
+        let strings = StringTable::new();
+        let source = "class B {} class Q {} class G {} class H {} mixin M {} \
+             enum E with M { x } \
+             class C1 extends B {} \
+             class C2 extends p.Q {} \
+             class C3 extends G<int> {} \
+             class C4 = H with M; \
+             class C5 {}";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let edge_for = |name: &str| -> Option<StringId> {
+            let row = index
+                .decls()
+                .iter()
+                .find(|row| row.name == id(&strings, name))
+                .unwrap_or_else(|| panic!("{name} row"));
+            let position = index
+                .decls()
+                .iter()
+                .position(|candidate| candidate == row)
+                .expect("row position");
+            index
+                .supers()
+                .iter()
+                .find(|edge| edge.container as usize == position)
+                .map(|edge| edge.name)
+        };
+        assert_eq!(edge_for("C1"), Some(id(&strings, "B")), "plain extends");
+        assert_eq!(
+            edge_for("C2"),
+            Some(id(&strings, "Q")),
+            "qualified keeps the continuation tail"
+        );
+        assert_eq!(
+            edge_for("C3"),
+            Some(id(&strings, "G")),
+            "generic: the type argument is not the edge"
+        );
+        assert_eq!(edge_for("C4"), Some(id(&strings, "H")), "mixin application head");
+        assert_eq!(edge_for("C5"), None, "no extends clause, no edge");
+        assert_eq!(edge_for("E"), None, "an enum's with-list is not a supertype");
+        assert_eq!(index.supers().len(), 4, "no edges beyond the four shapes");
+    }
+
+    /// Unpaired `handle_no_arguments` firings — enum constants and bare
+    /// annotations (the const-pattern path fires the same event) — must not
+    /// turn later genuine invocations into bare reads: a send is bare only
+    /// when it ends on the no-arguments token itself.
+    #[test]
+    fn unpaired_no_arguments_leave_later_sends_intact() {
+        let strings = StringTable::new();
+        let source = "enum E { one } \
+             @deprecated \
+             class C {} \
+             void f() {} \
+             void main() { \
+               f(); \
+               g; \
+             }";
+        let captured = build(source, &strings);
+        let sites = &captured.sites;
+        let kind_of = |name: &str| {
+            let needle = id(&strings, name);
+            let i = sites
+                .names
+                .iter()
+                .position(|&n| n == needle)
+                .unwrap_or_else(|| panic!("site {name}"));
+            sites.kind(i)
+        };
+        assert_eq!(
+            kind_of("f"),
+            RefKind::Invoked,
+            "f() after two unpaired firings still invokes"
+        );
+        assert_eq!(kind_of("g"), RefKind::Read, "a genuine bare send stays a read");
+    }
+
     /// A bailed parse still surfaces what was captured (under-report bias),
     /// and the container-stack flush keeps anchors consistent.
     #[test]
     fn bailed_parse_flushes_open_containers() {
         let strings = StringTable::new();
         // `class B {` never closes; the member must still surface.
-        let captured = build("class B { void m() {}", &strings);
+        let captured = build_recovered("class B { void m() {}", &strings);
         assert!(captured.index.by_name(id(&strings, "B")).is_some());
         assert!(captured.index.by_name(id(&strings, "m")).is_some());
     }

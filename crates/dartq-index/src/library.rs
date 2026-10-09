@@ -267,21 +267,26 @@ impl<'a> LibraryBuilder<'a> {
             let kind = sites.kind(i);
             let range = sites.range(i);
             match sites.family(i) {
-                Family::Bare => match self.resolve_bare(file, &capture.index, name) {
-                    BareHit::Decl(target) => self.refs.push(RefRow {
-                        target_file: target,
-                        target_name: name,
-                        kind,
-                        range,
-                        qualified: false,
-                    }),
-                    BareHit::Prefix(prefix) => armed = Some(prefix),
-                    BareHit::Miss => self.names.push(NameRow {
-                        name,
-                        kind,
-                        range,
-                        qualified: false,
-                    }),
+                Family::Bare => {
+                    // A prefix arms only the continuation immediately
+                    // following it: any intervening bare site disarms.
+                    armed = None;
+                    match self.resolve_bare(file, &capture.index, name) {
+                        BareHit::Decl(target) => self.refs.push(RefRow {
+                            target_file: target,
+                            target_name: name,
+                            kind,
+                            range,
+                            qualified: false,
+                        }),
+                        BareHit::Prefix(prefix) => armed = Some(prefix),
+                        BareHit::Miss => self.names.push(NameRow {
+                            name,
+                            kind,
+                            range,
+                            qualified: false,
+                        }),
+                    }
                 },
                 Family::Continuation => {
                     let hit = armed
@@ -324,9 +329,10 @@ impl<'a> LibraryBuilder<'a> {
     }
 
     /// The M1 scope chain for a bare name: the file's own declarations
-    /// first, then the library's namespace.
+    /// first (library faces only — members and type parameters are not
+    /// scope names), then the library's namespace.
     fn resolve_bare(&self, file: FileId, index: &FileIndex, name: StringId) -> BareHit {
-        if index.has(name) {
+        if index.has_library_face(name) {
             return BareHit::Decl(file);
         }
         match self.namespaces.lookup(self.graph, self.lib, name) {
@@ -694,5 +700,175 @@ pub(crate) mod tests {
         );
         assert!(index.library(fx.lib_b).is_some());
         assert!(index.file(file_a).is_some());
+    }
+
+    /// The local hop of a bare lookup matches library-face rows only: a
+    /// member sharing a name with an imported top-level must not shadow it,
+    /// a type parameter is no scope name either, and a genuine top-level
+    /// declaration still beats the namespace.
+    #[test]
+    fn local_hop_matches_library_faces_only() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep = capture_one(strings, &mut files, "d.dart", "void fa() {}\n");
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart';\nclass K {\n  void fa() {}\n}\nclass K2<Q> {\n  Q? f;\n}\nvoid fa2() {}\nvoid main() {\n  fa();\n  fa2();\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        let lib_d = builder.intern("package:t/d.dart");
+        let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)] {
+            for row in cap.decls() {
+                if row.kind == DeclKind::TypeParam || row.container != crate::capture::DeclRow::NONE
+                {
+                    continue; // members and type params are not library faces
+                }
+                builder.declare(lib, row.name, file);
+            }
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_d),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        builder.add_file(&dep);
+        let surface = builder.finish();
+
+        // `fa();`: declared only as a member locally — the member row must
+        // not satisfy the local hop, so the namespace hit on d.dart wins.
+        let fa = surface
+            .references_of(file_d, strings.intern("fa"))
+            .expect("fa resolves through the namespace");
+        assert_eq!(fa.len(), 1);
+        assert_eq!(fa[0].kind, RefKind::Invoked);
+        assert!(
+            surface.references_of(file_m, strings.intern("fa")).is_none(),
+            "the member row must not shadow the import"
+        );
+
+        // `fa2();`: a genuine top-level declaration still beats imports.
+        let fa2 = surface
+            .references_of(file_m, strings.intern("fa2"))
+            .expect("local top-level wins");
+        assert_eq!(fa2.len(), 1);
+
+        // `Q? f;`: a type parameter is not a library face — the use falls
+        // through to the namespace, misses, and lands in the names table.
+        assert!(
+            surface
+                .references_of(file_m, strings.intern("Q"))
+                .is_none(),
+            "a type parameter must not satisfy the local hop"
+        );
+        let q = surface.unresolved(strings.intern("Q")).collect::<Vec<_>>();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].kind, RefKind::Referenced);
+    }
+
+    /// A prefix arms only the continuation immediately following it: an
+    /// intervening bare site disarms, so the next continuation is a member
+    /// access even when its name exists in the prefix's scope.
+    #[test]
+    fn prefix_arm_does_not_leak_across_bare_sites() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep = capture_one(
+            strings,
+            &mut files,
+            "d.dart",
+            "void gone() {}\nvoid w() {}\n",
+        );
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart' as p;\nvoid main() {\n  p.gone;\n  z.w;\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        let lib_d = builder.intern("package:t/d.dart");
+        let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)]
+        {
+            for row in cap.decls() {
+                if row.kind == DeclKind::TypeParam || row.container != crate::capture::DeclRow::NONE
+                {
+                    continue; // members and type params are not library faces
+                }
+                builder.declare(lib, row.name, file);
+            }
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_d),
+                prefix: Some(strings.intern("p")),
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        builder.add_file(&dep);
+        let surface = builder.finish();
+
+        // `p.gone;`: the prefix arms and the continuation resolves.
+        let gone = surface
+            .references_of(file_d, strings.intern("gone"))
+            .expect("prefixed hit");
+        assert_eq!(gone.len(), 1);
+        assert!(gone[0].qualified);
+
+        // `z.w;`: the bare miss `z` disarmed the prefix, so `w` is a member
+        // access even though d.dart declares it.
+        assert!(
+            surface.references_of(file_d, strings.intern("w")).is_none(),
+            "the disarmed prefix must not resolve the later continuation"
+        );
+        let w = surface.unresolved(strings.intern("w")).collect::<Vec<_>>();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].qualified, "member access shape");
+        let z = surface.unresolved(strings.intern("z")).collect::<Vec<_>>();
+        assert_eq!(z.len(), 1);
+        assert!(!z[0].qualified);
+    }
+
+    /// Whole-unit eviction: removing a file's or a library's surface drops
+    /// it from every probe, and removing an absent id is a no-op.
+    #[test]
+    fn removal_drops_surfaces() {
+        let fx = fixture();
+        let mut builder = LibraryBuilder::new(fx.lib_a, &fx.graph, &fx.namespaces);
+        builder.add_file(&fx.capture_a);
+        let surface = builder.finish();
+        let mut index = SymbolIndex::default();
+        index.insert_file(fx.capture_a.file, fx.capture_a.index);
+        index.insert_library(fx.lib_a, surface);
+
+        assert!(index.remove_library(fx.lib_a).is_some());
+        assert!(index.library(fx.lib_a).is_none());
+        assert!(index.remove_library(fx.lib_a).is_none(), "absent id: no-op");
+        assert!(index.remove_file(fx.capture_a.file).is_some());
+        assert!(index.file(fx.capture_a.file).is_none());
     }
 }
