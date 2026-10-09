@@ -649,6 +649,22 @@ fn poison_sweep_catches_missed_patch() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn patch_outside_slot_fails_loudly() {
+    // A field past the open node's payload width would write a NEIGHBORING
+    // node's pool word. Debug builds fail at the assertion; release builds
+    // take the soft path (record the error through the error log, skip the
+    // write) so impossible input corrupts nothing.
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.begin(NodeKind::Break, 0); // width 1: has_target
+        b.patch(1, 0); // outside the slot
+    });
+    assert!(result.is_err(), "out-of-slot patch must fail loudly");
+}
+
+#[test]
 fn derived_accessors_read_eliminated_words() {
     // ModSet (#174): header flag bits + derived first modifier.
     let source = "abstract class A {}";

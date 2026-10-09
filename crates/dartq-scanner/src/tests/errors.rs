@@ -1,6 +1,6 @@
 //! Recovery strategies, diagnostic pinning, the @dart window, BOM/CRLF, dual-offset consistency.
 
-use super::{assert_codes, assert_kinds, scan_src};
+use super::{assert_codes, assert_kinds, codes, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
 
@@ -652,4 +652,29 @@ fn this_discards_open_lt() {
         .position(|tok| tok.kind == K::Lt)
         .unwrap();
     assert_eq!(t.matching_end(lt), None);
+}
+
+#[test]
+fn diagnostics_cap_bounds_adversarial_input() {
+    // A hostile source with more illegal characters than the recording cap
+    // must not stream unbounded diagnostics (each carries a fresh format!
+    // message): recording stops at the cap, parser parity (dartq-parser
+    // MAX_DIAGNOSTICS), while scanning still runs to EOF — the token stream
+    // is unchanged and the Eof sentinel is present.
+    let src = format!("var x = 1;{}", "\u{00A0}".repeat(10_500));
+    let r = scan_src(&src);
+    assert_eq!(r.diagnostics.len(), 10_000);
+    assert!(codes(&r).iter().all(|c| *c == "illegal_character"));
+    assert_kinds(
+        &r,
+        &[
+            K::Keyword(Keyword::Var),
+            K::Identifier,
+            K::Eq,
+            K::Int,
+            K::Semicolon,
+        ],
+    );
+    let eof = r.tokens.get(r.tokens.len() - 1).unwrap();
+    assert_eq!(eof.kind, K::Eof);
 }

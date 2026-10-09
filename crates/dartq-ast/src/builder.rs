@@ -239,15 +239,24 @@ impl AstBuilder {
     /// # Panics
     ///
     /// Panics when no node is open. Debug builds additionally assert that
-    /// the field lies inside the open node's slot.
+    /// the field lies inside the open node's slot; release builds record
+    /// the error through the error log and skip the write — a field
+    /// outside the slot would overwrite a neighboring node's payload word.
     pub fn patch(&mut self, field: usize, value: u32) {
         let node = self.open.last().expect("patch without an open node");
         let slot = node.payload_start as usize;
-        debug_assert!(
-            field < payload_len(node.kind) as usize,
-            "patch field {field} outside the slot of {:?}",
-            node.kind
-        );
+        let kind = node.kind;
+        if field >= payload_len(kind) as usize {
+            // Release guard for the debug assertion: a field outside the
+            // open node's slot addresses a NEIGHBORING node's pool word —
+            // silent corruption. Impossible input corrupts nothing instead:
+            // the error is recorded through the builder's error log (it
+            // propagates to ancestors at seal and stays rollback-safe) and
+            // the write is skipped.
+            debug_assert!(false, "patch field {field} outside the slot of {kind:?}");
+            self.mark_error();
+            return;
+        }
         self.pool[slot + field] = value;
     }
 

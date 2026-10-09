@@ -196,9 +196,15 @@ impl Lexer<'_> {
                 // (official unexpectedDollarInString → analyzer missing_identifier).
                 let dollar_start = self.pos - 1;
                 self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
-                let at = self
-                    .pin_back(self.pos)
-                    .min(self.src.len().saturating_sub(1));
+                // The pin sits at the character after `$` (official
+                // synthetic-identifier scanOffset, tokenizeInterpolatedIdentifier);
+                // at EOF it backs off one unit (translateErrorToken's
+                // `_isAtEnd` decrement) onto the 1-byte `$`. The byte cap is
+                // applied BEFORE the boundary snap: a `.min` after `pin_back`
+                // could cut a boundary-safe offset into a multi-byte
+                // character, and `TokenTable::lexeme` panics on
+                // non-boundary offsets.
+                let at = self.pin_back(self.pos.min(self.src.len().saturating_sub(1)));
                 self.emit_synthetic(TokenKind::Identifier, at, 0);
                 self.diag(
                     dartq_diagnostics::MISSING_IDENTIFIER,

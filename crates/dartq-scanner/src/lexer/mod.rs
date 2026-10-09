@@ -31,6 +31,13 @@ pub(crate) enum Flow {
     CloseInterp,
 }
 
+/// Per-file diagnostics cap, parser parity (`MAX_DIAGNOSTICS` in
+/// dartq-parser; the same stop-recording-but-keep-going semantics as the
+/// parser's bail-out). The scanner runs BEFORE the parser's own fuse, so it
+/// bounds itself: past the cap, recording stops but scanning continues to
+/// EOF — the token stream shape never depends on the cap.
+const MAX_DIAGNOSTICS: usize = 10_000;
+
 pub(crate) struct Lexer<'s> {
     src: &'s str,
     config: ScanConfig,
@@ -45,6 +52,9 @@ pub(crate) struct Lexer<'s> {
     end_of: Vec<u32>,
     /// Open-group stack (token indices; `<` is pushed as well — see lib.rs for the silent-discard semantics).
     groups: Vec<u32>,
+    /// Capped at [`MAX_DIAGNOSTICS`] so adversarial input (an illegal
+    /// character per byte, each with a fresh `format!` message) cannot grow
+    /// this without bound before the parser's own fuse applies.
     diags: Vec<ScanDiag>,
     /// UTF-16 count invariant: always equals `utf16(self.pos)` (maintained
     /// incrementally in bump; emit walks back by the lexeme to get the token
@@ -241,7 +251,11 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    /// Recording past [`MAX_DIAGNOSTICS`] is dropped (cap semantics above).
     fn diag(&mut self, code: CodeInfo, message: String, start: usize, end: usize) {
+        if self.diags.len() >= MAX_DIAGNOSTICS {
+            return;
+        }
         self.diags.push(ScanDiag {
             code,
             message,
@@ -256,6 +270,9 @@ impl<'s> Lexer<'s> {
     /// the character's low surrogate when it is astral, which no byte range
     /// can address, so the backoff is applied after UTF-16 conversion.
     fn diag_pin_last_unit(&mut self, code: CodeInfo, message: String, stop: usize) {
+        if self.diags.len() >= MAX_DIAGNOSTICS {
+            return;
+        }
         self.diags.push(ScanDiag {
             code,
             message,

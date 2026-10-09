@@ -2,7 +2,7 @@
 //! derive from the token table at access time (layout spec §2). Zero-width
 //! synthetic-only nodes derive a zero-length span at their insertion point.
 
-use dartq_scanner::{Token, TokenTable};
+use dartq_scanner::{Token, TokenKind, TokenTable};
 use dartq_source::utf16_len_of;
 
 use crate::kind::NodeKind;
@@ -14,6 +14,27 @@ fn token_at(tokens: &TokenTable, index: u32) -> &Token {
         .expect("node token id outside the token table")
 }
 
+/// Read-boundary contract, debug builds (layout spec §2): node token ranges
+/// stay inside the token table, and only a `CompilationUnit` may span the Eof
+/// sentinel — official End extents exclude Eof except the unit root, so a
+/// node sealed with `end_token == tokens.len()` would silently derive a span
+/// across trailing trivia to source end. A violation is a parser contract
+/// break, caught here at the read boundary (release trusts the parser).
+#[cfg(debug_assertions)]
+fn assert_read_boundary(tokens: &TokenTable, ast: &SyntaxTable, id: u32) {
+    let range = ast.token_range(id);
+    debug_assert!(
+        range.end as usize <= tokens.len(),
+        "node {id} token range {range:?} runs past the token table"
+    );
+    if ast.kind(id) != NodeKind::CompilationUnit && !range.is_empty() {
+        debug_assert!(
+            token_at(tokens, range.end - 1).kind != TokenKind::Eof,
+            "node {id} spans the Eof sentinel (only a CompilationUnit may)"
+        );
+    }
+}
+
 /// The node's byte span `[start, end)` in the source text.
 ///
 /// Exception kept on purpose (layout spec §2): a [`NodeKind::CompilationUnit`]
@@ -22,6 +43,8 @@ fn token_at(tokens: &TokenTable, index: u32) -> &Token {
 /// — do not "fix" this by derivation.
 #[must_use]
 pub fn byte_span(tokens: &TokenTable, ast: &SyntaxTable, id: u32) -> core::ops::Range<usize> {
+    #[cfg(debug_assertions)]
+    assert_read_boundary(tokens, ast, id);
     let range = ast.token_range(id);
     if ast.kind(id) == NodeKind::CompilationUnit {
         let eof = tokens.last();
@@ -45,6 +68,8 @@ pub fn utf16_span(
     ast: &SyntaxTable,
     id: u32,
 ) -> core::ops::Range<u32> {
+    #[cfg(debug_assertions)]
+    assert_read_boundary(tokens, ast, id);
     let range = ast.token_range(id);
     if ast.kind(id) == NodeKind::CompilationUnit {
         let eof = tokens.last();
