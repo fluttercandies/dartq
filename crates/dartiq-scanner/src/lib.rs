@@ -52,21 +52,31 @@
 //! inside the window. Emitting any real token closes the window. The syntax is
 //! strict: `//` + space* + `@dart` + space* + `=` + space* + digit+ + `.` +
 //! digit+ + space* + (LF|CR|EOF); `///`, tab indentation, and trailing garbage
-//! never match. When the window contains multiple matches, the **first** one
-//! wins (official `registerExplicitLanguageVersion`:
-//! `_languageVersion.isExplicit → return`,
-//! `source_compilation_unit.dart:486`; later matches do not override).
+//! never match. When the window contains multiple matches, the **last** one
+//! wins (oracle basis and the CFE split: see "consumer contract" below).
 //!
 //! # `language_version_override` consumer contract
 //!
 //! If [`ScanResult::language_version_override`] differs from the language
 //! version the caller assumed when building [`ScanConfig`], the caller **must**
 //! re-derive the config from the override and rescan the file before parsing.
-//! The official pipeline rebuilds the scanner configuration from the version
-//! comment before the main loop (source_loader.dart:1194-1209); dartiq's
-//! scanner takes a fixed [`ScanConfig`], so re-issuing it and rescanning is
-//! the consumer's job (currently nobody; this is the interface law for the
-//! CLI/engine lanes). Rescanning is cheap relative to parse/analysis.
+//! The oracle scanner folds the override into its configuration mid-scan
+//! (`scanner.configuration = buildConfig(_featureSet)`, analyzer-8.4.1
+//! scanner.dart:222), so a single pass suffices there; dartiq's scanner takes
+//! a fixed [`ScanConfig`], so re-issuing it and rescanning is the consumer's
+//! job (currently nobody; this is the interface law for the CLI/engine lanes).
+//! Rescanning is cheap relative to parse/analysis.
+//!
+//! Multiple-match precedence: the **last** valid version comment in the
+//! header window wins, because the oracle's `_languageVersionChanged` runs on
+//! every languageVersionChanged and unconditionally reassigns
+//! `_overrideVersion` (:206) and `scanner.configuration` (:222)
+//! (analyzer-8.4.1 scanner.dart:195-222). The CFE pipeline keeps the **first**
+//! match instead (`registerExplicitLanguageVersion`,
+//! `_languageVersion.isExplicit → return`, source_compilation_unit.dart:486);
+//! that split is real and expected — dartiq's parity basis for this behavior
+//! is the analyzer consumer path, and the CFE citation must not be reused for
+//! oracle alignment here.
 //!
 //! # Known divergences from the official scanner (recorded, revisit triggers)
 //!
@@ -78,6 +88,12 @@
 //! - The official `discardBeginGroupUntil` dual-strategy option tests are not
 //!   replicated: for pathological inputs the token-chain shape may differ
 //!   (intermediate unclosed begins), valid code always scans identically.
+//! - Invalid-input synthetic recovery token spans: ours emit zero-length or
+//!   clamped forms where the official scanner keeps `[start, stop)` partial
+//!   lexemes (abstract_scanner.dart:334-343, 1581-1592, 1697-1714).
+//!   Adjudicated KEEP — Jaccard-neutral (the oracle axis scores `(code, file)`
+//!   entries, not invalid-input token spans) and the shapes are pinned by
+//!   tests; `[start, stop)` partial-lexeme alignment remains a future option.
 //!
 //! # Identifiers
 //!
@@ -162,9 +178,9 @@ pub struct ScanResult {
     pub tokens: TokenTable,
     /// Lexical diagnostics (syntax codes, `SyntacticError` kind); ranges are UTF-16 offsets.
     pub diagnostics: Vec<Diagnostic>,
-    /// The first explicit `// @dart = x.y` matched within the header window
-    /// (later matches do not override — see "consumer contract" in the module
-    /// docs: a differing override obliges the consumer to re-issue
+    /// The last explicit `// @dart = x.y` matched within the header window
+    /// (later matches overwrite earlier ones — see "consumer contract" in the
+    /// module docs: a differing override obliges the consumer to re-issue
     /// [`ScanConfig`] and rescan).
     pub language_version_override: Option<LanguageVersion>,
     /// UTF-16 range of the whole version comment lexeme behind
@@ -174,7 +190,7 @@ pub struct ScanResult {
     /// offset/length that the analyzer's above-latest warning pins at
     /// (`analyzer/lib/src/dart/scanner/scanner.dart:124`). `None` exactly when
     /// `language_version_override` is `None`; with multiple matches it points
-    /// at the first (winning) one.
+    /// at the last (winning) one.
     pub language_version_override_span: Option<SourceRange>,
     /// Line index (authoritative dartiq-source implementation).
     pub line_index: LineIndex,

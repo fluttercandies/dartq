@@ -52,7 +52,7 @@ pub(crate) struct Lexer<'s> {
     utf16_value: u32,
     version_override: Option<LanguageVersion>,
     /// UTF-16 span of the comment lexeme behind `version_override` (set and
-    /// cleared together with it; first-match only, same block).
+    /// cleared together with it; last match wins, same block).
     version_override_span: Option<SourceRange>,
 }
 
@@ -337,31 +337,33 @@ impl<'s> Lexer<'s> {
             self.skip_to_line_end();
             return;
         }
-        // Full-line validation passed; the **first** valid version comment wins
-        // (official registerExplicitLanguageVersion: `_languageVersion.isExplicit
-        // → return`, source_compilation_unit.dart:486); later matches do not override.
-        if self.version_override.is_none() {
-            self.version_override = Some(version);
-            // The span mirrors the official LanguageVersionToken: the whole
-            // comment lexeme from the `//` through the last character before
-            // the line terminator (trailing spaces included, CR excluded —
-            // createLanguageVersionToken at the comment start,
-            // abstract_scanner.dart:1909; the analyzer's above-latest warning
-            // reuses it verbatim, scanner.dart:124
-            // `.atOffset(versionToken.offset, versionToken.length)`). The
-            // cursor sits at the terminator/EOF, so `utf16_value` is the
-            // comment's UTF-16 end.
-            let lexeme = &self.src[comment_start..self.pos];
-            let utf16_len = if lexeme.is_ascii() {
-                lexeme.len() as u32
-            } else {
-                lexeme.chars().map(|c| c.len_utf16() as u32).sum()
-            };
-            self.version_override_span = Some(SourceRange {
-                offset: self.utf16_value - utf16_len,
-                length: utf16_len,
-            });
-        }
+        // Full-line validation passed; the **last** valid version comment wins.
+        // Oracle path: the `dart analyze` scanner's `_languageVersionChanged`
+        // fires on every languageVersionChanged and unconditionally reassigns
+        // `_overrideVersion` (:206) and `scanner.configuration` (:222)
+        // (analyzer-8.4.1 scanner.dart:195-222); the CFE first-wins path
+        // (registerExplicitLanguageVersion, source_compilation_unit.dart:486)
+        // is a different pipeline, not our parity basis.
+        self.version_override = Some(version);
+        // The span mirrors the official LanguageVersionToken: the whole
+        // comment lexeme from the `//` through the last character before
+        // the line terminator (trailing spaces included, CR excluded —
+        // createLanguageVersionToken at the comment start,
+        // abstract_scanner.dart:1909; the analyzer's above-latest warning
+        // reuses it verbatim, scanner.dart:124
+        // `.atOffset(versionToken.offset, versionToken.length)`). The
+        // cursor sits at the terminator/EOF, so `utf16_value` is the
+        // comment's UTF-16 end.
+        let lexeme = &self.src[comment_start..self.pos];
+        let utf16_len = if lexeme.is_ascii() {
+            lexeme.len() as u32
+        } else {
+            lexeme.chars().map(|c| c.len_utf16() as u32).sum()
+        };
+        self.version_override_span = Some(SourceRange {
+            offset: self.utf16_value - utf16_len,
+            length: utf16_len,
+        });
     }
 
     /// Reads `digit+ '.' digit+` (not committed; the caller writes it after full-line validation).

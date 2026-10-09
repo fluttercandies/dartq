@@ -382,12 +382,13 @@ fn dart_version_comment_formats() {
         r.language_version_override,
         Some(dartiq_language::LanguageVersion::new(2, 19))
     );
-    // Multiple matches: the first one wins (official registerExplicitLanguageVersion:
-    // `_languageVersion.isExplicit → return`, source_compilation_unit.dart:486).
+    // Multiple matches: the last one wins (oracle `_languageVersionChanged`
+    // reassigns the override on every match, analyzer-8.4.1
+    // scanner.dart:195-222).
     let r = scan_src("// @dart = 2.1\n// @dart = 2.19\nx");
     assert_eq!(
         r.language_version_override,
-        Some(dartiq_language::LanguageVersion::new(2, 1))
+        Some(dartiq_language::LanguageVersion::new(2, 19))
     );
 }
 
@@ -451,8 +452,24 @@ fn dart_version_comment_span() {
     );
     // UTF-16 offsets: `é` on the leading line counts 1 unit, 3 bytes.
     assert_eq!(span_of("// é\n// @dart = 2.19\nx"), Some((5, 15)));
-    // First match wins, span follows the version.
-    assert_eq!(span_of("// @dart = 2.1\n// @dart = 2.19\nx"), Some((0, 14)));
+    // Last match wins; the span equals the winning (last) comment's lexeme.
+    assert_eq!(
+        span_of("// @dart = 2.1\n// @dart = 2.19\nx"),
+        Some((15, 15))
+    );
+    // Two different versions: the last one wins even though the first was
+    // also valid (second below latest → no above-latest warning in the
+    // oracle); the winning override is the last comment's version, and the
+    // span follows it.
+    let r = scan_src("// @dart = 2.19\n// @dart = 2.9\nx");
+    assert_eq!(
+        r.language_version_override,
+        Some(dartiq_language::LanguageVersion::new(2, 9))
+    );
+    assert_eq!(
+        span_of("// @dart = 2.19\n// @dart = 2.9\nx"),
+        Some((16, 14))
+    );
     // No override → no span.
     let r = scan_src("var x; // @dart = 2.19");
     assert_eq!(r.language_version_override, None);
