@@ -1,0 +1,6 @@
+# Host resource discipline (2026-10-09 memory incident: concurrent cargo
+# invocations across agent lanes spiked host memory to ~80 GB and froze the
+# machine). This caps concurrent rustc/linker jobs for EVERY cargo invocation
+# in this workspace. Do not override with `cargo build -j N`.
+[build]
+jobs = 2
