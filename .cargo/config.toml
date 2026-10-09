@@ -4,3 +4,15 @@
 # in this workspace. Do not override with `cargo build -j N`.
 [build]
 jobs = 2
+# sccache wraps rustc: compilation results are content-addressed and reused
+# across lanes/sessions (cargo check metadata caching is the big win with 7
+# parallel lanes). Incremental invocations pass through uncached; correctness
+# is unaffected. Requires `sccache` on PATH (brew install sccache).
+rustc-wrapper = "sccache"
+# Incremental rustc invocations cannot be cached by sccache (passed through
+# uncached), which would gut the wrapper's value for the dominant workload
+# here: seven parallel lanes re-running cargo check over mostly-unchanged
+# crates. Content-addressed cache hits across lanes/sessions outweigh
+# within-crate incremental reuse; an edited crate recompiles in full either
+# way, while its whole dependency graph turns into cache hits.
+incremental = false
