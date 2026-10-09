@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::machine::{MachineDiag, Severity, entry_key};
+use crate::machine::{EntryKeyBuilder, MachineDiag, Severity};
 
 pub(crate) type EntryKey = (String, String);
 
@@ -51,13 +51,14 @@ pub(crate) fn build_side_labeled(
         per_severity: BTreeMap::new(),
         samples: BTreeMap::new(),
     };
+    let mut keys = EntryKeyBuilder::new(corpus_root);
     for d in diags {
         if !keep(d) {
             side.dropped_by_filter += 1;
             continue;
         }
         side.total_diags += 1;
-        let mut key = entry_key(d, corpus_root);
+        let mut key = keys.key(d);
         if let Some(label) = label {
             key.1 = format!("{label}/{}", key.1);
         }
@@ -214,13 +215,15 @@ pub(crate) fn distribution(side: &Side) -> Distribution {
                 .or_default()
                 .entry(key.0.clone())
                 .or_default() += side.samples[key].count;
-            // Each key is a unique (code, file) pair; summing gives the distinct file count for that code
-            *dist.files_by_code.entry(key.0.clone()).or_default() += 1;
         }
     }
+    // files_by_code counts distinct (code, file) pairs: a key can appear in
+    // more than one severity tier, so counting from the per-tier loops above
+    // would double-count its file.
     for key in &side.entries {
         let sample = &side.samples[key];
         *dist.by_type.entry(sample.dtype.clone()).or_default() += sample.count;
+        *dist.files_by_code.entry(key.0.clone()).or_default() += 1;
         *dist
             .files_by_type
             .entry(sample.dtype.clone())
@@ -556,6 +559,30 @@ mod tests {
         assert!(!dist.files_by_type["SYNTACTIC_ERROR"].contains_key("b.dart"));
         assert_eq!(dist.files_by_type["STATIC_WARNING"]["a.dart"], 1);
         assert!(!dist.files_by_type["COMPILE_TIME_ERROR"].contains_key("a.dart"));
+    }
+
+    /// files_by_code counts distinct (code, file) entries: the same key in two
+    /// severity tiers (one analyzer emitting a code under different severities)
+    /// must count its file once, while per-tier instance counts stay tier-scoped.
+    #[test]
+    fn files_by_code_dedups_across_severity_tiers() {
+        let oracle = vec![
+            diag("E_A", "/corpus/a.dart", Severity::Error, "as error"),
+            diag("E_A", "/corpus/a.dart", Severity::Warning, "as warning"),
+            diag("E_A", "/corpus/b.dart", Severity::Error, "other file"),
+        ];
+        let dist = distribution(&build_side_labeled(
+            &oracle,
+            Path::new("/corpus"),
+            None,
+            |_| true,
+        ));
+        assert_eq!(
+            dist.files_by_code["e_a"], 2,
+            "a.dart counted once across tiers"
+        );
+        assert_eq!(dist.code_by_severity[&Severity::Error]["e_a"], 2);
+        assert_eq!(dist.code_by_severity[&Severity::Warning]["e_a"], 1);
     }
 
     /// Multi-corpus merge: labels disambiguate (identical relative paths do not collide), counts sum, first sample kept.

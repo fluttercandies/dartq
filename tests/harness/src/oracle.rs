@@ -1,6 +1,8 @@
 //! Oracle-side driver: runs `dart analyze` and parses its output into a diagnostic set.
 //! Exit code semantics (facts §3): {0,1,2,3} are valid; 4 = crash, 64 = usage error -> harness itself fails.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,8 +170,9 @@ fn driver_timeout(raw: Option<&str>) -> Result<Duration, String> {
 /// inherit the harness's). stdout/stderr are
 /// captured to temp files instead of OS pipes: a verbose driver (the merged
 /// corpus emits megabytes of diagnostics) would fill the pipe buffer, block on
-/// write, never exit, and trip a false timeout. On timeout the child is killed
-/// and the stderr tail is attached to the harness error.
+/// write, never exit, and trip a false timeout. On timeout the driver's whole
+/// process group is killed (unix; see [`kill_driver`]) and the stderr tail is
+/// attached to the harness error.
 pub(crate) fn run_captured(
     name: &str,
     program: &str,
@@ -190,6 +193,18 @@ pub(crate) fn run_captured(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    // Own process group for the child (unix): `dart` spawns its analysis server
+    // as a grandchild, and killing the direct child alone would leave that
+    // server burning a core past the timeout (the exact wedge this budget
+    // exists for). A setpgid failure is ignored -- worst case the timeout kill
+    // falls back to the direct child only.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("[{name}] failed to launch `{program}`: {e}"))?;
@@ -199,7 +214,7 @@ pub(crate) fn run_captured(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_driver(&mut child);
                     let _ = child.wait();
                     let tail = stderr_tail(&capture.stderr_bytes());
                     return Err(format!(
@@ -217,6 +232,26 @@ pub(crate) fn run_captured(
         stdout: capture.stdout_bytes(),
         stderr: capture.stderr_bytes(),
     })
+}
+
+/// Kill a timed-out driver. On unix the child runs in its own process group
+/// (`setpgid(0, 0)` pre-exec), so the whole group is signalled: `dart` runs
+/// its analysis server as a grandchild that a plain `child.kill()` leaves
+/// behind, burning a core past the budget. The trailing `child.kill()` covers
+/// the fork-to-setpgid window in which the group does not exist yet (kill(2)
+/// fails with ESRCH); both are no-ops on an already-exited target. Windows has
+/// no std-level process-group equivalent, so only the direct child is killed
+/// there.
+fn kill_driver(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: kill(2) with a negative PID signals the process group whose
+        // leader is our own just-spawned child (see the pre_exec hook).
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Last 5 stderr lines (diagnostic tail for failure reports).
@@ -356,6 +391,56 @@ mod tests {
             "must fail within the test budget, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// The timeout kill reaches the driver's whole POSIX process group: `dart`'s
+    /// analysis server is a grandchild process, and a plain `child.kill()` would
+    /// leave it running past the budget. Here the driver is `sh` with a
+    /// background `sleep` (the grandchild); after the timeout both must be gone.
+    /// Unix only -- the process-group mechanism is POSIX.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_reaches_whole_process_group() {
+        let tmp = std::env::temp_dir();
+        let child_pid = tmp.join(format!("dq_pg_child_{}.pid", std::process::id()));
+        let grand_pid = tmp.join(format!("dq_pg_grand_{}.pid", std::process::id()));
+        let script = format!(
+            "echo $$ > {child}; sleep 30 & echo $! > {grand}; wait",
+            child = child_pid.display(),
+            grand = grand_pid.display(),
+        );
+        let err = run_captured(
+            "oracle",
+            "sh",
+            &["-c".to_string(), script],
+            None,
+            Duration::from_millis(300),
+        )
+        .expect_err("hung driver must time out");
+        assert!(err.contains("timed out"), "error: {err}");
+
+        let read_pid = |path: &Path| -> i32 {
+            std::fs::read_to_string(path)
+                .expect("pid file written by the driver")
+                .trim()
+                .parse()
+                .expect("pid number")
+        };
+        // SIGKILL is immediate, but the reparented grandchild may take a moment
+        // to be reaped; poll briefly instead of asserting synchronously.
+        let alive = |pid: i32| -> bool {
+            // SAFETY: kill(2) with signal 0 probes liveness and delivers nothing.
+            unsafe { libc::kill(pid, 0) == 0 }
+        };
+        let (child, grand) = (read_pid(&child_pid), read_pid(&grand_pid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (alive(child) || alive(grand)) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(!alive(child), "driver sh (pid {child}) must be dead");
+        assert!(!alive(grand), "grandchild sleep (pid {grand}) must be dead");
+        std::fs::remove_file(&child_pid).ok();
+        std::fs::remove_file(&grand_pid).ok();
     }
 
     /// Capture must not go through OS pipes: a driver emitting more than the

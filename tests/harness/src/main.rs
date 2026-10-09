@@ -993,12 +993,14 @@ mod tests {
         assert!(filters.error_in_scope());
         let diags = vec![mk(Severity::Error, "UNDEFINED_CLASS")];
         let side = build_side_labeled(&diags, Path::new("/corpus"), None, |d| filters.keep(d));
-        assert!(matches!(
-            check_oracle_vacuity(&side, true, false),
-            Err(Outcome::Error(msg)) if msg.contains("vacuous")
-                && msg.contains("1 pre-filter entries, 1 dropped"),
+        assert!(
+            matches!(
+                check_oracle_vacuity(&side, true, false),
+                Err(Outcome::Error(msg)) if msg.contains("vacuous")
+                    && msg.contains("1 pre-filter entries, 1 dropped")
+            ),
             "error carries the accounting"
-        ));
+        );
         // The escape hatch accepts exactly this run
         assert!(check_oracle_vacuity(&side, true, true).is_ok());
 

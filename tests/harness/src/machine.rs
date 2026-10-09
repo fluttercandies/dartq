@@ -1,7 +1,14 @@
 //! Parsing of `dart analyze` machine/json output and normalization of diagnostic entry keys.
-//! Format facts source: docs/facts/oracle-machine-format.md §1 (machine EBNF/escapes), §2 (json fields).
+//!
+//! Wire-format source of truth: `.third/dart-sdk/pkg/dartdev/lib/src/commands/analyze.dart`
+//! `emitMachineFormat` (stdout, uppercase codes). analyzer_cli's `MachineErrorFormatter`
+//! (`pkg/analyzer_cli/lib/src/error_formatter.dart`, stderr, lowercase codes) is the legacy CLI
+//! path, not what this oracle prints. Format facts source:
+//! docs/facts/oracle-machine-format.md §1 (machine EBNF/escapes), §2 (json fields).
 
 use std::path::{Path, PathBuf};
+
+use rustc_hash::FxHashMap;
 
 /// All values of the diagnostic TYPE field in machine/json output (observed domain per facts §1/§2).
 pub(crate) const DIAG_TYPES: [&str; 4] = [
@@ -63,7 +70,8 @@ impl OutputFormat {
 }
 
 /// A single machine/json diagnostic. `code` is kept verbatim from the source side
-/// (machine uppercase, json lowercase) and normalized to lowercase via [`entry_key`] for comparison.
+/// (machine uppercase, json lowercase) and normalized to lowercase via [`EntryKeyBuilder::key`]
+/// for comparison.
 #[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)] // mandated domain naming machine::MachineDiag
 pub(crate) struct MachineDiag {
@@ -84,14 +92,17 @@ pub(crate) fn parse_output(text: &str, format: OutputFormat) -> Result<Vec<Machi
     }
 }
 
-/// Parse machine output: each line has 8 `|`-separated fields (facts §1.1 EBNF); empty output = no diagnostics.
+/// Parse machine output: each line has 8 `|`-separated fields (facts §1.1 EBNF); empty output =
+/// no diagnostics; a blank line is malformed output and errors like every other malformed line
+/// (dartdev machine mode never emits blank lines).
 fn parse_machine(text: &str) -> Result<Vec<MachineDiag>, String> {
     let mut diags = Vec::new();
     for (idx, line) in text.lines().enumerate() {
-        // Blank lines are skipped: the oracle is not observed to emit blank
-        // lines; strictness here was deferred to the serial verification phase.
         if line.is_empty() {
-            continue;
+            return Err(format!(
+                "machine line {} is blank; dartdev machine mode never emits blank lines",
+                idx + 1
+            ));
         }
         let fields = split_unescaped_pipe(line);
         let [sev, dtype, code, file, line_s, col_s, len_s, message] = fields.as_slice() else {
@@ -235,23 +246,48 @@ fn parse_num(field: &str, what: &str, line_idx: usize) -> Result<u32, String> {
         .map_err(|_| format!("machine line {}: invalid {what} `{field}`", line_idx + 1))
 }
 
-/// Entry key = (lowercased code, path relative to the corpus). The oracle emits symlink-resolved absolute
-/// paths (facts §7.4); the dartiq side canonicalizes before normalizing too, so `corpus_root` must
-/// already be canonicalized. Files outside the corpus root keep their canonical absolute path -- both
-/// sides normalize identically, so comparison still holds.
-pub(crate) fn entry_key(diag: &MachineDiag, corpus_root: &Path) -> (String, String) {
-    let canon = diag
-        .file
-        .canonicalize()
-        .unwrap_or_else(|_| diag.file.clone());
-    let rel = canon.strip_prefix(corpus_root).ok().map(|p| {
-        p.components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/")
-    });
-    let file = rel.unwrap_or_else(|| canon.display().to_string());
-    (diag.code.to_lowercase(), file)
+/// Memoized entry-key builder for one side build. The oracle repeats the same file path across
+/// many diagnostics (a large corpus emits ~10^5 instances over a few thousand distinct files)
+/// and each `canonicalize` is a chain of syscalls, so raw paths are canonicalized once and the
+/// result is reused. A failed canonicalize is memoized as the raw path itself, keeping the
+/// fallback identical to the unmemoized behavior.
+pub(crate) struct EntryKeyBuilder {
+    corpus_root: PathBuf,
+    canon: FxHashMap<PathBuf, PathBuf>,
+}
+
+impl EntryKeyBuilder {
+    pub(crate) fn new(corpus_root: &Path) -> Self {
+        Self {
+            corpus_root: corpus_root.to_path_buf(),
+            canon: FxHashMap::default(),
+        }
+    }
+
+    /// Entry key = (lowercased code, path relative to the corpus). The oracle emits symlink-resolved
+    /// absolute paths (facts §7.4); the dartiq side canonicalizes before normalizing too, so
+    /// `corpus_root` must already be canonicalized. Files outside the corpus root keep their
+    /// canonical absolute path -- both sides normalize identically, so comparison still holds.
+    pub(crate) fn key(&mut self, diag: &MachineDiag) -> (String, String) {
+        let canon = self.canonical(&diag.file);
+        let rel = canon.strip_prefix(&self.corpus_root).ok().map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+        let file = rel.unwrap_or_else(|| canon.display().to_string());
+        (diag.code.to_lowercase(), file)
+    }
+
+    fn canonical(&mut self, raw: &Path) -> PathBuf {
+        if let Some(canon) = self.canon.get(raw) {
+            return canon.clone();
+        }
+        let canon = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+        self.canon.insert(raw.to_path_buf(), canon.clone());
+        canon
+    }
 }
 
 #[cfg(test)]
@@ -354,8 +390,16 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
             "bad severity must error"
         );
         assert!(
+            parse_machine(
+                "ERROR|SYNTACTIC_ERROR|X|/f.dart|1|1|1|m\n\nERROR|SYNTACTIC_ERROR|Y|/g.dart|1|1|1|m"
+            )
+            .is_err(),
+            "blank line must error"
+        );
+        assert!(parse_machine("\n").is_err(), "a lone blank line must error");
+        assert!(
             parse_machine("").unwrap().is_empty(),
-            "empty output = no diags"
+            "empty output = no diags (not a blank line)"
         );
     }
 
@@ -401,6 +445,7 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
         std::fs::write(lib.join("a.dart"), "var x = 1;").expect("write");
         // The root path itself is canonicalized (on macOS /tmp -> /private/tmp)
         let root_canon = root.canonicalize().expect("canonicalize root");
+        let mut keys = EntryKeyBuilder::new(&root_canon);
 
         let diag = MachineDiag {
             severity: Severity::Error,
@@ -413,8 +458,11 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
             length: 1,
             message: "m".into(),
         };
-        let key = entry_key(&diag, &root_canon);
+        let key = keys.key(&diag);
         assert_eq!(key, ("expected_token".into(), "lib/a.dart".into()));
+        // Memo consistency: the same raw path through the cache must normalize
+        // identically (the memo elides repeated syscalls, never changes results).
+        assert_eq!(keys.key(&diag), key);
 
         // Files outside the corpus root keep the canonical absolute path (on macOS /etc -> /private/etc;
         // such symlink resolution is exactly canonicalize's job, and the expectation is normalized the same way)
@@ -423,7 +471,7 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
             ..diag
         };
         let expected_outside = PathBuf::from("/etc/hosts").canonicalize().unwrap();
-        let key = entry_key(&outside, &root_canon);
+        let key = keys.key(&outside);
         assert_eq!(key.1, expected_outside.display().to_string());
 
         std::fs::remove_dir_all(&root).ok();
