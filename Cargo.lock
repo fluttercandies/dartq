@@ -104,6 +104,14 @@ version = "0.1.0"
 [[package]]
 name = "dartiq-index"
 version = "0.1.0"
+dependencies = [
+ "dartiq-language",
+ "dartiq-parser",
+ "dartiq-resolution",
+ "dartiq-scanner",
+ "dartiq-source",
+ "rustc-hash",
+]
 
 [[package]]
 name = "dartiq-language"
