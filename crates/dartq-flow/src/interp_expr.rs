@@ -213,7 +213,6 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(cast_ty));
             }
             Ev::Assign { plain } => {
-                eprintln!("DBG assign len={}", self.exprs.len());
                 let rhs = self.exprs.pop().expect("assign rhs");
                 let target = self.exprs.pop().expect("assign target");
                 if let Some(var) = target.reference {
@@ -320,9 +319,15 @@ impl<'o> Interp<'o> {
                 self.unreachable_cur();
             }
             Ev::ParenBegin | Ev::ParenEnd => {}
-            Ev::RecordLitEnd { .. } => {
-                // Field values stay consumed by their enclosing literal
-                // grammar; nothing net-pushes.
+            Ev::RecordLitEnd { count } | Ev::ListLitEnd { count } => self.literal_value(*count),
+            Ev::MapEntryEnd => {
+                // The entry's value is the value's own stack entry; the
+                // key's entry drops.
+                let value = self.exprs.pop();
+                self.exprs.pop();
+                if let Some(value) = value {
+                    self.exprs.push(value);
+                }
             }
             Ev::CascadeBegin => {
                 self.stack.push(Frame::Cascade {
@@ -351,7 +356,11 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             Ev::Spread | Ev::NullAwareElement => {
+                // The operand's value is consumed; the element leaves its
+                // own (trivial) value — every literal element nets exactly
+                // one.
                 self.exprs.pop();
+                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             Ev::IfControlFlowBegin => {
                 let cond = self.exprs.pop().expect("element condition");
@@ -380,11 +389,17 @@ impl<'o> Interp<'o> {
                 };
                 let joined = self.join(Some(branch), Some(self.current.clone()));
                 self.current = joined;
+                // The element leaves its own value (every literal element
+                // nets exactly one).
+                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             Ev::AwaitBegin => {}
-            Ev::ExpressionFunctionBodyEnd | Ev::ExprBody => {
-                // The arrow body's value is consumed by the function.
+            Ev::ExprBody => {
+                // The arrow body's value is consumed by the function; the
+                // function expression leaves its own (trivial) value for
+                // the consumer's pop.
                 self.exprs.pop();
+                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             _ => return false,
         }
@@ -392,6 +407,19 @@ impl<'o> Interp<'o> {
     }
 
     // —— shared expression helpers ———————————————————————————————————————
+
+    /// Collapses one literal's element values to a single value: each
+    /// element netted exactly one, so the last is the literal's own value
+    /// for the enclosing consumer's LIFO pop and the earlier ones drop; an
+    /// empty literal carries a trivial value.
+    fn literal_value(&mut self, count: usize) {
+        if count > 0 {
+            self.exprs
+                .truncate(self.exprs.len().saturating_sub(count - 1));
+        } else {
+            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+        }
+    }
 
     /// The promoted type of a variable read (chain head or declared).
     pub(crate) fn promoted_type_of(&self, var: u32, model: &crate::model::VarModel) -> Ty {

@@ -345,3 +345,175 @@ fn labeled_case_group_terminates() {
     let source = "void f(int x) { switch (x) { foo: case 1: 1; } }";
     assert!(facts_of(source).is_empty());
 }
+
+/// An arrow body's value is consumed by the function and the function
+/// expression leaves its own value: `InitializerEnd` finds a right-hand
+/// side even when the body itself leaves nothing (a `throw` body). Before
+/// the fix the `ExprBody` no-op shadow leaked the body's value — with a
+/// `throw` body nothing was left and the variable stayed unwritten.
+#[test]
+fn arrow_body_nets_one_value() {
+    let source = "void f() { var g = () => throw 1; g; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// `suspension` demotes only inside a local function (official
+/// `_enclosingFunctionExpressionInfoStack` non-empty): an await directly
+/// in an async method body demotes nothing, so a promotion from the
+/// condition survives the await without crashing.
+#[test]
+fn await_in_plain_async_method_demotes_nothing() {
+    let source = "void f(int? x, Future g()) async { if (x != null) { await g(); x; } }";
+    assert!(facts_of(source).is_empty());
+}
+
+/// `joinPromotedTypes` is the order-preserving intersection (official
+/// `chain1.where(chain2.contains)`): a mid-chain fork keeps the deeper
+/// common element instead of stopping at the first mismatch. Only `t3` is
+/// common to both chains and it sits behind the incomparable fronts, so a
+/// prefix zip would produce an empty chain.
+#[test]
+fn join_promoted_intersection_keeps_deeper_common_types() {
+    use crate::model::{Lists, NIL, ReachArena, State, VarModel};
+    use crate::ty::{Base, Ty};
+    let ty = |name| Ty {
+        base: Base::Name(name),
+        nullable: false,
+    };
+    let (t1, t2, t3, t4, t5) = (ty(1), ty(2), ty(3), ty(4), ty(5));
+    let mut lists = Lists::default();
+    // Most-specific first: [t1, t3, t5] forked against [t2, t3, t4].
+    let a_mid = lists.cons(t5, NIL);
+    let a_tail = lists.cons(t3, a_mid);
+    let a = lists.cons(t1, a_tail);
+    let b_mid = lists.cons(t4, NIL);
+    let b_tail = lists.cons(t3, b_mid);
+    let b = lists.cons(t2, b_tail);
+    let state = |promoted| {
+        let mut s = State::new(0);
+        s.models.push(VarModel {
+            promoted,
+            tested: NIL,
+            version: 1,
+            assigned: true,
+            unassigned: false,
+        });
+        s
+    };
+    let mut reach = ReachArena::new();
+    let joined = State::join(Some(state(a)), Some(state(b)), &mut reach, &mut lists, 1);
+    let kept: Vec<Ty> = lists.iter(joined.model(0).promoted).collect();
+    assert_eq!(kept, vec![t3]);
+}
+
+/// A begin whose matching end never arrives (parser recovery) is skipped
+/// as self-contained: the extent consumers bail on the NIL match instead
+/// of slicing the buffer to an out-of-bounds end.
+#[test]
+fn unmatched_construct_begins_do_not_panic() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    let span = |offset: u32| dartq_parser::TokenSpan {
+        id: offset,
+        range: dartq_source::SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        // While without WhileEnd.
+        Ev::WhileBegin { span: span(1) },
+        Ev::WhileBodyBegin,
+        Ev::ExprStmt { span: span(2) },
+        // Do without DoEnd (its frame closes through the exit handler).
+        Ev::DoBegin { span: span(3) },
+        Ev::DoEnd,
+        // Try without TryEnd.
+        Ev::TryBegin { span: span(4) },
+        Ev::CatchClauseBegin,
+        Ev::CatchClauseEnd,
+        // Closure without ExecEnd.
+        Ev::ExecBegin { is_closure: true },
+        // C-style for without ForEnd.
+        Ev::ForBegin { span: span(5) },
+        Ev::ForParts {
+            left_sep: span(6),
+            right_sep: span(7),
+        },
+        // Collection for without ForControlFlowEnd.
+        Ev::ForControlFlowBegin,
+        // Switch block without SwitchBlockEnd.
+        Ev::SwitchBlockBegin,
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+}
+
+/// A declaration head nested inside an initializer (the collection-for
+/// loop variable) must not clobber the enclosing declaration's pending
+/// init: `VarDeclBegin`/`VarDeclEnd` pair as a stack, so the outer
+/// `InitializerEnd` still writes its variable.
+#[test]
+fn nested_declaration_head_preserves_enclosing_initializer() {
+    let source = "void f() { var x = [for (var i = 0; i < 3; i++) i]; x; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// Every literal element nets exactly one value: a spread element leaves
+/// its own value after consuming the operand's, so the literal's consumer
+/// finds a right-hand side and the variable is written.
+#[test]
+fn spread_element_nets_one_literal_value() {
+    let source = "void f(List<int> y) { var x = [...y]; x; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A C-style collection-for consumes its extent wholesale (jumping over
+/// the `ForControlFlowEnd` event), so it must close its loop frame itself:
+/// no frame leaks past the element, and the element nets exactly one
+/// value.
+#[test]
+fn c_style_collection_for_closes_its_loop_frame() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    // Event layout of `[for (var i = 0; i < 3; i++) e]`: the three header
+    // parts precede the `ForParts` marker in source order, partitioned by
+    // the separator offsets (init < 15 <= cond < 25 <= upd).
+    let events = vec![
+        Ev::ForControlFlowBegin,
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: true,
+            span: span(10),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::OtherExpr { span: span(11) },
+        Ev::InitializerEnd,
+        Ev::VarDeclEnd,
+        Ev::Ident {
+            name: 0,
+            token: span(20),
+            context: IdentifierContext::Expression,
+        },
+        Ev::Ident {
+            name: 0,
+            token: span(30),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ForParts {
+            left_sep: span(15),
+            right_sep: span(25),
+        },
+        Ev::OtherExpr { span: span(40) },
+        Ev::ForControlFlowEnd { for_in: false },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(interp.exprs.len(), 1);
+}

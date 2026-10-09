@@ -183,7 +183,6 @@ pub enum Ev {
         span: TokenSpan,
     },
     AssertEnd,
-    ExpressionFunctionBodyEnd,
 
     // —— expressions ——
     Ident {
@@ -245,6 +244,14 @@ pub enum Ev {
     RecordLitEnd {
         count: usize,
     },
+    /// List/set/map literal end: `count` elements were parsed, each of
+    /// which netted exactly one expression value.
+    ListLitEnd {
+        count: usize,
+    },
+    /// One map entry (`k: v`) ended after its value's events: the key and
+    /// value each left one expression value.
+    MapEntryEnd,
     CascadeBegin,
     CascadeAccess {
         null_aware: bool,

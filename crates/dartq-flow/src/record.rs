@@ -754,6 +754,37 @@ impl<'t> ParserListener for Flow<'t> {
         // The symbol body contributes no expression events.
     }
 
+    fn handle_literal_list(
+        &mut self,
+        count: usize,
+        _left: Token,
+        _const_keyword: Option<Token>,
+        _right: Token,
+    ) {
+        self.record(Ev::ListLitEnd { count });
+    }
+
+    fn handle_literal_set_or_map(
+        &mut self,
+        count: usize,
+        _left: Token,
+        _const_keyword: Option<Token>,
+        _right: Token,
+        _has_set_entry: bool,
+    ) {
+        self.record(Ev::ListLitEnd { count });
+    }
+
+    fn handle_literal_map_entry(
+        &mut self,
+        _colon: Token,
+        _end: Token,
+        _null_aware_key: Option<Token>,
+        _null_aware_value: Option<Token>,
+    ) {
+        self.record(Ev::MapEntryEnd);
+    }
+
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
         self.record(Ev::OtherExpr { span: token });
     }

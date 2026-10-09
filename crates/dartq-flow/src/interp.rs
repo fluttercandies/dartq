@@ -284,8 +284,14 @@ pub(crate) struct Interp<'o> {
     pub(crate) pending_ty: Option<Ty>,
     /// Pattern-assignment writes awaiting their right-hand side.
     pub(crate) pending_writes: Vec<u32>,
-    /// Locals declared since the variable declaration began.
+    /// Locals declared since the innermost variable declaration began.
+    /// `pending_decl_bases` holds each open declaration's base index into
+    /// this list, so nested declarations pop their own inits without
+    /// touching the enclosing declaration's.
     pub(crate) pending_inits: Vec<u32>,
+    /// Open declarations' base indices into `pending_inits` (one per
+    /// `VarDeclBegin`, paired at `VarDeclEnd`).
+    pub(crate) pending_decl_bases: Vec<usize>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
     /// Context for the next top-level pattern (case expressions and
@@ -334,6 +340,7 @@ impl<'o> Interp<'o> {
             pending_ty: None,
             pending_writes: Vec::new(),
             pending_inits: Vec::new(),
+            pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
             pattern_kind_hint: PatternKind::Decl,
@@ -630,16 +637,23 @@ impl<'o> Interp<'o> {
         self.current = current.conservative_join(&written, &captured, &finals);
     }
 
-    /// The official `suspension()`: every variable read in the current
-    /// closure and written anywhere loses its promotions, except the
-    /// closure's own locals.
+    /// The official `suspension` (`flow_analysis.dart:7909`): every
+    /// variable read in the current local function and written anywhere
+    /// loses its promotions, except the function's own locals. The demotion
+    /// applies only when the suspension point sits inside a local function
+    /// (official `_enclosingFunctionExpressionInfoStack` non-empty): an
+    /// await/yield directly in an async/sync* method body cannot let an
+    /// enclosing function resume, so nothing demotes there.
     pub(crate) fn suspend(&mut self) {
-        let demote: FxHashSet<u32> = match self
-            .stack
-            .iter()
-            .rev()
-            .find(|f| matches!(f, Frame::Exec { .. }))
-        {
+        let demote: FxHashSet<u32> = match self.stack.iter().rev().find(|f| {
+            matches!(
+                f,
+                Frame::Exec {
+                    is_closure: true,
+                    ..
+                }
+            )
+        }) {
             Some(Frame::Exec {
                 reads, declared, ..
             }) => reads
@@ -773,7 +787,20 @@ impl<'o> Interp<'o> {
         // Closure entry (official `_functionExpression_begin`): the
         // closure's own writes demote as captures; everything written
         // anywhere demotes as a possible pre-write.
-        let end = match_of[i] as usize;
+        // An unmatched begin (parser recovery) has no extent to collect:
+        // enter with no captured-write knowledge.
+        let end = match_of[i];
+        if end == NIL {
+            self.stack.push(Frame::Exec {
+                is_closure: true,
+                scopes_base,
+                saved: self.current.clone(),
+                reads: FxHashSet::default(),
+                declared: FxHashSet::default(),
+            });
+            return;
+        }
+        let end = end as usize;
         let effects = self.collect_ranges(events, &[i + 1..end]);
         self.cjoin(&FxHashSet::default(), &effects.written);
         let saved = self.current.clone();
@@ -850,7 +877,13 @@ impl<'o> Interp<'o> {
         if self.collect.is_some() {
             return Control::Continue;
         }
-        let end = match_of[i] as usize;
+        // An unmatched begin (parser recovery) has no extent to replay:
+        // fall through to a linear walk.
+        let end = match_of[i];
+        if end == NIL {
+            return Control::Continue;
+        }
+        let end = end as usize;
         let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) else {
             return Control::Continue;
         };
@@ -971,58 +1004,25 @@ impl<'o> Interp<'o> {
     }
 
     /// Collection `for` (`[for (var i = 0; i < 3; i++) e]`): consumes the
-    /// whole extent. List/set/map literals net no value of their own
-    /// (`handle_literal_list` is not recorded), so each element must leave
-    /// exactly one value for the enclosing consumer's LIFO pop — the
+    /// whole extent. The literal's own end event nets one value for the
+    /// enclosing consumer and each element nets exactly one, so the
     /// element's own value is truncated and replaced by a trivial
     /// placeholder carrying no effects.
     fn collection_for_begin(&mut self, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
         if self.collect.is_some() {
-            // Consume the extent wholesale: its events do not net against
-            // the value stack the way a linear walk expects (element values
-            // truncate here; the head can carry stray statement pops), and
-            // an unbalanced walk would mis-pop enclosing operands. The
-            // extent's effects come from the same range the real replay
-            // collects, merged into the enclosing collect frames. The match
-            // table is empty in collect runs, so the extent end is scanned
-            // by nesting depth.
-            let mut depth = 0usize;
-            let end = (i + 1..events.len()).find(|&j| match &events[j] {
-                Ev::ForControlFlowBegin => {
-                    depth += 1;
-                    false
-                }
-                Ev::ForControlFlowEnd { .. } => {
-                    if depth == 0 {
-                        true
-                    } else {
-                        depth -= 1;
-                        false
-                    }
-                }
-                _ => false,
-            });
-            let Some(end) = end else {
-                return Control::Continue;
-            };
-            let exprs_base = self.exprs.len();
-            let effects = self.collect_ranges(events, &[i + 1..end]);
-            if let Some(frames) = self.collect.as_mut() {
-                for frame in frames.iter_mut() {
-                    frame.declared.extend(effects.declared.iter().copied());
-                    frame.written.extend(effects.written.iter().copied());
-                    frame.read.extend(effects.read.iter().copied());
-                    frame.captured.extend(effects.captured.iter().copied());
-                    frame
-                        .read_captured
-                        .extend(effects.read_captured.iter().copied());
-                }
-            }
-            self.exprs.truncate(exprs_base);
-            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
-            return Control::Jump(end + 1);
+            // Collect runs walk the extent linearly: effect recording
+            // reaches the enclosing frames directly and the value-stack
+            // churn rolls back with the run. A nested collect here would
+            // clobber the enclosing run's rollback snapshot.
+            return Control::Continue;
         }
-        let end = match_of[i] as usize;
+        // An unmatched begin (parser recovery) has no extent to consume:
+        // fall through to a linear walk.
+        let end = match_of[i];
+        if end == NIL {
+            return Control::Continue;
+        }
+        let end = end as usize;
         let base = self.exprs.len();
         if let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) {
             let Ev::ForParts {
@@ -1041,6 +1041,10 @@ impl<'o> Interp<'o> {
                 end,
             );
             self.replay_c_for(bounds, events, match_of, true);
+            // The wholesale jump skips the `ForControlFlowEnd` event:
+            // close the loop frame here (it would otherwise leak to the
+            // end of the executable).
+            self.loop_exit(true);
         } else if let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForInParts)) {
             // For-in element: the head (loop variable + iterable) ends
             // BEFORE the parts marker, and `for_in_parts_at` below is the

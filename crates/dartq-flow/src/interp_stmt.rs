@@ -5,8 +5,8 @@
 use dartq_parser::TokenSpan;
 
 use crate::ev::{BlockKind, Ev};
-use crate::interp::{DeclCtx, Expr, Frame, Interp, PatternKind, Scope, VarMeta};
-use crate::model::{State, attach_finally_model};
+use crate::interp::{DeclCtx, Effects, Expr, Frame, Interp, PatternKind, Scope, VarMeta};
+use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
 
 impl<'o> Interp<'o> {
@@ -74,8 +74,14 @@ impl<'o> Interp<'o> {
                 }
                 // Loop head: split + conservative join over the whole loop
                 // (official `whileStatement_conditionBegin`).
-                let end = match_of[i] as usize;
-                let effects = self.collect_ranges(events, &[i..end]);
+                // An unmatched begin (parser recovery) collects nothing:
+                // the extent is treated as self-contained.
+                let end = match_of[i];
+                let effects = if end == NIL {
+                    Effects::default()
+                } else {
+                    self.collect_ranges(events, &[i..end as usize])
+                };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
                 let checkpoint = self.reach.parent(self.current.reach);
@@ -107,8 +113,12 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                let end = match_of[i] as usize;
-                let effects = self.collect_ranges(events, &[i..end]);
+                let end = match_of[i];
+                let effects = if end == NIL {
+                    Effects::default()
+                } else {
+                    self.collect_ranges(events, &[i..end as usize])
+                };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
                 let checkpoint = self.reach.parent(self.current.reach);
@@ -213,18 +223,25 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                let end = match_of[i] as usize;
-                // The try body extent ends at the first catch/finally
-                // marker or the end of the statement.
-                let body_end = (i + 1..=end)
-                    .find(|&j| {
-                        matches!(
-                            events[j],
-                            Ev::CatchClauseBegin | Ev::FinallyBlock | Ev::TryEnd { .. }
-                        )
-                    })
-                    .unwrap_or(end);
-                let effects = self.collect_ranges(events, &[i + 1..body_end]);
+                // An unmatched begin (parser recovery) collects nothing:
+                // the extent is treated as self-contained.
+                let matched = match_of[i];
+                let effects = if matched == NIL {
+                    Effects::default()
+                } else {
+                    // The try body extent ends at the first catch/finally
+                    // marker or the end of the statement.
+                    let end = matched as usize;
+                    let body_end = (i + 1..=end)
+                        .find(|&j| {
+                            matches!(
+                                events[j],
+                                Ev::CatchClauseBegin | Ev::FinallyBlock | Ev::TryEnd { .. }
+                            )
+                        })
+                        .unwrap_or(end);
+                    self.collect_ranges(events, &[i + 1..body_end])
+                };
                 let pre = self.current.clone();
                 self.split_cur();
                 self.stack.push(Frame::TryCatch {
@@ -370,7 +387,10 @@ impl<'o> Interp<'o> {
                 }
                 // The scrutinee expression value is on the stack.
                 self.exprs.pop();
-                let end = match_of[i] as usize;
+                // An unmatched begin (parser recovery) scopes no block
+                // events: the block range stays empty.
+                let end = match_of[i];
+                let block = if end == NIL { i..i } else { i..end as usize };
                 let checkpoint = self.current.reach;
                 self.stack.push(Frame::Switch {
                     is_expr: false,
@@ -383,7 +403,7 @@ impl<'o> Interp<'o> {
                     group_default: false,
                     group_combined: None,
                     body_depth: None,
-                    block: i..end,
+                    block,
                 });
             }
             Ev::CaseBegin {
@@ -590,7 +610,11 @@ impl<'o> Interp<'o> {
                     ty: Ty::UNKNOWN,
                 };
                 self.in_decl = true;
-                self.pending_inits.clear();
+                // Paired with `VarDeclEnd`: declarations nested inside an
+                // initializer stack their pending inits on top of the
+                // enclosing one (a flat list let the inner head's end
+                // clobber the enclosing pending write).
+                self.pending_decl_bases.push(self.pending_inits.len());
             }
             Ev::InitializedIdent { name } => {
                 let meta = VarMeta {
@@ -602,8 +626,7 @@ impl<'o> Interp<'o> {
                 // Declared before the initializer runs (official
                 // `declare(initialized: false)` — a self-reference reads
                 // definitely unassigned).
-                self.declare_var(*name, meta, false);
-                let var = self.vars.len() as u32 - 1;
+                let var = self.declare_var(*name, meta, false);
                 self.pending_inits.push(var);
             }
             Ev::NoInitializer => {}
@@ -617,7 +640,9 @@ impl<'o> Interp<'o> {
             Ev::VarDeclEnd => {
                 self.decl = DeclCtx::default();
                 self.in_decl = false;
-                self.pending_inits.clear();
+                if let Some(base) = self.pending_decl_bases.pop() {
+                    self.pending_inits.truncate(base);
+                }
             }
             Ev::Formal { name, .. } => {
                 let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
@@ -646,7 +671,7 @@ impl<'o> Interp<'o> {
                     self.scopes.truncate(scopes_base);
                 }
             }
-            Ev::BlockBodyBegin | Ev::BlockBodyEnd | Ev::ExprBody | Ev::EmptyBody => {}
+            Ev::BlockBodyBegin | Ev::BlockBodyEnd | Ev::EmptyBody => {}
             _ => return false,
         }
         true

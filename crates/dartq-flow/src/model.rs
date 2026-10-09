@@ -535,28 +535,32 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
     }
 }
 
-/// Longest common chain prefix (official `joinPromotedTypes`): promotions
-/// kept only if common to both states; where one state promoted further, the
-/// less specific promotion survives. Chains are stored most-specific first,
-/// so the official least-specific-first prefix comparison runs from the
-/// stored tails.
+/// Order-preserving intersection of two promotion chains (official
+/// `joinPromotedTypes`, `flow_analysis.dart:5154`): the greatest common
+/// subsequence — every type of `a` that also occurs in `b`
+/// (`chain1.where(chain2.contains)`), so a mid-chain fork keeps the deeper
+/// common elements instead of stopping at the first mismatch. Chains are
+/// stored most-specific first and the result preserves `a`'s order. The
+/// official O(m+n) merge exploits subtype ordering across a real types
+/// backend; until one lands, equality is the intersection sense, and the
+/// chains are tiny enough that the scan is trivially cheap.
 fn join_promoted(a: u32, b: u32, lists: &mut Lists) -> u32 {
     if a == b {
         return a;
     }
-    let mut left: Vec<Ty> = lists.iter(a).collect();
-    let mut right: Vec<Ty> = lists.iter(b).collect();
-    left.reverse(); // least-specific first
-    right.reverse();
-    let mut common: Vec<Ty> = Vec::new();
-    for (x, y) in left.iter().zip(right.iter()) {
-        if x != y {
-            break;
+    let mut kept: Vec<Ty> = Vec::new();
+    let mut total = 0usize;
+    for ty in lists.iter(a) {
+        total += 1;
+        if lists.iter(b).any(|other| other == ty) {
+            kept.push(ty);
         }
-        common.push(*x);
+    }
+    if kept.len() == total {
+        return a;
     }
     let mut rebuilt = NIL;
-    for ty in common.into_iter().rev() {
+    for ty in kept.into_iter().rev() {
         rebuilt = lists.cons(ty, rebuilt);
     }
     rebuilt
