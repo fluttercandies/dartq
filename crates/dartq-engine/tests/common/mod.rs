@@ -36,6 +36,13 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(libraries: &[(&str, &str)]) -> Self {
+        Self::with_language_version(libraries, "3.5")
+    }
+
+    /// Same workspace with a different package language version (the
+    /// `package_config.json` entry the engine derives per-file versions
+    /// from).
+    pub fn with_language_version(libraries: &[(&str, &str)], language_version: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
             "dartq-engine-test-{}-{}",
             std::process::id(),
@@ -58,7 +65,9 @@ impl Fixture {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            &format!(
+                r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "languageVersion": "{language_version}"}}], "generator": "pub"}}"#
+            ),
         );
         write("sdk/version", "3.13.1\n");
         write(

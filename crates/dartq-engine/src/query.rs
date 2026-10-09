@@ -15,8 +15,9 @@
 //! The index is built fresh per query, per library, on the batch fan-out
 //! (the analyze recompute's posture): member files are captured with the
 //! apply-phase per-file derivation (owning-package language version, the
-//! scanner's `@dart` override rescan), resolved through the analyze-built
-//! graph namespaces, and folded into [`SymbolIndex`] faces. Captures drop
+//! shared `l1::scan_unit` `@dart` override settlement), resolved through
+//! the analyze-built graph namespaces, and folded into [`SymbolIndex`]
+//! faces. Captures drop
 //! inside each fan-out job, so peak residency is one library's parse plus
 //! the row-sized finished surfaces. Incremental index maintenance in the L1
 //! cascade is deliberately out of scope here; this face is independent of
@@ -26,12 +27,9 @@ use dartq_index::{
     DeclRow, FileCapture, FileIndex, LibraryBuilder, LibraryIndex, SymbolDecl, SymbolIndex,
     capture,
 };
-use dartq_language::{
-    DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
-};
+use dartq_language::DEFAULT_LANGUAGE_VERSION;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::Namespaces;
-use dartq_scanner::{ScanConfig, scan};
 use dartq_source::{FileId, SourceRange};
 use rayon::prelude::*;
 
@@ -192,8 +190,10 @@ fn captured_files(captures: Vec<FileCapture>) -> Vec<(FileId, FileIndex)> {
 
 /// Captures one resident file's declaration and reference surface: the
 /// apply-phase per-file derivation (owning-package language version, the
-/// scanner's `@dart` override rescan contract) feeding the dartq-index
-/// capture pass. The parse is local to this call; only interned ids leave.
+/// shared `l1::scan_unit` `@dart` override settlement — an above-latest
+/// override drops here too, and its warning is not baked, the capture face
+/// produces no diagnostics) feeding the dartq-index capture pass. The parse
+/// is local to this call; only interned ids leave.
 fn capture_file(state: &EngineState, file: FileId) -> FileCapture {
     let facts = &state.residency[&file];
     let bytes = state.store.get(facts.content).expect("resident content");
@@ -206,14 +206,7 @@ fn capture_file(state: &EngineState, file: FileId) -> FileCapture {
         .containing(state.files.path(file).expect("interned path"))
         .and_then(|identity| identity.language_version)
         .map_or(DEFAULT_LANGUAGE_VERSION, dartq_pub::LanguageVersion::into_inner);
-    let mut feature_set = FeatureSet::for_language_version(version);
-    let mut scanned = scan(text, scan_config(feature_set, version), file);
-    if let Some(over) = scanned.language_version_override
-        && over != version
-    {
-        feature_set = FeatureSet::for_language_version(over);
-        scanned = scan(text, scan_config(feature_set, over), file);
-    }
+    let (feature_set, scanned, _) = crate::l1::scan_unit(text, version, file);
     capture(
         file,
         text,
@@ -221,13 +214,4 @@ fn capture_file(state: &EngineState, file: FileId) -> FileCapture {
         ParserFeatures::from_feature_set(feature_set),
         &state.strings,
     )
-}
-
-/// The scanner's two lexical gates, from the feature set in force (the
-/// apply-phase derivation; a shared helper awaits the #230 settle).
-fn scan_config(feature_set: FeatureSet, version: LanguageVersion) -> ScanConfig {
-    ScanConfig {
-        enable_triple_shift: triple_shift_enabled(version),
-        enable_augmentations: feature_set.is_enabled(Feature::Augmentations),
-    }
 }

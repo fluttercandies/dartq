@@ -7,7 +7,9 @@
 mod common;
 
 use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0};
+use dartq_diagnostics::Severity;
 use dartq_engine::{EngineError, RevalidateGate};
+use dartq_language::DEFAULT_LANGUAGE_VERSION;
 
 #[test]
 fn two_file_fixture_runs_the_full_pipeline() {
@@ -202,4 +204,89 @@ fn unknown_remove_is_an_explicit_error() {
         .remove_file(&fixture.path("lib/never.dart"))
         .expect_err("unknown path");
     assert!(matches!(error, EngineError::UnknownPath(_)));
+}
+
+/// Above-latest `// @dart` override (#245): officially warned and dropped,
+/// never applied — the file stays at its package version (3.15 here), so a
+/// clean file yields exactly the one STATIC_WARNING, pinned at the whole
+/// comment lexeme.
+#[test]
+fn above_latest_override_warns_and_drops() {
+    let fixture = Fixture::with_language_version(
+        &[("lib/main.dart", "// @dart = 4.0\nint standalone() => 3;\n")],
+        "3.15",
+    );
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("analyze");
+
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "only the override warning, nothing from a misapplied rescan: {diagnostics:?}"
+    );
+    let warning = &diagnostics[0];
+    assert_eq!(warning.code.name, "invalid_language_version_override");
+    assert!(matches!(warning.severity, Severity::Warning));
+    assert_eq!(warning.range.offset, 0);
+    assert_eq!(warning.range.length, 14, "the whole `// @dart = 4.0` lexeme");
+    assert_eq!(
+        warning.message,
+        format!(
+            "The language version override can't specify a version greater than \
+             the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
+        )
+    );
+}
+
+/// Below-latest overrides keep the plain consumer contract (regression
+/// guard for #245): no warning, and the rescan still applies the override —
+/// at 2.12 triple shift is off (enabledIn 2.14), so `>>>` no longer lexes
+/// as one operator and the otherwise-clean file surfaces parse errors.
+#[test]
+fn below_latest_override_still_applies_without_warning() {
+    let fixture = Fixture::new(&[("lib/main.dart", "// @dart = 2.12\nvar x = 1 >>> 2;\n")]);
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("analyze");
+
+    assert!(
+        !diagnostics.is_empty(),
+        "the 2.12 rescan must turn triple shift off and surface parse errors"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code.name != "invalid_language_version_override"),
+        "below-latest overrides never warn: {diagnostics:?}"
+    );
+}
+
+/// The index-capture face shares `scan_unit` with the apply recompute: an
+/// above-latest override is dropped there too, and the capture proceeds on
+/// the package-version feature set.
+#[test]
+fn capture_face_shares_the_override_settlement() {
+    let fixture = Fixture::with_language_version(
+        &[("lib/main.dart", "// @dart = 4.0\nint standalone() => 3;\n")],
+        "3.15",
+    );
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    engine
+        .analyze(&[], &mut |_| {}, &Default::default())
+        .expect("analyze");
+
+    let main = engine
+        .file_table()
+        .try_file_id(&fixture.path("lib/main.dart"))
+        .expect("main interned");
+    let answer = engine.query_symbols("standalone");
+    assert_eq!(answer.decls.len(), 1, "the above-latest file still captures");
+    assert_eq!(answer.decls[0].file, main);
+    assert_eq!(answer.decls[0].name, "standalone");
 }

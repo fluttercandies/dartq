@@ -24,8 +24,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// (the `AstKey.parser_version` component, PRD §5.6
 /// `EngineSemanticVersion`). v2: name-form `part of` directives skip URI
 /// resolution, and the capture-time duplicate log bakes as
-/// `duplicate_definition`.
-pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 2;
+/// `duplicate_definition`. v3: an above-latest `// @dart` override bakes the
+/// official `invalid_language_version_override` STATIC_WARNING and analyzes
+/// at the package/default version instead of adopting the override (#245) —
+/// v2-cached entries for such files carry neither.
+pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 3;
 
 /// The SDK target segment M1 resolves `dart:` URIs against. Context-level
 /// target selection is an M2 milestone (engine-api-spec §1.1); M1 pins the

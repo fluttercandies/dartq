@@ -6,15 +6,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, Severity};
-use dartq_language::{
-    DEFAULT_LANGUAGE_VERSION, FeatureSet, LanguageVersion, triple_shift_enabled,
-};
+use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
+use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{
     CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver,
 };
-use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, TokenKind, TokenTable, scan};
+use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_source::{ContentId, FileId, SourceRange, StringTable, utf16_len_of};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -236,9 +234,8 @@ fn language_version_for(state: &EngineState, file: FileId) -> LanguageVersion {
         .unwrap_or(DEFAULT_LANGUAGE_VERSION)
 }
 
-/// The pure per-file pipeline: scan (with the `@dart` override rescan the
-/// scanner's consumer contract mandates), directive diet walk, parse
-/// diagnostics, element collection.
+/// The pure per-file pipeline: the shared scan face ([`scan_unit`]), then
+/// directive diet walk, parse diagnostics, element collection.
 fn compute_unit(
     file: FileId,
     content: ContentId,
@@ -246,17 +243,7 @@ fn compute_unit(
     version: LanguageVersion,
     strings: &StringTable,
 ) -> UnitFacts {
-    let mut feature_set = FeatureSet::for_language_version(version);
-    let mut scanned = scan(text, scan_config_for(feature_set, version), file);
-    if let Some(over) = scanned.language_version_override {
-        if over != version {
-            feature_set = FeatureSet::for_language_version(over);
-            scanned = scan(text, scan_config_for(feature_set, over), file);
-        }
-    }
-
-    let directives = extract_directives(text, &scanned.tokens, strings);
-    let mut diagnostics = scanned.diagnostics;
+    let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file);
     diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
     let elements = dartq_semantic::collect(
         text,
@@ -268,18 +255,67 @@ fn compute_unit(
 
     UnitFacts {
         content,
-        directives,
+        directives: extract_directives(text, &scanned.tokens, strings),
         elements,
         diagnostics,
         line_index: scanned.line_index,
     }
 }
 
+/// The shared scan face of the engine's two per-file lanes (the apply
+/// recompute and the index capture): scans `text` at the file's `version`
+/// and settles the `@dart` override per the scanner's consumer contract
+/// (official `source_loader.dart:1194–1209` — a differing override
+/// re-derives the config and rescans; the scanner reports only the last
+/// header-window match, so at most one rescan settles).
+///
+/// An override above the latest known version is officially rejected, not
+/// clamped (official scanner `_languageVersionChanged`): the
+/// `invalid_language_version_override` STATIC_WARNING pins at the comment
+/// lexeme and the override is dropped (`_overrideVersion = null`) — the
+/// feature set stays the package/default-derived one and no rescan runs.
+/// The warning rides back for the diagnostics face to bake; the
+/// index-capture face drops it (it produces no diagnostics).
+pub(crate) fn scan_unit(
+    text: &str,
+    version: LanguageVersion,
+    file: FileId,
+) -> (FeatureSet, ScanResult, Vec<Diagnostic>) {
+    let mut feature_set = FeatureSet::for_language_version(version);
+    let mut scanned = scan(text, scan_config(feature_set), file);
+    let mut warnings = Vec::new();
+    if let Some(over) = scanned.language_version_override {
+        if over.is_above_latest() {
+            let code = CodeRegistry::builtin()
+                .get("invalid_language_version_override")
+                .expect("official registry pins invalid_language_version_override");
+            let span = scanned
+                .language_version_override_span
+                .expect("scanner records the comment span with every override");
+            warnings.push(Diagnostic::new(
+                Severity::Warning,
+                code,
+                format!(
+                    "The language version override can't specify a version greater than \
+                     the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
+                ),
+                file,
+                span,
+                None,
+            ));
+        } else if over != version {
+            feature_set = FeatureSet::for_language_version(over);
+            scanned = scan(text, scan_config(feature_set), file);
+        }
+    }
+    (feature_set, scanned, warnings)
+}
+
 /// The scanner's two lexical gates, from the feature set in force.
-fn scan_config_for(feature_set: FeatureSet, version: LanguageVersion) -> ScanConfig {
+fn scan_config(feature_set: FeatureSet) -> ScanConfig {
     ScanConfig {
-        enable_triple_shift: triple_shift_enabled(version),
-        enable_augmentations: feature_set.is_enabled(dartq_language::Feature::Augmentations),
+        enable_triple_shift: feature_set.is_enabled(Feature::TripleShift),
+        enable_augmentations: feature_set.is_enabled(Feature::Augmentations),
     }
 }
 
