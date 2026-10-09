@@ -93,8 +93,9 @@ impl Glob {
 
     /// Lists every filesystem entity beneath `root_dir` matching the glob,
     /// in pub's listing order (readdir order per directory, options and
-    /// children in declaration order), deduplicated by path — `listSync`
-    /// guarantees one entity per path (glob.dart:113-116).
+    /// children in declaration order), deduplicated by path when the tree
+    /// can list one path twice — `listSync` guarantees one entity per path
+    /// (glob.dart:113-116).
     ///
     /// Missing directories are silently skipped; any other I/O error
     /// surfaces here (package:glob only swallows the "missing" case,
@@ -102,11 +103,14 @@ impl Glob {
     pub(crate) fn list_sync(&self, root_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();
         self.root.list(root_dir, &mut out)?;
-        // The seen-set of `ListTree.listSync` (list_tree.dart:209-215): a
-        // no-op when nothing overlaps, so keeping it unconditional is
-        // observationally identical.
-        let mut seen = std::collections::BTreeSet::new();
-        out.retain(|path| seen.insert(path.clone()));
+        // The seen-set of `ListTree.listSync` (list_tree.dart:209-215) only
+        // filters when the same path can come out of two tree branches
+        // (`_computeCanOverlap`, list_tree.dart:171-179); otherwise the
+        // per-entry clone and insert is a pure no-op and is skipped.
+        if self.root.can_overlap() {
+            let mut seen = std::collections::BTreeSet::new();
+            out.retain(|path| seen.insert(path.clone()));
+        }
         Ok(out)
     }
 }
@@ -179,8 +183,16 @@ impl TreeNode {
                 out.push(path.clone());
             }
             // `entity is! Directory` with followLinks: a symlink to a
-            // directory counts (list_tree.dart:355-361).
-            let is_dir = std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir());
+            // directory counts (list_tree.dart:355-361). dart:io reads the
+            // type from the dirent and stats only symlinks; an
+            // unresolvable entry counts as not-a-directory.
+            let is_dir = match entry.file_type() {
+                Ok(file_type) if file_type.is_symlink() => {
+                    std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir())
+                }
+                Ok(file_type) => file_type.is_dir(),
+                Err(_) => false,
+            };
             if is_dir {
                 for (sequence, child) in &self.children {
                     if matches(&sequence.0, &basename) {
@@ -201,14 +213,18 @@ impl TreeNode {
         relative: &str,
         out: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
-        if relative.is_empty() {
-            // Only the top-level missing directory is swallowed
-            // (list_tree.dart:410-413).
-            if !dir.is_dir() {
-                return Ok(());
-            }
-        }
-        for entry in std::fs::read_dir(dir)? {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // Only "missing" is ever swallowed — pub's `isMissing` catches
+            // errno 2/3 alone and rethrows the rest (list_tree.dart:404-414,
+            // every failed directory open surfaces as kListError and is
+            // thrown, directory.cc:543-551) — so a file (`ENOTDIR`) or an
+            // unreadable directory surfaces here. A directory that goes
+            // missing mid-walk is likewise not a hard error.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -224,7 +240,18 @@ impl TreeNode {
             {
                 out.push(path.clone());
             }
-            if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            // followLinks: dart:io takes the type straight from the dirent
+            // and stats only symlinks (directory_linux.cc `Next`, DT_LNK
+            // branch); a symlink to a directory counts (list_tree.dart:355-
+            // 361), and an unresolvable entry counts as not-a-directory.
+            let is_dir = match entry.file_type() {
+                Ok(file_type) if file_type.is_symlink() => {
+                    std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir())
+                }
+                Ok(file_type) => file_type.is_dir(),
+                Err(_) => false,
+            };
+            if is_dir {
                 let nested = format!("{child_relative}/");
                 self.list_recursive(&path, &nested, out)?;
             }
@@ -237,6 +264,26 @@ impl TreeNode {
             && self.children.iter().all(|(sequence, _)| {
                 sequence.0.len() == 1 && matches!(&sequence.0[0], Node::Literal(_))
             })
+    }
+
+    /// Whether listing this node can return the same path twice
+    /// (list_tree.dart:256-277). A recursive node is a single listing
+    /// filtered by one validator and never overlaps; with more than one
+    /// child, any dynamic child may match a sibling's match; a single child
+    /// delegates. Case-insensitivity is out of scope: this port is
+    /// case-sensitive only.
+    fn can_overlap(&self) -> bool {
+        if self.recursive {
+            return false;
+        }
+        if self.children.len() > 1
+            && self.children.iter().any(|(sequence, _)| {
+                sequence.0.len() > 1 || !matches!(&sequence.0[0], Node::Literal(_))
+            })
+        {
+            return true;
+        }
+        self.children.iter().any(|(_, node)| node.can_overlap())
     }
 }
 
@@ -290,8 +337,12 @@ fn join(components: &[Sequence]) -> Sequence {
 /// (`ast.dart` `SequenceNode.split`, POSIX style). The split goes through
 /// `p.context.split`, which drops empty parts (`foo/` is one component,
 /// `a//b` two), so a trailing separator only forces a component boundary
-/// before whatever follows. Workspace entries are always relative, so the
-/// original's absolute-root branch is unreachable.
+/// before whatever follows. A literal starting with `/` parses as the
+/// absolute root plus the rest (context.dart:364-370 inserts the root at
+/// position 0), and the root branch of ast.dart:151-166 always finishes the
+/// pending component — a hard boundary — so mid-pattern `/…` literals never
+/// glue onto the component before them. The root literal itself is dropped:
+/// workspace entries are always relative, so no tree is ever rooted there.
 fn split(sequence: Sequence) -> Vec<Sequence> {
     let mut components: Vec<Sequence> = Vec::new();
     let mut current: Option<Vec<Node>> = None;
@@ -303,9 +354,14 @@ fn split(sequence: Sequence) -> Vec<Sequence> {
     for node in sequence.0 {
         match node {
             Node::Literal(text) if text.contains('/') => {
+                // ast.dart:164 `finishComponent()` fires whether or not the
+                // root literal is kept (ast.dart:153-163).
+                if text.starts_with('/') {
+                    flush(&mut current, &mut components);
+                }
                 let parts: Vec<&str> = text.split('/').filter(|part| !part.is_empty()).collect();
                 let Some((last, head)) = parts.split_last() else {
-                    continue; // `//`-only literal: unreachable via workspace entries
+                    continue; // `/`-only literal: boundary flushed above
                 };
                 for part in head {
                     current
@@ -755,6 +811,70 @@ mod tests {
         assert!(found.contains(&"a/pkg.dart".to_owned()));
         assert!(found.contains(&"a/inner/deep.dart".to_owned()));
         assert!(!found.contains(&"a".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leading_slash_literals_flush_component_boundaries() {
+        // Mid-pattern `/…` literals go through the absolute-root branch of
+        // ast.dart:151-166, whose `finishComponent()` always closes the
+        // pending component. Without that boundary `pkgs/{a,b}/lib` glues
+        // into a validator matching the basenames `alib`/`blib`,
+        // `packages/*/lib` glues `*` and `lib` together, `**/b` becomes one
+        // component matching any path ending in `b`, and `pkgs/{a,b}/**`
+        // folds `**` into a superset `[a, **]` validator.
+        let dir = std::env::temp_dir().join(format!("dartiq-glob-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(dir.join("pkgs").join(name).join("lib")).expect("mkdir");
+        }
+        std::fs::create_dir_all(dir.join("pkgs").join("ab")).expect("mkdir");
+        std::fs::write(dir.join("pkgs").join("ab").join("z.dart"), "").expect("write");
+        std::fs::write(dir.join("pkgs").join("alib"), "").expect("write");
+        std::fs::write(dir.join("pkgs").join("blib"), "").expect("write");
+        std::fs::create_dir_all(dir.join("packages").join("a").join("lib")).expect("mkdir");
+        std::fs::create_dir_all(dir.join("packages").join("b").join("lib")).expect("mkdir");
+        std::fs::create_dir_all(dir.join("packages").join("lib")).expect("mkdir");
+        std::fs::create_dir_all(dir.join("x")).expect("mkdir");
+        std::fs::write(dir.join("b"), "").expect("write");
+        std::fs::write(dir.join("x").join("b"), "").expect("write");
+
+        // `pkgs/{a,b}/lib` descends into both members in declaration order
+        // instead of matching the glued basenames.
+        assert_eq!(
+            listed("pkgs/{a,b}/lib", &dir),
+            vec!["pkgs/a/lib", "pkgs/b/lib"]
+        );
+
+        // `packages/*/lib` lists the member lib dirs, not a glued
+        // `…lib` basename under packages (readdir order, hence sorted).
+        let mut found = listed("packages/*/lib", &dir);
+        found.sort();
+        assert_eq!(found, vec!["packages/a/lib", "packages/b/lib"]);
+
+        // `**/b` needs at least one intermediate segment, consistent with
+        // the raw matcher (`!matches("**/b", "b")`).
+        assert_eq!(listed("**/b", &dir), vec!["x/b"]);
+
+        // `pkgs/{a,b}/**` recurses under both members only; `pkgs/ab/**`
+        // would match a glued `[a, **]` validator.
+        let mut found = listed("pkgs/{a,b}/**", &dir);
+        found.sort();
+        assert_eq!(found, vec!["pkgs/a/lib", "pkgs/b/lib"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recursive_listing_rethrows_non_missing_top_level_errors() {
+        // pub's `isMissing` catches errno 2/3 only (list_tree.dart:404-414):
+        // `a/**` over a file rethrows `ENOTDIR` instead of yielding an empty
+        // list, while a missing top-level directory stays swallowed.
+        let dir = std::env::temp_dir().join(format!("dartiq-glob-enotdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("a"), "").expect("write");
+        assert!(Glob::new("a/**").expect("parse").list_sync(&dir).is_err());
+        assert!(listed("missing/**", &dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

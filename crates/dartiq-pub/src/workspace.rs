@@ -44,9 +44,10 @@ pub struct WorkspaceLayout {
 /// # Errors
 ///
 /// Returns [`PubError::Workspace`] when no pubspec exists anywhere on the
-/// walk, when every pubspec met carries an explicit `resolution` (pub's
-/// "found a pubspec but no workspace root" FileException in
-/// `_loadWorkspace`, entrypoint.dart:141-152), when a member pubspec is
+/// walk, when the first pubspec met carries an explicit `resolution` and is
+/// not the root or a workspace member (pub's "found a pubspec but no
+/// workspace root" FileException in `_loadWorkspace`,
+/// entrypoint.dart:127-152), when a member pubspec is
 /// missing, unparseable, or unreadable, when a `workspace:` entry matches
 /// zero packages (package.dart:233-238) or a glob pattern fails to parse,
 /// when a member has not opted in with `resolution: workspace`
@@ -69,6 +70,30 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
             // (entrypoint.dart:124) — the key's absence, nothing else.
             if spec.resolution == Resolution::Unspecified {
                 let members = collect_members(&dir, &spec)?;
+                // pub accepts the root only when the first-met pubspec is
+                // the root's own or a transitive workspace member's
+                // (entrypoint.dart:127-137: `identical(pubspecsMet.entries
+                // .first.value, package.pubspec)` — the load cache is keyed
+                // on the canonicalized path, so identity means path
+                // equality). Anything else keeps pub walking and ends in
+                // the FileException at entrypoint.dart:143-152.
+                // `first_met` is always set here: this branch only runs on
+                // a met pubspec.
+                let (first_dir, first_resolution) =
+                    first_met.expect("first pubspec met before the root");
+                let first_key = inclusion_key(&first_dir);
+                if first_key != inclusion_key(&dir)
+                    && !members
+                        .iter()
+                        .any(|member| inclusion_key(member) == first_key)
+                {
+                    return Err(PubError::Workspace(format!(
+                        "Found a pubspec.yaml at {}. But it has resolution `{}`. \
+                         But found no workspace root including it in parent directories.",
+                        first_dir.display(),
+                        first_resolution.as_str()
+                    )));
+                }
                 return Ok(WorkspaceLayout { root: dir, members });
             }
         }
@@ -227,6 +252,10 @@ fn expand_entries(
     let pubspec_path = dir.join("pubspec.yaml").display().to_string();
     let mut children: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in &spec.workspace {
+        let before = children.len();
+        // The glob hint is only ever set in the literal branch: the glob
+        // branch implies language version >= 3.11 (package.dart:187-209).
+        let mut hint = String::new();
         if has_glob_wildcards(entry)
             && language_version >= LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS
         {
@@ -247,26 +276,29 @@ fn expand_entries(
                 }
             }
         } else {
-            let hint = if has_glob_wildcards(entry) {
-                format!(
+            let child = dir.join(entry);
+            if child.join("pubspec.yaml").is_file() {
+                children.push((child, dir.to_path_buf()));
+            } else if has_glob_wildcards(entry) {
+                // Reaching the literal branch with wildcards means the
+                // language version predates globs (package.dart:216-222).
+                hint = format!(
                     " Glob syntax is only supported from language version {}. \
                      Consider changing the language version of `{pubspec_path}` to {}.",
                     LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS,
                     LanguageVersion::FIRST_WITH_WORKSPACE_GLOBS,
-                )
-            } else {
-                String::new()
-            };
-            let child = dir.join(entry);
-            // Literal entries hit the same zero-packages error when their
-            // pubspec.yaml is missing (package.dart:210-238).
-            if !child.join("pubspec.yaml").is_file() {
-                return Err(PubError::Workspace(format!(
-                    "No workspace packages matching `{entry}`. \
-                     That was included in the workspace of `{pubspec_path}`.{hint}"
-                )));
+                );
             }
-            children.push((child, dir.to_path_buf()));
+        }
+        // The zero-packages check runs for both branches
+        // (package.dart:233-238): the glob branch lands here whenever no
+        // match carried a pubspec.yaml, the literal branch when its
+        // pubspec.yaml is missing.
+        if children.len() == before {
+            return Err(PubError::Workspace(format!(
+                "No workspace packages matching `{entry}`. \
+                 That was included in the workspace of `{pubspec_path}`.{hint}"
+            )));
         }
     }
     stack.extend(children.into_iter().rev());
@@ -575,6 +607,48 @@ mod tests {
             err.to_string().contains("resolution `external`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn first_pubspec_met_below_root_must_be_in_the_workspace() {
+        // pub accepts a root only when the first-met pubspec is the root's
+        // own or a member's (entrypoint.dart:127-137 `identical` check): a
+        // `resolution: local` pubspec between the working dir and the root
+        // ends in the FileException at entrypoint.dart:143-152.
+        let root = temp_dir("first-met");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - other\n",
+        );
+        write(
+            &root.join("other").join("pubspec.yaml"),
+            "name: other\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        write(
+            &root.join("nested").join("pubspec.yaml"),
+            "name: nested\nenvironment:\n  sdk: ^3.5.0\nresolution: local\n",
+        );
+        let err = find_workspace_root(&root.join("nested").join("deep"))
+            .expect_err("non-member first pubspec");
+        let text = err.to_string();
+        assert!(
+            text.contains("Found a pubspec.yaml at"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("resolution `local`"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("found no workspace root including it"),
+            "unexpected error: {text}"
+        );
+
+        // A first-met pubspec that IS a member resolves to the root
+        // normally.
+        let layout = find_workspace_root(&root.join("other")).expect("layout");
+        assert_eq!(layout.root, root);
+        assert_eq!(layout.members, vec![root.join("other")]);
     }
 
     #[test]
