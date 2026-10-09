@@ -242,7 +242,9 @@ pub enum Ev {
     Rethrow,
     ParenBegin,
     ParenEnd,
-    RecordLitEnd { count: usize },
+    RecordLitEnd {
+        count: usize,
+    },
     CascadeBegin,
     CascadeAccess {
         null_aware: bool,

@@ -2,8 +2,8 @@
 //! assignments, and collection elements.
 
 use crate::ev::{BinOp, Ev};
-pub(crate) use crate::interp::Expr;
 use crate::facts::FlowFact;
+pub(crate) use crate::interp::Expr;
 use crate::interp::{Frame, Interp};
 use crate::model::State;
 use crate::model::is_non_nullable;
@@ -12,7 +12,13 @@ use crate::ty::{Base, Ty};
 impl<'o> Interp<'o> {
     /// Handles one expression-layer event; `false` means the event belongs
     /// to another layer.
-    pub(crate) fn expr_step(&mut self, ev: &Ev, _events: &[Ev], _i: usize, _match_of: &[u32]) -> bool {
+    pub(crate) fn expr_step(
+        &mut self,
+        ev: &Ev,
+        _events: &[Ev],
+        _i: usize,
+        _match_of: &[u32],
+    ) -> bool {
         match ev {
             Ev::Ident {
                 name,
@@ -21,20 +27,18 @@ impl<'o> Interp<'o> {
             } => {
                 use dartq_parser::IdentifierContext as Ctx;
                 match context {
-                    Ctx::Expression | Ctx::ExpressionContinuation => {
-                        match self.resolve(*name) {
-                            Some(var) => {
-                                self.check_unassigned_read(*token, var);
-                                self.record_read(var);
-                                let model = self.current.model(var);
-                                let ty = self.promoted_type_of(var, &model);
-                                let mut expr = Expr::of_reference(var, ty);
-                                expr.read_span = Some(*token);
-                                self.exprs.push(expr);
-                            }
-                            None => self.exprs.push(Expr::trivial(Ty::UNKNOWN)),
+                    Ctx::Expression | Ctx::ExpressionContinuation => match self.resolve(*name) {
+                        Some(var) => {
+                            self.check_unassigned_read(*token, var);
+                            self.record_read(var);
+                            let model = self.current.model(var);
+                            let ty = self.promoted_type_of(var, &model);
+                            let mut expr = Expr::of_reference(var, ty);
+                            expr.read_span = Some(*token);
+                            self.exprs.push(expr);
                         }
-                    }
+                        None => self.exprs.push(Expr::trivial(Ty::UNKNOWN)),
+                    },
                     // Named-argument labels and declaration names carry no
                     // value; catch/declaration names never reach the
                     // expression stack.
@@ -209,6 +213,7 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(cast_ty));
             }
             Ev::Assign { plain } => {
+                eprintln!("DBG assign len={}", self.exprs.len());
                 let rhs = self.exprs.pop().expect("assign rhs");
                 let target = self.exprs.pop().expect("assign target");
                 if let Some(var) = target.reference {
@@ -247,11 +252,7 @@ impl<'o> Interp<'o> {
             }
             Ev::CondColon => {
                 let then_expr = self.exprs.pop().expect("then expression");
-                if let Some(Frame::Cond {
-                    branch,
-                    then_state,
-                }) = self.stack.last_mut()
-                {
+                if let Some(Frame::Cond { branch, then_state }) = self.stack.last_mut() {
                     *then_state = Some(self.current.clone());
                     self.current = branch.clone();
                 }
@@ -281,7 +282,8 @@ impl<'o> Interp<'o> {
                 if *null_aware {
                     // Official nullAwareAccess_end: the access path sees
                     // the target promoted non-null; the skip path does not.
-                    if let (Some(var), false) = (target.reference, is_non_nullable(self.ops, target.ty))
+                    if let (Some(var), false) =
+                        (target.reference, is_non_nullable(self.ops, target.ty))
                     {
                         let promoted = self.ops.promote_to_non_null(target.ty);
                         let matched = self.current.clone().finish_type_test(
@@ -340,7 +342,9 @@ impl<'o> Interp<'o> {
                     self.stack.push(frame);
                 }
             }
-            Ev::EndLiteralString { interpolation_count } => {
+            Ev::EndLiteralString {
+                interpolation_count,
+            } => {
                 for _ in 0..*interpolation_count {
                     self.exprs.pop();
                 }

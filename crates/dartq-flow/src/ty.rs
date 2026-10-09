@@ -143,7 +143,10 @@ impl TypeOps for NameTypeOps {
             return Ty::NEVER;
         }
         if from.nullable
-            && !matches!(from.base, Base::Dynamic | Base::Unknown | Base::Null | Base::Never)
+            && !matches!(
+                from.base,
+                Base::Dynamic | Base::Unknown | Base::Null | Base::Never
+            )
         {
             let non_null = from.non_null();
             if what == non_null || what.base == Base::Null {

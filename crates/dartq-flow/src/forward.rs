@@ -1,18 +1,23 @@
 //! Generated forwarding impl: every parser listener event reaches the
 //! [`Flow`] engine through the shared handle. Regenerate from
-//! `dartq-parser/src/listener.rs` when the trait grows; the four
-//! crate-private-parameter methods (`begin_block`/`end_block`/
-//! `begin_assert`/`end_assert`) cannot be named outside dartq-parser and
-//! stay at their no-op trait defaults.
+//! `dartq-parser/src/listener.rs` when the trait grows. Exactly four
+//! events stay at their no-op trait defaults (`begin_block`/`end_block`/
+//! `begin_assert`/`end_assert`): their `BlockKind`/`AssertKind` parameter
+//! types are pub enums inside dartq-parser's private `listener` module
+//! and are not re-exported, so the method signatures cannot be written
+//! here. Forwarding them (recording the `Ev::Block`/`Ev::AssertBegin`
+//! pairs in `record.rs`; the interpreter side is already written) needs
+//! those two names added to dartq-parser's `pub use listener::{...}` list
+//! first.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use dartq_parser::TokenSpan as Token;
 use dartq_parser::{
     ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind, ExperimentalFlag,
     FormalParameterKind, IdentifierContext, MemberKind, Message, ParserListener,
 };
-use dartq_parser::TokenSpan as Token;
 
 use crate::record::Flow;
 
@@ -33,15 +38,26 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_library_name(&mut self, library_keyword: Token, semicolon: Token, has_name: bool) {
-        self.0.borrow_mut().end_library_name(library_keyword, semicolon, has_name)
+        self.0
+            .borrow_mut()
+            .end_library_name(library_keyword, semicolon, has_name)
     }
 
     fn begin_library_augmentation(&mut self, augment_kw: Token, library_keyword: Token) {
-        self.0.borrow_mut().begin_library_augmentation(augment_kw, library_keyword)
+        self.0
+            .borrow_mut()
+            .begin_library_augmentation(augment_kw, library_keyword)
     }
 
-    fn end_library_augmentation(&mut self, augment_kw: Token, library_keyword: Token, semicolon: Token) {
-        self.0.borrow_mut().end_library_augmentation(augment_kw, library_keyword, semicolon)
+    fn end_library_augmentation(
+        &mut self,
+        augment_kw: Token,
+        library_keyword: Token,
+        semicolon: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_library_augmentation(augment_kw, library_keyword, semicolon)
     }
 
     fn begin_import(&mut self, import_keyword: Token) {
@@ -73,11 +89,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_conditional_uri(&mut self, if_kw: Token, left_paren: Token, equal_sign: Option<Token>) {
-        self.0.borrow_mut().end_conditional_uri(if_kw, left_paren, equal_sign)
+        self.0
+            .borrow_mut()
+            .end_conditional_uri(if_kw, left_paren, equal_sign)
     }
 
     fn handle_dotted_name(&mut self, count: usize, first_identifier: Token) {
-        self.0.borrow_mut().handle_dotted_name(count, first_identifier)
+        self.0
+            .borrow_mut()
+            .handle_dotted_name(count, first_identifier)
     }
 
     fn begin_export(&mut self, token: Token) {
@@ -129,7 +149,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_part_of(&mut self, part_keyword: Token, of_kw: Token, semicolon: Token, has_name: bool) {
-        self.0.borrow_mut().end_part_of(part_keyword, of_kw, semicolon, has_name)
+        self.0
+            .borrow_mut()
+            .end_part_of(part_keyword, of_kw, semicolon, has_name)
     }
 
     fn begin_metadata_star(&mut self, token: Token) {
@@ -145,7 +167,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_metadata(&mut self, begin: Token, period_before_name: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_metadata(begin, period_before_name, end)
+        self.0
+            .borrow_mut()
+            .end_metadata(begin, period_before_name, end)
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
@@ -189,30 +213,48 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_type_variables_defined(&mut self, token: Token, count: usize) {
-        self.0.borrow_mut().handle_type_variables_defined(token, count)
+        self.0
+            .borrow_mut()
+            .handle_type_variables_defined(token, count)
     }
 
     fn begin_type_variable(&mut self, token: Token) {
         self.0.borrow_mut().begin_type_variable(token)
     }
 
-    fn end_type_variable(&mut self, token: Token, index: usize, extends_or_super: Option<Token>, variance: Option<Token>) {
-        self.0.borrow_mut().end_type_variable(token, index, extends_or_super, variance)
+    fn end_type_variable(
+        &mut self,
+        token: Token,
+        index: usize,
+        extends_or_super: Option<Token>,
+        variance: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_type_variable(token, index, extends_or_super, variance)
     }
 
     fn begin_record_type(&mut self, left_paren: Token) {
         self.0.borrow_mut().begin_record_type(left_paren)
     }
 
-    fn end_record_type(&mut self, left_paren: Token, question: Option<Token>, count: usize, has_named_fields: bool) {
-        self.0.borrow_mut().end_record_type(left_paren, question, count, has_named_fields)
+    fn end_record_type(
+        &mut self,
+        left_paren: Token,
+        question: Option<Token>,
+        count: usize,
+        has_named_fields: bool,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_record_type(left_paren, question, count, has_named_fields)
     }
 
-    fn begin_record_type_entry(&mut self, ) {
+    fn begin_record_type_entry(&mut self) {
         self.0.borrow_mut().begin_record_type_entry()
     }
 
-    fn end_record_type_entry(&mut self, ) {
+    fn end_record_type_entry(&mut self) {
         self.0.borrow_mut().end_record_type_entry()
     }
 
@@ -221,11 +263,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_record_type_named_fields(&mut self, left_brace: Token) {
-        self.0.borrow_mut().begin_record_type_named_fields(left_brace)
+        self.0
+            .borrow_mut()
+            .begin_record_type_named_fields(left_brace)
     }
 
     fn end_record_type_named_fields(&mut self, count: usize, left_brace: Token) {
-        self.0.borrow_mut().end_record_type_named_fields(count, left_brace)
+        self.0
+            .borrow_mut()
+            .end_record_type_named_fields(count, left_brace)
     }
 
     fn begin_function_type(&mut self, begin: Token) {
@@ -241,7 +287,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, token: Token) {
-        self.0.borrow_mut().handle_void_keyword_with_type_arguments(token)
+        self.0
+            .borrow_mut()
+            .handle_void_keyword_with_type_arguments(token)
     }
 
     fn handle_literal_int(&mut self, token: Token) {
@@ -249,7 +297,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
-        self.0.borrow_mut().handle_literal_int_with_separators(token)
+        self.0
+            .borrow_mut()
+            .handle_literal_int_with_separators(token)
     }
 
     fn handle_literal_double(&mut self, token: Token) {
@@ -257,7 +307,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
-        self.0.borrow_mut().handle_literal_double_with_separators(token)
+        self.0
+            .borrow_mut()
+            .handle_literal_double_with_separators(token)
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
@@ -273,15 +325,21 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_interpolation_expression(&mut self, left: Token, right: Option<Token>) {
-        self.0.borrow_mut().handle_interpolation_expression(left, right)
+        self.0
+            .borrow_mut()
+            .handle_interpolation_expression(left, right)
     }
 
     fn end_literal_string(&mut self, interpolation_count: usize, end: Token) {
-        self.0.borrow_mut().end_literal_string(interpolation_count, end)
+        self.0
+            .borrow_mut()
+            .end_literal_string(interpolation_count, end)
     }
 
     fn handle_adjacent_string_literals(&mut self, start: Token, literal_count: usize) {
-        self.0.borrow_mut().handle_adjacent_string_literals(start, literal_count)
+        self.0
+            .borrow_mut()
+            .handle_adjacent_string_literals(start, literal_count)
     }
 
     fn begin_literal_symbol(&mut self, token: Token) {
@@ -293,7 +351,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_literal_symbol(&mut self, hash: Token, identifier_count: usize) {
-        self.0.borrow_mut().end_literal_symbol(hash, identifier_count)
+        self.0
+            .borrow_mut()
+            .end_literal_symbol(hash, identifier_count)
     }
 
     fn handle_operator(&mut self, token: Token) {
@@ -340,16 +400,45 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().end_const_literal(end)
     }
 
-    fn handle_literal_list(&mut self, count: usize, left: Token, const_keyword: Option<Token>, right: Token) {
-        self.0.borrow_mut().handle_literal_list(count, left, const_keyword, right)
+    fn handle_literal_list(
+        &mut self,
+        count: usize,
+        left: Token,
+        const_keyword: Option<Token>,
+        right: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_literal_list(count, left, const_keyword, right)
     }
 
-    fn handle_literal_set_or_map(&mut self, count: usize, left: Token, const_keyword: Option<Token>, right: Token, has_set_entry: bool) {
-        self.0.borrow_mut().handle_literal_set_or_map(count, left, const_keyword, right, has_set_entry)
+    fn handle_literal_set_or_map(
+        &mut self,
+        count: usize,
+        left: Token,
+        const_keyword: Option<Token>,
+        right: Token,
+        has_set_entry: bool,
+    ) {
+        self.0.borrow_mut().handle_literal_set_or_map(
+            count,
+            left,
+            const_keyword,
+            right,
+            has_set_entry,
+        )
     }
 
-    fn handle_literal_map_entry(&mut self, colon: Token, end: Token, null_aware_key: Option<Token>, null_aware_value: Option<Token>) {
-        self.0.borrow_mut().handle_literal_map_entry(colon, end, null_aware_key, null_aware_value)
+    fn handle_literal_map_entry(
+        &mut self,
+        colon: Token,
+        end: Token,
+        null_aware_key: Option<Token>,
+        null_aware_value: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_literal_map_entry(colon, end, null_aware_key, null_aware_value)
     }
 
     fn begin_new_expression(&mut self, token: Token) {
@@ -361,7 +450,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, token: Token) {
-        self.0.borrow_mut().begin_parenthesized_expression_or_record_literal(token)
+        self.0
+            .borrow_mut()
+            .begin_parenthesized_expression_or_record_literal(token)
     }
 
     fn end_parenthesized_expression(&mut self, token: Token) {
@@ -369,7 +460,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_record_literal(&mut self, token: Token, count: usize, const_keyword: Option<Token>) {
-        self.0.borrow_mut().end_record_literal(token, count, const_keyword)
+        self.0
+            .borrow_mut()
+            .end_record_literal(token, count, const_keyword)
     }
 
     fn handle_named_record_field(&mut self, colon: Token) {
@@ -405,15 +498,21 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_send_without_arguments(&mut self, begin: Token, end: Token, next: Token) {
-        self.0.borrow_mut().handle_send_without_arguments(begin, end, next)
+        self.0
+            .borrow_mut()
+            .handle_send_without_arguments(begin, end, next)
     }
 
     fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {
-        self.0.borrow_mut().handle_dot_access(token, end, is_null_aware)
+        self.0
+            .borrow_mut()
+            .handle_dot_access(token, end, is_null_aware)
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
-        self.0.borrow_mut().handle_indexed_expression(question, open, close)
+        self.0
+            .borrow_mut()
+            .handle_indexed_expression(question, open, close)
     }
 
     fn begin_constructor_reference(&mut self, start: Token) {
@@ -421,11 +520,21 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_no_constructor_reference_continuation_after_type_arguments(&mut self, token: Token) {
-        self.0.borrow_mut().handle_no_constructor_reference_continuation_after_type_arguments(token)
+        self.0
+            .borrow_mut()
+            .handle_no_constructor_reference_continuation_after_type_arguments(token)
     }
 
-    fn end_constructor_reference(&mut self, start: Token, period_before_name: Option<Token>, end: Token, context: ConstructorReferenceContext) {
-        self.0.borrow_mut().end_constructor_reference(start, period_before_name, end, context)
+    fn end_constructor_reference(
+        &mut self,
+        start: Token,
+        period_before_name: Option<Token>,
+        end: Token,
+        context: ConstructorReferenceContext,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_constructor_reference(start, period_before_name, end, context)
     }
 
     fn begin_await_expression(&mut self, token: Token) {
@@ -445,7 +554,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
-        self.0.borrow_mut().handle_assignment_expression(operator, end)
+        self.0
+            .borrow_mut()
+            .handle_assignment_expression(operator, end)
     }
 
     fn begin_cascade(&mut self, operator: Token) {
@@ -453,10 +564,12 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_cascade_access(&mut self, operator: Token, end: Token, is_null_aware: bool) {
-        self.0.borrow_mut().handle_cascade_access(operator, end, is_null_aware)
+        self.0
+            .borrow_mut()
+            .handle_cascade_access(operator, end, is_null_aware)
     }
 
-    fn end_cascade(&mut self, ) {
+    fn end_cascade(&mut self) {
         self.0.borrow_mut().end_cascade()
     }
 
@@ -464,20 +577,26 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().begin_conditional_expression(question)
     }
 
-    fn handle_conditional_expression_colon(&mut self, ) {
+    fn handle_conditional_expression_colon(&mut self) {
         self.0.borrow_mut().handle_conditional_expression_colon()
     }
 
     fn end_conditional_expression(&mut self, question: Token, colon: Token, end: Token) {
-        self.0.borrow_mut().end_conditional_expression(question, colon, end)
+        self.0
+            .borrow_mut()
+            .end_conditional_expression(question, colon, end)
     }
 
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
-        self.0.borrow_mut().handle_unary_prefix_assignment_expression(operator)
+        self.0
+            .borrow_mut()
+            .handle_unary_prefix_assignment_expression(operator)
     }
 
     fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
-        self.0.borrow_mut().handle_unary_postfix_assignment_expression(operator)
+        self.0
+            .borrow_mut()
+            .handle_unary_postfix_assignment_expression(operator)
     }
 
     fn begin_function_expression(&mut self, token: Token) {
@@ -497,15 +616,26 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_implicit_creation_expression(&mut self, token: Token) {
-        self.0.borrow_mut().begin_implicit_creation_expression(token)
+        self.0
+            .borrow_mut()
+            .begin_implicit_creation_expression(token)
     }
 
     fn end_implicit_creation_expression(&mut self, begin: Token, open_angle: Token) {
-        self.0.borrow_mut().end_implicit_creation_expression(begin, open_angle)
+        self.0
+            .borrow_mut()
+            .end_implicit_creation_expression(begin, open_angle)
     }
 
-    fn handle_augment_super_expression(&mut self, augment: Token, super_kw: Token, context: IdentifierContext) {
-        self.0.borrow_mut().handle_augment_super_expression(augment, super_kw, context)
+    fn handle_augment_super_expression(
+        &mut self,
+        augment: Token,
+        super_kw: Token,
+        context: IdentifierContext,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_augment_super_expression(augment, super_kw, context)
     }
 
     fn handle_dot_shorthand_head(&mut self, dot: Token) {
@@ -557,7 +687,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_type_argument_application(&mut self, open_angle: Token) {
-        self.0.borrow_mut().handle_type_argument_application(open_angle)
+        self.0
+            .borrow_mut()
+            .handle_type_argument_application(open_angle)
     }
 
     fn begin_pattern(&mut self, token: Token) {
@@ -613,7 +745,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_rest_pattern(&mut self, dots: Token, has_sub_pattern: bool) {
-        self.0.borrow_mut().handle_rest_pattern(dots, has_sub_pattern)
+        self.0
+            .borrow_mut()
+            .handle_rest_pattern(dots, has_sub_pattern)
     }
 
     fn handle_record_pattern(&mut self, left_paren: Token, count: usize) {
@@ -628,24 +762,46 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().handle_pattern_field(colon)
     }
 
-    fn handle_object_pattern(&mut self, first_identifier: Token, dot: Option<Token>, second_identifier: Option<Token>) {
-        self.0.borrow_mut().handle_object_pattern(first_identifier, dot, second_identifier)
+    fn handle_object_pattern(
+        &mut self,
+        first_identifier: Token,
+        dot: Option<Token>,
+        second_identifier: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_object_pattern(first_identifier, dot, second_identifier)
     }
 
     fn handle_object_pattern_fields(&mut self, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().handle_object_pattern_fields(count, begin, end)
+        self.0
+            .borrow_mut()
+            .handle_object_pattern_fields(count, begin, end)
     }
 
     fn handle_wildcard_pattern(&mut self, keyword: Option<Token>, wildcard: Token) {
-        self.0.borrow_mut().handle_wildcard_pattern(keyword, wildcard)
+        self.0
+            .borrow_mut()
+            .handle_wildcard_pattern(keyword, wildcard)
     }
 
     fn handle_assigned_variable_pattern(&mut self, variable: Token) {
-        self.0.borrow_mut().handle_assigned_variable_pattern(variable)
+        self.0
+            .borrow_mut()
+            .handle_assigned_variable_pattern(variable)
     }
 
-    fn handle_declared_variable_pattern(&mut self, keyword: Option<Token>, variable: Token, in_assignment_pattern: bool) {
-        self.0.borrow_mut().handle_declared_variable_pattern(keyword, variable, in_assignment_pattern)
+    fn handle_declared_variable_pattern(
+        &mut self,
+        keyword: Option<Token>,
+        variable: Token,
+        in_assignment_pattern: bool,
+    ) {
+        self.0.borrow_mut().handle_declared_variable_pattern(
+            keyword,
+            variable,
+            in_assignment_pattern,
+        )
     }
 
     fn begin_formal_parameters(&mut self, token: Token, kind: MemberKind) {
@@ -653,48 +809,109 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_formal_parameters(&mut self, count: usize, begin: Token, end: Token, kind: MemberKind) {
-        self.0.borrow_mut().end_formal_parameters(count, begin, end, kind)
+        self.0
+            .borrow_mut()
+            .end_formal_parameters(count, begin, end, kind)
     }
 
     fn begin_optional_formal_parameters(&mut self, token: Token) {
         self.0.borrow_mut().begin_optional_formal_parameters(token)
     }
 
-    fn end_optional_formal_parameters(&mut self, count: usize, begin: Token, end: Token, kind: MemberKind) {
-        self.0.borrow_mut().end_optional_formal_parameters(count, begin, end, kind)
+    fn end_optional_formal_parameters(
+        &mut self,
+        count: usize,
+        begin: Token,
+        end: Token,
+        kind: MemberKind,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_optional_formal_parameters(count, begin, end, kind)
     }
 
-    fn begin_formal_parameter(&mut self, token: Token, kind: MemberKind, required: Option<Token>, covariant_kw: Option<Token>, var_final_or_const: Option<Token>) {
-        self.0.borrow_mut().begin_formal_parameter(token, kind, required, covariant_kw, var_final_or_const)
+    fn begin_formal_parameter(
+        &mut self,
+        token: Token,
+        kind: MemberKind,
+        required: Option<Token>,
+        covariant_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+    ) {
+        self.0.borrow_mut().begin_formal_parameter(
+            token,
+            kind,
+            required,
+            covariant_kw,
+            var_final_or_const,
+        )
     }
 
     fn begin_function_typed_formal_parameter(&mut self, token: Token) {
-        self.0.borrow_mut().begin_function_typed_formal_parameter(token)
+        self.0
+            .borrow_mut()
+            .begin_function_typed_formal_parameter(token)
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
-        self.0.borrow_mut().end_function_typed_formal_parameter(token, question)
+        self.0
+            .borrow_mut()
+            .end_function_typed_formal_parameter(token, question)
     }
 
     fn begin_formal_parameter_default_value_expression(&mut self, token: Token) {
-        self.0.borrow_mut().begin_formal_parameter_default_value_expression(token)
+        self.0
+            .borrow_mut()
+            .begin_formal_parameter_default_value_expression(token)
     }
 
     fn end_formal_parameter_default_value_expression(&mut self, token: Token) {
-        self.0.borrow_mut().end_formal_parameter_default_value_expression(token)
+        self.0
+            .borrow_mut()
+            .end_formal_parameter_default_value_expression(token)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_formal_parameter(&mut self, var_or_final: Option<Token>, this_keyword: Option<Token>, super_keyword: Option<Token>, period_after_this_or_super: Option<Token>, name: Token, initializer_start: Option<Token>, initializer_end: Option<Token>, kind: FormalParameterKind, member_kind: MemberKind) {
-        self.0.borrow_mut().end_formal_parameter(var_or_final, this_keyword, super_keyword, period_after_this_or_super, name, initializer_start, initializer_end, kind, member_kind)
+    fn end_formal_parameter(
+        &mut self,
+        var_or_final: Option<Token>,
+        this_keyword: Option<Token>,
+        super_keyword: Option<Token>,
+        period_after_this_or_super: Option<Token>,
+        name: Token,
+        initializer_start: Option<Token>,
+        initializer_end: Option<Token>,
+        kind: FormalParameterKind,
+        member_kind: MemberKind,
+    ) {
+        self.0.borrow_mut().end_formal_parameter(
+            var_or_final,
+            this_keyword,
+            super_keyword,
+            period_after_this_or_super,
+            name,
+            initializer_start,
+            initializer_end,
+            kind,
+            member_kind,
+        )
     }
 
-    fn handle_valued_formal_parameter(&mut self, equals: Token, end: Token, kind: FormalParameterKind) {
-        self.0.borrow_mut().handle_valued_formal_parameter(equals, end, kind)
+    fn handle_valued_formal_parameter(
+        &mut self,
+        equals: Token,
+        end: Token,
+        kind: FormalParameterKind,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_valued_formal_parameter(equals, end, kind)
     }
 
     fn handle_formal_parameter_without_value(&mut self, token: Token) {
-        self.0.borrow_mut().handle_formal_parameter_without_value(token)
+        self.0
+            .borrow_mut()
+            .handle_formal_parameter_without_value(token)
     }
 
     fn handle_no_formal_parameters(&mut self, token: Token, kind: MemberKind) {
@@ -706,43 +923,87 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_invalid_top_level_declaration(&mut self, end: Token) {
-        self.0.borrow_mut().handle_invalid_top_level_declaration(end)
+        self.0
+            .borrow_mut()
+            .handle_invalid_top_level_declaration(end)
     }
 
     fn begin_uncategorized_top_level_declaration(&mut self, token: Token) {
-        self.0.borrow_mut().begin_uncategorized_top_level_declaration(token)
+        self.0
+            .borrow_mut()
+            .begin_uncategorized_top_level_declaration(token)
     }
 
     fn begin_top_level_member(&mut self, token: Token) {
         self.0.borrow_mut().begin_top_level_member(token)
     }
 
-    fn begin_top_level_method(&mut self, last_consumed: Token, augment: Option<Token>, external: Option<Token>) {
-        self.0.borrow_mut().begin_top_level_method(last_consumed, augment, external)
+    fn begin_top_level_method(
+        &mut self,
+        last_consumed: Token,
+        augment: Option<Token>,
+        external: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_top_level_method(last_consumed, augment, external)
     }
 
     fn end_top_level_method(&mut self, begin: Token, get_or_set: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_top_level_method(begin, get_or_set, end)
+        self.0
+            .borrow_mut()
+            .end_top_level_method(begin, get_or_set, end)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_top_level_fields(&mut self, augment_kw: Option<Token>, abstract_kw: Option<Token>, external_kw: Option<Token>, static_kw: Option<Token>, covariant_kw: Option<Token>, late_kw: Option<Token>, var_final_or_const: Option<Token>, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_top_level_fields(augment_kw, abstract_kw, external_kw, static_kw, covariant_kw, late_kw, var_final_or_const, count, begin, end)
+    fn end_top_level_fields(
+        &mut self,
+        augment_kw: Option<Token>,
+        abstract_kw: Option<Token>,
+        external_kw: Option<Token>,
+        static_kw: Option<Token>,
+        covariant_kw: Option<Token>,
+        late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        count: usize,
+        begin: Token,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_top_level_fields(
+            augment_kw,
+            abstract_kw,
+            external_kw,
+            static_kw,
+            covariant_kw,
+            late_kw,
+            var_final_or_const,
+            count,
+            begin,
+            end,
+        )
     }
 
     fn begin_typedef(&mut self, token: Token) {
         self.0.borrow_mut().begin_typedef(token)
     }
 
-    fn end_typedef(&mut self, augment: Option<Token>, typedef: Token, equals: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_typedef(augment, typedef, equals, end)
+    fn end_typedef(
+        &mut self,
+        augment: Option<Token>,
+        typedef: Token,
+        equals: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_typedef(augment, typedef, equals, end)
     }
 
-    fn begin_member(&mut self, ) {
+    fn begin_member(&mut self) {
         self.0.borrow_mut().begin_member()
     }
 
-    fn end_member(&mut self, ) {
+    fn end_member(&mut self) {
         self.0.borrow_mut().end_member()
     }
 
@@ -751,37 +1012,170 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_fields(&mut self, kind: DeclarationKind, augment_kw: Option<Token>, abstract_kw: Option<Token>, external_kw: Option<Token>, static_kw: Option<Token>, covariant_kw: Option<Token>, late_kw: Option<Token>, var_final_or_const: Option<Token>, last_consumed: Token) {
-        self.0.borrow_mut().begin_fields(kind, augment_kw, abstract_kw, external_kw, static_kw, covariant_kw, late_kw, var_final_or_const, last_consumed)
+    fn begin_fields(
+        &mut self,
+        kind: DeclarationKind,
+        augment_kw: Option<Token>,
+        abstract_kw: Option<Token>,
+        external_kw: Option<Token>,
+        static_kw: Option<Token>,
+        covariant_kw: Option<Token>,
+        late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        last_consumed: Token,
+    ) {
+        self.0.borrow_mut().begin_fields(
+            kind,
+            augment_kw,
+            abstract_kw,
+            external_kw,
+            static_kw,
+            covariant_kw,
+            late_kw,
+            var_final_or_const,
+            last_consumed,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_fields(&mut self, kind: DeclarationKind, abstract_kw: Option<Token>, augment_kw: Option<Token>, external_kw: Option<Token>, static_kw: Option<Token>, covariant_kw: Option<Token>, late_kw: Option<Token>, var_final_or_const: Option<Token>, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_fields(kind, abstract_kw, augment_kw, external_kw, static_kw, covariant_kw, late_kw, var_final_or_const, count, begin, end)
+    fn end_fields(
+        &mut self,
+        kind: DeclarationKind,
+        abstract_kw: Option<Token>,
+        augment_kw: Option<Token>,
+        external_kw: Option<Token>,
+        static_kw: Option<Token>,
+        covariant_kw: Option<Token>,
+        late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        count: usize,
+        begin: Token,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_fields(
+            kind,
+            abstract_kw,
+            augment_kw,
+            external_kw,
+            static_kw,
+            covariant_kw,
+            late_kw,
+            var_final_or_const,
+            count,
+            begin,
+            end,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_constructor(&mut self, kind: DeclarationKind, augment_kw: Option<Token>, external_kw: Option<Token>, static_kw: Option<Token>, covariant_kw: Option<Token>, var_final_or_const: Option<Token>, get_or_set: Option<Token>, new_kw: Option<Token>, name: Token, enclosing_declaration_name: Option<&str>) {
-        self.0.borrow_mut().begin_constructor(kind, augment_kw, external_kw, static_kw, covariant_kw, var_final_or_const, get_or_set, new_kw, name, enclosing_declaration_name)
+    fn begin_constructor(
+        &mut self,
+        kind: DeclarationKind,
+        augment_kw: Option<Token>,
+        external_kw: Option<Token>,
+        static_kw: Option<Token>,
+        covariant_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        get_or_set: Option<Token>,
+        new_kw: Option<Token>,
+        name: Token,
+        enclosing_declaration_name: Option<&str>,
+    ) {
+        self.0.borrow_mut().begin_constructor(
+            kind,
+            augment_kw,
+            external_kw,
+            static_kw,
+            covariant_kw,
+            var_final_or_const,
+            get_or_set,
+            new_kw,
+            name,
+            enclosing_declaration_name,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_constructor(&mut self, kind: DeclarationKind, begin: Token, new_kw: Option<Token>, begin_param: Token, begin_initializers: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_constructor(kind, begin, new_kw, begin_param, begin_initializers, end)
+    fn end_constructor(
+        &mut self,
+        kind: DeclarationKind,
+        begin: Token,
+        new_kw: Option<Token>,
+        begin_param: Token,
+        begin_initializers: Option<Token>,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_constructor(
+            kind,
+            begin,
+            new_kw,
+            begin_param,
+            begin_initializers,
+            end,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_method(&mut self, kind: DeclarationKind, augment_kw: Option<Token>, external_kw: Option<Token>, static_kw: Option<Token>, covariant_kw: Option<Token>, var_final_or_const: Option<Token>, get_or_set: Option<Token>, name: Token, enclosing_declaration_name: Option<&str>) {
-        self.0.borrow_mut().begin_method(kind, augment_kw, external_kw, static_kw, covariant_kw, var_final_or_const, get_or_set, name, enclosing_declaration_name)
+    fn begin_method(
+        &mut self,
+        kind: DeclarationKind,
+        augment_kw: Option<Token>,
+        external_kw: Option<Token>,
+        static_kw: Option<Token>,
+        covariant_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        get_or_set: Option<Token>,
+        name: Token,
+        enclosing_declaration_name: Option<&str>,
+    ) {
+        self.0.borrow_mut().begin_method(
+            kind,
+            augment_kw,
+            external_kw,
+            static_kw,
+            covariant_kw,
+            var_final_or_const,
+            get_or_set,
+            name,
+            enclosing_declaration_name,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_method(&mut self, kind: DeclarationKind, get_or_set: Option<Token>, begin: Token, begin_param: Token, begin_initializers: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_method(kind, get_or_set, begin, begin_param, begin_initializers, end)
+    fn end_method(
+        &mut self,
+        kind: DeclarationKind,
+        get_or_set: Option<Token>,
+        begin: Token,
+        begin_param: Token,
+        begin_initializers: Option<Token>,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_method(
+            kind,
+            get_or_set,
+            begin,
+            begin_param,
+            begin_initializers,
+            end,
+        )
     }
 
-    fn begin_factory(&mut self, kind: DeclarationKind, last_consumed: Token, augment_kw: Option<Token>, external_kw: Option<Token>, const_keyword: Option<Token>) {
-        self.0.borrow_mut().begin_factory(kind, last_consumed, augment_kw, external_kw, const_keyword)
+    fn begin_factory(
+        &mut self,
+        kind: DeclarationKind,
+        last_consumed: Token,
+        augment_kw: Option<Token>,
+        external_kw: Option<Token>,
+        const_keyword: Option<Token>,
+    ) {
+        self.0.borrow_mut().begin_factory(
+            kind,
+            last_consumed,
+            augment_kw,
+            external_kw,
+            const_keyword,
+        )
     }
 
     fn end_factory(&mut self, kind: DeclarationKind, begin: Token, factory: Token, end: Token) {
@@ -793,7 +1187,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_invalid_operator_name(&mut self, operator: Token, name: Token) {
-        self.0.borrow_mut().handle_invalid_operator_name(operator, name)
+        self.0
+            .borrow_mut()
+            .handle_invalid_operator_name(operator, name)
     }
 
     fn handle_no_identifier(&mut self, token: Token, context: IdentifierContext) {
@@ -820,7 +1216,7 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().end_initializers(count, begin, end)
     }
 
-    fn handle_no_initializers(&mut self, ) {
+    fn handle_no_initializers(&mut self) {
         self.0.borrow_mut().handle_no_initializers()
     }
 
@@ -833,7 +1229,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_function_body_skipped(&mut self, begin: Token, end: Token, is_expression_body: bool) {
-        self.0.borrow_mut().handle_function_body_skipped(begin, end, is_expression_body)
+        self.0
+            .borrow_mut()
+            .handle_function_body_skipped(begin, end, is_expression_body)
     }
 
     fn handle_empty_function_body(&mut self, semicolon: Token) {
@@ -845,11 +1243,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_native_function_body_skipped(&mut self, native: Token, semicolon: Token) {
-        self.0.borrow_mut().handle_native_function_body_skipped(native, semicolon)
+        self.0
+            .borrow_mut()
+            .handle_native_function_body_skipped(native, semicolon)
     }
 
     fn handle_native_function_body_ignored(&mut self, native: Token, next: Token) {
-        self.0.borrow_mut().handle_native_function_body_ignored(native, next)
+        self.0
+            .borrow_mut()
+            .handle_native_function_body_ignored(native, next)
     }
 
     fn begin_type_list(&mut self, token: Token) {
@@ -861,14 +1263,16 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_named_mixin_application_with_clause(&mut self, with_keyword: Token) {
-        self.0.borrow_mut().handle_named_mixin_application_with_clause(with_keyword)
+        self.0
+            .borrow_mut()
+            .handle_named_mixin_application_with_clause(with_keyword)
     }
 
     fn handle_class_with_clause(&mut self, with_keyword: Token) {
         self.0.borrow_mut().handle_class_with_clause(with_keyword)
     }
 
-    fn handle_class_no_with_clause(&mut self, ) {
+    fn handle_class_no_with_clause(&mut self) {
         self.0.borrow_mut().handle_class_no_with_clause()
     }
 
@@ -876,7 +1280,7 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().handle_enum_with_clause(with_keyword)
     }
 
-    fn handle_enum_no_with_clause(&mut self, ) {
+    fn handle_enum_no_with_clause(&mut self) {
         self.0.borrow_mut().handle_enum_no_with_clause()
     }
 
@@ -889,7 +1293,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_class_header(&mut self, begin: Token, class: Token, native: Option<Token>) {
-        self.0.borrow_mut().handle_class_header(begin, class, native)
+        self.0
+            .borrow_mut()
+            .handle_class_header(begin, class, native)
     }
 
     fn handle_mixin_header(&mut self, mixin: Token) {
@@ -904,17 +1310,40 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().handle_recover_declaration_header(kind)
     }
 
-    fn handle_recover_mixin_header(&mut self, ) {
+    fn handle_recover_mixin_header(&mut self) {
         self.0.borrow_mut().handle_recover_mixin_header()
     }
 
     fn begin_class_or_mixin_or_named_mixin_application_prelude(&mut self, token: Token) {
-        self.0.borrow_mut().begin_class_or_mixin_or_named_mixin_application_prelude(token)
+        self.0
+            .borrow_mut()
+            .begin_class_or_mixin_or_named_mixin_application_prelude(token)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_class_declaration(&mut self, begin: Token, abstract_kw: Option<Token>, sealed_kw: Option<Token>, base_kw: Option<Token>, interface_kw: Option<Token>, final_kw: Option<Token>, augment_kw: Option<Token>, mixin_kw: Option<Token>, name: Token) {
-        self.0.borrow_mut().begin_class_declaration(begin, abstract_kw, sealed_kw, base_kw, interface_kw, final_kw, augment_kw, mixin_kw, name)
+    fn begin_class_declaration(
+        &mut self,
+        begin: Token,
+        abstract_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
+        augment_kw: Option<Token>,
+        mixin_kw: Option<Token>,
+        name: Token,
+    ) {
+        self.0.borrow_mut().begin_class_declaration(
+            begin,
+            abstract_kw,
+            sealed_kw,
+            base_kw,
+            interface_kw,
+            final_kw,
+            augment_kw,
+            mixin_kw,
+            name,
+        )
     }
 
     fn end_class_declaration(&mut self, begin: Token, end: Token) {
@@ -922,28 +1351,77 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_named_mixin_application(&mut self, begin: Token, abstract_kw: Option<Token>, sealed_kw: Option<Token>, base_kw: Option<Token>, interface_kw: Option<Token>, final_kw: Option<Token>, augment_kw: Option<Token>, mixin_kw: Option<Token>, name: Token) {
-        self.0.borrow_mut().begin_named_mixin_application(begin, abstract_kw, sealed_kw, base_kw, interface_kw, final_kw, augment_kw, mixin_kw, name)
+    fn begin_named_mixin_application(
+        &mut self,
+        begin: Token,
+        abstract_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
+        augment_kw: Option<Token>,
+        mixin_kw: Option<Token>,
+        name: Token,
+    ) {
+        self.0.borrow_mut().begin_named_mixin_application(
+            begin,
+            abstract_kw,
+            sealed_kw,
+            base_kw,
+            interface_kw,
+            final_kw,
+            augment_kw,
+            mixin_kw,
+            name,
+        )
     }
 
-    fn end_named_mixin_application(&mut self, begin: Token, class: Token, equals: Token, implements: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_named_mixin_application(begin, class, equals, implements, end)
+    fn end_named_mixin_application(
+        &mut self,
+        begin: Token,
+        class: Token,
+        equals: Token,
+        implements: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_named_mixin_application(begin, class, equals, implements, end)
     }
 
     fn begin_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, token: Token) {
-        self.0.borrow_mut().begin_class_or_mixin_or_extension_body(kind, token)
+        self.0
+            .borrow_mut()
+            .begin_class_or_mixin_or_extension_body(kind, token)
     }
 
-    fn end_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_class_or_mixin_or_extension_body(kind, count, begin, end)
+    fn end_class_or_mixin_or_extension_body(
+        &mut self,
+        kind: DeclarationKind,
+        count: usize,
+        begin: Token,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_class_or_mixin_or_extension_body(kind, count, begin, end)
     }
 
     fn handle_no_class_body(&mut self, semicolon: Token) {
         self.0.borrow_mut().handle_no_class_body(semicolon)
     }
 
-    fn begin_mixin_declaration(&mut self, begin: Token, augment_kw: Option<Token>, base_kw: Option<Token>, mixin: Token, name: Token) {
-        self.0.borrow_mut().begin_mixin_declaration(begin, augment_kw, base_kw, mixin, name)
+    fn begin_mixin_declaration(
+        &mut self,
+        begin: Token,
+        augment_kw: Option<Token>,
+        base_kw: Option<Token>,
+        mixin: Token,
+        name: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_mixin_declaration(begin, augment_kw, base_kw, mixin, name)
     }
 
     fn end_mixin_declaration(&mut self, begin: Token, end: Token) {
@@ -955,19 +1433,45 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_enum_declaration_prelude(&mut self, enum_keyword: Token) {
-        self.0.borrow_mut().begin_enum_declaration_prelude(enum_keyword)
+        self.0
+            .borrow_mut()
+            .begin_enum_declaration_prelude(enum_keyword)
     }
 
-    fn begin_enum_declaration(&mut self, begin: Token, augment_kw: Option<Token>, enum_keyword: Token, name: Token) {
-        self.0.borrow_mut().begin_enum_declaration(begin, augment_kw, enum_keyword, name)
+    fn begin_enum_declaration(
+        &mut self,
+        begin: Token,
+        augment_kw: Option<Token>,
+        enum_keyword: Token,
+        name: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_enum_declaration(begin, augment_kw, enum_keyword, name)
     }
 
-    fn end_enum_declaration(&mut self, begin: Token, enum_keyword: Token, left_brace: Token, member_count: usize, end: Token) {
-        self.0.borrow_mut().end_enum_declaration(begin, enum_keyword, left_brace, member_count, end)
+    fn end_enum_declaration(
+        &mut self,
+        begin: Token,
+        enum_keyword: Token,
+        left_brace: Token,
+        member_count: usize,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_enum_declaration(begin, enum_keyword, left_brace, member_count, end)
     }
 
-    fn handle_enum_header(&mut self, augment: Option<Token>, enum_keyword: Token, left_brace: Token) {
-        self.0.borrow_mut().handle_enum_header(augment, enum_keyword, left_brace)
+    fn handle_enum_header(
+        &mut self,
+        augment: Option<Token>,
+        enum_keyword: Token,
+        left_brace: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_enum_header(augment, enum_keyword, left_brace)
     }
 
     fn begin_enum_body(&mut self, token: Token) {
@@ -979,7 +1483,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_enum_elements(&mut self, elements_end: Token, count: usize) {
-        self.0.borrow_mut().handle_enum_elements(elements_end, count)
+        self.0
+            .borrow_mut()
+            .handle_enum_elements(elements_end, count)
     }
 
     fn handle_enum_element(&mut self, begin: Token, augment: Option<Token>) {
@@ -991,27 +1497,64 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_extension_declaration_prelude(&mut self, extension_keyword: Token) {
-        self.0.borrow_mut().begin_extension_declaration_prelude(extension_keyword)
+        self.0
+            .borrow_mut()
+            .begin_extension_declaration_prelude(extension_keyword)
     }
 
-    fn begin_extension_declaration(&mut self, augment: Option<Token>, extension_keyword: Token, name: Option<Token>) {
-        self.0.borrow_mut().begin_extension_declaration(augment, extension_keyword, name)
+    fn begin_extension_declaration(
+        &mut self,
+        augment: Option<Token>,
+        extension_keyword: Token,
+        name: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_extension_declaration(augment, extension_keyword, name)
     }
 
-    fn end_extension_declaration(&mut self, begin: Token, extension_keyword: Token, on: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_extension_declaration(begin, extension_keyword, on, end)
+    fn end_extension_declaration(
+        &mut self,
+        begin: Token,
+        extension_keyword: Token,
+        on: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_extension_declaration(begin, extension_keyword, on, end)
     }
 
     fn handle_no_extension_body(&mut self, semicolon: Token) {
         self.0.borrow_mut().handle_no_extension_body(semicolon)
     }
 
-    fn begin_extension_type_declaration(&mut self, augment_kw: Option<Token>, extension_keyword: Token, name: Token) {
-        self.0.borrow_mut().begin_extension_type_declaration(augment_kw, extension_keyword, name)
+    fn begin_extension_type_declaration(
+        &mut self,
+        augment_kw: Option<Token>,
+        extension_keyword: Token,
+        name: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_extension_type_declaration(augment_kw, extension_keyword, name)
     }
 
-    fn end_extension_type_declaration(&mut self, begin: Token, augment_kw: Option<Token>, extension_keyword: Token, type_keyword: Token, end: Token) {
-        self.0.borrow_mut().end_extension_type_declaration(begin, augment_kw, extension_keyword, type_keyword, end)
+    fn end_extension_type_declaration(
+        &mut self,
+        begin: Token,
+        augment_kw: Option<Token>,
+        extension_keyword: Token,
+        type_keyword: Token,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_extension_type_declaration(
+            begin,
+            augment_kw,
+            extension_keyword,
+            type_keyword,
+            end,
+        )
     }
 
     fn handle_no_extension_type_body(&mut self, semicolon: Token) {
@@ -1023,11 +1566,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_redirecting_factory_body(&mut self, equals: Token, end: Token) {
-        self.0.borrow_mut().end_redirecting_factory_body(equals, end)
+        self.0
+            .borrow_mut()
+            .end_redirecting_factory_body(equals, end)
     }
 
     fn handle_no_type_name_in_constructor_reference(&mut self, token: Token) {
-        self.0.borrow_mut().handle_no_type_name_in_constructor_reference(token)
+        self.0
+            .borrow_mut()
+            .handle_no_type_name_in_constructor_reference(token)
     }
 
     fn handle_mixin_with_clause(&mut self, with_keyword: Token) {
@@ -1035,23 +1582,53 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn begin_primary_constructor_body(&mut self, token: Token, augment: Option<Token>) {
-        self.0.borrow_mut().begin_primary_constructor_body(token, augment)
+        self.0
+            .borrow_mut()
+            .begin_primary_constructor_body(token, augment)
     }
 
-    fn end_primary_constructor_body(&mut self, begin: Token, this: Token, begin_initializers: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_primary_constructor_body(begin, this, begin_initializers, end)
+    fn end_primary_constructor_body(
+        &mut self,
+        begin: Token,
+        this: Token,
+        begin_initializers: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_primary_constructor_body(begin, this, begin_initializers, end)
     }
 
     fn begin_primary_constructor(&mut self, begin: Token) {
         self.0.borrow_mut().begin_primary_constructor(begin)
     }
 
-    fn end_primary_constructor(&mut self, kind: DeclarationKind, begin: Token, end: Token, const_keyword: Option<Token>, has_constructor_name: bool) {
-        self.0.borrow_mut().end_primary_constructor(kind, begin, end, const_keyword, has_constructor_name)
+    fn end_primary_constructor(
+        &mut self,
+        kind: DeclarationKind,
+        begin: Token,
+        end: Token,
+        const_keyword: Option<Token>,
+        has_constructor_name: bool,
+    ) {
+        self.0.borrow_mut().end_primary_constructor(
+            kind,
+            begin,
+            end,
+            const_keyword,
+            has_constructor_name,
+        )
     }
 
-    fn handle_no_primary_constructor(&mut self, kind: DeclarationKind, token: Token, const_keyword: Option<Token>) {
-        self.0.borrow_mut().handle_no_primary_constructor(kind, token, const_keyword)
+    fn handle_no_primary_constructor(
+        &mut self,
+        kind: DeclarationKind,
+        token: Token,
+        const_keyword: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_no_primary_constructor(kind, token, const_keyword)
     }
 
     fn begin_block_function_body(&mut self, token: Token) {
@@ -1059,7 +1636,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_block_function_body(count, begin, end)
+        self.0
+            .borrow_mut()
+            .end_block_function_body(count, begin, end)
     }
 
     fn handle_invalid_function_body(&mut self, token: Token) {
@@ -1067,7 +1646,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_expression_function_body(&mut self, arrow: Token, end: Option<Token>) {
-        self.0.borrow_mut().handle_expression_function_body(arrow, end)
+        self.0
+            .borrow_mut()
+            .handle_expression_function_body(arrow, end)
     }
 
     fn handle_expression_statement(&mut self, begin: Token, end: Token) {
@@ -1111,19 +1692,31 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_for_initializer_empty_statement(&mut self, token: Token) {
-        self.0.borrow_mut().handle_for_initializer_empty_statement(token)
+        self.0
+            .borrow_mut()
+            .handle_for_initializer_empty_statement(token)
     }
 
     fn handle_for_initializer_expression_statement(&mut self, token: Token, for_in: bool) {
-        self.0.borrow_mut().handle_for_initializer_expression_statement(token, for_in)
+        self.0
+            .borrow_mut()
+            .handle_for_initializer_expression_statement(token, for_in)
     }
 
     fn handle_for_initializer_local_variable_declaration(&mut self, token: Token, for_in: bool) {
-        self.0.borrow_mut().handle_for_initializer_local_variable_declaration(token, for_in)
+        self.0
+            .borrow_mut()
+            .handle_for_initializer_local_variable_declaration(token, for_in)
     }
 
-    fn handle_for_initializer_pattern_variable_assignment(&mut self, pattern_keyword: Token, equals: Token) {
-        self.0.borrow_mut().handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals)
+    fn handle_for_initializer_pattern_variable_assignment(
+        &mut self,
+        pattern_keyword: Token,
+        equals: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals)
     }
 
     fn begin_for_statement_body(&mut self, token: Token) {
@@ -1139,8 +1732,21 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_for_loop_parts(&mut self, for_kw: Token, left_paren: Token, left_separator: Token, right_separator: Token, expression_count: usize) {
-        self.0.borrow_mut().handle_for_loop_parts(for_kw, left_paren, left_separator, right_separator, expression_count)
+    fn handle_for_loop_parts(
+        &mut self,
+        for_kw: Token,
+        left_paren: Token,
+        left_separator: Token,
+        right_separator: Token,
+        expression_count: usize,
+    ) {
+        self.0.borrow_mut().handle_for_loop_parts(
+            for_kw,
+            left_paren,
+            left_separator,
+            right_separator,
+            expression_count,
+        )
     }
 
     fn begin_for_in_body(&mut self, token: Token) {
@@ -1156,8 +1762,21 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_for_in_loop_parts(&mut self, await_kw: Option<Token>, for_kw: Token, left_paren: Token, pattern_keyword: Option<Token>, in_kw: Token) {
-        self.0.borrow_mut().handle_for_in_loop_parts(await_kw, for_kw, left_paren, pattern_keyword, in_kw)
+    fn handle_for_in_loop_parts(
+        &mut self,
+        await_kw: Option<Token>,
+        for_kw: Token,
+        left_paren: Token,
+        pattern_keyword: Option<Token>,
+        in_kw: Token,
+    ) {
+        self.0.borrow_mut().handle_for_in_loop_parts(
+            await_kw,
+            for_kw,
+            left_paren,
+            pattern_keyword,
+            in_kw,
+        )
     }
 
     fn begin_for_in_expression(&mut self, token: Token) {
@@ -1197,7 +1816,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_do_while_statement(&mut self, token: Token, while_kw: Token, end: Token) {
-        self.0.borrow_mut().end_do_while_statement(token, while_kw, end)
+        self.0
+            .borrow_mut()
+            .end_do_while_statement(token, while_kw, end)
     }
 
     fn begin_return_statement(&mut self, token: Token) {
@@ -1205,7 +1826,9 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_return_statement(&mut self, has_expression: bool, begin: Token, end: Token) {
-        self.0.borrow_mut().end_return_statement(has_expression, begin, end)
+        self.0
+            .borrow_mut()
+            .end_return_statement(has_expression, begin, end)
     }
 
     fn begin_yield_statement(&mut self, token: Token) {
@@ -1217,11 +1840,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_invalid_yield_statement(begin, star, end)
+        self.0
+            .borrow_mut()
+            .end_invalid_yield_statement(begin, star, end)
     }
 
     fn begin_labeled_statement(&mut self, token: Token, label_count: usize) {
-        self.0.borrow_mut().begin_labeled_statement(token, label_count)
+        self.0
+            .borrow_mut()
+            .begin_labeled_statement(token, label_count)
     }
 
     fn end_labeled_statement(&mut self, label_count: usize) {
@@ -1245,11 +1872,20 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_function_name(&mut self, begin: Token, end: Token, is_function_expression: bool) {
-        self.0.borrow_mut().end_function_name(begin, end, is_function_expression)
+        self.0
+            .borrow_mut()
+            .end_function_name(begin, end, is_function_expression)
     }
 
-    fn begin_variables_declaration(&mut self, token: Token, late_kw: Option<Token>, var_final_or_const: Option<Token>) {
-        self.0.borrow_mut().begin_variables_declaration(token, late_kw, var_final_or_const)
+    fn begin_variables_declaration(
+        &mut self,
+        token: Token,
+        late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .begin_variables_declaration(token, late_kw, var_final_or_const)
     }
 
     fn end_variables_declaration(&mut self, count: usize, end: Option<Token>) {
@@ -1280,8 +1916,16 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().begin_try_statement(token)
     }
 
-    fn end_try_statement(&mut self, count: usize, begin: Token, finally_kw: Option<Token>, end: Token) {
-        self.0.borrow_mut().end_try_statement(count, begin, finally_kw, end)
+    fn end_try_statement(
+        &mut self,
+        count: usize,
+        begin: Token,
+        finally_kw: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_try_statement(count, begin, finally_kw, end)
     }
 
     fn begin_catch_clause(&mut self, token: Token) {
@@ -1292,8 +1936,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().end_catch_clause(token)
     }
 
-    fn handle_catch_block(&mut self, on_kw: Option<Token>, catch_kw: Option<Token>, comma: Option<Token>) {
-        self.0.borrow_mut().handle_catch_block(on_kw, catch_kw, comma)
+    fn handle_catch_block(
+        &mut self,
+        on_kw: Option<Token>,
+        catch_kw: Option<Token>,
+        comma: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_catch_block(on_kw, catch_kw, comma)
     }
 
     fn handle_finally_block(&mut self, finally_kw: Token) {
@@ -1321,16 +1972,37 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, colon: Token) {
-        self.0.borrow_mut().end_case_expression(case_kw, when, colon)
+        self.0
+            .borrow_mut()
+            .end_case_expression(case_kw, when, colon)
     }
 
     fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, token: Token) {
-        self.0.borrow_mut().begin_switch_case(label_count, expression_count, token)
+        self.0
+            .borrow_mut()
+            .begin_switch_case(label_count, expression_count, token)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn end_switch_case(&mut self, label_count: usize, expression_count: usize, default_kw: Option<Token>, colon_after_default: Option<Token>, statement_count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_switch_case(label_count, expression_count, default_kw, colon_after_default, statement_count, begin, end)
+    fn end_switch_case(
+        &mut self,
+        label_count: usize,
+        expression_count: usize,
+        default_kw: Option<Token>,
+        colon_after_default: Option<Token>,
+        statement_count: usize,
+        begin: Token,
+        end: Token,
+    ) {
+        self.0.borrow_mut().end_switch_case(
+            label_count,
+            expression_count,
+            default_kw,
+            colon_after_default,
+            statement_count,
+            begin,
+            end,
+        )
     }
 
     fn begin_switch_case_when_clause(&mut self, token: Token) {
@@ -1346,11 +2018,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
-        self.0.borrow_mut().handle_break_statement(has_target, break_kw, end)
+        self.0
+            .borrow_mut()
+            .handle_break_statement(has_target, break_kw, end)
     }
 
     fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {
-        self.0.borrow_mut().handle_continue_statement(has_target, continue_kw, end)
+        self.0
+            .borrow_mut()
+            .handle_continue_statement(has_target, continue_kw, end)
     }
 
     fn begin_rethrow_statement(&mut self, token: Token) {
@@ -1369,8 +2045,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().end_initializer(end)
     }
 
-    fn handle_parenthesized_condition(&mut self, begin: Token, case_kw: Option<Token>, when: Option<Token>) {
-        self.0.borrow_mut().handle_parenthesized_condition(begin, case_kw, when)
+    fn handle_parenthesized_condition(
+        &mut self,
+        begin: Token,
+        case_kw: Option<Token>,
+        when: Option<Token>,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_parenthesized_condition(begin, case_kw, when)
     }
 
     fn begin_pattern_guard(&mut self, when: Token) {
@@ -1381,8 +2064,15 @@ impl<'t> ParserListener for SharedFlow<'t> {
         self.0.borrow_mut().end_pattern_guard(token)
     }
 
-    fn handle_pattern_variable_declaration_statement(&mut self, keyword: Token, equals: Token, semicolon: Token) {
-        self.0.borrow_mut().handle_pattern_variable_declaration_statement(keyword, equals, semicolon)
+    fn handle_pattern_variable_declaration_statement(
+        &mut self,
+        keyword: Token,
+        equals: Token,
+        semicolon: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .handle_pattern_variable_declaration_statement(keyword, equals, semicolon)
     }
 
     fn begin_if_control_flow(&mut self, token: Token) {
@@ -1438,26 +2128,42 @@ impl<'t> ParserListener for SharedFlow<'t> {
     }
 
     fn end_switch_expression_block(&mut self, count: usize, begin: Token, end: Token) {
-        self.0.borrow_mut().end_switch_expression_block(count, begin, end)
+        self.0
+            .borrow_mut()
+            .end_switch_expression_block(count, begin, end)
     }
 
-    fn begin_switch_expression_case(&mut self, ) {
+    fn begin_switch_expression_case(&mut self) {
         self.0.borrow_mut().begin_switch_expression_case()
     }
 
     fn handle_switch_expression_case_pattern(&mut self, token: Token) {
-        self.0.borrow_mut().handle_switch_expression_case_pattern(token)
+        self.0
+            .borrow_mut()
+            .handle_switch_expression_case_pattern(token)
     }
 
-    fn end_switch_expression_case(&mut self, begin: Token, when: Option<Token>, arrow: Token, end: Token) {
-        self.0.borrow_mut().end_switch_expression_case(begin, when, arrow, end)
+    fn end_switch_expression_case(
+        &mut self,
+        begin: Token,
+        when: Option<Token>,
+        arrow: Token,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_switch_expression_case(begin, when, arrow, end)
     }
 
     fn handle_recoverable_error(&mut self, message: Message, start: Token, end: Token) {
-        self.0.borrow_mut().handle_recoverable_error(message, start, end)
+        self.0
+            .borrow_mut()
+            .handle_recoverable_error(message, start, end)
     }
 
     fn handle_experiment_not_enabled(&mut self, flag: ExperimentalFlag, begin: Token, end: Token) {
-        self.0.borrow_mut().handle_experiment_not_enabled(flag, begin, end)
+        self.0
+            .borrow_mut()
+            .handle_experiment_not_enabled(flag, begin, end)
     }
 }

@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ev::Ev;
 use crate::facts::FlowFact;
-use crate::model::{Lists, ReachArena, State, NIL};
+use crate::model::{Lists, NIL, ReachArena, State};
 use crate::ty::{Ty, TypeOps};
 
 /// Metadata of one local variable (or parameter).
@@ -528,8 +528,13 @@ impl<'o> Interp<'o> {
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
         for range in ranges {
-            for i in range.clone() {
-                let _ = self.step(events, i, &MATCH_NONE);
+            let mut i = range.start;
+            while i < range.end {
+                match self.step(events, i, &MATCH_NONE) {
+                    Control::Continue => i += 1,
+                    // Extent handlers consume wholesale in collect runs too.
+                    Control::Jump(to) => i = to.max(range.start),
+                }
             }
         }
         let frames = self.collect.take().unwrap_or_default();
@@ -622,8 +627,7 @@ impl<'o> Interp<'o> {
         let captured: FxHashSet<u32> = captured.iter().copied().filter(live).collect();
         let finals = self.finals_of(&written);
         let current = std::mem::take(&mut self.current);
-        self.current =
-            current.conservative_join(&written, &captured, &finals);
+        self.current = current.conservative_join(&written, &captured, &finals);
     }
 
     /// The official `suspension()`: every variable read in the current
@@ -636,7 +640,9 @@ impl<'o> Interp<'o> {
             .rev()
             .find(|f| matches!(f, Frame::Exec { .. }))
         {
-            Some(Frame::Exec { reads, declared, .. }) => reads
+            Some(Frame::Exec {
+                reads, declared, ..
+            }) => reads
                 .intersection(&self.anywhere.written)
                 .copied()
                 .filter(|var| !declared.contains(var))
@@ -839,13 +845,7 @@ impl<'o> Interp<'o> {
     /// order). The effect collect covers the whole construct; the
     /// initializers' writes demote again through plain assignment before
     /// the condition runs, so the overlap is redundant, not unsound.
-    fn for_begin(
-        &mut self,
-        span: TokenSpan,
-        events: &[Ev],
-        i: usize,
-        match_of: &[u32],
-    ) -> Control {
+    fn for_begin(&mut self, span: TokenSpan, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
         self.dead_code(span);
         if self.collect.is_some() {
             return Control::Continue;
@@ -854,7 +854,11 @@ impl<'o> Interp<'o> {
         let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) else {
             return Control::Continue;
         };
-        let Ev::ForParts { left_sep, right_sep } = events[parts] else {
+        let Ev::ForParts {
+            left_sep,
+            right_sep,
+        } = events[parts]
+        else {
             return Control::Jump(end + 1);
         };
         let bounds = ForBounds::build(
@@ -899,9 +903,7 @@ impl<'o> Interp<'o> {
         // Condition (empty condition = `true`).
         let cond = self.run_header_expr(events, bounds.cond.clone(), match_of, base);
         let (if_true, if_false) = match cond {
-            Some(expr) => {
-                self.cond_split(&expr)
-            }
+            Some(expr) => self.cond_split(&expr),
             None => {
                 let cur = self.current.clone();
                 (cur.clone(), cur.set_unreachable(&mut self.reach))
@@ -916,9 +918,7 @@ impl<'o> Interp<'o> {
         // Updaters run on the back-edge state: join pending continues
         // first (official `forStatement_updaterBegin`).
         let continue_model = match &self.stack[frame] {
-            Frame::While {
-                continue_model, ..
-            } => continue_model.clone(),
+            Frame::While { continue_model, .. } => continue_model.clone(),
             _ => None,
         };
         self.current = self.join(Some(self.current.clone()), continue_model);
@@ -971,16 +971,65 @@ impl<'o> Interp<'o> {
     }
 
     /// Collection `for` (`[for (var i = 0; i < 3; i++) e]`): consumes the
-    /// whole extent; the element contributes no value to the enclosing
-    /// literal's type.
+    /// whole extent. List/set/map literals net no value of their own
+    /// (`handle_literal_list` is not recorded), so each element must leave
+    /// exactly one value for the enclosing consumer's LIFO pop — the
+    /// element's own value is truncated and replaced by a trivial
+    /// placeholder carrying no effects.
     fn collection_for_begin(&mut self, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
         if self.collect.is_some() {
-            return Control::Continue;
+            // Consume the extent wholesale: its events do not net against
+            // the value stack the way a linear walk expects (element values
+            // truncate here; the head can carry stray statement pops), and
+            // an unbalanced walk would mis-pop enclosing operands. The
+            // extent's effects come from the same range the real replay
+            // collects, merged into the enclosing collect frames. The match
+            // table is empty in collect runs, so the extent end is scanned
+            // by nesting depth.
+            let mut depth = 0usize;
+            let end = (i + 1..events.len()).find(|&j| match &events[j] {
+                Ev::ForControlFlowBegin => {
+                    depth += 1;
+                    false
+                }
+                Ev::ForControlFlowEnd { .. } => {
+                    if depth == 0 {
+                        true
+                    } else {
+                        depth -= 1;
+                        false
+                    }
+                }
+                _ => false,
+            });
+            let Some(end) = end else {
+                return Control::Continue;
+            };
+            let exprs_base = self.exprs.len();
+            let effects = self.collect_ranges(events, &[i + 1..end]);
+            if let Some(frames) = self.collect.as_mut() {
+                for frame in frames.iter_mut() {
+                    frame.declared.extend(effects.declared.iter().copied());
+                    frame.written.extend(effects.written.iter().copied());
+                    frame.read.extend(effects.read.iter().copied());
+                    frame.captured.extend(effects.captured.iter().copied());
+                    frame
+                        .read_captured
+                        .extend(effects.read_captured.iter().copied());
+                }
+            }
+            self.exprs.truncate(exprs_base);
+            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+            return Control::Jump(end + 1);
         }
         let end = match_of[i] as usize;
         let base = self.exprs.len();
         if let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) {
-            let Ev::ForParts { left_sep, right_sep } = events[parts] else {
+            let Ev::ForParts {
+                left_sep,
+                right_sep,
+            } = events[parts]
+            else {
                 return Control::Jump(end + 1);
             };
             let bounds = ForBounds::build(
@@ -993,14 +1042,17 @@ impl<'o> Interp<'o> {
             );
             self.replay_c_for(bounds, events, match_of, true);
         } else if let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForInParts)) {
-            // For-in element: head to the parts marker, then the element
-            // is the loop body.
-            self.run_range(events, i + 1..parts + 1, match_of);
+            // For-in element: the head (loop variable + iterable) ends
+            // BEFORE the parts marker, and `for_in_parts_at` below is the
+            // loop head. Replaying the marker would fire the statement-form
+            // handler too: a second pop plus a stray non-collection frame.
+            self.run_range(events, i + 1..parts, match_of);
             self.for_in_parts_at(events, parts, end, true);
             self.run_range(events, parts + 1..end, match_of);
             self.loop_exit(true);
         }
         self.exprs.truncate(base);
+        self.exprs.push(Expr::trivial(Ty::UNKNOWN));
         Control::Jump(end + 1)
     }
 

@@ -6,7 +6,7 @@ use dartq_parser::TokenSpan;
 
 use crate::ev::{BlockKind, Ev};
 use crate::interp::{DeclCtx, Expr, Frame, Interp, PatternKind, Scope, VarMeta};
-use crate::model::{attach_finally_model, State};
+use crate::model::{State, attach_finally_model};
 use crate::ty::Ty;
 
 impl<'o> Interp<'o> {
@@ -260,13 +260,15 @@ impl<'o> Interp<'o> {
                 };
                 let entry = if first {
                     let finals = self.finals_of(&written);
-                    let state =
-                        previous.conservative_join(&written, &captured, &finals);
+                    let state = previous.conservative_join(&written, &captured, &finals);
                     // The try body's normal exit seeds the after-accumulator
                     // (official tryCatchStatement_bodyEnd).
                     let body_exit = self.current.clone();
-                    if let Some(Frame::TryCatch { before_catch, after, .. }) =
-                        self.stack.last_mut()
+                    if let Some(Frame::TryCatch {
+                        before_catch,
+                        after,
+                        ..
+                    }) = self.stack.last_mut()
                     {
                         *before_catch = Some(state.clone());
                         *after = Some(body_exit);
@@ -505,9 +507,7 @@ impl<'o> Interp<'o> {
                 let combined = self.current.clone();
                 if let Some(frame_index) = self.switch_frame() {
                     let prior = match &mut self.stack[frame_index] {
-                        Frame::Switch {
-                            group_combined, ..
-                        } => group_combined.take(),
+                        Frame::Switch { group_combined, .. } => group_combined.take(),
                         _ => None,
                     };
                     let joined = self.join(prior, Some(combined));
@@ -534,10 +534,9 @@ impl<'o> Interp<'o> {
                 self.stack.remove(frame_index);
                 // Exhaustiveness of switch expressions is unmounted (needs
                 // the resolver); an unmatched-hole joins nothing.
-                self.current = self.join(combined, None).inherit_tested(
-                    &previous,
-                    &mut self.lists,
-                );
+                self.current = self
+                    .join(combined, None)
+                    .inherit_tested(&previous, &mut self.lists);
             }
             Ev::AssertBegin { span } => {
                 self.dead_code(*span);
@@ -567,15 +566,12 @@ impl<'o> Interp<'o> {
                 // message (if any) ran after it and its effects are
                 // dropped, matching the official join of previous &
                 // condTrue only.
-                let cond_true = self
-                    .exprs
-                    .get(exprs_base)
-                    .and_then(|cond| {
-                        cond.branches
-                            .as_ref()
-                            .map(|(if_true, _)| if_true.clone())
-                            .or(cond.bool_value.filter(|&b| b).map(|_| self.current.clone()))
-                    });
+                let cond_true = self.exprs.get(exprs_base).and_then(|cond| {
+                    cond.branches
+                        .as_ref()
+                        .map(|(if_true, _)| if_true.clone())
+                        .or(cond.bool_value.filter(|&b| b).map(|_| self.current.clone()))
+                });
                 self.exprs.truncate(exprs_base);
                 let joined = self.join(Some(previous), cond_true);
                 self.current = joined.unsplit(&mut self.reach);
@@ -674,11 +670,22 @@ impl<'o> Interp<'o> {
     /// One-event lookahead: closes the current case alternative group
     /// before its first body event (official `switch_endAlternatives`).
     pub(crate) fn maybe_close_case_group(&mut self, events: &[Ev]) {
-        let Some(frame_index) = self
-            .stack
-            .iter()
-            .rposition(|f| matches!(f, Frame::Switch { case_open: true, .. }))
-        else {
+        // The close runs its own collect over the switch block, and the
+        // frame keeps `case_open` until it returns — a collect run's
+        // re-stepped events would re-enter here for the same still-open
+        // group and recurse without bound.
+        if self.collect.is_some() {
+            return;
+        }
+        let Some(frame_index) = self.stack.iter().rposition(|f| {
+            matches!(
+                f,
+                Frame::Switch {
+                    case_open: true,
+                    ..
+                }
+            )
+        }) else {
             return;
         };
         let (labeled, block, combined, default) = match &self.stack[frame_index] {
@@ -706,10 +713,7 @@ impl<'o> Interp<'o> {
                 _ => return,
             };
             let finals = self.finals_of(&effects.written);
-            let joined = previous.conservative_join(&effects.written,
-                &effects.captured,
-                &finals,
-            );
+            let joined = previous.conservative_join(&effects.written, &effects.captured, &finals);
             self.current = joined;
         } else {
             self.current = combined.unwrap_or_else(|| self.current.clone());

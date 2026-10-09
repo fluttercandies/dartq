@@ -85,7 +85,9 @@ impl<'t> Flow<'t> {
     pub fn take_facts(&mut self) -> Vec<FlowFact> {
         let mut facts = std::mem::take(&mut self.facts);
         facts.sort_by_key(|fact| match fact {
-            FlowFact::DeadCode { span } | FlowFact::UnassignedRead { span, .. } => span.range.offset,
+            FlowFact::DeadCode { span } | FlowFact::UnassignedRead { span, .. } => {
+                span.range.offset
+            }
         });
         facts
     }
@@ -110,10 +112,7 @@ impl<'t> Flow<'t> {
     /// `true` for `=`, `false` for every compound assignment operator
     /// (`+=`, `??=`, …). Synthetic operators read as compound.
     fn is_plain_assign(&self, operator: Token) -> bool {
-        matches!(
-            self.kind(operator),
-            Some(dartq_scanner::TokenKind::Eq)
-        )
+        matches!(self.kind(operator), Some(dartq_scanner::TokenKind::Eq))
     }
 
     fn kind(&self, token: TokenSpan) -> Option<dartq_scanner::TokenKind> {
@@ -380,9 +379,11 @@ impl<'t> ParserListener for Flow<'t> {
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
         let id = self.name(name);
-        let base = match self.tokens.get(id as usize).map(|_| {
-            self.tokens.lexeme(self.source, id as usize)
-        }) {
+        let base = match self
+            .tokens
+            .get(id as usize)
+            .map(|_| self.tokens.lexeme(self.source, id as usize))
+        {
             Some("dynamic") => crate::ty::Base::Dynamic,
             Some("void") => crate::ty::Base::Void,
             Some("Never") => crate::ty::Base::Never,
@@ -717,7 +718,9 @@ impl<'t> ParserListener for Flow<'t> {
 
     fn handle_literal_bool(&mut self, token: Token) {
         let value = self.kind(token)
-            == Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::True));
+            == Some(dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::True,
+            ));
         self.record(Ev::Bool { value });
     }
 
@@ -790,7 +793,9 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn handle_is_operator(&mut self, _is_operator: Token, not: Option<Token>) {
-        self.record(Ev::IsOperator { is_not: not.is_some() });
+        self.record(Ev::IsOperator {
+            is_not: not.is_some(),
+        });
     }
 
     fn begin_as_operator_type(&mut self, _operator: Token) {
@@ -993,15 +998,10 @@ impl<'t> ParserListener for Flow<'t> {
         _flag: ExperimentalFlag,
         _begin: Token,
         _end: Token,
-    ) {}
-    fn end_invalid_await_expression(&mut self, _begin: Token, _end: Token) {}
-    fn end_invalid_yield_statement(
-        &mut self,
-        _begin: Token,
-        _star: Option<Token>,
-        _end: Token,
     ) {
     }
+    fn end_invalid_await_expression(&mut self, _begin: Token, _end: Token) {}
+    fn end_invalid_yield_statement(&mut self, _begin: Token, _star: Option<Token>, _end: Token) {}
     fn handle_invalid_function_body(&mut self, _token: Token) {}
     fn handle_invalid_statement(&mut self, _begin: Token) {}
     fn begin_rethrow_statement(&mut self, _token: Token) {}

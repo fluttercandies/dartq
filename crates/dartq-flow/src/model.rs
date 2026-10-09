@@ -316,13 +316,27 @@ impl State {
             let mut candidates: Vec<Ty> = Vec::new();
             let declared_non_null = ops.promote_to_non_null(declared);
             if declared_non_null != declared {
-                consider(ops, lists, written, current, declared_non_null, &mut candidates);
+                consider(
+                    ops,
+                    lists,
+                    written,
+                    current,
+                    declared_non_null,
+                    &mut candidates,
+                );
             }
             for tested in lists.iter(model.tested) {
                 consider(ops, lists, written, current, tested, &mut candidates);
                 let tested_non_null = ops.promote_to_non_null(tested);
                 if tested_non_null != tested {
-                    consider(ops, lists, written, current, tested_non_null, &mut candidates);
+                    consider(
+                        ops,
+                        lists,
+                        written,
+                        current,
+                        tested_non_null,
+                        &mut candidates,
+                    );
                 }
             }
             // The unique candidate that is a subtype of all the others wins.
@@ -478,7 +492,13 @@ impl State {
                 }
             }
             let var = var as u32;
-            this = this.with_model(var, VarModel { tested: merged, ..a });
+            this = this.with_model(
+                var,
+                VarModel {
+                    tested: merged,
+                    ..a
+                },
+            );
         }
         this
     }
@@ -610,9 +630,10 @@ fn consider(
 fn unique_subtype(ops: &dyn TypeOps, candidates: &[Ty]) -> Option<Ty> {
     let mut found: Option<Ty> = None;
     for &candidate in candidates {
-        if candidates.iter().all(|&other| {
-            other == candidate || ops.is_subtype(candidate, other)
-        }) {
+        if candidates
+            .iter()
+            .all(|&other| other == candidate || ops.is_subtype(candidate, other))
+        {
             if found.is_some() {
                 return None; // not unique
             }

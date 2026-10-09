@@ -83,7 +83,9 @@ impl<'o> Interp<'o> {
             Ev::GuardEnd => {
                 let guard = self.exprs.pop();
                 if let Some(pattern) = self.pattern.as_mut() {
-                    pattern.guard.get_or_insert(guard.unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN)));
+                    pattern
+                        .guard
+                        .get_or_insert(guard.unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN)));
                 }
             }
             _ => {}
@@ -192,4 +194,3 @@ impl<'o> Interp<'o> {
         unmatched
     }
 }
-

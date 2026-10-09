@@ -18,15 +18,16 @@ fn facts_of(source: &str) -> Vec<FlowFact> {
             enable_triple_shift: true,
             enable_augmentations: true,
         },
-        dartq_source::FileTable::new()
-            .intern(std::path::Path::new("test.dart")),
+        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
     );
     assert!(result.diagnostics.is_empty(), "{source:?}");
     let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(3, 15),
     ));
-    let flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(tokens, source))));
+    let flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+        tokens, source,
+    ))));
     let mut parser = dartq_parser::Parser::new(
         source,
         tokens,
@@ -45,7 +46,8 @@ fn dead_snippets(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -59,7 +61,8 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::UnassignedRead { span, .. } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -295,4 +298,50 @@ fn finally_return_kills_exit() {
 fn try_finally_fallthrough_alive() {
     let source = "void f() { try { 1; } finally { 2; } 3; }";
     assert!(dead_snippets(source).is_empty());
+}
+
+/// A collection `for`-in element replays its head exactly once: the
+/// statement-form `ForInParts` handler must not also fire inside the
+/// collection extent (the double head popped the assignment operands —
+/// an empty-stack panic at the assignment).
+///
+/// Ignored until the upstream blocker closes: the parser currently
+/// mis-parses every collection-element for-head (a synthetic `ForParts`
+/// C-style recovery with stray statement events instead of `ForInParts`,
+/// silently, no diagnostics), so this source never produces the event
+/// shape the defect lives on. dartq-parser owns the mis-parse; the flow
+/// side is fixed (single head, extent consumed wholesale in collect runs,
+/// element placeholder value).
+#[ignore = "blocked: parser mis-parses collection-element for-heads (dartq-parser lane) — no ForInParts extent is produced to pin"]
+#[test]
+fn collection_for_in_assignment_element_no_panic() {
+    let source = "void f(List<int> b) { int x; x = [for (var a in b) a]; x; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A collection `for`-in element as a variable initializer: the write from
+/// the initializer must reach later reads of the variable.
+///
+/// Ignored until the upstream blockers close: the parser currently
+/// mis-parses every collection-element for-head (synthetic `ForParts`
+/// separators instead of `ForInParts`, silent), and even a correctly
+/// parsed head would clear the enclosing declaration's pending init (the
+/// loop variable's `VarDeclBegin` resets the flat `pending_inits` list),
+/// so `InitializerEnd` finds no variable to write. dartq-parser owns the
+/// mis-parse; the pending-init pairing is a flow-side follow-up.
+#[ignore = "blocked: parser mis-parses collection-element for-heads (dartq-parser lane); stray VarDeclBegin clears pending_inits"]
+#[test]
+fn collection_for_in_initializer_write_reaches_later_reads() {
+    let source = "void f(List<int> b) { var x = [for (var a in b) a]; x; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A labeled case group closes exactly once: the group-close lookahead
+/// must not re-enter a collect run over the same still-open group
+/// (unbounded recursion — stack overflow on `switch (x) { foo: case 1:
+/// 1; }`).
+#[test]
+fn labeled_case_group_terminates() {
+    let source = "void f(int x) { switch (x) { foo: case 1: 1; } }";
+    assert!(facts_of(source).is_empty());
 }
