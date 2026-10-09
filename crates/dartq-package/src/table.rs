@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use dartq_pub::{PackageConfig, PubError, ResolvedPackageGraph, normalize};
+use dartq_source::normalize_path;
 use rustc_hash::FxHashMap;
 
 use crate::SourceCategory;
@@ -88,8 +89,13 @@ impl PackageTable {
     /// grammar, `packageUri` subtree validation) — is
     /// [`PackageConfig::resolve`], dartq-pub's single face shared with the
     /// resolution layer's `package:` table. This build adds what is
-    /// resolution-specific: source categories from the graph instances'
-    /// source references, and the attribution-unique-root invariant.
+    /// resolution-specific: the canonical spelling universe (every stored
+    /// root, lib dir, and the workspace bound go through dartq-source's
+    /// normalize rule — canonicalized longest existing ancestor — so
+    /// attribution holds no matter whether the caller canonicalized its
+    /// assembly path, the C5 `/var` vs `/private/var` caliber), source
+    /// categories from the graph instances' source references, and the
+    /// attribution-unique-root invariant.
     ///
     /// `config_dir` must be absolute (enforced by
     /// [`PackageConfig::resolve`] — the engine's assembly step passes the
@@ -142,21 +148,31 @@ impl PackageTable {
                     name: package.name.clone(),
                 }
             })?;
+            // Canonicalize before storage (#323): `resolve` normalizes
+            // lexically only, so a config assembled without the CLI's
+            // up-front canonicalize would store alias spellings (`/var`
+            // vs `/private/var`) and split attribution. dartq-source's
+            // rule — the canonicalized longest existing ancestor — puts
+            // every stored root in the one spelling universe the engine's
+            // FileTable interns into and the attribution walk matches
+            // against, whatever the caller's assembly path.
+            let root = normalize_path(&package.root);
+            let lib_dir = normalize_path(&package.lib_dir);
             // Duplicate normalized roots make file→package attribution
             // ambiguous (analyzer analog: `package_map_resolver.dart:33-52`
             // scans every root per file, where two equal roots race).
-            if let Some(first) = root_owners.get(&package.root) {
+            if let Some(first) = root_owners.get(&root) {
                 return Err(crate::PackageError::DuplicateRoot {
                     first: first.to_string(),
                     name: package.name.clone(),
-                    root: package.root.display().to_string(),
+                    root: root.display().to_string(),
                 });
             }
-            root_owners.insert(package.root.clone(), name.clone());
+            root_owners.insert(root.clone(), name.clone());
             let identity = PackageIdentity {
-                lib_dir: package.lib_dir.clone(),
+                lib_dir,
                 name,
-                root: package.root.clone(),
+                root,
                 language_version: package.language_version,
                 category: SourceCategory::of(&instance.source_ref),
             };
@@ -202,11 +218,13 @@ impl PackageTable {
         by_depth.sort_by_key(|&(_, depth)| std::cmp::Reverse(depth));
         let by_depth = by_depth.into_iter().map(|(name, _)| name.clone()).collect();
 
-        // Normalized so the walk's inclusive bound compares
-        // spelling-canonical against the normalized query and roots (a
-        // dot-segment `config_dir` would otherwise strand the bound
-        // mid-chain while the roots resolved past it).
-        let workspace_root = normalize(config_dir.parent().unwrap_or(config_dir));
+        // Canonicalized through the same dartq-source rule as the member
+        // roots, so the walk's inclusive bound compares spelling-canonical
+        // against the normalized query and roots no matter which spelling
+        // the config_dir arrived in (a dot-segment or alias-spelled
+        // `config_dir` would otherwise strand the bound mid-chain or fence
+        // off the roots entirely).
+        let workspace_root = normalize_path(config_dir.parent().unwrap_or(config_dir));
         // Pub always writes the root package's `rootUri` onto the
         // `config_dir` parent, so the walk's inclusive bound is a config
         // root; a hand-config diverging from that is rejected at build
@@ -1085,6 +1103,72 @@ sdks:
         );
         assert_eq!(owner("/elsewhere/lib/f.dart"), None);
         assert_eq!(owner("/elsewhere/./lib/f.dart"), None);
+    }
+
+    /// Build-side spelling canon (#323): `build` canonicalizes member
+    /// roots, lib dirs, and the workspace bound through dartq-source's
+    /// normalize rule, so an assembly path that skips the CLI's up-front
+    /// canonicalization cannot reintroduce the C5 split (a config resolved
+    /// through an alias spelling would store alias roots while the engine's
+    /// FileTable attributes through canonical spellings — the canonical
+    /// query would find no owner at all). Mirrors the path_universe
+    /// fixture shape: a real temp workspace plus an in-tree alias symlink,
+    /// the table built from the alias-spelled config dir.
+    #[cfg(unix)]
+    #[test]
+    fn build_canonicalizes_alias_spelled_roots() {
+        let root = std::env::temp_dir().join(format!("dartq-package-323-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".dart_tool")).expect("config dir");
+        std::os::unix::fs::symlink(&root, root.join("link")).expect("alias symlink");
+
+        let config_dir = root.join("link").join(".dart_tool");
+        let config = PackageConfig::parse(
+            r#"{
+              "configVersion": 2,
+              "packages": [{"name": "app", "rootUri": "../"}],
+              "generator": "pub"
+            }"#,
+        )
+        .expect("valid config");
+        let lock = LockFile::parse(LOCK).expect("valid lock");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec(),
+            &BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        let table = PackageTable::build(&config, &graph, &config_dir).expect("table");
+
+        // Stored spelling: the alias component (and any symlinked temp-dir
+        // prefix, macOS `/var` → `/private/var`) is resolved — the same
+        // canonical universe `fs::canonicalize` reports, regardless of the
+        // spelling assembly came in through.
+        let canonical = root.canonicalize().expect("canonical root");
+        let app = table.get("app").expect("app entry");
+        assert_eq!(app.root, canonical, "stored root must be canonical");
+        assert_eq!(app.lib_dir, canonical.join("lib"));
+
+        // Attribution in both spellings: the canonical one (what the
+        // resolver and FileTable produce — pre-#323 an alias-assembled
+        // table left this query ownerless on symlinked temp dirs) and the
+        // in-tree alias one (the purely lexical walk climbs to the
+        // canonical root inside the bound).
+        let owner = |path: &Path| {
+            table
+                .containing(path)
+                .map(|identity| identity.name.as_str().to_owned())
+        };
+        assert_eq!(owner(&canonical.join("lib/a.dart")), Some("app".to_owned()));
+        assert_eq!(
+            owner(&canonical.join("link/lib/a.dart")),
+            Some("app".to_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The memo is keyed by directories only: querying a file memoizes

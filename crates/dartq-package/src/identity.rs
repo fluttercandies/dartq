@@ -92,8 +92,9 @@ impl PackageId {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PackageIdentity {
     pub name: PackageName,
-    /// Package root directory, lexically normalized (no symlink resolution
-    /// — identity needs spelling stability, not filesystem truth).
+    /// Package root directory, canonicalized at table build (dartq-source's
+    /// normalize rule) — one spelling universe across the engine, alias
+    /// components and symlinked ancestors resolved.
     pub root: PathBuf,
     /// The Dart-source directory (`packageUri`, normally `lib/`).
     pub lib_dir: PathBuf,

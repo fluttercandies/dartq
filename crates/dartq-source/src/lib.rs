@@ -28,7 +28,7 @@ mod store;
 mod string_table;
 
 pub use content_id::{ContentId, ParseContentIdError, content_hash};
-pub use file_table::{FileId, FileTable, normalize_lexical};
+pub use file_table::{FileId, FileTable, normalize_lexical, normalize_path};
 pub use locator::Locator;
 pub use source_range::{
     LineIndex, SourceRange, byte_offset_to_utf16, utf16_len_of, utf16_offset_to_byte,
