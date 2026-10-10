@@ -1,6 +1,7 @@
 //! Shared test helpers.
 
 mod errors;
+mod escapes;
 mod inserted;
 mod kinds;
 mod numbers_strings;

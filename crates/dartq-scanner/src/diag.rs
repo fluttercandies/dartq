@@ -180,6 +180,18 @@ pub(crate) mod msg {
         "Digit separators ('_') in a number literal can only be placed between two digits.";
     pub const MISSING_IDENTIFIER: &str = "Expected an identifier.";
 
+    /// String escape validations (quote.dart unescape, verbatim from the
+    /// registry). `INVALID_CODE_POINT`'s registry template fills its `{0}`
+    /// with the literal `\u{...}` (analyzer `error_converter.dart`).
+    pub const INVALID_ESCAPE_STARTED: &str = "The string '\\' can't stand alone.";
+    pub const INVALID_HEX_ESCAPE: &str =
+        "An escape sequence starting with '\\x' must be followed by 2 hexadecimal digits.";
+    pub const INVALID_UNICODE_ESCAPE_U_STARTED: &str = "An escape sequence starting with '\\u' must be followed by 4 hexadecimal digits or from 1 to 6 digits between '{' and '}'.";
+    pub const INVALID_UNICODE_ESCAPE_U_BRACKET: &str = "An escape sequence starting with '\\u{' must be followed by 1 to 6 hexadecimal digits followed by a '}'.";
+    pub const INVALID_UNICODE_ESCAPE_U_NO_BRACKET: &str =
+        "An escape sequence starting with '\\u' must be followed by 4 hexadecimal digits.";
+    pub const INVALID_CODE_POINT: &str = "The escape sequence '\\u{...}' isn't a valid code point.";
+
     /// The `unsupported_operator` registry template with `{0}` filled by the
     /// unsupported lexeme (both `===` and `!==` route here).
     pub fn unsupported_operator(lexeme: &str) -> String {

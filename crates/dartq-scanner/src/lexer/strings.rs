@@ -12,6 +12,16 @@
 //! level, so deeply nested input could overflow it — here the frames live on
 //! the heap and the driver is a flat loop.
 //!
+//! Escape sequences are validated against the official unescape rules
+//! (`.third/dart-sdk` `pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
+//! `unescapeCodeUnits`): `\x` wants exactly two hex digits, `\u` a
+//! `{1-6 hex}` bracket or four bare hex digits, values above 0x10FFFF are
+//! invalid, and a part cannot end with a lone backslash. Unescaping happens
+//! per string part there and returns at the first error, so this scanner
+//! also stops validating after one malformed escape per segment (the
+//! `escape_err` frame flag); the missing-`}` report for `\u{xxxxxxx}` is the
+//! official exception that keeps validating.
+//!
 //! For the token sequence contract see "Interpolated string token sequence
 //! shape" in the crate docs. An unterminated string produces a synthetic empty
 //! STRING segment (pinned where scanning stopped) +
@@ -24,7 +34,11 @@ use crate::diag::msg;
 use crate::keyword::{Keyword, keyword_from_str};
 use crate::lexer::{Flow, Lexer};
 use crate::token::TokenKind;
-use dartq_diagnostics::UNTERMINATED_STRING_LITERAL;
+use dartq_diagnostics::{
+    CodeInfo, INVALID_CODE_POINT, INVALID_HEX_ESCAPE, INVALID_UNICODE_ESCAPE_STARTED,
+    INVALID_UNICODE_ESCAPE_U_BRACKET, INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
+    INVALID_UNICODE_ESCAPE_U_STARTED, UNTERMINATED_STRING_LITERAL,
+};
 
 /// One string body suspended by an open `${`: everything needed to resume body
 /// scanning once the interpolation's `}` arrives.
@@ -36,6 +50,11 @@ struct StringFrame {
     /// Source offset where the current STRING segment began (the opening
     /// quote for the first segment; just past the last `}` / `$id` after).
     segment_start: usize,
+    /// A malformed escape was already reported in the current segment:
+    /// official unescape runs per string part and returns at the first
+    /// error, so the rest of the segment passes through unvalidated. Reset
+    /// wherever `segment_start` restarts.
+    escape_err: bool,
 }
 
 /// Outcome of scanning one string body (content mode).
@@ -93,6 +112,7 @@ impl Lexer<'_> {
                     Flow::CloseInterp => {
                         frame = suspended.pop().expect("SII close without a suspended body");
                         frame.segment_start = self.pos;
+                        frame.escape_err = false;
                         break;
                     }
                     Flow::Eof => {
@@ -127,6 +147,7 @@ impl Lexer<'_> {
                 raw,
                 triple: true,
                 segment_start: quote_start,
+                escape_err: false,
             });
         }
         if self.peek() == Some(quote) {
@@ -140,6 +161,7 @@ impl Lexer<'_> {
             raw,
             triple: false,
             segment_start: quote_start,
+            escape_err: false,
         })
     }
 
@@ -166,17 +188,24 @@ impl Lexer<'_> {
                     return StringBody::Done;
                 }
                 '\\' => {
+                    let backslash = self.pos;
                     self.bump();
                     // The escaped character is checked for LF/CR after the
                     // backslash advance (official abstract_scanner.dart
                     // tokenizeSingleLineString): an escaped newline still
-                    // terminates the string. EOF reports unterminated on the
-                    // next iteration.
-                    if matches!(self.peek(), Some('\n' | '\r')) {
+                    // terminates the string. The content keeps the backslash
+                    // (the official last part carries it; the synthetic
+                    // closing quote makes unescape see it), so it reports
+                    // invalidEscapeStarted — unless this segment already
+                    // returned from an escape error.
+                    if matches!(self.peek(), None | Some('\n' | '\r')) {
+                        if !f.escape_err {
+                            self.escape_started(f, backslash);
+                        }
                         self.unterminated();
                         return StringBody::Done;
                     }
-                    self.bump();
+                    self.escape(f, backslash);
                 }
                 '$' => {
                     if self.scan_dollar(f) {
@@ -243,12 +272,19 @@ impl Lexer<'_> {
                 continue;
             }
             if !f.raw && c == '\\' {
+                let backslash = self.pos;
                 self.bump();
                 if self.peek().is_none() {
+                    // EOF right after the backslash: the part's content ends
+                    // with a lone `\` (corpus string2.dart:21) — reported
+                    // unless this segment already had an escape error.
+                    if !f.escape_err {
+                        self.escape_started(f, backslash);
+                    }
                     self.unterminated();
                     return StringBody::Done;
                 }
-                self.bump();
+                self.escape(f, backslash);
                 continue;
             }
             if f.raw {
@@ -279,6 +315,7 @@ impl Lexer<'_> {
         }
         self.scan_interpolated_identifier();
         f.segment_start = self.pos;
+        f.escape_err = false;
         false
     }
 
@@ -334,6 +371,282 @@ impl Lexer<'_> {
         }
     }
 
+    /// Validates and consumes the escape whose backslash sits at `backslash`
+    /// (already consumed; the lookahead is the designator character).
+    /// Mirrors the official unescape decision order per string part
+    /// (quote.dart `unescapeCodeUnits`): `\x` with exactly two hex digits,
+    /// `\u` with a `{1-6 hex}` bracket or four bare hex digits, code points
+    /// capped at 0x10FFFF, and every other escaped character passing through.
+    fn escape(&mut self, f: &mut StringFrame, backslash: usize) {
+        if f.escape_err {
+            // This segment already reported a malformed escape (official
+            // unescapeCodeUnits returns at the first error): the rest of the
+            // segment passes through unvalidated.
+            self.bump();
+            return;
+        }
+        match self.peek() {
+            Some('x') => self.hex_escape(f, backslash),
+            Some('u') => self.unicode_escape(f, backslash),
+            // Any other escaped character passes through unchanged.
+            _ => {
+                self.bump();
+            }
+        }
+    }
+
+    /// `\x` with exactly two hex digits (quote.dart `invalidHexEscape`).
+    /// Official order: the presence of both digit code units is checked
+    /// first (a short part reports with its range reaching the content end),
+    /// then digit validity left to right (the bad digit is excluded from the
+    /// range and left in the stream as ordinary content).
+    fn hex_escape(&mut self, f: &mut StringFrame, backslash: usize) {
+        self.bump(); // 'x'
+        if let Err(boundary) = self.digit_units(f, self.pos, 2) {
+            self.escape_error(
+                f,
+                INVALID_HEX_ESCAPE,
+                msg::INVALID_HEX_ESCAPE,
+                backslash,
+                boundary,
+            );
+            return;
+        }
+        // Both digit units are present; each must be a hex digit. A multi-unit
+        // (astral) character contributes a non-hex high unit at its position.
+        let d1 = self
+            .peek()
+            .expect("presence walk guarantees a digit character");
+        if d1.len_utf16() == 2 || hex_value(d1).is_none() {
+            self.escape_error(
+                f,
+                INVALID_HEX_ESCAPE,
+                msg::INVALID_HEX_ESCAPE,
+                backslash,
+                self.pos,
+            );
+            return;
+        }
+        let at2 = self.pos + d1.len_utf8();
+        let d2 = self
+            .peek_char(at2)
+            .expect("presence walk guarantees a second digit unit");
+        if d2.len_utf16() == 2 || hex_value(d2).is_none() {
+            self.escape_error(
+                f,
+                INVALID_HEX_ESCAPE,
+                msg::INVALID_HEX_ESCAPE,
+                backslash,
+                at2,
+            );
+            return;
+        }
+        self.bump();
+        self.bump();
+    }
+
+    /// `\u` escape (quote.dart `invalidUnicodeEscapeU*` / `invalidCodePoint`):
+    /// either `u{` + 1-6 hex digits + `}` or four bare hex digits, with the
+    /// bracket value capped at 0x10FFFF.
+    fn unicode_escape(&mut self, f: &mut StringFrame, backslash: usize) {
+        self.bump(); // 'u'
+        if self.part_end(f, self.pos, self.peek()) {
+            // The segment's content ends right after `\u`.
+            self.escape_error(
+                f,
+                INVALID_UNICODE_ESCAPE_U_STARTED,
+                msg::INVALID_UNICODE_ESCAPE_U_STARTED,
+                backslash,
+                self.pos,
+            );
+            return;
+        }
+        if self.peek() != Some('{') {
+            self.unicode_escape_digits(f, backslash);
+            return;
+        }
+        self.bump(); // '{'
+        let mut code: u32 = 0;
+        let mut end_bracket = None;
+        let mut seventh = self.pos;
+        for j in 0..7 {
+            if self.part_end(f, self.pos, self.peek()) {
+                // Content end inside the bracket digits (j == 0 covers `\u{`
+                // with the part ending right after the brace).
+                self.escape_error(
+                    f,
+                    INVALID_UNICODE_ESCAPE_U_BRACKET,
+                    msg::INVALID_UNICODE_ESCAPE_U_BRACKET,
+                    backslash,
+                    self.pos,
+                );
+                return;
+            }
+            let c = self.peek().expect("part_end guarantees a character");
+            let at = self.pos;
+            if j != 0 && c == '}' {
+                self.bump();
+                end_bracket = Some(at);
+                break;
+            }
+            if j == 6 {
+                // Seventh character: the official loop breaks without adding
+                // it to the value, reports the missing `}` — and, alone among
+                // the errors, keeps validating the rest of the segment.
+                self.bump();
+                seventh = at;
+                break;
+            }
+            let Some(d) = hex_value(c) else {
+                // Bad digit; the official range includes the offending
+                // character, which stays in the stream as ordinary content.
+                self.escape_error(
+                    f,
+                    INVALID_UNICODE_ESCAPE_U_BRACKET,
+                    msg::INVALID_UNICODE_ESCAPE_U_BRACKET,
+                    backslash,
+                    at + c.len_utf8(),
+                );
+                return;
+            };
+            self.bump();
+            code = (code << 4) | d;
+        }
+        if end_bracket.is_none() {
+            self.diag(
+                INVALID_UNICODE_ESCAPE_U_BRACKET,
+                || msg::INVALID_UNICODE_ESCAPE_U_BRACKET.to_owned(),
+                backslash,
+                seventh,
+            );
+        }
+        if code > 0x10_FFFF {
+            // The range ends before the `}` (or at the seventh character).
+            self.escape_error(
+                f,
+                INVALID_CODE_POINT,
+                msg::INVALID_CODE_POINT,
+                backslash,
+                end_bracket.unwrap_or(seventh),
+            );
+        }
+    }
+
+    /// The bare `\u` form: exactly four hex-digit code units (quote.dart
+    /// `invalidUnicodeEscapeUNoBracket`). Official order: presence of all
+    /// four units first, then digit validity left to right. Four digits cap
+    /// at 0xFFFF, so no code point check applies.
+    fn unicode_escape_digits(&mut self, f: &mut StringFrame, backslash: usize) {
+        let end = match self.digit_units(f, self.pos, 4) {
+            Ok(end) => end,
+            Err(boundary) => {
+                self.escape_error(
+                    f,
+                    INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
+                    msg::INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
+                    backslash,
+                    boundary,
+                );
+                return;
+            }
+        };
+        let mut at = self.pos;
+        while at < end {
+            let c = self
+                .peek_char(at)
+                .expect("presence walk guarantees the digit units");
+            if c.len_utf16() == 2 || hex_value(c).is_none() {
+                self.escape_error(
+                    f,
+                    INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
+                    msg::INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
+                    backslash,
+                    at,
+                );
+                return;
+            }
+            at += c.len_utf8();
+        }
+        for _ in 0..4 {
+            self.bump();
+        }
+    }
+
+    /// `invalidEscapeStarted` (quote.dart): a part's content ends with a lone
+    /// backslash, which can't stand alone.
+    fn escape_started(&mut self, f: &mut StringFrame, backslash: usize) {
+        self.escape_error(
+            f,
+            INVALID_UNICODE_ESCAPE_STARTED,
+            msg::INVALID_ESCAPE_STARTED,
+            backslash,
+            backslash + 1,
+        );
+    }
+
+    /// Reports one malformed escape and disables further escape validation in
+    /// the segment (official unescapeCodeUnits returns at the first error).
+    /// The range starts at the backslash; `end` is the byte offset of the
+    /// official range boundary (its UTF-16 width matches the official
+    /// code-unit length after conversion).
+    fn escape_error(
+        &mut self,
+        f: &mut StringFrame,
+        code: CodeInfo,
+        message: &'static str,
+        backslash: usize,
+        end: usize,
+    ) {
+        f.escape_err = true;
+        self.diag(code, || message.to_owned(), backslash, end);
+    }
+
+    /// Whether the character `c` at byte offset `at` ends the current
+    /// segment's content for escape validation — what official unescape
+    /// would not see as a code unit of this part: EOF, the `$` that starts
+    /// an interpolation, the closing quote of a single-line string, the
+    /// closing triple quote of a multiline string (one or two quotes are
+    /// ordinary content there), and the line terminator ending a
+    /// single-line string.
+    fn part_end(&self, f: &StringFrame, at: usize, c: Option<char>) -> bool {
+        let Some(c) = c else {
+            return true;
+        };
+        if c == '$' {
+            return true;
+        }
+        if c == f.quote {
+            if !f.triple {
+                return true;
+            }
+            let q = f.quote as u8; // ' or " — ASCII
+            let b = self.src.as_bytes();
+            return b.get(at + 1) == Some(&q) && b.get(at + 2) == Some(&q);
+        }
+        matches!(c, '\n' | '\r') && !f.triple
+    }
+
+    /// Fixed digit-count presence walk (official `codeUnits.length` checks
+    /// against the part end): walks up to `units` UTF-16 code units from
+    /// `at` without consuming. `Ok` returns the offset past the units; `Err`
+    /// returns the byte offset where the content ended (the official
+    /// too-few-digits range boundary). An astral character contributes two
+    /// units, matching the official code-unit counting.
+    fn digit_units(&self, f: &StringFrame, mut at: usize, units: u32) -> Result<usize, usize> {
+        let mut left = units;
+        while left > 0 {
+            let Some(c) = self.peek_char(at) else {
+                return Err(at);
+            };
+            if self.part_end(f, at, Some(c)) {
+                return Err(at);
+            }
+            at += c.len_utf8();
+            left = left.saturating_sub(c.len_utf16() as u32);
+        }
+        Ok(at)
+    }
+
     /// Unterminated string: a synthetic empty STRING segment (pinned where
     /// scanning stopped) + diagnostic (pinned to the last UTF-16 unit:
     /// official `UnterminatedString` + analyzer-side `endOffset-1`, `length 1`).
@@ -346,5 +659,16 @@ impl Lexer<'_> {
             || msg::UNTERMINATED_STRING.to_owned(),
             stop,
         );
+    }
+}
+
+/// Hex digit value (`characters.dart` `hexDigitValue`); `None` for anything
+/// else, including the surrogate halves of an astral character.
+fn hex_value(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => Some(c as u32 - '0' as u32),
+        'a'..='f' => Some(c as u32 - 'a' as u32 + 10),
+        'A'..='F' => Some(c as u32 - 'A' as u32 + 10),
+        _ => None,
     }
 }

@@ -162,24 +162,39 @@ fn unterminated_single_line() {
 fn escaped_newline_terminates_single_line() {
     // The official scanner checks LF/CR after the backslash advance
     // (abstract_scanner.dart tokenizeSingleLineString): `'a\` + EOL does NOT
-    // continue the string. The first diagnostic pins to the backslash (last
-    // unit before the EOL); after the EOL `b` scans as code and the dangling
-    // `'` is a second unterminated string (same shape as the plain-EOL case).
+    // continue the string. The part's content keeps the backslash, so unescape
+    // adds invalidEscapeStarted ("can't stand alone") to the unterminated
+    // string; both pin to the backslash (last unit before the EOL). After the
+    // EOL `b` scans as code and the dangling `'` is a second unterminated
+    // string (same shape as the plain-EOL case).
     let r = scan_src("'a\\\nb'");
     assert_codes(
         &r,
-        &["unterminated_string_literal", "unterminated_string_literal"],
+        &[
+            "invalid_unicode_escape_started",
+            "unterminated_string_literal",
+            "unterminated_string_literal",
+        ],
     );
     assert_kinds(&r, &[K::String, K::Identifier, K::String]);
     assert!(r.tokens.first().is_synthetic());
     assert_eq!(r.diagnostics[0].range.offset, 2);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[0].message, "Unterminated string literal.");
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The string '\\' can't stand alone."
+    );
+    assert_eq!(r.diagnostics[1].range.offset, 2);
+    assert_eq!(r.diagnostics[1].range.length, 1);
     // A CR line break terminates the same way.
     let r = scan_src("'a\\\rb'");
     assert_codes(
         &r,
-        &["unterminated_string_literal", "unterminated_string_literal"],
+        &[
+            "invalid_unicode_escape_started",
+            "unterminated_string_literal",
+            "unterminated_string_literal",
+        ],
     );
     assert_kinds(&r, &[K::String, K::Identifier, K::String]);
 }
