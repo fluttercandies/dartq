@@ -36,6 +36,10 @@ harness = false
 name = "query_symbols"
 harness = false
 
+[[bench]]
+name = "apply_residency"
+harness = false
+
 [dev-dependencies]
 serde_json = { workspace = true }
 
