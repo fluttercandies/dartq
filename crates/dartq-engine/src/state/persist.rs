@@ -470,11 +470,7 @@ impl PersistedDirective {
             .map(|config| {
                 let span = config.uri_span.source_range();
                 (
-                    Configuration::new(
-                        &config.dotted_name,
-                        config.value.as_deref(),
-                        &config.uri,
-                    ),
+                    Configuration::new(&config.dotted_name, config.value.as_deref(), &config.uri),
                     span,
                 )
             })

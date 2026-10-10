@@ -1,6 +1,6 @@
-//! `apply_pending`: the ContentId gate → facts recompute → directive diff →
-//! library reformation → reverse-edge closure (incremental-l1-spec §3.2
-//! steps 1–5).
+//! `apply_pending`: the ContentId gate → facts recompute → the
+//! identity-keyed library-graph delta → cascade closure
+//! (incremental-l1-spec §3.2 steps 1–5).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -60,9 +60,16 @@ pub(crate) fn apply(
     let mut changed: Vec<(FileId, dartq_source::ContentId, String)> = Vec::new();
     let mut removed: Vec<FileId> = Vec::new();
     let mut gate_hits: Vec<FileId> = Vec::new();
+    // Previous facts of every touched file — the OLD face the graph delta
+    // subtracts. Captured here because both arms destroy the entries: a
+    // removal drops residency, a set overwrites it below.
+    let mut old_facts: FxHashMap<FileId, Arc<UnitFacts>> = FxHashMap::default();
     for file in order {
         match pending.remove(&file) {
             Some(PendingChange::Set(text)) => {
+                if let Some(previous) = state.residency.get(&file) {
+                    old_facts.insert(file, Arc::clone(previous));
+                }
                 let content = state.store.put(text.as_bytes());
                 if state
                     .residency
@@ -75,20 +82,20 @@ pub(crate) fn apply(
                 }
             }
             Some(PendingChange::Remove) => {
-                if state.residency.remove(&file).is_some() {
+                if let Some(previous) = state.residency.remove(&file) {
+                    old_facts.insert(file, previous);
                     // The maintained index inputs drop with residency: a
                     // removed file's capture must not serve a later query.
                     state.captures.remove(&file);
                     // The canonical-URI memo drops with residency too
                     // (bounded, audit #398 F10 — the map previously grew
                     // monotonically with every path ever resident). Eviction
-                    // is safe because `reform_libraries` is its only reader:
-                    // it lazily recomputes the entry for every resident file
-                    // before reading it, and the recompute is a pure function
-                    // of the file's immutable interned path (the package
-                    // table and config dir are fixed at state assembly), so
-                    // a returning file reproduces the identical string and
-                    // no library identity can fork across the gap.
+                    // is safe because re-formation lazily recomputes the
+                    // entry from the file's immutable interned path (the
+                    // package table and config dir are fixed at state
+                    // assembly), so a returning file reproduces the
+                    // identical string and no library identity can fork
+                    // across the gap.
                     state.canonical_uris.remove(&file);
                     removed.push(file);
                 }
@@ -157,13 +164,13 @@ pub(crate) fn apply(
         .map(|(file, _, _)| *file)
         .collect();
 
-    // Steps 4–5: library reformation, reverse-edge rebuild, dirty seeds,
-    // importer closure. The closure output *replaces* the phase-2 work queue
+    // Steps 4–5: library-graph delta, dirty seeds, importer closure. The
+    // closure output *replaces* the phase-2 work queue
     // (state.rs: "post-closure dirty set of the last apply; consumed by
     // analyze") — assignment, never a union. A cancelled analyze may leave
     // unfinished libraries queued; close() seeds those leftovers into its
-    // dirty set, filtered to the post-reform live set: the identity diff
-    // alone cannot see closure-stale leftovers — a library invalidated
+    // dirty set, filtered to the post-delta live set: the delta alone cannot
+    // see closure-stale leftovers — a library invalidated
     // because a DEPENDENCY's face moved carries that staleness nowhere in
     // its own identity (that is why cancel is a token, not an identity diff)
     // — so dropping such a leftover would serve its stale cached result
@@ -173,25 +180,14 @@ pub(crate) fn apply(
     // an intervening remove, and analyze unwraps every queued id's info.
     //
     // The closure is signature-gated (L2, PRD §11.3): seeds are the owners of
-    // signature-changed files, the (still live) former owners of removed
-    // files, and both live owners of any changed file whose membership moved;
-    // everything else stays clean unless its own identity moved. The
-    // pre-reform owners are captured before reform rebuilds
-    // `library_of_file` — after the rebuild only the *new* owner of a changed
-    // file is reachable, which is the detach hole (a `part of` edit strands
-    // the losing library's importers on stale facts) and the transfer hole
-    // (a claimant renaming away hands its part to a competitor library that
-    // no seed reaches).
-    let removed_owners: Vec<Option<LibraryId>> = removed
-        .iter()
-        .map(|file| state.library_of_file.get(file).copied())
-        .collect();
-    let changed_pre_owners: Vec<(FileId, Option<LibraryId>)> = changed
-        .iter()
-        .map(|(file, _, _)| (*file, state.library_of_file.get(file).copied()))
-        .collect();
+    // signature-changed files, and both live owners of every file whose
+    // membership moved (a `part of` detach strands the losing library's
+    // importers on stale facts; a claim transfer hands its part to a
+    // competitor library that no other seed reaches). The delta reads the
+    // pre-apply owners straight out of `library_of_file` before it writes
+    // any membership entry.
     let (invalidated, retired_any) =
-        reform_and_close(state, &sig_changed, &changed_pre_owners, &removed_owners);
+        maintain_and_close(state, &changed, &removed, &old_facts, &sig_changed);
     state.invalidated = invalidated.clone();
     // The resolution graph rebuilds only when its inputs moved: a
     // signature-bearing face (element or directive), a removal, or a library
@@ -380,10 +376,20 @@ fn recompute_facts(
         // targets (and URI diagnostics) to every same-content successor.
         to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
         for sibling in siblings.remove(&index).unwrap_or_default() {
-            let derived = derive_facts(&facts, changed[sibling].0, &mut resolver, &state.declared_variables);
+            let derived = derive_facts(
+                &facts,
+                changed[sibling].0,
+                &mut resolver,
+                &state.declared_variables,
+            );
             slots[sibling] = Some((Arc::new(derived), true));
         }
-        resolve_unit(&mut facts, changed[index].0, &mut resolver, &state.declared_variables);
+        resolve_unit(
+            &mut facts,
+            changed[index].0,
+            &mut resolver,
+            &state.declared_variables,
+        );
         slots[index] = Some((Arc::new(facts), false));
     }
     // Cross-batch hits (#303): the served face was computed for another
@@ -393,7 +399,12 @@ fn recompute_facts(
     // re-attributed: the AstKey triple is path-free by contract (PRD §5.3),
     // making this a hit-site duty.
     for (index, facts) in hits {
-        let derived = derive_facts(&facts, changed[index].0, &mut resolver, &state.declared_variables);
+        let derived = derive_facts(
+            &facts,
+            changed[index].0,
+            &mut resolver,
+            &state.declared_variables,
+        );
         slots[index] = Some((Arc::new(derived), true));
     }
     // Warm-start re-derivation (#482): the materialized face attributes and
@@ -416,7 +427,12 @@ fn recompute_facts(
         facts
             .diagnostics
             .truncate(facts.diagnostics.len() - uri_tail);
-        resolve_unit(&mut facts, changed[index].0, &mut resolver, &state.declared_variables);
+        resolve_unit(
+            &mut facts,
+            changed[index].0,
+            &mut resolver,
+            &state.declared_variables,
+        );
         slots[index] = Some((Arc::new(facts), true));
     }
     drop(resolver);
@@ -706,11 +722,8 @@ fn resolve_unit(
                 | DirectiveKind::PartOf
         ) {
             let (uri, _span) = selected_uri(directive, declared);
-            let UriResolution { target, code, .. } = resolver.resolve(
-                file,
-                uri,
-                dartq_resolution::DirectiveKind::ImportExport,
-            );
+            let UriResolution { target, code, .. } =
+                resolver.resolve(file, uri, dartq_resolution::DirectiveKind::ImportExport);
             directive.target = target;
             directive.code = code;
         }
@@ -718,12 +731,9 @@ fn resolve_unit(
     for directive in &facts.directives {
         if let Some(code) = directive.code {
             let (uri, span) = selected_uri(directive, declared);
-            facts.diagnostics.push(uri_diagnostic(
-                code,
-                uri.unwrap_or_default(),
-                span,
-                file,
-            ));
+            facts
+                .diagnostics
+                .push(uri_diagnostic(code, uri.unwrap_or_default(), span, file));
         }
     }
 }
@@ -1107,7 +1117,7 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
     (decodable.then(|| value.into_boxed_str()), span, j)
 }
 
-/// `import`/`export`: uri, conditional-uri clauses (`if (test) uri`), 
+/// `import`/`export`: uri, conditional-uri clauses (`if (test) uri`),
 /// `[deferred] [as p]` (import shapes only in practice, tolerated on both),
 /// combinator list, `;`.
 fn walk_import_export(
@@ -1121,7 +1131,7 @@ fn walk_import_export(
     let (uri, uri_span, mut i) = read_uri(text, tokens, start + 1);
     let mut prefix = None;
     let mut deferred = false;
-    let mut clauses: Vec<CombinatorClause> = Vec::new();
+    let mut clauses: Vec<(CombinatorClause, Box<[SourceRange]>)> = Vec::new();
     let mut configurations: Vec<Configuration> = Vec::new();
     let mut configuration_spans: Vec<SourceRange> = Vec::new();
     loop {
@@ -1162,21 +1172,32 @@ fn walk_import_export(
                 let hide = kind_at(tokens, i) == Some(TokenKind::Keyword(Keyword::Hide));
                 i += 1;
                 let mut names = Vec::new();
+                let mut name_spans: Vec<SourceRange> = Vec::new();
                 while let Some(next) = kind_at(tokens, i) {
                     match next {
                         TokenKind::Identifier => {
-                            names.push(strings.intern(tokens.lexeme(text, i)));
+                            let lexeme = tokens.lexeme(text, i);
+                            names.push(strings.intern(lexeme));
+                            // The written token's span rides with it — the
+                            // per-token combinator-warning anchor
+                            // (dead_code_verifier.dart:148-158).
+                            let token = tokens.get(i).expect("kind_at checked");
+                            name_spans.push(SourceRange {
+                                offset: token.utf16_offset,
+                                length: utf16_len_of(lexeme),
+                            });
                             i += 1;
                         }
                         TokenKind::Comma => i += 1,
                         _ => break,
                     }
                 }
-                clauses.push(if hide {
+                let clause = if hide {
                     CombinatorClause::Hide(names.into())
                 } else {
                     CombinatorClause::Show(names.into())
-                });
+                };
+                clauses.push((clause, name_spans.into()));
             }
             _ => i += 1,
         }
@@ -1189,7 +1210,7 @@ fn walk_import_export(
         code: None,
         prefix,
         deferred,
-        combinators: Combinators::new(clauses, strings),
+        combinators: Combinators::with_spans(clauses, strings),
         name: None,
         configurations: configurations.into(),
         configuration_spans: configuration_spans.into(),
@@ -1273,7 +1294,10 @@ fn walk_conditional_uri(
 
     // The candidate URI after the group (official :1155).
     let (uri, span, next) = read_uri(text, tokens, i);
-    if clean && !name.is_empty() && let Some(uri) = uri {
+    if clean
+        && !name.is_empty()
+        && let Some(uri) = uri
+    {
         configurations.push(Configuration::new(&name, value.as_deref(), &uri));
         configuration_spans.push(span);
     }
@@ -1434,240 +1458,781 @@ fn unescape(body: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Library reformation + cascade closure
+// Library-graph delta + cascade closure
 // ---------------------------------------------------------------------------
 
-/// Rebuilds the library set from residency, recomputes reverse import edges,
-/// and derives the post-closure dirty set: seeds are libraries with no
-/// cached result or a changed identity — member contents, dependency set,
-/// and the unclaimed part targets (§3.2 steps 3–5). Old and new identities
-/// are exact lists, so every membership, edge, or part-target residency
-/// change shows up as a difference on the library that owns it; no separate
-/// directive diff is needed.
-///
-/// The importer closure over that set is signature-gated (L2, PRD §11.3):
-/// it fans out only from `sig_changed` files' owners and the live former
-/// owners of removed files. Returns the invalidated set and whether any
-/// library was retired.
-fn reform_and_close(
-    state: &mut EngineState,
-    sig_changed: &[FileId],
-    changed_pre_owners: &[(FileId, Option<LibraryId>)],
-    removed_owners: &[Option<LibraryId>],
-) -> (Vec<LibraryId>, bool) {
-    let retired_any = reform_libraries(state);
-    let invalidated = close(state, sig_changed, changed_pre_owners, removed_owners);
-    (invalidated, retired_any)
+/// The formation-relevant projection of one file's facts: the part flag plus
+/// the raw resolved directive targets. Residency-independent — targets are
+/// interned at facts-compute time whether or not they are resident — and
+/// duplicate-keeping: one entry per directive occurrence, because
+/// reverse-edge multiplicity is per occurrence.
+struct UnitFace {
+    part: bool,
+    /// Targets of `part` directives, source order (the claim offers a
+    /// defining file makes).
+    part_targets: Vec<FileId>,
+    /// Targets of `import`/`export` directives, source order (the reverse
+    /// edges a file contributes).
+    import_targets: Vec<FileId>,
 }
 
-/// Rebuilds `libraries`, `library_of_file`, and `importers` from residency.
-///
-/// Formation: defining files (no `part of`) each own a library keyed on
-/// their canonical URI; their `part` targets that are themselves part files
-/// join in directive order (first claim wins on conflicts, precedence by
-/// interned path bytes — the oracle's path-smallest claimant;
-/// `duplicate_part` is a diagnostic ticket's business). Part
-/// files claimed by nobody become singleton libraries. Every resident file
-/// belongs to exactly one library (engine-api-spec §1.2). Returns whether
-/// any library was retired (a structure-graph input).
-fn reform_libraries(state: &mut EngineState) -> bool {
-    // Canonical URIs are a pure function of the interned path; memoize per
-    // file (a file's path never changes once interned).
-    let mut resident: Vec<FileId> = state.residency.keys().copied().collect();
-    resident.sort_unstable_by_key(|file| file.index());
-    for file in &resident {
-        if !state.canonical_uris.contains_key(file) {
-            let path = state
-                .files
-                .path(*file)
-                .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
-            // canonical_uri never probes existence (state.rs face contract):
-            // the resident filter is inert here, pass the documented no-probe
-            // closure (pre-#287 this call site had no filter at all).
-            let uri = state.uri_resolver(&|_| false).canonical_uri(&path);
-            state.canonical_uris.insert(*file, Arc::from(uri));
-        }
-    }
-
-    // Pass A: defining libraries. Claim precedence is the interned-path byte
-    // order (the oracle picks the path-smallest claiming library,
-    // file_state.dart:2176-2192). Both prior keyings would fork that winner:
-    // `FileId` interning order differs between the incremental and full arms
-    // when files are created mid-sequence, and canonical-URI bytes reorder
-    // percent-encoded paths (a space sorts below `!` as a path, above it as
-    // `%20` in a URI) — so the sort keys on the path itself, the FileTable's
-    // own universe (#287), stable across arms.
-    let mut defining: Vec<(FileId, LibraryId)> = Vec::new();
-    let mut is_part: FxHashSet<FileId> = FxHashSet::default();
-    for file in &resident {
-        if state.residency[file].is_part() {
-            is_part.insert(*file);
-        } else {
-            let id = state.libraries.intern(&state.canonical_uris[file]);
-            defining.push((*file, id));
-        }
-    }
-    defining.sort_unstable_by(|a, b| {
-        let path_bytes = |file: FileId| {
-            state
-                .files
-                .path(file)
-                .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+impl UnitFace {
+    fn of(facts: &UnitFacts) -> Self {
+        let mut face = Self {
+            part: facts.is_part(),
+            part_targets: Vec::new(),
+            import_targets: Vec::new(),
         };
-        path_bytes(a.0).cmp(path_bytes(b.0))
-    });
+        for directive in &facts.directives {
+            if let ResolvedTarget::Resolved(target) = directive.target {
+                match directive.kind {
+                    DirectiveKind::Part => face.part_targets.push(target),
+                    DirectiveKind::Import | DirectiveKind::Export => {
+                        face.import_targets.push(target)
+                    }
+                    DirectiveKind::PartOf | DirectiveKind::Library => {}
+                }
+            }
+        }
+        face
+    }
+}
 
-    // Pass B: attach parts (directive order, first claim wins). Belonging
-    // follows the part-of form (analyzer file_state.dart:2087-2266): a
-    // URI-form part file belongs to the includer its `part of` URI resolves
-    // to (`PartOfUriKnownFileKind`); a name-form part file joins an includer
-    // only when the includer's declared library name equals the part-of name
-    // (`PartOfNameFileKind::isPartOf`, file_state.dart:2222-2225), bounded to
-    // one package — the M1 stand-in for the oracle's sibling-directory
-    // candidate discovery (incremental-l1-spec §7.1). A name-form file with
-    // no qualifying includer stays unclaimed and falls through to the orphan
-    // singletons of Pass C (the oracle's `library` = null face).
-    let mut claims: FxHashMap<FileId, LibraryId> = FxHashMap::default();
-    let mut parts_of: FxHashMap<LibraryId, Vec<FileId>> = FxHashMap::default();
-    for (defining_file, lib) in &defining {
-        let library_name = declared_library_name(&state.residency[defining_file]);
-        for directive in &state.residency[defining_file].directives {
-            if directive.kind != DirectiveKind::Part {
+/// Applies the identity-keyed library-graph delta for one batch and derives
+/// the post-closure dirty set (§3.2 steps 3–5).
+///
+/// The changed set is known (the gate passed it), so maintenance touches
+/// only what moved:
+///
+/// 1. The raw projection indexes ([`EngineState::part_offers`],
+///    [`EngineState::import_sources`]) take the batch's paired
+///    subtract/add per file face, and the affected claim-key set is
+///    collected: the part files themselves when changed, plus every target a
+///    changed or removed defining file offered (old AND new faces — a
+///    library-name edit flips `may_claim` while the offer set stands).
+/// 2. Claim resolution runs over the affected keys only, against the final
+///    offer index. Resolution itself stays deterministic-total (the
+///    path-smallest qualifying candidate), so restricting WHICH part files
+///    resolve never forks precedence; ownership entries are written only
+///    where the resolved owner differs.
+/// 3. Libraries whose key file lost its tenant retire precisely
+///    ([`LibraryTable::retire`]); their results and surfaces go with them.
+/// 4. The reverse edges rewrite as one paired event per file — old face
+///    subtracted, new face added, zero map operations when a stable owner
+///    keeps an identical target set (the body-edit common case).
+/// 5. Every touched library recomputes its [`LibraryInfo`] from current
+///    facts and membership (the affected component's full recompute);
+///    untouched libraries keep theirs byte-exact. Identity comparison of
+///    old against new drives the dirty set, replacing the full rebuild's
+///    workspace-wide result scan.
+///
+/// Formation semantics are unchanged from the full rebuild: defining files
+/// own libraries keyed on their canonical URI, part files join the
+/// path-smallest qualifying claimant or fall back to singletons, and every
+/// resident file belongs to exactly one library. Returns the invalidated
+/// set and whether any library was retired.
+fn maintain_and_close(
+    state: &mut EngineState,
+    changed: &[(FileId, ContentId, String)],
+    removed: &[FileId],
+    old_facts: &FxHashMap<FileId, Arc<UnitFacts>>,
+    sig_changed: &[FileId],
+) -> (Vec<LibraryId>, bool) {
+    let changed_set: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
+    let removed_set: FxHashSet<FileId> = removed.iter().copied().collect();
+    // Old and new faces. A file entering residency here has no old face —
+    // nothing to subtract.
+    let changed_faces: Vec<(FileId, Option<UnitFace>, UnitFace)> = changed
+        .iter()
+        .map(|(file, _, _)| {
+            let new = UnitFace::of(&state.residency[file]);
+            let old = old_facts.get(file).map(|facts| UnitFace::of(facts));
+            (*file, old, new)
+        })
+        .collect();
+    let removed_faces: Vec<(FileId, UnitFace)> = removed
+        .iter()
+        .map(|file| {
+            let facts = old_facts
+                .get(file)
+                .expect("a removed file's previous facts were captured at the gate");
+            (*file, UnitFace::of(facts))
+        })
+        .collect();
+
+    // Phase 1 — projection-index deltas and the affected claim-key set.
+    // Offers come only from defining files (claims are only ever made by
+    // them); import sources from every file. Both indexes are raw, so the
+    // maintenance is a pure face diff.
+    const NO_TARGETS: &[FileId] = &[];
+    let mut affected_parts: FxHashSet<FileId> = FxHashSet::default();
+    for (file, old, new) in &changed_faces {
+        let old_defining_offers: &[FileId] = match old {
+            Some(face) if !face.part => &face.part_targets,
+            _ => NO_TARGETS,
+        };
+        let new_defining_offers: &[FileId] = if new.part {
+            NO_TARGETS
+        } else {
+            &new.part_targets
+        };
+        affected_parts.extend(old_defining_offers.iter().copied());
+        affected_parts.extend(new_defining_offers.iter().copied());
+        if old.as_ref().is_some_and(|face| face.part) || new.part {
+            affected_parts.insert(*file);
+        }
+        reindex(
+            &mut state.part_offers,
+            *file,
+            old_defining_offers,
+            new_defining_offers,
+        );
+        let old_imports: &[FileId] = match old {
+            Some(face) => &face.import_targets,
+            None => NO_TARGETS,
+        };
+        reindex(
+            &mut state.import_sources,
+            *file,
+            old_imports,
+            &new.import_targets,
+        );
+    }
+    for (file, face) in &removed_faces {
+        if !face.part {
+            affected_parts.extend(face.part_targets.iter().copied());
+            reindex(
+                &mut state.part_offers,
+                *file,
+                &face.part_targets,
+                NO_TARGETS,
+            );
+        }
+        reindex(
+            &mut state.import_sources,
+            *file,
+            &face.import_targets,
+            NO_TARGETS,
+        );
+    }
+
+    // Phase 2 — ownership decisions. Resolution reads the FINAL offer index,
+    // so every offer delta above has landed; owners mint through the arena's
+    // URI keys, which keeps a defining file's library id stable across edits
+    // of its content (the URI is path-derived). `library_keys` records the
+    // key file of every interned id so freshly formed slots (no info yet)
+    // know their defining file at the recompute.
+    let mut library_keys: FxHashMap<LibraryId, FileId> = FxHashMap::default();
+    let mut movers: Vec<(FileId, Option<LibraryId>, LibraryId)> = Vec::new();
+    // Unchanged part files whose claim may have moved. Raw offers can name
+    // defining files (they claim nothing) and removed files (nothing left to
+    // resolve); both skip.
+    for file in &affected_parts {
+        let Some(facts) = state.residency.get(file) else {
+            continue;
+        };
+        if changed_set.contains(file) || !facts.is_part() {
+            continue;
+        }
+        let new_owner = match resolve_claim(state, *file) {
+            Some(claimant) => intern_library_key(state, claimant, &mut library_keys),
+            None => intern_library_key(state, *file, &mut library_keys),
+        };
+        let old_owner = state.library_of_file.get(file).copied();
+        if old_owner != Some(new_owner) {
+            state.library_of_file.insert(*file, new_owner);
+            movers.push((*file, old_owner, new_owner));
+        }
+    }
+    // Changed files take their formation owner directly; removed files leave
+    // the membership map, their old owners riding on to retirement and the
+    // closure seeds.
+    let mut changed_owners: Vec<(FileId, Option<LibraryId>, LibraryId)> =
+        Vec::with_capacity(changed_faces.len());
+    for (file, _, new) in &changed_faces {
+        let new_owner = if new.part {
+            match resolve_claim(state, *file) {
+                Some(claimant) => intern_library_key(state, claimant, &mut library_keys),
+                None => intern_library_key(state, *file, &mut library_keys),
+            }
+        } else {
+            intern_library_key(state, *file, &mut library_keys)
+        };
+        let old_owner = state.library_of_file.get(file).copied();
+        if old_owner != Some(new_owner) {
+            movers.push((*file, old_owner, new_owner));
+        }
+        state.library_of_file.insert(*file, new_owner);
+        changed_owners.push((*file, old_owner, new_owner));
+    }
+    let mut removed_owners: Vec<Option<LibraryId>> = Vec::with_capacity(removed_faces.len());
+    for (file, _) in &removed_faces {
+        removed_owners.push(state.library_of_file.remove(file));
+    }
+
+    // Phase 3 — precise retirement: a library survives exactly when its key
+    // file still hands formation its URI (resident, and owned by this
+    // library — a defining key file that turned part either re-keys the same
+    // URI as an orphan singleton or moved to a claimant; a removed one
+    // leaves no tenant). All interns of the batch precede this, so a
+    // recycled id cannot alias a same-batch formation (#374).
+    let mut candidates: FxHashSet<LibraryId> = FxHashSet::default();
+    for (_, old_owner, new_owner) in changed_owners.iter().chain(movers.iter()) {
+        if Some(*new_owner) != *old_owner
+            && let Some(owner) = old_owner
+        {
+            candidates.insert(*owner);
+        }
+    }
+    for owner in removed_owners.iter().flatten() {
+        candidates.insert(*owner);
+    }
+    let retired: Vec<LibraryId> = candidates
+        .into_iter()
+        .filter(|library| !library_survives(state, *library))
+        .collect();
+    for library in &retired {
+        state.libraries.retire(*library);
+        state.results.remove(library);
+        state.library_surfaces.remove(library);
+    }
+
+    // Phase 4 — the affected component set and the reverse-edge rewrite.
+    // Every library whose membership, edges, or identity inputs the batch
+    // touched recomputes; everything else keeps its exact state.
+    let mut affected: FxHashSet<LibraryId> = FxHashSet::default();
+    for (_, old_owner, new_owner) in changed_owners.iter().chain(movers.iter()) {
+        if let Some(owner) = old_owner {
+            affected.insert(*owner);
+        }
+        affected.insert(*new_owner);
+    }
+    for owner in removed_owners.iter().flatten() {
+        affected.insert(*owner);
+    }
+    // A removed target's importers lose their dependency (the target is no
+    // longer resident) — captured before the entry drops.
+    for (file, _) in &removed_faces {
+        if let Some(importers) = state.importers.get(file) {
+            for library in importers.keys() {
+                affected.insert(*library);
+            }
+        }
+    }
+    // A target whose owning library id moved flips the dependency column of
+    // every library that imports it.
+    for (file, old_owner, new_owner) in &movers {
+        if old_owner.is_some() && changed_set.contains(file) {
+            continue; // covered by the changed-file pass below
+        }
+        if *old_owner != Some(*new_owner)
+            && let Some(importers) = state.importers.get(file)
+        {
+            for library in importers.keys() {
+                affected.insert(*library);
+            }
+        }
+    }
+    for (file, old_owner, new_owner) in &changed_owners {
+        if *old_owner != Some(*new_owner)
+            && let Some(importers) = state.importers.get(file)
+        {
+            for library in importers.keys() {
+                affected.insert(*library);
+            }
+        }
+    }
+    // A part target's residency flip moves the offering libraries'
+    // part-target identity.
+    for file in removed.iter().copied().chain(
+        changed_faces
+            .iter()
+            .filter(|(_, old, _)| old.is_none())
+            .map(|(file, _, _)| *file),
+    ) {
+        let offerers: Vec<FileId> = state
+            .part_offers
+            .get(&file)
+            .map(|offers| offers.iter().copied().collect())
+            .unwrap_or_default();
+        for offerer in offerers {
+            if let Some(&library) = state.library_of_file.get(&offerer) {
+                affected.insert(library);
+            }
+        }
+    }
+    // A file entering residency gains the reverse edges of every unchanged
+    // source that already pointed at it (the sources' own events carried
+    // nothing — their directive faces never moved). Changed and mover
+    // sources re-add their edges through their own events below.
+    for (file, old, _) in &changed_faces {
+        if old.is_some() {
+            continue;
+        }
+        let sources: Vec<FileId> = state
+            .import_sources
+            .get(file)
+            .map(|sources| sources.iter().copied().collect())
+            .unwrap_or_default();
+        for source in sources {
+            if changed_set.contains(&source) || movers.iter().any(|(moved, _, _)| moved == &source)
+            {
                 continue;
             }
-            if let ResolvedTarget::Resolved(target) = directive.target
-                && is_part.contains(&target)
-                && state.residency.contains_key(&target)
-                && !claims.contains_key(&target)
-                && may_claim(state, *defining_file, library_name, target)
-            {
-                claims.insert(target, *lib);
-                parts_of.entry(*lib).or_default().push(target);
+            let Some(&owner) = state.library_of_file.get(&source) else {
+                continue;
+            };
+            let occurrences = state
+                .residency
+                .get(&source)
+                .map(|facts| UnitFace::of(facts).import_targets)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|target| target == file)
+                .count();
+            for _ in 0..occurrences {
+                add_edge(&mut state.importers, *file, owner);
             }
+            affected.insert(owner);
         }
     }
-
-    // Pass C: orphaned part files become singleton libraries.
-    for file in &resident {
-        if is_part.contains(file) && !claims.contains_key(file) {
-            let id = state.libraries.intern(&state.canonical_uris[file]);
-            defining.push((*file, id));
-        }
-    }
-
-    // File membership (every resident file, exactly one library).
-    let mut library_of_file: FxHashMap<FileId, LibraryId> = FxHashMap::default();
-    for (file, lib) in &defining {
-        library_of_file.insert(*file, *lib);
-    }
-    for (file, lib) in &claims {
-        library_of_file.insert(*file, *lib);
-    }
-
-    // Pass D: content identity (defining + parts, directive order) and
-    // dependency set (resolved import/export targets' owning libraries).
-    let mut infos: Vec<(LibraryId, LibraryInfo)> = Vec::with_capacity(defining.len());
-    for (file, lib) in &defining {
-        let parts = parts_of
-            .get(lib)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        let mut members: Vec<FileId> = vec![*file];
-        members.extend_from_slice(&parts);
-        let content: Box<[ContentId]> = members
+    // One paired edge event per file: the old face subtracted, the new face
+    // added, multiplicity exact. Formation only ever created edges between
+    // resident endpoints, so both sides filter to the same notion: an edge
+    // can exist exactly for a target resident pre-apply (post-update
+    // residency plus this batch's removals), and a new edge exactly for a
+    // target resident now. A stable owner over an identical effective target
+    // set performs zero map operations.
+    let was_resident =
+        |target: FileId| state.residency.contains_key(&target) || removed_set.contains(&target);
+    for ((_, old, new), (_, old_owner, new_owner)) in changed_faces.iter().zip(&changed_owners) {
+        let old_imports: Vec<FileId> = match old {
+            Some(face) => face
+                .import_targets
+                .iter()
+                .copied()
+                .filter(|target| was_resident(*target))
+                .collect(),
+            None => Vec::new(),
+        };
+        let new_imports: Vec<FileId> = new
+            .import_targets
             .iter()
-            .map(|member| state.residency[member].content)
+            .copied()
+            .filter(|target| state.residency.contains_key(target))
             .collect();
-        let mut deps: Vec<LibraryId> = Vec::new();
-        for member in &members {
-            for directive in &state.residency[member].directives {
-                if matches!(
-                    directive.kind,
-                    DirectiveKind::Import | DirectiveKind::Export
-                ) && let ResolvedTarget::Resolved(target) = directive.target
-                    && let Some(dep) = library_of_file.get(&target)
-                    && *dep != *lib
-                {
-                    deps.push(*dep);
+        retarget_edges(
+            &mut state.importers,
+            *old_owner,
+            &old_imports,
+            *new_owner,
+            &new_imports,
+        );
+    }
+    // Removals all precede the entry drops: two removed files may import
+    // each other, and each removal must see the other's edge still counted.
+    for ((file, _), owner) in removed_faces.iter().zip(&removed_owners) {
+        if let Some(owner) = owner {
+            // The face is gone from residency; its old targets ride on the
+            // captured old facts, gated to the pre-apply residency (an edge
+            // to a never-resident target never existed).
+            let targets = old_facts
+                .get(file)
+                .map(|facts| UnitFace::of(facts).import_targets)
+                .unwrap_or_default();
+            for target in targets {
+                if was_resident(target) {
+                    remove_edge(&mut state.importers, target, *owner);
                 }
             }
         }
-        deps.sort_unstable();
-        deps.dedup();
-        // Part directives resolving to a resident file outside membership:
-        // neither content (membership) nor deps (import/export only) sees
-        // them, so their residency flip is carried by the identity
-        // explicitly. Without it, removing such a target leaves the library
-        // clean while its cached result predates the URI going dangling —
-        // incremental diverges from a full recompute, which bakes
-        // `uri_does_not_exist` against the absent target.
-        let mut part_targets: Vec<FileId> = Vec::new();
-        for member in &members {
-            for directive in &state.residency[member].directives {
-                if directive.kind == DirectiveKind::Part
-                    && let ResolvedTarget::Resolved(target) = directive.target
-                    && state.residency.contains_key(&target)
-                    // O(1) membership: the defining file itself and every
-                    // target this library claimed are members; any other
-                    // resident target is an unclaimed part target.
-                    && target != *file
-                    && claims.get(&target).copied() != Some(*lib)
+    }
+    for (file, _) in &removed_faces {
+        state.importers.remove(file);
+    }
+    for (file, old_owner, new_owner) in &movers {
+        if changed_set.contains(file) {
+            continue; // the changed-file event above moved these edges
+        }
+        // An unchanged mover keeps its directive face; both sides carry the
+        // same targets, filtered per side (a target created this batch had
+        // no old edge, a removed one keeps no new edge), re-owned.
+        let targets = UnitFace::of(&state.residency[file]).import_targets;
+        let old_effective: Vec<FileId> = targets
+            .iter()
+            .copied()
+            .filter(|target| was_resident(*target))
+            .collect();
+        let new_effective: Vec<FileId> = targets
+            .iter()
+            .copied()
+            .filter(|target| state.residency.contains_key(target))
+            .collect();
+        retarget_edges(
+            &mut state.importers,
+            *old_owner,
+            &old_effective,
+            *new_owner,
+            &new_effective,
+        );
+    }
+
+    // Phase 5 — the affected components' full recompute: rebuild each
+    // touched library's info from current facts and membership. The
+    // old-vs-new identity comparison drives the dirty set, so the full
+    // rebuild's workspace-wide result scan disappears; a library whose
+    // identity stood is left byte-exact (no info write at all). Retired ids
+    // skip: they left the live set this batch, and retirement and formation
+    // are disjoint (candidates are pre-apply live ids, formed ids come from
+    // fresh interns or the freelist).
+    let retired_set: FxHashSet<LibraryId> = retired.iter().copied().collect();
+    let mut identity_moved: FxHashSet<LibraryId> = FxHashSet::default();
+    let mut targets_moved: FxHashSet<LibraryId> = FxHashSet::default();
+    for library in &affected {
+        if retired_set.contains(library) {
+            continue;
+        }
+        let previous = state.libraries.info(*library).map(|info| {
+            (
+                info.defining,
+                info.content.clone(),
+                info.deps.clone(),
+                info.part_targets.clone(),
+            )
+        });
+        match previous {
+            Some((defining, content, deps, part_targets)) => {
+                let fresh = build_library_info(state, *library, defining);
+                if fresh.part_targets != part_targets {
+                    targets_moved.insert(*library);
+                }
+                if fresh.content != content
+                    || fresh.deps != deps
+                    || fresh.part_targets != part_targets
                 {
-                    part_targets.push(target);
+                    identity_moved.insert(*library);
+                    state.libraries.set_info(*library, fresh);
                 }
             }
-        }
-        part_targets.sort_unstable_by_key(|file| file.index());
-        part_targets.dedup();
-        infos.push((
-            *lib,
-            LibraryInfo {
-                // The memo's allocation, shared: a refcount per defining
-                // library per apply, never a copy of the URI bytes.
-                uri: Arc::clone(&state.canonical_uris[file]),
-                defining: *file,
-                parts: parts.into(),
-                content,
-                deps,
-                part_targets: part_targets.into(),
-            },
-        ));
-    }
-
-    // Reverse edges from the new directive set.
-    let mut importers: FxHashMap<FileId, FxHashSet<LibraryId>> = FxHashMap::default();
-    for (file, lib) in &library_of_file {
-        for directive in &state.residency[file].directives {
-            if matches!(
-                directive.kind,
-                DirectiveKind::Import | DirectiveKind::Export
-            ) && let ResolvedTarget::Resolved(target) = directive.target
-                && state.residency.contains_key(&target)
-            {
-                importers.entry(target).or_default().insert(*lib);
+            None => {
+                // Formed this batch (a fresh intern or a recycled slot): no
+                // previous identity to compare — everything about it is new,
+                // so it is dirty by construction.
+                let defining = library_keys
+                    .get(library)
+                    .copied()
+                    .expect("an info-less live library was formed by this batch");
+                let fresh = build_library_info(state, *library, defining);
+                identity_moved.insert(*library);
+                state.libraries.set_info(*library, fresh);
             }
         }
     }
 
-    // Write back: retire gone libraries (their results go with them),
-    // replace infos, and swap the derived maps.
-    let live: FxHashSet<LibraryId> = defining.iter().map(|(_, lib)| *lib).collect();
-    let retired = state.libraries.retire_except(&live);
-    let retired_any = !retired.is_empty();
-    for id in retired {
-        state.results.remove(&id);
-        // The reference surface goes with the retired library; a returning
-        // (recycled) id rebuilds it at its next LibraryAnalyzed point.
-        state.library_surfaces.remove(&id);
+    let invalidated = close(
+        state,
+        sig_changed,
+        &movers,
+        &changed_set,
+        &removed_owners,
+        &affected,
+        &identity_moved,
+        &targets_moved,
+    );
+    (invalidated, !retired.is_empty())
+}
+
+/// The file's canonical URI, memoized ([`EngineState::canonical_uris`]): a
+/// pure function of the immutable interned path, so a miss recomputes
+/// exactly the string a previous residency held and no library identity can
+/// fork across an eviction gap (audit #398 F10). canonical_uri never probes
+/// existence (the state.rs face contract), so the resident filter is inert
+/// — the documented no-probe closure.
+fn canonical_uri_memo(state: &mut EngineState, file: FileId) -> Arc<str> {
+    if let Some(uri) = state.canonical_uris.get(&file) {
+        return Arc::clone(uri);
     }
-    for (id, info) in infos {
-        state.libraries.set_info(id, info);
+    let path = state
+        .files
+        .path(file)
+        .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
+    let uri = Arc::from(state.uri_resolver(&|_| false).canonical_uri(&path));
+    state.canonical_uris.insert(file, Arc::clone(&uri));
+    uri
+}
+
+/// Interns the library keyed on `file`'s canonical URI — its defining or
+/// singleton formation key — recording the key file so a freshly formed
+/// arena slot knows its defining file at the recompute.
+fn intern_library_key(
+    state: &mut EngineState,
+    file: FileId,
+    library_keys: &mut FxHashMap<LibraryId, FileId>,
+) -> LibraryId {
+    let uri = canonical_uri_memo(state, file);
+    let id = state.libraries.intern(&uri);
+    library_keys.entry(id).or_insert(file);
+    id
+}
+
+/// Interned-path byte order — the claim-precedence total order (the oracle
+/// picks the path-smallest claimant, file_state.dart:2176-2192). Stable
+/// across the incremental and full arms because paths are the FileTable's
+/// own universe (#287): FileId interning order and canonical-URI bytes both
+/// reorder under mid-sequence file creation and percent-encoding.
+fn path_key<'a>(state: &'a EngineState, file: FileId) -> &'a [u8] {
+    state
+        .files
+        .path(file)
+        .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+}
+
+/// Claim resolution for one resident part file over the offer index: the
+/// path-smallest defining file whose `may_claim` holds against current
+/// facts. Deterministic-total over the candidate set, so restricting which
+/// part files resolve (the affected key set) never forks precedence; two
+/// candidates cannot tie because interned paths are unique per file.
+fn resolve_claim(state: &EngineState, part: FileId) -> Option<FileId> {
+    let mut winner: Option<FileId> = None;
+    for candidate in state.part_offers.get(&part).into_iter().flatten() {
+        let candidate = *candidate;
+        let library_name = declared_library_name(&state.residency[&candidate]);
+        if may_claim(state, candidate, library_name, part)
+            && winner.is_none_or(|current| path_key(state, candidate) < path_key(state, current))
+        {
+            winner = Some(candidate);
+        }
     }
-    state.library_of_file = library_of_file;
-    state.importers = importers;
-    retired_any
+    winner
+}
+
+/// The one-library formation recomputed from current facts — the affected
+/// component's full recompute. Membership follows the maintained ownership
+/// map (a defining file's `part` targets claimed by this library, directive
+/// order), content folds the member contents, and deps plus unclaimed part
+/// targets scan the members' directives. The construction is the full
+/// rebuild's, verbatim; the delta only decides which libraries run it.
+fn build_library_info(
+    state: &mut EngineState,
+    library: LibraryId,
+    defining: FileId,
+) -> LibraryInfo {
+    let uri = canonical_uri_memo(state, defining);
+    let defining_facts = &state.residency[&defining];
+    let parts: Vec<FileId> = defining_facts
+        .directives
+        .iter()
+        .filter(|directive| directive.kind == DirectiveKind::Part)
+        .filter_map(|directive| match directive.target {
+            ResolvedTarget::Resolved(target) => Some(target),
+            _ => None,
+        })
+        .filter(|target| *target != defining && state.library_of_file.get(target) == Some(&library))
+        .collect();
+    let mut members = Vec::with_capacity(parts.len() + 1);
+    members.push(defining);
+    members.extend_from_slice(&parts);
+    let content: Box<[ContentId]> = members
+        .iter()
+        .map(|member| state.residency[member].content)
+        .collect();
+    let mut deps: Vec<LibraryId> = Vec::new();
+    let mut part_targets: Vec<FileId> = Vec::new();
+    for member in &members {
+        for directive in &state.residency[member].directives {
+            let ResolvedTarget::Resolved(target) = directive.target else {
+                continue;
+            };
+            match directive.kind {
+                DirectiveKind::Import | DirectiveKind::Export => {
+                    if let Some(&dep) = state.library_of_file.get(&target)
+                        && dep != library
+                    {
+                        deps.push(dep);
+                    }
+                }
+                DirectiveKind::Part => {
+                    // Part directives resolving to a resident file outside
+                    // membership: neither content nor deps sees them, so
+                    // their residency flip rides on the identity explicitly
+                    // (removing such a target must re-bake
+                    // `uri_does_not_exist` against the absent URI).
+                    if state.residency.contains_key(&target)
+                        && target != defining
+                        && state.library_of_file.get(&target) != Some(&library)
+                    {
+                        part_targets.push(target);
+                    }
+                }
+                DirectiveKind::PartOf | DirectiveKind::Library => {}
+            }
+        }
+    }
+    deps.sort_unstable();
+    deps.dedup();
+    part_targets.sort_unstable_by_key(|file| file.index());
+    part_targets.dedup();
+    LibraryInfo {
+        // The memo's allocation, shared: a refcount per formed library,
+        // never a copy of the URI bytes.
+        uri,
+        defining,
+        parts: parts.into(),
+        content,
+        deps,
+        part_targets: part_targets.into(),
+    }
+}
+
+/// The tenancy test: the library's key file is resident and still owned by
+/// this library — exactly the formation condition for its URI key (a
+/// defining key, or the orphan-singleton key when the key file is an
+/// unclaimed part).
+fn library_survives(state: &EngineState, library: LibraryId) -> bool {
+    let Some(info) = state.libraries.info(library) else {
+        return false;
+    };
+    state.residency.contains_key(&info.defining)
+        && state.library_of_file.get(&info.defining) == Some(&library)
+}
+
+/// Paired set-index maintenance (the raw offer/source projections): the
+/// file's old target set subtracted, the new one added; an unchanged face
+/// touches nothing. Empty entries drop, so the indexes stay bounded by the
+/// live directive set.
+fn reindex(
+    index: &mut FxHashMap<FileId, FxHashSet<FileId>>,
+    source: FileId,
+    old_targets: &[FileId],
+    new_targets: &[FileId],
+) {
+    if old_targets == new_targets {
+        return;
+    }
+    let old_set: FxHashSet<FileId> = old_targets.iter().copied().collect();
+    let new_set: FxHashSet<FileId> = new_targets.iter().copied().collect();
+    for target in old_set.difference(&new_set) {
+        if let Some(sources) = index.get_mut(target) {
+            sources.remove(&source);
+            if sources.is_empty() {
+                index.remove(target);
+            }
+        }
+    }
+    for target in new_set.difference(&old_set) {
+        index.entry(*target).or_default().insert(source);
+    }
+}
+
+/// One reverse-edge insert. The adjacency counts multiplicity: two members
+/// of one library importing the same target is a count of two, so one of
+/// them re-targeting away leaves the edge exact.
+fn add_edge(
+    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
+    target: FileId,
+    library: LibraryId,
+) {
+    *importers
+        .entry(target)
+        .or_default()
+        .entry(library)
+        .or_insert(0) += 1;
+}
+
+/// The paired remove: decrements the multiplicity and drops entries as they
+/// empty, so no zero-count ghost survives. An absent edge is a delta
+/// asymmetry — debug builds trap on it.
+fn remove_edge(
+    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
+    target: FileId,
+    library: LibraryId,
+) {
+    debug_assert!(
+        importers
+            .get(&target)
+            .is_some_and(|libraries| libraries.contains_key(&library)),
+        "removing an absent reverse edge (delta asymmetry)"
+    );
+    if let Some(libraries) = importers.get_mut(&target) {
+        if let Some(count) = libraries.get_mut(&library) {
+            *count -= 1;
+            if *count == 0 {
+                libraries.remove(&library);
+            }
+        }
+        if libraries.is_empty() {
+            importers.remove(&target);
+        }
+    }
+}
+
+/// Rewrites one file's outgoing reverse edges from its old face to its new
+/// face. A stable owner over an unchanged target set performs zero map
+/// operations (the body-edit common case); an ownership move re-owns every
+/// edge; otherwise the multiset difference moves only the changed
+/// directives. Every removal is paired with the add that created the edge —
+/// an asymmetry surfaces as a ghost edge, which the incremental-vs-full
+/// oracle gate and the debug assert in [`remove_edge`] both catch.
+fn retarget_edges(
+    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
+    old_owner: Option<LibraryId>,
+    old_targets: &[FileId],
+    new_owner: LibraryId,
+    new_targets: &[FileId],
+) {
+    match old_owner {
+        Some(owner) if owner == new_owner => {
+            if old_targets == new_targets {
+                return;
+            }
+            let (dropped, added) = multiset_delta(old_targets, new_targets);
+            for target in dropped {
+                remove_edge(importers, target, owner);
+            }
+            for target in added {
+                add_edge(importers, target, owner);
+            }
+        }
+        owner => {
+            if let Some(owner) = owner {
+                for target in old_targets {
+                    remove_edge(importers, *target, owner);
+                }
+            }
+            for target in new_targets {
+                add_edge(importers, *target, new_owner);
+            }
+        }
+    }
+}
+
+/// Multiset difference per multiplicity: what `old` holds beyond `new`, and
+/// vice versa (directive order is irrelevant to edge counts).
+fn multiset_delta(old: &[FileId], new: &[FileId]) -> (Vec<FileId>, Vec<FileId>) {
+    let count = |targets: &[FileId]| {
+        let mut counts: FxHashMap<FileId, u32> = FxHashMap::default();
+        for target in targets {
+            *counts.entry(*target).or_insert(0) += 1;
+        }
+        counts
+    };
+    let mut new_counts = count(new);
+    let mut dropped = Vec::new();
+    for target in old {
+        match new_counts.get_mut(target) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => dropped.push(*target),
+        }
+    }
+    let mut old_counts = count(old);
+    let mut added = Vec::new();
+    for target in new {
+        match old_counts.get_mut(target) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => added.push(*target),
+        }
+    }
+    (dropped, added)
 }
 
 /// The name a defining file's `library` directive declares, `None` when the
@@ -1724,94 +2289,97 @@ fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
 }
 
 /// The post-closure dirty set (§3.2 step 5, L2-refined per PRD §11.3):
-/// libraries with no cached result or changed identity, plus the importer
-/// closure fanned out **only from the propagation seeds** — the owners of
-/// `sig_changed` files, both live owners of a changed file whose membership
-/// moved (the pre-reform owner is the losing side of a `part of` detach),
-/// libraries whose part-target identity moved (a claim flip between
-/// competitor libraries), and the live former owners of removed files. From
-/// a seed the closure passes unconditionally through every importer (the
-/// re-export chain D←L←M: M's face moves, L re-exports it unchanged, D must
-/// still recompute); a library that is only identity-stale (a body edit
-/// under a stable face) recomputes alone and does not propagate. A retired
-/// former owner needs no seed: its direct importers go stale by identity
-/// (the dropped dependency), and their own faces did not move.
+/// touched libraries whose identity moved or that have no cached result,
+/// plus the importer closure fanned out **only from the propagation seeds**
+/// — the owners of `sig_changed` files, both live owners of every changed
+/// file whose membership moved (the losing owner of a `part of` detach, the
+/// claim transfer's winner), libraries with a cached result whose
+/// part-target identity moved (a claim flip between competitor libraries,
+/// or a part target's residency flip), and the live former owners of
+/// removed files. From a seed the closure passes unconditionally through
+/// every importer (the re-export chain D←L←M: M's face moves, L re-exports
+/// it unchanged, D must still recompute); a library that is only
+/// identity-stale (a body edit under a stable face) recomputes alone and
+/// does not propagate. A retired former owner needs no seed: its direct
+/// importers go stale by identity (the dropped dependency), and their own
+/// faces did not move.
+///
+/// The seed categories are the full rebuild's, exactly — the closure input
+/// defines the invalidated SET, which the oracle pins per step, so an extra
+/// seed would over-dirty just as a missing one under-dirties. In particular
+/// an unchanged part file's claim flip seeds only through the surviving
+/// endpoints' part-target moves (a newly formed winner stays unseeded: its
+/// importers dirty by identity and do not propagate), and a result-less
+/// library never seeds.
 fn close(
     state: &mut EngineState,
     sig_changed: &[FileId],
-    changed_pre_owners: &[(FileId, Option<LibraryId>)],
+    movers: &[(FileId, Option<LibraryId>, LibraryId)],
+    changed_set: &FxHashSet<FileId>,
     removed_owners: &[Option<LibraryId>],
+    touched: &FxHashSet<LibraryId>,
+    identity_moved: &FxHashSet<LibraryId>,
+    targets_moved: &FxHashSet<LibraryId>,
 ) -> Vec<LibraryId> {
     let mut dirty: FxHashSet<LibraryId> = FxHashSet::default();
     let mut queued: FxHashSet<LibraryId> = FxHashSet::default();
     let mut work: Vec<LibraryId> = Vec::new();
-    // Cancelled-analyze leftovers carry forward (#428): reform_libraries has
-    // already run, so filtering on live info is the post-reform live set. A
-    // leftover invalidated by a dependency's face move is identity-fresh (the
-    // pass below would drop it), and the retired ids among the leftovers must
-    // not re-enter — analyze unwraps every queued id's info, and a freelist-
-    // recycled id (#230) aliases a fresh tenant that, if it reached here at
-    // all, is result-less and already dirty. Leftovers seed `dirty` only,
-    // never the fan-out: the cancelled run's dirty set was the full
-    // transitive closure of its own close, so every still-invalid importer
-    // is already among them.
-    for lib in std::mem::take(&mut state.invalidated) {
-        if state.libraries.info(lib).is_some() {
-            dirty.insert(lib);
+    // Cancelled-analyze leftovers carry forward (#428): filtering on live
+    // info is the post-delta live set. A leftover invalidated by a
+    // dependency's face move is identity-fresh (the touched pass below would
+    // drop it), and the retired ids among the leftovers must not re-enter —
+    // analyze unwraps every queued id's info, and a freelist-recycled id
+    // (#230) aliases a fresh tenant that, if it reached here at all, is
+    // result-less and already dirty. Leftovers seed `dirty` only, never the
+    // fan-out: the cancelled run's dirty set was the full transitive closure
+    // of its own close, so every still-invalid importer is already among
+    // them.
+    for library in std::mem::take(&mut state.invalidated) {
+        if state.libraries.info(library).is_some() {
+            dirty.insert(library);
         }
     }
-    for lib in state.libraries.live() {
-        let info = state.libraries.info(lib).expect("live library has info");
-        let stale = match state.results.get(&lib) {
-            None => true,
-            Some(result) => {
-                result.content != info.content
-                    || result.deps != info.deps
-                    || result.part_targets != info.part_targets
-            }
-        };
-        if stale {
-            dirty.insert(lib);
+    // Untouched libraries keep their identity by the maintenance invariant,
+    // so staleness is a touched-set question: moved identity, or no result
+    // at all (a freshly formed library has nothing cached to reuse). The
+    // pass is live-gated exactly like the full rebuild's iteration over
+    // `libraries.live()`: a retired id sits in the touched set as a former
+    // owner, its result dropped alongside its info at retirement — without
+    // the gate its "resultless" shape would resurrect a dead id into the
+    // dirty set, and analyze unwraps every queued id's info (#230).
+    for library in touched {
+        if state.libraries.info(*library).is_none() {
+            continue;
         }
-        // Membership-change seed (transfer shape): the part-target identity
-        // moves exactly when a resolved `part` target flipped claim state or
-        // residency. The gaining library's own files are unchanged and the
-        // moved member carries no signature, so no other seed reaches it —
-        // yet its namespace changed, and its identity-clean importers would
-        // keep stale facts.
-        if let Some(result) = state.results.get(&lib)
-            && result.part_targets != info.part_targets
-            && queued.insert(lib)
-        {
-            work.push(lib);
+        if identity_moved.contains(library) || !state.results.contains_key(library) {
+            dirty.insert(*library);
         }
     }
-    // Signature-gated propagation seeds. All categories are identity-stale
-    // by construction (a signature move implies a content move; a membership
-    // move implies an identity move), so the identity pass above already
-    // invalidated them — seeding only starts the fan-out, deduplicated by
-    // `queued` so each library propagates once. Retired owners are skipped:
-    // their importers went stale through the dropped dependency instead.
+    // Signature-gated propagation seeds. Identity-stale seeds are already in
+    // `dirty` by construction (a signature move implies a content move; a
+    // membership move implies an identity move), so seeding only starts the
+    // fan-out, deduplicated by `queued` so each library propagates once.
+    // Retired owners are skipped: their importers went stale through the
+    // dropped dependency instead.
     for file in sig_changed {
-        if let Some(&lib) = state.library_of_file.get(file)
-            && state.libraries.info(lib).is_some()
-            && queued.insert(lib)
+        if let Some(&library) = state.library_of_file.get(file)
+            && state.libraries.info(library).is_some()
+            && queued.insert(library)
         {
-            work.push(lib);
+            work.push(library);
         }
     }
-    // Membership-change seed (detach shape): a changed file whose owner
-    // differs between the pre- and post-reform membership maps moved between
-    // libraries. The losing owner is identity-stale (it dropped a member)
-    // but identity-clean importers ride its seed; the winning owner is
-    // usually already seeded through its member's own signature move.
-    for (file, pre_owner) in changed_pre_owners {
-        let post_owner = state.library_of_file.get(file).copied();
-        if post_owner != *pre_owner {
-            for owner in [*pre_owner, post_owner].into_iter().flatten() {
-                if state.libraries.info(owner).is_some() && queued.insert(owner) {
-                    work.push(owner);
-                }
+    // Membership-change seeds: changed files whose ownership moved (both
+    // live owners), and libraries whose part-target identity moved — the
+    // transfer shape, gated on a cached result exactly like the full
+    // rebuild's pass over the live set.
+    for (file, old_owner, new_owner) in movers {
+        if !changed_set.contains(file) {
+            continue;
+        }
+        for owner in [*old_owner, Some(*new_owner)].into_iter().flatten() {
+            if state.libraries.info(owner).is_some() && queued.insert(owner) {
+                work.push(owner);
             }
         }
     }
@@ -1820,11 +2388,19 @@ fn close(
             work.push(owner);
         }
     }
-    while let Some(lib) = work.pop() {
-        let info = state.libraries.info(lib).expect("seed is live");
+    for library in targets_moved {
+        if state.results.contains_key(library)
+            && state.libraries.info(*library).is_some()
+            && queued.insert(*library)
+        {
+            work.push(*library);
+        }
+    }
+    while let Some(library) = work.pop() {
+        let info = state.libraries.info(library).expect("seed is live");
         for file in std::iter::once(info.defining).chain(info.parts.iter().copied()) {
-            if let Some(importer_set) = state.importers.get(&file) {
-                for importer in importer_set {
+            if let Some(importers) = state.importers.get(&file) {
+                for importer in importers.keys() {
                     dirty.insert(*importer);
                     if queued.insert(*importer) {
                         work.push(*importer);
@@ -2037,8 +2613,7 @@ mod tests {
     fn conditional_import_forks_by_declared_variables() {
         let fixture = Fixture::new();
         let lib = fixture.root.join("lib");
-        let source =
-            "import 'a.dart' if (dart.library.io) 'b.dart' if (x == 'y') 'c.dart';\n";
+        let source = "import 'a.dart' if (dart.library.io) 'b.dart' if (x == 'y') 'c.dart';\n";
         let c_offset = source.find("'c.dart'").expect("candidate literal");
 
         // The oracle-default empty context: every condition misses, the
@@ -2179,6 +2754,163 @@ mod tests {
         assert_eq!(
             face, expected,
             "the raw byte rides inside its framed lexeme"
+        );
+    }
+
+    /// The structural graph face of the live library set: membership,
+    /// defining file, parts, deps, and part targets — everything the delta
+    /// must keep exact except the per-member content identity (which moves
+    /// on every member edit by design).
+    fn graph_shape(
+        state: &EngineState,
+    ) -> Vec<(LibraryId, FileId, Vec<FileId>, Vec<LibraryId>, Vec<FileId>)> {
+        let mut shape: Vec<_> = state
+            .libraries
+            .iter_infos()
+            .map(|(id, info)| {
+                (
+                    id,
+                    info.defining,
+                    info.parts.to_vec(),
+                    info.deps.clone(),
+                    info.part_targets.to_vec(),
+                )
+            })
+            .collect();
+        shape.sort_unstable_by_key(|(id, _, _, _, _)| *id);
+        shape
+    }
+
+    /// Body-edit invariant (delta discipline): an edit that changes no
+    /// directive performs ZERO graph mutations — membership, reverse edges,
+    /// the URI memo, and every library's structural identity stand
+    /// byte-exact — while the owning library still invalidates (its content
+    /// identity moved), and nothing else dirties.
+    #[test]
+    fn body_edit_without_directive_change_performs_zero_graph_mutations() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        set(&mut state, &lib.join("a.dart"), "int a() => 1;\n");
+        let main = set(
+            &mut state,
+            &lib.join("main.dart"),
+            "import 'a.dart';\nint mainValue = 1;\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let owner = state.library_of_file[&main];
+        let membership = state.library_of_file.clone();
+        let importers = state.importers.clone();
+        let uris = state.canonical_uris.clone();
+        let offers = state.part_offers.clone();
+        let sources = state.import_sources.clone();
+        let shape = graph_shape(&state);
+
+        // The carry-forward contract (#428): an apply replaces the dirty
+        // set, but the NEXT close seeds the previous set back as leftovers
+        // until an analyze consumes it. The cold apply left both libraries
+        // invalidated; drain them so this pin isolates the body-edit delta
+        // itself instead of the leftover union a real client's analyze
+        // would have consumed between applies.
+        state.invalidated.clear();
+        set(
+            &mut state,
+            &lib.join("main.dart"),
+            "import 'a.dart';\nint mainValue = 2;\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        assert_eq!(state.library_of_file, membership, "membership untouched");
+        assert_eq!(state.importers, importers, "reverse edges untouched");
+        assert_eq!(state.canonical_uris, uris, "URI memo untouched");
+        assert_eq!(state.part_offers, offers, "offer index untouched");
+        assert_eq!(state.import_sources, sources, "source index untouched");
+        assert_eq!(graph_shape(&state), shape, "structural identity untouched");
+        assert_eq!(
+            state.invalidated,
+            vec![owner],
+            "the owning library still invalidates through its moved content identity"
+        );
+    }
+
+    /// Reverse-edge symmetry: re-targeting an import drops the old edge
+    /// exactly (entry removed, no zero-count ghost) and adds the new one —
+    /// and the whole reverse-edge map holds only that one exact edge.
+    #[test]
+    fn import_retarget_updates_importers_symmetrically() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        set(&mut state, &lib.join("a.dart"), "int a() => 1;\n");
+        set(&mut state, &lib.join("b.dart"), "int b() => 2;\n");
+        let main = set(&mut state, &lib.join("main.dart"), "import 'a.dart';\n");
+        apply(&mut state, &mut |_| {});
+
+        let owner = state.library_of_file[&main];
+        let a = state
+            .files
+            .try_file_id(&lib.join("a.dart"))
+            .expect("a.dart interned");
+        let b = state
+            .files
+            .try_file_id(&lib.join("b.dart"))
+            .expect("b.dart interned");
+        assert_eq!(
+            state.importers.get(&a),
+            Some(&[(owner, 1)].into_iter().collect())
+        );
+
+        set(&mut state, &lib.join("main.dart"), "import 'b.dart';\n");
+        apply(&mut state, &mut |_| {});
+
+        assert!(
+            state.importers.get(&a).is_none(),
+            "the old edge is gone without a ghost: {:?}",
+            state.importers.get(&a)
+        );
+        assert_eq!(
+            state.importers.get(&b),
+            Some(&[(owner, 1)].into_iter().collect()),
+            "the new edge carries the importing library"
+        );
+        assert_eq!(state.importers.len(), 1, "no other reverse edge exists");
+        assert_eq!(state.library_of_file[&main], owner, "the owner id stands");
+    }
+
+    /// Structural retirement: deleting a library's last file retires the
+    /// library — its infos entry drops, the membership entry goes, and the
+    /// cached result and reference surface go with it (no unbounded growth).
+    #[test]
+    fn deleting_the_last_file_of_a_library_drops_its_infos_entry() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = set(&mut state, &lib.join("main.dart"), "void main() {}\n");
+        apply(&mut state, &mut |_| {});
+
+        let owner = state.library_of_file[&main];
+        assert!(state.libraries.info(owner).is_some(), "the library is live");
+
+        remove(&mut state, main);
+        apply(&mut state, &mut |_| {});
+
+        assert!(
+            state.libraries.info(owner).is_none(),
+            "the infos entry dropped with its tenant"
+        );
+        assert!(!state.library_of_file.contains_key(&main));
+        assert!(
+            state.libraries.live().all(|live| live != owner),
+            "the id is not live"
+        );
+        assert!(
+            !state.results.contains_key(&owner),
+            "the cached result went with the retirement"
+        );
+        assert!(
+            !state.library_surfaces.contains_key(&owner),
+            "the reference surface went with the retirement"
         );
     }
 }

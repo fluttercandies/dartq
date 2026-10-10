@@ -133,16 +133,10 @@ pub(crate) fn analyze(
         };
         let resolved = resolved.expect("graph exists when libraries exist");
         diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
+        state
+            .results
+            .insert(*library, LibraryResult { diagnostics });
         let info = state.libraries.info(*library).expect("live library");
-        state.results.insert(
-            *library,
-            LibraryResult {
-                content: info.content.clone(),
-                deps: info.deps.clone(),
-                part_targets: info.part_targets.clone(),
-                diagnostics,
-            },
-        );
         let surface = library_surface(state, resolved, *library, info);
         state.library_surfaces.insert(*library, surface);
         completed.insert(*library);

@@ -263,8 +263,8 @@ pub struct ScannedFace {
 pub(crate) struct LibraryInfo {
     /// Canonical URI the library identity keys on. Shares the
     /// canonical-URI memo's allocation ([`EngineState::canonical_uris`]):
-    /// reformation clones an `Arc` refcount per defining library per apply,
-    /// never re-copies the bytes.
+    /// formation clones an `Arc` refcount per formed library, never
+    /// re-copies the bytes.
     pub uri: Arc<str>,
     /// The defining (non-`part of`) file.
     pub defining: FileId,
@@ -286,15 +286,11 @@ pub(crate) struct LibraryInfo {
 }
 
 /// The per-library cached result (incremental-l1-spec §3.1 last row): the
-/// merged diagnostic set keyed by the library's content + dependency
-/// identity. Invalidation is explicit (dirty marking), never key comparison.
+/// merged diagnostic set. Invalidation is explicit (the apply phase's dirty
+/// marking, derived from the graph delta) — never key comparison, so the
+/// entry carries only the diagnostics.
 #[derive(Debug)]
 pub(crate) struct LibraryResult {
-    pub content: Box<[ContentId]>,
-    pub deps: Vec<LibraryId>,
-    /// The [`LibraryInfo::part_targets`] snapshot this result was computed
-    /// from; `close` compares it against the rebuilt identity.
-    pub part_targets: Box<[FileId]>,
     /// The library's diagnostics in canonical order (path bytes, offset,
     /// code name, message, length, correction — `pipeline::
     /// compare_canonical`): sorted once per recompute at store time, so the
@@ -352,11 +348,11 @@ pub(crate) struct LibraryTable {
     ids_by_uri: FxHashMap<Box<str>, LibraryId>,
     infos: Vec<Option<LibraryInfo>>,
     /// Retired ids available for reuse. Entries are distinct (an id can
-    /// re-enter only through a later [`Self::retire_except`]), so the list
+    /// re-enter only through a later [`Self::retire`]), so the list
     /// is bounded by the historical live peak. A recycled id is handed to
     /// whatever interns next and is indistinguishable from its previous
     /// incarnation — reuse safety is the caller's ordering contract (see
-    /// [`Self::retire_except`]).
+    /// [`Self::retire`]).
     free: Vec<LibraryId>,
 }
 
@@ -411,35 +407,28 @@ impl LibraryTable {
             .filter_map(|(index, info)| info.is_some().then_some(LibraryId(index as u32)))
     }
 
-    /// Drops every registration whose id is not in `keep`, returning their
-    /// ids to the reuse freelist. Returns the retired ids (ascending).
+    /// Retires one live id — the incremental twin of a whole-set sweep: the
+    /// graph delta knows exactly which keys lost their tenant, so
+    /// retirement is O(1) per key, never O(arena). The id's uri is
+    /// unregistered and the id returns to the reuse freelist. A live id
+    /// always carries info (the formation writes it), so the unregister
+    /// reads the uri from there.
     ///
     /// Ordering contract (the freelist-recycling hazard, #374): a recycled
     /// id aliases its previous incarnation — stale snapshots holding it
-    /// (`LibraryResult::deps`, library identity arrays) compare equal
-    /// against the new tenant. Recycling is safe only when nothing stale is
-    /// left to alias: the caller must complete every intern of the current
-    /// batch *before* retiring (an id retired early could be re-minted to a
-    /// different URI within the same batch) and must drop cached results of
-    /// retired ids alongside. l1's apply honors this: `retire_except` runs
-    /// at write-back, after the reform passes' interns, and removes each
-    /// retired id's result in the same sweep.
-    pub(crate) fn retire_except(&mut self, keep: &FxHashSet<LibraryId>) -> Vec<LibraryId> {
-        let mut retired = Vec::new();
-        self.ids_by_uri.retain(|_, id| {
-            if keep.contains(id) {
-                true
-            } else {
-                retired.push(*id);
-                false
-            }
-        });
-        for id in &retired {
-            self.infos[id.index() as usize] = None;
-            self.free.push(*id);
+    /// compare equal against the new tenant. Recycling is safe only when
+    /// nothing stale is left to alias: the caller must complete every intern
+    /// of the current batch *before* retiring (an id retired early could be
+    /// re-minted to a different URI within the same batch) and must drop the
+    /// retired id's cached result and reference surface alongside. The apply
+    /// phase honors this: retirement runs after the delta's interns, and
+    /// results/surfaces go in the same step.
+    pub(crate) fn retire(&mut self, id: LibraryId) {
+        let index = id.index() as usize;
+        if let Some(info) = self.infos[index].take() {
+            self.ids_by_uri.remove(info.uri.as_ref());
+            self.free.push(id);
         }
-        retired.sort_unstable();
-        retired
     }
 }
 
@@ -483,24 +472,49 @@ pub(crate) struct EngineState {
     /// entirely (their `FileId`s stay interned in [`Self::files`]).
     pub residency: FxHashMap<FileId, Arc<UnitFacts>>,
     /// Canonical URI memo per interned file (a file's path never changes
-    /// once interned, so neither does its canonical URI). The `Arc`
+    /// once interned, so neither does its canonical URI). Filled lazily —
+    /// only for files the apply phase actually touches (changed files plus
+    /// files whose URI a formation key needs) — so maintenance is
+    /// O(changed), never O(residency). The `Arc`
     /// allocation is shared, not copied: [`LibraryInfo::uri`] reuses it, so
-    /// reformation pays a refcount per defining library per apply, never a
-    /// heap clone.
+    /// reformation pays a refcount per formed library, never a heap clone.
     pub canonical_uris: FxHashMap<FileId, Arc<str>>,
     /// Library arena with per-library membership and dependency data.
     pub libraries: LibraryTable,
-    /// File → owning library (defining or part), rebuilt at apply.
+    /// File → owning library (defining or part), maintained by the apply
+    /// phase's graph delta (only entries whose ownership moved are written).
     pub library_of_file: FxHashMap<FileId, LibraryId>,
-    /// Reverse import edges (§3.1): target file → libraries whose member
-    /// files import/export it. Rebuilt with the library set at apply.
-    pub importers: FxHashMap<FileId, FxHashSet<LibraryId>>,
+    /// Reverse import edges (§3.1): resident target file → importing
+    /// library → edge multiplicity (two members of one library importing the
+    /// same target count twice, so one of them re-targeting away keeps the
+    /// edge exact). Maintained by the apply phase's graph delta: every
+    /// add is paired with a remove from the file's previous directive face.
+    /// The adjacency is a sparse per-target map; the 10⁵-scale upgrade path
+    /// is a CSR projection built lazily from this map, not a second
+    /// maintained structure.
+    pub importers: FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
+    /// Raw part-directive offers (residency-independent): target file →
+    /// defining files whose current facts contain a `part` directive
+    /// resolving to it. The claim-resolution candidate set: resolution picks
+    /// the path-smallest candidate whose `may_claim` holds against current
+    /// facts, so precedence stays deterministic-total while the delta keeps
+    /// lookups O(offers) per affected part file. Maintained by paired
+    /// subtract/add on every facts change; bounded by the live directive
+    /// set.
+    pub part_offers: FxHashMap<FileId, FxHashSet<FileId>>,
+    /// Raw import/export sources (residency-independent): target file →
+    /// files whose current facts contain an import/export directive
+    /// resolving to it. This is the residency-flip fan-out: when a file
+    /// enters residency, its importers are exactly the owners of these
+    /// sources; the reverse query (`importers`) cannot answer it because it
+    /// only holds resident targets. Maintained like [`Self::part_offers`].
+    pub import_sources: FxHashMap<FileId, FxHashSet<FileId>>,
     /// Per-library result cache.
     pub results: FxHashMap<LibraryId, LibraryResult>,
     /// Post-closure dirty set of the last apply; consumed by analyze.
     /// Invariant: every entry is a live library id — apply assigns `close`'s
     /// output outright; `close` seeds the incoming leftovers (filtered to the
-    /// post-reform live set) into its dirty set, so a cancelled analyze's
+    /// post-delta live set) into its dirty set, so a cancelled analyze's
     /// still-invalid libraries carry forward. Unioning the incoming set back
     /// directly could instead resurrect ids retired by an intervening remove
     /// (#230), and analyze unwraps every queued id's info.
@@ -605,6 +619,8 @@ impl EngineState {
             libraries: LibraryTable::default(),
             library_of_file: FxHashMap::default(),
             importers: FxHashMap::default(),
+            part_offers: FxHashMap::default(),
+            import_sources: FxHashMap::default(),
             results: FxHashMap::default(),
             invalidated: Vec::new(),
             structure_dirty: false,
@@ -742,6 +758,19 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dartq_source::content_hash;
+
+    /// A live info for `uri`, the shape `retire` unregisters through.
+    fn stub_info(uri: &str) -> LibraryInfo {
+        LibraryInfo {
+            uri: Arc::from(uri),
+            defining: FileTable::new().intern(std::path::Path::new("/stub.dart")),
+            parts: Vec::new(),
+            content: Box::new([content_hash(uri.as_bytes())]),
+            deps: Vec::new(),
+            part_targets: Box::new([]),
+        }
+    }
 
     #[test]
     fn intern_returns_the_live_id_and_reuses_retired_ones() {
@@ -752,16 +781,19 @@ mod tests {
         assert_eq!(table.intern("package:a/a.dart"), a, "live uri keeps its id");
         assert_eq!(table.arena_len(), 2);
 
-        // Retiring everything returns both ids ascending and unregisters
-        // them; the next interns re-mint those ids for different URIs — the
-        // aliasing the retire_except ordering contract guards against. The
-        // freelist pops in hash-iteration order (only the returned vec is
-        // sorted), so which tenant gets which id is unspecified.
-        let retired = table.retire_except(&FxHashSet::default());
-        assert_eq!(retired, vec![a, b]);
+        // Retiring live registrations returns their ids to the freelist and
+        // unregisters them; the next interns re-mint those ids for different
+        // URIs — the aliasing the retire ordering contract guards against.
+        // The freelist pops in retirement order, so which tenant gets which
+        // id follows the retire sequence.
+        table.set_info(a, stub_info("package:a/a.dart"));
+        table.set_info(b, stub_info("package:b/b.dart"));
+        table.retire(a);
+        table.retire(b);
         let c = table.intern("package:c/c.dart");
         let d = table.intern("package:d/d.dart");
-        assert!(retired.contains(&c) && retired.contains(&d) && c != d);
+        assert_eq!(c, b, "the freelist pops in retirement order");
+        assert_eq!(d, a);
         assert_eq!(
             table.arena_len(),
             2,
@@ -770,20 +802,23 @@ mod tests {
     }
 
     #[test]
-    fn retire_except_keeps_live_ids_and_recycles_retired_ones() {
+    fn retire_unregisters_retired_uris_and_keeps_live_ones() {
         let mut table = LibraryTable::default();
         let a = table.intern("package:a/a.dart");
         let b = table.intern("package:b/b.dart");
         let c = table.intern("package:c/c.dart");
-        let mut keep = FxHashSet::default();
-        keep.insert(b);
-        let retired = table.retire_except(&keep);
-        assert_eq!(retired, vec![a, c]);
+        table.set_info(a, stub_info("package:a/a.dart"));
+        table.set_info(b, stub_info("package:b/b.dart"));
+        table.set_info(c, stub_info("package:c/c.dart"));
+        table.retire(a);
+        table.retire(c);
 
         // The kept id stays registered; the retired uris are unregistered.
         assert_eq!(table.ids_by_uri.get("package:b/b.dart"), Some(&b));
         assert!(table.ids_by_uri.get("package:a/a.dart").is_none());
         assert!(table.ids_by_uri.get("package:c/c.dart").is_none());
+        assert!(table.info(a).is_none());
+        assert!(table.info(c).is_none());
 
         // A retired uri interns as a fresh registration, not a resurrection
         // of stale info: it draws a recycled id from the freelist instead of

@@ -11,8 +11,13 @@ use dartq_engine::{EngineEvent, RevalidateGate};
 
 /// The steady-state entry bound after any apply: one resident content, the
 /// facts-cache cap, and fewer than `GC_DEAD_THRESHOLD` (state.rs) unswept
-/// dead versions between amortized sweeps.
-const ENTRY_BOUND: usize = 1 + 1024 + 63;
+/// dead versions between amortized sweeps. The threshold rides at the cache
+/// cap since the #374 amortization retune (it was 64 when this bound was
+/// written — the 63 here was its minus-one), so the bound mirrors it: under
+/// this churn debt accrues 2/edit (replaced residency + cache eviction),
+/// sweeps fire every 512 edits, and the post-final-sweep remainder is
+/// 10000 mod 512 = 272 unswept dead — 1024 live + 272 = 1296 observed.
+const ENTRY_BOUND: usize = 1 + 1024 + 1023;
 
 #[test]
 fn ten_thousand_edits_keep_the_store_bounded() {
