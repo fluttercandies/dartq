@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, FileLayoutProvider as _};
@@ -28,28 +29,21 @@ pub enum AnalyzeError {
     Cancelled,
 }
 
-/// The discover+analyze prelude's full yield: the merged diagnostic set of
-/// every live library (canonically sorted by the engine) plus the run facts
-/// the metrics faces report.
-pub(crate) struct Prelude {
-    pub diagnostics: Vec<Diagnostic>,
-    pub file_count: usize,
-    pub loc: u64,
-    pub discovery: Duration,
-    pub analysis: Duration,
-    pub libraries_analyzed: usize,
-    pub libraries_from_cache: usize,
+/// Runs the prelude: [`Engine::discover_workspace`] then one
+/// [`Engine::analyze`] pass — the read-after-write barrier every engine-
+/// backed query face reflects. The faces read the analysis through the
+/// collectors they installed before the pass, so the yield is only the
+/// failure tier.
+pub(crate) fn prelude(engine: &mut Engine) -> Result<(), AnalyzeError> {
+    run_overlaid(engine, &[]).map(|_| ())
 }
 
-/// Runs the prelude: [`Engine::discover_workspace`] then one
-/// [`Engine::analyze`] pass (the read-after-write every query face reflects).
-pub(crate) fn prelude(engine: &mut Engine) -> Result<Prelude, AnalyzeError> {
-    let started = std::time::Instant::now();
-    let stats = engine
-        .discover_workspace()
-        .map_err(AnalyzeError::Discovery)?;
-    let discovery = started.elapsed();
-
+/// One [`Engine::analyze`] pass: the merged diagnostics, the wall-clock,
+/// and the `LibraryAnalyzed` counters (fresh, cached) — [`run_overlaid`]'s
+/// second half.
+fn analyze_pass(
+    engine: &mut Engine,
+) -> Result<(Vec<Diagnostic>, Duration, usize, usize), AnalyzeError> {
     let mut analyzed = (0_usize, 0_usize);
     let mut on_event = |event: EngineEvent| {
         if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
@@ -64,17 +58,7 @@ pub(crate) fn prelude(engine: &mut Engine) -> Result<Prelude, AnalyzeError> {
     let diagnostics = engine
         .analyze(&[], &mut on_event, &CancellationToken::default())
         .map_err(|_: Cancelled| AnalyzeError::Cancelled)?;
-    let analysis = analyze_at.elapsed();
-
-    Ok(Prelude {
-        diagnostics,
-        file_count: stats.file_count,
-        loc: stats.loc_total,
-        discovery,
-        analysis,
-        libraries_analyzed: analyzed.0,
-        libraries_from_cache: analyzed.1,
-    })
+    Ok((diagnostics, analyze_at.elapsed(), analyzed.0, analyzed.1))
 }
 
 /// One analyze run's result: the oracle-ordered diagnostic set, the layout
@@ -102,18 +86,55 @@ pub struct AnalyzeRun<'a> {
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
 pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
-    let prelude = prelude(engine)?;
-    let layout = EngineLayout::over(engine, prelude.diagnostics.iter().map(|d| d.file));
-    let mut diagnostics = prelude.diagnostics;
+    run_overlaid(engine, &[])
+}
+
+/// Runs the analyze face over an engine with overlay content applied —
+/// the PRD §16.3 set-content flow, hoisted here as the one implementation
+/// the CLI `--overlay` face and the daemon share (PRD §15.1's CLI face
+/// shape: the per-command core in `dartq-commands` runs the engine; the
+/// faces only parse, render, and tier).
+///
+/// The order is the contract: discovery first (it re-enqueues disk bytes
+/// for every discovered file, and pending content ops are last-wins per
+/// path, so overlay content must enqueue after it), then each `(path,
+/// bytes)` replaces the analyzed bytes via [`Engine::set_content`] — the
+/// workspace on disk is never touched — then one analyze pass, and the
+/// same yield as [`run`]: the oracle display order plus the run facts the
+/// metrics faces report. An empty `overlays` is the plain run. The
+/// callers address discovered files by their canonical package-root path
+/// (the identity discovery interns); a path discovery never saw is
+/// interned as a new file.
+///
+/// # Errors
+///
+/// [`AnalyzeError`] on discovery failure or cancellation.
+pub fn run_overlaid<'a>(
+    engine: &'a mut Engine,
+    overlays: &[(PathBuf, Vec<u8>)],
+) -> Result<AnalyzeRun<'a>, AnalyzeError> {
+    let started = std::time::Instant::now();
+    let stats = engine
+        .discover_workspace()
+        .map_err(AnalyzeError::Discovery)?;
+    let discovery = started.elapsed();
+
+    for (path, bytes) in overlays {
+        engine.set_content(path, bytes);
+    }
+
+    let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache) =
+        analyze_pass(engine)?;
+    let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
-        discovery: prelude.discovery,
-        analysis: prelude.analysis,
-        file_count: prelude.file_count,
-        loc: prelude.loc,
-        libraries_analyzed: prelude.libraries_analyzed,
-        libraries_from_cache: prelude.libraries_from_cache,
+        discovery,
+        analysis,
+        file_count: stats.file_count,
+        loc: stats.loc_total,
+        libraries_analyzed,
+        libraries_from_cache,
         layout,
     })
 }
@@ -175,6 +196,87 @@ mod tests {
         diagnostics.sort_by(|left, right| oracle_cmp(left, right, &layout));
         let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(messages, ["alpha", "beta", "gamma", "delta", "omega"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The overlay run's contract (PRD §16.3): an empty overlay list is the
+    /// plain run, an overlay replaces the discovered bytes for the analyzed
+    /// pass only (the workspace on disk stays broken), and the yield keeps
+    /// the run facts plus the oracle display order — the semantic row
+    /// (offset 11) precedes the syntax row (offset 13) inside one library.
+    #[test]
+    fn run_overlaid_replaces_discovered_bytes_for_one_run() {
+        let root = workspace(
+            "analyze_overlay",
+            &[("lib/broken.dart", "void f() { x }\n")],
+        );
+        // Discovery interns canonical package-root paths; the overlay must
+        // address that identity (the CLI's spec decoding canonicalizes for
+        // the same reason).
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let target = root.join("lib/broken.dart");
+        // Each run borrows the engine through its layout, so every run's
+        // yield is reduced to owned data inside its own scope.
+        let hits = |diag: &[Diagnostic]| -> Vec<(u32, String)> {
+            diag.iter()
+                .map(|d| (d.range.offset, d.message.clone()))
+                .collect()
+        };
+
+        // Plain run over the discovered bytes: the on-disk error surfaces,
+        // and an empty overlay list runs the same pipeline.
+        let (plain_hits, plain_facts) = {
+            let plain = run(&mut engine).expect("plain run");
+            let hits = hits(&plain.diagnostics);
+            assert!(
+                hits.iter().any(|(_, m)| m.contains("'x'")),
+                "the discovered bytes are analyzed: {hits:?}"
+            );
+            (hits, (plain.file_count, plain.loc))
+        };
+        let (bare_hits, bare_facts) = {
+            let bare = run_overlaid(&mut engine, &[]).expect("bare run");
+            (hits(&bare.diagnostics), (bare.file_count, bare.loc))
+        };
+        assert_eq!(bare_hits, plain_hits, "no overlays: the plain run");
+        assert_eq!(bare_facts, plain_facts);
+
+        // A clean overlay silences it for one run; the workspace on disk is
+        // never touched, and the run facts keep flowing.
+        let overlays = vec![(target.clone(), b"var ok = 1;\n".to_vec())];
+        let fixed_facts = {
+            let fixed = run_overlaid(&mut engine, &overlays).expect("overlaid run");
+            assert!(
+                fixed.diagnostics.is_empty(),
+                "clean overlay: no diagnostics"
+            );
+            (fixed.file_count, fixed.loc)
+        };
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target intact"),
+            "void f() { x }\n",
+            "the overlay never rewrites the workspace"
+        );
+        assert_eq!(fixed_facts, plain_facts);
+
+        // A broken overlay reports against the analyzed path in oracle
+        // order: the undefined-name row precedes the missing-`;` row.
+        let overlays = vec![(target, b"void g() { y }\n".to_vec())];
+        let broken_hits = {
+            let broken = run_overlaid(&mut engine, &overlays).expect("overlaid run");
+            hits(&broken.diagnostics)
+        };
+        assert_eq!(
+            broken_hits,
+            vec![
+                (11, "Undefined name 'y'.".to_owned()),
+                (13, "Expected ';' after this.".to_owned()),
+            ],
+            "oracle order inside one library: severity, path, offset, message"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

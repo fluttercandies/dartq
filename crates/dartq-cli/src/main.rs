@@ -52,15 +52,15 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
+use dartq_commands::analyze::AnalyzeRun;
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
-use dartq_commands::layout::{EngineLayout, path_key, severity_rank};
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{engine_config, open_engine};
 use dartq_diagnostics::{
     AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json, write_machine,
 };
-use dartq_engine::{CancellationToken, DeclHit, EngineEvent, RefHit};
+use dartq_engine::{DeclHit, RefHit};
 
 /// Process exit codes (engine-api-spec §4.2, pinned to analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210).
@@ -485,10 +485,9 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 
 /// One analyze run over a real package directory: pub faces → engine →
 /// oracle-format output on `out`, metrics JSON at exit. The workspace
-/// assembly and the engine pass live in `dartq-commands`; this shell adds
-/// the crash tier, the writers, and the exit tier. `--overlay` specs route
-/// to [`analyze_overlaid`] (the shared [`dartq_commands::analyze::run`]
-/// cannot express the overlay's discover → set-content → analyze order).
+/// assembly and the engine pass — plain or `--overlay` — live in
+/// `dartq-commands`; this shell adds the crash tier, the writers, and the
+/// exit tier.
 fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     if args.overlays.is_empty() {
         analyze_plain(args, out)
@@ -514,6 +513,49 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
+    analyze_finish(args, &run, started, out)
+}
+
+/// The `--overlay` path (PRD §16.3): the specs decode here (relative paths
+/// resolve against the package directory, `-` reads stdin), then
+/// [`dartq_commands::analyze::run_overlaid`] runs the contract order —
+/// discovery first, the overlay content enqueued after it (last-wins per
+/// path), one analyze pass, the oracle display order — and this face
+/// renders and tiers like every sibling.
+fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
+    let started = Instant::now();
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let overlays = match load_overlays(&args.overlays, &args.dir) {
+        Ok(overlays) => overlays,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let run = match dartq_commands::analyze::run_overlaid(&mut engine, &overlays) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    analyze_finish(args, &run, started, out)
+}
+
+/// The shared analyze postlude: oracle-format diagnostics on `out`, the
+/// `--metrics-json` facts at exit, then the severity exit tier.
+fn analyze_finish(
+    args: &AnalyzeArgs,
+    run: &AnalyzeRun<'_>,
+    started: Instant,
+    out: &mut impl Write,
+) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
 
@@ -550,108 +592,6 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         }
     }
     severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
-}
-
-/// The `--overlay` path (PRD §16.3): discovery runs first (it re-enqueues
-/// disk bytes for every discovered file and pending content ops are
-/// last-wins per path, so overlay content must enqueue after it), the
-/// overlay texts replace the on-disk bytes, one analyze pass runs, and the
-/// oracle display order is applied. The postlude mirrors
-/// `dartq_commands::analyze::run` (severity → path → offset → message; the
-/// shared run cannot express this order) and is pinned byte-exact by this
-/// face's overlay test.
-fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
-    let started = Instant::now();
-    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
-    let overlays = match load_overlays(&args.overlays, &args.dir) {
-        Ok(overlays) => overlays,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
-    let discovery_at = Instant::now();
-    let stats = match engine.discover_workspace() {
-        Ok(stats) => stats,
-        Err(error) => {
-            eprintln!("dartq: internal error: {error}");
-            return exit::INTERNAL_ERROR;
-        }
-    };
-    let discovery = discovery_at.elapsed();
-    for (path, bytes) in &overlays {
-        engine.set_content(path, bytes);
-    }
-
-    let analyze_at = Instant::now();
-    let mut analyzed = (0_usize, 0_usize);
-    let mut on_event = |event: EngineEvent| {
-        if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
-            if from_cache {
-                analyzed.1 += 1;
-            } else {
-                analyzed.0 += 1;
-            }
-        }
-    };
-    let mut diagnostics = match engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
-        Ok(diagnostics) => diagnostics,
-        Err(_cancelled) => {
-            eprintln!("dartq: internal error: analysis cancelled");
-            return exit::INTERNAL_ERROR;
-        }
-    };
-    let analysis = analyze_at.elapsed();
-    let layout = EngineLayout::over(&engine, diagnostics.iter().map(|d| d.file));
-    diagnostics.sort_by(|a, b| {
-        severity_rank(a.severity)
-            .cmp(&severity_rank(b.severity))
-            .then_with(|| {
-                path_key(layout.file_path(a.file)).cmp(path_key(layout.file_path(b.file)))
-            })
-            .then_with(|| a.range.offset.cmp(&b.range.offset))
-            .then_with(|| a.message.cmp(&b.message))
-    });
-
-    let written = match args.format {
-        AnalyzeFormat::Machine => write_machine(
-            out,
-            &AnalysisOutput {
-                diagnostics: &diagnostics,
-                files: &layout,
-            },
-        ),
-        AnalyzeFormat::Human => write_human(out, &diagnostics, &layout),
-    };
-    if let Err(error) = written.and_then(|()| out.flush()) {
-        eprintln!("dartq: internal error: writing diagnostics failed: {error}");
-        return exit::INTERNAL_ERROR;
-    }
-
-    if let Some(metrics_path) = &args.metrics_json {
-        let metrics = RunMetrics {
-            files: stats.file_count,
-            loc: stats.loc_total,
-            diagnostics: diagnostics.len(),
-            discovery_ms: elapsed_ms(discovery),
-            analyze_ms: elapsed_ms(analysis),
-            total_ms: elapsed_ms(started.elapsed()),
-            libraries_analyzed: analyzed.0,
-            libraries_from_cache: analyzed.1,
-            max_rss_bytes: max_rss_bytes(),
-        };
-        if let Err(error) = write_metrics(metrics_path, &metrics) {
-            eprintln!("dartq: internal error: writing metrics failed: {error}");
-            return exit::INTERNAL_ERROR;
-        }
-    }
-    severity_exit(&diagnostics, !args.no_fatal_warnings, args.fatal_infos)
 }
 
 /// Decodes `--overlay PATH=FILE` specs: the analyzed path (relative specs
