@@ -9,7 +9,9 @@
 //! micro-kind tag: local declarations and re-exports from the graph's export
 //! scope (a declaration is identified by `Decl(file)` + looked-up name —
 //! #117's contract; the kind comes from the declaring file's
-//! [`FileElements`]), plus one `prefix` marker per import prefix. A name
+//! [`FileElements`]), the exported names of every unprefixed import
+//! (combinator filtered, never displacing local names), plus one `prefix`
+//! marker per import prefix. A name
 //! declared outside the indexed files (`dart:` SDK, an unanalyzed
 //! dependency) surfaces as [`ScopeKind::External`] — present, but
 //! kind-sensitive diagnostics must be suppressed.
@@ -128,16 +130,18 @@ impl LibraryScopes {
     /// already folded each library's part tree into its local declarations
     /// (the caller declared every file), so a face needs no part information
     /// here.
+    ///
+    /// Beyond the library's own export scope, each unprefixed import joins
+    /// the face with the target's exported names (#117's merge contract:
+    /// the face is the library's visible-name surface) — combinator
+    /// filtered, and never displacing a local or earlier-seeded name.
     #[must_use]
     pub fn build(graph: &LibraryGraph, index: &ElementIndex, libs: &[LibraryId]) -> Self {
         let mut scopes: Vec<Option<ScopeFace>> = (0..graph.len()).map(|_| None).collect();
         for &lib in libs {
             let mut face = ScopeFace::default();
             for (name, entry) in graph.export_scope(lib) {
-                let kind = index
-                    .get(entry.file)
-                    .and_then(|file| file.decl(name))
-                    .map_or(ScopeKind::External, |decl| ScopeKind::Kind(decl.kind));
+                let kind = Self::kind_of(index, name, entry.file);
                 face.names.insert(name, kind);
             }
             for edge in graph.import_edges(lib) {
@@ -145,11 +149,32 @@ impl LibraryScopes {
                     face.names
                         .entry(prefix)
                         .or_insert(ScopeKind::Kind(MicroKind::Prefix));
+                    continue;
+                }
+                let Some(target) = edge.target else {
+                    continue;
+                };
+                for (name, entry) in graph.export_scope(target) {
+                    if !edge.combinators.allows(name) {
+                        continue;
+                    }
+                    let kind = Self::kind_of(index, name, entry.file);
+                    face.names.entry(name).or_insert(kind);
                 }
             }
             scopes[lib.index() as usize] = Some(face);
         }
         Self { scopes }
+    }
+
+    /// The kind tag of an exported name from its declaring file: a known
+    /// [`MicroKind`] inside the indexed set, [`ScopeKind::External`]
+    /// otherwise.
+    fn kind_of(index: &ElementIndex, name: StringId, file: FileId) -> ScopeKind {
+        index
+            .get(file)
+            .and_then(|file| file.decl(name))
+            .map_or(ScopeKind::External, |decl| ScopeKind::Kind(decl.kind))
     }
 
     /// The face of `lib`, if built.

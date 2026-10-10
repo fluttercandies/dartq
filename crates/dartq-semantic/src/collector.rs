@@ -1356,6 +1356,18 @@ mod tests {
     /// Formal tables: positional (required-first, with types) and named;
     /// nested function-typed formals do not pollute the outer table;
     /// getters/setters carry their declared shapes.
+    ///
+    /// RED (parser gap, #339): a function-typed formal with a committed
+    /// return type (`void cb(int inner)?`) never enters the inline
+    /// function-type path — `parse_formal_parameter` detects the bare-`(`
+    /// follower only when `type_info` is `NoType`
+    /// (`formal_params.rs`, `before_inline_function_type` gate) — so `cb`
+    /// parses as a plain formal, the orphaned `(` trips the named-group
+    /// recovery ("Expected '}'"), and every following formal (`outer`)
+    /// is dropped: `g`'s named table captures `["cb"]` only. Event trace:
+    /// `begin_named_group | end_formal(cb) | REPORT Expected '}' |
+    /// end_named_group count=1`. Un-reds when the parser detects the
+    /// type+name+`(` shape (official parser_impl.dart:2221-2264).
     #[test]
     fn captures_formals() {
         let strings = StringTable::new();

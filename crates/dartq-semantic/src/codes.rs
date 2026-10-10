@@ -491,7 +491,9 @@ impl SemanticCode {
             Self::UnreachableSwitchCase => {
                 "This case is covered by the previous cases.".to_string()
             }
-            _ => unreachable!("two-placeholder rows route through `message`"),
+            // One- and two-placeholder rows: the extra placeholder is
+            // ignored (the descriptor stays total over the frozen set).
+            _ => self.message(a0, a1),
         }
     }
 
@@ -506,7 +508,8 @@ impl SemanticCode {
                     "The {a0} '{a1}' is declared with {a2} type parameters, but {a3} type arguments are given."
                 )
             }
-            _ => unreachable!("four-placeholder rows are the `_element` family"),
+            // Other rows keep their own (shorter) templates.
+            _ => self.message(a0, a1),
         }
     }
 }

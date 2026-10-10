@@ -439,10 +439,18 @@ struct ExecReturn {
 
 /// One open argument list: the arguments collected so far (name, type,
 /// range — the range of the argument's expression row) plus the argument
-/// currently being parsed.
+/// currently being parsed. `mark` is the row-stack index where the current
+/// argument's rows begin — the parser fires the positional-argument event
+/// *after* the expression (rows already pushed) and the named-argument
+/// events *before* the value, so the window from `mark` to the row count is
+/// the event-order-agnostic shape of one argument.
 struct ArgLevel {
     args: Vec<(Option<StringId>, Ty, SourceRange)>,
-    pending: Option<(Option<StringId>, usize)>,
+    /// An argument is open between its `open_argument` and the next flush.
+    arg_open: bool,
+    /// The open argument's name (`None` = positional).
+    pending_name: Option<StringId>,
+    mark: usize,
 }
 
 /// The member-walk outcome: found, genuinely absent after a clean walk, or a
@@ -1126,9 +1134,24 @@ impl<'a> Engine<'a> {
     }
 
     /// A bare identifier in value position: resolved immediately (the
-    /// verdict is the snapshot pass 2 emits from).
+    /// verdict is the snapshot pass 2 emits from). A miss under `new`/`const`
+    /// is a creation head: it names a class, so the guarded miss is the
+    /// oracle's `undefined_class` (`new Missing()`), never an invocation
+    /// read — the row reclassifies as a type use.
     fn push_bare(&mut self, name: StringId, range: SourceRange) {
         let info = self.resolve_bare(name);
+        if self.ctor_pos > 0 && matches!(info, BareInfo::Missing { .. }) {
+            self.push_row(Row {
+                name,
+                range,
+                qualified: false,
+                shape: RowShape::TypeUse(TypeVerdict::Missing, false),
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::UNKNOWN,
+            });
+            return;
+        }
         let ty = match info {
             BareInfo::Plain { ty } => ty,
             _ => Ty::UNKNOWN,
@@ -1336,9 +1359,12 @@ impl<'a> Engine<'a> {
             self.callee_index()
         };
         self.invokes.push(callee);
+        let mark = self.rows.len();
         self.arg_levels.push(ArgLevel {
             args: Vec::new(),
-            pending: None,
+            arg_open: false,
+            pending_name: None,
+            mark,
         });
     }
 
@@ -1346,32 +1372,66 @@ impl<'a> Engine<'a> {
     /// collected argument types check against the callee's formals first
     /// (`argument_type_not_assignable`, decided on declared types only).
     fn close_arguments(&mut self) {
+        self.flush_unclaimed();
         self.flush_argument();
         let levels = self.arg_levels.pop();
         self.check_arguments(levels);
         self.pending_send = self.invokes.pop().flatten();
     }
 
-    /// Starts a new argument in the open argument list.
+    /// Starts a new argument in the open argument list (the row window the
+    /// argument owns closes at the next [`Engine::flush_argument`]).
     fn open_argument(&mut self, name: Option<StringId>) {
+        self.flush_unclaimed();
         self.flush_argument();
         if let Some(level) = self.arg_levels.last_mut() {
-            level.pending = Some((name, self.rows.len()));
+            level.arg_open = true;
+            level.pending_name = name;
         }
     }
 
-    /// Closes the pending argument: exactly one pushed row is a terminal
-    /// expression whose type stands for the whole argument; anything else
-    /// stays `Unknown` (compound operands must not lend their type).
+    /// Recovers the unclaimed window `[mark, rows.len())` as a positional
+    /// argument. The normal expression path fires no per-argument events
+    /// (only the const path emits `positional_argument`), so a group whose
+    /// window holds exactly one row since `mark` reads that row as the
+    /// single positional argument; wider windows stay unattributed
+    /// (compound operands must not lend their type — under-report).
+    fn flush_unclaimed(&mut self) {
+        let Some(level) = self.arg_levels.last_mut() else {
+            return;
+        };
+        if level.arg_open {
+            return;
+        }
+        let hi = self.rows.len();
+        if hi == level.mark {
+            return;
+        }
+        if let Some(row) = self.rows.get(level.mark).filter(|_| hi == level.mark + 1) {
+            level.args.push((None, row.ty, row.range));
+        }
+        level.mark = hi;
+    }
+
+    /// Closes the pending argument: exactly one pushed row since the last
+    /// argument boundary is a terminal expression whose type stands for the
+    /// whole argument; anything else stays `Unknown` (compound operands must
+    /// not lend their type). An empty window pushes nothing.
     fn flush_argument(&mut self) {
         let Some(level) = self.arg_levels.last_mut() else {
             return;
         };
-        let Some((name, mark)) = level.pending.take() else {
+        if !level.arg_open {
             return;
-        };
-        let (ty, range) = match self.rows.get(mark) {
-            Some(row) if self.rows.len() == mark + 1 => (row.ty, row.range),
+        }
+        level.arg_open = false;
+        let name = level.pending_name.take();
+        let hi = self.rows.len();
+        if hi == level.mark {
+            return;
+        }
+        let (ty, range) = match self.rows.get(level.mark) {
+            Some(row) if hi == level.mark + 1 => (row.ty, row.range),
             _ => (
                 Ty::UNKNOWN,
                 SourceRange {
@@ -1380,6 +1440,7 @@ impl<'a> Engine<'a> {
                 },
             ),
         };
+        level.mark = hi;
         level.args.push((name, ty, range));
     }
 
@@ -3392,6 +3453,12 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.open_argument(Some(name));
                 }
             }
+            C::EnumValueDeclaration => {
+                // The enum constant's window opens here: its type arguments
+                // check against the enclosing enum's declared count (the
+                // `_enum` code). `handle_enum_element` closes it.
+                engine.enter_enum_element();
+            }
             C::TopLevelFunctionDeclaration => {
                 if let Some(name) = name {
                     engine.latch_return_type(ExecKind::Function, name);
@@ -3539,10 +3606,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().open_argument(None);
     }
 
-    fn handle_named_argument(&mut self, _colon: Token) {
-        // Fires after the value: the pending named argument closes here.
-        self.engine.borrow_mut().flush_argument();
-    }
+    // `handle_named_argument` needs no override: the parser fires it before
+    // the value expression, so the named argument opened at its identifier
+    // event stays pending until the next argument boundary closes it.
 
     fn begin_return_statement(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
@@ -3944,7 +4010,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_enum_element(&mut self, _begin: Token, _augment: Option<Token>) {
-        self.engine.borrow_mut().enter_enum_element();
+        // The parser fires this after the constant's type arguments and
+        // constructor arguments: the constant's window closed (it opened at
+        // the EnumValueDeclaration identifier).
+        self.engine.borrow_mut().leave_enum_element();
     }
 
     fn handle_enum_elements(&mut self, _elements_end: Token, _count: usize) {
@@ -4886,6 +4955,14 @@ mod tests {
     /// sync body; `in_executable` holds and the guard passes → the
     /// no-argument emit; `x` still reports `undefined_identifier`. In `g`
     /// the async modifier makes `await` an expression — no identifier event.
+    ///
+    /// RED (parser gap, #339): the statement-position await probe
+    /// (`looks_like_await_or_yield_expression`, statements.rs) returns
+    /// "declaration" for `await x;` in a sync body, so `await x` parses as
+    /// a variable declaration (type `await`, name `x`) — the engine sees a
+    /// missing type use (`undefined_class`) and no `x` read. Un-reds when
+    /// the probe stops reading `await name` as a declaration head in sync
+    /// contexts.
     #[test]
     fn await_in_sync_body_reports_await_code() {
         let report = report("void f() { await x; } void g() async { await f; }");
@@ -4947,6 +5024,15 @@ mod tests {
     /// creation head, never a type reference) resolving as a container; the
     /// group's head slot is empty and the `ctor_pos` branch checks the
     /// container's count (0) against 1 → base code. `new C()` stays silent.
+    ///
+    /// RED (parser gap, #339): the `const` statement probe
+    /// (`parse_expression_statement_or_const_declaration` →
+    /// `compute_type`) consumes `C<A>` as a declaration type, so
+    /// `const C<A>();` parses as a const-declaration head instead of a
+    /// const-creation expression — the engine receives no creation head or
+    /// type-argument events at all (observed output: `[]`). Un-reds when
+    /// `compute_type` refuses the `Type<args>(` shape in expression-statement
+    /// context (the official `(`-follower veto).
     #[test]
     fn creation_arity_reports_base_code() {
         let report = report("class A {} class C {} void f() { new C(); const C<A>(); }");
@@ -5028,6 +5114,13 @@ mod tests {
     /// deferred entry to `m`'s callee row, and the member walk finds `m`'s
     /// declared count (2) → `_element`/`method`. `c`'s declared type comes
     /// from the formal binding.
+    ///
+    /// RED (parser gap, #339): the statement declaration-probe's
+    /// `compute_type` consumes `c.m<D>` as a (prefixed, parameterized) type,
+    /// so `c.m<D>();` parses as a declaration head — the engine sees a
+    /// missing type use (`undefined_class`) and no send/type-argument
+    /// events. Un-reds when `compute_type` stops at the `.` of an
+    /// expression-statement head (`c.` can never open a declaration).
     #[test]
     fn member_invocation_arity_reports_element_method() {
         let report = report("class D {} class C { void m<T, U>() {} } void f(C c) { c.m<D>(); }");
@@ -5061,6 +5154,14 @@ mod tests {
     ///
     /// Hand-trace: `g<A, A>;` never opens an argument group; the application
     /// event consumes the deferred entry against `g`'s declared count.
+    ///
+    /// RED (parser gap, #339): in expression-statement context the
+    /// declaration probe consumes `g<A, A>` as a parameterized type (the
+    /// `;` follower reads as a declaration end), so the statement parses as
+    /// a nameless declaration head and the engine receives no identifier or
+    /// application events (observed output: `[]`). Un-reds when the
+    /// `<...>`-group scan in statement position falls back to the expression
+    /// grammar once no name follows (official computeType posture).
     #[test]
     fn function_reference_arity_reports_element_function() {
         let report = report("class A {} void g<T>() {} void f() { g<A, A>; }");
@@ -5081,6 +5182,14 @@ mod tests {
     /// Hand-trace: `c`'s row snapshots its declared type `C`; the
     /// application event walks `C.call`, finds a method with 1 type
     /// parameter, and checks it against the given 2.
+    ///
+    /// RED (parser gap, #339): `c<A, A>;` in statement position has no
+    /// declaration shape, but the `<` group is not rescanned as type
+    /// arguments either — the statement parses as relational operators
+    /// (`c < A`, `,`, `A >` …), producing `undefined_class` ×2,
+    /// `undefined_operator`, `undefined_identifier`. Same family as
+    /// `function_reference_arity` (the `<A, A>` complex-group scan in
+    /// expression context). Un-reds with the same parser fix.
     #[test]
     fn implicit_call_reference_reports_element_call() {
         let report = report("class C { T call<T>(T x) => x; } void f(C c) { c<A, A>; }");
@@ -5101,6 +5210,14 @@ mod tests {
     /// `ctor_pos` branch resolves `Ex` as an extension container and checks
     /// its declared count (0) against 1 immediately. The trailing `(a)` runs
     /// under `ctor_pos` (callee `None`) and stays silent.
+    ///
+    /// RED (parser gap, #339): the statement declaration-probe's
+    /// `compute_type` consumes `Ex<A>` as a parameterized type and the `(`
+    /// follower reads as an invocation-headed declaration, so the statement
+    /// parses as a declaration head — no identifier, type-argument, or
+    /// creation events reach the engine (observed output: `[]`). Un-reds
+    /// with the same `Type<args>(` expression-statement veto as
+    /// `creation_arity`.
     #[test]
     fn extension_override_arity_reports_extension_code() {
         let report = report("class A {} extension Ex on A {} void f(A a) { Ex<A>(a); }");
@@ -5143,6 +5260,14 @@ mod tests {
     /// Hand-trace: `int x = null` checks the single-row initializer against
     /// the group type → `invalid_assignment`; `int? y = null` is Right Top
     /// (subtype.dart:263) → silent.
+    ///
+    /// RED (parser gap, #339): a nullable declared type followed by an
+    /// initializer (`int? y = null;`) loses the declaration: the `?`-type
+    /// plus `=`-initializer statement shape parses as the expression
+    /// `int ? y …`, `y` never binds, and its name surfaces as
+    /// `undefined_identifier` (probe: `int? y = 1;` alone reports it too;
+    /// `int? y;` without an initializer parses fine). Un-reds when the
+    /// declaration probe accepts `Type? name =` as a variable declaration.
     #[test]
     fn declaration_initializer_null_reports_invalid_assignment() {
         let report = report("class int {} void f() { int x = null; int? y = null; }");
@@ -5270,11 +5395,14 @@ mod tests {
     ///
     /// Hand-trace: `operator +(a, b)` → expected 1, found 2; `set s(a, b)` →
     /// not one required-positional → the syntactic-tier setter text; the
-    /// correct `operator [](i)` and `set ok(v)` stay silent.
+    /// correct `operator [](i)` and `set ok(v)` stay silent. The `int`
+    /// annotations model `dart:core` (the harness has no core library —
+    /// `report()`'s contract — so core names join as concrete declarations,
+    /// as in `null_assignment`).
     #[test]
     fn declaration_arity_folds_operator_and_setter() {
         let report = report(
-            "class C { int operator +(int a, int b) => 1; set s(int x, int y) {} int operator [](int i) => 1; set ok(int v) {} }",
+            "class int {} class C { int operator +(int a, int b) => 1; set s(int x, int y) {} int operator [](int i) => 1; set ok(int v) {} }",
         );
         assert_eq!(
             code_names(&report),
@@ -5299,10 +5427,11 @@ mod tests {
     ///
     /// Hand-trace: `operator -(a, b)` declares 2 parameters; the table's
     /// fall-through arm (`error_verifier.dart:5731-5740`) fires the minus
-    /// variant with the found count only.
+    /// variant with the found count only. `int` models `dart:core` (the
+    /// `report()` harness contract).
     #[test]
     fn minus_operator_arity_uses_the_minus_template() {
-        let report = report("class C { C operator -(int a, int b) => C(); }");
+        let report = report("class int {} class C { C operator -(int a, int b) => C(); }");
         assert_eq!(
             code_names(&report),
             ["wrong_number_of_parameters_for_operator"]
@@ -5705,7 +5834,7 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].range.offset,
             u32::try_from(
-                "class C { C operator +(C o) => this; } class D {} void f(C c, D d, D d2) { c "
+                "class C { C operator +(C o) => this; } class D {} void f(C c, D d, D d2) { c + d; d "
                     .len()
             )
             .unwrap()
@@ -5719,11 +5848,13 @@ mod tests {
     ///
     /// Hand-trace: `j`'s row carries `Operator('+')`; the walk finds the
     /// field `j: R` → the operator check runs on `R` → `undefined_operator`.
-    /// `c.k + r` clean-misses `k` → `undefined_getter` only.
+    /// `c.k` has no declaration in `C` → clean miss → `undefined_getter`
+    /// only (a declared field would read cleanly and lend its own type to
+    /// the operator, so `k` must stay undeclared for the no-cascade shape).
     #[test]
     fn member_result_operator_checks_the_result_type() {
         let report = report(
-            "class R {} class C { R j; R2 k; } class R2 {} \
+            "class R {} class C { R j; } class R2 {} \
              void f(C c, R r, R2 r2) { c.j + r; c.k + r2; }",
         );
         assert_eq!(
