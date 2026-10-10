@@ -19,3 +19,5 @@ build/
 
 # Rust build artifacts
 /target
+crates/dartq-plugin-host/.dart_tool/
+crates/dartq-plugin-host/pubspec.lock
