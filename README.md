@@ -26,17 +26,169 @@ design document.
    place of `dart analyze` (machine-readable superset), measured against
    the official analyzer as the oracle.
 
+## Build
+
+```bash
+cargo build -p dartq-cli          # the binary lands at target/debug/dartq
+cargo build --release -p dartq-cli
+cargo test --workspace
+```
+
+The toolchain is pinned by `rust-toolchain.toml` (Rust 1.96.0, edition
+2024, resolver "3"). `Cargo.lock` is committed: the workspace ships
+binaries (`dartq-cli`, `harness`). Concurrent cargo invocations share
+`target/` under a workspace-pinned job cap (`.cargo/config.toml`,
+`jobs = 2`).
+
+## Command Surface
+
+`dartq` has eight commands: `analyze`, `check`, `compat`, `daemon`, `fix`,
+`impact`, `query`, and `version`. Every flag below is parsed by the CLI —
+run `dartq <command> --help` for the full grammar.
+
+```bash
+# Scan + parse a directory tree (the differential face): syntax
+# diagnostics in the oracle's machine format by default.
+dartq check lib/ test/
+dartq check lib/ --format=json
+
+# Full engine over a package directory (needs pubspec.yaml and
+# .dart_tool/package_config.json): pub faces, discovery, scan, parse,
+# resolution.
+dartq analyze ~/src/my_app
+dartq analyze ~/src/my_app --format=human
+
+# Symbol index: declarations of one name plus resolved references to them.
+dartq query symbol Foo
+dartq query symbol Foo --format=json
+
+# Impact: what depends on one file's API surface (a hypothetical change —
+# a CLI run holds no edit baseline; the daemon passes real diffs).
+dartq impact lib/models/user.dart
+
+# Compatibility matrix: one file analyzed under several SDK roots.
+dartq compat lib/api.dart --sdk-root ~/fvm/versions/3.5.0 \
+                           --sdk-root ~/fvm/versions/3.13.0
+# Or through dartiq.yaml contexts (see below); both flags are repeatable.
+dartq compat lib/api.dart --context beta
+
+# Fixes: --dry-run only prints the patch document; without it, edits
+# apply in place (drift-corrected through their anchors).
+dartq fix lib/ --dry-run
+dartq fix lib/
+
+# The daemon: an LSP server over stdin/stdout (see "Daemon" below).
+dartq daemon ~/src/my_app
+
+# Version.
+dartq version
+dartq --version
+```
+
+Severity-sensitive flags mirror the oracle on `check`/`analyze`:
+warnings are fatal by default (`--no-fatal-warnings` clears that), infos
+are not (`--fatal-infos` opts in). `check`/`analyze` also accept
+`--metrics-json PATH` — one JSON object at exit with file/LOC/diagnostic
+counts, phase timings, library cache counters, and peak RSS.
+
+## Exit Codes
+
+The diagnostics faces (`check`, `analyze`) use dartdev's analyze
+semantics — the oracle-parity tiers:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | clean, or infos present without `--fatal-infos` |
+| 1 | fatal infos (`--fatal-infos`) |
+| 2 | fatal warnings (the default) |
+| 3 | any error |
+| 4 | internal failure (stdout stays empty — a partial set never poses as a result) |
+| 64 | usage error (bad flags, missing paths/package config/SDK) |
+
+The query-family faces (`query`, `impact`, `compat`, `fix`) use the query
+tiers: 0 on a successful query — zero results and incompatible compat
+axes are the answer's data, not failures; stale fix anchors are safe
+no-ops — plus 64 usage and 4 internal.
+
+## Daemon
+
+`dartq daemon <dir>` serves LSP 3.17 over stdin/stdout: hand-written
+`Content-Length` framing, JSON-RPC 2.0, one client. Lifecycle is standard
+(`initialize` → `initialized` → requests → `shutdown` → `exit`); whole-file
+overlay edits arrive through `textDocument/didOpen`/`didChange`/`didClose`
+(never touching disk), full diagnostic sets push via
+`textDocument/publishDiagnostics`, and `$/cancelRequest` cancels a queued
+read. Each turn batches all queued work — N edits collapse into one apply
+plus one analysis.
+
+Six `dartq/*` methods mirror the CLI commands one-to-one (announced under
+`capabilities.experimental`): `dartq/analyze` (merged diagnostics, document
+URIs), `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/fix`, and
+`dartq/compat` (canonical path labels; `dartq/compat` requires explicit
+`sdk_roots` — the CLI's `$DART_SDK` fallback has no daemon equivalent).
+Every answer carries `schema_version` and honors an optional `verbosity`
+tier. Example frame:
+
+```text
+Content-Length: 71
+
+{"jsonrpc":"2.0","id":1,"method":"dartq/query","params":{"name":"Foo"}}
+```
+
+## Workspace Config: dartiq.yaml
+
+An optional `dartiq.yaml` at the workspace root configures the faces. It is
+all-optional — an absent file is the zero-config default — unknown keys are
+ignored, and an optional `version` key (currently `1`) guards the shape.
+Today `contexts` feeds `dartq compat`; the other sections are parsed and
+validated ahead of their consumers.
+
+```yaml
+version: 1
+
+# Named SDK contexts — `dartq compat --context <label>` axes, in file order.
+contexts:
+  stable:
+    sdk: system            # $DART_SDK
+  beta:
+    sdk: fvm:3.13.0        # an FVM-installed version
+  pinned:
+    sdk: path:sdks/dart-3.5  # relative to the workspace root
+    target: io             # io | web | wasm
+    define:                # -D variables for the context's conditional env
+      MY_FLAG: "1"
+
+# Generated-file policy.
+generated:
+  include: false
+  editable: false
+  patterns: ["*.g.dart", "*.freezed.dart"]
+
+memory:
+  limit_mib: 2048
+cache:
+  size_limit_gib: 8
+```
+
 ## Performance
 
-Design targets (budgets from the charter, not yet end-to-end claims):
+End-to-end numbers come from the benchmark reports under
+`docs/audits/bench/`, measured over the M0 corpus (279 files, 22,656 LOC)
+with **debug builds** of `dartq check` — labeled as measured, not
+projected:
 
-- **≥ 10x** faster than `dart analyze` end-to-end — the floor for shipping
-  any milestone.
-- **100x – 1000x** on cold analysis of large repositories.
-- **1000x+** on incremental re-analysis after small edits.
+| Metric | dartq | Comparison |
+| --- | --- | --- |
+| Incremental re-run, p95 | 13.97 ms | `dart analyze` ≈ 555 ms per step (≈ 40x) |
+| Peak RSS over the corpus | 7.2 MiB (≈ 31.6 MiB per 100k LOC) | — |
+| Machine-format output bytes | 175,114 | oracle 435,207 (see note) |
 
-Measured so far (component-level microbenchmarks; Apple M1-class arm64,
-release builds; these are current measurements, not projections):
+The output-volume row compares identical machine-format faces, but the
+oracle currently emits a strictly larger diagnostic set (full analysis vs
+dartq's syntax tier), so the gap reflects the surface difference as much
+as output economy.
+
+Component microbenchmarks (release builds, Apple M1-class arm64):
 
 | Component | Measurement |
 | --- | --- |
@@ -44,21 +196,23 @@ release builds; these are current measurements, not projections):
 | Type system | subtype chain 4.7M ops/s; interner hit path 29M ops/s; 64 B per interned type |
 | Source layer | ~1.16 MB of persistent storage per MB of source (content-addressed) |
 
-End-to-end comparisons against `dart analyze` are established by
-`tests/bench/oracle_baseline.sh` (see [Differential Testing](#differential-testing)
-and [Oracle Baseline](#oracle-baseline)).
+Design targets (budgets from the charter, not claims): ≥ 10x faster than
+`dart analyze` end-to-end as the shipping floor, 100x–1000x on cold
+analysis of large repositories, 1000x+ on incremental re-analysis after
+small edits.
 
 ## Architecture
 
-One-way layering, one crate per concern. 23 workspace crates plus the
-differential-testing harness:
+One-way layering, one crate per concern. 25 workspace crates plus the
+differential-testing harness. Status = what ships through the CLI/daemon
+faces today:
 
 | Layer | Crate | Role | Status |
 | --- | --- | --- | --- |
 | Foundation | [`dartq-source`](crates/dartq-source) | Content-addressed source storage: `ContentId` (blake3), source store, `FileId`, locators | landed |
 | Foundation | [`dartq-language`](crates/dartq-language) | Feature registry generated at build time from the SDK's `experimental_features.yaml`; `LanguageVersion` / `FeatureSet` resolution | landed |
-| Foundation | [`dartq-diagnostics`](crates/dartq-diagnostics) | Stable diagnostic code registry (265 official + 12 dartq-own codes) and `machine` / `json` writers byte-compatible with `dart analyze --format=machine` | landed |
-| Foundation | [`dartq-schema`](crates/dartq-schema) | Versioned machine-readable JSON output schemas | in development |
+| Foundation | [`dartq-diagnostics`](crates/dartq-diagnostics) | Stable diagnostic code registry and `machine` / `json` writers byte-compatible with `dart analyze --format=machine` | landed |
+| Foundation | [`dartq-schema`](crates/dartq-schema) | Versioned machine-readable JSON output schemas (frozen v1) + CI validator | landed |
 | Frontend | [`dartq-scanner`](crates/dartq-scanner) | Full Dart 3.15 tokenizer: single pass, no backtracking, `@dart` version-comment window, error recovery → linear token table + syntax diagnostics | landed |
 | Frontend | [`dartq-parser`](crates/dartq-parser) | Fault-tolerant recursive-descent parser for the full Dart 3.15 grammar: token table in, parser-event stream out | landed |
 | Frontend | [`dartq-ast`](crates/dartq-ast) | Compact arena AST: nodes reference token ranges, spans derive from the token table (byte + UTF-16) | landed |
@@ -66,22 +220,22 @@ differential-testing harness:
 | Environment | [`dartq-package`](crates/dartq-package) | Typed package-identity model consumed by resolution, composed on `dartq-pub`'s artifacts | landed |
 | Environment | [`dartq-sdk`](crates/dartq-sdk) | SDK metadata: `libraries.json` loading, identity, `dart:` library surface, target/platform scoping | landed |
 | Semantics | [`dartq-types`](crates/dartq-types) | Type system M1 surface: ten-shape type skeleton, nullability dimension, canonical interning, subtype / assignability, least upper bound | landed |
-| Semantics | [`dartq-resolution`](crates/dartq-resolution) | URI, import/export/part, and conditional-import resolution with namespace computation | in development |
+| Semantics | [`dartq-resolution`](crates/dartq-resolution) | URI, import/export/part, and conditional-import resolution with namespace computation | landed |
 | Semantics | [`dartq-semantic`](crates/dartq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
 | Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
-| Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | in development |
-| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | in development |
-| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache (L1/L2/L3) and eviction policies | in development |
-| Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | in development |
-| Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | in development |
-| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set | in development |
-| Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin protocol IPC types | in development |
-| Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | in development |
-| Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | in development |
+| Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | landed |
+| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | landed |
+| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache and eviction policies | landed (L1) |
+| Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | partial — flush machinery only |
+| Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | landed |
+| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (64 official core/recommended rules) | rules implemented; CLI wiring pending |
+| Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin protocol v1 IPC types: frames, codec, handshake, manifest | protocol landed; core spawn pending |
+| Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | landed |
+| Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | landed |
 | Testing | [`harness`](tests/harness) | Differential-testing driver: oracle vs dartq over shared corpora, `(code, file)` Jaccard comparison | landed |
 
 `crates/dartq-plugin-host/` is the host-side Dart package of the plugin
-protocol (M4) and is not part of the Cargo workspace.
+protocol and is not part of the Cargo workspace.
 
 ## Differential Testing
 
@@ -89,10 +243,8 @@ protocol (M4) and is not part of the Cargo workspace.
 and dartq over the same corpora and compares results as `(code, file)`
 entry sets (Jaccard). Corpora live in `tests/corpus/`: `m0` (assembled
 analyzer-suite cases), `m0-syntax` (syntax-broken files), and the syntax
-gate's code list `syntax-codes.txt` — the syntax codes of
-`crates/dartq-diagnostics/data/syntax-codes.tsv` (265 rows: 262
-scanner/parser codes + the 3-code language-version family; the txt file
-drops the family, leaving 262).
+gate's code list `syntax-codes.txt` (262 codes, the scanner/parser subset
+of `crates/dartq-diagnostics/data/syntax-codes.tsv`).
 
 Current measured baseline (oracle: `dart analyze` 3.13.1, `--e2e-oracle`
 self-check, both sides the analyzer — Jaccard 1.000 across all runs):
@@ -139,39 +291,58 @@ one per round plus a summary record. Run it before and after performance
 work to keep comparisons honest — dartq budgets are stated relative to
 these numbers.
 
-## Build and Test
+## Versioning
+
+- The CLI binary follows semver; the workspace version is `0.1.0`.
+- Machine-readable outputs carry `schema_version`. The frozen v1 contract
+  and its evolution rules (breaking change ⇒ major bump; additive fields
+  stay in-major and force the schema document to move first) are specified
+  in `dartq-schema`'s crate docs (`crates/dartq-schema`). The diagnostics
+  envelope deliberately keys its contract `version`, not `schema_version`,
+  for byte parity with `dart analyze --format=json`.
+- `dartiq.yaml`'s optional `version` key is currently `1`; any other value
+  is rejected with a usage error.
+- The on-disk snapshot format is internal to the engine — not a published
+  contract.
+
+## Limitations
+
+Honest state of the current tree:
+
+- `dartq analyze` covers scan, parse, and resolution; the type-system and
+  semantic-diagnostic seam is still landing, so semantic errors beyond
+  syntax/resolution are not yet reported.
+- `query` has a single face, `symbol`. More query kinds are unplanned
+  future work.
+- The 64 built-in lint rules are implemented and tested but not yet wired
+  into the CLI/daemon diagnostic output.
+- `dartq fix` plumbing (anchoring, drift-correcting applier, patch
+  document) is complete, but no fix sources are wired yet — current runs
+  apply zero edits.
+- Plugins: the wire protocol (v1) and the host-side Dart package exist;
+  the core does not yet spawn or discover plugins.
+- The daemon's debounced snapshot flush machinery is in place; the
+  generation payload awaits engine faces, so nothing is written yet.
+- `analyze --format=human` is a convenience view, not a differential
+  face — its layout may change freely.
+- The benchmark numbers above are debug builds over a 22.7k-LOC corpus.
+
+## Publication
+
+dartiq is not published to crates.io — build from source.
+
+## Development Gates
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo fmt --all -- --check                # rustfmt.toml: style_edition 2024, max_width 100
-cargo clippy --workspace --all-targets    # rust_2018_idioms + clippy all/pedantic (warn)
+scripts/ci.sh              # serial per-crate gate: cargo fmt --check,
+                           # then cargo clippy --all-targets -- -D warnings
+scripts/ci.sh --check-only # fast mode: cargo check per crate only
 ```
 
-The toolchain is pinned by `rust-toolchain.toml` (Rust 1.96.0, edition
-2024, resolver "3"). `Cargo.lock` is committed: the workspace ships
-binaries (`dartq-cli`, `harness`).
-
-## Status
-
-M0 (scanner, parser, arena AST, source layer, diagnostics registry, and the
-differential harness) has landed; the language/version, pub/package, SDK,
-and type-system foundations are in place, and the syntax-caliber gate runs
-at Jaccard 1.000. M1 (resolution, semantic graph, incremental analysis,
-JSON CLI) is in progress — the remaining crates in the table above are
-under development.
-
-Milestones per `PRD.md` §20.3:
-
-- **M0 — skeleton**: fault-tolerant parser + arena AST for the full Dart
-  3.15 grammar; syntax differential testing against the official analyzer.
-- **M1 — MVP**: URI resolution, symbol index, static nullability, basic
-  semantic diagnostics, L1 incremental analysis, JSON CLI.
-- **M2 — full semantics**: complete type system, flow analysis, built-in
-  lints, L2 incremental analysis.
-- **M3 — multi-environment**: impact/test graphs, multi-workspace,
-  persistent snapshots, L3 incremental analysis.
-- **M4 — ecosystem**: plugin host, fixes/assists, daemon + RPC.
+The loop walks the workspace members (fixture/test-only members skipped),
+one crate at a time, and stops at the first failure naming the crate.
+Concurrency stays under the workspace job cap — `.cargo/config.toml`
+pins `jobs = 2`; the script passes no `-j`.
 
 ## Third-Party Notices
 
