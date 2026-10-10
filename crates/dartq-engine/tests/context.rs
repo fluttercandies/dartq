@@ -285,8 +285,12 @@ fn stale_epoch_tasks_drop_at_drain() {
         .open_context(context_config(&fixture, 0))
         .expect("open");
 
-    runtime.enqueue(context, false, Tier::Normal, 1).expect("enqueue");
-    runtime.enqueue(context, true, Tier::Normal, 2).expect("enqueue");
+    runtime
+        .enqueue(context, false, Tier::Normal, 1)
+        .expect("enqueue");
+    runtime
+        .enqueue(context, true, Tier::Normal, 2)
+        .expect("enqueue");
     assert_eq!(runtime.epoch(context), Some(0));
 
     let main = fixture.path("lib/main.dart");
@@ -306,11 +310,15 @@ fn stale_epoch_tasks_drop_at_drain() {
         "the write bumped the epoch"
     );
 
-    let fresh = runtime.enqueue(context, false, Tier::Normal, 3).expect("enqueue");
+    let fresh = runtime
+        .enqueue(context, false, Tier::Normal, 3)
+        .expect("enqueue");
     assert_eq!(fresh.epoch, 1, "new tasks carry the new epoch");
 
     runtime.cancel(context).expect("cancel");
-    let last = runtime.enqueue(context, false, Tier::Normal, 4).expect("enqueue");
+    let last = runtime
+        .enqueue(context, false, Tier::Normal, 4)
+        .expect("enqueue");
     assert_eq!(last.epoch, 2);
 
     let report = runtime.drain();
@@ -341,11 +349,21 @@ fn drain_orders_writes_before_reads() {
         .open_context(context_config(&fixture, 1))
         .expect("open");
 
-    runtime.enqueue(first, false, Tier::Normal, 101).expect("enqueue");
-    runtime.enqueue(first, true, Tier::Normal, 102).expect("enqueue");
-    runtime.enqueue(first, false, Tier::Normal, 103).expect("enqueue");
-    runtime.enqueue(second, false, Tier::Normal, 201).expect("enqueue");
-    runtime.enqueue(second, true, Tier::Normal, 202).expect("enqueue");
+    runtime
+        .enqueue(first, false, Tier::Normal, 101)
+        .expect("enqueue");
+    runtime
+        .enqueue(first, true, Tier::Normal, 102)
+        .expect("enqueue");
+    runtime
+        .enqueue(first, false, Tier::Normal, 103)
+        .expect("enqueue");
+    runtime
+        .enqueue(second, false, Tier::Normal, 201)
+        .expect("enqueue");
+    runtime
+        .enqueue(second, true, Tier::Normal, 202)
+        .expect("enqueue");
 
     let report = runtime.drain();
     assert_eq!(report.stale_dropped, 0);
@@ -443,7 +461,9 @@ fn close_context_recycles_cleanly() {
     let context = runtime
         .open_context(context_config(&fixture, 0))
         .expect("open");
-    runtime.enqueue(context, false, Tier::Normal, 1).expect("enqueue");
+    runtime
+        .enqueue(context, false, Tier::Normal, 1)
+        .expect("enqueue");
 
     runtime.close_context(context).expect("close");
     assert_eq!(runtime.len_contexts(), 0);
@@ -465,7 +485,9 @@ fn close_context_recycles_cleanly() {
         .open_context(context_config(&fixture, 0))
         .expect("open");
     assert_eq!(runtime.epoch(reopened), Some(0), "fresh epoch");
-    runtime.enqueue(reopened, false, Tier::Normal, 3).expect("enqueue");
+    runtime
+        .enqueue(reopened, false, Tier::Normal, 3)
+        .expect("enqueue");
     let report = runtime.drain();
     assert_eq!(report.stale_dropped, 0);
     assert_eq!(report.tasks.len(), 1);

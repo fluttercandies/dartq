@@ -24,25 +24,31 @@ use dartq_source::{
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-/// Bumped with any engine-side change to what [`UnitFacts`] records
-/// (directive extraction, diagnostic baking); part of the facts cache key
-/// (the `AstKey.parser_version` component, PRD §5.6
-/// `EngineSemanticVersion`). v2: name-form `part of` directives skip URI
+/// The engine-side facts-shape version: bumped with any engine-side change
+/// to what [`UnitFacts`] records (directive extraction, diagnostic
+/// baking). Shape history — v2: name-form `part of` directives skip URI
 /// resolution, and the capture-time duplicate log bakes as
-/// `duplicate_definition`. v3: an above-latest `// @dart` override bakes the
-/// official `invalid_language_version_override` STATIC_WARNING and analyzes
-/// at the package/default version instead of adopting the override (#245) —
-/// v2-cached entries for such files carry neither.
-///
-/// Version discipline: cached facts carry the baked
-/// [`UnitFacts::api_signature`], so any bump of
-/// `dartq_semantic::SIGNATURE_VERSION` (the element-face composition) must
-/// bump this too, or stale-signature comparisons survive a facts-cache hit.
+/// `duplicate_definition`. v3: an above-latest `// @dart` override bakes
+/// the official `invalid_language_version_override` STATIC_WARNING and
+/// analyzes at the package/default version instead of adopting the
+/// override (#245) — v2-cached entries for such files carry neither.
+const FACTS_SHAPE_VERSION: u32 = 3;
+
+/// The facts-cache-key version (the `AstKey.parser_version` component, PRD
+/// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
+/// `dartq_semantic::SIGNATURE_VERSION` (the element-face composition the
+/// baked [`UnitFacts::api_signature`] carries). Cached facts carry that
+/// baked signature, so a signature bump must invalidate them — the fold
+/// makes it automatic, in memory ([`FactsKey`]'s hash) and across restarts
+/// (the snapshot `EntryKey`s and the generation header key on this same
+/// value), with no manual cross-crate bump discipline and no separate
+/// version comparison anywhere.
 ///
 /// Public since #341: the snapshot wiring keys every
 /// `dartq_snapshot::EntryKey` and the generation header's
 /// `semantic_version` on it.
-pub const FACTS_SEMANTIC_VERSION: u32 = 3;
+pub const FACTS_SEMANTIC_VERSION: u32 =
+    (FACTS_SHAPE_VERSION << 16) | (dartq_semantic::SIGNATURE_VERSION & 0xffff);
 
 /// The SDK target segment M1 resolves `dart:` URIs against. Context-level
 /// target selection is an M2 milestone (engine-api-spec §1.1); M1 pins the
@@ -70,11 +76,14 @@ const SCANNED_CACHE_CAP: usize = 1024;
 /// replaced or removed residency, evicted facts-cache entries — and sweeping
 /// per keystroke would cost O(residency + cache + entries) each time, so
 /// collection amortizes: one sweep runs once the tally crosses this bound.
-/// The timing never affects correctness (the sweep keeps everything
-/// referenced, a later trigger only delays reclamation), only the
-/// steady-state entry bound: residency + [`FACTS_CACHE_CAP`] + fewer than
-/// this many unswept dead versions.
-const GC_DEAD_THRESHOLD: usize = 64;
+/// Cache-cap scale (matches [`FACTS_CACHE_CAP`], #374): at 10⁵-file
+/// residency a 64-entry cadence re-marked the whole workspace every few
+/// keystrokes, while the unswept-dead tail stays the same order the facts
+/// cache already retains. The timing never affects correctness (the sweep
+/// keeps everything referenced, a later trigger only delays reclamation),
+/// only the steady-state entry bound: residency + [`FACTS_CACHE_CAP`] +
+/// fewer than this many unswept dead versions.
+const GC_DEAD_THRESHOLD: usize = 1024;
 
 /// The directive family of one [`DirectiveFacts`] entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +268,8 @@ pub(crate) struct LibraryResult {
 pub(crate) struct FactsKey {
     pub content: ContentId,
     pub feature_fingerprint: u64,
+    /// The [`FACTS_SEMANTIC_VERSION`] component — rides the hash, so any
+    /// engine facts-shape or semantic signature bump invalidates the entry.
     pub semantic_version: u32,
 }
 
@@ -302,7 +313,10 @@ pub(crate) struct LibraryTable {
     infos: Vec<Option<LibraryInfo>>,
     /// Retired ids available for reuse. Entries are distinct (an id can
     /// re-enter only through a later [`Self::retire_except`]), so the list
-    /// is bounded by the historical live peak.
+    /// is bounded by the historical live peak. A recycled id is handed to
+    /// whatever interns next and is indistinguishable from its previous
+    /// incarnation — reuse safety is the caller's ordering contract (see
+    /// [`Self::retire_except`]).
     free: Vec<LibraryId>,
 }
 
@@ -357,6 +371,17 @@ impl LibraryTable {
 
     /// Drops every registration whose id is not in `keep`, returning their
     /// ids to the reuse freelist. Returns the retired ids (ascending).
+    ///
+    /// Ordering contract (the freelist-recycling hazard, #374): a recycled
+    /// id aliases its previous incarnation — stale snapshots holding it
+    /// (`LibraryResult::deps`, library identity arrays) compare equal
+    /// against the new tenant. Recycling is safe only when nothing stale is
+    /// left to alias: the caller must complete every intern of the current
+    /// batch *before* retiring (an id retired early could be re-minted to a
+    /// different URI within the same batch) and must drop cached results of
+    /// retired ids alongside. l1's apply honors this: `retire_except` runs
+    /// at write-back, after the reform passes' interns, and removes each
+    /// retired id's result in the same sweep.
     pub(crate) fn retire_except(&mut self, keep: &FxHashSet<LibraryId>) -> Vec<LibraryId> {
         let mut retired = Vec::new();
         self.ids_by_uri.retain(|_, id| {
@@ -634,5 +659,65 @@ impl EngineState {
             &mut self.files,
             resident,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_returns_the_live_id_and_reuses_retired_ones() {
+        let mut table = LibraryTable::default();
+        let a = table.intern("package:a/a.dart".into());
+        let b = table.intern("package:b/b.dart".into());
+        assert_ne!(a, b);
+        assert_eq!(
+            table.intern("package:a/a.dart".into()),
+            a,
+            "live uri keeps its id"
+        );
+        assert_eq!(table.arena_len(), 2);
+
+        // Retiring everything returns both ids ascending and unregisters
+        // them; the next interns re-mint those ids for different URIs — the
+        // aliasing the retire_except ordering contract guards against. The
+        // freelist pops in hash-iteration order (only the returned vec is
+        // sorted), so which tenant gets which id is unspecified.
+        let retired = table.retire_except(&FxHashSet::default());
+        assert_eq!(retired, vec![a, b]);
+        let c = table.intern("package:c/c.dart".into());
+        let d = table.intern("package:d/d.dart".into());
+        assert!(retired.contains(&c) && retired.contains(&d) && c != d);
+        assert_eq!(
+            table.arena_len(),
+            2,
+            "reuse keeps the arena at the live peak"
+        );
+    }
+
+    #[test]
+    fn retire_except_keeps_live_ids_and_recycles_retired_ones() {
+        let mut table = LibraryTable::default();
+        let a = table.intern("package:a/a.dart".into());
+        let b = table.intern("package:b/b.dart".into());
+        let c = table.intern("package:c/c.dart".into());
+        let mut keep = FxHashSet::default();
+        keep.insert(b);
+        let retired = table.retire_except(&keep);
+        assert_eq!(retired, vec![a, c]);
+
+        // The kept id stays registered; the retired uris are unregistered.
+        assert_eq!(table.ids_by_uri.get("package:b/b.dart"), Some(&b));
+        assert!(table.ids_by_uri.get("package:a/a.dart").is_none());
+        assert!(table.ids_by_uri.get("package:c/c.dart").is_none());
+
+        // A retired uri interns as a fresh registration, not a resurrection
+        // of stale info: it draws a recycled id from the freelist instead of
+        // growing the arena.
+        let a2 = table.intern("package:a/a.dart".into());
+        assert!(a2 == a || a2 == c, "interns draw from the freelist");
+        assert_eq!(table.ids_by_uri.get("package:a/a.dart"), Some(&a2));
+        assert_eq!(table.arena_len(), 3);
     }
 }
