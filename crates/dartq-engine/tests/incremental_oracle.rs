@@ -19,16 +19,12 @@
 //! signature-gated: body/comment edits with a stable element face stop at
 //! the edited file (C1.1/C2.1/C4.1/C6.1/C8.1 narrow), while a
 //! signature-changing edit seeds the unconditional transitive closure (C9).
-//! Two cases stay red on pre-existing gaps the working seam exposed, none
-//! of them seam defects: C5's
-//! overlay-only part file interns under a different FileTable spelling than
-//! the resolver composes (existence-dependent normalization), so the part
-//! claim misses residency and p2 forms an orphan singleton; C7's
-//! `undefined_function` entries are suppressed by dartq-semantic's
-//! `UndefinedGuard` (a bare miss under any unfiltered broken import
-//! over-suppresses; the oracle ignores only show-listed names — its own doc
-//! defers the tightening). Faithful red over fake green; see the case
-//! comments.
+//! C5 and C7 were long red on pre-existing gaps (C5: the overlay-only part
+//! file interning under a different FileTable spelling than the resolver
+//! composes; C7: dartq-semantic's UndefinedGuard over-suppressing bare
+//! misses under any unfiltered broken import) — both now pass end to end
+//! (C7's A3 table asserts the previously-suppressed `undefined_function`
+//! rows), so no case is red; the case comments carry the history.
 //!
 //! The manifests and expectations live as in-test tables. Hoisting them into
 //! `tests/cases/<case>/{manifest.json, expectations.json}` (§4 placement) is
@@ -1330,5 +1326,90 @@ fn adjacent_string_uri_concatenates_before_resolution() {
         machine_bytes(&engine, &diagnostics),
         full_arm_bytes(&fixture, &state),
         "A1 adjacent-string baseline"
+    );
+}
+
+/// Cancelled-analyze leftovers survive the next unrelated edit (audit #428
+/// P0): a library invalidated because a DEPENDENCY's face moved carries that
+/// staleness nowhere in its own identity, so the identity re-derivation in
+/// `close` cannot rediscover it — the apply after a cancelled analyze must
+/// seed the leftover set into its dirty set. Sequence: cold analyze (l1
+/// imports l2) → signature-changing edit on l2 → pre-cancelled analyze (the
+/// l1/l2 leftovers stay invalidated, nothing recomputes) → body edit on
+/// unrelated u (stable face, unreachable from any seed) → apply + analyze.
+/// Pre-fix, l1's cached result — computed against l2's pre-edit face — is
+/// served from then on: the rename's `undefined_function` never appears and
+/// the bytes diverge from a fresh engine's full recompute, permanently
+/// (incremental ≠ full recompute with no repair path).
+#[test]
+fn cancelled_analyze_leftover_survives_an_unrelated_edit() {
+    const L1: &str = "import 'l2.dart';\nint f() => g();\n";
+    const L2_0: &str = "int g() => 1;\n";
+    const L2_1: &str = "int g2() => 1;\n"; // the rename flips l2's face
+    const U_0: &str = "int u() => 3;\n";
+    const U_1: &str = "int u() => 4;\n"; // body edit, stable face
+
+    let fixture = Fixture::new(&[
+        ("lib/l1.dart", L1),
+        ("lib/l2.dart", L2_0),
+        ("lib/u.dart", U_0),
+    ]);
+    let mut state: BTreeMap<String, String> = BTreeMap::from([
+        ("lib/l1.dart".to_owned(), L1.to_owned()),
+        ("lib/l2.dart".to_owned(), L2_0.to_owned()),
+        ("lib/u.dart".to_owned(), U_0.to_owned()),
+    ]);
+    let mut engine = fixture.engine();
+    for (path, source) in &state {
+        engine.set_content(&fixture.path(path), source.as_bytes());
+    }
+    engine.apply_pending(&mut |_| {});
+    let mut log = RawLog::default();
+    let cold = analyze_all(&fixture, &mut engine, &state, &mut log);
+    assert!(cold.is_empty(), "cold baseline is clean: {cold:?}");
+
+    // Signature-changing edit on l2, analyzed under a pre-cancelled token:
+    // the run stops before any recompute, and the l1/l2 leftovers stay
+    // invalidated.
+    engine.set_content(&fixture.path("lib/l2.dart"), L2_1.as_bytes());
+    state.insert("lib/l2.dart".to_owned(), L2_1.to_owned());
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(matches!(
+        engine.analyze(&[], &mut |_| {}, &token),
+        Err(dartq_engine::Cancelled)
+    ));
+
+    // Unrelated body edit: u's library is identity-stale and re-derived;
+    // identity-fresh l1 must carry its invalidation through this apply
+    // instead of being dropped by the assignment.
+    engine.set_content(&fixture.path("lib/u.dart"), U_1.as_bytes());
+    state.insert("lib/u.dart".to_owned(), U_1.to_owned());
+    let report = engine.apply_pending(&mut |_| {});
+    let l1 = engine
+        .file_table()
+        .try_file_id(&fixture.path("lib/l1.dart"))
+        .expect("interned");
+    let l1_library = engine.library_of(l1).expect("live");
+    assert!(
+        report.invalidated.contains(&l1_library),
+        "the closure-stale leftover carries forward: {:?}",
+        sorted_defining(&fixture, &engine, &report.invalidated)
+    );
+
+    // The full-recompute face: l1 sees g vanish and says so.
+    let mut log = RawLog::default();
+    let diagnostics = engine
+        .analyze(&[], &mut log.sink(), &CancellationToken::new())
+        .expect("analyze");
+    assert_eq!(
+        absolute_set(&fixture, &engine, &diagnostics),
+        code_file_set(&[("undefined_function", "lib/l1.dart")]),
+        "l1 recomputes against l2's new face: {diagnostics:?}"
+    );
+    assert_eq!(
+        machine_bytes(&engine, &diagnostics),
+        full_arm_bytes(&fixture, &state),
+        "A1 cancel-then-edit"
     );
 }

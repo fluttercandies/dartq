@@ -157,15 +157,16 @@ pub(crate) fn apply(
     // importer closure. The closure output *replaces* the phase-2 work queue
     // (state.rs: "post-closure dirty set of the last apply; consumed by
     // analyze") — assignment, never a union. A cancelled analyze may leave
-    // unfinished libraries queued, but every still-invalid leftover is
-    // re-derived here: close() re-seeds from the result cache (no cached
-    // result or changed identity ⇒ dirty), and between the cancel and this
-    // close only the completed-slot insert writes results — by definition
-    // excluding the leftovers. (A leftover whose cached result matches its
-    // rebuilt identity is genuinely fresh, so dropping it is sound.)
-    // Assignment preserves the invariant `state.invalidated ⊆ live()`;
-    // a union would resurrect ids retired by an intervening remove, and
-    // analyze unwraps every queued id's info.
+    // unfinished libraries queued; close() seeds those leftovers into its
+    // dirty set, filtered to the post-reform live set: the identity diff
+    // alone cannot see closure-stale leftovers — a library invalidated
+    // because a DEPENDENCY's face moved carries that staleness nowhere in
+    // its own identity (that is why cancel is a token, not an identity diff)
+    // — so dropping such a leftover would serve its stale cached result
+    // forever, and incremental would diverge from a full recompute
+    // permanently. Assignment still preserves the invariant
+    // `state.invalidated ⊆ live()`; a union would resurrect ids retired by
+    // an intervening remove, and analyze unwraps every queued id's info.
     //
     // The closure is signature-gated (L2, PRD §11.3): seeds are the owners of
     // signature-changed files, the (still live) former owners of removed
@@ -1217,7 +1218,7 @@ fn reform_libraries(state: &mut EngineState) -> bool {
             // the resident filter is inert here, pass the documented no-probe
             // closure (pre-#287 this call site had no filter at all).
             let uri = state.uri_resolver(&|_| false).canonical_uri(&path);
-            state.canonical_uris.insert(*file, uri);
+            state.canonical_uris.insert(*file, Arc::from(uri));
         }
     }
 
@@ -1235,7 +1236,7 @@ fn reform_libraries(state: &mut EngineState) -> bool {
         if state.residency[file].is_part() {
             is_part.insert(*file);
         } else {
-            let id = state.libraries.intern(state.canonical_uris[file].clone());
+            let id = state.libraries.intern(&state.canonical_uris[file]);
             defining.push((*file, id));
         }
     }
@@ -1282,7 +1283,7 @@ fn reform_libraries(state: &mut EngineState) -> bool {
     // Pass C: orphaned part files become singleton libraries.
     for file in &resident {
         if is_part.contains(file) && !claims.contains_key(file) {
-            let id = state.libraries.intern(state.canonical_uris[file].clone());
+            let id = state.libraries.intern(&state.canonical_uris[file]);
             defining.push((*file, id));
         }
     }
@@ -1356,7 +1357,9 @@ fn reform_libraries(state: &mut EngineState) -> bool {
         infos.push((
             *lib,
             LibraryInfo {
-                uri: state.canonical_uris[file].clone(),
+                // The memo's allocation, shared: a refcount per defining
+                // library per apply, never a copy of the URI bytes.
+                uri: Arc::clone(&state.canonical_uris[file]),
                 defining: *file,
                 parts: parts.into(),
                 content,
@@ -1475,6 +1478,21 @@ fn close(
     let mut dirty: FxHashSet<LibraryId> = FxHashSet::default();
     let mut queued: FxHashSet<LibraryId> = FxHashSet::default();
     let mut work: Vec<LibraryId> = Vec::new();
+    // Cancelled-analyze leftovers carry forward (#428): reform_libraries has
+    // already run, so filtering on live info is the post-reform live set. A
+    // leftover invalidated by a dependency's face move is identity-fresh (the
+    // pass below would drop it), and the retired ids among the leftovers must
+    // not re-enter — analyze unwraps every queued id's info, and a freelist-
+    // recycled id (#230) aliases a fresh tenant that, if it reached here at
+    // all, is result-less and already dirty. Leftovers seed `dirty` only,
+    // never the fan-out: the cancelled run's dirty set was the full
+    // transitive closure of its own close, so every still-invalid importer
+    // is already among them.
+    for lib in std::mem::take(&mut state.invalidated) {
+        if state.libraries.info(lib).is_some() {
+            dirty.insert(lib);
+        }
+    }
     for lib in state.libraries.live() {
         let info = state.libraries.info(lib).expect("live library has info");
         let stale = match state.results.get(&lib) {

@@ -228,8 +228,11 @@ pub struct ScannedFace {
 /// folds the member contents in exactly this order).
 #[derive(Debug)]
 pub(crate) struct LibraryInfo {
-    /// Canonical URI the library identity keys on.
-    pub uri: Box<str>,
+    /// Canonical URI the library identity keys on. Shares the
+    /// canonical-URI memo's allocation ([`EngineState::canonical_uris`]):
+    /// reformation clones an `Arc` refcount per defining library per apply,
+    /// never re-copies the bytes.
+    pub uri: Arc<str>,
     /// The defining (non-`part of`) file.
     pub defining: FileId,
     /// Included part files, part-directive order.
@@ -326,9 +329,11 @@ pub(crate) struct LibraryTable {
 
 impl LibraryTable {
     /// The library registered under `uri`, interning the id on first sight.
-    /// A previously retired id is reused before the arena grows.
-    pub(crate) fn intern(&mut self, uri: Box<str>) -> LibraryId {
-        if let Some(&id) = self.ids_by_uri.get(&uri) {
+    /// A previously retired id is reused before the arena grows. The uri is
+    /// borrowed — the table clones only on the insert path, so the hot
+    /// hit-per-apply path pays no heap allocation.
+    pub(crate) fn intern(&mut self, uri: &str) -> LibraryId {
+        if let Some(&id) = self.ids_by_uri.get(uri) {
             return id;
         }
         let id = if let Some(id) = self.free.pop() {
@@ -338,7 +343,7 @@ impl LibraryTable {
             self.infos.push(None);
             id
         };
-        self.ids_by_uri.insert(uri, id);
+        self.ids_by_uri.insert(Box::from(uri), id);
         id
     }
 
@@ -433,8 +438,11 @@ pub(crate) struct EngineState {
     /// entirely (their `FileId`s stay interned in [`Self::files`]).
     pub residency: FxHashMap<FileId, Arc<UnitFacts>>,
     /// Canonical URI memo per interned file (a file's path never changes
-    /// once interned, so neither does its canonical URI).
-    pub canonical_uris: FxHashMap<FileId, Box<str>>,
+    /// once interned, so neither does its canonical URI). The `Arc`
+    /// allocation is shared, not copied: [`LibraryInfo::uri`] reuses it, so
+    /// reformation pays a refcount per defining library per apply, never a
+    /// heap clone.
+    pub canonical_uris: FxHashMap<FileId, Arc<str>>,
     /// Library arena with per-library membership and dependency data.
     pub libraries: LibraryTable,
     /// File → owning library (defining or part), rebuilt at apply.
@@ -446,8 +454,11 @@ pub(crate) struct EngineState {
     pub results: FxHashMap<LibraryId, LibraryResult>,
     /// Post-closure dirty set of the last apply; consumed by analyze.
     /// Invariant: every entry is a live library id — apply assigns `close`'s
-    /// output outright (a cancelled analyze's leftovers are re-derived or
-    /// dropped there, never unioned back).
+    /// output outright; `close` seeds the incoming leftovers (filtered to the
+    /// post-reform live set) into its dirty set, so a cancelled analyze's
+    /// still-invalid libraries carry forward. Unioning the incoming set back
+    /// directly could instead resurrect ids retired by an intervening remove
+    /// (#230), and analyze unwraps every queued id's info.
     pub invalidated: Vec<LibraryId>,
     /// Whether residency/structure changed since the last resolution-graph
     /// build (rebuild gate for the analyze phase).
@@ -673,14 +684,10 @@ mod tests {
     #[test]
     fn intern_returns_the_live_id_and_reuses_retired_ones() {
         let mut table = LibraryTable::default();
-        let a = table.intern("package:a/a.dart".into());
-        let b = table.intern("package:b/b.dart".into());
+        let a = table.intern("package:a/a.dart");
+        let b = table.intern("package:b/b.dart");
         assert_ne!(a, b);
-        assert_eq!(
-            table.intern("package:a/a.dart".into()),
-            a,
-            "live uri keeps its id"
-        );
+        assert_eq!(table.intern("package:a/a.dart"), a, "live uri keeps its id");
         assert_eq!(table.arena_len(), 2);
 
         // Retiring everything returns both ids ascending and unregisters
@@ -690,8 +697,8 @@ mod tests {
         // sorted), so which tenant gets which id is unspecified.
         let retired = table.retire_except(&FxHashSet::default());
         assert_eq!(retired, vec![a, b]);
-        let c = table.intern("package:c/c.dart".into());
-        let d = table.intern("package:d/d.dart".into());
+        let c = table.intern("package:c/c.dart");
+        let d = table.intern("package:d/d.dart");
         assert!(retired.contains(&c) && retired.contains(&d) && c != d);
         assert_eq!(
             table.arena_len(),
@@ -703,9 +710,9 @@ mod tests {
     #[test]
     fn retire_except_keeps_live_ids_and_recycles_retired_ones() {
         let mut table = LibraryTable::default();
-        let a = table.intern("package:a/a.dart".into());
-        let b = table.intern("package:b/b.dart".into());
-        let c = table.intern("package:c/c.dart".into());
+        let a = table.intern("package:a/a.dart");
+        let b = table.intern("package:b/b.dart");
+        let c = table.intern("package:c/c.dart");
         let mut keep = FxHashSet::default();
         keep.insert(b);
         let retired = table.retire_except(&keep);
@@ -719,7 +726,7 @@ mod tests {
         // A retired uri interns as a fresh registration, not a resurrection
         // of stale info: it draws a recycled id from the freelist instead of
         // growing the arena.
-        let a2 = table.intern("package:a/a.dart".into());
+        let a2 = table.intern("package:a/a.dart");
         assert!(a2 == a || a2 == c, "interns draw from the freelist");
         assert_eq!(table.ids_by_uri.get("package:a/a.dart"), Some(&a2));
         assert_eq!(table.arena_len(), 3);

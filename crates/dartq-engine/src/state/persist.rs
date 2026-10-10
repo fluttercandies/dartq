@@ -156,16 +156,19 @@ impl PersistedFacts {
     /// mints file ids through `intern_file` (the load wiring drives its own
     /// file table), and rebuilds the line index from `source` — the source
     /// bytes whose content hash keys this entry, which the loader holds by
-    /// construction.
+    /// construction. `codes` is the builtin registry, built **once per load**
+    /// by the caller: `materialize` runs per entry, and a per-entry
+    /// `CodeRegistry::builtin()` would rebuild the ~270-entry map for every
+    /// snapshot file (the l1.rs #269 F2 anti-pattern).
     #[must_use]
     pub fn materialize(
         self,
         source: &str,
         strings: &StringTable,
+        codes: &CodeRegistry,
         intern_file: &mut dyn FnMut(&Path) -> FileId,
     ) -> UnitFacts {
         let files: Vec<FileId> = self.files.iter().map(|path| intern_file(path)).collect();
-        let codes = CodeRegistry::builtin();
         let directives = self
             .directives
             .into_iter()
@@ -174,7 +177,7 @@ impl PersistedFacts {
         let diagnostics = self
             .diagnostics
             .into_iter()
-            .map(|diagnostic| diagnostic.restore(&codes, &files))
+            .filter_map(|diagnostic| diagnostic.restore(codes, &files))
             .collect();
         UnitFacts {
             content: content_hash(source.as_bytes()),
@@ -297,7 +300,9 @@ impl PersistedResolutionCode {
 /// One diagnostic in payload form. The code rides as its four registry
 /// columns: registry-known names restore as the canonical `&'static` row;
 /// foreign names (a lint table outside the builtin registry) rebuild from
-/// the stored columns so no diagnostic is ever dropped on load.
+/// the stored columns so no diagnostic is ever dropped on load — the one
+/// exception being a corrupt out-of-range file index, which
+/// [`PersistedDiagnostic::restore`] drops as unattributable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedDiagnostic {
     pub severity: PersistedSeverity,
@@ -379,7 +384,14 @@ impl PersistedDirective {
             uri: self.uri.map(Box::from),
             uri_span: self.uri_span.source_range(),
             target: match self.target {
-                PersistedTarget::File(at) => ResolvedTarget::Resolved(files[at as usize]),
+                // The index is disk payload: an out-of-range value is a
+                // corrupt entry, and the file's miss-never-error posture
+                // degrades to the missing-target face instead of panicking
+                // the loader (under-report, never a crash).
+                PersistedTarget::File(at) => files
+                    .get(at as usize)
+                    .copied()
+                    .map_or(ResolvedTarget::Missing, ResolvedTarget::Resolved),
                 PersistedTarget::External => ResolvedTarget::External,
                 PersistedTarget::Missing => ResolvedTarget::Missing,
             },
@@ -431,7 +443,13 @@ impl PersistedDiagnostic {
         }
     }
 
-    fn restore(self, codes: &CodeRegistry, files: &[FileId]) -> Diagnostic {
+    /// Restores one diagnostic. Returns `None` only for a corrupt payload —
+    /// a file index outside [`PersistedFacts::files`] cannot be faithfully
+    /// attributed, and mis-attributing it to some other file would fabricate
+    /// a diagnostic; the loader's never-fail posture drops the single
+    /// unattributable row rather than panicking the whole load.
+    fn restore(self, codes: &CodeRegistry, files: &[FileId]) -> Option<Diagnostic> {
+        let file = *files.get(self.file as usize)?;
         let code = codes.get(&self.code_name).unwrap_or_else(|| {
             // A code outside the builtin registry (a lint table's own row):
             // rebuild from the stored columns. The spellings leak — the
@@ -454,14 +472,14 @@ impl PersistedDiagnostic {
             PersistedSeverity::Warning => Severity::Warning,
             PersistedSeverity::Error => Severity::Error,
         };
-        Diagnostic::new(
+        Some(Diagnostic::new(
             severity,
             code,
             self.message,
-            files[self.file as usize],
+            file,
             self.range.source_range(),
             self.correction,
-        )
+        ))
     }
 }
 
@@ -515,8 +533,250 @@ fn written_names(names: &[StringId], strings: &StringTable) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::state::DirectiveKind;
+    use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_source::SourceRange;
+    use std::collections::BTreeMap;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A throwaway directory tree for the graph fixtures: package dirs
+    /// `a`/`b` and `.dart_tool/` under one canonical root, so every rebuild
+    /// resolves the same root spellings and fingerprint deltas are pure
+    /// column effects.
+    fn graph_config_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-persist-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["a", "b", ".dart_tool"] {
+            std::fs::create_dir_all(root.join(dir)).expect("fixture dir");
+        }
+        root.join(".dart_tool")
+    }
+
+    /// Builds a `PackageTable` over `config_dir` through the real
+    /// dartq-pub/dartq-package faces — every identity column the
+    /// fingerprint folds is live.
+    fn graph_table(config_dir: &Path, config_text: &str, lock_text: &str) -> PackageTable {
+        let config = PackageConfig::parse(config_text).expect("valid config");
+        let lock = LockFile::parse(lock_text).expect("valid lock");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &BTreeMap::new(),
+            None,
+            config_dir,
+        )
+        .expect("graph");
+        PackageTable::build(&config, &graph, config_dir).expect("table")
+    }
+
+    /// Three packages (root `t` + `a` + `b`) in one config, plus the
+    /// per-column mutation variants the sensitivity test applies.
+    const GRAPH_CONFIG: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "a", "rootUri": "../a", "languageVersion": "3.5"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_CONFIG_REORDERED: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"},
+        {"name": "a", "rootUri": "../a", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_CONFIG_NAME_MUTATED: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "c", "rootUri": "../a", "languageVersion": "3.5"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_CONFIG_ROOT_MUTATED: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "a", "rootUri": "../a2", "languageVersion": "3.5"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_CONFIG_LIB_MUTATED: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "a", "rootUri": "../a", "packageUri": "lib2", "languageVersion": "3.5"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_CONFIG_VERSION_MUTATED: &str = r#"{"configVersion": 2, "packages": [
+        {"name": "t", "rootUri": "../", "languageVersion": "3.5"},
+        {"name": "a", "rootUri": "../a", "languageVersion": "3.6"},
+        {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
+    ], "generator": "pub"}"#;
+    const GRAPH_LOCK_EMPTY: &str = "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n";
+    /// Locking `a` as hosted flips its source category (Path → PubCache),
+    /// the fifth folded column.
+    const GRAPH_LOCK_HOSTED_A: &str = "packages:\n  a:\n    description:\n      name: a\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"1.0.0\"\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n";
+
+    /// A synthetic SDK scaffold with parameterizable metadata — exactly the
+    /// components `sdk_identity` folds (version, revision, libraries.json).
+    fn sdk_snapshot(version: &str, revision: Option<&str>, libraries_json: &str) -> SdkSnapshot {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-persist-sdk-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib/_internal")).expect("sdk dirs");
+        std::fs::write(root.join("version"), version).expect("version");
+        if let Some(revision) = revision {
+            std::fs::write(root.join("revision"), revision).expect("revision");
+        }
+        std::fs::write(root.join("lib/libraries.json"), libraries_json).expect("libraries");
+        std::fs::write(
+            root.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("experiments");
+        SdkSnapshot::load(&root, None).expect("synthetic SDK loads")
+    }
+
+    const SDK_LIBRARIES: &str = r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#;
+    const SDK_LIBRARIES_MUTATED: &str =
+        r#"{"vm": {"libraries": {"core": {"uri": "core/core2.dart"}}}}"#;
+
+    /// Corrupt snapshot payloads never panic the loader: the file-id column
+    /// is disk data, so both consumers bounds-check it — an out-of-range
+    /// directive target degrades to the missing-target face (under-report),
+    /// an out-of-range diagnostic file index drops the unattributable row.
+    #[test]
+    fn corrupt_file_indices_degrade_instead_of_panicking() {
+        let strings = StringTable::new();
+        let payload = PersistedFacts {
+            api_signature: [7; 16],
+            directives: vec![PersistedDirective {
+                kind: PersistedDirectiveKind::Import,
+                uri: Some("package:a/a.dart".to_owned()),
+                uri_span: PersistedRange::of(SourceRange {
+                    offset: 0,
+                    length: 18,
+                }),
+                target: PersistedTarget::File(9),
+                code: None,
+                prefix: None,
+                deferred: false,
+                combinators: Vec::new(),
+                name: None,
+            }],
+            elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
+            diagnostics: vec![PersistedDiagnostic {
+                severity: PersistedSeverity::Error,
+                code_name: "uri_does_not_exist".to_owned(),
+                code_machine: "URI_DOES_NOT_EXIST".to_owned(),
+                code_dtype: PersistedDiagnosticType::CompileTimeError,
+                code_published: false,
+                message: "Target of URI doesn't exist: 'package:a/a.dart'.".to_owned(),
+                file: 9,
+                range: PersistedRange::of(SourceRange {
+                    offset: 0,
+                    length: 18,
+                }),
+                correction: None,
+            }],
+            files: vec![PathBuf::from("/w/lib/main.dart")],
+        };
+
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = payload.materialize(
+            "import 'package:a/a.dart';\n",
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
+        assert_eq!(
+            restored.directives[0].target,
+            ResolvedTarget::Missing,
+            "out-of-range target degrades to Missing"
+        );
+        assert!(
+            restored.diagnostics.is_empty(),
+            "the unattributable row is dropped"
+        );
+    }
+
+    /// The fingerprint is the whole-generation miss gate (PRD §5.6/§17.2):
+    /// identical tables digest equally across fresh builds, config entry
+    /// order is normalized away, and moving any one folded column (name,
+    /// root, lib dir, language version, source category) forks the digest.
+    #[test]
+    fn package_graph_fingerprint_is_stable_and_column_sensitive() {
+        let config_dir = graph_config_dir();
+        let table = |config: &str, lock: &str| graph_table(&config_dir, config, lock);
+        let base = table(GRAPH_CONFIG, GRAPH_LOCK_EMPTY);
+        let base_digest = package_graph_fingerprint(&base);
+
+        assert_eq!(
+            base_digest,
+            package_graph_fingerprint(&table(GRAPH_CONFIG, GRAPH_LOCK_EMPTY)),
+            "two fresh builds of identical tables digest equally"
+        );
+        assert_eq!(
+            base_digest,
+            package_graph_fingerprint(&table(GRAPH_CONFIG_REORDERED, GRAPH_LOCK_EMPTY)),
+            "config entry order is normalized away"
+        );
+
+        for (column, config, lock) in [
+            ("name", GRAPH_CONFIG_NAME_MUTATED, GRAPH_LOCK_EMPTY),
+            ("root", GRAPH_CONFIG_ROOT_MUTATED, GRAPH_LOCK_EMPTY),
+            ("lib dir", GRAPH_CONFIG_LIB_MUTATED, GRAPH_LOCK_EMPTY),
+            (
+                "language version",
+                GRAPH_CONFIG_VERSION_MUTATED,
+                GRAPH_LOCK_EMPTY,
+            ),
+            ("source category", GRAPH_CONFIG, GRAPH_LOCK_HOSTED_A),
+        ] {
+            assert_ne!(
+                base_digest,
+                package_graph_fingerprint(&table(config, lock)),
+                "{column} column must fork the fingerprint"
+            );
+        }
+    }
+
+    /// The SDK identity half of the miss gate: identical snapshots produce
+    /// equal identities, and every folded component (version, revision,
+    /// libraries.json content hash) moves it.
+    #[test]
+    fn sdk_identity_is_stable_and_component_sensitive() {
+        let base = sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES));
+        assert!(
+            base.contains("dart-sdk 3.13.1 revision - "),
+            "an absent revision spells `-`: {base}"
+        );
+        assert_eq!(
+            base,
+            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES)),
+            "identical snapshots produce equal identities"
+        );
+
+        let revised = sdk_identity(&sdk_snapshot("3.13.1\n", Some("abc123\n"), SDK_LIBRARIES));
+        assert!(
+            revised.contains("revision abc123 ") && revised != base,
+            "the revision component moves the identity: {revised}"
+        );
+        assert_ne!(
+            base,
+            sdk_identity(&sdk_snapshot("3.14.0\n", None, SDK_LIBRARIES)),
+            "the version component moves the identity"
+        );
+        assert_ne!(
+            base,
+            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES_MUTATED)),
+            "the libraries.json hash component moves the identity"
+        );
+    }
 
     /// A directive with show/hide combinators, a file target, a prefix, and
     /// a diagnostic survive the payload round trip; the api signature rides
@@ -576,10 +836,13 @@ mod tests {
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let decoded: PersistedFacts = serde_json::from_slice(&bytes).expect("deserialize");
 
-        // Restore into fresh tables — a new process's world.
+        // Restore into fresh tables — a new process's world. One registry
+        // for the whole load (the per-entry build is the retired
+        // anti-pattern).
+        let codes = CodeRegistry::builtin();
         let restored_strings = StringTable::new();
         let mut restored_files = FileTable::new();
-        let restored = decoded.materialize(source, &restored_strings, &mut |path| {
+        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
             restored_files.intern(path)
         });
 
