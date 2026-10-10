@@ -242,8 +242,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             return;
                         }
                     } else if self.peek_kind() == TokenKind::Keyword(Keyword::Typedef) {
-                        // `typedef <...> =` — missing the typedef name.
-                        if let Some(end_group) = self.angle_group_after(2)
+                        // `typedef <...> =` — missing the typedef name
+                        // (official :763-773: endGroup followed by `=`).
+                        if let Some(end_group) = self.angle_group_after(1)
                             && self.kind_at_abs(end_group + 1) == TokenKind::Eq
                         {
                             self.check_declaration();
@@ -438,12 +439,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 TokenKind::Keyword(Keyword::Const) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::modifier_out_of_order("const", "class"), t);
+                    self.report(msg::const_class(), t);
                 }
                 TokenKind::Keyword(Keyword::External) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::modifier_out_of_order("external", "class"), t);
+                    self.report(msg::external_class(), t);
                 }
                 TokenKind::Keyword(Keyword::Covariant) => {
                     let t = self.peek_span();
@@ -474,9 +475,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 _ => break,
             }
         }
-        if let Some(c) = mods.const_kw {
-            let _ = c;
-        }
         let _ = keyword;
         mods
     }
@@ -497,18 +495,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 TokenKind::Keyword(Keyword::Const) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(
-                        msg::modifier_out_of_order("const", self.cursor.lexeme(keyword.id)),
-                        t,
-                    );
+                    self.report(msg::extraneous_modifier("const"), t);
                 }
                 TokenKind::Keyword(Keyword::External) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(
-                        msg::modifier_out_of_order("external", self.cursor.lexeme(keyword.id)),
-                        t,
-                    );
+                    match self.cursor.lexeme(keyword.id) {
+                        "enum" => self.report(msg::external_enum(), t),
+                        "typedef" => self.report(msg::external_typedef(), t),
+                        _ => self.report(msg::extraneous_modifier("external"), t),
+                    }
                 }
                 TokenKind::Keyword(Keyword::Abstract) => {
                     let t = self.peek_span();
@@ -621,7 +617,36 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 equals = Some(self.peek_span());
                 self.cursor.advance();
                 let type_info = self.compute_type(true, true);
-                type_info.ensure_type_or_void(self);
+                if matches!(type_info, crate::types::TypeInfo::NoType)
+                    && self.peek_kind() == TokenKind::Lt
+                    && let Some(end_group) = self.angle_group_after(0)
+                    && self.kind_at(end_group + 1) == TokenKind::Semicolon
+                {
+                    // Official :1596-1605: `typedef i = <...>;` — the type
+                    // arguments belong to a missing `Function`. The missing
+                    // parameter list is reported on the group's closer and
+                    // the alias parses as `Function<...>();`.
+                    let closer = self.span_of(self.real_id(end_group));
+                    self.report(msg::missing_typedef_parameters(), closer);
+                    self.skip_to_token(self.real_id(end_group));
+                    self.cursor.advance(); // the closer
+                    let open = self.synthetic(TokenKind::OpenParen, closer.range.offset);
+                    let close = self.synthetic(TokenKind::CloseParen, closer.range.offset);
+                    self.listener.begin_formal_parameters(
+                        open,
+                        crate::listener::MemberKind::FunctionTypeAlias,
+                    );
+                    self.listener.end_formal_parameters(
+                        0,
+                        open,
+                        close,
+                        crate::listener::MemberKind::FunctionTypeAlias,
+                    );
+                    self.cursor.advance();
+                    self.cursor.advance();
+                } else {
+                    type_info.ensure_type_or_void(self);
+                }
                 end = self.ensure_semicolon();
             } else {
                 // A rewrite removed the `=`: parse parameters instead.
@@ -636,6 +661,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             if self.peek_is_identifier() || self.peek_kind_ahead_is_paren_after_type() {
                 let _ = self.ensure_identifier(IdentifierContext::TypedefDeclaration);
             } else {
+                // No name at all (`typedef void = ...;`): the 3.13 oracle
+                // recovers through the top-level-member message anchored on
+                // the offending token before inserting the synthetic name.
+                // EOF has no offending token — only the synthetic name.
+                if !matches!(self.peek_kind(), TokenKind::Keyword(_) | TokenKind::Eof) {
+                    self.report(msg::expected_executable(), self.peek_span());
+                }
                 let _ = self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration);
             }
             type_param.parse_variables(self, false);
@@ -667,7 +699,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             const_keyword = Some(self.peek_span());
             self.cursor.advance();
         }
-        let name = self.ensure_identifier(IdentifierContext::EnumDeclaration);
+        // The 3.13 oracle's enumDeclaration context rejects a reserved head
+        // with a missing identifier and a synthetic name (the real token is
+        // left for the body recovery below).
+        let name = if matches!(self.peek_kind(), TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved)
+        {
+            let at = self.peek_span();
+            self.report(msg::missing_identifier(), at);
+            self.synthetic(TokenKind::Identifier, at.range.offset)
+        } else {
+            self.ensure_identifier(IdentifierContext::EnumDeclaration)
+        };
         let type_param = self.compute_type_param_or_arg_on_lt(false);
         type_param.parse_variables(self, true);
         self.listener
@@ -807,7 +849,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         // Skip garbage between clauses (official recoverySmallLookAheadSkip
         // reduced to a bounded skip of non-clause tokens).
-        self.skip_to_clause(&[
+        let _ = self.skip_to_clause(&[
             TokenKind::Keyword(Keyword::Implements),
             TokenKind::OpenCurly,
         ]);
@@ -1219,16 +1261,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.cursor.advance();
                 }
             }
-            // extends
+            // extends (`extend`/`on` read as a misspelled `extends` for every
+            // declaration kind; ExtensionType additionally rejects the clause)
             if matches!(self.peek_kind(), TokenKind::Keyword(_))
                 && matches!(self.cursor.lexeme(self.peek_id()), "extend" | "on")
-                && kind == DeclarationHeaderKind::Class
             {
-                self.report(msg::expected_instead("extends"), self.peek_span());
+                let misspelled = self.peek_span();
+                self.report(msg::expected_instead("extends"), misspelled);
                 self.cursor.advance();
-                let kw = self.peek_span();
-                self.parse_class_extends_seen(kw, kind);
-                clauses.extends = true;
+                self.parse_class_extends_seen(misspelled, kind);
+                if kind == DeclarationHeaderKind::ExtensionType {
+                    self.report(msg::extension_type_extends(), misspelled);
+                } else {
+                    clauses.extends = true;
+                }
             } else if self.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
                 let extends_kw = self.peek_span();
                 self.cursor.advance();
@@ -1667,10 +1713,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.listener.handle_no_extension_type_body(semi);
         } else {
             if self.peek_kind() != TokenKind::OpenCurly {
-                self.parse_class_header_recovery(
-                    DeclarationHeaderKind::ExtensionType,
-                    HeaderClauses::default(),
-                );
+                // The implements clause parsed above counts toward the
+                // at-most-one rule the recovery loop enforces
+                // (`parseDeclarationHeaderRecoveryInternal` re-parses the
+                // header to learn exactly this).
+                let seen = HeaderClauses {
+                    implements: implements_seen,
+                    ..HeaderClauses::default()
+                };
+                self.parse_class_header_recovery(DeclarationHeaderKind::ExtensionType, seen);
                 self.ensure_block(msg_block_kind_extension_type());
             }
             self.parse_class_or_mixin_or_extension_body(DeclarationKind::ExtensionType, name);
@@ -1737,17 +1788,57 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.ensure_identifier(IdentifierContext::PrimaryConstructorDeclaration);
             }
             if self.peek_kind() == TokenKind::OpenParen {
+                if kind == DeclarationKind::ExtensionType && allow_representation {
+                    self.rep_field_check = Some(crate::parser::RepFieldCheck::default());
+                }
                 self.parse_formal_parameters_required_opt(
                     crate::listener::MemberKind::PrimaryConstructor,
                 );
+                let rep = self.rep_field_check.take();
+                if let Some(state) = rep {
+                    // `_checkForExtensionTypeRepresentationErrorCodes`
+                    // (error_verifier.dart:5356-5460; primary constructors
+                    // feature disabled arm).
+                    if state.count == 0 {
+                        self.report(msg::expected_representation_field(), self.peek_span());
+                    } else if state.count > 1 {
+                        if let Some(comma) = state.comma_after_first {
+                            self.report(msg::multiple_representation_fields(), comma);
+                        }
+                    } else if state.this_or_super {
+                        // Reported at the this/super keyword; the keyword span
+                        // is not carried in the state, so anchor at the
+                        // parameter's modifier or the formals begin.
+                        self.report(
+                            msg::expected_representation_field(),
+                            state.modifier.unwrap_or(begin),
+                        );
+                    } else if let Some(delim) = state.delimiter {
+                        self.report(msg::expected_representation_field(), delim);
+                    } else if state.fn_typed {
+                        self.report(msg::expected_representation_field(), begin);
+                    } else if let Some(m) = state.modifier {
+                        let lexeme = self.cursor.lexeme(m.id);
+                        if !self.features.primary_constructors_enabled || lexeme == "var" {
+                            self.report(msg::representation_field_modifier(lexeme), m);
+                        }
+                    }
+                }
             } else {
-                if matches!(kind, DeclarationKind::Class | DeclarationKind::Enum)
-                    || (kind == DeclarationKind::ExtensionType && allow_representation)
-                {
+                let report_missing_parameters =
+                    matches!(kind, DeclarationKind::Class | DeclarationKind::Enum)
+                        || (kind == DeclarationKind::ExtensionType && allow_representation);
+                if report_missing_parameters {
                     self.report(
                         msg::missing_primary_constructor_parameters(),
                         self.peek_span(),
                     );
+                }
+                if kind == DeclarationKind::ExtensionType {
+                    // `_checkForExtensionTypeRepresentationErrorCodes`: the
+                    // synthesized empty formal list has no representation
+                    // field (error_verifier.dart:5366).
+                    self.report(msg::expected_representation_field(), self.peek_span());
                 }
                 let at = self.peek_span();
                 self.listener.handle_no_formal_parameters(
@@ -1764,8 +1855,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 has_constructor_name,
             );
         } else {
-            if kind == DeclarationKind::ExtensionType && allow_representation {
+            if kind == DeclarationKind::ExtensionType {
+                // The 3.13 oracle reports the missing primary constructor for
+                // every extension type without a representation — including
+                // augmentations (no augmentation gating there) — and the
+                // verifier's synthesized empty formal list additionally yields
+                // `expectedRepresentationField`.
                 self.report(msg::missing_primary_constructor(), self.peek_span());
+                self.report(msg::expected_representation_field(), self.peek_span());
             } else if let Some(c) = const_keyword {
                 match kind {
                     DeclarationKind::Mixin => self.report(msg::mixin_primary_constructor(), c),
@@ -1781,10 +1878,75 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
     }
 
-    /// Bounded clause-garbage skip (the `recoverySmallLookAheadSkipTokens`
-    /// stand-in): skip tokens that cannot start a clause until a boundary.
-    fn skip_to_clause(&mut self, boundaries: &[TokenKind]) {
-        self.skip_to_sync(boundaries);
+    /// Official `recoverySmallLookAheadSkipTokens` (`parser_impl.dart:2861`):
+    /// bounded lookahead of up to 3 garbage tokens searching for a clause
+    /// boundary; refuses to start on or cross a token that looks like the
+    /// start of the next top-level declaration. Callers may sit ON a boundary
+    /// (`{` with no clauses parsed) — there is nothing to skip and the
+    /// boundary belongs to the caller. On success reports the skip
+    /// (`unexpected_token` for a single skipped token, `unexpected_tokens`
+    /// for a range) and leaves the cursor on the boundary; returns whether a
+    /// boundary was reached.
+    fn skip_to_clause(&mut self, boundaries: &[TokenKind]) -> bool {
+        let kind = self.peek_kind();
+        if self.cursor.at_eof()
+            || boundaries.contains(&kind)
+            || Self::starts_next_top_level_declaration(kind)
+        {
+            return false;
+        }
+        let first = self.peek_span();
+        let mut last = first;
+        let mut skipped = 0usize;
+        while skipped < 3 {
+            skipped += 1;
+            let next = self.cursor.look_kind(1);
+            if next == TokenKind::Eof {
+                return false;
+            }
+            if boundaries.contains(&next) || Self::starts_next_top_level_declaration(next) {
+                if skipped == 1 {
+                    self.report(msg::unexpected_token(self.cursor.lexeme(first.id)), first);
+                } else {
+                    self.report_with_end(msg::unexpected_tokens(), first, last);
+                }
+                self.cursor.advance();
+                return true;
+            }
+            self.cursor.advance();
+            last = self.peek_span();
+            if Self::starts_next_top_level_declaration(self.peek_kind()) {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// `looksLikeStartOfNextTopLevelDeclaration`
+    /// (`identifier_context_impl.dart:1650`): top-level keywords plus the
+    /// `const`/`get`/`final`/`set`/`var`/`void` member starters.
+    fn starts_next_top_level_declaration(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Keyword(
+                Keyword::Class
+                    | Keyword::Enum
+                    | Keyword::Typedef
+                    | Keyword::Mixin
+                    | Keyword::Extension
+                    | Keyword::Import
+                    | Keyword::Export
+                    | Keyword::Part
+                    | Keyword::Library
+                    | Keyword::Augment
+                    | Keyword::Const
+                    | Keyword::Get
+                    | Keyword::Set
+                    | Keyword::Final
+                    | Keyword::Var
+                    | Keyword::Void
+            )
+        )
     }
 }
 
@@ -1802,7 +1964,6 @@ struct ClassModifiers {
     augment: Option<TokenSpan>,
     final_kw: Option<TokenSpan>,
     late_kw: Option<TokenSpan>,
-    const_kw: Option<TokenSpan>,
     covariant: Option<TokenSpan>,
 }
 

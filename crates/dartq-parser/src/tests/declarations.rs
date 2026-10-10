@@ -399,7 +399,9 @@ fn switch_expression_missing_body_reports_on_close_paren() {
     let mut p = setup("switch (n);");
     let _ = p.parse_expression();
     let c = p.listener;
-    assert_eq!(c.error_codes(), ["expected_switch_expression_body"]);
+    // The per-kind shared-parser body codes all surface under the single
+    // analyzer registry name `expected_body` (diagnostic.g.dart).
+    assert_eq!(c.error_codes(), ["expected_body"]);
     assert_eq!(c.errors[0].1, 9);
     assert_eq!(c.errors[0].2, 10);
 }

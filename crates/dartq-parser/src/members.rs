@@ -13,7 +13,7 @@
 //! official `mayParseFunctionExpressions = false` rider while the
 //! initializer list parses.
 
-use dartq_scanner::{Keyword, TokenKind};
+use dartq_scanner::{Keyword, KeywordStyle, TokenKind};
 
 use crate::listener::{
     AssertKind, ConstructorReferenceContext, DeclarationKind, IdentifierContext, MemberKind,
@@ -39,6 +39,8 @@ struct MemberModifiers {
     covariant: Option<TokenSpan>,
     var_kw: Option<TokenSpan>,
     final_kw: Option<TokenSpan>,
+    const_kw: Option<TokenSpan>,
+    required: Option<TokenSpan>,
 }
 
 impl<'s, L: ParserListener> Parser<'s, '_, L> {
@@ -246,6 +248,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 TokenKind::Keyword(Keyword::Abstract) if mods.abstract_kw.is_none() => {
                     let t = self.peek_span();
                     self.cursor.advance();
+                    // Official `_parseAbstract` order chain (top-level member
+                    // flavor): `var/final/const` before `abstract`.
+                    if let Some(vfc) = mods.var_final_or_const {
+                        let earlier = self.cursor.lexeme(vfc.id);
+                        self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                    } else if let Some(c) = mods.covariant {
+                        self.report(
+                            msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
+                            t,
+                        );
+                    }
                     self.report(msg::extraneous_modifier("abstract"), t);
                     mods.abstract_kw = Some(t);
                 }
@@ -376,6 +389,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.parse_metadata_star();
 
         let mods = self.walk_class_member_modifiers();
+        // Official `parseClassMemberModifiers`: `required` is always
+        // extraneous on a class member (it belongs to named parameters).
+        if let Some(r) = mods.required {
+            self.report(msg::extraneous_modifier("required"), r);
+        }
 
         self.listener.begin_member();
 
@@ -445,7 +463,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         || is_modifier_kind(follower)
                         || follower == TokenKind::Keyword(Keyword::New)
                     {
-                        if self.cursor.progress()
+                        // `typeBeforeFactory` gates on a type actually having
+                        // been consumed (official `beforeType != token`,
+                        // parser_impl.dart:5448).
+                        if crate::cursor::TokenCursor::progress_at(before_type)
                             != crate::cursor::TokenCursor::progress_at(after_type)
                         {
                             let t = self.peek_span();
@@ -468,10 +489,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // Fall through: `factory` used as an identifier.
                 }
                 TokenKind::Keyword(Keyword::Operator) => {
+                    // Official parseMember `operator` branch (:5489-5504):
+                    // arm 1 requires `typeParam == noTypeParamOrArg`, i.e. no
+                    // type-argument group directly after `operator`
+                    // (`operator <T>(...)` falls through; `operator <(x)`
+                    // still parses as the `<` operator).
                     let follower = self.cursor.look_kind(1);
-                    if Self::is_user_definable_operator(follower)
-                        && !matches!(self.cursor.look_kind(2), TokenKind::Lt)
-                    {
+                    let type_param_none = follower != TokenKind::Lt
+                        || self.cursor.look_kind(2) == TokenKind::OpenParen;
+                    if Self::is_user_definable_operator(follower) && type_param_none {
                         self.parse_method(
                             kind,
                             enclosing_declaration_name,
@@ -529,6 +555,66 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     }
                 }
                 ref k if !is_keyword_or_identifier(*k) => {
+                    if let Some(a) = mods.abstract_kw {
+                        self.report(msg::abstract_class_member(), a);
+                    }
+                    self.recover_from_invalid_member(
+                        kind,
+                        enclosing_declaration_name,
+                        mods,
+                        before_type,
+                        type_info,
+                        get_or_set,
+                        new_kw,
+                    );
+                    self.listener.end_member();
+                    return;
+                }
+                TokenKind::Keyword(Keyword::Class | Keyword::Enum) => {
+                    // Official parseMember catch-all (`!next.isIdentifier`):
+                    // `class`/`enum` at member start route to
+                    // `recoverFromInvalidMember` (classInClass/enumInClass).
+                    if let Some(a) = mods.abstract_kw {
+                        self.report(msg::abstract_class_member(), a);
+                    }
+                    self.recover_from_invalid_member(
+                        kind,
+                        enclosing_declaration_name,
+                        mods,
+                        before_type,
+                        type_info,
+                        get_or_set,
+                        new_kw,
+                    );
+                    self.listener.end_member();
+                    return;
+                }
+                TokenKind::Keyword(Keyword::Typedef)
+                    if matches!(type_info, TypeInfo::NoType)
+                        && is_identifier(self.cursor.look_kind(1)) =>
+                {
+                    // Official routing gate for `typedef`
+                    // (parser_impl.dart:5607): no type and a name follows.
+                    if let Some(a) = mods.abstract_kw {
+                        self.report(msg::abstract_class_member(), a);
+                    }
+                    self.recover_from_invalid_member(
+                        kind,
+                        enclosing_declaration_name,
+                        mods,
+                        before_type,
+                        type_info,
+                        get_or_set,
+                        new_kw,
+                    );
+                    self.listener.end_member();
+                    return;
+                }
+                TokenKind::Keyword(kw) if kw.style() == KeywordStyle::Reserved => {
+                    // Official :5606: every non-identifier head that none of
+                    // the special cases handled recovers as an invalid
+                    // member (`null`, `super`, `this` outside a primary
+                    // constructor shape, ...).
                     if let Some(a) = mods.abstract_kw {
                         self.report(msg::abstract_class_member(), a);
                     }
@@ -616,117 +702,214 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.listener.end_member();
     }
 
-    /// Class-member modifier walk (official head of
-    /// `parseClassOrMixinOrExtensionOrEnumMemberImpl` +
-    /// `parseClassMemberModifiers`).
+    /// Class-member modifier walk (official `ModifierContext._parseModifiers`
+    /// handlers + `parseClassMemberModifiers`). Every arm mirrors its
+    /// official `_parse<Key>` handler: order checks against already-seen
+    /// modifiers, then the duplicate/recovery reports.
     fn walk_class_member_modifiers(&mut self) -> MemberModifiers {
         let mut mods = MemberModifiers::default();
         let mut static_seen = false;
         let mut covariant_seen = false;
-        let mut vfc_seen = false;
         loop {
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::External) if mods.external.is_none() => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if mods.augment.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "augment"), t);
-                    }
-                    if let Some(vfc) = mods.var_final_or_const {
+                    // Official `_parseExternal` order chain (no augment arm).
+                    if let Some(c) = mods.const_kw {
+                        let earlier = self.cursor.lexeme(c.id);
+                        self.report(msg::modifier_out_of_order("external", earlier), t);
+                    } else if mods.static_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("external", "static"), t);
+                    } else if mods.late_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("external", "late"), t);
+                    } else if let Some(vfc) = mods.var_final_or_const {
                         let earlier = self.cursor.lexeme(vfc.id);
                         self.report(msg::modifier_out_of_order("external", earlier), t);
+                    } else if mods.covariant.is_some() {
+                        self.report(msg::modifier_out_of_order("external", "covariant"), t);
                     }
                     mods.external = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Augment) if mods.augment.is_none() => {
                     let t = self.peek_span();
                     self.cursor.advance();
+                    // Official `_parseAugment` order chain.
+                    if let Some(vfc) = mods.var_final_or_const {
+                        let earlier = self.cursor.lexeme(vfc.id);
+                        self.report(msg::modifier_out_of_order("augment", earlier), t);
+                    } else if let Some(a) = mods.abstract_kw {
+                        self.report(
+                            msg::modifier_out_of_order("augment", self.cursor.lexeme(a.id)),
+                            t,
+                        );
+                    } else if mods.const_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "const"), t);
+                    } else if mods.covariant.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "covariant"), t);
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "final"), t);
+                    } else if mods.late_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "late"), t);
+                    } else if mods.static_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "static"), t);
+                    } else if mods.external.is_some() {
+                        self.report(msg::modifier_out_of_order("augment", "external"), t);
+                    }
                     mods.augment = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Abstract) if mods.abstract_kw.is_none() => {
                     let t = self.peek_span();
                     self.cursor.advance();
+                    // Official `_parseAbstract` order chain.
+                    if let Some(vfc) = mods.var_final_or_const {
+                        let earlier = self.cursor.lexeme(vfc.id);
+                        self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                    } else if let Some(c) = mods.covariant {
+                        self.report(
+                            msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
+                            t,
+                        );
+                    }
                     mods.abstract_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Static)
-                    if !static_seen && mods.abstract_kw.is_none() =>
-                {
+                TokenKind::Keyword(Keyword::Static) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if covariant_seen {
+                    if !covariant_seen && !static_seen {
+                        // Official `_parseStatic` order chain.
+                        if mods.abstract_kw.is_some() && self.features.augmentations_enabled {
+                            self.report(msg::modifier_out_of_order("static", "abstract"), t);
+                        } else if mods.const_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("static", "const"), t);
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("static", "final"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("static", "late"), t);
+                        } else if mods.var_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("static", "var"), t);
+                        }
+                        mods.static_kw = Some(t);
+                        static_seen = true;
+                    } else if covariant_seen {
+                        // Recovery: static after covariant.
                         self.report(msg::covariant_and_static(), t);
+                    } else {
+                        self.report(msg::duplicated_modifier("static"), t);
                     }
-                    if mods.augment.is_some() {
-                        self.report(msg::modifier_out_of_order("static", "augment"), t);
-                    }
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("static", earlier), t);
-                    }
-                    mods.static_kw = Some(t);
-                    static_seen = true;
                 }
-                TokenKind::Keyword(Keyword::Covariant) if !covariant_seen => {
+                TokenKind::Keyword(Keyword::Covariant) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if mods.static_kw.is_some() {
+                    if !covariant_seen && !static_seen && mods.const_kw.is_none() {
+                        // Official `_parseCovariant` order chain.
+                        if let Some(v) = mods.var_kw {
+                            self.report(
+                                msg::modifier_out_of_order("covariant", self.cursor.lexeme(v.id)),
+                                t,
+                            );
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("covariant", "final"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("covariant", "late"), t);
+                        }
+                        mods.covariant = Some(t);
+                        covariant_seen = true;
+                    } else if covariant_seen {
+                        self.report(msg::duplicated_modifier("covariant"), t);
+                    } else if static_seen {
                         self.report(msg::covariant_and_static(), t);
+                    } else {
+                        // covariant after const.
+                        self.report(msg::conflicting_modifiers("covariant", "const"), t);
                     }
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("covariant", earlier), t);
-                    }
-                    mods.covariant = Some(t);
-                    covariant_seen = true;
                 }
                 TokenKind::Keyword(Keyword::Late) if mods.late_kw.is_none() => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("late", earlier), t);
+                    // Official `_parseLate` order chain.
+                    if mods.const_kw.is_some() {
+                        self.report(msg::conflicting_modifiers("late", "const"), t);
+                    } else if mods.var_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("late", "var"), t);
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("late", "final"), t);
                     }
                     mods.late_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Final) if !vfc_seen => {
+                TokenKind::Keyword(Keyword::Final) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    mods.final_kw = Some(t);
-                    if mods.late_kw.is_some() {
+                    if mods.final_kw.is_none() && mods.var_final_or_const.is_none() {
+                        mods.final_kw = Some(t);
+                        mods.var_final_or_const = Some(t);
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::duplicated_modifier("final"), t);
+                    } else if mods.const_kw.is_some() {
+                        self.report(msg::const_and_final(), t);
+                    } else if mods.var_kw.is_some() {
+                        self.report(msg::final_and_var(), t);
+                    } else if mods.late_kw.is_some() {
                         self.report(msg::modifier_out_of_order("final", "late"), t);
                     }
-                    if let Some(v) = mods.var_kw {
-                        self.report(msg::final_and_var(), v);
-                    }
-                    mods.var_final_or_const = Some(t);
-                    vfc_seen = true;
                 }
-                TokenKind::Keyword(Keyword::Var) if !vfc_seen => {
+                TokenKind::Keyword(Keyword::Var) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    mods.var_kw = Some(t);
-                    mods.var_final_or_const = Some(t);
-                    vfc_seen = true;
+                    if mods.var_final_or_const.is_none() {
+                        mods.var_kw = Some(t);
+                        mods.var_final_or_const = Some(t);
+                    } else if mods.var_kw.is_some() {
+                        self.report(msg::duplicated_modifier("var"), t);
+                    } else if mods.const_kw.is_some() {
+                        self.report(msg::conflicting_modifiers("var", "const"), t);
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::final_and_var(), t);
+                    }
                 }
-                TokenKind::Keyword(Keyword::Const) if !vfc_seen && !covariant_seen => {
+                TokenKind::Keyword(Keyword::Const) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if let Some(l) = mods.late_kw {
-                        self.report(msg::conflicting_modifiers("const", "late"), l);
+                    if mods.var_final_or_const.is_none() && mods.covariant.is_none() {
+                        // Official `_parseConst`: const is recorded; `late`
+                        // conflicts, `final` reports const_and_final.
+                        if mods.late_kw.is_some() {
+                            self.report(msg::conflicting_modifiers("const", "late"), t);
+                        }
+                        mods.const_kw = Some(t);
+                        mods.var_final_or_const = Some(t);
+                    } else if mods.const_kw.is_some() {
+                        self.report(msg::duplicated_modifier("const"), t);
+                    } else if mods.covariant.is_some() {
+                        self.report(msg::conflicting_modifiers("const", "covariant"), t);
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::const_and_final(), t);
+                    } else if mods.var_kw.is_some() {
+                        self.report(msg::conflicting_modifiers("const", "var"), t);
                     }
-                    if let Some(f) = mods.final_kw {
-                        self.report(msg::const_and_final(), f);
-                    }
-                    if let Some(v) = mods.var_kw {
-                        self.report(msg::conflicting_modifiers("const", "var"), v);
-                    }
-                    mods.var_final_or_const = Some(t);
-                    vfc_seen = true;
                 }
                 TokenKind::Keyword(Keyword::Required) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("required"), t);
+                    // Official `_parseRequired` order chain (the member-level
+                    // extraneous report happens in `parse_class_member_impl`
+                    // via `parseClassMemberModifiers`).
+                    if let Some(c) = mods.const_kw {
+                        self.report(
+                            msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
+                            t,
+                        );
+                    } else if let Some(c) = mods.covariant {
+                        self.report(
+                            msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
+                            t,
+                        );
+                    } else if mods.final_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("required", "final"), t);
+                    } else if mods.var_kw.is_some() {
+                        self.report(msg::modifier_out_of_order("required", "var"), t);
+                    }
+                    mods.required = Some(t);
                 }
                 _ => break,
             }
@@ -768,7 +951,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if get_or_set.is_none() && self.peek_kind() == TokenKind::Keyword(Keyword::Operator) {
             let operator_kw = self.peek_span();
             let follower = self.cursor.look_kind(1);
-            if Self::is_user_definable_operator(follower)
+            // Official :5826: `operator.isOperator || === || !== ||
+            // isUnaryMinus` — the full operator-token set, not just the
+            // user-definable one (`operator = 2` is a field, recovered as an
+            // invalid operator declaration from `recoverFromInvalidMember`).
+            if Self::is_operator_token(follower)
                 || matches!(follower, TokenKind::EqEqEq | TokenKind::BangEqEq)
             {
                 is_operator = true;
@@ -778,6 +965,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 if matches!(follower, TokenKind::EqEqEq | TokenKind::BangEqEq) {
                     // The scanner reports `===`/`!==`; the parser only fires
                     // the invalid-name event (official parseOperatorName).
+                    self.listener.handle_invalid_operator_name(operator_kw, op);
+                } else if !Self::is_user_definable_operator(follower) {
+                    // Official parseOperatorName (:6303-6312): the user has
+                    // specified an invalid operator name; report and accept.
+                    self.report(msg::invalid_operator(self.cursor.lexeme(op.id)), op);
                     self.listener.handle_invalid_operator_name(operator_kw, op);
                 } else {
                     self.listener.handle_operator_name(operator_kw, op);
@@ -885,8 +1077,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             // The return-type re-parse rewound to `operator`; skip the
             // introducer and the operator token consumed above (grammar
             // guarantees adjacency, official parseMethod keeps `token` on
-            // the name throughout).
-            self.cursor.jump_to(name.id);
+            // the name throughout). The recovered no-keyword form (synthetic
+            // introducer) may already sit ON the operator token.
+            if (name.id as usize) > self.cursor.real_pos() {
+                self.cursor.jump_to(name.id);
+            }
             self.cursor.advance();
         }
 
@@ -894,6 +1089,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if is_operator {
             // Name already consumed above.
         } else if new_kw.is_some() {
+            // Official `token = token.next!` (:5936): the checks read the
+            // token AFTER the `new` head, which itself is the constructor
+            // name carried by `newToken`.
+            self.cursor.advance();
             if is_identifier(self.peek_kind()) {
                 let ident = self.ensure_identifier(IdentifierContext::MethodDeclaration);
                 name = ident;
@@ -946,7 +1145,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 is_considered_getter = false;
             }
         } else {
-            self.parse_method_type_var(name);
+            let lt = if self.peek_kind() == TokenKind::Lt {
+                Some(self.peek_span())
+            } else {
+                None
+            };
+            let has_type_vars = self.parse_method_type_var(name);
+            if has_type_vars && let Some(lt) = lt {
+                // AstBuilder `endClassConstructor`/`endClassMethod`
+                // (ast_builder.dart:6152/6396): the anchors are the `<`.
+                if is_constructor {
+                    self.report(msg::type_parameter_on_constructor(), lt);
+                } else if is_operator {
+                    self.report(msg::type_parameter_on_operator(), lt);
+                }
+            }
         }
 
         let member_kind = match kind {
@@ -974,11 +1187,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         };
 
         let name_for_formals = name;
+        self.external_ctor_field_formals = is_constructor && mods.external.is_some();
+        self.in_constructor_formals = is_constructor;
         let begin_param = self.parse_getter_or_formal_parameters(
             name_for_formals,
             is_considered_getter,
             member_kind,
         );
+        self.external_ctor_field_formals = false;
+        self.in_constructor_formals = false;
+        // `AstBuilder` `_ensureSetterFormalParameter` (ast_builder.dart:6457):
+        // a setter takes exactly one required positional parameter; the
+        // report anchors on the setter name.
+        if !is_constructor
+            && !is_considered_getter
+            && get_or_set.is_some_and(|t| self.cursor.lexeme(t.id) == "set")
+            && self.last_parameter_count != 1
+        {
+            self.report(msg::wrong_number_of_parameters_for_setter(), name);
+        }
 
         let begin_initializers = self.parse_initializers_opt();
 
@@ -992,6 +1219,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if mods.external.is_some() && self.peek_kind() != TokenKind::Semicolon {
             self.report(msg::external_method_with_body(), self.peek_span());
         }
+        let body_kind = self.peek_kind();
+        let body_begin = self.peek_span();
         let end = if self.peek_kind() == TokenKind::Eq {
             let at = self.peek_span();
             self.report(msg::redirection_in_non_factory(), at);
@@ -1032,6 +1261,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.peek_span(),
                 );
             }
+            // Analyzer `_verifyConstructor`: a `const` constructor with a
+            // block or expression body (real or recovery-synthetic) reports
+            // at the body's opening brace / `=>`; `;` bodies stay clean.
+            if let Some(c) = var_final_or_const
+                && self.cursor.lexeme(c.id) == "const"
+                && body_kind != TokenKind::Semicolon
+                && body_kind != TokenKind::Eq
+            {
+                self.report(msg::const_constructor_with_body(), body_begin);
+            }
             match kind {
                 DeclarationKind::Mixin => self.report(msg::mixin_declares_constructor(), name),
                 DeclarationKind::Extension => {
@@ -1056,6 +1295,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             if let Some(vfc) = var_final_or_const {
                 self.report(msg::const_method(), vfc);
+            }
+            // error_verifier `extensionDeclaresAbstractMember` (the parse
+            // body is `;` and the extension member is neither static nor
+            // external): reported at the member name.
+            if kind == DeclarationKind::Extension
+                && static_kw.is_none()
+                && mods.external.is_none()
+                && body_kind == TokenKind::Semicolon
+            {
+                self.report(msg::extension_declares_abstract_member(), name);
             }
             self.listener.end_method(
                 kind,
@@ -1131,6 +1380,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             end = self.parse_function_body(false, true);
         } else {
+            // Official `parseFactoryMethod`: a `const` modifier with a real
+            // body (the `handleConstFactory` event; external and redirecting
+            // factories bypass it) is the analyzer's `const_factory`.
+            if let Some(c) = var_final_or_const
+                && self.cursor.lexeme(c.id) == "const"
+            {
+                self.report(msg::const_factory(), c);
+            }
             end = self.parse_function_body(false, self.features.augmentations_enabled);
         }
         match kind {
@@ -1151,8 +1408,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         mods: MemberModifiers,
         before_type: crate::cursor::CursorMark,
     ) {
-        // Skip straight to the operator token and parse it as a method.
-        while !Self::is_user_definable_operator(self.peek_kind())
+        // Skip straight to the operator token (official :11224-11237: the
+        // operator is the head when it `isOperator`, not only the
+        // user-definable set) and parse it as a method with a synthetic
+        // `operator` introducer spliced in.
+        while !Self::is_operator_token(self.peek_kind())
             && !matches!(
                 self.peek_kind(),
                 TokenKind::EqEqEq | TokenKind::BangEqEq | TokenKind::Eof
@@ -1162,6 +1422,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         let at = self.peek_span();
         self.report(msg::missing_operator_keyword(), at);
+        self.synthetic(TokenKind::Keyword(Keyword::Operator), at.range.offset);
         self.parse_method(
             kind,
             None,
@@ -1204,9 +1465,37 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             TokenKind::Keyword(Keyword::Typedef) => {
                 self.report(msg::typedef_in_class(), next_span);
                 self.listener.handle_invalid_member(next_span);
+                // The oracle emits this single diagnostic for a well-formed
+                // in-class typedef; skip the declaration so the reparse adds
+                // no rider errors (official reportAndSkipTypedefInClass TODO).
+                self.cursor.advance(); // `typedef`
+                loop {
+                    match self.peek_kind() {
+                        TokenKind::Semicolon => {
+                            self.cursor.advance();
+                            break;
+                        }
+                        TokenKind::CloseCurly | TokenKind::Eof => break,
+                        _ => {
+                            self.cursor.advance();
+                        }
+                    }
+                }
                 return;
             }
             _ => {}
+        }
+        // Official :11315-11316: an operator-token head (e.g. a stray `=`
+        // member) recovers as an operator declaration missing the keyword
+        // (`next.isOperator && next.endGroup == null`; bracket heads carry a
+        // group and stay excluded).
+        if !matches!(
+            next_kind,
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+        ) && Self::is_operator_token(next_kind)
+        {
+            self.parse_invalid_operator_declaration(kind, mods, before_type);
+            return;
         }
         if get_or_set.is_some()
             || matches!(
@@ -1244,9 +1533,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
     }
 
-    /// `reportAndSkipClassInClass`/`reportAndSkipEnumInClass` shape: skip
-    /// `name { body }` when it looks like a nested declaration.
+    /// `reportAndSkipClassInClass`/`reportAndSkipEnumInClass` shape: cursor
+    /// is on the `class`/`enum` keyword; skip `name { body }` when it looks
+    /// like a nested declaration.
     fn skip_member_shaped_declaration(&mut self) {
+        self.cursor.advance(); // `class`/`enum`
         if is_identifier(self.peek_kind()) {
             self.cursor.advance();
             if self.peek_kind() == TokenKind::OpenCurly
@@ -1306,6 +1597,26 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         if let (Some(a), true) = (mods.abstract_kw, mods.external.is_some()) {
             self.report(msg::abstract_external_field(), a);
+        }
+        // Official `_endClassFields` modifier validation (class-like fields;
+        // extension fields have their dedicated codes below).
+        if !matches!(
+            kind,
+            DeclarationKind::Extension | DeclarationKind::ExtensionType
+        ) {
+            if let Some(a) = mods.abstract_kw {
+                if mods.static_kw.is_some() {
+                    self.report(msg::abstract_static_field(), a);
+                }
+                if mods.late_kw.is_some() {
+                    self.report(msg::abstract_late_field(), a);
+                }
+            }
+            if let Some(e) = mods.external
+                && mods.late_kw.is_some()
+            {
+                self.report(msg::external_late_field(), e);
+            }
         }
 
         self.cursor.reset(before_type);
@@ -1427,14 +1738,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseMethodTypeVar` (`<...>` after a method name).
-    fn parse_method_type_var(&mut self, name: TokenSpan) {
+    fn parse_method_type_var(&mut self, name: TokenSpan) -> bool {
         if self.peek_kind() == TokenKind::Bang {
             let at = self.peek_span();
             self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
             self.cursor.advance();
         }
         if self.peek_kind() != TokenKind::Lt {
-            return;
+            let _ = name;
+            return false;
         }
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         if !matches!(type_param, TypeParamOrArg::None) {
@@ -1446,6 +1758,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
         }
         let _ = name;
+        true
     }
 
     /// Official `parseQualifiedRestOpt`: `. identifier` suffix.
@@ -1477,12 +1790,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             next
         } else {
             // Recovery: report and parse a synthetic empty parameter list.
+            // The official `insertSyntheticToken` pair splices into the
+            // stream and the parser moves past it (`parseGetterOrFormalParameters`
+            // recovery, :5560); drain the queue so the body-section reads
+            // see the real follower, not the queued synthetics.
             self.report(msg::missing_parameters(kind), name);
             let at = self.peek_span();
             let open = self.synthetic(TokenKind::OpenParen, at.range.offset);
             let close = self.synthetic(TokenKind::CloseParen, at.range.offset);
             self.listener.begin_formal_parameters(open, kind);
             self.listener.end_formal_parameters(0, open, close, kind);
+            self.cursor.advance();
+            self.cursor.advance();
             close
         }
     }
@@ -1575,16 +1894,39 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             let next = self.cursor.look_kind(1);
             if next == TokenKind::Period {
                 // `this.name = ...`: lookahead only — the expression re-read
-                // reparses the `this.name` head natively (`.new` included).
-                let name = self.cursor.look_kind(2);
-                if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
-                    // Official `insertSyntheticIdentifier(dot, fieldInitializer)`
-                    // (:4841): the context recovery template.
+                // reparses the `this.name` head natively.
+                let name_kind = self.cursor.look_kind(2);
+                let after_name = self.cursor.look_kind(3);
+                // `_tryRewriteNewToIdentifier` (:4830-4834): for
+                // `this.new(` the reserved `new` is rewritten to the name
+                // before the identifier check — no report.
+                let rewritten = name_kind == TokenKind::Keyword(Keyword::New)
+                    && after_name == TokenKind::OpenParen;
+                if !rewritten && !is_identifier(name_kind) {
+                    // Official `insertSyntheticIdentifier(dot,
+                    // fieldInitializer)` (:4841); the follow-up Eq/OpenParen
+                    // checks then read the *real* name token (:4845-4858) —
+                    // e.g. `new` is neither `=` nor `(` — so the entry falls
+                    // to the final synthetic-assignment recovery (:4902).
+                    // The official stream is `<id2> = this . <id1> <name>`;
+                    // the queued tokens here would drain ahead of the real
+                    // stream, so the `this . <id1>` prefix is driven
+                    // directly and the entry ends on the real keyword (the
+                    // remaining `= expr` then re-enters the member loop as
+                    // the official cascade does).
                     let at = self.peek_span_at(2);
                     self.report(msg::missing_identifier(), at);
+                    self.report(msg::missing_assignment_in_initializer(), head);
+                    self.cursor.advance(); // `this`
+                    self.cursor.advance(); // `.`
                     self.synthetic(TokenKind::Identifier, at.range.offset);
+                    let name = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                    self.listener
+                        .handle_identifier(name, IdentifierContext::ExpressionContinuation);
+                    self.listener.end_initializer(name);
+                    return name;
                 }
-                let follower = self.cursor.look_kind(3);
+                let follower = after_name;
                 if follower == TokenKind::Eq {
                     return self.parse_initializer_expression_rest();
                 }
@@ -1656,6 +1998,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// Parses `this(...)`/`this.name(...)` as a redirecting initializer and
     /// checks the body that follows (:4860-4866).
     fn finish_redirecting_initializer(&mut self) -> TokenSpan {
+        // AstBuilder initializer recovery (`ast_builder.dart:803-815`):
+        // `this(...)` followed by a selector (`this().foo`) reports
+        // `invalid_this_in_initializer` at `this`.
+        let mut n = 1;
+        if self.cursor.look_kind(n) == TokenKind::Period {
+            n += 1;
+        }
+        if self.cursor.look_kind(n) == TokenKind::OpenParen
+            && let Some(close) = self.cursor.table_matching_end(self.peek_span_at(n).id)
+            && matches!(
+                self.kind_at(self.offset_of(close) + 1),
+                TokenKind::Period | TokenKind::QuestionPeriod | TokenKind::OpenSquare
+            )
+        {
+            self.report(msg::invalid_this_in_initializer(), self.peek_span());
+        }
         let end = self.parse_initializer_expression_rest();
         let after = self.peek_kind();
         if after == TokenKind::OpenCurly || after == TokenKind::Function {
@@ -1667,6 +2025,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// Official `parseSuperInitializerExpression` (:4918): lookahead over
     /// `super (. name)?` to validate the shape, then the expression re-read.
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
+        let head = self.peek_span();
         let mut n = 1;
         if self.cursor.look_kind(n) == TokenKind::Period {
             n += 1;
@@ -1692,7 +2051,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             } else if next == TokenKind::Eq {
                 let before_eq = self.cursor.look_kind(n - 1);
-                if before_eq != TokenKind::Keyword(Keyword::Super) {
+                if before_eq == TokenKind::Keyword(Keyword::Super) {
+                    // Bare `super = ...`: the parser stays silent ("parseExpression
+                    // will report error on assignment to super") but the analyzer
+                    // builder cannot build an initializer from a bare super
+                    // assignment (`buildInitializer` `default: return null`) and
+                    // reports `invalidInitializer` at the initializer begin.
+                    self.report(msg::invalid_initializer(), head);
+                } else {
                     // `super.name = ...` — parseExpression reports the
                     // assignment itself; this is the declaring-class rider.
                     self.report(
@@ -1707,6 +2073,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.report(msg::expected_after_but_got("("), at);
                 self.synthetic(TokenKind::OpenParen, at.range.offset);
                 self.synthetic(TokenKind::CloseParen, at.range.offset);
+            }
+        } else if let Some(close) = self.cursor.table_matching_end(self.peek_span_at(n).id) {
+            let after = self.kind_at(self.offset_of(close) + 1);
+            if matches!(
+                after,
+                TokenKind::Period | TokenKind::QuestionPeriod | TokenKind::OpenSquare
+            ) {
+                // `super(...)` followed by a selector (`super().foo`): AstBuilder
+                // initializer recovery reports `invalid_super_in_initializer` at
+                // `super` (ast_builder.dart:786-800).
+                self.report(msg::invalid_super_in_initializer(), head);
+            } else if after == TokenKind::Bang {
+                // `super()!`: the postfix `!` leaves no representable
+                // initializer node (`buildInitializer` final `return null`) —
+                // `invalidInitializer` at the initializer begin (issue_41597).
+                self.report(msg::invalid_initializer(), head);
             }
         }
         self.parse_initializer_expression_rest()
@@ -1810,7 +2192,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             )
     }
 
-    fn peek_is_reserved_at(&self, n: usize) -> bool {
+    pub(crate) fn peek_is_reserved_at(&self, n: usize) -> bool {
         matches!(self.cursor.look_kind(n), TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved)
     }
 
@@ -1839,7 +2221,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if new_kw.is_some() {
             return true;
         }
-        let after = self.cursor.look_kind(0);
+        // Official `_isConstructor` navigates from `name.next!`. In the
+        // operator case the cursor already consumed `operator <op>`, so the
+        // current peek is `name.next`; otherwise the cursor sits on the name.
+        // The queue is empty at this decision point (the peek is a real
+        // token), so `look_kind(1)` and `name.id + 1` agree with the
+        // official `name.next!` walk in both cases.
+        let (after, at) = if is_operator {
+            (self.cursor.look_kind(0), 0usize)
+        } else {
+            (self.cursor.look_kind(1), 1usize)
+        };
         if after == TokenKind::Period {
             return true;
         }
@@ -1852,12 +2244,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
         if after == TokenKind::Bang {
-            after = self.cursor.look_kind(1);
+            after = self.cursor.look_kind(at + 1);
         }
         if after == TokenKind::Lt {
             // Skip a `<...>` group when it is scanner-paired.
-            if let Some(end) = self.current_group_end_at(0) {
-                let after_group = self.kind_after(end);
+            if let Some(end) = self.cursor.table_matching_end(name.id + 1) {
+                let after_group = self.kind_at(self.offset_of(end) + 1);
                 if after_group == TokenKind::Eq {
                     after = TokenKind::Eq;
                 } else {
@@ -1866,8 +2258,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
         if after == TokenKind::OpenParen {
-            if let Some(close) = self.current_group_end_at(0)
-                && self.kind_after(close) == TokenKind::Colon
+            if let Some(close) = self.cursor.table_matching_end(name.id + 1)
+                && self.kind_at(self.offset_of(close) + 1) == TokenKind::Colon
             {
                 return true;
             }
@@ -1878,24 +2270,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             return false;
         }
         enclosing_declaration_name == Some(self.cursor.lexeme(name.id))
-    }
-
-    /// Matching close id for a group at cursor-relative offset `n`.
-    fn current_group_end_at(&self, n: usize) -> Option<TokenId> {
-        // Only valid right after a clean consume; n > 0 falls back to None
-        // (queue-aware group matching is unnecessary for the constructor
-        // check's shapes).
-        let _ = n;
-        self.current_matching_end()
-    }
-
-    /// Kind right after absolute id `end`.
-    fn kind_after(&self, end: TokenId) -> TokenKind {
-        let offset = self.offset_of(end);
-        if self.cursor.peek_id() > end {
-            return self.cursor.look_kind(0);
-        }
-        self.kind_at(offset + 1)
     }
 
     /// `skipOuterPattern` (compute-only): returns the id of the pattern's

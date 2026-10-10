@@ -417,9 +417,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut count = 0usize;
         let mut was_record = const_keyword.is_some();
         let mut was_valid_record = false;
-        // `(,)` marks the empty record (the dedicated report is culled at
-        // the pin); the marker itself needs no further use.
-        let mut _illegal_trailing_comma: Option<TokenSpan> = None;
+        // `(,)` marks the empty record literal (:7649-7655,
+        // `recordLiteralZeroFieldsWithTrailingComma`).
+        let mut illegal_trailing_comma: Option<TokenSpan> = None;
         let end;
         loop {
             if self.peek_kind() == TokenKind::CloseParen {
@@ -434,7 +434,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 && self.cursor.look_kind(1) == TokenKind::CloseParen
             {
                 // Empty record literal with a comma `(,)` (:7649-7655).
-                _illegal_trailing_comma = Some(self.peek_span());
+                illegal_trailing_comma = Some(self.peek_span());
                 was_record = true;
                 self.cursor.advance();
                 end = self.ensure_close_paren(begin);
@@ -467,8 +467,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.cursor.advance();
         }
         if was_record {
-            if count == 1 && !was_valid_record {
+            if let (0, Some(comma)) = (count, illegal_trailing_comma) {
+                // Empty record literal with a comma `(,)`
+                // (`recordLiteralZeroFieldsWithTrailingComma`, the analyzer's
+                // `empty_record_literal_with_comma`).
+                self.report(msg::empty_record_literal_with_comma(), comma);
+            } else if count == 1 && !was_valid_record {
                 self.report(msg::record_literal_one_positional_no_trailing_comma(), end);
+            } else if count == 0
+                && self.constant_pattern_ctx != crate::listener::ConstantPatternContext::None
+            {
+                // `case const ()` / `case ()` (:8389-8394).
+                self.report(msg::invalid_constant_pattern_empty_record_literal(), begin);
             }
             self.listener.end_record_literal(end, count, const_keyword);
         } else {

@@ -307,8 +307,16 @@ fn import_at_eof_recovers_semicolon() {
 
 #[test]
 fn uri_must_be_string() {
-    assert_eq!(error_codes("import 5;"), ["expected_string_literal"]);
-    assert_eq!(error_codes("part 5;"), ["expected_string_literal"]);
+    // The 3.13 oracle surfaces the shared-code expectedString and an
+    // unexpectedToken on the offending token.
+    assert_eq!(
+        error_codes("import 5;"),
+        ["unexpected_token", "expected_string_literal"]
+    );
+    assert_eq!(
+        error_codes("part 5;"),
+        ["unexpected_token", "expected_string_literal"]
+    );
 }
 
 #[test]
@@ -323,7 +331,11 @@ fn conditional_uri_missing_paren() {
     // token then fails the URI read.
     assert_eq!(
         error_codes("import 'a.dart' if x;"),
-        ["expected_token", "expected_string_literal"]
+        [
+            "expected_token",
+            "unexpected_token",
+            "expected_string_literal"
+        ]
     );
 }
 
@@ -360,13 +372,15 @@ fn repeated_part_directives_are_legal() {
 
 #[test]
 fn directive_modifier_errors() {
-    // parseTopLevelKeywordModifiers (modifier_context.dart:183): const and
-    // external are out-of-order; the rest are extraneous. (var/late/final/
-    // const before a directive never reach this walk — the official
-    // dispatch routes them to member parsing, parser_impl.dart:613-624.)
+    // parseTopLevelKeywordModifiers (modifier_context.dart:674-688):
+    // `external` reports extraneousModifier before anything but
+    // class/enum/typedef, and `const` reports constClass only before
+    // `class`; every other modifier is extraneous. (var/late/final/const
+    // before a directive never reach this walk — the official dispatch
+    // routes them to member parsing, parser_impl.dart:613-624.)
     assert_eq!(
         error_codes("external import 'a.dart';"),
-        ["modifier_out_of_order"]
+        ["extraneous_modifier"]
     );
     assert_eq!(
         error_codes("abstract part 'a.dart';"),

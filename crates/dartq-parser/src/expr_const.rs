@@ -150,6 +150,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         precedence: u8,
         context: ConstantPatternContext,
     ) -> TokenSpan {
+        // Keep [`Parser::constant_pattern_ctx`] in step with the threaded
+        // parameter so the record-literal parse can read it.
+        let saved = self.constant_pattern_ctx;
+        self.constant_pattern_ctx = context;
+        let end = self.parse_pattern_precedence_inner(precedence, context);
+        self.constant_pattern_ctx = saved;
+        end
+    }
+
+    fn parse_pattern_precedence_inner(
+        &mut self,
+        precedence: u8,
+        context: ConstantPatternContext,
+    ) -> TokenSpan {
         if !self.enter_depth() {
             return self.peek_span();
         }
@@ -405,6 +419,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     .handle_super_expression(token, IdentifierContext::Expression);
                 self.parse_selector_chain(token, context)
             }
+            TokenKind::Keyword(Keyword::Void) => {
+                // `void name() {}` named-function-expression recovery
+                // (official parsePrimary `void` arm routes to
+                // parseSendOrFunctionLiteral).
+                let end = self.parse_send_or_function_literal(IdentifierContext::Expression);
+                self.parse_selector_chain(end, context)
+            }
             TokenKind::Keyword(Keyword::Const) => {
                 let const_keyword = self.peek_span();
                 if context == ConstantPatternContext::Explicit {
@@ -528,7 +549,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.listener.handle_indexed_expression(None, open, close);
                     end = close;
                 }
-                TokenKind::Bang => {
+                // Postfix `!` is an expression operator only outside constant
+                // patterns; in pattern context it stays for the pattern loop
+                // (null-assert pattern, parser_impl.dart:11618-11626).
+                TokenKind::Bang if context == ConstantPatternContext::None => {
                     let bang = self.peek_span();
                     self.cursor.advance();
                     self.listener.handle_non_null_assert_expression(bang);
@@ -694,7 +718,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// offset `lt_offset` (official `typeArg.skip(token).next!`). With
     /// [`crate::types::TypeParamOrArg::None`] there is no group, so the token
     /// at `lt_offset` (the `<` itself) follows. Combined closers
-    /// (`>>`/`>=`) split on consume, so the follower is the split remainder.
+    /// (`>>`/`>=`) split on consume: a raw compound leaves the split
+    /// remainder as the follower, while a compound shared with enclosing
+    /// groups (its last `>` closes this group) is fully consumed and the
+    /// real successor follows (official `skipEnd`, nested
+    /// `Map<String, List<int>>{}` fires the literal-with-class recovery).
     pub(crate) fn type_arg_follower(
         &self,
         type_param: &crate::types::TypeParamOrArg,
@@ -710,9 +738,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             },
             crate::types::TypeParamOrArg::Complex(g) => {
                 let end = self.offset_of(g.end);
-                match crate::cursor::split_remainders(self.kind_at(end)).first() {
-                    Some((kind, _)) => *kind,
-                    None => self.kind_at(end + 1),
+                if g.end_raw_compound {
+                    match crate::cursor::split_remainders(self.kind_at(end)).first() {
+                        Some((kind, _)) => *kind,
+                        None => self.kind_at(end + 1),
+                    }
+                } else {
+                    self.kind_at(end + 1)
                 }
             }
         }

@@ -272,9 +272,40 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// official `parseExpression`).
     pub(crate) fn parse_expression_statement(&mut self) -> TokenSpan {
         let begin = self.peek_span();
+        // AstBuilder `handleExpressionStatement` (ast_builder.dart:4396): the
+        // `missing_statement` report fires only when the whole expression is
+        // a single recovered reserved-keyword NAME (`class;`). Reserved
+        // keywords that begin real expression forms (`throw;`, `void;`, …)
+        // never see it — official `parseStatementX` routes them through the
+        // expression arms.
+        let before = self.cursor.real_pos();
+        let head = self.peek_kind();
+        let head_is_recoverable_name = self.peek_is_reserved_at(0)
+            && !matches!(
+                head,
+                TokenKind::Keyword(
+                    Keyword::Const
+                        | Keyword::Throw
+                        | Keyword::Rethrow
+                        | Keyword::Void
+                        | Keyword::New
+                        | Keyword::Super
+                        | Keyword::This
+                        | Keyword::True
+                        | Keyword::False
+                        | Keyword::Null
+                        | Keyword::Switch
+                        | Keyword::Await
+                )
+            );
         let _ = self.parse_expression();
+        let single_recovered_name =
+            head_is_recoverable_name && self.cursor.real_pos() - before == 1;
         let end = self.ensure_semicolon();
         self.listener.handle_expression_statement(begin, end);
+        if single_recovered_name {
+            self.report(msg::missing_statement(), begin);
+        }
         end
     }
 
@@ -287,11 +318,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             return;
         }
         let const_kw = self.peek_span();
+        let before_const = self.cursor.mark();
         self.cursor.advance();
         {
             let type_info = self.compute_type(false, true);
             if matches!(type_info, TypeInfo::NoType) {
                 if !self.peek_is_identifier() {
+                    // Re-enter at the `const` so the whole statement parses
+                    // through the expression engine (official
+                    // parseExpressionStatement(start)); consuming the `const`
+                    // here would let a following outer-pattern `=` trigger
+                    // the pattern-assignment reading the official never
+                    // reaches.
+                    self.cursor.reset(before_const);
                     self.parse_expression_statement();
                     return;
                 }
@@ -301,6 +340,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     TokenKind::Eq | TokenKind::Semicolon | TokenKind::Comma | TokenKind::OpenCurly
                 ) && !is_keyword_or_identifier(follower)
                 {
+                    self.cursor.reset(before_const);
                     self.parse_expression_statement();
                     return;
                 }
@@ -734,11 +774,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     // labels
     // ------------------------------------------------------------------
 
-    /// Official `parseLabel`: `identifier ':'` with `handleLabel`.
-    fn parse_label(&mut self) {
-        let _ = self.ensure_identifier(IdentifierContext::LabelDeclaration);
+    /// Official `parseLabel`: `identifier ':'` with `handleLabel`. Returns
+    /// the label name span (the switch-block duplicate check reads it).
+    fn parse_label(&mut self) -> TokenSpan {
+        let name = self.ensure_identifier(IdentifierContext::LabelDeclaration);
         let colon = self.expect_kind(TokenKind::Colon);
         self.listener.handle_label(colon);
+        name
+    }
+
+    /// `AstBuilder` `duplicateLabelInSwitchStatement` (`ast_builder.dart:3148`):
+    /// a label name repeated inside one switch statement reports at the
+    /// second occurrence.
+    fn check_duplicate_switch_label(&mut self, seen: &mut Vec<&'s str>, name: TokenSpan) {
+        let lexeme = self.cursor.lexeme(name.id);
+        if seen.contains(&lexeme) {
+            self.report(msg::duplicate_label_in_switch_statement(lexeme), name);
+        } else {
+            seen.push(lexeme);
+        }
     }
 
     /// Official `parseLabeledStatement`: `label* nonLabelledStatement`.
@@ -928,6 +982,30 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
             close
         };
+        // Official `parseForLoopPartsRest` :10369-10373: when the parts parse
+        // stalls anywhere but the `(` group's closer, the stalling token is
+        // reported and the cursor jumps to the closer. An unclosed `(` (the
+        // scanner pinned a synthetic closer) can never complete, and the
+        // declaration-rest recovery consumes the enclosing block's `}` on the
+        // way, so the stall point is detected up front: the first `}` inside
+        // the group.
+        if let Some(end_id) = self.cursor.table_matching_end(left_paren.id)
+            && self.cursor.resolve(end_id).1
+        {
+            let mut n = 0usize;
+            while n < 256 {
+                let kind = self.cursor.look_kind(n);
+                if kind == TokenKind::Eof {
+                    break;
+                }
+                if kind == TokenKind::CloseCurly {
+                    let stall = self.peek_span_at(n);
+                    self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
+                    break;
+                }
+                n += 1;
+            }
+        }
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             ExprStmtOrDecl::PatternHead { pattern_keyword } => {
@@ -1070,9 +1148,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             self.cursor.advance();
         }
-        // Close the group (consume at the closer, jump + report when
-        // distant — official `ensureCloseParen`).
-        let _ = self.ensure_close_paren(left_paren);
+        // Official :10369-10373 runs no `ensureCloseParen` here: if the parts
+        // parse did not land on the `(` group's closer, the landing token is
+        // reported as unexpected and the cursor jumps to the closer.
+        match self.cursor.table_matching_end(left_paren.id) {
+            Some(end_id) => {
+                if self.peek_id() != end_id {
+                    let at = self.peek_span();
+                    self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+                    self.skip_to_token(end_id);
+                }
+                self.cursor.advance(); // the closer
+            }
+            None => {
+                let _ = self.ensure_close_paren(left_paren);
+            }
+        }
         self.listener.handle_for_loop_parts(
             for_kw,
             left_paren,
@@ -1284,16 +1375,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let open = if self.peek_kind() == TokenKind::OpenParen {
             self.peek_span()
         } else {
-            // Recovery: `insertParens(includeIdentifier: true)`.
+            // Recovery: `insertParens(includeIdentifier: true)` (:11092) —
+            // the synthetic `(`, identifier and `)` splice into the stream
+            // ahead of the real tokens; the shared consume path below pops
+            // them, leaving the real follower untouched.
             let at = self.peek_span();
             self.report(msg::expected_but_got("("), at);
             let offset = at.range.offset;
             let synthetic_open = self.synthetic(TokenKind::OpenParen, offset);
-            self.cursor.advance();
             self.synthetic(TokenKind::Identifier, offset);
-            self.cursor.advance();
             self.synthetic(TokenKind::CloseParen, offset);
-            self.cursor.advance();
             synthetic_open
         };
         self.cursor.advance(); // `(`
@@ -1416,13 +1507,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let open_group_synthetic = close_id.map_or(true, |close| self.cursor.resolve(close).1);
         let scan_mark = self.cursor.mark();
         self.cursor.advance(); // `(`
-        let name_synthetic = if !self.peek_is_identifier() {
-            let _ = self.ensure_identifier(IdentifierContext::CatchParameter);
-            true
-        } else {
-            self.cursor.advance();
-            false
-        };
+        let name_synthetic = !self.peek_is_identifier();
+        let _ = self.ensure_catch_parameter();
         if self.peek_kind() != TokenKind::CloseParen {
             let mut current_comma = None;
             if self.peek_kind() == TokenKind::Comma {
@@ -1443,13 +1529,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             }
             if let Some(comma_span) = current_comma {
-                let trace_synthetic = if !self.peek_is_identifier() {
-                    let _ = self.ensure_identifier(IdentifierContext::CatchParameter);
-                    true
-                } else {
-                    self.cursor.advance();
-                    false
-                };
+                let trace_synthetic = !self.peek_is_identifier();
+                let _ = self.ensure_catch_parameter();
                 if self.peek_kind() != TokenKind::CloseParen {
                     let at = self.peek_span();
                     if !trace_synthetic {
@@ -1503,6 +1584,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let mut case_count = 0usize;
         let mut default_kw: Option<TokenSpan> = None;
         let mut colon_after_default: Option<TokenSpan> = None;
+        // Official AstBuilder `_switchLabels`: label names seen in this
+        // switch statement; a repeat reports `duplicateLabelInSwitchStatement`
+        // at the second occurrence.
+        let mut switch_labels: Vec<&'s str> = Vec::new();
         if had_open {
             while !self.cursor.at_eof()
                 && self.peek_kind() != TokenKind::CloseCurly
@@ -1519,7 +1604,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             && !self.cursor.at_eof()
                             && !self.is_bailed()
                         {
-                            self.parse_label();
+                            let name = self.parse_label();
+                            self.check_duplicate_switch_label(&mut switch_labels, name);
                             label_count += 1;
                         }
                         if let Some(_previous) = default_kw {
@@ -1536,7 +1622,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             && !self.cursor.at_eof()
                             && !self.is_bailed()
                         {
-                            self.parse_label();
+                            let name = self.parse_label();
+                            self.check_duplicate_switch_label(&mut switch_labels, name);
                             label_count += 1;
                         }
                         if default_kw.is_some() {

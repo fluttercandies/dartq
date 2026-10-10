@@ -218,6 +218,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if !self.enter_depth() {
             return self.peek_span();
         }
+        // Plain (non-pattern) expressions drop the constant-pattern context;
+        // restore it on exit so an enclosing pattern operand keeps its own.
+        let saved_ctx = self.constant_pattern_ctx;
+        self.constant_pattern_ctx = crate::listener::ConstantPatternContext::None;
+        let end = self.parse_precedence_inner(precedence, allow_cascades);
+        self.constant_pattern_ctx = saved_ctx;
+        end
+    }
+
+    fn parse_precedence_inner(&mut self, precedence: u8, allow_cascades: bool) -> TokenSpan {
         // `_isDotShorthand` (:6499): `.` followed by an identifier or `new`.
         let is_dot_shorthand = self.peek_kind() == TokenKind::Period
             && (is_identifier(self.cursor.look_kind(1))
@@ -329,6 +339,28 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 last_cascade = true;
                 left = self.parse_cascade_expression(left);
             } else if token_level == ASSIGNMENT_PRECEDENCE {
+                // AstBuilder assignment-target check (ast_builder.dart:4428):
+                // only identifiers, property accesses, and index expressions
+                // are assignable; any other LHS reports
+                // `illegal_assignment_to_non_assignable`.
+                // `Token.isOperator`-style proxy for AstBuilder
+                // `handleAssignment`'s assignability check (:5856): the LHS
+                // must end in an identifier (or `]` of an index target).
+                // The final LHS token's kind: a table id is read back by
+                // offset (a span id can alias an inserted token); an inserted
+                // (synthetic) token is read by id — its offset points at the
+                // real token it stands in for, never at itself.
+                let lhs_assignable = self.cursor.last_consumed_id().is_some_and(|id| {
+                    let kind = if (id as usize) < self.table.len() {
+                        self.kind_at(self.offset_of(id))
+                    } else {
+                        self.cursor.resolve(id).0
+                    };
+                    matches!(kind, TokenKind::Identifier | TokenKind::CloseSquare)
+                });
+                if !lhs_assignable {
+                    self.report(msg::illegal_assignment_to_non_assignable(), left);
+                }
                 // Right associative: recurse at the same level (:6671-6691).
                 // The `>>=`-without-triple-shift recovery is dead at the pin
                 // (3.13.1 ships with triple shift on, and the scanner lexes
@@ -364,7 +396,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     TokenKind::Period | TokenKind::QuestionPeriod => {
                         let dot = self.peek_span();
                         self.cursor.advance();
+                        // AstBuilder `doDotExpression` (ast_builder.dart:918):
+                        // the operand after `.` must be a name — a literal or
+                        // bracket operand (`a?.[0]`) is reported as a missing
+                        // identifier and replaced by a synthetic name.
+                        let operand = self.peek_span();
+                        let operand_kind = self.peek_kind();
                         left = self.parse_primary(IdentifierContext::ExpressionContinuation);
+                        if !is_identifier(operand_kind)
+                            && operand_kind != TokenKind::Keyword(Keyword::New)
+                        {
+                            self.report(msg::missing_identifier(), operand);
+                        }
                         if is_dot_shorthand {
                             self.listener.handle_dot_shorthand_head(dot);
                             is_dot_shorthand = false;
@@ -1127,6 +1170,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.listener.handle_send(super_kw, end);
             return end;
         }
+        // `super?.x` (`diag.superNullAware`, parser_impl.dart:8466).
+        if self.peek_kind() == TokenKind::QuestionPeriod {
+            let at = self.peek_span();
+            self.report(msg::invalid_operator_questionmark_period_for_super(), at);
+        }
         super_kw
     }
 
@@ -1246,7 +1294,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// Official `parseSendOrFunctionLiteral`: a function literal is only
     /// considered when allowed and not in a `.`-continuation position.
-    fn parse_send_or_function_literal(&mut self, context: IdentifierContext) -> TokenSpan {
+    pub(crate) fn parse_send_or_function_literal(
+        &mut self,
+        context: IdentifierContext,
+    ) -> TokenSpan {
         if !self.may_parse_function_expressions
             || context == IdentifierContext::ExpressionContinuation
         {

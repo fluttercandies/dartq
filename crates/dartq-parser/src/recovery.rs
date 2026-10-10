@@ -14,10 +14,11 @@
 //! * skip-to-sync — group-aware jump to a boundary set, with a no-progress
 //!   guard at every loop level (official strategy C, `parser_impl.dart:445`).
 
-use dartq_scanner::TokenKind;
+use dartq_scanner::{Keyword, TokenKind};
 
+use crate::members::is_keyword_or_identifier;
 use crate::message::msg;
-use crate::parser::Parser;
+use crate::parser::{AsyncModifier, Parser};
 use crate::token_id::TokenSpan;
 
 impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
@@ -105,15 +106,171 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return span;
         }
         if is_identifier(peek.kind) {
+            self.check_async_keyword_as_identifier(&peek, context);
             let id = self.cursor.advance();
             let span = self.span_of(id);
             self.listener.handle_identifier(span, context);
             return span;
         }
+        // `TypeReference.ensureIdentifier` (identifier_context_impl.dart:1528):
+        // `var` in type-reference position is reported and consumed as the
+        // type name (the caller emits its own type event for the span).
+        if matches!(
+            context,
+            crate::listener::IdentifierContext::TypeReference
+                | crate::listener::IdentifierContext::PrefixedTypeReference
+        ) && peek.kind == TokenKind::Keyword(Keyword::Var)
+        {
+            self.report(msg::var_as_type_name(), peek.span);
+            let id = self.cursor.advance();
+            return self.span_of(id);
+        }
+        if matches!(
+            context,
+            crate::listener::IdentifierContext::Expression
+                | crate::listener::IdentifierContext::ExpressionContinuation
+        ) && !is_identifier(peek.kind)
+        {
+            return self.ensure_expression_identifier(context);
+        }
         // Official recovery template for identifiers: report and insert a
         // synthetic (identifier_context_impl.dart recovery templates); the
         // synthetic is consumed so the caller's next token is the real one.
         self.report(msg::missing_identifier(), peek.span);
+        let id = self
+            .cursor
+            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+        self.cursor.advance();
+        self.span_of(id)
+    }
+
+    /// `ExpressionIdentifierContext.ensureIdentifier`
+    /// (`identifier_context_impl.dart:393-472`): a keyword in expression
+    /// position is consumed as the name with
+    /// `expected_identifier_but_got_keyword` (except `as`/`is`/EOF in a
+    /// non-continuation context); other junk either makes way for a
+    /// synthetic or falls through to `expected_identifier` + synthetic.
+    fn ensure_expression_identifier(
+        &mut self,
+        context: crate::listener::IdentifierContext,
+    ) -> TokenSpan {
+        let peek = self.cursor.peek();
+        let is_continuation = context == crate::listener::IdentifierContext::ExpressionContinuation;
+        let junk_kind = peek.kind;
+        if !self.looks_like_statement_start_at(1) {
+            if is_keyword_or_identifier(junk_kind) {
+                let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
+                if is_continuation
+                    || (!matches!(junk_kind, TokenKind::Eof) && lexeme != "as" && lexeme != "is")
+                {
+                    self.report(msg::expected_identifier_but_got_keyword(&lexeme), peek.span);
+                    let id = self.cursor.advance();
+                    let span = self.span_of(id);
+                    self.listener.handle_identifier(span, context);
+                    return span;
+                }
+            } else if !crate::members::is_user_definable_operator_kind(junk_kind)
+                && !matches!(
+                    junk_kind,
+                    TokenKind::Eq
+                        | TokenKind::Bang
+                        | TokenKind::Comma
+                        | TokenKind::Question
+                        | TokenKind::Period
+                        | TokenKind::QuestionPeriod
+                        | TokenKind::OpenParen
+                        | TokenKind::CloseParen
+                        | TokenKind::OpenSquare
+                        | TokenKind::CloseSquare
+                        | TokenKind::OpenCurly
+                        | TokenKind::CloseCurly
+                        | TokenKind::Colon
+                        | TokenKind::Semicolon
+                        | TokenKind::Eof
+                )
+            {
+                // When in doubt, consume the token to ensure progress; the
+                // report anchors on it and the synthetic lands after.
+                let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
+                self.report(msg::expected_identifier(&lexeme), peek.span);
+                self.cursor.advance();
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+                self.cursor.advance();
+                return self.span_of(id);
+            }
+        }
+        let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
+        self.report(msg::expected_identifier(&lexeme), peek.span);
+        let id = self
+            .cursor
+            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+        self.cursor.advance();
+        self.span_of(id)
+    }
+
+    /// `looksLikeStatementStart` (`identifier_context.dart:402`) evaluated
+    /// at cursor-relative offset `n`.
+    fn looks_like_statement_start_at(&self, n: usize) -> bool {
+        matches!(
+            self.cursor.look_kind(n),
+            TokenKind::At
+                | TokenKind::Keyword(
+                    Keyword::Assert
+                        | Keyword::Break
+                        | Keyword::Continue
+                        | Keyword::Do
+                        | Keyword::Else
+                        | Keyword::Final
+                        | Keyword::For
+                        | Keyword::If
+                        | Keyword::Return
+                        | Keyword::Switch
+                        | Keyword::Try
+                        | Keyword::Var
+                        | Keyword::Void
+                        | Keyword::While
+                )
+                | TokenKind::Eof
+        )
+    }
+
+    /// Official `checkAsyncAwaitYieldAsIdentifier`
+    /// (`identifier_context_impl.dart:1632`): `await`/`yield` consumed as a
+    /// plain name inside an async or generator function reports
+    /// `async_keyword_used_as_identifier`.
+    fn check_async_keyword_as_identifier(
+        &mut self,
+        view: &crate::cursor::TokenView,
+        context: crate::listener::IdentifierContext,
+    ) {
+        if self.async_state == AsyncModifier::Sync || !context.checks_async_keyword() {
+            return;
+        }
+        let lexeme = self.cursor.lexeme(view.span.id);
+        if lexeme == "await" || lexeme == "yield" {
+            self.report(msg::async_keyword_used_as_identifier(), view.span);
+        }
+    }
+
+    /// `IdentifierContext.catchParameter.ensureIdentifier`
+    /// (`identifier_context_impl.dart:25`): the catch template reports
+    /// `catch_syntax` (not `missing_identifier`) for non-identifier junk.
+    pub(crate) fn ensure_catch_parameter(&mut self) -> TokenSpan {
+        let peek = self.cursor.peek();
+        if is_identifier(peek.kind) {
+            self.check_async_keyword_as_identifier(
+                &peek,
+                crate::listener::IdentifierContext::CatchParameter,
+            );
+            let id = self.cursor.advance();
+            let span = self.span_of(id);
+            self.listener
+                .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
+            return span;
+        }
+        self.report(msg::catch_syntax(), peek.span);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
@@ -346,6 +503,15 @@ fn keyword_as_name_message(
                 == crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration =>
         {
             Some(msg::built_in_identifier_in_declaration(lexeme))
+        }
+        // Type-variable names reject built-in keywords outright: the oracle
+        // reports `expectedIdentifierButGotKeyword` for `Function` in
+        // `<...>` type parameters (issue_45703 line 4) and consumes it as
+        // the name.
+        dartq_scanner::KeywordStyle::BuiltIn
+            if context == crate::listener::IdentifierContext::TypeVariableDeclaration =>
+        {
+            Some(msg::expected_identifier_but_got_keyword(lexeme))
         }
         _ => None,
     }

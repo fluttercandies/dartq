@@ -57,14 +57,30 @@ pub(crate) mod msg {
         OUT_OF_ORDER_CLAUSES, REDIRECTING_CONSTRUCTOR_WITH_BODY,
         REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM, SEALED_MIXIN, SEALED_MIXIN_CLASS,
         SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR, TOP_LEVEL_OPERATOR,
-        TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN, VAR_RETURN_TYPE,
-        WITH_BEFORE_EXTENDS,
+        TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN, UNEXPECTED_TOKENS,
+        VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
     };
     use dartq_diagnostics::{
         ABSTRACT_FINAL_BASE_CLASS, ABSTRACT_FINAL_INTERFACE_CLASS, ABSTRACT_SEALED_CLASS,
         EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER, MISSING_KEYWORD_OPERATOR,
         MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES, MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
         PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
+    };
+    use dartq_diagnostics::{
+        ABSTRACT_LATE_FIELD, ABSTRACT_STATIC_FIELD, ANNOTATION_SPACE_BEFORE_PARENTHESIS,
+        ASYNC_KEYWORD_USED_AS_IDENTIFIER, CONST_CLASS, CONST_CONSTRUCTOR_WITH_BODY, CONST_FACTORY,
+        DEFAULT_VALUE_IN_FUNCTION_TYPE, DUPLICATE_LABEL_IN_SWITCH_STATEMENT,
+        EMPTY_RECORD_LITERAL_WITH_COMMA, EXPECTED_BODY, EXPECTED_REPRESENTATION_FIELD,
+        EXTENSION_DECLARES_ABSTRACT_MEMBER, EXTERNAL_CLASS,
+        EXTERNAL_CONSTRUCTOR_WITH_FIELD_INITIALIZERS, EXTERNAL_ENUM, EXTERNAL_LATE_FIELD,
+        EXTERNAL_TYPEDEF, FIELD_INITIALIZER_OUTSIDE_CONSTRUCTOR, FUNCTION_TYPED_PARAMETER_VAR,
+        ILLEGAL_ASSIGNMENT_TO_NON_ASSIGNABLE, INVALID_CONSTANT_PATTERN_EMPTY_RECORD_LITERAL,
+        INVALID_INITIALIZER, INVALID_OPERATOR, INVALID_OPERATOR_QUESTIONMARK_PERIOD_FOR_SUPER,
+        INVALID_SUPER_IN_INITIALIZER, INVALID_THIS_IN_INITIALIZER,
+        INVALID_USE_OF_COVARIANT_IN_EXTENSION, MISSING_ENUM_BODY, MISSING_STATEMENT,
+        MULTIPLE_REPRESENTATION_FIELDS, REPRESENTATION_FIELD_MODIFIER,
+        TYPE_PARAMETER_ON_CONSTRUCTOR, TYPE_PARAMETER_ON_OPERATOR, VAR_AS_TYPE_NAME,
+        WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER,
     };
     use dartq_diagnostics::{
         ANNOTATION_ON_TYPE_ARGUMENT, ANNOTATION_WITH_TYPE_ARGUMENTS_UNINSTANTIATED,
@@ -316,6 +332,17 @@ pub(crate) mod msg {
 
     pub(crate) fn unexpected_token(lexeme: &str) -> Message {
         Message::new(UNEXPECTED_TOKEN, format!("Unexpected token '{lexeme}'."))
+    }
+
+    pub(crate) fn unexpected_tokens() -> Message {
+        Message::new(UNEXPECTED_TOKENS, "Unexpected tokens.".to_string())
+    }
+
+    pub(crate) fn expected_executable() -> Message {
+        Message::new(
+            EXPECTED_EXECUTABLE,
+            "Expected a method, getter, setter or operator declaration.".to_string(),
+        )
     }
 
     // —— directive family (#300) —————————————————————————————————————————
@@ -585,73 +612,49 @@ pub(crate) mod msg {
         Message::new(MISSING_FUNCTION_BODY, "A function body must be provided.")
     }
 
-    /// `expected{Class,Mixin,Enum,Extension,ExtensionType}Body` (shared-parser
-    /// own codes; not in the analyzer registry capture) plus the
-    /// `Expected{Try,Catch,Finally}...Body` shared codes (same convention:
-    /// shared-parser own names, exact official texts).
-    pub(crate) fn expected_block_body(kind: BlockKind, lexeme: &str) -> Message {
+    /// `expected{Class,Mixin,Enum,Extension,ExtensionType,Try,Catch,Finally,
+    /// SwitchStatement,SwitchExpression}Body`: the shared parser's per-kind
+    /// block-body codes all surface under the single analyzer registry name
+    /// `expected_body` (`diagnostic.g.dart` names every one `expected_body`),
+    /// each keeping its official fixed text. The template flavors
+    /// (`expectedEnumBody`, `expectedFunctionBody`) interpolate the offending
+    /// lexeme like the official templates.
+    pub(crate) fn expected_block_body(kind: BlockKind, _lexeme: &str) -> Message {
         if kind == BlockKind::Body {
             return expected_but_got("{");
         }
-        let (name, machine, text) = match kind {
-            BlockKind::Class => (
-                "expected_class_body",
-                "EXPECTED_CLASS_BODY",
-                format!("Expected a class body, but got '{lexeme}'."),
-            ),
-            BlockKind::Mixin => (
-                "expected_mixin_body",
-                "EXPECTED_MIXIN_BODY",
-                format!("Expected a mixin body, but got '{lexeme}'."),
-            ),
-            BlockKind::Enum => (
-                "expected_enum_body",
-                "EXPECTED_ENUM_BODY",
-                format!("Expected a enum body, but got '{lexeme}'."),
-            ),
-            BlockKind::Extension => (
-                "expected_extension_body",
-                "EXPECTED_EXTENSION_BODY",
-                format!("Expected a extension body, but got '{lexeme}'."),
-            ),
-            BlockKind::ExtensionType => (
-                "expected_extension_type_body",
-                "EXPECTED_EXTENSION_TYPE_BODY",
-                format!("Expected a extension type body, but got '{lexeme}'."),
-            ),
-            BlockKind::TryStatement => (
-                "expected_try_statement_body",
-                "EXPECTED_TRY_STATEMENT_BODY",
-                "A try statement must have a body, even if it is empty.".to_owned(),
-            ),
-            BlockKind::CatchClause => (
-                "expected_catch_clause_body",
-                "EXPECTED_CATCH_CLAUSE_BODY",
-                "A catch clause must have a body, even if it is empty.".to_owned(),
-            ),
-            BlockKind::FinallyClause => (
-                "expected_finally_clause_body",
-                "EXPECTED_FINALLY_CLAUSE_BODY",
-                "A finally clause must have a body, even if it is empty.".to_owned(),
-            ),
-            BlockKind::SwitchStatement => (
-                "expected_switch_statement_body",
-                "EXPECTED_SWITCH_STATEMENT_BODY",
-                "A switch statement must have a body, even if it is empty.".to_owned(),
-            ),
-            BlockKind::SwitchExpression => (
-                "expected_switch_expression_body",
-                "EXPECTED_SWITCH_EXPRESSION_BODY",
-                "A switch expression must have a body, even if it is empty.".to_owned(),
-            ),
+        let text = match kind {
+            BlockKind::Class => "A class declaration must have a body, even if it is empty.",
+            BlockKind::Mixin => "A mixin declaration must have a body, even if it is empty.",
+            // `expectedEnumBody` is a pseudoSharedCode mapping to the
+            // analyzer's `missing_enum_body`, not `expected_body`.
+            BlockKind::Enum => {
+                return Message::new(
+                    MISSING_ENUM_BODY,
+                    "An enum definition must have a body with at least one constant name.",
+                );
+            }
+            BlockKind::Extension => {
+                "An extension declaration must have a body, even if it is empty."
+            }
+            BlockKind::ExtensionType => {
+                "An extension type declaration must have a body, even if it is empty."
+            }
+            BlockKind::TryStatement => "A try statement must have a body, even if it is empty.",
+            BlockKind::CatchClause => "A catch clause must have a body, even if it is empty.",
+            BlockKind::FinallyClause => "A finally clause must have a body, even if it is empty.",
+            BlockKind::SwitchStatement => {
+                "A switch statement must have a body, even if it is empty."
+            }
+            BlockKind::SwitchExpression => {
+                "A switch expression must have a body, even if it is empty."
+            }
             // Never reported: statement blocks are only entered with `{`
             // present.
-            BlockKind::Statement => {
-                return expected_but_got("{");
-            }
+            BlockKind::Statement => return expected_but_got("{"),
             BlockKind::Body => unreachable!("handled above"),
         };
-        Message::new(local_code(name, machine), text)
+        Message::new(EXPECTED_BODY, text)
     }
 
     pub(crate) fn member_with_same_name_as_class() -> Message {
@@ -712,6 +715,271 @@ pub(crate) mod msg {
         Message::new(
             MISSING_ASSIGNMENT_IN_INITIALIZER,
             "Expected an assignment after the field name.",
+        )
+    }
+
+    /// `handleConstFactory` (analyzer registry code `const_factory`): a
+    /// `const factory` whose body is neither a redirection nor `external …;`.
+    pub(crate) fn const_factory() -> Message {
+        Message::new(
+            CONST_FACTORY,
+            "Only redirecting factory constructors can be declared to be 'const'.",
+        )
+    }
+
+    /// `constConstructorWithBody`: a `const` constructor with a `{}` body.
+    pub(crate) fn const_constructor_with_body() -> Message {
+        Message::new(
+            CONST_CONSTRUCTOR_WITH_BODY,
+            "Const constructors can't have a body.",
+        )
+    }
+
+    /// `reportTopLevelModifierError` for `const` before a declaration
+    /// keyword (only `class` gets a dedicated code; everything else is
+    /// `extraneous_modifier`).
+    pub(crate) fn const_class() -> Message {
+        Message::new(CONST_CLASS, "Classes can't be declared to be 'const'.")
+    }
+
+    pub(crate) fn external_class() -> Message {
+        Message::new(
+            EXTERNAL_CLASS,
+            "Classes can't be declared to be 'external'.",
+        )
+    }
+
+    pub(crate) fn external_enum() -> Message {
+        Message::new(EXTERNAL_ENUM, "Enums can't be declared to be 'external'.")
+    }
+
+    pub(crate) fn external_typedef() -> Message {
+        Message::new(
+            EXTERNAL_TYPEDEF,
+            "Typedefs can't be declared to be 'external'.",
+        )
+    }
+
+    /// `_endClassFields`: `external` + `late` on one field.
+    pub(crate) fn external_late_field() -> Message {
+        Message::new(EXTERNAL_LATE_FIELD, "External fields cannot be late.")
+    }
+
+    /// `_endClassFields`: `abstract` + `late` on one field.
+    pub(crate) fn abstract_late_field() -> Message {
+        Message::new(ABSTRACT_LATE_FIELD, "Abstract fields cannot be late.")
+    }
+
+    /// `_endClassFields`: `abstract` + `static` on one field.
+    pub(crate) fn abstract_static_field() -> Message {
+        Message::new(
+            ABSTRACT_STATIC_FIELD,
+            "Static fields can't be declared 'abstract'.",
+        )
+    }
+
+    /// `external` constructor with `: field` initializers (analyzer
+    /// `external_constructor_with_field_initializers`).
+    pub(crate) fn external_constructor_with_field_initializers() -> Message {
+        Message::new(
+            EXTERNAL_CONSTRUCTOR_WITH_FIELD_INITIALIZERS,
+            "An external constructor can't initialize fields.",
+        )
+    }
+
+    /// `invalidUseOfCovariantInExtension` (`covariant` members in an
+    /// `extension` body).
+    pub(crate) fn invalid_use_of_covariant_in_extension(modifier: &str) -> Message {
+        Message::new(
+            INVALID_USE_OF_COVARIANT_IN_EXTENSION,
+            format!("Can't have modifier '{modifier}' in an extension."),
+        )
+    }
+
+    /// `extensionDeclaresAbstractMember`: an abstract member in an extension.
+    pub(crate) fn extension_declares_abstract_member() -> Message {
+        Message::new(
+            EXTENSION_DECLARES_ABSTRACT_MEMBER,
+            "Extensions can't declare abstract members.",
+        )
+    }
+
+    /// `AstBuilder` `_endClassMethod`: a setter's parameter-count validation.
+    pub(crate) fn wrong_number_of_parameters_for_setter() -> Message {
+        Message::new(
+            WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER,
+            "Setters must declare exactly one required positional parameter.",
+        )
+    }
+
+    /// Primary-constructor / extension-type representation-field recovery.
+    pub(crate) fn expected_representation_field() -> Message {
+        Message::new(
+            EXPECTED_REPRESENTATION_FIELD,
+            "Expected a representation field.",
+        )
+    }
+
+    /// A modifier (`final`/`var`/`late`/…) on a representation field.
+    pub(crate) fn representation_field_modifier(modifier: &str) -> Message {
+        Message::new(
+            REPRESENTATION_FIELD_MODIFIER,
+            format!("Representation fields can't have the modifier '{modifier}'."),
+        )
+    }
+
+    /// A second representation field in one extension type.
+    pub(crate) fn multiple_representation_fields() -> Message {
+        Message::new(
+            MULTIPLE_REPRESENTATION_FIELDS,
+            "Each extension type should have exactly one representation field.",
+        )
+    }
+
+    /// `this.x` field formal outside a constructor.
+    pub(crate) fn field_initializer_outside_constructor() -> Message {
+        Message::new(
+            FIELD_INITIALIZER_OUTSIDE_CONSTRUCTOR,
+            "Field formal parameters can only be used in a constructor.",
+        )
+    }
+
+    /// Statement-position junk the official `parseStatement` cannot shape.
+    pub(crate) fn missing_statement() -> Message {
+        Message::new(MISSING_STATEMENT, "Expected a statement.")
+    }
+
+    /// `parseTypedef` without a parameter list (issue 26073 recovery).
+    pub(crate) fn missing_typedef_parameters() -> Message {
+        Message::new(
+            MISSING_TYPEDEF_PARAMETERS,
+            "Typedefs must have an explicit list of parameters.",
+        )
+    }
+
+    /// `parseOperatorName` invalid operator name recovery.
+    pub(crate) fn invalid_operator(lexeme: &str) -> Message {
+        Message::new(
+            INVALID_OPERATOR,
+            format!("The string '{lexeme}' isn't a user-definable operator."),
+        )
+    }
+
+    /// `AstBuilder` `handleInvalidInitializer` (`C() : 3;`).
+    pub(crate) fn invalid_initializer() -> Message {
+        Message::new(INVALID_INITIALIZER, "Not a valid initializer.")
+    }
+
+    /// `@Annotation ()` — whitespace between the annotation name and `()`.
+    pub(crate) fn annotation_space_before_parenthesis() -> Message {
+        Message::new(
+            ANNOTATION_SPACE_BEFORE_PARENTHESIS,
+            "Annotations can't have spaces or comments before the parenthesis.",
+        )
+    }
+
+    /// `()` record literal with a trailing comma.
+    pub(crate) fn empty_record_literal_with_comma() -> Message {
+        Message::new(
+            EMPTY_RECORD_LITERAL_WITH_COMMA,
+            "A record literal without fields can't have a trailing comma.",
+        )
+    }
+
+    /// `case ()` — the empty record literal is not a constant pattern.
+    pub(crate) fn invalid_constant_pattern_empty_record_literal() -> Message {
+        Message::new(
+            INVALID_CONSTANT_PATTERN_EMPTY_RECORD_LITERAL,
+            "The empty record literal is not supported as a constant pattern.",
+        )
+    }
+
+    /// `AstBuilder` assignment-LHS validation (`(a) = 3` non-assignable).
+    pub(crate) fn illegal_assignment_to_non_assignable() -> Message {
+        Message::new(
+            ILLEGAL_ASSIGNMENT_TO_NON_ASSIGNABLE,
+            "Illegal assignment to non-assignable expression.",
+        )
+    }
+
+    /// `await`/`yield` consumed as an identifier inside an async function.
+    pub(crate) fn async_keyword_used_as_identifier() -> Message {
+        Message::new(
+            ASYNC_KEYWORD_USED_AS_IDENTIFIER,
+            "The keywords 'await' and 'yield' can't be used as identifiers in an asynchronous or generator function.",
+        )
+    }
+
+    /// A duplicated label on one switch member (`AstBuilder`).
+    pub(crate) fn duplicate_label_in_switch_statement(label: &str) -> Message {
+        Message::new(
+            DUPLICATE_LABEL_IN_SWITCH_STATEMENT,
+            format!("The label '{label}' was already used in this switch statement."),
+        )
+    }
+
+    /// `super` in an initializer but not a constructor call (`AstBuilder`).
+    pub(crate) fn invalid_super_in_initializer() -> Message {
+        Message::new(
+            INVALID_SUPER_IN_INITIALIZER,
+            "Can only use 'super' in an initializer for calling the superclass constructor (e.g. 'super()' or 'super.namedConstructor()')",
+        )
+    }
+
+    /// `this` in an initializer but not field init/redirection (`AstBuilder`).
+    pub(crate) fn invalid_this_in_initializer() -> Message {
+        Message::new(
+            INVALID_THIS_IN_INITIALIZER,
+            "Can only use 'this' in an initializer for field initialization (e.g. 'this.x = something') and constructor redirection (e.g. 'this()' or 'this.namedConstructor())",
+        )
+    }
+
+    /// `super?.foo` — null-aware access on `super` (parser recovery).
+    pub(crate) fn invalid_operator_questionmark_period_for_super() -> Message {
+        Message::new(
+            INVALID_OPERATOR_QUESTIONMARK_PERIOD_FOR_SUPER,
+            "The operator '?.' cannot be used with 'super' because 'super' cannot be null.",
+        )
+    }
+
+    /// `var` in a type position (`varAsTypeName`, identifier context).
+    pub(crate) fn var_as_type_name() -> Message {
+        Message::new(
+            VAR_AS_TYPE_NAME,
+            "The keyword 'var' can't be used as a type name.",
+        )
+    }
+
+    /// `<T>` on a constructor declaration.
+    pub(crate) fn type_parameter_on_constructor() -> Message {
+        Message::new(
+            TYPE_PARAMETER_ON_CONSTRUCTOR,
+            "Constructors can't have type parameters.",
+        )
+    }
+
+    /// `<T>` on an operator declaration.
+    pub(crate) fn type_parameter_on_operator() -> Message {
+        Message::new(
+            TYPE_PARAMETER_ON_OPERATOR,
+            "Types parameters aren't allowed when defining an operator.",
+        )
+    }
+
+    /// `var` where a function-typed parameter's return type sits (official
+    /// `parseFormalParameterModifiers` `GeneralizedFunctionType` arm).
+    pub(crate) fn function_typed_parameter_var() -> Message {
+        Message::new(
+            FUNCTION_TYPED_PARAMETER_VAR,
+            "Function-typed parameters can't specify 'const', 'final' or 'var' in place of a return type.",
+        )
+    }
+
+    /// `void f([int x = 1])` inside a function *type*.
+    pub(crate) fn default_value_in_function_type() -> Message {
+        Message::new(
+            DEFAULT_VALUE_IN_FUNCTION_TYPE,
+            "Parameters in a function type can't have default values.",
         )
     }
 

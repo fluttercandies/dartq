@@ -379,6 +379,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return end;
         }
 
+        // A reserved keyword cannot start a pattern element: official
+        // parsePrimary recovery reports the missing identifier and parses on
+        // with a synthetic name (CFE `case [if]` cascade).
+        if let TokenKind::Keyword(kw) = self.peek_kind()
+            && kw.style() == dartq_scanner::KeywordStyle::Reserved
+        {
+            let at = self.peek_span();
+            self.report(msg::missing_identifier(), at);
+            let synthetic = self.synthetic(TokenKind::Identifier, at.range.offset);
+            self.cursor.advance();
+            self.listener
+                .handle_identifier(synthetic, IdentifierContext::Expression);
+            self.is_last_pattern_allowed_inside_unary_pattern = true;
+            return synthetic;
+        }
+
         // Constant pattern (implicit const).
         self.listener.begin_constant_pattern(None);
         let end = self.parse_constant_expression(ConstantPatternContext::Implicit);

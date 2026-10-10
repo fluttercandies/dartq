@@ -296,6 +296,33 @@ pub enum IdentifierContext {
     PartNameContinuation,
 }
 
+impl IdentifierContext {
+    /// Contexts whose official `ensureIdentifier` runs
+    /// `checkAsyncAwaitYieldAsIdentifier` (`identifier_context_impl.dart`):
+    /// `await`/`yield` in these positions report
+    /// `async_keyword_used_as_identifier` inside async functions.
+    pub(crate) fn checks_async_keyword(self) -> bool {
+        matches!(
+            self,
+            Self::CatchParameter
+                | Self::ConstructorReference
+                | Self::ConstructorReferenceContinuationAfterTypeArguments
+                | Self::Expression
+                | Self::ExpressionContinuation
+                | Self::FormalParameterDeclaration
+                | Self::RecordFieldDeclaration
+                | Self::LocalFunctionDeclaration
+                | Self::LabelDeclaration
+                | Self::LabelReference
+                | Self::LocalVariableDeclaration
+                | Self::MetadataReference
+                | Self::MetadataContinuation
+                | Self::NamedArgumentReference
+                | Self::NamedRecordFieldReference
+        )
+    }
+}
+
 /// Experimental feature flag referenced by
 /// [`ParserListener::handle_experiment_not_enabled`]; mirrors the flags the
 /// parser consults (`ExperimentalFlag` in the SDK experiments registry).

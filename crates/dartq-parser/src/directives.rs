@@ -475,7 +475,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseCombinatorStar` :1207: `(hideCombinator |
     /// showCombinator)*`. Returns whether any combinator was seen. The
     /// `multipleCombinators` report is gated on the official
-    /// `single-combinators` experiment, which dartiq does not track (the
+    /// `single-combinators` experiment, which dartq does not track (the
     /// oracle lock has it disabled), so no report fires.
     pub(crate) fn parse_combinator_star(&mut self) -> bool {
         let begin = self.peek_span();
@@ -599,6 +599,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if self.peek_kind() != TokenKind::String {
             let at = self.peek_span();
             let lexeme = self.cursor.lexeme(at.id).to_owned();
+            // The 3.13 oracle surfaces both the shared-code expectedString
+            // and an unexpectedToken on the offending token.
+            self.report(msg::unexpected_token(&lexeme), at);
             self.report(msg::expected_string(&lexeme), at);
             let id = self
                 .cursor

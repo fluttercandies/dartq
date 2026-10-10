@@ -41,6 +41,10 @@ pub(crate) enum AsyncModifier {
 /// Construct with [`Parser::new`], drive with the grammar entry points
 /// ([`Parser::parse_unit`], [`Parser::parse_type_entry`],
 /// [`Parser::parse_pattern_entry`]).
+// The bool fields mirror the official parser's independent state variables
+// (lookahead latch, bail-out, constructor-formals context, …); folding them
+// into a flags word would obscure that one-to-one mapping.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Parser<'s, 't, L: ParserListener> {
     pub(crate) table: &'t TokenTable,
     pub(crate) cursor: TokenCursor<'s, 't>,
@@ -64,6 +68,11 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// Whether function-literal detection is active at the primary level
     /// (official `mayParseFunctionExpressions`, `parser_impl.dart:276`).
     pub(crate) may_parse_function_expressions: bool,
+    /// The constant-pattern context riding the operand parse (official
+    /// `constantPatternContext`); set by `parse_pattern_precedence`, reset to
+    /// `None` inside plain `parse_precedence`, read by the record-literal
+    /// parse for `invalid_constant_pattern_empty_record_literal`.
+    pub(crate) constant_pattern_ctx: crate::listener::ConstantPatternContext,
     /// `loopState`: break/continue admissibility of the enclosing construct.
     pub(crate) loop_state: crate::listener::LoopState,
     /// Augment token captured by a declaration-modifier walk, handed to the
@@ -75,6 +84,37 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// `DirectiveContext.state` (`directive_context.dart:20`): where the
     /// unit is in the directive prelude (ordering checks, #300).
     pub(crate) directive_state: crate::directives::DirectiveState,
+    /// Set while an `external` constructor's formal parameters parse:
+    /// `this.x` field formals report
+    /// `external_constructor_with_field_initializers` (`AstBuilder`
+    /// `endClassConstructor`, `ast_builder.dart:6160`).
+    pub(crate) external_ctor_field_formals: bool,
+    /// Set while a constructor's formal parameters parse: `this.x` field
+    /// formals there are legal; anywhere else the verifier reports
+    /// `field_initializer_outside_constructor` (`error_verifier.dart:5595`).
+    pub(crate) in_constructor_formals: bool,
+    /// Parameter count of the most recent formal-parameter group (the
+    /// `endFormalParameters` count); read by the setter's exactly-one-check
+    /// (`AstBuilder` `_ensureSetterFormalParameter`, `ast_builder.dart:6457`).
+    pub(crate) last_parameter_count: usize,
+    /// Set while an extension type's representation formals parse; the
+    /// accumulated shape drives the representation-field error codes
+    /// (analyzer `error_verifier` `_checkForExtensionTypeRepresentationErrorCodes`,
+    /// error_verifier.dart:5356-5460).
+    pub(crate) rep_field_check: Option<RepFieldCheck>,
+}
+
+/// Representation-field shape state for one extension type primary
+/// constructor (first parameter only, per the official check).
+#[derive(Default)]
+pub(crate) struct RepFieldCheck {
+    pub(crate) count: usize,
+    pub(crate) comma_after_first: Option<TokenSpan>,
+    pub(crate) delimiter: Option<TokenSpan>,
+    pub(crate) modifier: Option<TokenSpan>,
+    pub(crate) this_or_super: bool,
+    pub(crate) fn_typed: bool,
+    pub(crate) has_type: bool,
 }
 
 impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
@@ -98,10 +138,15 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             bailed: false,
             async_state: AsyncModifier::Sync,
             may_parse_function_expressions: true,
+            constant_pattern_ctx: crate::listener::ConstantPatternContext::None,
             loop_state: crate::listener::LoopState::OutsideLoop,
             pending_augment: None,
             currently_recovering: false,
             directive_state: crate::directives::DirectiveState::Unknown,
+            external_ctor_field_formals: false,
+            in_constructor_formals: false,
+            last_parameter_count: 0,
+            rep_field_check: None,
         }
     }
 
@@ -313,10 +358,15 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             bailed: self.bailed,
             async_state: self.async_state,
             may_parse_function_expressions: self.may_parse_function_expressions,
+            constant_pattern_ctx: self.constant_pattern_ctx,
             loop_state: self.loop_state,
             pending_augment: self.pending_augment,
             currently_recovering: self.currently_recovering,
             directive_state: self.directive_state,
+            external_ctor_field_formals: self.external_ctor_field_formals,
+            in_constructor_formals: self.in_constructor_formals,
+            last_parameter_count: self.last_parameter_count,
+            rep_field_check: None,
         }
     }
 }

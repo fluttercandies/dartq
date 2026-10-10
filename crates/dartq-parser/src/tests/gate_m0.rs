@@ -1,5 +1,5 @@
 //! M0-gate panic regressions (#322, #326): corpus files that crashed the
-//! dartiq-vs-oracle smoke waves (docs/audits/gate-m0/smoke-141{,-r2}/
+//! dartq-vs-oracle smoke waves (docs/audits/gate-m0/smoke-141{,-r2}/
 //! report.json) must flow through `parse_unit` without panicking.
 //!
 //! Three root-cause families, pinned verbatim (the files are official SDK

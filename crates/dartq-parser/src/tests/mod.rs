@@ -8,6 +8,7 @@ mod expressions;
 mod features;
 mod gate_m0;
 mod gate_m0_wave1;
+mod gate_m0_wave2;
 mod goldens;
 mod patterns;
 

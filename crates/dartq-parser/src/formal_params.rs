@@ -65,11 +65,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 TokenKind::OpenSquare => {
+                    if kind == MemberKind::PrimaryConstructor {
+                        let span = self.peek_span();
+                        if let Some(state) = self.rep_field_check.as_mut()
+                            && state.delimiter.is_none()
+                        {
+                            state.delimiter = Some(span);
+                        }
+                    }
                     let after = self.parse_optional_positional_parameters(kind);
                     end = self.ensure_close_paren(after);
                     break;
                 }
                 TokenKind::OpenCurly => {
+                    if kind == MemberKind::PrimaryConstructor {
+                        let span = self.peek_span();
+                        if let Some(state) = self.rep_field_check.as_mut()
+                            && state.delimiter.is_none()
+                        {
+                            state.delimiter = Some(span);
+                        }
+                    }
                     let after = self.parse_optional_named_parameters(kind);
                     end = self.ensure_close_paren(after);
                     break;
@@ -108,6 +124,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.parse_formal_parameter(FormalParameterKind::RequiredPositional, kind);
             match self.peek_kind() {
                 TokenKind::Comma => {
+                    if kind == MemberKind::PrimaryConstructor {
+                        let span = self.peek_span();
+                        if let Some(state) = self.rep_field_check.as_mut()
+                            && state.count == 1
+                            && state.comma_after_first.is_none()
+                        {
+                            state.comma_after_first = Some(span);
+                        }
+                    }
                     self.cursor.advance();
                 }
                 TokenKind::CloseParen => {
@@ -124,6 +149,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
         }
+        self.last_parameter_count = parameter_count;
         self.listener
             .end_formal_parameters(parameter_count, begin, end, kind);
         self.leave_depth();
@@ -282,17 +308,32 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     required.get_or_insert(t);
                 }
                 TokenKind::Keyword(Keyword::Covariant)
+                    if matches!(
+                        member_kind,
+                        MemberKind::ExtensionNonStaticMethod | MemberKind::ExtensionStaticMethod
+                    ) =>
+                {
+                    // `reportExtraneousModifierInExtension`
+                    // (modifier_context.dart:230, analyzer code
+                    // invalid_use_of_covariant_in_extension).
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    self.report(msg::invalid_use_of_covariant_in_extension("covariant"), t);
+                }
+                TokenKind::Keyword(Keyword::Covariant)
                     if !matches!(
                         member_kind,
                         MemberKind::StaticMethod
                             | MemberKind::TopLevelMethod
-                            | MemberKind::ExtensionNonStaticMethod
-                            | MemberKind::ExtensionStaticMethod
                             | MemberKind::ExtensionTypeNonStaticMethod
                             | MemberKind::ExtensionTypeStaticMethod
-                            | MemberKind::PrimaryConstructor
                     ) =>
                 {
+                    // PrimaryConstructor is accepted silently here: the 3.13
+                    // oracle consumes `covariant` in primary-constructor
+                    // formals without a covariant-specific diagnostic (the
+                    // `invalidCovariantModifierInPrimaryConstructor` check
+                    // postdates the oracle).
                     covariant.get_or_insert(self.peek_span());
                     self.cursor.advance();
                 }
@@ -312,6 +353,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.cursor.advance();
                     self.report(msg::extraneous_modifier("const"), t);
                 }
+                TokenKind::Keyword(Keyword::Required) if required.is_some() => {
+                    // `_parseRequired` recovery (modifier_context.dart:596).
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    self.report(msg::duplicated_modifier("required"), t);
+                }
                 TokenKind::Keyword(Keyword::Required) => {
                     let t = self.peek_span();
                     self.cursor.advance();
@@ -323,7 +370,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if member_kind == MemberKind::GeneralizedFunctionType
             && let Some(t) = var_final_or_const
         {
-            self.report(msg::function_type_default_value(), t);
+            self.report(msg::function_typed_parameter_var(), t);
         }
         self.listener.begin_formal_parameter(
             start,
@@ -359,6 +406,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 name_context = IdentifierContext::FieldInitializer;
                 if is_this {
                     this_keyword = Some(keyword);
+                    if self.external_ctor_field_formals {
+                        self.report(msg::external_constructor_with_field_initializers(), keyword);
+                    }
                 } else {
                     super_keyword = Some(keyword);
                 }
@@ -387,64 +437,106 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 name_context = IdentifierContext::FieldInitializer;
                 if is_this {
                     this_keyword = Some(keyword);
+                    if self.external_ctor_field_formals {
+                        self.report(msg::external_constructor_with_field_initializers(), keyword);
+                    }
                 } else {
                     super_keyword = Some(keyword);
                 }
             }
         }
 
-        // Inline function-typed parameter detection: `name` followed by
-        // `<...>` `(` or directly `(` (official checks the follower of the
-        // type+name, `parser_impl.dart:2221-2264` — a committed type never
-        // reaches the bare-`(` arm, so record-type parameters like
-        // `((Enum, Enum) r)` parse as type + name).
+        // Field formals are only legal in constructor formals; anywhere else
+        // the verifier reports `field_initializer_outside_constructor` at the
+        // `this` keyword (error_verifier.dart:5595; primary constructors are
+        // exempt via `PrimaryConstructorDeclaration`).
+        if let Some(kw) = this_keyword
+            && member_kind != crate::listener::MemberKind::PrimaryConstructor
+            && !self.in_constructor_formals
+        {
+            self.report(msg::field_initializer_outside_constructor(), kw);
+        }
+
+        // Inline function-typed parameter detection (official :2221-2264):
+        // the token after the type is the tentative name; its `<...>(` or
+        // direct `(` follower makes this an inline function-typed parameter
+        // (a committed type never reaches the bare-`(` arm, so record-type
+        // parameters like `((Enum, Enum) r)` parse as type + name).
         let mut before_inline_function_type: Option<TokenSpan> = None;
+        let mut inline_name: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
-        if self.peek_kind() == TokenKind::Lt {
-            type_param = self.compute_type_param_or_arg_on_lt(false);
-            if !matches!(type_param, TypeParamOrArg::None) {
-                let closer = type_param.skip(self.peek_id());
-                if self.kind_at(self.offset_of(closer) + 1) == TokenKind::OpenParen {
+        if this_keyword.is_none() {
+            let before_name = self.cursor.mark();
+            type_info.skip_type_raw(self);
+            let tentative_name = is_identifier(self.peek_kind());
+            let mut shape_matched = false;
+            if tentative_name {
+                let follower = self.cursor.look_kind(1);
+                let name = self.peek_span();
+                if follower == TokenKind::Lt {
+                    self.cursor.advance();
+                    type_param = self.compute_type_param_or_arg_on_lt(false);
+                    if !matches!(type_param, TypeParamOrArg::None) {
+                        let closer = type_param.skip(self.peek_id());
+                        if self.kind_at(self.offset_of(closer) + 1) == TokenKind::OpenParen {
+                            shape_matched = true;
+                        }
+                    }
+                } else if follower == TokenKind::OpenParen {
+                    shape_matched = true;
+                }
+                if shape_matched {
                     if let Some(t) = var_final_or_const
                         && member_kind != MemberKind::PrimaryConstructor
                     {
-                        self.report(msg::function_type_default_value(), t);
+                        self.report(msg::function_typed_parameter_var(), t);
                     }
-                    before_inline_function_type = Some(self.peek_span());
+                    inline_name = Some(name);
+                    before_inline_function_type = Some(name);
                 }
-            }
-        } else if self.peek_kind() == TokenKind::OpenParen
-            && this_keyword.is_none()
-            && matches!(type_info, TypeInfo::NoType)
-        {
-            if let Some(t) = var_final_or_const
-                && member_kind != MemberKind::PrimaryConstructor
+            } else if self.peek_kind() == TokenKind::OpenParen
+                && matches!(type_info, TypeInfo::NoType)
             {
-                self.report(msg::function_type_default_value(), t);
+                if let Some(t) = var_final_or_const
+                    && member_kind != MemberKind::PrimaryConstructor
+                {
+                    self.report(msg::function_typed_parameter_var(), t);
+                }
+                before_inline_function_type = Some(self.peek_span());
             }
-            before_inline_function_type = Some(self.peek_span());
+            // The unified parse below re-walks from the type start (official
+            // `parseType(beforeType)`).
+            self.cursor.reset(before_name);
         }
 
         let mut var_or_final = None;
         if let Some(t) = var_final_or_const {
+            // `var`/`final` stay silent here (official :2271-2277 gates the
+            // extraneousModifier report on the primary-constructors feature,
+            // which the gate oracle does not enable); `const` was already
+            // reported in the modifier walk.
             let is_var = self.cursor.lexeme(t.id) == "var";
             let is_final = self.cursor.lexeme(t.id) == "final";
-            if (is_var || is_final) && member_kind != MemberKind::PrimaryConstructor {
-                self.report(msg::extraneous_modifier(self.cursor.lexeme(t.id)), t);
-            }
             if is_var || is_final {
                 var_or_final = Some(t);
+                if is_var && !matches!(type_info, TypeInfo::NoType) {
+                    self.report(msg::var_and_type(), t);
+                }
             }
         }
 
         if let Some(before) = before_inline_function_type {
-            // The `<...>` variables were already computed above when the
-            // shape started with `<`; parse them now.
+            // Official :2294-2331: re-walk the return type, then the
+            // name-relative type variables, then the parameter list.
             self.listener.begin_function_typed_formal_parameter(before);
+            type_info.parse_type(self);
+            if self.peek_kind() != TokenKind::Lt && self.peek_kind() != TokenKind::OpenParen {
+                // Step over the name onto its `<...>`/`(` suffix.
+                self.cursor.advance();
+            }
             if !matches!(type_param, TypeParamOrArg::None) {
                 type_param.parse_variables(self, false);
             }
-            type_info.parse_type(self);
             let after_params =
                 self.parse_formal_parameters_required_opt(MemberKind::FunctionTypedParameter);
             let mut question = None;
@@ -466,7 +558,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
 
         // Name.
-        let name = if in_function_type
+        let name = if let Some(n) = inline_name {
+            n
+        } else if in_function_type
             && !matches!(
                 parameter_kind,
                 FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
@@ -501,18 +595,40 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     initializer_end.unwrap(),
                     parameter_kind,
                 );
+                // Official :2386-2395: required-positional default reports
+                // `requiredParameterWithDefault`; optional-positional `:`
+                // reports `positionalParameterWithEquals`; function-typed
+                // contexts report `functionTypeDefaultValue`.
                 if parameter_kind == FormalParameterKind::RequiredPositional {
                     self.report(msg::required_parameter_with_default(), equals);
                 } else if parameter_kind == FormalParameterKind::OptionalPositional
                     && separator == TokenKind::Colon
                 {
                     self.report(msg::positional_parameter_with_equals(), equals);
+                } else if in_function_type
+                    || member_kind == MemberKind::FunctionTypeAlias
+                    || member_kind == MemberKind::FunctionTypedParameter
+                {
+                    self.report(msg::default_value_in_function_type(), equals);
                 }
             }
             _ => {
                 let next = self.peek_span();
                 self.listener.handle_formal_parameter_without_value(next);
             }
+        }
+        // Representation-field shape (extension type primary constructor
+        // only; nested function-typed formals use a different member kind).
+        if let Some(state) = self.rep_field_check.as_mut()
+            && member_kind == MemberKind::PrimaryConstructor
+        {
+            if state.count == 0 {
+                state.modifier = var_final_or_const;
+                state.this_or_super = this_keyword.is_some() || super_keyword.is_some();
+                state.fn_typed = before_inline_function_type.is_some();
+                state.has_type = !matches!(type_info, TypeInfo::NoType);
+            }
+            state.count += 1;
         }
         self.listener.end_formal_parameter(
             var_or_final,

@@ -64,7 +64,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if has_type_arguments && self.peek_kind() != TokenKind::OpenParen {
             self.report(msg::annotation_with_type_arguments_uninstantiated(), name);
         }
-        let end = self.parse_arguments_opt_metadata(has_type_arguments);
+        // `parseArgumentsOptMetadata` (parser_impl.dart:9459): the argument
+        // list must hug the annotation name; a gap only recovers as arguments
+        // when the parse requires them (type arguments) or the follower is a
+        // reserved `class`/`enum` head.
+        #[allow(clippy::cast_possible_truncation)]
+        let prev = self.cursor.real_pos().saturating_sub(1) as crate::token_id::TokenId;
+        let prev_span = self.cursor.span(prev);
+        let name_end = prev_span.offset + prev_span.length;
+        let adjacent =
+            self.peek_kind() == TokenKind::OpenParen && self.peek_span().range.offset == name_end;
+        let end = self.parse_arguments_opt_metadata(has_type_arguments, adjacent);
         self.listener.end_metadata(at, period, end);
         end
     }
@@ -73,12 +83,39 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         crate::recovery::is_identifier(self.cursor.peek_kind_ahead(n))
     }
 
-    /// Official `parseArgumentsOptMetadata` (:9460): optional argument list;
-    /// with type arguments the list is required.
-    fn parse_arguments_opt_metadata(&mut self, has_type_arguments: bool) -> TokenSpan {
+    /// Official `parseArgumentsOptMetadata` (:9459): optional argument list;
+    /// with type arguments the list is required. A spaced `(` only parses as
+    /// the annotation's arguments when required (`has_type_arguments`) or
+    /// when a `class`/`enum` declaration follows the group.
+    fn parse_arguments_opt_metadata(
+        &mut self,
+        has_type_arguments: bool,
+        adjacent: bool,
+    ) -> TokenSpan {
         if self.peek_kind() != TokenKind::OpenParen {
+            let next = self.peek_span();
+            self.listener.handle_no_arguments(next);
+            return next;
+        }
+        if !adjacent {
             if has_type_arguments {
-                // Reported above via `annotation_with_type_arguments_uninstantiated`.
+                // Required arguments: report + parse anyway (:9473).
+                self.report(msg::annotation_space_before_parenthesis(), self.peek_span());
+                return self.parse_arguments_rest();
+            }
+            let open_id = self.peek_id();
+            if let Some(close) = self.cursor.table_matching_end(open_id) {
+                let after = self.kind_at(self.offset_of(close) + 1);
+                if matches!(
+                    after,
+                    TokenKind::Keyword(
+                        dartq_scanner::Keyword::Class | dartq_scanner::Keyword::Enum
+                    )
+                ) {
+                    // Recovery is unambiguous before `class`/`enum` (:9480-9486).
+                    self.report(msg::annotation_space_before_parenthesis(), self.peek_span());
+                    return self.parse_arguments_rest();
+                }
             }
             let next = self.peek_span();
             self.listener.handle_no_arguments(next);

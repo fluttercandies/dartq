@@ -367,6 +367,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     // leading `>` is this group's own (raw).
                     return Some((self.real_id(scan), recovered, is_compound_closer(here)));
                 }
+                // Official computeType(required) recovery: `var` as a type
+                // entry, accepted before `<`/`,`/`>` (type_info.dart:210-217,
+                // `computeBuiltinOrVarAsType`); the parse reports
+                // `var_as_type_name` through the type-reference ensure.
+                if here == TokenKind::Keyword(Keyword::Var)
+                    && matches!(
+                        self.kind_at(scan + 1),
+                        TokenKind::Lt | TokenKind::Comma | TokenKind::Gt
+                    )
+                {
+                    recovered = true;
+                    scan += 1;
+                    continue;
+                }
                 if scan == lt_offset + 1 && !in_declaration {
                     return None;
                 }
