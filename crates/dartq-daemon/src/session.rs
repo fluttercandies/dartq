@@ -61,6 +61,17 @@
 //! engine turn answers its requests `INTERNAL_ERROR` and the session
 //! survives instead of taking the process down.
 //!
+//! The panic boundary holds no lock: the session owns the engine
+//! exclusively and every engine call runs on the main-loop thread through
+//! `&mut self`, so a panic cannot poison a shared mutex and there is
+//! nothing to recover with `into_inner`. What a panic taints is engine
+//! state, so the boundary treats it as untrusted for the rest of the turn
+//! — the remaining view groups answer `INTERNAL_ERROR` without analyzing,
+//! and a best-effort base restore (itself panic-contained) hands the next
+//! turn the cleanest view achievable. Nothing is masked: the panic is
+//! logged to stderr with its payload, and the affected requests see the
+//! internal-error tier.
+//!
 //! # Tier mapping (PRD §16.5 — the one place it is defined)
 //!
 //! A task's [`Tier`] is fixed where it enters the scheduler, at enqueue: a
@@ -288,6 +299,11 @@ pub struct Session {
     /// The workspace root the context was assembled from (relative
     /// `dartq/*` request paths resolve against it).
     workspace_root: PathBuf,
+    /// The resolved SDK root the context was assembled from —
+    /// `dartq/explain`'s default when its request omits `sdk` (the session
+    /// analyzes against this SDK, so the report must come from the same
+    /// one).
+    sdk_root: PathBuf,
     next_cookie: u64,
     /// Open overlay documents: last-known client version per path. A closed
     /// or never-opened file is absent — publishes then carry no version.
@@ -363,12 +379,14 @@ impl Session {
 
     fn assemble(config: EngineConfig, store: Option<SnapshotStore>) -> Result<Self, EngineError> {
         let mut runtime = Runtime::new();
-        // The context's workspace root (`config_dir` = root/.dart_tool);
-        // captured before the config moves into the context.
+        // The context's workspace root (`config_dir` = root/.dart_tool) and
+        // the resolved SDK root; both captured before the config moves into
+        // the context.
         let workspace_root = config
             .config_dir
             .parent()
             .map_or_else(Default::default, Path::to_path_buf);
+        let sdk_root = config.sdk.dart_sdk_root().to_path_buf();
         let context = runtime.open_context(ContextConfig {
             engine: config,
             flags: 0,
@@ -377,6 +395,7 @@ impl Session {
             runtime,
             context,
             workspace_root,
+            sdk_root,
             next_cookie: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
@@ -875,18 +894,37 @@ impl Session {
             turn.publishes
                 .extend(self.plan_publishes(&diagnostics, &converted));
         }
-        let entries: Vec<lsp::AnalyzeEntry> = diagnostics
+        // dartq/analyze answers keep the CLI analyze face's printed order
+        // (severity-first before writing; the twin key lives in dartq-cli's
+        // analyze runner): severity, path bytes, offset, message — not the
+        // engine's canonical (file, offset) order the other faces mirror.
+        // The entries pair with their engine diagnostics for the sort key,
+        // then strip.
+        let mut paired: Vec<(&Diagnostic, &Path, lsp::AnalyzeEntry)> = diagnostics
             .iter()
             .zip(converted)
-            .filter_map(|(engine_diag, converted)| {
-                let diagnostic = converted?;
-                let path = self.engine().file_table().path(engine_diag.file)?;
-                Some(lsp::AnalyzeEntry {
-                    uri: uri::from_path(path),
+            .filter_map(|(diagnostic, converted)| {
+                let converted = converted?;
+                let path = self.engine().file_table().path(diagnostic.file)?;
+                Some((
                     diagnostic,
-                })
+                    path,
+                    lsp::AnalyzeEntry {
+                        uri: uri::from_path(path),
+                        diagnostic: converted,
+                    },
+                ))
             })
             .collect();
+        paired.sort_by(|(a, a_path, _), (b, b_path, _)| {
+            analyze_severity_rank(a.severity)
+                .cmp(&analyze_severity_rank(b.severity))
+                .then_with(|| analyze_path_key(a_path).cmp(analyze_path_key(b_path)))
+                .then_with(|| a.range.offset.cmp(&b.range.offset))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        let entries: Vec<lsp::AnalyzeEntry> =
+            paired.into_iter().map(|(_, _, entry)| entry).collect();
         let agent_changed: Option<Vec<(PathBuf, u64)>> = agent.map(|agent| {
             self.agents[agent]
                 .files
@@ -904,6 +942,7 @@ impl Session {
         let mut drain = commands::Drain {
             engine,
             root: &self.workspace_root,
+            sdk_root: &self.sdk_root,
             diagnostics: &diagnostics,
             entries: &entries,
             changes: &changes,
@@ -1174,6 +1213,23 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("opaque panic payload")
+}
+
+/// The CLI analyze face's severity precedence (the twin of dartq-cli's
+/// `severity_rank`, which sorts its diagnostics before writing): errors,
+/// then warnings, then infos.
+fn analyze_severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Info => 2,
+    }
+}
+
+/// Plain byte key of a path — the twin of dartq-cli's `path_key` (the
+/// oracle's `filePath.compareTo` order) for the analyze answer's sort.
+fn analyze_path_key(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
 }
 
 #[cfg(test)]
@@ -2384,6 +2440,71 @@ mod tests {
         assert!(matches!(&turn.answers[0].1, Ok(_)));
     }
 
+    /// The same bound under agent-overlay churn (the store-hygiene ticket's
+    /// shape): distinct agent overlays driven through turns cross the
+    /// threshold — each wear/restore cycle leaves the agent's content dead
+    /// in the shared store — the turn-boundary sweep evicts it, and a
+    /// still-active agent's next turn answers correctly after the sweeps.
+    #[test]
+    fn agent_overlay_churn_is_swept_at_the_turn_boundary() {
+        let (workspace, mut session) = fixture("agent-overlay-gc-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // One distinct content per agent: N agents accumulate N garbage
+        // contents across their turns.
+        let count = GC_CONTENTS_THRESHOLD + 8;
+        for index in 0..count {
+            let agent = format!("agent-{index}");
+            session
+                .set_overlay(
+                    &agent,
+                    vec![(
+                        main.clone(),
+                        format!("void agent() {{}} // {index}\n").into_bytes(),
+                    )],
+                )
+                .expect("under the agent cap");
+            session.queue_command(
+                RequestId::Num(i64::try_from(index).expect("index fits i64") + 2),
+                Request::Analyze {
+                    verbosity: Verbosity::Compact,
+                    agent: Some(agent),
+                },
+            );
+            let turn = session.service();
+            assert!(
+                turn.answers[0].1.is_ok(),
+                "agent {index} answers: {:?}",
+                turn.answers[0]
+            );
+        }
+        let contents = session.overlay_store_contents();
+        assert!(
+            contents <= GC_CONTENTS_THRESHOLD + 4,
+            "the turn-boundary sweep bounds the store: {contents} contents after {count} \
+             agent overlays"
+        );
+
+        // A still-active agent's next turn is correct after the sweeps: the
+        // view materializes again from its staged overlay.
+        session.queue_command(
+            RequestId::Num(10_000),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: Some(format!("agent-{}", count - 1)),
+            },
+        );
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Ok(_)),
+            "the still-active agent answers after the sweeps: {:?}",
+            turn.answers[0]
+        );
+    }
+
     /// The live-agent cap: one more overlay than the cap answers
     /// INVALID_PARAMS until one is cleared.
     #[test]
@@ -2412,5 +2533,106 @@ mod tests {
         session
             .set_overlay("overflow", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
             .expect("a cleared slot frees room");
+    }
+
+    /// dartq/analyze answers follow the CLI's severity-first printed order
+    /// (severity, path bytes, offset, message — the analyze face's sort),
+    /// not the engine's canonical (file, offset) order the other faces
+    /// mirror: the fixture's file order (a.dart before b.dart) disagrees
+    /// with severity-first, and the answer still puts b.dart's error first.
+    #[test]
+    fn analyze_answers_sort_severity_first_like_the_cli() {
+        let workspace = Workspace::new(CLEAN_MAIN);
+        // a.dart sorts first and carries only a static warning.
+        fs::write(
+            workspace.path("lib/a.dart"),
+            "class C { void m() {} } void f(C c) { c?.m(); }\n",
+        )
+        .expect("write a.dart");
+        // b.dart carries the URI-layer error.
+        fs::write(
+            workspace.path("lib/b.dart"),
+            "import 'missing.dart';\nvoid main() {}\n",
+        )
+        .expect("write b.dart");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("analyze-order-unit")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_store(workspace.engine_config(), store).expect("session");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
+        assert_eq!(entries.len(), 2, "the warning plus the error: {entries:?}");
+        assert_eq!(
+            entries[0]["uri"],
+            uri::from_path(&workspace.path("lib/b.dart")),
+            "the error sorts first despite b.dart sorting second: {entries:?}"
+        );
+        assert_eq!(entries[0]["severity"], 1, "error first");
+        assert_eq!(
+            entries[1]["uri"],
+            uri::from_path(&workspace.path("lib/a.dart")),
+            "the warning follows: {entries:?}"
+        );
+        assert_eq!(entries[1]["severity"], 2, "warning second");
+    }
+
+    /// dartq/explain's `sdk` default is the session's resolved SDK root: a
+    /// request without `sdk` still answers (the per-query engine assembles
+    /// against the SDK the session itself runs on), and an explicit `sdk`
+    /// stays authoritative — a bogus root is the usage tier.
+    #[test]
+    fn explain_sdk_defaults_to_the_session_root_and_explicit_wins() {
+        let (workspace, mut session) = fixture("explain-sdk-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Absent `sdk`: the session's root backs the report.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Explain {
+                symbol: "main".into(),
+                verbosity: Verbosity::Compact,
+                since: None,
+                sdk: None,
+            },
+        );
+        let turn = session.service();
+        let report = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the session SDK backs the report");
+        assert_eq!(report["declaration"]["name"], "main");
+
+        // Explicit `sdk` is authoritative: a bogus root fails loudly.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Explain {
+                symbol: "main".into(),
+                verbosity: Verbosity::Compact,
+                since: None,
+                sdk: Some(workspace.path("no-such-sdk")),
+            },
+        );
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Err(SessionError::InvalidParams(_))),
+            "a bogus explicit sdk answers INVALID_PARAMS: {:?}",
+            turn.answers[0]
+        );
     }
 }

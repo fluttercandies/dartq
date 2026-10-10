@@ -82,8 +82,9 @@
 //! against the session's workspace root (the CLI resolves them against the
 //! process cwd). The CLI's `$DART_SDK` fallback has no daemon equivalent:
 //! `dartq/compat` requires explicit `sdk_roots`, and `dartq/explain` takes
-//! an optional `sdk` root per query (absent falls back to `$DART_SDK`, the
-//! CLI's default).
+//! an optional `sdk` root per query — absent resolves to the session's own
+//! SDK root (the SDK the analyzed view was assembled against); the
+//! `$DART_SDK` fallback stays the CLI path's business.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -153,7 +154,8 @@ pub(crate) enum Request {
     },
     /// The §15.3 report over a per-query disk engine (the visibility
     /// table's `dartq/explain` row): no `agent` field by construction, and
-    /// `sdk` because the daemon retains no SDK root.
+    /// `sdk` — an explicit value is authoritative; absent defaults to the
+    /// session's resolved SDK root.
     Explain {
         symbol: String,
         verbosity: Verbosity,
@@ -228,8 +230,8 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         symbol: String,
         #[serde(default)]
         verbosity: Verbosity,
-        /// The per-query SDK root; the daemon retains none (the CLI's
-        /// `$DART_SDK` fallback applies when absent).
+        /// The per-query SDK root; absent defaults to the session's
+        /// resolved SDK root (an explicit value wins).
         sdk: Option<PathBuf>,
     }
     #[derive(Deserialize)]
@@ -602,6 +604,10 @@ pub(crate) struct Drain<'a> {
     pub engine: &'a dartq_engine::Engine,
     /// The session workspace root (relative-path resolution).
     pub root: &'a Path,
+    /// The session's resolved SDK root — `dartq/explain`'s default when its
+    /// request omits `sdk` (the session analyzes against this SDK, so the
+    /// report must come from the same one).
+    pub sdk_root: &'a Path,
     /// The analyzed view's raw diagnostic set (engine-canonical order).
     pub diagnostics: &'a [dartq_diagnostics::Diagnostic],
     /// The shared analyze entries (uri + converted LSP diagnostic per
@@ -699,7 +705,10 @@ fn delta_row(
 /// The merged diagnostic set of the analyzed view. Compact keeps the
 /// entry shape (uri + LSP diagnostic); minimal keeps the red line (code +
 /// location, here `uri` + `range`); full equals compact plus the short-id
-/// economics over entry URIs.
+/// economics over entry URIs. Rows keep the CLI analyze face's
+/// severity-first printed order (the entries are sorted where the read
+/// task builds them); the other faces mirror the engine's canonical
+/// (file, offset) order.
 pub(crate) fn analyze_answer(drain: &mut Drain<'_>, verbosity: Verbosity) -> Value {
     let diagnostics: Vec<Value> = drain
         .entries
@@ -981,6 +990,8 @@ const EXPLAIN_SPOTS: &[(&str, &str)] = &[
 /// filters the sections that name use/import/test files by the session's
 /// written-file cursors and echoes the current cursor. The report is born
 /// schema-valid (validated against `Domain::Explain` where it is built).
+/// The request's explicit `sdk` is authoritative; absent, the session's
+/// own SDK root backs the report.
 ///
 /// # Errors
 ///
@@ -993,6 +1004,7 @@ fn explain_answer(
     since: Option<u64>,
     sdk: Option<&Path>,
 ) -> Result<Value, SessionError> {
+    let sdk = sdk.or(Some(drain.sdk_root));
     let mut report = explain_core(drain.root, sdk, symbol, verbosity).map_err(|error| match error {
         ExplainError::Workspace(_) | ExplainError::Engine(_) => {
             SessionError::InvalidParams(error.to_string())
