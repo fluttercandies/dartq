@@ -6,8 +6,10 @@ coding agents as its first-class users: machine-readable output, incremental
 re-analysis, a bounded memory footprint, and multi-SDK support. The official
 Dart analyzer is the semantic oracle — dartq replicates its diagnostics and
 exceeds its performance envelope, and every semantic claim is validated by
-differential testing against `dart analyze`. See `PRD.md` for the full
-design document.
+differential testing against `dart analyze`. The governing charter fixes
+the priority order once: correctness against the oracle is the
+non-negotiable floor, and above that floor extreme performance and a
+bounded memory footprint outrank every other consideration.
 
 ## Design Pillars
 
@@ -172,9 +174,8 @@ cache:
 
 ## Performance
 
-End-to-end numbers come from the benchmark reports under
-`docs/audits/bench/`, measured over the M0 corpus (279 files, 22,656 LOC)
-with **debug builds** of `dartq check` — labeled as measured, not
+End-to-end numbers are measured over the M0 corpus (279 files, 22,656
+LOC) with **debug builds** of `dartq check` — labeled as measured, not
 projected:
 
 | Metric | dartq | Comparison |
@@ -203,9 +204,10 @@ small edits.
 
 ## Architecture
 
-One-way layering, one crate per concern. 25 workspace crates plus the
-differential-testing harness. Status = what ships through the CLI/daemon
-faces today:
+One-way layering, one crate per concern. 25 `dartq-*` workspace crates,
+plus the differential-testing harness and the corpus generator
+(`tools/corpus-gen`). Status = what ships through the CLI/daemon faces
+today:
 
 | Layer | Crate | Role | Status |
 | --- | --- | --- | --- |
@@ -231,7 +233,9 @@ faces today:
 | Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (64 official core/recommended rules) | rules implemented; CLI wiring pending |
 | Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin protocol v1 IPC types: frames, codec, handshake, manifest | protocol landed; core spawn pending |
 | Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | landed |
+| Interface | [`dartq-commands`](crates/dartq-commands) | Per-command cores shared by the CLI and daemon faces: plain parameters in, typed results out — no parsing, printing, or exit codes | landed |
 | Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | landed |
+| Interface | [`dartq-daemon`](crates/dartq-daemon) | LSP 3.17 server over stdin/stdout: turn batching, overlay edits, plugin host, `dartq/*` methods, publish pushes | landed |
 | Testing | [`harness`](tests/harness) | Differential-testing driver: oracle vs dartq over shared corpora, `(code, file)` Jaccard comparison | landed |
 
 `crates/dartq-plugin-host/` is the host-side Dart package of the plugin
@@ -329,7 +333,11 @@ Honest state of the current tree:
 
 ## Publication
 
-dartq is not published to crates.io — build from source.
+dartq is not yet published to crates.io — build from source. Publication
+is the deliberate destination, and the tree is prepared for it: one
+workspace-level version/license declaration, frozen v1 output schemas
+behind `schema_version`, and a committed `Cargo.lock` for reproducible
+builds.
 
 ## Development Gates
 

@@ -1,7 +1,10 @@
 # dartq_plugin_host
 
-Host-side Dart package of the dartq plugin protocol (PRD section 14, M4
-milestone). The dartq core spawns one process running
+Host-side Dart package of the dartq plugin protocol: newline-delimited
+JSON frames over stdio, a versioned handshake with capability negotiation,
+and diagnostic/fix notifications between the dartq core (the client) and
+one spawned process per plugin (the server). The dartq core spawns one
+process running
 `bin/dartq_plugin_host.dart` per plugin; the process speaks the wire contract
 specified by the Rust crate `dartq-plugin` (`crates/dartq-plugin`, the single
 source of truth for the protocol) and hosts third-party plugins behind an
@@ -18,7 +21,7 @@ contains no `Cargo.toml`, and the workspace member list in the root
 - `lib/src/capabilities.dart` — capability vocabulary; the effective set is
   the intersection of both handshake sides (mirrors `capability.rs`).
 - `lib/src/plugin_config.dart` — the `dartq_plugin.json` manifest as a value
-  object with PRD section 14.3 defaults (mirrors `manifest.rs`).
+  object carrying the protocol's manifest defaults (mirrors `manifest.rs`).
 - `lib/src/plugin_session.dart` — the server role of the handshake state
   machine (mirrors `session.rs`, the client role).
 - `lib/src/plugin.dart`, `lib/src/registry.dart`, `lib/src/edits.dart` — the
