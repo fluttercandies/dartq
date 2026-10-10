@@ -81,7 +81,7 @@ class CapabilitySet {
       other._caps.every(_caps.contains);
 
   @override
-  int get hashCode => Object.hashAll(_caps);
+  int get hashCode => Object.hashAllUnordered(_caps);
 
   @override
   String toString() => 'CapabilitySet(${names().join(', ')})';

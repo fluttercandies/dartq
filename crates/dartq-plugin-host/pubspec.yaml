@@ -2,3 +2,5 @@ name: dartq_plugin_host
 description: Host-side Dart package of the dartq plugin protocol (PRD section 14). Not part of the Cargo workspace.
 environment:
   sdk: ^3.10.0
+dev_dependencies:
+  test: ^1.25.0
