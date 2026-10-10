@@ -75,6 +75,17 @@ pub(crate) fn apply(
                     // The maintained index inputs drop with residency: a
                     // removed file's capture must not serve a later query.
                     state.captures.remove(&file);
+                    // The canonical-URI memo drops with residency too
+                    // (bounded, audit #398 F10 — the map previously grew
+                    // monotonically with every path ever resident). Eviction
+                    // is safe because `reform_libraries` is its only reader:
+                    // it lazily recomputes the entry for every resident file
+                    // before reading it, and the recompute is a pure function
+                    // of the file's immutable interned path (the package
+                    // table and config dir are fixed at state assembly), so
+                    // a returning file reproduces the identical string and
+                    // no library identity can fork across the gap.
+                    state.canonical_uris.remove(&file);
                     removed.push(file);
                 }
             }
@@ -439,10 +450,10 @@ fn compute_unit(
 /// cached on the facts — never a per-query cost.
 fn unit_signature(
     elements: &dartq_semantic::FileElements,
-    directive_face: &str,
+    directive_face: &[u8],
     strings: &StringTable,
 ) -> dartq_semantic::ApiSignature {
-    elements.api_signature_with_directives(strings, directive_face.as_bytes())
+    elements.api_signature_with_directives(strings, directive_face)
 }
 
 /// The directive-region lexemes: every token the diet walk consumed
@@ -454,12 +465,20 @@ fn unit_signature(
 /// Resolution outcomes are deliberately absent: a target's residency is the
 /// *other* file's face, and importing it must not re-seed this file's
 /// importers.
-fn directive_face(text: &str, tokens: &TokenTable, region_end: usize) -> String {
-    let mut face = String::new();
+///
+/// Framing is a length prefix (audit #398 F12): per lexeme, the byte length
+/// as a little-endian `u64`, then the lexeme's UTF-8 bytes. The face is
+/// injective over the lexeme sequence — the retired `\u{1}` separator
+/// aliased whenever a lexeme itself carried U+0001 (a raw control character
+/// inside a directive's string literal is legal source). The face is only
+/// ever hashed, so bare bytes suffice.
+fn directive_face(text: &str, tokens: &TokenTable, region_end: usize) -> Vec<u8> {
+    let mut face = Vec::new();
     for i in 0..region_end {
         if tokens.get(i).is_some() {
-            face.push_str(tokens.lexeme(text, i));
-            face.push('\u{1}');
+            let lexeme = tokens.lexeme(text, i);
+            face.extend_from_slice(&(lexeme.len() as u64).to_le_bytes());
+            face.extend_from_slice(lexeme.as_bytes());
         }
     }
     face
@@ -1178,7 +1197,8 @@ fn reform_and_close(
 /// Formation: defining files (no `part of`) each own a library keyed on
 /// their canonical URI; their `part` targets that are themselves part files
 /// join in directive order (first claim wins on conflicts, precedence by
-/// canonical URI — `duplicate_part` is a diagnostic ticket's business). Part
+/// interned path bytes — the oracle's path-smallest claimant;
+/// `duplicate_part` is a diagnostic ticket's business). Part
 /// files claimed by nobody become singleton libraries. Every resident file
 /// belongs to exactly one library (engine-api-spec §1.2). Returns whether
 /// any library was retired (a structure-graph input).
@@ -1201,11 +1221,14 @@ fn reform_libraries(state: &mut EngineState) -> bool {
         }
     }
 
-    // Pass A: defining libraries. Claim precedence is the canonical-URI byte
+    // Pass A: defining libraries. Claim precedence is the interned-path byte
     // order (the oracle picks the path-smallest claiming library,
-    // file_state.dart:2176-2192): `FileId` interning order differs between
-    // the incremental and full arms when files are created mid-sequence, so
-    // it would fork the winner when two libraries include the same part.
+    // file_state.dart:2176-2192). Both prior keyings would fork that winner:
+    // `FileId` interning order differs between the incremental and full arms
+    // when files are created mid-sequence, and canonical-URI bytes reorder
+    // percent-encoded paths (a space sorts below `!` as a path, above it as
+    // `%20` in a URI) — so the sort keys on the path itself, the FileTable's
+    // own universe (#287), stable across arms.
     let mut defining: Vec<(FileId, LibraryId)> = Vec::new();
     let mut is_part: FxHashSet<FileId> = FxHashSet::default();
     for file in &resident {
@@ -1216,7 +1239,15 @@ fn reform_libraries(state: &mut EngineState) -> bool {
             defining.push((*file, id));
         }
     }
-    defining.sort_unstable_by(|a, b| state.canonical_uris[&a.0].cmp(&state.canonical_uris[&b.0]));
+    defining.sort_unstable_by(|a, b| {
+        let path_bytes = |file: FileId| {
+            state
+                .files
+                .path(file)
+                .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+        };
+        path_bytes(a.0).cmp(path_bytes(b.0))
+    });
 
     // Pass B: attach parts (directive order, first claim wins). Belonging
     // follows the part-of form (analyzer file_state.dart:2087-2266): a
@@ -1520,4 +1551,255 @@ fn close(
     let mut invalidated: Vec<LibraryId> = dirty.into_iter().collect();
     invalidated.sort_unstable();
     invalidated
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
+    use dartq_sdk::SdkSnapshot;
+
+    use super::*;
+
+    /// A throwaway one-package workspace ("t") with a synthetic VM SDK —
+    /// the in-module twin of `tests/common/mod.rs`, which lib tests cannot
+    /// import. The analyzed files themselves are overlay-only (the
+    /// `Engine::set_content` discipline); only the pub/SDK scaffolding
+    /// touches disk.
+    struct Fixture {
+        root: PathBuf,
+        config_dir: PathBuf,
+        config: Arc<PackageConfig>,
+        packages: IdentityTable,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "dartq-engine-l1-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |relative: &str, content: &str| {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                std::fs::write(path, content).expect("file");
+            };
+            write(
+                "pubspec.yaml",
+                "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+            );
+            write(
+                "pubspec.lock",
+                "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+            );
+            write(
+                ".dart_tool/package_config.json",
+                r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            );
+            write("sdk/version", "3.13.1\n");
+            write(
+                "sdk/lib/libraries.json",
+                r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+            );
+            write(
+                "sdk/lib/_internal/allowed_experiments.json",
+                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+            );
+            // Canonicalize before the pub faces resolve it (the #287
+            // spelling universe — macOS /var vs /private/var).
+            let root = root.canonicalize().expect("fixture root resolves");
+            let config_dir = root.join(".dart_tool");
+            let config = Arc::new(
+                PackageConfig::parse(
+                    &std::fs::read_to_string(config_dir.join("package_config.json"))
+                        .expect("config"),
+                )
+                .expect("valid config"),
+            );
+            let lock =
+                LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+                    .expect("valid lock");
+            let root_pubspec =
+                Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+                    .expect("valid pubspec");
+            let graph = build_graph(
+                &config,
+                &lock,
+                &root_pubspec,
+                &std::collections::BTreeMap::new(),
+                None,
+                &config_dir,
+            )
+            .expect("graph");
+            let packages = IdentityTable::build(&config, &graph, &config_dir).expect("table");
+            Self {
+                root,
+                config_dir,
+                config,
+                packages,
+            }
+        }
+
+        fn state(&self) -> EngineState {
+            EngineState::new(
+                self.packages.clone(),
+                &self.config,
+                &self.config_dir,
+                SdkSnapshot::load(&self.root.join("sdk"), None).expect("synthetic SDK loads"),
+                crate::memory_store(),
+            )
+            .expect("engine state")
+        }
+    }
+
+    /// Enqueues a content overlay (the `Engine::set_content` discipline:
+    /// intern, append to the order on first sight, last write wins).
+    fn set(state: &mut EngineState, path: &Path, text: &str) -> FileId {
+        let file = state.files.intern(path);
+        if !state.pending.contains_key(&file) {
+            state.pending_order.push(file);
+        }
+        state.pending.insert(file, PendingChange::Set(text.to_owned()));
+        file
+    }
+
+    /// Enqueues a removal (the `Engine::remove_file` discipline).
+    fn remove(state: &mut EngineState, file: FileId) {
+        if !state.pending.contains_key(&file) {
+            state.pending_order.push(file);
+        }
+        state.pending.insert(file, PendingChange::Remove);
+    }
+
+    /// Claim precedence (audit #398 F7): two libraries `part`-including the
+    /// same name-form part file race on the Pass A order. The claimants are
+    /// chosen so canonical-URI byte order disagrees with interned-path byte
+    /// order (`a b.dart` vs `a!b.dart`: space sorts below `!` as a path, but
+    /// its `%20` sorts above it in a URI) — the winner must be the
+    /// path-smaller library, the oracle's path-smallest-claimant rule
+    /// (file_state.dart:2176-2192).
+    #[test]
+    fn ambiguous_part_claim_follows_path_order_not_canonical_uri_order() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let claimant = |state: &mut EngineState, name: &str| {
+            set(state, &lib.join(name), "library dup;\npart 'p.dart';\n")
+        };
+        let spaced = claimant(&mut state, "a b.dart");
+        let banged = claimant(&mut state, "a!b.dart");
+        let part = set(&mut state, &lib.join("p.dart"), "part of dup;\n");
+        apply(&mut state, &mut |_| {});
+
+        // Precondition: the two orders genuinely disagree, otherwise this
+        // test pins nothing.
+        let path_bytes = |file: FileId| {
+            state
+                .files
+                .path(file)
+                .map_or(Vec::new(), |path| path.as_os_str().as_encoded_bytes().to_vec())
+        };
+        assert!(path_bytes(spaced) < path_bytes(banged), "space < '!' as path bytes");
+        assert!(
+            state.canonical_uris[&banged] < state.canonical_uris[&spaced],
+            "canonical-URI order must disagree with path order for the pin to bite"
+        );
+
+        let lib_spaced = state.library_of_file[&spaced];
+        let lib_banged = state.library_of_file[&banged];
+        assert_ne!(lib_spaced, lib_banged, "two defining libraries stay distinct");
+        assert_eq!(
+            state.library_of_file[&part], lib_spaced,
+            "the path-smaller claimant wins the ambiguous part"
+        );
+        assert_eq!(
+            state.libraries.info(lib_spaced).expect("live").parts.as_slice(),
+            &[part]
+        );
+    }
+
+    /// Bounded canonical-URI memo (audit #398 F10): a file leaving residency
+    /// drops its memo; a returning file recomputes the identical string from
+    /// its immutable interned path, so the memo tracks the resident set
+    /// instead of growing monotonically.
+    #[test]
+    fn canonical_uri_memo_evicts_with_residency_and_recomputes_identically() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = set(&mut state, &lib.join("main.dart"), "void main() {}\n");
+        let helper = set(&mut state, &lib.join("helper.dart"), "int helper() => 1;\n");
+        let extra = set(&mut state, &lib.join("extra.dart"), "int extra() => 2;\n");
+        apply(&mut state, &mut |_| {});
+        assert_eq!(state.canonical_uris.len(), state.residency.len());
+        let extra_uri = state.canonical_uris[&extra].clone();
+
+        remove(&mut state, extra);
+        apply(&mut state, &mut |_| {});
+        assert!(
+            !state.canonical_uris.contains_key(&extra),
+            "memo evicted at residency exit"
+        );
+        assert_eq!(state.canonical_uris.len(), state.residency.len());
+        assert!(state.canonical_uris.contains_key(&main));
+        assert!(state.canonical_uris.contains_key(&helper));
+
+        // The returning file's memo is byte-identical to the evicted one:
+        // library identities keyed on it must not fork across the gap.
+        set(&mut state, &lib.join("extra.dart"), "int extra() => 3;\n");
+        apply(&mut state, &mut |_| {});
+        assert_eq!(state.canonical_uris[&extra], extra_uri);
+        assert_eq!(state.canonical_uris.len(), state.residency.len());
+    }
+
+    /// The directive face framing (audit #398 F12): per lexeme, a
+    /// little-endian `u64` byte length followed by the lexeme's UTF-8 bytes
+    /// — self-delimiting, injective over the lexeme sequence.
+    #[test]
+    fn directive_face_is_length_prefixed() {
+        let text = "import 'a.dart';\n";
+        let file = FileTable::new().intern(Path::new("/face.dart"));
+        let (_, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file);
+        assert!(warnings.is_empty());
+        let strings = StringTable::new();
+        let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
+        let face = directive_face(text, &scanned.tokens, region_end);
+
+        let mut expected = Vec::new();
+        for lexeme in ["import", "'a.dart'", ";"] {
+            expected.extend_from_slice(&(lexeme.len() as u64).to_le_bytes());
+            expected.extend_from_slice(lexeme.as_bytes());
+        }
+        assert_eq!(face, expected);
+    }
+
+    /// A raw U+0001 inside a directive's string literal (legal source — the
+    /// scanner folds control bytes into the string body) must stay framed by
+    /// its length prefix: the face is not the retired `\u{1}`-separated join,
+    /// which such a lexeme could alias into another token sequence.
+    #[test]
+    fn control_character_lexeme_does_not_alias_the_separator_join() {
+        let text = "import 'a\u{1}b.dart';\n";
+        let file = FileTable::new().intern(Path::new("/face.dart"));
+        let (_, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file);
+        let strings = StringTable::new();
+        let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
+        let face = directive_face(text, &scanned.tokens, region_end);
+
+        let retired = "import\u{1}'a\u{1}b.dart'\u{1};\u{1}".as_bytes().to_vec();
+        assert_ne!(face, retired, "the separator join is retired");
+
+        let mut expected = Vec::new();
+        for lexeme in ["import", "'a\u{1}b.dart'", ";"] {
+            expected.extend_from_slice(&(lexeme.len() as u64).to_le_bytes());
+            expected.extend_from_slice(lexeme.as_bytes());
+        }
+        assert_eq!(face, expected, "the raw byte rides inside its framed lexeme");
+    }
 }

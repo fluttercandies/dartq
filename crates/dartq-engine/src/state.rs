@@ -25,14 +25,18 @@ use dartq_source::{
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 /// The engine-side facts-shape version: bumped with any engine-side change
-/// to what [`UnitFacts`] records (directive extraction, diagnostic
-/// baking). Shape history — v2: name-form `part of` directives skip URI
+/// to what [`UnitFacts`] records (directive extraction, diagnostic baking).
+/// Shape history — v2: name-form `part of` directives skip URI
 /// resolution, and the capture-time duplicate log bakes as
 /// `duplicate_definition`. v3: an above-latest `// @dart` override bakes
 /// the official `invalid_language_version_override` STATIC_WARNING and
 /// analyzes at the package/default version instead of adopting the
 /// override (#245) — v2-cached entries for such files carry neither.
-const FACTS_SHAPE_VERSION: u32 = 3;
+/// v4: the directive face folded into [`UnitFacts::api_signature`]
+/// switched to length-prefixed lexeme framing (#398 F12) — the baked
+/// signature bytes changed for every file with a directive region, so
+/// v3-cached entries and snapshots must not survive the upgrade.
+const FACTS_SHAPE_VERSION: u32 = 4;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
