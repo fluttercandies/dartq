@@ -1038,3 +1038,94 @@ fn ast_key_equality() {
         "FeatureSetId wraps the language fingerprint"
     );
 }
+
+#[test]
+fn begin_adopting_adopts_completed_sibling_subtrees() {
+    // Container + a completed two-node subtree, then an adoption begin:
+    // the adopted subtree becomes the container's leading child without
+    // moving any arena row.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // Sibling 1: a container with a child (subtree rows 1-2).
+    b.begin(NodeKind::Block, 1);
+    b.leaf(NodeKind::EmptyStatement, 1);
+    b.end(NodeKind::Block, 2);
+    // The adoption opens anchored at the sibling's head token.
+    b.begin_adopting(NodeKind::BinaryExpression, 1, 1);
+    b.patch(0, 3);
+    b.leaf(NodeKind::LiteralInt, 4);
+    b.end(NodeKind::BinaryExpression, 5);
+    b.end(NodeKind::CompilationUnit, 5);
+    let ast = b.finish();
+    let binary = ast
+        .root()
+        .map(|root| root - 1)
+        .expect("non-empty");
+    assert_eq!(ast.kind(binary), NodeKind::BinaryExpression);
+    // The adopted Block subtree is the leading child; the LiteralInt the
+    // second.
+    // Direct children read off the completion window by subtree tiling
+    // (the window holds descendants, not just direct children).
+    let mut kids: Vec<NodeKind> = Vec::new();
+    let window = ast.children(binary);
+    let mut i = window.end;
+    while i > window.start {
+        i -= 1;
+        kids.push(ast.kind(i));
+        i = ast.children(i).start;
+    }
+    kids.reverse();
+    assert_eq!(kids, [NodeKind::Block, NodeKind::LiteralInt]);
+}
+
+#[test]
+fn begin_with_first_child_takes_an_explicit_segment_start() {
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::EmptyStatement, 0); // row 1: before the segment
+    let segment_start = b.len() as u32;
+    b.leaf(NodeKind::LiteralInt, 1); // row 2: the segment
+    b.begin_with_first_child(NodeKind::SwitchCase, 1, segment_start);
+    b.patch(0, TOKEN_NONE);
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, 1);
+    b.leaf(NodeKind::EmptyStatement, 2);
+    b.end(NodeKind::SwitchCase, 3);
+    b.end(NodeKind::CompilationUnit, 3);
+    let ast = b.finish();
+    let case = ast.root().expect("root") - 1;
+    let mut kids: Vec<NodeKind> = Vec::new();
+    let window = ast.children(case);
+    let mut i = window.end;
+    while i > window.start {
+        i -= 1;
+        kids.push(ast.kind(i));
+        i = ast.children(i).start;
+    }
+    kids.reverse();
+    // The pre-segment leaf stays outside; the segment leaf is the child.
+    assert_eq!(kids, [NodeKind::LiteralInt, NodeKind::EmptyStatement]);
+}
+
+#[test]
+fn last_node_accessors_read_the_arena_tail() {
+    let mut b = AstBuilder::new();
+    assert_eq!(b.last_first_token(), None);
+    assert_eq!(b.last_end_token(), None);
+    assert_eq!(b.last_subtree_start(), None);
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Block, 1);
+    b.leaf(NodeKind::EmptyStatement, 1);
+    // The last COMPLETED node is the leaf: head 1, exclusive end 2,
+    // subtree start = its own row.
+    assert_eq!(b.last_first_token(), Some(1));
+    assert_eq!(b.last_end_token(), Some(2));
+    assert_eq!(b.last_subtree_start(), Some(b.len() as u32 - 1));
+    b.end(NodeKind::Block, 2);
+    // After the seal the completed node is the Block: its subtree starts at
+    // the leaf's row.
+    assert_eq!(b.last_first_token(), Some(1));
+    assert_eq!(b.last_end_token(), Some(2));
+    assert_eq!(b.last_subtree_start(), Some(b.len() as u32 - 2));
+    b.end(NodeKind::CompilationUnit, 2);
+}
