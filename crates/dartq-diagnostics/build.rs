@@ -176,8 +176,8 @@ fn placeholders(message: &str) -> Vec<(u32, usize)> {
 /// - `C*` sources: `CompileTimeErrorCode` consts (the ERROR-level
 ///   language-version rows) — class type `COMPILE_TIME_ERROR`
 ///   (analyzer-8.4.1 codes.g.dart: `illegalLanguageVersionOverride`
-///   CompileTimeErrorTemplate, `inconsistentLanguageVersionOverride`
-///   CompileTimeErrorWithoutArguments).
+///   `CompileTimeErrorTemplate`, `inconsistentLanguageVersionOverride`
+///   `CompileTimeErrorWithoutArguments`).
 /// - `W*` sources: `WarningCode` consts (`invalid_language_version_override`)
 ///   — class type `STATIC_WARNING`.
 /// - Everything else: parser/scanner class type `SYNTACTIC_ERROR`.

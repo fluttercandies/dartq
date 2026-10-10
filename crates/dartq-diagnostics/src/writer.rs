@@ -168,7 +168,7 @@ fn write_json_diagnostic(
 /// codes are never published (pinned by the registry tests in `code.rs`), so
 /// the flag alone decides. The URL is built in the caller's reused buffer and
 /// returned borrowed.
-fn documentation_url<'a>(code: CodeInfo, buf: &'a mut String) -> Option<&'a str> {
+fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
     if code.has_published_docs {
         buf.clear();
         buf.push_str("https://dart.dev/diagnostics/");
