@@ -126,16 +126,24 @@ pub(crate) mod control_flow_in_finally {
     /// Official: `pkg/linter/lib/src/rules/control_flow_in_finally.dart:24-107`
     /// — `break`/`continue`/`return` inside a `finally` block reports, unless
     /// the statement sits inside a closure within the block (its jump binds
-    /// locally), or — for targeted `break`/`continue` — the target is inside
-    /// the try statement (the jump stays local to it). Message:
-    /// `diagnostic.g.dart` `controlFlowInFinally`.
+    /// locally), or — for targeted `break`/`continue` — the resolved target
+    /// sits within the try statement (the jump stays local to it). Targets
+    /// resolve through the official label machinery
+    /// (`_lookupBreakOrContinueTarget`, `scope_analyzer.dart:1042-1093`): a
+    /// labeled jump through the lexical label scope — the nearest enclosing
+    /// labeled statement or switch member declaring the label, where a
+    /// statement's label binds the statement after the labels
+    /// (`visitLabeledStatement`, :631-639) — an untargeted jump through the
+    /// break/continue context chain (the nearest enclosing loop; `continue`
+    /// skips switches, `scope.dart:333-341`; the chain resets at every
+    /// function body, :224). Message: `diagnostic.g.dart`
+    /// `controlFlowInFinally`.
     ///
-    /// Approximation (documented): the official resolves the break/continue
-    /// target through the label scope; here an untargeted statement uses its
-    /// nearest enclosing loop/switch on the path and a targeted one its
-    /// nearest enclosing `LabeledStatement`/loop — for valid code the
-    /// enclosing-label chain is the target chain, so only nested labels
-    /// wrapping the try can diverge.
+    /// Approximation (documented): the switch's member labels scope across
+    /// the whole statement officially (`scope_analyzer.dart:847-850`), so a
+    /// forward `continue L` to a later member resolves there but not in
+    /// this lexical walk — a member label matches only when the member
+    /// encloses the jump.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "control_flow_in_finally",
         group: Group::Recommended,
@@ -183,29 +191,18 @@ pub(crate) mod control_flow_in_finally {
             return;
         }
         let report = match c.kind(node) {
-            NodeKind::Break | NodeKind::Continue => {
-                let has_target = c.payload(node).first().copied().unwrap_or(0) != 0;
-                let target = nearest(c, node_idx, |kind| match kind {
-                    NodeKind::WhileStatement
-                    | NodeKind::ForStatement
-                    | NodeKind::ForIn
-                    | NodeKind::DoWhileStatement
-                    | NodeKind::SwitchStatement => true,
-                    NodeKind::LabeledStatement => has_target,
-                    _ => false,
-                });
-                match target {
-                    // `ancestor.thisOrAncestorMatching(n == tryStatement)`
-                    // (:79-91): the enabler exists when the jump target's own
-                    // ancestor chain contains the try statement — the target
-                    // sits below the try on the path (idx > try_idx) and the
-                    // jump stays local to it.
-                    Some(idx) => idx <= try_idx,
-                    // Unresolved target: the closure exemption decides
-                    // (`ancestor == null` branch, :69-77).
-                    None => !closure_wraps(c, try_idx + 1, node_idx),
-                }
-            }
+            NodeKind::Break | NodeKind::Continue => match jump_target(c, node, node_idx) {
+                // `target.thisOrAncestorMatching(n == tryStatement)` (:79-91):
+                // the enabler (the target's own chain contains the try) keeps
+                // the jump local — `thisOrAncestorMatching` includes the
+                // target itself, so a label bound onto the try (`a: try …`)
+                // also counts as within. Outside it the jump crosses the
+                // finally and reports.
+                Some(target_idx) => target_idx < try_idx,
+                // Unresolved target (`target == null`): the closure exemption
+                // decides (the `ancestor == null` branch, :69-77).
+                None => !closure_wraps(c, try_idx + 1, node_idx),
+            },
             _ => !closure_wraps(c, try_idx + 1, node_idx),
         };
         if report {
@@ -214,9 +211,63 @@ pub(crate) mod control_flow_in_finally {
         }
     }
 
-    /// The nearest path index below `from` whose node kind satisfies `pred`.
-    fn nearest(c: &Check<'_>, from: usize, pred: impl Fn(NodeKind) -> bool) -> Option<usize> {
-        (0..from).rev().find(|&i| pred(c.kind(c.path[i])))
+    /// The resolved jump target's path index, `None` for the official
+    /// `target == null` face (`_lookupBreakOrContinueTarget`,
+    /// `scope_analyzer.dart:1042-1093`).
+    fn jump_target(c: &Check<'_>, node: u32, node_idx: usize) -> Option<usize> {
+        // The payload carries only the `has_target` bit (collapse map §3.4
+        // BreakStatementHandle); the label identifier is the token after the
+        // `break`/`continue` keyword, and a synthetic recovery token never
+        // names a label.
+        if c.payload(node).first().copied().unwrap_or(0) != 0 {
+            let label_token = c.head_token(node) + 1;
+            if c.token_is_synthetic(label_token) {
+                return None;
+            }
+            let label = c.lexeme(label_token);
+            let Some(binding) = c.path[..node_idx].iter().rposition(|&n| {
+                matches!(c.kind(n), NodeKind::LabeledStatement | NodeKind::SwitchCase)
+                    && declares_label(c, n, label)
+            }) else {
+                return None;
+            };
+            // `visitLabeledStatement` (:631-639): a statement's label binds
+            // the statement after the labels — the next path node; a switch
+            // member's label binds the member itself.
+            return Some(match c.kind(c.path[binding]) {
+                NodeKind::LabeledStatement => binding + 1,
+                _ => binding,
+            });
+        }
+        let is_continue = c.kind(node) == NodeKind::Continue;
+        for (idx, &ancestor) in c.path[..node_idx].iter().enumerate().rev() {
+            match c.kind(ancestor) {
+                NodeKind::WhileStatement
+                | NodeKind::ForStatement
+                | NodeKind::ForIn
+                | NodeKind::DoWhileStatement => return Some(idx),
+                // An untargeted `continue` never binds a switch
+                // (scope.dart:336-341).
+                NodeKind::SwitchStatement if !is_continue => return Some(idx),
+                // The context chain resets at every function body (:224) —
+                // the jump cannot bind past a closure (`target == null`).
+                NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::LocalFunctionDeclaration => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether a labeled statement / switch member declares `label` among
+    /// its `Label` children prefix (collapse map §3.4: the label count is
+    /// the Label-children prefix length).
+    fn declares_label(c: &Check<'_>, node: u32, label: &str) -> bool {
+        c.collect_direct(node)
+            .into_iter()
+            .take_while(|&kid| c.kind(kid) == NodeKind::Label)
+            .any(|kid| c.lexeme(c.head_token(kid)) == label)
     }
 
     /// Whether a closure (function expression / local function) sits on the
@@ -233,21 +284,21 @@ pub(crate) mod control_flow_in_finally {
 }
 
 pub(crate) mod no_duplicate_case_values {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::token_seq_equal;
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, first_child, last_child};
 
     /// Official: `pkg/linter/lib/src/rules/no_duplicate_case_values.dart:37-58`
     /// — a `case` whose constant value equals an earlier `case` of the same
     /// switch reports at the duplicate expression with both sources spelled
-    /// into `{0}`/`{1}`.
-    ///
-    /// Approximation (documented): the official keys the map by the
-    /// computed constant (`computeConstantValue`, :44); duplicate
-    /// detection here compares token-lexeme sequences, so only
-    /// syntactically identical expressions collide — `case 1 + 1:` vs
-    /// `case 2:` diverges (under-reports), and an identifier repeated
-    /// across two cases reports even when non-constant (the official skips
-    /// unknown values — over-reports on erroneous code only). Message:
+    /// into `{0}`/`{1}`. The official keys the map by the computed constant
+    /// (`computeConstantValue`, :44); the face here is an in-rule constant
+    /// folder over the syntax substrate — integer/string/bool/null
+    /// literals, `+ - * ~/ %` and unary `-`, parentheses (64-bit wrapping
+    /// integers, Dart `~/` truncation and `%` divisor-sign semantics),
+    /// descending through `ConstantPattern`/`ParenthesizedExpression`.
+    /// Expressions outside the folder's grammar evaluate unknown and never
+    /// dedupe — the documented under-report family (const identifiers,
+    /// doubles, interpolation, adjacent strings, const constructors),
+    /// mirroring the official `hasKnownValue` skip (:47-49). Message:
     /// `diagnostic.g.dart` `noDuplicateCaseValues`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "no_duplicate_case_values",
@@ -274,7 +325,7 @@ pub(crate) mod no_duplicate_case_values {
             .copied()
             .filter(|&kid| c.kind(kid) == NodeKind::SwitchCase)
             .collect();
-        let mut seen: Vec<u32> = Vec::new();
+        let mut seen: Vec<(ConstValue, u32)> = Vec::new();
         for case in cases {
             // Expressions follow the label prefix (`labelCount` pruned to
             // the Label children, collapse map §3.4 SwitchCaseEnd); word 2
@@ -290,20 +341,188 @@ pub(crate) mod no_duplicate_case_values {
                 .take(count)
                 .collect();
             for expression in expressions {
-                if let Some(original) = seen
-                    .iter()
-                    .copied()
-                    .find(|&earlier| token_seq_equal(c, earlier, expression))
-                {
+                // `computeConstantValue` → `hasKnownValue` or skip (:44-49).
+                let Some(value) = const_value(c, expression) else {
+                    continue;
+                };
+                if let Some(&(_, original)) = seen.iter().find(|(seen, _)| *seen == value) {
                     let dup = source_slice(c, expression).to_owned();
                     let orig = source_slice(c, original).to_owned();
                     let range = c.utf16_span(expression);
                     c.report(range, &[&dup, &orig]);
                 } else {
-                    seen.push(expression);
+                    seen.push((value, expression));
                 }
             }
         }
+    }
+
+    /// One computed case value — the map key the official builds from
+    /// `DartObject`s (:38, :51).
+    #[derive(PartialEq)]
+    enum ConstValue {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Str(Box<str>),
+    }
+
+    /// The constant value of one case expression, `None` when it is outside
+    /// the folder's grammar (unknown — the official `hasKnownValue` skip).
+    fn const_value(c: &Check<'_>, expression: u32) -> Option<ConstValue> {
+        match c.kind(expression) {
+            NodeKind::LiteralNull => Some(ConstValue::Null),
+            NodeKind::LiteralBool => {
+                Some(ConstValue::Bool(c.lexeme(c.head_token(expression)) == "true"))
+            }
+            NodeKind::LiteralInt => Some(ConstValue::Int(int_literal(c.lexeme(
+                c.head_token(expression),
+            ))?)),
+            NodeKind::StringLiteral => string_literal(c, expression),
+            NodeKind::ConstantPattern | NodeKind::ParenthesizedExpression => {
+                const_value(c, first_child(c, expression)?)
+            }
+            NodeKind::UnaryPrefix => {
+                // The operator is the span head (collapse map §3.5,
+                // derivable-word0 face).
+                if c.lexeme(c.head_token(expression)) != "-" {
+                    return None;
+                }
+                match const_value(c, first_child(c, expression)?)? {
+                    ConstValue::Int(value) => Some(ConstValue::Int(value.wrapping_neg())),
+                    _ => None,
+                }
+            }
+            NodeKind::BinaryExpression => {
+                // The operator token is payload word 0 (collapse map §3.5
+                // BinaryExpressionEnd); the operands are children ×2.
+                let operator = c.payload(expression).first().copied()?;
+                if operator == NONE_TOKEN {
+                    return None;
+                }
+                let left = const_value(c, first_child(c, expression)?)?;
+                let right = const_value(c, last_child(c, expression)?)?;
+                fold_binary(c.lexeme(operator), left, right)
+            }
+            _ => None,
+        }
+    }
+
+    /// The folder's binary faces: `+` over integers and string
+    /// concatenation, `- * ~/ %` over integers — 64-bit wrapping like the
+    /// VM's int, `~/` truncating toward zero, `%` taking the divisor's
+    /// sign. Division by zero throws officially, so the value is not a
+    /// known constant.
+    fn fold_binary(operator: &str, left: ConstValue, right: ConstValue) -> Option<ConstValue> {
+        match (operator, left, right) {
+            ("+", ConstValue::Int(a), ConstValue::Int(b)) => {
+                Some(ConstValue::Int(a.wrapping_add(b)))
+            }
+            ("+", ConstValue::Str(a), ConstValue::Str(b)) => {
+                Some(ConstValue::Str(format!("{a}{b}").into()))
+            }
+            ("-", ConstValue::Int(a), ConstValue::Int(b)) => {
+                Some(ConstValue::Int(a.wrapping_sub(b)))
+            }
+            ("*", ConstValue::Int(a), ConstValue::Int(b)) => {
+                Some(ConstValue::Int(a.wrapping_mul(b)))
+            }
+            ("~/", ConstValue::Int(a), ConstValue::Int(b)) if b != 0 => {
+                Some(ConstValue::Int(a.wrapping_div(b)))
+            }
+            ("%", ConstValue::Int(a), ConstValue::Int(b)) if b != 0 => {
+                let mut rem = a.wrapping_rem(b);
+                if rem != 0 && (rem < 0) != (b < 0) {
+                    rem = rem.wrapping_add(b);
+                }
+                Some(ConstValue::Int(rem))
+            }
+            _ => None,
+        }
+    }
+
+    /// The Dart integer literal grammar the folder reads — decimal and hex
+    /// (`0x`), digit separators dropped, wrapping to the VM's 64-bit int.
+    fn int_literal(lexeme: &str) -> Option<i64> {
+        let text: String = lexeme.chars().filter(|&ch| ch != '_').collect();
+        let (digits, radix) = match text.get(..2) {
+            Some("0x" | "0X") => (&text[2..], 16),
+            _ => (&text[..], 10),
+        };
+        u64::from_str_radix(digits, radix).ok().map(|value| value as i64)
+    }
+
+    /// The value of one string literal: a single-token span (adjacent
+    /// segments span several tokens and never fold), quote forms `'…'` /
+    /// `"…"` and the triple variants, `r`-raw bodies verbatim, cooked
+    /// bodies escape-decoded. A `$` in a cooked body is interpolation (a
+    /// token-layer face) — unknown.
+    fn string_literal(c: &Check<'_>, node: u32) -> Option<ConstValue> {
+        let first = c.head_token(node);
+        if first != crate::rules::tail_token(c, node) {
+            return None;
+        }
+        let text = c.lexeme(first);
+        let (raw, text) = match text.strip_prefix('r') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        let body = if let Some(rest) = text.strip_prefix("'''") {
+            rest.strip_suffix("'''")?
+        } else if let Some(rest) = text.strip_prefix("\"\"\"") {
+            rest.strip_suffix("\"\"\"")?
+        } else {
+            let quote = text.chars().next().filter(|&ch| ch == '\'' || ch == '"')?;
+            text.strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))?
+        };
+        if raw {
+            return Some(ConstValue::Str(body.into()));
+        }
+        if body.contains('$') {
+            return None;
+        }
+        let mut value = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                value.push(ch);
+                continue;
+            }
+            match chars.next()? {
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                'b' => value.push('\u{0008}'),
+                'f' => value.push('\u{000C}'),
+                'v' => value.push('\u{000B}'),
+                'x' => {
+                    let hex: String = chars.by_ref().take(2).collect();
+                    value.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                'u' => {
+                    let mut hex = String::new();
+                    let first = chars.next()?;
+                    if first == '{' {
+                        for ch in chars.by_ref() {
+                            if ch == '}' {
+                                break;
+                            }
+                            hex.push(ch);
+                        }
+                    } else {
+                        // The peeked character is the first of four hex
+                        // digits.
+                        hex.push(first);
+                        hex.extend(chars.by_ref().take(3));
+                    }
+                    value.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                escaped @ ('\\' | '\'' | '"') => value.push(escaped),
+                _ => return None,
+            }
+        }
+        Some(ConstValue::Str(value.into()))
     }
 
     /// The source text of one expression (the official `toString()`
@@ -316,16 +535,21 @@ pub(crate) mod no_duplicate_case_values {
 
 pub(crate) mod use_rethrow_when_possible {
     use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::first_child;
+    use crate::rules::{first_child, member_name};
 
     /// Official: `pkg/linter/lib/src/rules/use_rethrow_when_possible.dart:36-46`
     /// — a `throw` of exactly the caught exception parameter, as a statement,
     /// reports at the throw. The parameter identity
-    /// (`element == exceptionParameter`, :39-44) is
-    /// approximated lexically: the thrown identifier must name the nearest
-    /// enclosing catch's parameter (same lexeme). The documented divergence
-    /// is shadowing — a local named like the parameter inside the catch body
-    /// over-reports. Message: `diagnostic.g.dart` `useRethrowWhenPossible`.
+    /// (`element == exceptionParameter`, :39-44) resolves lexically: the
+    /// thrown identifier must name the nearest enclosing catch's parameter
+    /// and not be shadowed between the throw and that catch clause — a
+    /// same-lexeme local variable, pattern variable, loop-variable
+    /// declaration, or closure parameter inside the catch body binds the
+    /// read instead. The catch clause is the walk's boundary: its parameter
+    /// is the candidate itself, never a shadow. The remaining lexical face
+    /// (documented): a sibling local-function declaration sharing the name
+    /// shadows in the official scope but is not walked here. Message:
+    /// `diagnostic.g.dart` `useRethrowWhenPossible`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "use_rethrow_when_possible",
         group: Group::Recommended,
@@ -375,10 +599,142 @@ pub(crate) mod use_rethrow_when_possible {
         let Some(&name) = c.payload(exception).get(1) else {
             return;
         };
-        if c.lexeme(c.head_token(operand)) == c.lexeme(name) {
+        let thrown = c.lexeme(c.head_token(operand));
+        if thrown == c.lexeme(name) && !shadowed_between(c, operand, catch_clause, thrown) {
             let range = c.utf16_span(c.node());
             c.report(range, &[]);
         }
+    }
+
+    /// Whether any declaration visible between the throw's operand and the
+    /// catch clause binds `name` — the lexical face of the official element
+    /// identity: the innermost binding of a read inside the catch body
+    /// wins, so a same-name declaration below the catch parameter makes the
+    /// thrown identifier a different element.
+    fn shadowed_between(c: &Check<'_>, use_node: u32, catch_clause: u32, name: &str) -> bool {
+        let use_start = c.byte_span(use_node).start;
+        for &ancestor in c.path.iter().rev().skip(1) {
+            if ancestor == catch_clause {
+                return false;
+            }
+            match c.kind(ancestor) {
+                NodeKind::Block => {
+                    if block_declares_before(c, ancestor, use_start, name) {
+                        return true;
+                    }
+                }
+                NodeKind::ForIn => {
+                    if scope_declares(c, ancestor, name) {
+                        return true;
+                    }
+                }
+                NodeKind::ForParts => {
+                    // `for (var e = …; …)` declares in the loop parts,
+                    // outside the body block.
+                    if for_parts_declares(c, ancestor, name) {
+                        return true;
+                    }
+                }
+                NodeKind::FunctionExpression | NodeKind::NamedFunctionExpression => {
+                    // Parameters scope the whole body regardless of position.
+                    if parameter_names(c, ancestor).contains(&name) {
+                        return true;
+                    }
+                }
+                NodeKind::LocalFunctionDeclaration => {
+                    // The function name binds from its declaration on; the
+                    // parameters scope the whole body.
+                    let names_decl = member_name(c, ancestor).is_some_and(|decl| {
+                        c.lexeme(c.head_token(decl)) == name
+                            && c.byte_span(decl).start < use_start
+                    });
+                    if names_decl || parameter_names(c, ancestor).contains(&name) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Local declarations of a block that precede the use: variables
+    /// (`VariablesDeclaration`) and pattern bindings.
+    fn block_declares_before(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> bool {
+        for decl in c.collect_direct(block) {
+            match c.kind(decl) {
+                NodeKind::VariablesDeclaration => {
+                    for var in c.collect_direct(decl) {
+                        if c.kind(var) != NodeKind::InitializedIdentifier {
+                            continue;
+                        }
+                        if let Some(var_name) = member_name(c, var)
+                            && c.lexeme(c.head_token(var_name)) == name
+                            && c.byte_span(var_name).start < use_start
+                        {
+                            return true;
+                        }
+                    }
+                }
+                NodeKind::PatternVarDeclStatement => {
+                    let window = c.children(decl);
+                    for id in window.start..window.end {
+                        if c.kind(id) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(id)) == name
+                            && c.byte_span(id).start < use_start
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Any name binding directly inside a for-in header.
+    fn scope_declares(c: &Check<'_>, scope: u32, name: &str) -> bool {
+        let window = c.children(scope);
+        for id in window.start..window.end {
+            if c.kind(id) == NodeKind::Identifier && c.lexeme(c.head_token(id)) == name {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The loop-variable declarations of a classic for header.
+    fn for_parts_declares(c: &Check<'_>, parts: u32, name: &str) -> bool {
+        c.collect_direct(parts).into_iter().any(|decl| {
+            c.kind(decl) == NodeKind::VariablesDeclaration
+                && c.collect_direct(decl).into_iter().any(|var| {
+                    c.kind(var) == NodeKind::InitializedIdentifier
+                        && member_name(c, var).is_some_and(|var_name| {
+                            c.lexeme(c.head_token(var_name)) == name
+                        })
+                })
+        })
+    }
+
+    /// The parameter names of a closure or local function (the
+    /// `FormalParameters` child's `FormalParameter` name words).
+    fn parameter_names<'a>(c: &'a Check<'a>, function: u32) -> Vec<&'a str> {
+        let Some(params) = c
+            .collect_direct(function)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return Vec::new();
+        };
+        c.collect_direct(params)
+            .into_iter()
+            .filter(|&param| c.kind(param) == NodeKind::FormalParameter)
+            .filter_map(|param| {
+                let name = c.payload(param).get(1).copied()?;
+                (name != super::NONE_TOKEN).then(|| c.lexeme(name))
+            })
+            .collect()
     }
 }
 
@@ -1270,6 +1626,226 @@ mod tests {
         assert!(f.run(&one_rule("control_flow_in_finally")).is_empty());
     }
 
+    /// A labeled loop outside the try: the break's resolved target (the
+    /// loop the label binds, `visitLabeledStatement` :631-639) wraps the
+    /// try, so the jump crosses the finally — reports.
+    #[test]
+    fn finally_labeled_break_outside_reports() {
+        let source = "loop: for (;;) { try {} finally { break loop; } }";
+        // loop0 :1 for2 (3 ;4 ;5 )6 {7 try8 {9 }10 finally11 {12 break13
+        // loop14 ;15 }16 }17
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Label, 0);
+                b.end(NodeKind::Label, 2);
+                b.begin_adopting(NodeKind::LabeledStatement, 0, 1);
+                b.begin(NodeKind::ForStatement, 2);
+                b.begin(NodeKind::ForParts, 3);
+                b.patch(0, 3);
+                b.patch(1, 4);
+                b.patch(2, 5);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 7);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::TryStatement, 8);
+                b.patch(0, tok_at(source, t, "finally", 0));
+                b.leaf_span(NodeKind::Block, 9, 11);
+                b.begin(NodeKind::Block, 12);
+                b.begin(NodeKind::Break, 13);
+                b.patch(0, 1);
+                b.end(NodeKind::Break, 16);
+                b.end(NodeKind::Block, 17);
+                b.end(NodeKind::TryStatement, 17);
+                b.end(NodeKind::Block, 18);
+                b.end(NodeKind::ForStatement, 18);
+                b.end(NodeKind::LabeledStatement, 18);
+            }),
+        );
+        let lints = f.run(&one_rule("control_flow_in_finally"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 13));
+    }
+
+    /// A label binding a loop inside the finally block itself: the target
+    /// sits below the try (its own chain contains it) — no report.
+    #[test]
+    fn finally_labeled_loop_inside_finally_passes() {
+        let source = "try {} finally { inner: for (;;) { break inner; } }";
+        // try0 {1 }2 finally3 {4 inner5 :6 for7 (8 ;9 ;10 )11 {12 break13
+        // inner14 ;15 }16 }17
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, tok_at(source, t, "finally", 0));
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::Label, 5);
+                b.end(NodeKind::Label, 7);
+                b.begin_adopting(NodeKind::LabeledStatement, 5, 1);
+                b.begin(NodeKind::ForStatement, 7);
+                b.begin(NodeKind::ForParts, 8);
+                b.patch(0, 8);
+                b.patch(1, 9);
+                b.patch(2, 10);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 12);
+                b.begin(NodeKind::Block, 12);
+                b.begin(NodeKind::Break, 13);
+                b.patch(0, 1);
+                b.end(NodeKind::Break, 16);
+                b.end(NodeKind::Block, 17);
+                b.end(NodeKind::ForStatement, 17);
+                b.end(NodeKind::LabeledStatement, 17);
+                b.end(NodeKind::Block, 18);
+                b.end(NodeKind::TryStatement, 18);
+            }),
+        );
+        assert!(f.run(&one_rule("control_flow_in_finally")).is_empty());
+    }
+
+    /// Nested labels wrapping the try: both labels bind the same loop
+    /// through the label scope, which encloses the try — the official
+    /// target lookup reports.
+    #[test]
+    fn finally_nested_labels_wrapping_try_report() {
+        let source = "a: b: for (;;) { try {} finally { break a; } }";
+        // a0 :1 b2 :3 for4 (5 ;6 ;7 )8 {9 try10 {11 }12 finally13 {14
+        // break15 a16 ;17 }18 }19
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Label, 0);
+                b.end(NodeKind::Label, 2);
+                b.begin(NodeKind::Label, 2);
+                b.end(NodeKind::Label, 4);
+                b.begin_adopting(NodeKind::LabeledStatement, 0, 2);
+                b.begin(NodeKind::ForStatement, 4);
+                b.begin(NodeKind::ForParts, 5);
+                b.patch(0, 5);
+                b.patch(1, 6);
+                b.patch(2, 7);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 9);
+                b.begin(NodeKind::Block, 9);
+                b.begin(NodeKind::TryStatement, 10);
+                b.patch(0, tok_at(source, t, "finally", 0));
+                b.leaf_span(NodeKind::Block, 11, 13);
+                b.begin(NodeKind::Block, 14);
+                b.begin(NodeKind::Break, 15);
+                b.patch(0, 1);
+                b.end(NodeKind::Break, 18);
+                b.end(NodeKind::Block, 19);
+                b.end(NodeKind::TryStatement, 19);
+                b.end(NodeKind::Block, 20);
+                b.end(NodeKind::ForStatement, 20);
+                b.end(NodeKind::LabeledStatement, 20);
+            }),
+        );
+        let lints = f.run(&one_rule("control_flow_in_finally"));
+        assert_eq!(lints.len(), 1);
+    }
+
+    /// The resolution the label walk closes: a loop inside the finally is
+    /// the nearest enclosing loop but not the resolved target — `break
+    /// outer` binds the outer loop, whose chain lacks the try — reports
+    /// (the nearest-loop heuristic kept this silent).
+    #[test]
+    fn finally_inner_loop_does_not_mask_labeled_target() {
+        let source = "outer: for (;;) { try {} finally { for (;;) { break outer; } } }";
+        // outer0 :1 for2 (3 ;4 ;5 )6 {7 try8 {9 }10 finally11 {12 for13 (14
+        // ;15 ;16 )17 {18 break19 outer20 ;21 }22 }23 }24
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Label, 0);
+                b.end(NodeKind::Label, 2);
+                b.begin_adopting(NodeKind::LabeledStatement, 0, 1);
+                b.begin(NodeKind::ForStatement, 2);
+                b.begin(NodeKind::ForParts, 3);
+                b.patch(0, 3);
+                b.patch(1, 4);
+                b.patch(2, 5);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 7);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::TryStatement, 8);
+                b.patch(0, tok_at(source, t, "finally", 0));
+                b.leaf_span(NodeKind::Block, 9, 11);
+                b.begin(NodeKind::Block, 12);
+                b.begin(NodeKind::ForStatement, 13);
+                b.begin(NodeKind::ForParts, 14);
+                b.patch(0, 14);
+                b.patch(1, 15);
+                b.patch(2, 16);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 18);
+                b.begin(NodeKind::Block, 18);
+                b.begin(NodeKind::Break, 19);
+                b.patch(0, 1);
+                b.end(NodeKind::Break, 22);
+                b.end(NodeKind::Block, 23);
+                b.end(NodeKind::ForStatement, 23);
+                b.end(NodeKind::Block, 24);
+                b.end(NodeKind::TryStatement, 24);
+                b.end(NodeKind::Block, 25);
+                b.end(NodeKind::ForStatement, 25);
+                b.end(NodeKind::LabeledStatement, 25);
+            }),
+        );
+        let lints = f.run(&one_rule("control_flow_in_finally"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 19));
+    }
+
+    /// A closure resets the unlabeled-break context chain (:224), so a bare
+    /// break inside one has no target even with loops outside — the
+    /// FunctionBody exemption (:69-77) keeps it silent (the nearest-loop
+    /// heuristic reported this).
+    #[test]
+    fn finally_closure_break_with_outer_loop_passes() {
+        let source = "for (;;) { try {} finally { f(() { break; }); } }";
+        // for0 (1 ;2 ;3 )4 {5 try6 {7 }8 finally9 {10 f11 (12 (13 )14 {15
+        // break16 ;17 }18 )19 ;20 }21 }22
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ForStatement, 0);
+                b.begin(NodeKind::ForParts, 1);
+                b.patch(0, 1);
+                b.patch(1, 2);
+                b.patch(2, 3);
+                b.patch(3, 0);
+                b.end(NodeKind::ForParts, 5);
+                b.begin(NodeKind::Block, 5);
+                b.begin(NodeKind::TryStatement, 6);
+                b.patch(0, tok_at(source, t, "finally", 0));
+                b.leaf_span(NodeKind::Block, 7, 9);
+                b.begin(NodeKind::Block, 10);
+                b.begin(NodeKind::ExpressionStatement, 11);
+                b.begin(NodeKind::Send, 11);
+                identifier(b, 11, 12);
+                b.begin(NodeKind::Arguments, 12);
+                b.begin(NodeKind::FunctionExpression, 13);
+                b.begin(NodeKind::Block, 15);
+                b.begin(NodeKind::Break, 16);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 18);
+                b.end(NodeKind::Block, 19);
+                b.end(NodeKind::FunctionExpression, 19);
+                b.end(NodeKind::Arguments, 20);
+                b.end(NodeKind::Send, 20);
+                b.end(NodeKind::ExpressionStatement, 21);
+                b.end(NodeKind::Block, 22);
+                b.end(NodeKind::TryStatement, 22);
+                b.end(NodeKind::Block, 23);
+                b.end(NodeKind::ForStatement, 23);
+            }),
+        );
+        assert!(f.run(&one_rule("control_flow_in_finally")).is_empty());
+    }
+
     // —— no_duplicate_case_values —————————————————————————————————————————
 
     /// `test/rules/no_duplicate_case_values_test.dart` `test_duplicateCase`
@@ -1353,6 +1929,133 @@ mod tests {
                 b.end(NodeKind::SwitchCase, 19);
                 b.end(NodeKind::SwitchBlock, 20);
                 b.end(NodeKind::SwitchStatement, 20);
+            }),
+        );
+        assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
+    }
+
+    /// The official keys by computed constant (`computeConstantValue`, :44):
+    /// `case 1 + 1:` collides with `case 2:` — the later expression reports
+    /// with both sources.
+    #[test]
+    fn computed_duplicate_case_values_report() {
+        let source = "switch (x) { case 1 + 1: break; case 2: break; }";
+        // switch0 (1 x2 )3 {4 case5 16 +7 18 :9 break10 ;11 case12 213 :14
+        // break15 ;16 }17
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 9);
+                b.patch(2, 1);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.leaf(NodeKind::LiteralInt, 8);
+                b.begin_adopting(NodeKind::BinaryExpression, 6, 2);
+                b.patch(0, 7);
+                b.end(NodeKind::BinaryExpression, 9);
+                b.begin(NodeKind::Break, 10);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 12);
+                b.end(NodeKind::SwitchCase, 12);
+                b.begin(NodeKind::SwitchCase, 12);
+                b.patch(0, NONE);
+                b.patch(1, 14);
+                b.patch(2, 1);
+                b.leaf(NodeKind::LiteralInt, 13);
+                b.begin(NodeKind::Break, 15);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 17);
+                b.end(NodeKind::SwitchCase, 17);
+                b.end(NodeKind::SwitchBlock, 18);
+                b.end(NodeKind::SwitchStatement, 18);
+            }),
+        );
+        let lints = f.run(&one_rule("no_duplicate_case_values"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The value of the case clause ('2') is equal to the value of an earlier case clause ('1 + 1')."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 13));
+    }
+
+    /// String concatenation folds: `case 'a' + 'b':` collides with
+    /// `case 'ab':`.
+    #[test]
+    fn string_concatenation_duplicate_cases_report() {
+        let source = "switch (x) { case 'a' + 'b': break; case 'ab': break; }";
+        // switch0 (1 x2 )3 {4 case5 'a'6 +7 'b'8 :9 break10 ;11 case12
+        // 'ab'13 :14 break15 ;16 }17
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 9);
+                b.patch(2, 1);
+                b.leaf(NodeKind::StringLiteral, 6);
+                b.leaf(NodeKind::StringLiteral, 8);
+                b.begin_adopting(NodeKind::BinaryExpression, 6, 2);
+                b.patch(0, 7);
+                b.end(NodeKind::BinaryExpression, 9);
+                b.begin(NodeKind::Break, 10);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 12);
+                b.end(NodeKind::SwitchCase, 12);
+                b.begin(NodeKind::SwitchCase, 12);
+                b.patch(0, NONE);
+                b.patch(1, 14);
+                b.patch(2, 1);
+                b.leaf(NodeKind::StringLiteral, 13);
+                b.begin(NodeKind::Break, 15);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 17);
+                b.end(NodeKind::SwitchCase, 17);
+                b.end(NodeKind::SwitchBlock, 18);
+                b.end(NodeKind::SwitchStatement, 18);
+            }),
+        );
+        let lints = f.run(&one_rule("no_duplicate_case_values"));
+        assert_eq!(lints.len(), 1);
+        // The official `toString()` arguments carry the source spelling,
+        // quotes included (the template's `('…')` wrap doubles them).
+        assert_eq!(
+            lints[0].message,
+            "The value of the case clause (''ab'') is equal to the value of an earlier case clause (''a' + 'b'')."
+        );
+    }
+
+    /// Expressions outside the folder's grammar evaluate unknown and never
+    /// dedupe (the official `hasKnownValue` skip): repeated non-constant
+    /// identifiers stay silent.
+    #[test]
+    fn non_constant_case_expressions_pass() {
+        let source = "switch (x) { case y: break; case y: break; }";
+        // switch0 (1 x2 )3 {4 case5 y6 :7 break8 ;9 case10 y11 :12 break13
+        // ;14 }15
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                for (case_head, y_tok, colon) in [(5, 6, 7), (10, 11, 12)] {
+                    b.begin(NodeKind::SwitchCase, case_head);
+                    b.patch(0, NONE);
+                    b.patch(1, colon);
+                    b.patch(2, 1);
+                    identifier(b, y_tok, y_tok + 1);
+                    b.begin(NodeKind::Break, colon + 1);
+                    b.patch(0, 0);
+                    b.end(NodeKind::Break, colon + 3);
+                    b.end(NodeKind::SwitchCase, colon + 3);
+                }
+                b.end(NodeKind::SwitchBlock, 16);
+                b.end(NodeKind::SwitchStatement, 16);
             }),
         );
         assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
@@ -1497,6 +2200,52 @@ mod tests {
                 b.end(NodeKind::Block, 15);
                 b.end(NodeKind::CatchClause, 15);
                 b.end(NodeKind::TryStatement, 15);
+            }),
+        );
+        assert!(f.run(&one_rule("use_rethrow_when_possible")).is_empty());
+    }
+
+    /// A local shadowing the catch parameter binds the throw — the lexical
+    /// face of the official element identity (`e` the local, not the
+    /// parameter): no report.
+    #[test]
+    fn rethrow_of_shadowing_local_passes() {
+        let source = "try {} catch (e) { var e = 1; throw e; }";
+        // try0 {1 }2 catch3 (4 e5 )6 {7 var8 e9 =10 111 ;12 throw13 e14 ;15 }16
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::VariablesDeclaration, 8);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 9);
+                identifier(b, 9, 10);
+                b.begin(NodeKind::VariableInitializer, 10);
+                b.leaf(NodeKind::LiteralInt, 11);
+                b.end(NodeKind::VariableInitializer, 12);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::ThrowExpression, 13);
+                identifier(b, 14, 15);
+                b.end(NodeKind::ThrowExpression, 16);
+                b.end(NodeKind::ExpressionStatement, 16);
+                b.end(NodeKind::Block, 17);
+                b.end(NodeKind::CatchClause, 17);
+                b.end(NodeKind::TryStatement, 17);
             }),
         );
         assert!(f.run(&one_rule("use_rethrow_when_possible")).is_empty());
