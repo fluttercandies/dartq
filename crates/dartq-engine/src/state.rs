@@ -14,7 +14,8 @@ use dartq_language::FeatureSet;
 use dartq_package::PackageTable as IdentityTable;
 use dartq_pub::PackageConfig;
 use dartq_resolution::{
-    Combinators, PackageTable as UriPackageTable, ResolutionCode, ResolvedTarget, UriResolver,
+    Combinators, Configuration, PackageTable as UriPackageTable, ResolutionCode, ResolvedTarget,
+    UriResolver,
 };
 use dartq_scanner::TokenTable;
 use dartq_sdk::SdkSnapshot;
@@ -40,6 +41,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// table to the oracle's declared-variables semantics (#455) —
 /// v4-cached entries for files with configurable directives carry the
 /// wrong selected URIs and must not survive the upgrade.
+/// v6: directives carry their `if`-clause configurations with per-clause
+/// URI spans (#512) — resolution forks per context and a selected branch's
+/// missing-target diagnostic attributes to the branch literal; v5 payloads
+/// carry no clause rows, so a restored configurable directive would lose
+/// its fork decision input.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -56,7 +62,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// already forced through a compile review by the exhaustive `of`/`restore`
 /// matches; they change the on-disk schema all the same, so they bump this
 /// version too.)
-const FACTS_SHAPE_VERSION: u32 = 5;
+const FACTS_SHAPE_VERSION: u32 = 6;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
@@ -144,6 +150,18 @@ pub struct DirectiveFacts {
     pub combinators: Combinators,
     /// The dotted name of `library a.b;` / `part of a.b;`, source spelling.
     pub name: Option<Box<str>>,
+    /// The `if (dottedName (== 'value')?) 'uri'` clauses of an import/export,
+    /// in source order — the conditional-import fork's decision input
+    /// (#512). Empty for every other directive family and for clause-free
+    /// imports/exports. Resolution picks the first clause the context's
+    /// declared variables match; the primary URI is the fallback.
+    pub configurations: Box<[Configuration]>,
+    /// UTF-16 span of each clause's URI literal, index-locked to
+    /// [`DirectiveFacts::configurations`] (built together in the diet walk).
+    /// A selected branch's missing-target diagnostic attributes to the
+    /// branch's own literal — the oracle reports `state.selectedUri`
+    /// (library_analyzer.dart:698-717), never the primary's span.
+    pub configuration_spans: Box<[SourceRange]>,
 }
 
 /// Everything one compilation unit contributes, keyed by its content

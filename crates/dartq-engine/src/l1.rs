@@ -10,7 +10,10 @@ use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, Severity};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
-use dartq_resolution::{CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver};
+use dartq_resolution::{
+    CombinatorClause, Combinators, Configuration, ResolvedTarget, SelectedUri, UriResolution,
+    UriResolver, resolve_conditional,
+};
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_snapshot::EntryKey;
 use dartq_source::{ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of};
@@ -377,10 +380,10 @@ fn recompute_facts(
         // targets (and URI diagnostics) to every same-content successor.
         to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
         for sibling in siblings.remove(&index).unwrap_or_default() {
-            let derived = derive_facts(&facts, changed[sibling].0, &mut resolver);
+            let derived = derive_facts(&facts, changed[sibling].0, &mut resolver, &state.declared_variables);
             slots[sibling] = Some((Arc::new(derived), true));
         }
-        resolve_unit(&mut facts, changed[index].0, &mut resolver);
+        resolve_unit(&mut facts, changed[index].0, &mut resolver, &state.declared_variables);
         slots[index] = Some((Arc::new(facts), false));
     }
     // Cross-batch hits (#303): the served face was computed for another
@@ -390,7 +393,7 @@ fn recompute_facts(
     // re-attributed: the AstKey triple is path-free by contract (PRD §5.3),
     // making this a hit-site duty.
     for (index, facts) in hits {
-        let derived = derive_facts(&facts, changed[index].0, &mut resolver);
+        let derived = derive_facts(&facts, changed[index].0, &mut resolver, &state.declared_variables);
         slots[index] = Some((Arc::new(derived), true));
     }
     // Warm-start re-derivation (#482): the materialized face attributes and
@@ -413,7 +416,7 @@ fn recompute_facts(
         facts
             .diagnostics
             .truncate(facts.diagnostics.len() - uri_tail);
-        resolve_unit(&mut facts, changed[index].0, &mut resolver);
+        resolve_unit(&mut facts, changed[index].0, &mut resolver, &state.declared_variables);
         slots[index] = Some((Arc::new(facts), true));
     }
     drop(resolver);
@@ -468,12 +471,17 @@ fn materialize_warm(
 /// re-attributed to `file`, directives re-resolved against its own path.
 /// The template must be pre-resolution (one URI diagnostic per coded
 /// directive; resolving twice would double them).
-fn derive_facts(template: &UnitFacts, file: FileId, resolver: &mut UriResolver<'_>) -> UnitFacts {
+fn derive_facts(
+    template: &UnitFacts,
+    file: FileId,
+    resolver: &mut UriResolver<'_>,
+    declared: &FxHashMap<String, String>,
+) -> UnitFacts {
     let mut derived = UnitFacts::clone(template);
     for diagnostic in &mut derived.diagnostics {
         diagnostic.file = file;
     }
-    resolve_unit(&mut derived, file, resolver);
+    resolve_unit(&mut derived, file, resolver, declared);
     derived
 }
 
@@ -659,7 +667,18 @@ fn scan_config(feature_set: FeatureSet) -> ScanConfig {
 /// URI-layer diagnostics (the only resolution diagnostics that are a pure
 /// function of the file's own content — everything cross-file belongs to the
 /// semantic seam).
-fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<'_>) {
+///
+/// `declared` is the context's conditional-evaluation map (`-D name=value`):
+/// configurable imports/exports select the first matching clause against it
+/// (the shared `resolve_conditional` decision), falling back to the primary
+/// URI. Under the oracle-default empty map every condition misses, so the
+/// no-`-D` face is unchanged.
+fn resolve_unit(
+    facts: &mut UnitFacts,
+    file: FileId,
+    resolver: &mut UriResolver<'_>,
+    declared: &FxHashMap<String, String>,
+) {
     // The engine extracts no `@docImport`s at M1, so every resolvable kind
     // maps to the resolution face's `DirectiveKind::ImportExport`; a
     // docImport extraction only gains a branch here. Authority-carrying
@@ -686,9 +705,10 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
                 | DirectiveKind::Part
                 | DirectiveKind::PartOf
         ) {
+            let (uri, _span) = selected_uri(directive, declared);
             let UriResolution { target, code, .. } = resolver.resolve(
                 file,
-                directive.uri.as_deref(),
+                uri,
                 dartq_resolution::DirectiveKind::ImportExport,
             );
             directive.target = target;
@@ -697,13 +717,41 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
     }
     for directive in &facts.directives {
         if let Some(code) = directive.code {
+            let (uri, span) = selected_uri(directive, declared);
             facts.diagnostics.push(uri_diagnostic(
                 code,
-                directive.uri.as_deref().unwrap_or_default(),
-                directive.uri_span,
+                uri.unwrap_or_default(),
+                span,
                 file,
             ));
         }
+    }
+}
+
+/// The URI string a directive's resolution selects against `declared`, with
+/// its own literal span: the first configuration the declared variables
+/// match (the resolution crate's `resolve_conditional` — source order,
+/// exact-value equality, primary fallback), else the primary. The span
+/// follows the selection so a selected branch's missing-target diagnostic
+/// lands on the branch literal — the oracle reports `state.selectedUri`
+/// (library_analyzer.dart:698-717), never the primary's. Unmatched branch
+/// URIs are never resolved here (the oracle never reads them), so a missing
+/// *unselected* target stays silent.
+fn selected_uri<'a>(
+    directive: &'a DirectiveFacts,
+    declared: &FxHashMap<String, String>,
+) -> (Option<&'a str>, SourceRange) {
+    debug_assert_eq!(
+        directive.configurations.len(),
+        directive.configuration_spans.len(),
+        "configuration spans are index-locked to the clauses"
+    );
+    match resolve_conditional(&directive.configurations, declared) {
+        SelectedUri::Primary => (directive.uri.as_deref(), directive.uri_span),
+        SelectedUri::Configuration(index) => (
+            Some(directive.configurations[index].uri.as_ref()),
+            directive.configuration_spans[index],
+        ),
     }
 }
 
@@ -972,6 +1020,8 @@ fn walk_library(
         deferred: false,
         combinators: Combinators::unfiltered(),
         name,
+        configurations: Box::default(),
+        configuration_spans: Box::default(),
     });
     end
 }
@@ -1057,8 +1107,9 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
     (decodable.then(|| value.into_boxed_str()), span, j)
 }
 
-/// `import`/`export`: uri, `[deferred] [as p]` (import shapes only in
-/// practice, tolerated on both), combinator list, `;`.
+/// `import`/`export`: uri, conditional-uri clauses (`if (test) uri`), 
+/// `[deferred] [as p]` (import shapes only in practice, tolerated on both),
+/// combinator list, `;`.
 fn walk_import_export(
     text: &str,
     tokens: &TokenTable,
@@ -1071,12 +1122,27 @@ fn walk_import_export(
     let mut prefix = None;
     let mut deferred = false;
     let mut clauses: Vec<CombinatorClause> = Vec::new();
+    let mut configurations: Vec<Configuration> = Vec::new();
+    let mut configuration_spans: Vec<SourceRange> = Vec::new();
     loop {
         match kind_at(tokens, i) {
             None | Some(TokenKind::Eof) => break,
             Some(TokenKind::Semicolon) => {
                 i += 1;
                 break;
+            }
+            Some(TokenKind::Keyword(Keyword::If)) => {
+                // The conditional-uri clauses join the directive from any
+                // clause position: the official import recovery
+                // (parseImportRecovery :1022-1026) re-parses them into the
+                // same configurations, so a late `if` still forks resolution.
+                i = walk_conditional_uri(
+                    text,
+                    tokens,
+                    i,
+                    &mut configurations,
+                    &mut configuration_spans,
+                );
             }
             Some(TokenKind::Keyword(Keyword::Deferred)) => {
                 deferred = true;
@@ -1125,8 +1191,93 @@ fn walk_import_export(
         deferred,
         combinators: Combinators::new(clauses, strings),
         name: None,
+        configurations: configurations.into(),
+        configuration_spans: configuration_spans.into(),
     });
     i
+}
+
+/// One diet-walk `if (dottedName (== 'string')?) 'uri'` clause, mirroring the
+/// official `parseConditionalUri` decision order (parser_impl.dart:1095):
+/// the paren group (a missing `(` reads the bare name the official's
+/// `insertParens` would wrap, :1102-1109), the dotted name, the optional
+/// `==` value, the group close (garbage inside a real group is jumped over
+/// to the closer, :1124-1136), then the candidate URI.
+///
+/// A clause is recorded only when its whole shape reads clean and both
+/// strings decode — the diet walk's under-report bias (never a false
+/// positive): a malformed clause contributes no configuration, which under
+/// selection resolves the primary URI, and the parser face carries the
+/// diagnostics for the same source. Every return path advances past `if`,
+/// so the walk stays terminating.
+fn walk_conditional_uri(
+    text: &str,
+    tokens: &TokenTable,
+    if_at: usize,
+    configurations: &mut Vec<Configuration>,
+    configuration_spans: &mut Vec<SourceRange>,
+) -> usize {
+    let mut i = if_at + 1; // past `if`
+    let mut name = String::new();
+    let mut value: Option<Box<str>> = None;
+    let mut clean = true;
+
+    if kind_at(tokens, i) == Some(TokenKind::OpenParen) {
+        let close = tokens.matching_end(i);
+        let interior_end = close.unwrap_or(i + 1);
+        let mut j = i + 1;
+        // dottedName: identifier ('.' identifier)* — a trailing or leading
+        // period (a synthetic official name) leaves the clause malformed.
+        let mut expect_name = true;
+        while let Some(kind) = kind_at(tokens, j) {
+            if expect_name && is_name_token(kind) {
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(tokens.lexeme(text, j));
+                expect_name = false;
+                j += 1;
+            } else if !expect_name && kind == TokenKind::Period {
+                expect_name = true;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        clean &= !expect_name;
+        // Optional `== value`: the same literal read as the candidate URI
+        // (adjacent segments concatenate; interpolation stays shapeless).
+        if kind_at(tokens, j) == Some(TokenKind::EqEq) {
+            j += 1;
+            let (read, _, value_next) = read_uri(text, tokens, j);
+            match read {
+                Some(decoded) => {
+                    value = Some(decoded);
+                    j = value_next;
+                }
+                None => clean = false,
+            }
+        }
+        // Garbage between the condition and the real closer: the clause
+        // shape is broken (the official reports and jumps to the group end).
+        clean &= j == interior_end;
+        i = close.map_or(interior_end, |end| end + 1);
+    } else {
+        // Missing `(`: the official's insertParens (:1102-1109) stands in an
+        // EMPTY synthetic condition name — a clause that can never match a
+        // declared variable — and the real tokens shift past the synthetic
+        // `)` into the value/URI reads. Recording nothing here is the same
+        // resolution outcome (primary) under the under-report bias.
+        clean = false;
+    }
+
+    // The candidate URI after the group (official :1155).
+    let (uri, span, next) = read_uri(text, tokens, i);
+    if clean && !name.is_empty() && let Some(uri) = uri {
+        configurations.push(Configuration::new(&name, value.as_deref(), &uri));
+        configuration_spans.push(span);
+    }
+    next
 }
 
 /// `part 'u';` and `part of 'u' | a.b.c;`
@@ -1153,6 +1304,8 @@ fn walk_part(
                 deferred: false,
                 combinators: Combinators::unfiltered(),
                 name: None,
+                configurations: Box::default(),
+                configuration_spans: Box::default(),
             });
             return i;
         }
@@ -1170,6 +1323,8 @@ fn walk_part(
             deferred: false,
             combinators: Combinators::unfiltered(),
             name,
+            configurations: Box::default(),
+            configuration_spans: Box::default(),
         });
         return end;
     }
@@ -1187,6 +1342,8 @@ fn walk_part(
         deferred: false,
         combinators: Combinators::unfiltered(),
         name: None,
+        configurations: Box::default(),
+        configuration_spans: Box::default(),
     });
     i
 }
@@ -1774,6 +1931,12 @@ mod tests {
         }
 
         fn state(&self) -> EngineState {
+            self.state_with(FxHashMap::default())
+        }
+
+        /// The state over a custom declared-variables context — the
+        /// conditional-import fork axis (#512).
+        fn state_with(&self, declared: FxHashMap<String, String>) -> EngineState {
             EngineState::new(
                 self.packages.clone(),
                 &self.config,
@@ -1781,7 +1944,7 @@ mod tests {
                 SdkSnapshot::load(&self.root.join("sdk"), None).expect("synthetic SDK loads"),
                 crate::memory_store(),
                 "vm".to_owned(),
-                FxHashMap::default(),
+                declared,
             )
             .expect("engine state")
         }
@@ -1863,6 +2026,78 @@ mod tests {
                 .as_slice(),
             &[part]
         );
+    }
+
+    /// Conditional imports fork end-to-end (#512): the diet walk captures
+    /// the `if` clauses, resolution selects the first clause the context's
+    /// declared variables match (source order), and only the SELECTED
+    /// candidate is read — an unmatched branch's missing target stays
+    /// silent, a selected one is diagnosed at its own literal.
+    #[test]
+    fn conditional_import_forks_by_declared_variables() {
+        let fixture = Fixture::new();
+        let lib = fixture.root.join("lib");
+        let source =
+            "import 'a.dart' if (dart.library.io) 'b.dart' if (x == 'y') 'c.dart';\n";
+        let c_offset = source.find("'c.dart'").expect("candidate literal");
+
+        // The oracle-default empty context: every condition misses, the
+        // primary URI resolves, no URI diagnostic fires.
+        let mut state = fixture.state_with(FxHashMap::default());
+        let main = set(&mut state, &lib.join("main.dart"), source);
+        let a = set(&mut state, &lib.join("a.dart"), "library a;\n");
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+        assert_eq!(facts.directives[0].target, ResolvedTarget::Resolved(a));
+        assert!(facts.diagnostics.is_empty(), "{:?}", facts.diagnostics);
+
+        // `dart.library.io` declared: the FIRST matching clause wins in
+        // source order (the later `x == 'y'` matches too) and the branch
+        // target forks away from the primary — the daemon's multi-context
+        // fork observability.
+        let declared: FxHashMap<String, String> = [("dart.library.io", "true"), ("x", "y")]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let mut state = fixture.state_with(declared);
+        let main = set(&mut state, &lib.join("main.dart"), source);
+        let b = set(&mut state, &lib.join("b.dart"), "library b;\n");
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+        assert_eq!(facts.directives[0].target, ResolvedTarget::Resolved(b));
+        // The unmatched `c.dart` is absent from disk — and silent: only the
+        // selected URI is ever read (library_analyzer.dart:698-717).
+        assert!(facts.diagnostics.is_empty(), "{:?}", facts.diagnostics);
+
+        // Declared but non-matching values (`io=false` misses the bare
+        // condition's exact `"true"` test): the second clause selects the
+        // missing `c.dart`. A file target lands on its interned id with the
+        // missing-target code riding the `code` column — `ResolvedTarget`
+        // is `Missing` only for the non-file faces (dart:/other-scheme/
+        // undecodable) — and the `uri_does_not_exist` diagnostic
+        // attributes to the branch's own literal, not the primary's.
+        let declared: FxHashMap<String, String> = [("dart.library.io", "false"), ("x", "y")]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let mut state = fixture.state_with(declared);
+        let main = set(&mut state, &lib.join("main.dart"), source);
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+        let c = state
+            .files
+            .try_file_id(&lib.join("c.dart"))
+            .expect("the selected branch target is interned by resolution");
+        assert_eq!(facts.directives[0].target, ResolvedTarget::Resolved(c));
+        let diagnostic = &facts.diagnostics[0];
+        assert_eq!(diagnostic.code.name, "uri_does_not_exist");
+        assert!(
+            diagnostic.message.contains("'c.dart'"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(diagnostic.range.offset, c_offset as u32);
+        assert_eq!(diagnostic.range.length, "'c.dart'".len() as u32);
     }
 
     /// Bounded canonical-URI memo (audit #398 F10): a file leaving residency

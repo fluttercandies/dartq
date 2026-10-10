@@ -35,11 +35,15 @@ use serde::{Deserialize, Serialize};
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
-use dartq_resolution::{CombinatorClause, Combinators, ResolutionCode, ResolvedTarget};
+use dartq_resolution::{
+    CombinatorClause, Combinators, Configuration, ResolutionCode, ResolvedTarget,
+};
 use dartq_sdk::SdkSnapshot;
 use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
-use dartq_source::{FileId, FileTable, LineIndex, StringId, StringTable, content_hash};
+use dartq_source::{
+    FileId, FileTable, LineIndex, SourceRange, StringId, StringTable, content_hash,
+};
 
 use crate::state::{DirectiveFacts, DirectiveKind, UnitFacts};
 
@@ -262,6 +266,27 @@ pub struct PersistedDirective {
     pub combinators: Vec<PersistedCombinator>,
     /// The dotted name of `library a.b;` / `part of a.b;`.
     pub name: Option<String>,
+    /// The `if` clauses in source order (#512): condition name/value,
+    /// candidate URI, and the URI literal's span (a selected branch's
+    /// missing-target diagnostic attributes to the branch literal, so the
+    /// span rides with the clause). Restore splits them back into the
+    /// index-locked [`DirectiveFacts`] columns.
+    pub configurations: Vec<PersistedConfiguration>,
+}
+
+/// One conditional-import clause in payload form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedConfiguration {
+    /// The condition's dotted name, as written (`dart.library.io`, a `-D`
+    /// name).
+    pub dotted_name: String,
+    /// The `=` value; `None` for the bare form (and for a written `= ''` —
+    /// the constructor folds it, `valueOrTrue`).
+    pub value: Option<String>,
+    /// The URI string selected when the condition matches.
+    pub uri: String,
+    /// UTF-16 span of the clause's URI literal.
+    pub uri_span: PersistedRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,10 +449,36 @@ impl PersistedDirective {
                 })
                 .collect(),
             name: directive.name.as_ref().map(|name| name.to_string()),
+            configurations: directive
+                .configurations
+                .iter()
+                .zip(directive.configuration_spans.iter())
+                .map(|(config, span)| PersistedConfiguration {
+                    dotted_name: config.dotted_name.to_string(),
+                    value: config.value.as_ref().map(|value| value.to_string()),
+                    uri: config.uri.to_string(),
+                    uri_span: PersistedRange::of(*span),
+                })
+                .collect(),
         }
     }
 
     fn restore(self, strings: &StringTable, files: &[FileId]) -> DirectiveFacts {
+        let (configurations, configuration_spans): (Vec<Configuration>, Vec<SourceRange>) = self
+            .configurations
+            .into_iter()
+            .map(|config| {
+                let span = config.uri_span.source_range();
+                (
+                    Configuration::new(
+                        &config.dotted_name,
+                        config.value.as_deref(),
+                        &config.uri,
+                    ),
+                    span,
+                )
+            })
+            .unzip();
         DirectiveFacts {
             kind: match self.kind {
                 PersistedDirectiveKind::Import => DirectiveKind::Import,
@@ -469,6 +520,8 @@ impl PersistedDirective {
                 strings,
             ),
             name: self.name.map(Box::from),
+            configurations: configurations.into(),
+            configuration_spans: configuration_spans.into(),
         }
     }
 }
@@ -613,7 +666,9 @@ mod tests {
         r#"{"kind":"Import","uri":"package:a/a.dart","uri_span":{"offset":0,"length":18},"#,
         r#""target":{"File":0},"code":"UriDoesNotExist","prefix":"p","deferred":true,"#,
         r#""combinators":[{"hide":false,"names":["showOnly"]},{"hide":true,"names":["hideMe"]}],"#,
-        r#""name":"main"}],"#,
+        r#""name":"main","configurations":[{"dotted_name":"dart.library.io","value":null,"#,
+        r#""uri":"io.dart","uri_span":{"offset":20,"length":9}},{"dotted_name":"flutter.mode","#,
+        r#""value":"release","uri":"release.dart","uri_span":{"offset":36,"length":14}}]}],"#,
         r#""elements":{"strings":[],"decls":[],"containers":[],"container_order":[],"#,
         r#""extension_faces":[],"duplicates":[],"arity_violations":[]},"diagnostics":["#,
         r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
@@ -661,6 +716,26 @@ mod tests {
                     },
                 ],
                 name: Some("main".to_owned()),
+                configurations: vec![
+                    PersistedConfiguration {
+                        dotted_name: "dart.library.io".to_owned(),
+                        value: None,
+                        uri: "io.dart".to_owned(),
+                        uri_span: PersistedRange::of(SourceRange {
+                            offset: 20,
+                            length: 9,
+                        }),
+                    },
+                    PersistedConfiguration {
+                        dotted_name: "flutter.mode".to_owned(),
+                        value: Some("release".to_owned()),
+                        uri: "release.dart".to_owned(),
+                        uri_span: PersistedRange::of(SourceRange {
+                            offset: 36,
+                            length: 14,
+                        }),
+                    },
+                ],
             }],
             elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
             diagnostics: vec![
@@ -853,6 +928,7 @@ mod tests {
                 deferred: false,
                 combinators: Vec::new(),
                 name: None,
+                configurations: Vec::new(),
             }],
             elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
             diagnostics: vec![PersistedDiagnostic {
@@ -1205,6 +1281,8 @@ mod tests {
                 &strings,
             ),
             name: None,
+            configurations: Box::default(),
+            configuration_spans: Box::default(),
         }];
         let diagnostics = vec![Diagnostic::new(
             Severity::Error,
