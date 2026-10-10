@@ -40,6 +40,22 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// table to the oracle's declared-variables semantics (#455) —
 /// v4-cached entries for files with configurable directives carry the
 /// wrong selected URIs and must not survive the upgrade.
+///
+/// # Bump contract (structural guard)
+///
+/// Any change to the persisted payload layout — a field added to, removed
+/// from, renamed in, retyped in, or reordered within the
+/// [`persist::PersistedFacts`] tree, a mirror-enum variant added, or a serde
+/// representation change — must bump this version in the same change: a
+/// payload written by the old shape must never be served to code expecting
+/// the new one. The discipline is structural, not memory-resident:
+/// `persist::tests::persisted_payload_shape_is_pinned` pins the byte-exact
+/// JSON encoding of a representative payload, so a layout edit without a
+/// bump fails the guard, and its message names the fix — bump this version,
+/// extend the history above, re-pin. (Mirror-enum *variant* additions are
+/// already forced through a compile review by the exhaustive `of`/`restore`
+/// matches; they change the on-disk schema all the same, so they bump this
+/// version too.)
 const FACTS_SHAPE_VERSION: u32 = 5;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD

@@ -597,6 +597,137 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Byte-exact pinned encoding of [`shape_probe`], the representative
+    /// persisted payload — the structural facts-shape guard. Any layout edit
+    /// in the `PersistedFacts` tree (a field added, removed, renamed,
+    /// retyped, or reordered; a serde representation change) moves these
+    /// bytes while `FACTS_SHAPE_VERSION` (state.rs) stays put, and
+    /// [`Self::persisted_payload_shape_is_pinned`] fails. The pinned literal
+    /// (not a hash of it) is deliberate: it bites identically, is reviewable
+    /// by eye, and the failure prints the actual encoding for a one-paste
+    /// re-pin. Mirror-enum variant *additions* leave existing encodings
+    /// unchanged (the pin cannot see them); the exhaustive `of`/`restore`
+    /// matches already force that review at compile time.
+    const FACTS_SHAPE_JSON_PIN: &str = concat!(
+        r#"{"api_signature":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"directives":["#,
+        r#"{"kind":"Import","uri":"package:a/a.dart","uri_span":{"offset":0,"length":18},"#,
+        r#""target":{"File":0},"code":"UriDoesNotExist","prefix":"p","deferred":true,"#,
+        r#""combinators":[{"hide":false,"names":["showOnly"]},{"hide":true,"names":["hideMe"]}],"#,
+        r#""name":"main"}],"#,
+        r#""elements":{"strings":[],"decls":[],"containers":[],"container_order":[],"#,
+        r#""extension_faces":[],"duplicates":[],"arity_violations":[]},"diagnostics":["#,
+        r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
+        r#""code_dtype":"CompileTimeError","code_published":false,"message":"Target of URI "#,
+        r#"doesn't exist: 'package:a/a.dart'.","file":0,"range":{"offset":0,"length":18},"#,
+        r#""correction":null},{"severity":"Warning","code_name":"dead_code","#,
+        r#""code_machine":"DEAD_CODE","code_dtype":"StaticWarning","code_published":true,"#,
+        r#""message":"Dead code.","file":1,"range":{"offset":4,"length":9},"#,
+        r#""correction":"Try removing the dead code."}],"#,
+        r#""files":["/w/lib/main.dart","/w/lib/other.dart"]}"#,
+    );
+
+    /// The representative payload the shape pin guards: one instance of every
+    /// engine-side payload struct in the `PersistedFacts` tree, exercising
+    /// the `Some`/`None` faces (`uri`, `code`, `prefix`, `name`,
+    /// `correction`), both combinator directions, a file-target index, and
+    /// two severities. The element model rides empty
+    /// (`FileElements::default()` projects to empty columns): the semantic
+    /// mirrors live in dartq-semantic with their own review surface, while
+    /// the pin guards the engine-side layout — including
+    /// `PersistedElements`' own column list.
+    fn shape_probe() -> PersistedFacts {
+        let strings = StringTable::new();
+        PersistedFacts {
+            api_signature: [7; 16],
+            directives: vec![PersistedDirective {
+                kind: PersistedDirectiveKind::Import,
+                uri: Some("package:a/a.dart".to_owned()),
+                uri_span: PersistedRange::of(SourceRange {
+                    offset: 0,
+                    length: 18,
+                }),
+                target: PersistedTarget::File(0),
+                code: Some(PersistedResolutionCode::UriDoesNotExist),
+                prefix: Some("p".to_owned()),
+                deferred: true,
+                combinators: vec![
+                    PersistedCombinator {
+                        hide: false,
+                        names: vec!["showOnly".to_owned()],
+                    },
+                    PersistedCombinator {
+                        hide: true,
+                        names: vec!["hideMe".to_owned()],
+                    },
+                ],
+                name: Some("main".to_owned()),
+            }],
+            elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
+            diagnostics: vec![
+                PersistedDiagnostic {
+                    severity: PersistedSeverity::Error,
+                    code_name: "uri_does_not_exist".to_owned(),
+                    code_machine: "URI_DOES_NOT_EXIST".to_owned(),
+                    code_dtype: PersistedDiagnosticType::CompileTimeError,
+                    code_published: false,
+                    message: "Target of URI doesn't exist: 'package:a/a.dart'.".to_owned(),
+                    file: 0,
+                    range: PersistedRange::of(SourceRange {
+                        offset: 0,
+                        length: 18,
+                    }),
+                    correction: None,
+                },
+                PersistedDiagnostic {
+                    severity: PersistedSeverity::Warning,
+                    code_name: "dead_code".to_owned(),
+                    code_machine: "DEAD_CODE".to_owned(),
+                    code_dtype: PersistedDiagnosticType::StaticWarning,
+                    code_published: true,
+                    message: "Dead code.".to_owned(),
+                    file: 1,
+                    range: PersistedRange::of(SourceRange {
+                        offset: 4,
+                        length: 9,
+                    }),
+                    correction: Some("Try removing the dead code.".to_owned()),
+                },
+            ],
+            files: vec![
+                PathBuf::from("/w/lib/main.dart"),
+                PathBuf::from("/w/lib/other.dart"),
+            ],
+        }
+    }
+
+    /// The facts-shape guard (state.rs `FACTS_SHAPE_VERSION` contract): the
+    /// representative payload's encoding must match the pinned bytes
+    /// byte-for-byte, so a persisted-layout edit cannot land without the
+    /// version bump that invalidates old snapshots. The message names the
+    /// whole fix; the printed actual encoding is the re-pin value.
+    #[test]
+    fn persisted_payload_shape_is_pinned() {
+        let bytes = serde_json::to_vec(&shape_probe()).expect("probe payload serializes");
+        let encoded = String::from_utf8(bytes).expect("json is utf-8");
+        assert_eq!(
+            encoded, FACTS_SHAPE_JSON_PIN,
+            "the persisted facts payload layout changed without a \
+             FACTS_SHAPE_VERSION bump (state.rs): a snapshot written by the \
+             old shape must never be served to code expecting the new one. \
+             Bump FACTS_SHAPE_VERSION, extend its shape history, and re-pin \
+             FACTS_SHAPE_JSON_PIN to the actual encoding printed below."
+        );
+        // Decode + re-encode must reproduce the pinned bytes: serde's own
+        // representation of the shape is stable, not just the derive surface.
+        let decoded: PersistedFacts =
+            serde_json::from_str(FACTS_SHAPE_JSON_PIN).expect("pinned encoding decodes");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-encode"),
+            FACTS_SHAPE_JSON_PIN,
+            "decode+re-encode must reproduce the pinned encoding byte-for-byte"
+        );
+    }
+
     /// A throwaway directory tree for the graph fixtures: package dirs
     /// `a`/`b` and `.dart_tool/` under one canonical root, so every rebuild
     /// resolves the same root spellings and fingerprint deltas are pure
