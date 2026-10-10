@@ -1,8 +1,14 @@
 //! The check face's core: the M0 pipeline (engine-api-spec §2.1) over a
 //! discovered file set — bytes → scan → `@dart` override rescan → parse —
-//! producing the canonical-order diagnostic set the oracle-exact writers
-//! render. Stops there by design: no pub/package/SDK/engine involvement
-//! (the spec's M1 forbid-list).
+//! plus the URI-layer existence face for relative directive targets:
+//! `uri_does_not_exist` / `uri_has_not_been_generated` where a sibling the
+//! directive names is absent, the one resolution diagnostic decidable from
+//! the file set alone. Producing the canonical-order diagnostic set the
+//! oracle-exact writers render, it stops there by design: no
+//! pub/package/SDK/engine involvement (scheme-carrying URIs — `dart:`,
+//! `package:` — need the package/SDK universe and stay the engine view's
+//! business; PRD §15.1's CLI/RPC equivalence is pinned by both faces
+//! sharing this implementation).
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -12,14 +18,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dartq_diagnostics::{
-    AnalysisOutput, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity, SourceRange,
+    AnalysisOutput, CodeInfo, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity,
+    SourceRange,
 };
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
 };
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
-use dartq_scanner::{ScanConfig, ScanResult, scan};
-use dartq_source::{FileTable, LineIndex};
+use dartq_resolution::{ResolutionCode, parse_directive_uri};
+use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
+use dartq_source::{FileTable, LineIndex, normalize_lexical, utf16_len_of};
 
 /// One check run's result: the per-file layout state behind the writers and
 /// the canonical-order diagnostic set (file discovery order, then source
@@ -72,13 +80,21 @@ impl CheckRun {
 /// # Errors
 ///
 /// Source read or UTF-8 decode failure.
+///
+/// # Panics
+///
+/// Never in practice: every file arrives canonicalized by [`read_source`],
+/// and a canonical path always has a parent.
 pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
     let mut files_state = FileSet::default();
     let mut diags = Vec::new();
     for path in files {
         let (canonical, source) = read_source(path)?;
         let file = files_state.push(&source, &canonical);
-        diags.extend(analyze_file(&source, file));
+        // Relative directive targets compose against the canonical file's
+        // directory (canonical paths are absolute, so the parent exists).
+        let dir = canonical.parent().expect("canonical path has a parent");
+        diags.extend(analyze_file(&source, dir, file));
     }
     diags.sort_by(|a, b| {
         a.file
@@ -148,9 +164,10 @@ impl FileLayoutProvider for FileSet {
     }
 }
 
-/// Runs the M0 pipeline over one file: scan (+ override rescan), then parse
-/// through a diagnostics-collecting listener.
-fn analyze_file(source: &str, file: FileId) -> Vec<Diagnostic> {
+/// Runs the M0 pipeline over one file: scan (+ override rescan), parse
+/// through a diagnostics-collecting listener, then the relative-URI
+/// existence face over the harvested directive targets.
+fn analyze_file(source: &str, dir: &Path, file: FileId) -> Vec<Diagnostic> {
     let (version, scanned, mut diags) = scan_file(source, file);
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
     // The parser owns its listener by value and exposes no accessor; a shared
@@ -168,8 +185,295 @@ fn analyze_file(source: &str, file: FileId) -> Vec<Diagnostic> {
     )
     .parse_unit();
     diags.extend(std::mem::take(&mut *sink.borrow_mut()));
+    diags.extend(directive_diagnostics(dir, file, &scanned.tokens, source));
     diags.extend(scanned.diagnostics);
     diags
+}
+
+// ---------------------------------------------------------------------------
+// The relative-URI existence face
+//
+// The engine resolves directive URIs through `l1::resolve_unit` +
+// `UriResolver` over the full package/SDK universe; the disk face has
+// neither, so it judges exactly the decidable class — a scheme-less target
+// composes against the file's own directory and must exist on disk
+// (`uri_does_not_exist`, or `uri_has_not_been_generated` for the generated
+// suffixes). The directive harvest restates the engine's diet walk
+// (`l1::extract_directives`) minus the resolution bookkeeping; like it, the
+// face never false-positives — shapes it cannot judge (interpolated,
+// escape-carrying, percent-encoded, scheme-carrying URIs) stay silent.
+// ---------------------------------------------------------------------------
+
+/// One resolvable directive URI: the cooked value (adjacent literals
+/// concatenated) and its UTF-16 span — the whole literal region, quotes
+/// included (the engine's `read_uri` face).
+struct DirectiveUri {
+    value: String,
+    span: SourceRange,
+}
+
+/// The URI diagnostics of one file: every harvested directive target that
+/// is missing on disk.
+fn directive_diagnostics(
+    dir: &Path,
+    file: FileId,
+    tokens: &TokenTable,
+    text: &str,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for uri in harvest_directive_uris(text, tokens) {
+        if let Some(diagnostic) = missing_relative(&uri, dir, file) {
+            diags.push(diagnostic);
+        }
+    }
+    diags
+}
+
+/// One directive URI's existence verdict: `Some` when its relative target
+/// is missing on disk. Scheme-carrying URIs (`dart:`, `package:`, `file:`,
+/// `data:`, …), protocol-relative authorities, and percent-encoded paths
+/// need machinery the disk face lacks and return `None`.
+fn missing_relative(uri: &DirectiveUri, dir: &Path, file: FileId) -> Option<Diagnostic> {
+    let raw = parse_directive_uri(&uri.value).ok()?;
+    if !raw.scheme.is_empty() || raw.authority.is_some() || raw.path.contains('%') {
+        return None;
+    }
+    let target = normalize_lexical(&dir.join(&*raw.path));
+    if target.exists() {
+        return None;
+    }
+    Some(uri_diagnostic(
+        missing_file_code(&target),
+        &uri.value,
+        uri.span,
+        file,
+    ))
+}
+
+/// The §4.2 code for a known-path-but-missing target: generated-suffix paths
+/// report `uri_has_not_been_generated`, everything else `uri_does_not_exist`
+/// (the engine's `missing_file_code`; suffixes frozen at
+/// `library_analyzer.dart:694-700`).
+fn missing_file_code(path: &Path) -> ResolutionCode {
+    const GENERATED_SUFFIXES: [&str; 6] = [
+        ".g.dart",
+        ".pb.dart",
+        ".pbenum.dart",
+        ".pbserver.dart",
+        ".pbjson.dart",
+        ".template.dart",
+    ];
+    let text = path.to_string_lossy();
+    if GENERATED_SUFFIXES
+        .iter()
+        .any(|suffix| text.ends_with(suffix))
+    {
+        ResolutionCode::UriHasNotBeenGenerated
+    } else {
+        ResolutionCode::UriDoesNotExist
+    }
+}
+
+/// One URI-layer diagnostic from the resolution registry's descriptor (the
+/// engine's `uri_diagnostic` face): the family decides TYPE and severity,
+/// and the oracle message template takes the URI as written.
+fn uri_diagnostic(code: ResolutionCode, uri: &str, range: SourceRange, file: FileId) -> Diagnostic {
+    let info = code.info();
+    Diagnostic::new(
+        info.dtype.severity(),
+        CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
+        info.message.replace("{0}", uri),
+        file,
+        range,
+        info.correction.map(str::to_owned),
+    )
+}
+
+/// Walks the directive region of a token table (the engine diet walk's
+/// region rules: after an optional script tag, metadata, and `;`s,
+/// `library`/`import`/`export`/`part` open directive shapes consumed to
+/// their `;`; any other token ends the region) and returns the resolvable
+/// URIs of `import`/`export`/`part`/`part of` string forms.
+fn harvest_directive_uris(text: &str, tokens: &TokenTable) -> Vec<DirectiveUri> {
+    let mut uris = Vec::new();
+    let mut i = 0;
+    while let Some(token) = tokens.get(i) {
+        match token.kind {
+            // EOF and any non-directive token end the region.
+            TokenKind::Semicolon | TokenKind::ScriptTag => i += 1,
+            TokenKind::At => i = skip_annotation(tokens, i + 1),
+            TokenKind::Keyword(Keyword::Library) => i = skip_dotted_name(tokens, i + 1),
+            TokenKind::Keyword(Keyword::Import | Keyword::Export) => {
+                let (uri, end) = read_uri(text, tokens, i + 1);
+                if let Some(uri) = uri {
+                    uris.push(uri);
+                }
+                i = skip_to_semicolon(tokens, end);
+            }
+            TokenKind::Keyword(Keyword::Part) => i = harvest_part(text, tokens, i, &mut uris),
+            _ => break,
+        }
+    }
+    uris
+}
+
+/// The token kind at `i`, if any.
+fn kind_at(tokens: &TokenTable, i: usize) -> Option<TokenKind> {
+    tokens.get(i).map(|token| token.kind)
+}
+
+/// Whether `kind` can spell part of an annotation name: identifiers and
+/// built-in identifiers (`dynamic`) only — reserved/pseudo keywords would
+/// swallow the next declaration.
+fn is_name_token(kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::Identifier => true,
+        TokenKind::Keyword(keyword) => keyword.style() == KeywordStyle::BuiltIn,
+        _ => false,
+    }
+}
+
+/// Skips `@qualifiedName[(args)]` starting after the `@`.
+fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
+    while kind_at(tokens, i).is_some_and(is_name_token)
+        || kind_at(tokens, i) == Some(TokenKind::Period)
+    {
+        i += 1;
+    }
+    if kind_at(tokens, i) == Some(TokenKind::OpenParen) {
+        i = tokens.matching_end(i).map_or(i, |end| end + 1);
+    }
+    i
+}
+
+/// A dotted name (`a.b.c`) of identifier-ish tokens, consumed to the `;`
+/// (`library a.b.c;` / `part of a.b;` carry no URI).
+fn skip_dotted_name(tokens: &TokenTable, mut i: usize) -> usize {
+    loop {
+        match kind_at(tokens, i) {
+            Some(TokenKind::Semicolon) | None => return i + 1,
+            Some(kind) if is_name_token(kind) || kind == TokenKind::Period => i += 1,
+            _ => return i + 1,
+        }
+    }
+}
+
+/// Consumes the rest of an `import`/`export` shape to (and past) its `;`.
+fn skip_to_semicolon(tokens: &TokenTable, mut i: usize) -> usize {
+    loop {
+        match kind_at(tokens, i) {
+            None | Some(TokenKind::Eof) => return i,
+            Some(TokenKind::Semicolon) => return i + 1,
+            _ => i += 1,
+        }
+    }
+}
+
+/// Reads the URI literal starting at `i`: the run of adjacent plain `String`
+/// segments concatenates into one value, and any interpolation segment makes
+/// the region shapeless (the whole chain is skipped so the region walk stays
+/// aligned). A cooked segment carrying escapes stays unjudged — its value
+/// needs the engine's escape processor — while raw segments cook verbatim.
+/// Returns the URI (absent when shapeless or unjudged) and the index just
+/// past the literal region.
+fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<DirectiveUri>, usize) {
+    if kind_at(tokens, i) != Some(TokenKind::String) {
+        return (None, i);
+    }
+    let mut j = i;
+    let mut value = String::new();
+    let mut judged = true;
+    let span_offset = tokens.get(i).expect("kind_at checked").utf16_offset;
+    // Always overwritten by the first iteration (segment `i` is a `String`).
+    let mut span_end = span_offset;
+    while kind_at(tokens, j) == Some(TokenKind::String) {
+        let lexeme = tokens.lexeme(text, j);
+        let token = tokens.get(j).expect("kind_at checked");
+        span_end = token.utf16_offset + utf16_len_of(lexeme);
+        match simple_string_value(lexeme) {
+            Some(segment) => value.push_str(segment),
+            None => judged = false,
+        }
+        j += 1;
+    }
+    if matches!(
+        kind_at(tokens, j),
+        Some(TokenKind::StringInterpolationExpression | TokenKind::StringInterpolationIdentifier)
+    ) {
+        loop {
+            match kind_at(tokens, j) {
+                Some(TokenKind::String | TokenKind::StringInterpolationIdentifier) => j += 1,
+                Some(TokenKind::StringInterpolationExpression) => {
+                    j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
+                }
+                _ => break,
+            }
+        }
+        return (None, j);
+    }
+    let uri = judged.then_some(DirectiveUri {
+        value,
+        span: SourceRange {
+            offset: span_offset,
+            length: span_end - span_offset,
+        },
+    });
+    (uri, j)
+}
+
+/// `part 'u';` and `part of 'u' | a.b.c;` — the string forms carry a URI.
+fn harvest_part(
+    text: &str,
+    tokens: &TokenTable,
+    start: usize,
+    out: &mut Vec<DirectiveUri>,
+) -> usize {
+    if kind_at(tokens, start + 1) == Some(TokenKind::Keyword(Keyword::Of)) {
+        if kind_at(tokens, start + 2) == Some(TokenKind::String) {
+            let (uri, mut i) = read_uri(text, tokens, start + 2);
+            if let Some(uri) = uri {
+                out.push(uri);
+            }
+            if kind_at(tokens, i) == Some(TokenKind::Semicolon) {
+                i += 1;
+            }
+            return i;
+        }
+        return skip_dotted_name(tokens, start + 2);
+    }
+    let (uri, mut i) = read_uri(text, tokens, start + 1);
+    if let Some(uri) = uri {
+        out.push(uri);
+    }
+    if kind_at(tokens, i) == Some(TokenKind::Semicolon) {
+        i += 1;
+    }
+    i
+}
+
+/// The literal's cooked value when that is certain without escape
+/// processing: raw bodies are verbatim; cooked bodies are verbatim unless
+/// they carry a backslash (then `None`). A `$` in a plain `String` token is
+/// a literal dollar — the scanner splits interpolated segments into their
+/// own token kinds.
+fn simple_string_value(lexeme: &str) -> Option<&str> {
+    let (raw, body) = match lexeme.strip_prefix('r') {
+        Some(rest) => (true, rest),
+        None => (false, lexeme),
+    };
+    let body = if let Some(rest) = body.strip_prefix("\"\"\"") {
+        rest.strip_suffix("\"\"\"")?
+    } else if let Some(rest) = body.strip_prefix("'''") {
+        rest.strip_suffix("'''")?
+    } else if let Some(rest) = body.strip_prefix('"') {
+        rest.strip_suffix('"')?
+    } else {
+        body.strip_prefix('\'')?.strip_suffix('\'')?
+    };
+    if !raw && body.contains('\\') {
+        return None;
+    }
+    Some(body)
 }
 
 /// Scans `source`, honoring the `@dart` override consumer contract (scanner
@@ -432,6 +736,96 @@ mod tests {
             "expected_token",
             "canonical order puts the one diagnostic forward"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The disk pipeline's URI face (the row the CLI check face and the
+    /// daemon's disk view both render — PRD §15.1 equivalence): a missing
+    /// relative import surfaces `uri_does_not_exist` at the URI literal,
+    /// `../` composes through the canonical parent, and the generated
+    /// suffixes code `uri_has_not_been_generated`. Everything the face
+    /// cannot judge stays silent: the satisfied import, the raw-string
+    /// spelling of a present target, the interpolated and percent-encoded
+    /// URIs, and the scheme-carrying `dart:`/`package:` imports (the
+    /// engine/compat faces' universe).
+    #[test]
+    fn analyze_files_reports_missing_relative_imports() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_uri_{}", std::process::id()));
+        fs::create_dir_all(root.join("lib/sub")).expect("mkdir");
+        fs::write(
+            root.join("lib/main.dart"),
+            "import 'missing.dart';\nimport 'present.dart';\nvoid main() {}\n",
+        )
+        .expect("write main");
+        fs::write(root.join("lib/present.dart"), "var ok = 1;\n").expect("write present");
+        fs::write(
+            root.join("lib/foreign.dart"),
+            "import 'dart:core';\nimport 'package:nowhere/x.dart';\n",
+        )
+        .expect("write foreign");
+        fs::write(
+            root.join("lib/gen.dart"),
+            "import 'missing.g.dart';\nimport r'present.dart';\n",
+        )
+        .expect("write gen");
+        fs::write(
+            root.join("lib/sub/deep.dart"),
+            "import '../present.dart';\nimport 'gone.dart';\n",
+        )
+        .expect("write deep");
+        fs::write(
+            root.join("lib/unjudged.dart"),
+            "import '${dynamic}.dart';\nimport 'a%20b.dart';\nvoid f() { x }\n",
+        )
+        .expect("write unjudged");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        let run = analyze_files(&files).expect("check core");
+
+        let by_code = |name: &str| {
+            run.diagnostics()
+                .iter()
+                .filter(|d| d.code.name == name)
+                .collect::<Vec<_>>()
+        };
+        let missing = by_code("uri_does_not_exist");
+        assert_eq!(
+            missing.len(),
+            2,
+            "main.dart + sub/deep.dart only: {:?}",
+            run.diagnostics()
+        );
+        assert_eq!(missing[0].severity, Severity::Error);
+        assert_eq!(
+            missing[0].message,
+            "Target of URI doesn't exist: 'missing.dart'."
+        );
+        assert_eq!(
+            missing[0].range.offset, 7,
+            "the URI literal, quotes included"
+        );
+        assert_eq!(missing[0].range.length, 14, "'missing.dart' with quotes");
+        assert!(
+            run.output()
+                .files
+                .file_path(missing[1].file)
+                .ends_with("lib/sub/deep.dart"),
+            "`../` composed from the sub directory"
+        );
+
+        let generated = by_code("uri_has_not_been_generated");
+        assert_eq!(
+            generated.len(),
+            1,
+            "the .g.dart suffix codes the generated face"
+        );
+
+        // The syntax error in unjudged.dart is the only non-URI row; the
+        // satisfied import, the raw-string spelling of a present target, the
+        // interpolated and percent-encoded URIs, and the scheme-carrying
+        // `dart:`/`package:` imports all stay silent.
+        assert_eq!(run.diagnostics().len(), 4);
 
         fs::remove_dir_all(&root).ok();
     }

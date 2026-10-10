@@ -15,6 +15,7 @@ dartq-lints = { path = "../dartq-lints" }
 dartq-package = { path = "../dartq-package" }
 dartq-parser = { path = "../dartq-parser" }
 dartq-pub = { path = "../dartq-pub" }
+dartq-resolution = { path = "../dartq-resolution" }
 dartq-scanner = { path = "../dartq-scanner" }
 dartq-schema = { path = "../dartq-schema" }
 dartq-sdk = { path = "../dartq-sdk" }

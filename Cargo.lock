@@ -233,6 +233,7 @@ dependencies = [
  "dartq-package",
  "dartq-parser",
  "dartq-pub",
+ "dartq-resolution",
  "dartq-scanner",
  "dartq-schema",
  "dartq-sdk",

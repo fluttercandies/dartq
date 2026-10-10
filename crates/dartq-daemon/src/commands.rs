@@ -1005,12 +1005,13 @@ fn explain_answer(
     sdk: Option<&Path>,
 ) -> Result<Value, SessionError> {
     let sdk = sdk.or(Some(drain.sdk_root));
-    let mut report = explain_core(drain.root, sdk, symbol, verbosity).map_err(|error| match error {
-        ExplainError::Workspace(_) | ExplainError::Engine(_) => {
-            SessionError::InvalidParams(error.to_string())
-        }
-        ExplainError::Analyze(_) => SessionError::Internal(error.to_string()),
-    })?;
+    let mut report =
+        explain_core(drain.root, sdk, symbol, verbosity).map_err(|error| match error {
+            ExplainError::Workspace(_) | ExplainError::Engine(_) => {
+                SessionError::InvalidParams(error.to_string())
+            }
+            ExplainError::Analyze(_) => SessionError::Internal(error.to_string()),
+        })?;
     if let Some(since) = since {
         // Delta mode (the impact face's mapping over the report's own
         // sections): a use/import/test row stays when its file changed in
@@ -1030,7 +1031,13 @@ fn explain_answer(
             }
         }
     }
-    Ok(session_answer(report, verbosity, since, drain, EXPLAIN_SPOTS))
+    Ok(session_answer(
+        report,
+        verbosity,
+        since,
+        drain,
+        EXPLAIN_SPOTS,
+    ))
 }
 
 // ---------------------------------------------------------------------------

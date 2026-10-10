@@ -11,7 +11,8 @@
 //!   check and fix faces).
 //! * [`workspace`] — the workspace/SDK assembly behind every engine-backed
 //!   face ([`EngineConfig`] plus the canonical package directory).
-//! * [`check`] — the M0 scan+parse pipeline.
+//! * [`check`] — the M0 scan+parse pipeline plus the relative-URI
+//!   existence face (`uri_does_not_exist` for missing directive targets).
 //! * [`config`] — the `dartq.yaml` workspace config (PRD §15.9) plus the
 //!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
