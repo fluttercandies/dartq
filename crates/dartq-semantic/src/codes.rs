@@ -340,6 +340,63 @@ pub enum SemanticCode {
     /// the local declaration there — we keep the class-name anchor, a
     /// documented span divergence).
     InconsistentInheritanceGetterAndMethod,
+    // —— #504: the usage cluster (all `STATIC_WARNING`,
+    //    `unused_local_elements_verifier.dart`) ————————————————————————————
+    /// `The value of the local variable '{0}' isn't used.` — a local
+    /// variable (pattern-declared included) no read of which resolves to it
+    /// (`_visitLocalVariableElement`, unused_local_elements_verifier.dart:
+    /// 1259-1280). Writes alone and statement-discarded reads do not count;
+    /// `_`-wildcard names are exempt.
+    UnusedLocalVariable,
+    /// `The declaration '{0}' isn't referenced.` — a private local function,
+    /// private top-level declaration, private container, or private class
+    /// member with no library-level reference (`_visitLocalFunctionElement`
+    /// /`_visitTopLevelFunctionElement`/`_visitClassElement`/
+    /// `_visitMethodElement`/`_visitPropertyAccessorElement`/
+    /// `_visitConstructorElement`, unused_local_elements_verifier.dart).
+    UnusedElement,
+    /// `The value of the field '{0}' isn't used.` — a private field no
+    /// library-level read resolves to (`_visitFieldElement`, unused_local_
+    /// elements_verifier.dart:1240-1247): writes never count, reads do.
+    UnusedField,
+    /// `A value for optional parameter '{0}' isn't ever given.` — an
+    /// optional parameter of a non-publicly-accessible executable that no
+    /// invocation supplies and no body reference reads
+    /// (`visitFormalParameterList` + `_isUsedElement`'s parameter arm,
+    /// unused_local_elements_verifier.dart:781-792, 1060-1125).
+    UnusedElementParameter,
+    // —— #504/#505: the catch-variable rows (same traversal) ————————————————
+    /// `The exception variable '{0}' isn't used, so the 'catch' clause can
+    /// be removed.` — an `on T catch (e)` exception variable with no stack
+    /// trace sibling and no body reference (unused_local_elements_verifier.
+    /// dart:1262-1268; a plain `catch (e)` auto-uses its variable).
+    UnusedCatchClause,
+    /// `The stack trace variable '{0}' isn't used and can be removed.` — a
+    /// catch clause's stack trace parameter with no body reference
+    /// (unused_local_elements_verifier.dart:1269-1273).
+    UnusedCatchStack,
+    // —— #505: the import/flow cluster (all `STATIC_WARNING`) ———————————————
+    /// `Unused import: '{0}'.` — an import with a resolved, existing,
+    /// non-`dart:core` target that contributed no used element
+    /// (`generateUnusedImportWarnings`, imports_verifier.dart:228-268);
+    /// `{0}` is the URI as written.
+    UnusedImport,
+    /// `The left operand can't be null, so the right operand is never
+    /// executed.` — an `e1 ?? e2` / `e1 ??= e2` whose left side's static
+    /// type is strictly non-nullable (`_checkForDeadNullCoalesce`,
+    /// error_verifier.dart:4733-4739, 1512, 1526); anchored at the right
+    /// operand.
+    DeadNullAwareExpression,
+    /// `Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch
+    /// (e)' are never reached.` — a try's catch clauses following a
+    /// catch-all clause (`_CatchClausesVerifier.nextCatchClause`,
+    /// dead_code_verifier.dart:571-586); the span covers the first dead
+    /// clause through the last one.
+    DeadCodeCatchFollowingCatch,
+    /// `The label '{0}' isn't used.` — a label no `break`/`continue` in its
+    /// label scope targets (`_withLabelTracker`, dead_code_verifier.dart:
+    /// 163-176).
+    UnusedLabel,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -565,9 +622,28 @@ impl SemanticCode {
                 "inconsistent_inheritance_getter_and_method",
                 "INCONSISTENT_INHERITANCE_GETTER_AND_METHOD",
             ),
+            Self::UnusedLocalVariable => ("unused_local_variable", "UNUSED_LOCAL_VARIABLE"),
+            Self::UnusedElement => ("unused_element", "UNUSED_ELEMENT"),
+            Self::UnusedField => ("unused_field", "UNUSED_FIELD"),
+            Self::UnusedElementParameter => (
+                "unused_element_parameter",
+                "UNUSED_ELEMENT_PARAMETER",
+            ),
+            Self::UnusedCatchClause => ("unused_catch_clause", "UNUSED_CATCH_CLAUSE"),
+            Self::UnusedCatchStack => ("unused_catch_stack", "UNUSED_CATCH_STACK"),
+            Self::UnusedImport => ("unused_import", "UNUSED_IMPORT"),
+            Self::DeadNullAwareExpression => (
+                "dead_null_aware_expression",
+                "DEAD_NULL_AWARE_EXPRESSION",
+            ),
+            Self::DeadCodeCatchFollowingCatch => (
+                "dead_code_catch_following_catch",
+                "DEAD_CODE_CATCH_FOLLOWING_CATCH",
+            ),
+            Self::UnusedLabel => ("unused_label", "UNUSED_LABEL"),
         };
         let dtype = self.dtype();
-        // Unpublished rows: the function variant is the one wrong-number
+        // Unpublished rows: the function variant is the only wrong-number
         // template without a `hasPublishedDocs` field
         // (diagnostic.g.dart:18725-18744); `memberWithClassName`
         // (:10552-10564) and `expectedRepresentationType` (:5334-5345) carry
@@ -599,7 +675,17 @@ impl SemanticCode {
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
-            | Self::DeadCode => DiagnosticType::StaticWarning,
+            | Self::DeadCode
+            | Self::UnusedLocalVariable
+            | Self::UnusedElement
+            | Self::UnusedField
+            | Self::UnusedElementParameter
+            | Self::UnusedCatchClause
+            | Self::UnusedCatchStack
+            | Self::UnusedImport
+            | Self::DeadNullAwareExpression
+            | Self::DeadCodeCatchFollowingCatch
+            | Self::UnusedLabel => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -618,6 +704,35 @@ impl SemanticCode {
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
+            // The #504 usage cluster (unused_local_elements_verifier.dart)
+            // and the #505 import/flow rows: one-argument messages over the
+            // declaration's name; the flow rows carry none.
+            Self::UnusedLocalVariable => {
+                format!("The value of the local variable '{a0}' isn't used.")
+            }
+            Self::UnusedElement => format!("The declaration '{a0}' isn't referenced."),
+            Self::UnusedField => format!("The value of the field '{a0}' isn't used."),
+            Self::UnusedElementParameter => {
+                format!("A value for optional parameter '{a0}' isn't ever given.")
+            }
+            Self::UnusedCatchClause => {
+                format!(
+                    "The exception variable '{a0}' isn't used, so the 'catch' clause can be removed."
+                )
+            }
+            Self::UnusedCatchStack => {
+                format!("The stack trace variable '{a0}' isn't used and can be removed.")
+            }
+            Self::UnusedLabel => format!("The label '{a0}' isn't used."),
+            Self::UnusedImport => format!("Unused import: '{a0}'."),
+            Self::DeadNullAwareExpression => {
+                "The left operand can't be null, so the right operand is never executed."
+                    .to_string()
+            }
+            Self::DeadCodeCatchFollowingCatch => {
+                "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached."
+                    .to_string()
+            }
             Self::UndefinedAnnotation => {
                 format!("Undefined name '{a0}' used as an annotation.")
             }
@@ -915,6 +1030,36 @@ impl SemanticCode {
             Self::InconsistentInheritanceGetterAndMethod => format!(
                 "'{a0}' is inherited as a getter (from '{a1}') and also a method (from '{a2}')."
             ),
+            // The #504 usage cluster (unused_local_elements_verifier.dart):
+            // one-argument rows over the declaration's name.
+            Self::UnusedLocalVariable => {
+                format!("The value of the local variable '{a0}' isn't used.")
+            }
+            Self::UnusedElement => format!("The declaration '{a0}' isn't referenced."),
+            Self::UnusedField => format!("The value of the field '{a0}' isn't used."),
+            Self::UnusedElementParameter => {
+                format!("A value for optional parameter '{a0}' isn't ever given.")
+            }
+            Self::UnusedCatchClause => {
+                format!(
+                    "The exception variable '{a0}' isn't used, so the 'catch' clause can be removed."
+                )
+            }
+            Self::UnusedCatchStack => {
+                format!("The stack trace variable '{a0}' isn't used and can be removed.")
+            }
+            Self::UnusedLabel => format!("The label '{a0}' isn't used."),
+            // The #505 import/flow rows: the URI names the import; the two
+            // flow rows carry no arguments.
+            Self::UnusedImport => format!("Unused import: '{a0}'."),
+            Self::DeadNullAwareExpression => {
+                "The left operand can't be null, so the right operand is never executed."
+                    .to_string()
+            }
+            Self::DeadCodeCatchFollowingCatch => {
+                "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached."
+                    .to_string()
+            }
             // One- and two-placeholder rows: the extra placeholder is
             // ignored (the descriptor stays total over the frozen set).
             _ => self.message(a0, a1),
@@ -939,6 +1084,30 @@ impl SemanticCode {
             // (diagnostic.g.dart:3547-3549).
             Self::DeadCode => Some(
                 "Try removing the code, or fixing the code before it so that it can be reached."
+                    .to_string(),
+            ),
+            // The #504/#505 rows' verbatim oracle corrections
+            // (diagnostic.g.dart, the usage and import/flow families).
+            Self::UnusedLocalVariable => Some("Try removing the variable or using it.".to_string()),
+            Self::UnusedElement => Some(format!("Try removing the declaration of '{a2}'.")),
+            Self::UnusedField => Some("Try removing the field, or using it.".to_string()),
+            Self::UnusedElementParameter => {
+                Some("Try removing the unused parameter.".to_string())
+            }
+            Self::UnusedCatchClause => Some("Try removing the catch clause.".to_string()),
+            Self::UnusedCatchStack => {
+                Some("Try removing the stack trace variable, or using it.".to_string())
+            }
+            Self::UnusedImport => Some("Try removing the import directive.".to_string()),
+            Self::DeadNullAwareExpression => {
+                Some("Try removing the operator and the right operand.".to_string())
+            }
+            Self::DeadCodeCatchFollowingCatch => Some(
+                "Try reordering the catch clauses so that they can be reached, or removing the unreachable catch clauses."
+                    .to_string(),
+            ),
+            Self::UnusedLabel => Some(
+                "Try removing the label, or using it in either a 'break' or 'continue' statement."
                     .to_string(),
             ),
             _ => None,
@@ -1070,6 +1239,17 @@ mod tests {
             SemanticCode::InheritsAbstractMemberFivePlus,
             SemanticCode::InconsistentInheritance,
             SemanticCode::InconsistentInheritanceGetterAndMethod,
+            // The #504 usage cluster and the #505 import/flow rows.
+            SemanticCode::UnusedLocalVariable,
+            SemanticCode::UnusedElement,
+            SemanticCode::UnusedField,
+            SemanticCode::UnusedElementParameter,
+            SemanticCode::UnusedCatchClause,
+            SemanticCode::UnusedCatchStack,
+            SemanticCode::UnusedLabel,
+            SemanticCode::UnusedImport,
+            SemanticCode::DeadNullAwareExpression,
+            SemanticCode::DeadCodeCatchFollowingCatch,
         ];
         for code in codes {
             let info = code.code_info();
@@ -1125,6 +1305,17 @@ mod tests {
     /// The severity pin's coverage list — grows with each implemented batch
     /// (a data table, so it lives outside the test body).
     const SEVERITY_CODES: &[SemanticCode] = &[
+        // The warning-tier rows the usage/import clusters add.
+        SemanticCode::UnusedLocalVariable,
+        SemanticCode::UnusedElement,
+        SemanticCode::UnusedField,
+        SemanticCode::UnusedElementParameter,
+        SemanticCode::UnusedCatchClause,
+        SemanticCode::UnusedCatchStack,
+        SemanticCode::UnusedLabel,
+        SemanticCode::UnusedImport,
+        SemanticCode::DeadNullAwareExpression,
+        SemanticCode::DeadCodeCatchFollowingCatch,
         SemanticCode::DuplicateDefinition,
         SemanticCode::UndefinedAnnotation,
         SemanticCode::UndefinedClass,

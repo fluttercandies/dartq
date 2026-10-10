@@ -515,6 +515,10 @@ pub struct FileReport {
     pub diagnostics: Vec<Diagnostic>,
     /// Unresolved-name rows (the §8 recovery surface), in source order.
     pub names: Vec<NameRow>,
+    /// The usage-cluster emissions staged while the parse runs (scope
+    /// frames close out of source order); merged into `diagnostics` by
+    /// offset at the end of the pass.
+    usage: Vec<Diagnostic>,
 }
 
 /// The `shouldIgnoreUndefined` mirror (`element.dart:8217-8250`) over the
@@ -819,6 +823,111 @@ enum TypeHead {
     Continuation,
 }
 
+/// One local declaration of the open frame stack (the usage cluster's
+/// declaration side). `uses` counts the finalized reads that resolved here;
+/// the routing at frame close follows the official
+/// `_visitLocalVariableElement` split (unused_local_elements_verifier.dart:
+/// 1259-1280).
+struct LocalDecl {
+    name: StringId,
+    /// The name token's span (the diagnostic anchor).
+    range: SourceRange,
+    kind: LocalKind,
+    uses: u32,
+    /// The pattern-variable-declaration group (`None` = independent).
+    group: Option<u32>,
+}
+
+/// The local declaration kinds the usage cluster routes on.
+#[derive(Clone, Copy)]
+enum LocalKind {
+    /// A plain local variable.
+    Variable,
+    /// A pattern-declared variable (`var (a, b) = …`, `case var x`).
+    PatternVariable,
+    /// A formal parameter; the declaration site it belongs to feeds the
+    /// `unused_element_parameter` body-reference rule.
+    Parameter { site: Option<usize> },
+    /// A catch clause's exception variable; `auto` records the official
+    /// visitCatchClause auto-use (a plain `catch` without an `on` type, or
+    /// a stack-trace sibling present) — patched in at `handle_catch_block`
+    /// once both facts are known.
+    CatchException {
+        auto: bool,
+    },
+    /// A catch clause's stack trace variable.
+    CatchStack,
+    /// A named local function (reports as `unused_element`).
+    LocalFunction,
+}
+
+/// One library-level declaration site of this file (the usage cluster's
+/// library-level side), captured at the declaration events with the name
+/// token's span.
+#[derive(Clone, Copy)]
+struct DeclSite {
+    /// Lookup spelling — setters under `name=` (the model's convention;
+    /// use checks compare against the bare name).
+    name: StringId,
+    range: SourceRange,
+    kind: DeclKind,
+    /// Any metadata annotation was present (the pragma/JS exemption gates'
+    /// under-report superset: an annotated declaration is never reported).
+    annotated: bool,
+}
+
+/// The library-level declaration kinds the usage cluster reports on.
+#[derive(Clone, Copy)]
+enum DeclKind {
+    /// A top-level function, getter, or setter.
+    TopLevelFn,
+    /// A top-level variable.
+    TopLevelVar,
+    /// A typedef (either style).
+    TypeAlias,
+    /// A named class/mixin/enum/extension-type declaration. Unnamed and
+    /// named extensions never join: the official verifier has no
+    /// extension-declaration visit (unused_local_elements_verifier.dart
+    /// visits classes, enums, mixins, and extension types only).
+    Container,
+    /// A class member; `container` names the declaring container.
+    Member {
+        kind: MemberKind,
+        is_static: bool,
+        container: StringId,
+    },
+    /// A named constructor of `container`.
+    Constructor { container: StringId },
+}
+
+/// One import directive of this file (the `unused_import` side): the
+/// written URI, its prefix, and the source-matched graph edge.
+struct ImportSite {
+    /// The URI as written (quotes stripped; the message's `{0}`).
+    uri_text: String,
+    /// The URI literal's span (the diagnostic anchor).
+    uri_range: SourceRange,
+    prefix: Option<StringId>,
+}
+
+/// One label scope (`_LabelTracker`): the labels declared in it and their
+/// used flags.
+struct LabelScope {
+    labels: Vec<(StringId, SourceRange, bool)>,
+}
+
+/// One completed catch clause of a try (the
+/// `_CatchClausesVerifier.nextCatchClause` inputs).
+struct CatchClauseFact {
+    /// The `on T` type's name (`None` = plain `catch`, and `Object` plays
+    /// the same catch-all role).
+    on_type: Option<StringId>,
+    /// The clause's first token (`on`/`catch`).
+    start: SourceRange,
+    /// The clause block's closing brace.
+    end: SourceRange,
+}
+
 /// The engine: one parse, then the resolution pass.
 struct Engine<'a> {
     graph: &'a LibraryGraph,
@@ -911,6 +1020,10 @@ struct Engine<'a> {
     type_prefix: Option<TypePrefix>,
     /// Suppression depth inside `is`/`as` type operands.
     non_type_pos: u32,
+    /// Suppression depth inside `is` type operands only (the usage
+    /// cluster's `_insideIsExpression` gate — `as` operands still count as
+    /// type uses).
+    is_type_pos: u32,
     /// Suppression depth inside `new`/`const`/implicit-creation expressions.
     ctor_pos: u32,
     /// The open constructor reference's segments `(class, ctor-selector)`:
@@ -989,6 +1102,119 @@ struct Engine<'a> {
     /// Begin spans of open string literals (the `end_literal_string`
     /// event carries only the end token).
     const_string_begins: Vec<SourceRange>,
+    // —— #504: the usage cluster ———————————————————————————————————————————
+    /// Flat stack of the open frames' local declarations; frame `i` owns
+    /// `[frame_local_marks[i], len)` (the #504 usage cluster's declaration
+    /// side, `unused_local_elements_verifier.dart`).
+    locals: Vec<LocalDecl>,
+    /// Per open frame, the locals-stack length at frame open.
+    frame_local_marks: Vec<usize>,
+    /// Local-referencing rows: the row's range offset → the local
+    /// declaration the bare read resolved to. Consumed by the write-only /
+    /// useless-read cancellations and the receiver merge (the row stack
+    /// shifts, so rows carry no back-pointer).
+    local_hits: FxHashMap<u32, u32>,
+    /// The open pattern-variable-declaration group window (a locals-stack
+    /// base): every pattern-declared variable since the base joins the
+    /// group, and one used member spares the whole group (official
+    /// `visitPatternVariableDeclaration`, unused_local_elements_verifier.
+    /// dart:856-884). The window opens at the first declared variable after
+    /// the previous statement boundary and closes at
+    /// `handle_pattern_variable_declaration_statement` — case-pattern
+    /// variables keep `group = None` and report independently.
+    pattern_group_mark: Option<usize>,
+    /// The pattern-group sequence (group ids).
+    pattern_group_seq: u32,
+    /// The parameters of the executable declaration in flight attach to
+    /// this declaration site (set at the site-creating begin events,
+    /// read by the formal-parameter identifiers).
+    open_exec_site: Option<usize>,
+    /// Declaration sites of this file, parse order (= source order): the
+    /// library-level side of the usage cluster.
+    decl_sites: Vec<DeclSite>,
+    /// The open field group's static bit (`begin_fields` arms it, the
+    /// group's `FieldDeclaration` identifiers read it).
+    /// Metadata names of the declaration in flight (`MetadataReference`
+    /// collects; a declaration site consumes them into its `annotated`
+    /// exemption bit — any annotation exempts, the official pragma/JS
+    /// gates' under-report superset).
+    pending_annotations: Vec<StringId>,
+    /// Library-level reference index: every name some reference resolved
+    /// to in this file (locals included — shadowing only ever suppresses).
+    used_names: FxHashSet<StringId>,
+    /// Names a READ-shaped member access resolved to (the `unused_field`
+    /// read-only rule: writes never spare a field).
+    read_names: FxHashSet<StringId>,
+    /// `(callee spelling, named argument)` pairs some invocation gave (the
+    /// `_addParametersForArguments` face of the official use index).
+    named_given: FxHashSet<(StringId, StringId)>,
+    /// Callee spelling → the largest positional argument count any
+    /// invocation gave (optional-positional parameters past it stay
+    /// ungiven).
+    positional_given: FxHashMap<StringId, u16>,
+    /// Declaration site → the parameter names some body use resolved to.
+    site_param_uses: FxHashMap<usize, FxHashSet<StringId>>,
+    // —— #505: the import/flow cluster —————————————————————————————————————
+    /// The import directives of this file, parse order: the written URI
+    /// and the prefix (`ImportPrefixDeclaration` identifier).
+    imports: Vec<ImportSite>,
+    /// Open label scopes (`_LabelTracker`, dead_code_verifier.dart:
+    /// 618-661): labeled statements and switch member label groups.
+    label_scopes: Vec<LabelScope>,
+    /// The `on`-type name of the catch clause in flight (the first type
+    /// reference before the catch parameters).
+    catch_on_type: Option<StringId>,
+    /// The catch clause's first token (`on`/`catch`) — the clause fact's
+    /// start anchor.
+    catch_clause_start: Option<SourceRange>,
+    /// Catch parameters seen in the clause in flight (0 = none, 1 =
+    /// exception, 2 = exception + stack trace).
+    catch_params: u8,
+    /// Per open try, the completed catch-clause facts (the
+    /// `_CatchClausesVerifier` state).
+    try_clauses: Vec<Vec<CatchClauseFact>>,
+    /// Open `??` binary groups: rows-stack mark at `begin_binary_expression`,
+    /// for the strictly-non-nullable left operand check at close.
+    if_null_groups: Vec<(usize, SourceRange)>,
+    /// Formal-parameter name spans per declaration site (the
+    /// `unused_element_parameter` anchors).
+    site_params: FxHashMap<usize, Vec<(StringId, SourceRange)>>,
+    /// Rows pushed while the named scope referred to itself (the official
+    /// `_enclosingClass`/`_enclosingExec` self-reference exclusions): the
+    /// used-name marking at resolve time skips exactly these rows.
+    self_scope_rows: FxHashSet<u32>,
+    /// Rows pushed while the bare name matched a field of the enclosing
+    /// container: a non-write resolution is the field's implicit-getter
+    /// read (the official `readMembers` face the `unused_field` rule
+    /// consults).
+    field_read_rows: FxHashSet<u32>,
+    /// The container of the constructor/factory being parsed (`None`
+    /// outside one).
+    ctor_pending: Option<StringId>,
+    /// The top-level function declaration site awaiting its setter
+    /// spelling fix-up at `end_top_level_method`.
+    open_toplevel_site: Option<usize>,
+    /// The member declaration's `set` head (`begin_method` latch; the
+    /// member site's lookup spelling).
+    open_member_setter: bool,
+    /// The member/field declaration's `static` head (`begin_method` /
+    /// `begin_fields` latch; the member site's static bit).
+    open_member_static: bool,
+    /// The label name captured at `LabelDeclaration`, consumed by the
+    /// `handle_label` colon.
+    pending_label: Option<(StringId, SourceRange)>,
+    /// The last block's closing-brace span (the catch body anchor).
+    last_block_end: Option<SourceRange>,
+    /// The local function whose name has fired but whose declaration has
+    /// not closed: the tracked `LocalFunction` entry materializes into the
+    /// ENCLOSING frame's window at the end event (the name resolves in the
+    /// function's own frame, but its use-counting scope is the enclosing
+    /// one).
+    pending_local_fn: Option<(StringId, SourceRange)>,
+    /// Open local-function frames as `(frame depth, name)`: the official
+    /// `_enclosingExec` spelling for bodies inside a local function (a
+    /// self-reference never marks the function used).
+    local_fn_stack: Vec<(usize, StringId)>,
 }
 
 /// A const-environment binding.
@@ -1072,6 +1298,7 @@ impl<'a> Engine<'a> {
             pending_send: None,
             type_prefix: None,
             non_type_pos: 0,
+            is_type_pos: 0,
             ctor_pos: 0,
             creation_ref: None,
             object_members,
@@ -1098,6 +1325,37 @@ impl<'a> Engine<'a> {
             owner_libs: RefCell::new(FxHashMap::default()),
             reported_extension_types: FxHashSet::default(),
             reported_face_checks: FxHashSet::default(),
+            locals: Vec::new(),
+            frame_local_marks: Vec::new(),
+            local_hits: FxHashMap::default(),
+            pattern_group_mark: None,
+            pattern_group_seq: 0,
+            open_exec_site: None,
+            decl_sites: Vec::new(),
+            pending_annotations: Vec::new(),
+            used_names: FxHashSet::default(),
+            read_names: FxHashSet::default(),
+            named_given: FxHashSet::default(),
+            positional_given: FxHashMap::default(),
+            site_param_uses: FxHashMap::default(),
+            imports: Vec::new(),
+            label_scopes: Vec::new(),
+            catch_on_type: None,
+            catch_clause_start: None,
+            catch_params: 0,
+            try_clauses: Vec::new(),
+            if_null_groups: Vec::new(),
+            site_params: FxHashMap::default(),
+            self_scope_rows: FxHashSet::default(),
+            field_read_rows: FxHashSet::default(),
+            ctor_pending: None,
+            open_toplevel_site: None,
+            open_member_setter: false,
+            open_member_static: false,
+            pending_label: None,
+            last_block_end: None,
+            pending_local_fn: None,
+            local_fn_stack: Vec::new(),
         }
     }
 
@@ -1223,17 +1481,815 @@ impl<'a> Engine<'a> {
             type_mark,
             row_mark,
         });
+        self.frame_local_marks.push(self.locals.len());
         self.const_scopes.push(FxHashMap::default());
     }
 
     fn pop_frame(&mut self) {
         if let Some(frame) = self.frames.pop() {
             self.type_params.truncate(frame.type_mark);
+            self.close_frame_locals(frame);
+        }
+        while self
+            .local_fn_stack
+            .last()
+            .is_some_and(|(depth, _)| *depth >= self.frames.len())
+        {
+            self.local_fn_stack.pop();
         }
         // Scope 0 is the file scope; it never pops.
         if self.const_scopes.len() > 1 {
             self.const_scopes.pop();
         }
+    }
+
+    /// Closes a frame's local declarations: the usage cluster's per-scope
+    /// decision point. Every un-referenced declaration routes per its kind
+    /// (the official `_visitLocalVariableElement` split,
+    /// unused_local_elements_verifier.dart:1259-1280); the emissions stage
+    /// for the end-of-pass source-order merge.
+    fn close_frame_locals(&mut self, _frame: Frame) {
+        let mark = self.frame_local_marks.pop().unwrap_or(self.locals.len());
+        if mark >= self.locals.len() {
+            self.locals.truncate(mark);
+            return;
+        }
+        // Pattern-declaration groups report all-or-nothing: one used member
+        // spares the group (official visitPatternVariableDeclaration).
+        let mut group_used: FxHashMap<u32, bool> = FxHashMap::default();
+        for decl in &self.locals[mark..] {
+            if let Some(group) = decl.group {
+                *group_used.entry(group).or_default() |= decl.uses > 0;
+            }
+        }
+        for index in mark..self.locals.len() {
+            let (name, range, kind, uses, group) = {
+                let decl = &self.locals[index];
+                (decl.name, decl.range, decl.kind, decl.uses, decl.group)
+            };
+            // Parameters feed the declaration site's body-reference rule
+            // (`unused_element_parameter`); they never emit per se.
+            if let LocalKind::Parameter { site: Some(site) } = kind {
+                if uses > 0 {
+                    self.site_param_uses
+                        .entry(site)
+                        .or_default()
+                        .insert(name);
+                }
+                continue;
+            }
+            if uses > 0 {
+                continue;
+            }
+            let spared = match group {
+                Some(group) => group_used.get(&group).copied().unwrap_or(false),
+                None => false,
+            };
+            if spared {
+                continue;
+            }
+            let wildcard = self.is_wildcard(name);
+            let name_text = self.strings.resolve(name).to_string();
+            let (code, name) = match kind {
+                LocalKind::Variable | LocalKind::PatternVariable => {
+                    // The wildcard-variables feature: an all-underscores
+                    // name never reports (unused_local_elements_verifier.dart
+                    // :985-994).
+                    if wildcard {
+                        continue;
+                    }
+                    (SemanticCode::UnusedLocalVariable, name_text)
+                }
+                LocalKind::Parameter { .. } => {
+                    // Parameters route through `unused_element_parameter` at
+                    // the declaration site, never the local-variable row.
+                    continue;
+                }
+                LocalKind::LocalFunction => {
+                    if wildcard {
+                        continue;
+                    }
+                    (SemanticCode::UnusedElement, name_text)
+                }
+                LocalKind::CatchException { auto } => {
+                    // A plain `catch (e)` (no `on` type) or a clause that
+                    // also declares a stack trace parameter auto-uses its
+                    // exception variable (official visitCatchClause,
+                    // unused_local_elements_verifier.dart:67-82); the flag
+                    // was patched in at `handle_catch_block`.
+                    if auto || wildcard {
+                        continue;
+                    }
+                    (SemanticCode::UnusedCatchClause, name_text)
+                }
+                // The stack trace row carries no wildcard exemption — the
+                // official catch-stack branch has none either.
+                LocalKind::CatchStack => (SemanticCode::UnusedCatchStack, name_text),
+            };
+            self.stage_usage(code, range, &name);
+        }
+        self.locals.truncate(mark);
+    }
+
+    /// Stages one usage-cluster diagnostic (merged into the report at the
+    /// end of the pass, source order restored there).
+    fn stage_usage(&mut self, code: SemanticCode, range: SourceRange, a0: &str) {
+        let correction = code.correction_message(a0);
+        self.report.usage.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message(a0, ""),
+            self.file,
+            range,
+            correction,
+        ));
+    }
+
+    /// The bare lookup spelling of a site name (setters live under `name=`
+    /// in the sites; the use index carries plain names).
+    fn bare_name(&self, spelling: StringId) -> StringId {
+        let text = self.strings.resolve(spelling);
+        match text.strip_suffix('=') {
+            Some(bare) => self.intern(bare),
+            None => spelling,
+        }
+    }
+
+    /// The `_`-private test (library privacy, the usage cluster's gate).
+    fn is_private_name(&self, name: StringId) -> bool {
+        self.strings.resolve(name).starts_with('_')
+    }
+
+    /// The usage cluster's library-level pass, after every use is indexed:
+    /// the declaration sites of this file walk against the use index (the
+    /// official `UnusedLocalElementsVerifier`), then the import directives
+    /// against the contributed-element index (`imports_verifier.dart`).
+    /// Each arm's gate mirrors the official `_isUsed*` split; every
+    /// unmodelable corner suppresses (the under-report direction).
+    fn finalize_usage(&mut self) {
+        for site_index in 0..self.decl_sites.len() {
+            let site = self.decl_sites[site_index];
+            let bare = self.bare_name(site.name);
+            let name_text = self.strings.resolve(site.name).to_string();
+            match site.kind {
+                DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
+                    // `_isUsedElement`'s else arm: a public name is used;
+                    // otherwise any indexed use spares the declaration.
+                    if !site.annotated
+                        && self.is_private_name(site.name)
+                        && !self.used_names.contains(&bare)
+                    {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+                DeclKind::Container => {
+                    // `_visitClassElement` (classes, enums, mixins, and
+                    // extension types; extensions are never visited): the
+                    // same public/used gate.
+                    if !site.annotated
+                        && self.is_private_name(site.name)
+                        && !self.used_names.contains(&bare)
+                    {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+                DeclKind::Member {
+                    kind: MemberKind::Field,
+                    is_static,
+                    container,
+                } => {
+                    // `_isReadMember`: a public field of a public container
+                    // is used; a public static field of a private container
+                    // is checked like a private one. Used only when READ
+                    // (the implicit getter enters the read set; writes never
+                    // spare it), or when a super-name it overrides is read.
+                    let eligible = !site.annotated
+                        && (self.is_private_name(site.name)
+                            || (self.is_private_name(container) && is_static));
+                    if !eligible || self.read_names.contains(&bare) {
+                        continue;
+                    }
+                    self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
+                }
+                DeclKind::Member { container, .. } => {
+                    // `_isUsedMember` for methods/getters/setters: the
+                    // accessibility gate first, then indexed uses, then the
+                    // override face (a member overriding a super-name is
+                    // spared — the walk cannot see whether the overridden
+                    // member is itself used, so this only under-reports).
+                    // The parameter pass below runs regardless — the
+                    // official `visitFormalParameterList` is independent of
+                    // the member's own unused-ness.
+                    let spared = site.annotated
+                        || self.is_publicly_accessible(site.name, &site.kind)
+                        || self.used_names.contains(&bare)
+                        || matches!(self.walk_super(container, site.name), Walk::Found(_));
+                    if !spared {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+                DeclKind::Constructor { container } => {
+                    // `_visitConstructorElement`: named constructors only
+                    // (the capture side enforces that), and only when the
+                    // class declares more than one — a single constructor
+                    // may serve to prevent extension. The parameter pass
+                    // below runs regardless.
+                    let multi = self
+                        .index
+                        .get(self.file)
+                        .and_then(|f| f.container(container))
+                        .is_some_and(|c| {
+                            c.constructors.len() + usize::from(c.has_unnamed_constructor) > 1
+                        });
+                    let spared = !multi
+                        || site.annotated
+                        || self.is_publicly_accessible(site.name, &site.kind)
+                        || self.used_names.contains(&bare)
+                        || matches!(self.walk_super(container, site.name), Walk::Found(_));
+                    if !spared {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+            }
+            self.report_optional_parameters(site_index, site);
+        }
+        self.report_unused_imports();
+    }
+
+    /// `_isPubliclyAccessible` (unused_local_elements_verifier.dart:
+    /// 1002-1028) over the site's facts: a private name is never
+    /// accessible; an instance member of a private interface stays
+    /// reachable through exported instances; a static member or
+    /// constructor of a private interface is not; a member of an extension
+    /// is accessible exactly when the extension is; a constructor of an
+    /// enum never is.
+    fn is_publicly_accessible(&self, name: StringId, kind: &DeclKind) -> bool {
+        if self.is_private_name(name) {
+            return false;
+        }
+        let (container, is_static, is_ctor) = match kind {
+            DeclKind::Member {
+                is_static,
+                container,
+                ..
+            } => (*container, *is_static, false),
+            DeclKind::Constructor { container } => (*container, false, true),
+            // A top-level executable's accessibility is just its name.
+            _ => return !self.is_private_name(name),
+        };
+        let Some(c) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+        else {
+            return true;
+        };
+        match c.kind {
+            ContainerKind::Enum => !(is_ctor || (self.is_private_name(container) && is_static)),
+            ContainerKind::Extension => !self.is_private_name(container),
+            _ => !(self.is_private_name(container) && (is_static || is_ctor)),
+        }
+    }
+
+    /// The `unused_element_parameter` pass over one executable's
+    /// declaration site (`visitFormalParameterList` +
+    /// `_isUsedElement`'s parameter arm,
+    /// unused_local_elements_verifier.dart:1064-1115): optional parameters
+    /// of constructors, methods, and top-level functions that no body use
+    /// resolves to and no invocation supplies. The official exemptions in
+    /// order: a required parameter, a constructor of a generic class, a
+    /// generic executable, a publicly accessible executable, an executable
+    /// overriding a super-name, and the super-parameter face (unmodelable —
+    /// suppressed).
+    fn report_optional_parameters(&mut self, site_index: usize, site: DeclSite) {
+        let (member_kind, container) = match site.kind {
+            DeclKind::Member { kind, container, .. } => (Some(kind), Some(container)),
+            DeclKind::Constructor { container } => (None, Some(container)),
+            _ => (None, None),
+        };
+        if matches!(member_kind, Some(MemberKind::Field) | Some(MemberKind::Setter)) {
+            return;
+        }
+        let formals = match container {
+            Some(c) => self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(c))
+                .and_then(|x| x.members.get(&site.name))
+                .and_then(|m| m.formals.as_deref()),
+            None => self
+                .index
+                .get(self.file)
+                .and_then(|f| f.decl(site.name))
+                .and_then(|d| d.formals.as_deref()),
+        };
+        let Some(formals) = formals else {
+            return;
+        };
+        // The 47839 exemptions: a constructor of a generic class, or an
+        // executable with its own type parameters, is never reported.
+        let executable = self.index.get(self.file).and_then(|f| {
+            container.and_then(|c| f.container(c)).map(|x| {
+                (
+                    x.type_params > 0,
+                    x.members.get(&site.name).map_or(false, |m| m.type_params > 0),
+                )
+            })
+        });
+        let (class_generic, member_generic) = match (site.kind, executable) {
+            (DeclKind::Constructor { .. }, Some((class_generic, _))) => (class_generic, false),
+            (_, Some((class_generic, member_generic))) => (class_generic, member_generic),
+            _ => (false, false),
+        };
+        if member_generic || (class_generic && matches!(site.kind, DeclKind::Constructor { .. })) {
+            return;
+        }
+        // The accessibility and override gates.
+        if self.is_publicly_accessible(site.name, &site.kind) {
+            return;
+        }
+        if let Some(c) = container
+            && matches!(self.walk_super(c, site.name), Walk::Found(_))
+        {
+            return;
+        }
+        let bare = self.bare_name(site.name);
+        // Cloned: the emit below mutates the report while the set is read.
+        let body_uses = self.site_param_uses.get(&site_index).cloned();
+        let given_positional = self.positional_given.get(&bare).copied().unwrap_or(0);
+        let name_span = |engine: &Self, formal: StringId| -> SourceRange {
+            engine
+                .site_params
+                .get(&site_index)
+                .and_then(|ps| ps.iter().find(|(n, _)| *n == formal).map(|(_, r)| *r))
+                .unwrap_or(site.range)
+        };
+        for (index, formal) in formals.positional.iter().enumerate() {
+            if formal.required {
+                continue;
+            }
+            let referenced = body_uses.as_ref().is_some_and(|u| u.contains(&formal.name));
+            if referenced || given_positional > index as u16 {
+                continue;
+            }
+            let text = self.strings.resolve(formal.name).to_string();
+            let range = name_span(self, formal.name);
+            self.stage_usage(SemanticCode::UnusedElementParameter, range, &text);
+        }
+        for formal in formals.named.iter() {
+            if formal.required {
+                continue;
+            }
+            let referenced = body_uses.as_ref().is_some_and(|u| u.contains(&formal.name));
+            if referenced || self.named_given.contains(&(bare, formal.name)) {
+                continue;
+            }
+            let text = self.strings.resolve(formal.name).to_string();
+            let range = name_span(self, formal.name);
+            self.stage_usage(SemanticCode::UnusedElementParameter, range, &text);
+        }
+    }
+
+    /// The `unused_import` pass: an import with a resolved, existing,
+    /// non-`dart:core` target reports when it contributed no used element
+    /// (`generateUnusedImportWarnings`, imports_verifier.dart:228-268).
+    /// Edge matching is positional and only when the directive count agrees
+    /// with the library's edge count — a mismatch suppresses (under-report).
+    fn report_unused_imports(&mut self) {
+        if self.imports.is_empty() {
+            return;
+        }
+        let edges = self.graph.import_edges(self.lib);
+        if edges.len() != self.imports.len() {
+            return;
+        }
+        let used: Vec<StringId> = self.used_names.iter().copied().collect();
+        for (index, edge) in edges.iter().enumerate() {
+            // Copied first: the emit below mutates the report.
+            let (uri_text, uri_range, prefix) = {
+                let site = &self.imports[index];
+                (site.uri_text.clone(), site.uri_range, site.prefix)
+            };
+            let Some(target) = edge.target else {
+                continue;
+            };
+            if self.graph.uri(target) == "dart:core" {
+                continue;
+            }
+            let is_used = match prefix {
+                Some(prefix) => self.used_names.contains(&prefix),
+                None => used
+                    .iter()
+                    .any(|&n| edge.combinators.allows(n) && self.graph.exported(target, n).is_some()),
+            };
+            if !is_used {
+                self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
+            }
+        }
+    }
+
+    /// The `_`-wildcard test: the name consists entirely of underscores
+    /// (the official fallback rule, unused_local_elements_verifier.dart:
+    /// 985-994 — the wildcard-variables feature's `isWildcardVariable`
+    /// answers the same for `_`).
+    fn is_wildcard(&self, name: StringId) -> bool {
+        let text = self.strings.resolve(name);
+        !text.is_empty() && text.bytes().all(|b| b == b'_')
+    }
+
+    /// The enclosing executable's lookup spelling once its name has fired
+    /// (the official `_enclosingExec`); constructors, factories stay
+    /// `None` (their `ret` latch is unset by design). A local function's
+    /// own body is covered by the open local-function stack.
+    fn exec_self_name(&self) -> Option<StringId> {
+        if let Some((depth, name)) = self.local_fn_stack.last()
+            && *depth == self.frames.len().saturating_sub(1)
+        {
+            return Some(*name);
+        }
+        self.frames.last().and_then(|f| match &f.kind {
+            FrameKind::Executable {
+                ret: Some(ret), ..
+            } => Some(ret.name),
+            _ => None,
+        })
+    }
+
+    /// The official self-reference test: `name` names the enclosing
+    /// executable or the enclosing container (`_useIdentifierElement`'s
+    /// identical checks).
+    fn in_own_named_scope(&self, name: StringId) -> bool {
+        self.exec_self_name() == Some(name)
+            || self.container_context().is_some_and(|(c, _)| c == name)
+    }
+
+    /// Consumes the pending annotation latch: any metadata annotation
+    /// since the last declaration site marks it exempt (the pragma/JS
+    /// entry-point gates' under-report superset).
+    fn take_annotated(&mut self) -> bool {
+        let annotated = !self.pending_annotations.is_empty();
+        self.pending_annotations.clear();
+        annotated
+    }
+
+    /// Pushes one library-level declaration site (the usage cluster's
+    /// library-level side) and returns its index.
+    fn note_decl_site(&mut self, name: StringId, range: SourceRange, kind: DeclKind) -> usize {
+        let annotated = self.take_annotated();
+        self.decl_sites.push(DeclSite {
+            name,
+            range,
+            kind,
+            annotated,
+        });
+        self.decl_sites.len() - 1
+    }
+
+    /// A local variable declaration (`LocalVariableDeclaration`): the
+    /// tracked local of the open frame.
+    fn note_local(&mut self, name: StringId, range: SourceRange) {
+        self.add_tracked_local(name, range, LocalKind::Variable);
+    }
+
+    /// A formal parameter of the executable whose name has fired: the
+    /// tracked local joins its declaration site for the
+    /// `unused_element_parameter` body-reference rule.
+    fn note_parameter(&mut self, name: StringId, range: SourceRange) {
+        self.add_tracked_local(name, range, LocalKind::Parameter {
+            site: self.open_exec_site,
+        });
+        if let Some(site) = self.open_exec_site {
+            self.site_params.entry(site).or_default().push((name, range));
+        }
+    }
+
+    /// A catch clause parameter: first is the exception variable, second
+    /// the stack trace. The exception's auto-use bit patches in at
+    /// `handle_catch_block` when both facts are known.
+    fn note_catch_parameter(&mut self, name: StringId, range: SourceRange) {
+        let kind = if self.catch_params == 0 {
+            LocalKind::CatchException { auto: false }
+        } else {
+            LocalKind::CatchStack
+        };
+        self.catch_params += 1;
+        self.add_tracked_local(name, range, kind);
+    }
+
+    /// A named local function (reports as `unused_element`). The name
+    /// event fires inside the function's own frame: the name joins the
+    /// ENCLOSING frame's resolution set (its official scope — in-body
+    /// recursion resolves through it, and outer invocations find it),
+    /// while the tracked entry defers to the end event — its use-counting
+    /// window is the enclosing frame's, so an outer invocation spares it
+    /// (the official `_enclosingExec` keeps only in-body self-references
+    /// from counting: the entry is absent from the tracked stack while
+    /// the body parses, so a self-reference finds no declaration).
+    fn note_local_function(&mut self, name: StringId, range: SourceRange) {
+        if self.frames.len() >= 2
+            && let Some(enclosing) = self.frames.len().checked_sub(2)
+            && let Some(frame) = self.frames.get_mut(enclosing)
+        {
+            frame.locals.insert(name);
+        }
+        self.pending_local_fn = Some((name, range));
+        if let Some(depth) = self.frames.len().checked_sub(1) {
+            self.local_fn_stack.push((depth, name));
+        }
+    }
+
+    /// `end_local_function_declaration` / `end_named_function_expression`:
+    /// the tracked local-function entry materializes into the enclosing
+    /// frame's window just before the frame pops.
+    fn finish_local_fn_site(&mut self) {
+        if let Some((name, range)) = self.pending_local_fn.take() {
+            self.locals.push(LocalDecl {
+                name,
+                range,
+                kind: LocalKind::LocalFunction,
+                uses: 0,
+                group: None,
+            });
+        }
+    }
+
+    /// `begin_import`: the URI literal is the token after the keyword.
+    /// Only an honestly quoted literal joins (recovery shapes stay
+    /// silent — the under-report direction).
+    fn begin_import_site(&mut self, import_kw: Token) {
+        let Some(uri) = self.tokens.get(import_kw.id as usize + 1) else {
+            return;
+        };
+        let raw = &self.source[uri.byte_range()];
+        let bytes = raw.as_bytes();
+        if bytes.len() < 2 {
+            return;
+        }
+        let quote = bytes[0];
+        if (quote != b'\'' && quote != b'"') || bytes[bytes.len() - 1] != quote {
+            return;
+        }
+        self.imports.push(ImportSite {
+            uri_text: raw[1..raw.len() - 1].to_string(),
+            uri_range: SourceRange {
+                offset: uri.utf16_offset,
+                length: raw.chars().map(char::len_utf16).sum::<usize>() as u32,
+            },
+            prefix: None,
+        });
+    }
+
+    /// The statement-window read rule (the official `_isUsefulRead`,
+    /// unused_local_elements_verifier.dart:603-619): a single unqualified
+    /// read in an expression statement whose parent shape is a
+    /// null-assertion, a logical-not, an increment/decrement, or a
+    /// unary-operator invocation never counts (`!v;`, `v!;`, `v++;`,
+    /// `++v;`, `-v;`); a compound assignment's read does not count either
+    /// (`visitCompoundAssignment`'s `readCountsAsUse: parent is!
+    /// ExpressionStatement`). Plain `v;`, `v + 1;`, and `v ??= 1;` are
+    /// useful reads.
+    fn check_statement_use(&mut self, begin: Token, end: Token) {
+        // The statement boundary closes the pattern-declaration window: a
+        // later group is its own all-or-nothing set.
+        self.pattern_group_mark = None;
+        let w0 = begin.range.offset;
+        let w1 = end.range.end();
+        // The window's single non-value row (value rows are literals,
+        // groups, closures — their shapes are never the discarded read).
+        let mut found: Option<(SourceRange, bool, bool)> = None; // (range, read, read-write)
+        for row in self.rows.iter().rev() {
+            if row.range.end() <= w0 {
+                break;
+            }
+            if row.range.offset >= w1 || matches!(row.shape, RowShape::Value) {
+                continue;
+            }
+            let read = row.intent == Intent::Read;
+            let read_write = row.intent == Intent::ReadWrite;
+            if !read && !read_write {
+                return; // invoke/write/operator rows are always uses
+            }
+            if found.is_some() {
+                return; // two named rows: the reads are useful
+            }
+            found = Some((row.range, read, read_write));
+        }
+        let Some((row_range, read, read_write)) = found else {
+            return;
+        };
+        // The window's token texts (bounded by the statement itself); the
+        // offset side is the token's UTF-16 offset, comparable with the
+        // rows' ranges.
+        let window_ops: Vec<(u32, &str)> = (begin.id..=end.id)
+            .filter_map(|id| {
+                self.tokens
+                    .get(id as usize)
+                    .map(|t| (t.utf16_offset, &self.source[t.byte_range()]))
+            })
+            .collect();
+        let discarded = if read {
+            let head_op = self.text_of(begin).is_some_and(|text| {
+                matches!(text, "!" | "-" | "~" | "++" | "--")
+            });
+            let tail_op = window_ops
+                .iter()
+                .any(|(offset, text)| *offset == row_range.end() && matches!(*text, "!" | "++" | "--"));
+            head_op || tail_op
+        } else if read_write {
+            // A compound assignment discards; `??=` never does
+            // (`visitIfNullAssignment` reads count as use unconditionally).
+            window_ops.iter().any(|(_, text)| {
+                matches!(
+                    *text,
+                    "+=" | "-="
+                        | "*=" | "/="
+                        | "%="
+                        | "~/="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | ">>>="
+                )
+            })
+        } else {
+            false
+        };
+        if discarded && let Some(hit) = self.local_hits.remove(&row_range.offset) {
+            self.locals[hit as usize].uses -= 1;
+        }
+    }
+
+    /// `handle_catch_block`: the clause's facts are complete (on-type,
+    /// parameters, body block). The official auto-use decision patches the
+    /// exception variable (plain `catch`, or a stack-trace sibling, uses
+    /// it), the clause joins the try's clause list, and the catch frame
+    /// closes — the parameters leave scope only after the body.
+    fn finish_catch_clause(&mut self) {
+        let auto = self.catch_on_type.is_none() || self.catch_params > 1;
+        if let Some(mark) = self.frame_local_marks.last().copied() {
+            for decl in self.locals[mark..].iter_mut().rev() {
+                if let LocalKind::CatchException { auto: slot } = &mut decl.kind {
+                    *slot = auto;
+                    break;
+                }
+            }
+        }
+        self.catch_params = 0;
+        let Some(start) = self.catch_clause_start.take() else {
+            self.catch_on_type = None;
+            return;
+        };
+        let on_type = self.catch_on_type.take();
+        if let Some(clauses) = self.try_clauses.last_mut() {
+            clauses.push(CatchClauseFact {
+                on_type,
+                start,
+                end: self.last_block_end.unwrap_or(start),
+            });
+        }
+        self.pop_frame();
+    }
+
+    /// `end_try_statement`: the official `_CatchClausesVerifier` — a
+    /// catch-all clause (no `on` type, or `on Object`) followed by more
+    /// clauses makes the tail dead; the span covers the next clause's
+    /// first token through the last clause's closing brace
+    /// (`dead_code_verifier.dart`, `nextCatchClause`).
+    fn finish_try_statement(&mut self) {
+        let Some(clauses) = self.try_clauses.pop() else {
+            return;
+        };
+        let object = self.intern("Object");
+        for (index, clause) in clauses.iter().enumerate() {
+            let catches_all = clause.on_type.map_or(true, |t| t == object);
+            if catches_all && index + 1 < clauses.len() {
+                let start = clauses[index + 1].start.offset;
+                let end = clauses[clauses.len() - 1].end.end();
+                self.stage_usage(
+                    SemanticCode::DeadCodeCatchFollowingCatch,
+                    SourceRange {
+                        offset: start,
+                        length: end.saturating_sub(start),
+                    },
+                    "",
+                );
+                break;
+            }
+        }
+    }
+
+    /// `handle_label` (the colon fired): the pending label opens its own
+    /// scope; `end_labeled_statement` pops one scope per label.
+    fn note_label_decl(&mut self) {
+        if let Some((name, range)) = self.pending_label.take() {
+            self.label_scopes.push(LabelScope {
+                labels: vec![(name, range, false)],
+            });
+        }
+    }
+
+    /// A `break`/`continue` target: the innermost scope declaring the name
+    /// marks its label used.
+    fn note_label_use(&mut self, name: StringId) {
+        for scope in self.label_scopes.iter_mut().rev() {
+            if let Some(slot) = scope.labels.iter_mut().find(|(n, _, _)| *n == name) {
+                slot.2 = true;
+                return;
+            }
+        }
+    }
+
+    /// `end_labeled_statement`: one scope per label pops; the statement's
+    /// labels merge (nested `a: b: stmt` declares both) and the unused
+    /// ones report (the official `_LabelTracker` pop,
+    /// dead_code_verifier.dart).
+    fn finish_labeled_statement(&mut self, label_count: usize) {
+        let count = label_count.min(self.label_scopes.len());
+        if count == 0 {
+            return;
+        }
+        let split = self.label_scopes.len() - count;
+        let mut merged: Vec<(StringId, SourceRange, bool)> = Vec::new();
+        for scope in self.label_scopes.drain(split..) {
+            merged.extend(scope.labels);
+        }
+        for (name, range, used) in merged {
+            if !used {
+                let text = self.strings.resolve(name).to_string();
+                self.stage_usage(SemanticCode::UnusedLabel, range, &text);
+            }
+        }
+    }
+
+    /// `begin_binary_expression` for `??`: the left operand's row parks
+    /// with the operator span.
+    fn begin_if_null(&mut self, op_range: SourceRange) {
+        self.if_null_groups.push((self.rows.len(), op_range));
+    }
+
+    /// `end_binary_expression` for `??`: the right operand's row anchors
+    /// the report when the left operand's type is strictly non-nullable —
+    /// the right operand is never executed (the official
+    /// `_checkForDeadNullCoalesce`, error_verifier.dart:4733-4739).
+    fn end_if_null(&mut self) {
+        let Some((mark, _op_range)) = self.if_null_groups.pop() else {
+            return;
+        };
+        let non_null = mark
+            .checked_sub(1)
+            .and_then(|index| self.rows.get(index))
+            .is_some_and(|lhs| lhs.ty.is_strictly_non_nullable());
+        if !non_null {
+            return;
+        }
+        if let Some(rhs) = self.rows.last() {
+            let range = rhs.range;
+            self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
+        }
+    }
+
+    /// `handle_assignment_expression` for `??=`: the target's read type
+    /// strictly non-nullable anchors the report at the value (the official
+    /// `_checkForDeadNullCoalesce`'s `??=` arm).
+    fn check_dead_null_assignment(&mut self, operator: Token) {
+        if self.text_of(operator) != Some("??=") {
+            return;
+        }
+        let limit = operator.range.offset;
+        let non_null = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
+            .is_some_and(|target| target.ty.is_strictly_non_nullable());
+        if non_null && let Some(value) = self.rows.last() {
+            let range = value.range;
+            self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
+        }
+    }
+
+    /// The local declaration `name` resolves to, innermost frame first
+    /// (the same walk [`Engine::resolve_bare`]'s locals arm runs).
+    fn resolve_local(&self, name: StringId) -> Option<u32> {
+        for depth in (0..self.frames.len()).rev() {
+            if self.frames[depth].locals.contains(&name) {
+                let lo = self.frame_local_marks[depth];
+                let hi = self
+                    .frame_local_marks
+                    .get(depth + 1)
+                    .copied()
+                    .unwrap_or(self.locals.len());
+                // Within one frame, a use follows its declaration
+                // textually: the last entry under the name is it.
+                return self.locals[lo..hi]
+                    .iter()
+                    .rposition(|d| d.name == name)
+                    .map(|p| (lo + p) as u32);
+            }
+        }
+        None
     }
 
     fn container_context(&self) -> Option<(StringId, ContainerKind)> {
@@ -1294,6 +2350,36 @@ impl<'a> Engine<'a> {
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.insert(name);
         }
+    }
+
+    /// Records a local declaration of the usage cluster: the frame's name
+    /// set (resolution) plus the tracked entry (kind, anchor, group).
+    fn add_tracked_local(&mut self, name: StringId, range: SourceRange, kind: LocalKind) {
+        self.add_local(name);
+        // A pattern-variable-declaration window claims the pattern-declared
+        // variables since its last statement boundary: the first opens it,
+        // the rest join its group (one used member spares all).
+        let group = if matches!(kind, LocalKind::PatternVariable) {
+            match self.pattern_group_mark {
+                Some(base) => self.locals[base].group,
+                None => {
+                    self.pattern_group_seq += 1;
+                    Some(self.pattern_group_seq)
+                }
+            }
+        } else {
+            None
+        };
+        if group.is_some() && self.pattern_group_mark.is_none() {
+            self.pattern_group_mark = Some(self.locals.len());
+        }
+        self.locals.push(LocalDecl {
+            name,
+            range,
+            kind,
+            uses: 0,
+            group,
+        });
     }
 
     /// Binds the open declaration group's type to `name` in the innermost
@@ -2664,6 +3750,40 @@ impl<'a> Engine<'a> {
     /// read — the row reclassifies as a type use.
     fn push_bare(&mut self, name: StringId, range: SourceRange) {
         let info = self.resolve_bare(name);
+        // The usage cluster's local-use capture: a bare read that resolves
+        // into the frame stack counts for the declaration it lands on.
+        // (A local function's own name is absent from the tracked stack
+        // while its body parses, so in-body self-references never count —
+        // the official `_enclosingExec` exclusion.) The final intent may
+        // still cancel it (write-only, statement-discarded reads).
+        if let Some(hit) = self.resolve_local(name) {
+            let hit = hit as usize;
+            self.locals[hit].uses += 1;
+            self.local_hits.insert(range.offset, hit as u32);
+        }
+        // The official self-reference exclusions (`_useIdentifierElement`):
+        // a reference to the enclosing container or the enclosing executable
+        // itself never marks that declaration used. The row offset joins the
+        // skip set so the resolve-time marking obeys the same rule.
+        if self.exec_self_name() == Some(name) || self.container_context().map_or(false, |(c, _)| c == name)
+        {
+            self.self_scope_rows.insert(range.offset);
+        }
+        // A bare mention of a field name inside its own container: the
+        // final intent decides read vs write at resolve time.
+        if let Some((container, _)) = self.container_context()
+            && self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .is_some_and(|c| {
+                    c.members
+                        .get(&name)
+                        .is_some_and(|m| m.kind == MemberKind::Field)
+                })
+        {
+            self.field_read_rows.insert(range.offset);
+        }
         if self.ctor_pos > 0 && matches!(info, BareInfo::Missing { .. }) {
             self.push_row(Row {
                 name,
@@ -2783,6 +3903,17 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 if !matches!(self.resolve_bare(name), BareInfo::Missing { .. }) {
+                    // A defined type reference uses the type (the official
+                    // `visitNamedType` → `_useIdentifierElement` face) —
+                    // except inside an `is` type operand, where the oracle
+                    // deliberately does not count it
+                    // (`_useIdentifierElement`'s `_insideIsExpression`
+                    // early return), and except a self-reference from
+                    // inside the declaration itself (`_enclosingClass` /
+                    // `_enclosingExec`).
+                    if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                        self.used_names.insert(name);
+                    }
                     return;
                 }
                 self.push_row(Row {
@@ -2814,15 +3945,21 @@ impl<'a> Engine<'a> {
                         write_op: None,
                         ty: Ty::UNKNOWN,
                     });
+                } else if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                    self.used_names.insert(name);
                 }
             }
         }
     }
 
     /// Arms the type-prefix slot for a `PrefixedTypeReference` head; a miss
-    /// also pushes the head's own report row.
+    /// also pushes the head's own report row. A live prefix head counts as
+    /// a prefix use (the `unused_import` prefix face).
     fn arm_type_prefix(&mut self, name: StringId, range: SourceRange) {
         let live = !matches!(self.resolve_bare(name), BareInfo::Missing { .. });
+        if live {
+            self.used_names.insert(name);
+        }
         self.type_prefix = Some(TypePrefix { prefix: name, live });
         if !live {
             self.push_row(Row {
@@ -2848,11 +3985,28 @@ impl<'a> Engine<'a> {
         };
         let receiver_offset = self.rows.last().map(|r| r.range.offset);
         let recv = match self.rows.pop() {
-            Some(popped) => match popped.shape {
-                RowShape::Bare(info) => Engine::receiver_of_bare(info),
-                RowShape::Receiver(recv) => recv,
-                _ => Receiver::Unknown,
-            },
+            Some(popped) => {
+                // The receiver's read counts for the local it resolved to
+                // (`v.m` reads `v`): the member row inherits the hit.
+                if let Some(hit) = self.local_hits.remove(&popped.range.offset) {
+                    self.local_hits.insert(member.range.offset, hit);
+                }
+                // The receiver's own reference marks its name used (the
+                // official `members` face, and `unused_import`'s
+                // hasPrefixUsedWithoutName face for a prefix receiver):
+                // the row folds into the member row, so pass 2 never
+                // resolves it.
+                if matches!(popped.shape, RowShape::Bare(_))
+                    && !self.self_scope_rows.contains(&popped.range.offset)
+                {
+                    self.used_names.insert(popped.name);
+                }
+                match popped.shape {
+                    RowShape::Bare(info) => Engine::receiver_of_bare(info),
+                    RowShape::Receiver(recv) => recv,
+                    _ => Receiver::Unknown,
+                }
+            }
             None => Receiver::Unknown,
         };
         if is_null_aware {
@@ -2955,8 +4109,18 @@ impl<'a> Engine<'a> {
     /// belongs to a `new`/`const`/implicit-creation reference, whose class
     /// name resolves as a type use, never an invocation.
     fn open_arguments(&mut self) {
+        // Inside a creation window the head row tells the two lists apart:
+        // the creation's own list heads with the container row (no formals
+        // to mark), while the trailing member invocation's list
+        // (`C().m(1, 2)`) heads with the member row and must join the
+        // given-count face.
         let callee = if self.ctor_pos > 0 {
-            None
+            self.callee_index().filter(|&i| {
+                matches!(
+                    self.rows.get(i).map(|r| &r.shape),
+                    Some(RowShape::Member { .. })
+                )
+            })
         } else {
             self.callee_index()
         };
@@ -2973,11 +4137,13 @@ impl<'a> Engine<'a> {
     /// Closes an argument group; its callee awaits the send event. The
     /// collected argument types check against the callee's formals first
     /// (`argument_type_not_assignable`, decided on declared types only).
-    fn close_arguments(&mut self) {
+    /// `positional` is the parser's total argument count feeding the
+    /// given-at-call index.
+    fn close_arguments(&mut self, positional: u16) {
         self.flush_unclaimed();
         self.flush_argument();
         let levels = self.arg_levels.pop();
-        self.check_arguments(levels);
+        self.check_arguments(levels, positional);
         self.pending_send = self.invokes.pop().flatten();
     }
 
@@ -3055,7 +4221,7 @@ impl<'a> Engine<'a> {
     /// positional by index, named by spelling. Extra positionals are the
     /// `extra_positional_arguments` family's business (unfrozen — skipped);
     /// unresolved callees suppress.
-    fn check_arguments(&mut self, level: Option<ArgLevel>) {
+    fn check_arguments(&mut self, level: Option<ArgLevel>, positional: u16) {
         let Some(level) = level else { return };
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
@@ -3063,12 +4229,33 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.get(callee) else {
             return;
         };
-        let formals: Option<&Formals> = match &row.shape {
+        // The usage cluster's given-at-call index (the
+        // `_addParametersForArguments` face) keys by callee spelling alone
+        // and must not wait on the formals: a receiver this face cannot
+        // type (a creation-folded `C().m(...)` head) still supplies its
+        // arguments. The parser's count is exact where the row recovery is
+        // not: wide positional windows (compound operands) stay
+        // unattributed above, so the positional supply is the total count
+        // less the attributed named entries. Callee-spelling keys — a
+        // same-named member elsewhere suppresses, never false-positives.
+        let callee_spelling = row.name;
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        if positional > named {
+            let given = self.positional_given.entry(callee_spelling).or_default();
+            *given = (*given).max(positional - named);
+        }
+        // Cloned: the assignability path below reads the table while the
+        // named-argument marking mutates it.
+        let formals: Option<Formals> = match &row.shape {
             // A top-level function's declared formals.
             RowShape::Bare(BareInfo::Plain { .. }) => self
                 .top_level_decl(row.name)
-                .and_then(|d| d.formals.as_deref()),
-            RowShape::Member { recv } => self.member_formals_full(recv, row.name),
+                .and_then(|d| d.formals.as_deref().cloned()),
+            RowShape::Member { recv } => self.member_formals_full(recv, row.name).cloned(),
             _ => None,
         };
         let Some(formals) = formals else {
@@ -3084,6 +4271,9 @@ impl<'a> Engine<'a> {
                 positional_index += 1;
                 formal
             };
+            if let Some(n) = name {
+                self.named_given.insert((callee_spelling, *n));
+            }
             let Some(formal) = formal else {
                 continue;
             };
@@ -3134,6 +4324,12 @@ impl<'a> Engine<'a> {
             if let Some(row) = self.rows.get_mut(callee)
                 && let RowShape::Bare(BareInfo::Container { name, kind }) = row.shape
             {
+                // The creation's head reference uses the class (the official
+                // `visitNamedType`/identifier face): the row folds into a
+                // receiver in place, so pass 2 never resolves it.
+                if !self.self_scope_rows.contains(&row.range.offset) {
+                    self.used_names.insert(name);
+                }
                 *row = Row {
                     name,
                     range: row.range,
@@ -3699,6 +4895,14 @@ impl<'a> Engine<'a> {
             }
             match &row.intent {
                 Intent::Read => {
+                    // A write alone never uses a local variable (the
+                    // official `_useAssignmentTargetElement` early return);
+                    // the plain-write hit cancels.
+                    if !compound
+                        && let Some(hit) = self.local_hits.remove(&row.range.offset)
+                    {
+                        self.locals[hit as usize].uses -= 1;
+                    }
                     row.intent = if compound {
                         Intent::ReadWrite
                     } else {
@@ -4471,9 +5675,29 @@ impl<'a> Engine<'a> {
         let name_text = self.strings.resolve(row.name);
         match info {
             // A prefix used bare: invoking a prefix is an error the oracle
-            // names with an unfrozen code — record only.
-            BareInfo::Container { .. } | BareInfo::Prefix { .. } => {}
+            // names with an unfrozen code — record only. The bare prefix
+            // reference still counts as a use of the prefix (`unused_import`
+            // hasPrefixUsedWithoutName face).
+            BareInfo::Container { .. } | BareInfo::Prefix { .. } => {
+                if !self.self_scope_rows.contains(&row.range.offset) {
+                    self.used_names.insert(row.name);
+                }
+            }
             BareInfo::Plain { ty } => {
+                // Any resolved reference uses the name it resolved to (the
+                // official `_useIdentifierElement` / `members` faces; writes
+                // included — only the local-variable rows distinguish). The
+                // parse-time self-reference exclusions skip their rows.
+                if !self.self_scope_rows.contains(&row.range.offset) {
+                    self.used_names.insert(row.name);
+                }
+                // A non-write resolution of a field name is the implicit
+                // getter's read (writes never spare a field).
+                if !matches!(row.intent, Intent::Write)
+                    && self.field_read_rows.contains(&row.range.offset)
+                {
+                    self.read_names.insert(row.name);
+                }
                 // A direct operator application on a declared-typed receiver
                 // (`c + d`, `c[i] = v`).
                 if matches!(row.intent, Intent::Operator(..)) {
@@ -4584,6 +5808,19 @@ impl<'a> Engine<'a> {
     }
 
     fn resolve_member_row(&mut self, row: &Row, recv: Receiver) {
+        // Any member access uses the accessed name (the official `members`
+        // set; unresolved reads land in `unresolvedReadMembers`, which the
+        // field rule credits the same). Read-shaped accesses also join the
+        // field-read index — writes never spare a field. A row that named
+        // the enclosing executable itself never marks (the official
+        // `_enclosingExec` exclusion).
+        let self_named = self.self_scope_rows.contains(&row.range.offset);
+        if !self_named {
+            self.used_names.insert(row.name);
+        }
+        if !self_named && matches!(row.intent, Intent::Read | Intent::ReadWrite) {
+            self.read_names.insert(row.name);
+        }
         let name_text = self.strings.resolve(row.name);
         match recv {
             Receiver::Unknown => {}
@@ -4683,6 +5920,12 @@ impl<'a> Engine<'a> {
             defined = resolved
                 .members
                 .contains_key(&self.setter_spelling(row.name));
+        }
+        if !defined && resolved.constructors.contains(&row.name) {
+            // A named-constructor selector (`C.named`) resolves through the
+            // creation face — the constructor is the class's own
+            // declaration, never an undefined member.
+            return;
         }
         if defined {
             return;
@@ -5794,9 +7037,18 @@ pub fn diagnose(
         .expect("the parser released its listener")
         .into_inner();
     engine.resolve_rows();
+    // The usage cluster's library-level pass runs after every use indexed:
+    // declaration sites and import directives walk the index, staging into
+    // the report; the staged emissions merge source-ordered into the tail.
+    engine.finalize_usage();
     let mut report = std::mem::take(&mut engine.report);
     // The flow layer's dead-code facts join the source-ordered tail of the
     // report (both sides are offset-sorted; the merge keeps the invariant).
+    // The flow merge runs FIRST: dead_code is a resolution-phase diagnostic
+    // while the usage cluster is the post-resolution verifier, so at a
+    // shared anchor (dead `var x = 1;` and its unread `x`) the official
+    // collection order is dead_code before unused_local_variable — the
+    // `<=` tie-break below then keeps that order into the final list.
     let mut flow_diagnostics = Vec::new();
     for fact in flow.borrow_mut().take_facts() {
         if let FlowFact::DeadCode { span } = fact {
@@ -5812,6 +7064,9 @@ pub fn diagnose(
         }
     }
     report.diagnostics = merge_source_ordered(report.diagnostics, flow_diagnostics);
+    let mut staged = std::mem::take(&mut report.usage);
+    staged.sort_by_key(|d| d.range.offset);
+    report.diagnostics = merge_source_ordered(report.diagnostics, staged);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
@@ -5897,9 +7152,8 @@ impl ParserListener for DiagnoseListener<'_> {
         let name_range = name.range;
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
-        // The face-inheritance checks read the element model (complete
-        // since `collect`) and anchor at this name token (#498).
         if let Some(name) = name {
+            engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
         }
     }
@@ -5925,6 +7179,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
         if let Some(name) = name {
+            engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
         }
     }
@@ -5953,6 +7208,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Mixin, name);
         if let Some(name) = name {
+            engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Mixin, name_range);
         }
     }
@@ -5973,6 +7229,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Enum, name);
         if let Some(name) = name {
+            engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Enum, name_range);
         }
     }
@@ -6021,6 +7278,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // The representation checks read the element model (complete since
         // `collect`) and anchor at this name token.
         if let Some(name) = name {
+            engine.note_decl_site(
+                name,
+                name_range,
+                DeclKind::Container,
+            );
             engine.check_extension_type(name, name_range);
         }
         engine.push_container_frame(ContainerKind::Extension, name);
@@ -6065,19 +7327,23 @@ impl ParserListener for DiagnoseListener<'_> {
             _enclosing_declaration_name,
         );
 
-        self.engine
-            .borrow_mut()
-            .push_executable_frame(static_kw.is_none());
+        let mut engine = self.engine.borrow_mut();
+        let is_setter = get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
+        engine.open_member_setter = is_setter;
+        engine.open_member_static = static_kw.is_some();
+        engine.ctor_pending = None;
+        engine.open_toplevel_site = None;
+        engine.open_exec_site = None;
+        engine.push_executable_frame(static_kw.is_none());
         // The `invalid_override` check runs at the declaration head: the
         // element model is already complete (`collect` parsed before this
         // pass), and this event carries the name token whose span anchors
         // the emission. Setters live under `name=` in the model.
-        let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
         let Some(name) = engine.name_of(name) else {
             return;
         };
-        let is_setter = get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
+        let is_setter = engine.open_member_setter;
         let spelling = if is_setter {
             engine.setter_spelling(name)
         } else {
@@ -6117,7 +7383,12 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .begin_top_level_method(_last_consumed, _augment, _external);
 
-        self.engine.borrow_mut().push_executable_frame(false);
+        let mut engine = self.engine.borrow_mut();
+        engine.open_member_setter = false;
+        engine.open_member_static = false;
+        engine.ctor_pending = None;
+        engine.open_exec_site = None;
+        engine.push_executable_frame(false);
     }
 
     fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, _end: Token) {
@@ -6125,7 +7396,16 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .end_top_level_method(_begin, _get_or_set, _end);
 
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        // A top-level setter's site spelling fixes up here (`set` parses
+        // before the name event): setters live under `name=`.
+        let site = engine.open_toplevel_site.take();
+        let is_setter = _get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
+        if let (Some(site), true) = (site, is_setter) {
+            let bare = engine.decl_sites[site].name;
+            engine.decl_sites[site].name = engine.setter_spelling(bare);
+        }
+        engine.pop_frame();
     }
 
     fn begin_constructor(
@@ -6160,6 +7440,11 @@ impl ParserListener for DiagnoseListener<'_> {
         if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
             engine.note_const_ctor();
         }
+        engine.open_member_setter = false;
+        engine.open_member_static = false;
+        engine.open_toplevel_site = None;
+        engine.open_exec_site = None;
+        engine.ctor_pending = engine.container_context().map(|(c, _)| c);
         engine.push_executable_frame(true);
     }
 
@@ -6181,7 +7466,9 @@ impl ParserListener for DiagnoseListener<'_> {
             _end,
         );
 
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.ctor_pending = None;
+        engine.pop_frame();
     }
 
     fn begin_factory(
@@ -6206,6 +7493,11 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.note_const_ctor();
         }
         // Factories have no `this`.
+        engine.open_member_setter = false;
+        engine.open_member_static = false;
+        engine.open_toplevel_site = None;
+        engine.open_exec_site = None;
+        engine.ctor_pending = engine.container_context().map(|(c, _)| c);
         engine.push_executable_frame(false);
     }
 
@@ -6214,7 +7506,9 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .end_factory(_kind, _begin, _factory, _end);
 
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.ctor_pending = None;
+        engine.pop_frame();
     }
 
     fn begin_local_function_declaration(&mut self, _token: Token) {
@@ -6222,14 +7516,27 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .begin_local_function_declaration(_token);
 
+        // The closure/local-function face leaves the enclosing site: its
+        // parameters are never `unused_element_parameter` candidates (the
+        // official `_isUsedElement` enclosing-element gate), and its locals
+        // close with their own frame.
         let instance = self.engine.borrow().instance_context();
+        self.engine.borrow_mut().open_exec_site = None;
+        self.engine.borrow_mut().pending_local_fn = None;
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
     fn end_local_function_declaration(&mut self, _end: Token) {
         self.flow.borrow_mut().end_local_function_declaration(_end);
 
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        // Materialize after the pop: the function's own frame mark covers the
+        // decl index otherwise, so `close_frame_locals` would judge the decl
+        // at the function's close (before any later use) and truncate it.
+        // After the pop it joins the enclosing frame's window — the official
+        // verifier judges local functions at their scope's close.
+        engine.pop_frame();
+        engine.finish_local_fn_site();
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
@@ -6237,6 +7544,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
+        self.engine.borrow_mut().open_exec_site = None;
+        self.engine.borrow_mut().pending_local_fn = None;
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
@@ -6255,6 +7564,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .begin_named_function_expression(_token);
 
         let instance = self.engine.borrow().instance_context();
+        self.engine.borrow_mut().open_exec_site = None;
+        self.engine.borrow_mut().pending_local_fn = None;
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
@@ -6262,7 +7573,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().end_named_function_expression(end);
 
         let mut engine = self.engine.borrow_mut();
+        // Same pop-before-materialize discipline as the declaration form.
         engine.pop_frame();
+        engine.finish_local_fn_site();
         engine.push_value_row(end);
     }
 
@@ -6288,14 +7601,21 @@ impl ParserListener for DiagnoseListener<'_> {
         // The catch frame owns the catch parameters; the body block's own
         // events are not overridable from outside dartq-parser (BlockKind
         // is crate-private), so block scoping comes from the executable and
-        // catch frames only.
-        self.engine.borrow_mut().push_block_frame();
+        // catch frames only. The frame closes at `handle_catch_block` —
+        // after the body — so the parameters stay visible in it and their
+        // locals close with the clause.
+        let mut engine = self.engine.borrow_mut();
+        engine.catch_clause_start = Some(_token.range);
+        engine.catch_on_type = None;
+        engine.catch_params = 0;
+        engine.push_block_frame();
     }
 
     fn end_catch_clause(&mut self, _token: Token) {
         self.flow.borrow_mut().end_catch_clause(_token);
 
-        self.engine.borrow_mut().pop_frame();
+        // The frame pop moved to `handle_catch_block` (the clause's body
+        // block parses between the two events).
     }
 
     fn begin_for_statement(&mut self, _token: Token) {
@@ -6420,6 +7740,14 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::TypeReference | C::TypeReferenceContinuation => {
                 if let Some(name) = name {
+                    // The catch clause's `on` type: the first type reference
+                    // after `begin_catch_clause` and before any parameter.
+                    if engine.catch_clause_start.is_some()
+                        && engine.catch_params == 0
+                        && engine.catch_on_type.is_none()
+                    {
+                        engine.catch_on_type = Some(name);
+                    }
                     let head = if context == C::TypeReference {
                         TypeHead::Bare
                     } else {
@@ -6454,15 +7782,43 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::LocalVariableDeclaration => {
                 if let Some(name) = name {
-                    engine.add_local(name);
+                    engine.note_local(name, token.range);
                     engine.const_decl_name(name, false);
                     engine.bind_declared_type(name);
                 }
             }
-            C::FormalParameterDeclaration | C::CatchParameter => {
+            C::FormalParameterDeclaration => {
                 if let Some(name) = name {
-                    engine.add_local(name);
+                    engine.note_parameter(name, token.range);
                     engine.bind_parameter_type(name);
+                }
+            }
+            C::CatchParameter => {
+                if let Some(name) = name {
+                    engine.note_catch_parameter(name, token.range);
+                    engine.bind_parameter_type(name);
+                }
+            }
+            C::LocalFunctionDeclaration => {
+                if let Some(name) = name {
+                    engine.note_local_function(name, token.range);
+                }
+            }
+            C::LabelDeclaration => {
+                if let Some(name) = name {
+                    engine.pending_label = Some((name, token.range));
+                }
+            }
+            C::LabelReference => {
+                if let Some(name) = name {
+                    engine.note_label_use(name);
+                }
+            }
+            C::ImportPrefixDeclaration => {
+                if let Some(name) = name
+                    && let Some(site) = engine.imports.last_mut()
+                {
+                    site.prefix = Some(name);
                 }
             }
             C::NamedArgumentReference => {
@@ -6475,9 +7831,24 @@ impl ParserListener for DiagnoseListener<'_> {
                 // The enum constant's window opens here: its type arguments
                 // check against the enclosing enum's declared count (the
                 // `_enum` code), and its constructor arguments capture as
-                // a const context (`handle_enum_element` closes it).
+                // a const context (`handle_enum_element` closes it). The
+                // constant is a static field site — the `unused_field`
+                // read rule owns it.
                 engine.enter_enum_element();
                 engine.open_enum_const_element();
+                if let Some(name) = name
+                    && let Some((container, _)) = engine.container_context()
+                {
+                    engine.note_decl_site(
+                        name,
+                        token.range,
+                        DeclKind::Member {
+                            kind: MemberKind::Field,
+                            is_static: true,
+                            container,
+                        },
+                    );
+                }
             }
             C::ConstructorReferenceContinuationAfterTypeArguments
                 if engine.in_enum_element.is_some() && engine.ctor_pos == 0 =>
@@ -6492,17 +7863,75 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::MetadataReference => {
                 if let Some(name) = name {
+                    // The annotated-declaration exemption latch (the
+                    // pragma/JS entry-point gates' superset) plus the
+                    // annotation-arity check.
+                    engine.pending_annotations.push(name);
                     engine.check_annotation(name, token.range);
                 }
             }
             C::TopLevelFunctionDeclaration => {
                 if let Some(name) = name {
                     engine.latch_return_type(ExecKind::Function, name);
+                    let site = engine.note_decl_site(name, token.range, DeclKind::TopLevelFn);
+                    engine.open_toplevel_site = Some(site);
+                    engine.open_exec_site = Some(site);
                 }
             }
             C::MethodDeclaration => {
                 if let Some(name) = name {
                     engine.latch_return_type(ExecKind::Method, name);
+                    let is_setter = engine.open_member_setter;
+                    let spelling = if is_setter {
+                        engine.setter_spelling(name)
+                    } else {
+                        name
+                    };
+                    let is_static = engine.open_member_static;
+                    let container = engine.container_context().map_or(name, |(c, _)| c);
+                    let site = engine.note_decl_site(
+                        spelling,
+                        token.range,
+                        DeclKind::Member {
+                            kind: MemberKind::Method,
+                            is_static,
+                            container,
+                        },
+                    );
+                    engine.open_exec_site = Some(site);
+                }
+            }
+            C::OperatorName => {
+                if let Some(name) = name {
+                    let container = engine.container_context().map_or(name, |(c, _)| c);
+                    engine.note_decl_site(
+                        name,
+                        token.range,
+                        DeclKind::Member {
+                            kind: MemberKind::Method,
+                            is_static: false,
+                            container,
+                        },
+                    );
+                }
+            }
+            C::MethodDeclarationContinuation => {
+                // The named constructor selector (`A.named`): the site joins
+                // only under an open constructor/factory (the same context
+                // also fires for qualified method heads, which never declare
+                // a constructor).
+                if let (Some(name), Some(container)) = (name, engine.ctor_pending) {
+                    let site = engine.note_decl_site(
+                        name,
+                        token.range,
+                        DeclKind::Constructor { container },
+                    );
+                    engine.open_exec_site = Some(site);
+                }
+            }
+            C::TypedefDeclaration => {
+                if let Some(name) = name {
+                    engine.note_decl_site(name, token.range, DeclKind::TypeAlias);
                 }
             }
             // Field groups (class fields, enum body fields, top-level
@@ -6515,6 +7944,20 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.const_decl_name(name, true);
                     if context == C::FieldDeclaration {
                         engine.check_override(name, token.range);
+                        if let Some((container, _)) = engine.container_context() {
+                            let is_static = engine.open_member_static;
+                            engine.note_decl_site(
+                                name,
+                                token.range,
+                                DeclKind::Member {
+                                    kind: MemberKind::Field,
+                                    is_static,
+                                    container,
+                                },
+                            );
+                        }
+                    } else {
+                        engine.note_decl_site(name, token.range, DeclKind::TopLevelVar);
                     }
                 }
             }
@@ -6644,6 +8087,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
         engine.check_assignment(operator);
+        engine.check_dead_null_assignment(operator);
     }
 
     fn begin_binary_expression(&mut self, operator: Token) {
@@ -6656,6 +8100,9 @@ impl ParserListener for DiagnoseListener<'_> {
         engine
             .const_capture
             .begin_binary(bin_op_of(text), operator.range);
+        if text == "??" {
+            engine.begin_if_null(operator.range);
+        }
         if USER_OPERATORS.contains(&text) {
             let op = engine.intern(text);
             engine.mark_operator(op, operator.range);
@@ -6665,7 +8112,11 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_binary_expression(&mut self, _operator: Token, end: Token) {
         self.flow.borrow_mut().end_binary_expression(_operator, end);
 
-        self.engine.borrow_mut().const_capture.end_binary(end.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.const_capture.end_binary(end.range);
+        if engine.text_of(_operator) == Some("??") {
+            engine.end_if_null();
+        }
     }
 
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
@@ -6746,13 +8197,19 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_is_operator_type(&mut self, _operator: Token) {
         self.flow.borrow_mut().begin_is_operator_type(_operator);
 
-        self.engine.borrow_mut().enter_non_type_pos();
+        let mut engine = self.engine.borrow_mut();
+        engine.enter_non_type_pos();
+        // The `is` operand's type never counts as a type use (the official
+        // `_insideIsExpression` face).
+        engine.is_type_pos += 1;
     }
 
     fn end_is_operator_type(&mut self, _operator: Token) {
         self.flow.borrow_mut().end_is_operator_type(_operator);
 
-        self.engine.borrow_mut().leave_non_type_pos();
+        let mut engine = self.engine.borrow_mut();
+        engine.leave_non_type_pos();
+        engine.is_type_pos -= 1;
     }
 
     fn begin_as_operator_type(&mut self, _operator: Token) {
@@ -6810,8 +8267,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().open_arguments();
     }
 
-    fn end_arguments(&mut self, _count: usize, _begin: Token, end: Token) {
-        self.flow.borrow_mut().end_arguments(_count, _begin, end);
+    fn end_arguments(&mut self, count: usize, _begin: Token, end: Token) {
+        self.flow.borrow_mut().end_arguments(count, _begin, end);
 
         let closed = self
             .engine
@@ -6860,7 +8317,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.const_capture.opaque_leaf(closed.span);
             }
         }
-        engine.close_arguments();
+        engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX));
     }
 
     fn handle_positional_argument(&mut self, _token: Token) {
@@ -7178,9 +8635,11 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // The bound variable joins the enclosing scope (the flat M1 frame;
         // the oracle's pattern scoping is finer, and a wider binding can
-        // only under-report undefined-name, never false-positive).
+        // only under-report undefined-name, never false-positive). The
+        // usage cluster tracks it as a pattern variable: the enclosing
+        // `PatternVariableDeclaration` group reports all-or-nothing.
         if let Some(name) = engine.name_of(variable) {
-            engine.add_local(name);
+            engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
             match engine.armed_ty.take() {
                 Some(Ty::Named {
                     name: ty_name,
@@ -7662,6 +9121,12 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.push_value_row(end);
     }
 
+    // —— #505: directives ———————————————————————————————————————————————
+
+    fn begin_import(&mut self, import_keyword: Token) {
+        self.engine.borrow_mut().begin_import_site(import_keyword);
+    }
+
     // —— #279: const contexts ————————————————————————————————————————
 
     fn begin_fields(
@@ -7670,7 +9135,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _augment_kw: Option<Token>,
         _abstract_kw: Option<Token>,
         _external_kw: Option<Token>,
-        _static_kw: Option<Token>,
+        static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
         _late_kw: Option<Token>,
         var_final_or_const: Option<Token>,
@@ -7680,6 +9145,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
             engine.arm_const_group();
         }
+        engine.open_member_static = static_kw.is_some();
     }
 
     fn end_fields(
@@ -7863,6 +9329,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .begin_switch_case(label_count, expression_count, token);
+
+        // A case's pattern variables form their own group window.
+        self.engine.borrow_mut().pattern_group_mark = None;
     }
 
     fn begin_then_statement(&mut self, token: Token) {
@@ -7871,6 +9340,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_try_statement(&mut self, token: Token) {
         self.flow.borrow_mut().begin_try_statement(token);
+
+        let mut engine = self.engine.borrow_mut();
+        engine.try_clauses.push(Vec::new());
     }
 
     fn begin_while_statement(&mut self, token: Token) {
@@ -7896,6 +9368,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
         self.flow.borrow_mut().end_block(count, begin, end, kind);
+
+        // The catch clause fact's body anchor: `handle_catch_block` fires
+        // right after the clause body's block ends, so the last block end
+        // is its closing brace.
+        self.engine.borrow_mut().last_block_end = Some(end.range);
     }
 
     fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {
@@ -8000,6 +9477,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_labeled_statement(&mut self, label_count: usize) {
         self.flow.borrow_mut().end_labeled_statement(label_count);
+
+        self.engine.borrow_mut().finish_labeled_statement(label_count);
     }
 
     fn end_pattern_guard(&mut self, token: Token) {
@@ -8026,6 +9505,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .end_try_statement(count, begin, finally_kw, end);
+
+        self.engine.borrow_mut().finish_try_statement();
     }
 
     fn end_while_statement(&mut self, token: Token, end: Token) {
@@ -8061,6 +9542,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .handle_catch_block(on_kw, catch_kw, comma);
+
+        self.engine.borrow_mut().finish_catch_clause();
     }
 
     fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {
@@ -8087,6 +9570,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .handle_expression_statement(begin, end);
+
+        self.engine.borrow_mut().check_statement_use(begin, end);
     }
 
     fn handle_finally_block(&mut self, finally_kw: Token) {
@@ -8130,6 +9615,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_label(&mut self, token: Token) {
         self.flow.borrow_mut().handle_label(token);
+
+        self.engine.borrow_mut().note_label_decl();
     }
 
     fn handle_no_variable_initializer(&mut self, token: Token) {
@@ -8153,6 +9640,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .handle_pattern_variable_declaration_statement(keyword, equals, semicolon);
+
+        // The statement boundary closes the group window (the next
+        // declaration is its own all-or-nothing set).
+        self.engine.borrow_mut().pattern_group_mark = None;
     }
 
     fn handle_recoverable_error(&mut self, _p0: Message, _p1: Token, _p2: Token) {
@@ -8841,7 +10332,14 @@ mod tests {
             [
                 "return_of_invalid_type",
                 "argument_type_not_assignable",
+                // `y`/`d`/`ok` are never read: the official
+                // `_isUsefulRead`/`_isUsedElement` split counts reads only,
+                // so each declaration also reports `unused_local_variable`
+                // at its name (source order interleaves with the assignability rows).
+                "unused_local_variable",
                 "invalid_assignment",
+                "unused_local_variable",
+                "unused_local_variable",
             ],
             "{:?}",
             code_names(&report)
@@ -8855,7 +10353,7 @@ mod tests {
             "The argument type 'String' can't be assigned to the parameter type 'int'. "
         );
         assert_eq!(
-            report.diagnostics[2].message,
+            report.diagnostics[3].message,
             "A value of type 'String' can't be assigned to a variable of type 'int'."
         );
     }
@@ -8883,15 +10381,21 @@ mod tests {
         assert_eq!(
             code_names(&report),
             [
+                // `a`/`b`/`c` are never read (a pure write is not a use —
+                // the official read-only use rule), so each reports
+                // `unused_local_variable` interleaved in source order.
+                "unused_local_variable",
+                "unused_local_variable",
                 "invalid_assignment",
                 "argument_type_not_assignable",
+                "unused_local_variable",
                 "invalid_assignment",
             ],
             "{:?}",
             code_names(&report)
         );
         assert_eq!(
-            report.diagnostics[0].message,
+            report.diagnostics[2].message,
             "A value of type 'int' can't be assigned to a variable of type 'double'."
         );
     }
@@ -9437,9 +10941,12 @@ mod tests {
     #[test]
     fn await_in_sync_body_reports_await_code() {
         let report = report("void f() { await x; } void g() async { await f; }");
+        // In a sync body `await x` recovers as the type `await` declaring
+        // the local `x`, which is never read — the official read-only use
+        // rule reports `unused_local_variable` at its name.
         assert_eq!(
             code_names(&report),
-            ["undefined_identifier_await"],
+            ["undefined_identifier_await", "unused_local_variable"],
             "{:?}",
             code_names(&report)
         );
@@ -9479,9 +10986,14 @@ mod tests {
     #[test]
     fn annotation_arity_reports_base_code() {
         let report = report("class A {} class C<T, U> {} void f() { C<A> x; }");
+        // `x` is declared, never read — the official read-only use rule
+        // reports `unused_local_variable` after the arity row.
         assert_eq!(
             code_names(&report),
-            ["wrong_number_of_type_arguments"],
+            [
+                "wrong_number_of_type_arguments",
+                "unused_local_variable",
+            ],
             "{:?}",
             code_names(&report)
         );
@@ -9732,12 +11244,18 @@ mod tests {
     #[test]
     fn null_assignment_reports_invalid_assignment() {
         let report = report("class int {} void f() { int x; x = null; }");
-        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        // `x` is written but never read: the official read-only use rule
+        // reports `unused_local_variable` at its name, before the
+        // assignment row.
         assert_eq!(
-            report.diagnostics[0].message,
+            code_names(&report),
+            ["unused_local_variable", "invalid_assignment"]
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
             "A value of type 'Null' can't be assigned to a variable of type 'int'."
         );
-        assert_eq!(report.diagnostics[0].severity, Severity::Error);
+        assert_eq!(report.diagnostics[1].severity, Severity::Error);
     }
 
     /// A declaration initializer runs the same decision
@@ -9758,9 +11276,18 @@ mod tests {
     #[test]
     fn declaration_initializer_null_reports_invalid_assignment() {
         let report = report("class int {} void f() { int x = null; int? y = null; }");
-        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        // `x` and `y` are never read (the official read-only use rule);
+        // only `x`'s null initializer reports the assignment.
         assert_eq!(
-            report.diagnostics[0].message,
+            code_names(&report),
+            [
+                "unused_local_variable",
+                "invalid_assignment",
+                "unused_local_variable",
+            ]
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
             "A value of type 'Null' can't be assigned to a variable of type 'int'."
         );
     }
@@ -9774,9 +11301,14 @@ mod tests {
     #[test]
     fn nullable_assignment_reports_invalid_assignment() {
         let report = report("class int {} void f() { int? y; int x; x = y; }");
-        assert_eq!(code_names(&report), ["invalid_assignment"]);
+        // `x` is written only (never read — the official read-only use
+        // rule); `y` is read by the assignment and stays silent.
         assert_eq!(
-            report.diagnostics[0].message,
+            code_names(&report),
+            ["unused_local_variable", "invalid_assignment"]
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
             "A value of type 'int?' can't be assigned to a variable of type 'int'."
         );
     }
@@ -10587,19 +12119,22 @@ mod tests {
         let report = report(
             "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.green => 2 }; }",
         );
+        // `x` binds the switch expression's value and is never read (the
+        // official read-only use rule), so it reports before the
+        // exhaustiveness row.
         assert_eq!(
             code_names(&report),
-            ["non_exhaustive_switch_expression"],
+            ["unused_local_variable", "non_exhaustive_switch_expression"],
             "{:?}",
             code_names(&report)
         );
         assert_eq!(
-            report.diagnostics[0].message,
+            report.diagnostics[1].message,
             "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
         );
         // The expression-face correctionMessage (diagnostic.g.dart:13018).
         assert_eq!(
-            report.diagnostics[0].correction.as_deref(),
+            report.diagnostics[1].correction.as_deref(),
             Some("Try adding a wildcard pattern or cases that match 'Color.blue'.")
         );
     }
@@ -10616,21 +12151,37 @@ mod tests {
         let missing = report(
             "sealed class S {} class A extends S {} class B extends S {} void f(S s) { var x = switch (s) { A a => 1 }; }",
         );
+        // `x` is unread before the switch; the case variable `a` is unread
+        // after it — the covering row anchors at the switch expression
+        // (constant_verifier.dart:1080-1088), so source order interleaves
+        // the two unused rows around it.
         assert_eq!(
             code_names(&missing),
-            ["non_exhaustive_switch_expression"],
+            [
+                "unused_local_variable",
+                "non_exhaustive_switch_expression",
+                "unused_local_variable",
+            ],
             "{:?}",
             code_names(&missing)
         );
         assert_eq!(
-            missing.diagnostics[0].message,
+            missing.diagnostics[1].message,
             "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'B'."
         );
 
         let covered = report(
             "sealed class S {} class A extends S {} class B extends S {} void f(S s) { var x = switch (s) { A a => 1, B b => 2 }; }",
         );
-        assert_eq!(covered.diagnostics.len(), 0);
+        // `x`, `a`, and `b` are all unread.
+        assert_eq!(
+            code_names(&covered),
+            [
+                "unused_local_variable",
+                "unused_local_variable",
+                "unused_local_variable",
+            ]
+        );
     }
 
     /// A switch expression over a nullable enum needs the `null` case: the
@@ -10641,16 +12192,21 @@ mod tests {
         let missing = report(
             "enum Color { red, green, blue } void f(Color? c) { var x = switch (c) { Color.red => 1, Color.green => 2, Color.blue => 3 }; }",
         );
-        assert_eq!(code_names(&missing), ["non_exhaustive_switch_expression"]);
+        // `x` is unread (the official read-only use rule).
         assert_eq!(
-            missing.diagnostics[0].message,
+            code_names(&missing),
+            ["unused_local_variable", "non_exhaustive_switch_expression"]
+        );
+        assert_eq!(
+            missing.diagnostics[1].message,
             "The type 'Color?' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'null'."
         );
 
         let with_null = report(
             "enum Color { red, green, blue } void f(Color? c) { var x = switch (c) { Color.red => 1, Color.green => 2, Color.blue => 3, null => 4 }; }",
         );
-        assert_eq!(with_null.diagnostics.len(), 0);
+        // `x` is unread.
+        assert_eq!(code_names(&with_null), ["unused_local_variable"]);
     }
 
     /// A single non-sealed type case covers the whole (non-nullable)
@@ -10660,8 +12216,13 @@ mod tests {
     /// substitutes to `Named(C, false)` — the full space of the scrutinee.
     #[test]
     fn single_type_case_covers_non_sealed_scrutinee() {
+        // `x` and the case variable `v` are never read (the official
+        // read-only use rule).
         let report = report("class C {} void f(C c) { var x = switch (c) { C v => 1 }; }");
-        assert_eq!(report.diagnostics.len(), 0);
+        assert_eq!(
+            code_names(&report),
+            ["unused_local_variable", "unused_local_variable"]
+        );
     }
 
     /// A cyclic sealed hierarchy terminates: the covering search walks the
@@ -10678,21 +12239,12 @@ mod tests {
     fn cyclic_sealed_hierarchy_terminates_without_false_positive() {
         let self_cycle =
             report("sealed class S extends S {} void f(S s) { var x = switch (s) { 1 => 2 }; }");
-        assert_eq!(
-            self_cycle.diagnostics.len(),
-            0,
-            "{:?}",
-            code_names(&self_cycle)
-        );
+        // `x` is unread (the official read-only use rule).
+        assert_eq!(code_names(&self_cycle), ["unused_local_variable"]);
         let mutual_cycle = report(
             "sealed class A extends B {} sealed class B extends A {} void f(A a) { var x = switch (a) { 1 => 2 }; }",
         );
-        assert_eq!(
-            mutual_cycle.diagnostics.len(),
-            0,
-            "{:?}",
-            code_names(&mutual_cycle)
-        );
+        assert_eq!(code_names(&mutual_cycle), ["unused_local_variable"]);
     }
 
     /// An unresolvable scrutinee skips the whole exhaustiveness check (the
@@ -10702,8 +12254,10 @@ mod tests {
     /// and false-positive the covering gap.
     #[test]
     fn unknown_scrutinee_switch_expression_emits_nothing() {
+        // `x` is unread (the official read-only use rule); the `_`
+        // wildcard never reports.
         let report = report("void g() {} void f() { var x = switch (g()) { _ => 0 }; }");
-        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+        assert_eq!(code_names(&report), ["unused_local_variable"]);
     }
 
     /// A switch expression over a name declared outside the file emits no
@@ -10722,9 +12276,11 @@ mod tests {
     #[test]
     fn cross_file_sealed_scrutinee_expression_emits_no_covering_gap() {
         let report = report("void f(S s) { var x = switch (s) { A() => 1, B() => 2 }; }");
+        // `x` is unread (the official read-only use rule), after the
+        // unresolved parameter type.
         assert_eq!(
             code_names(&report),
-            ["undefined_class"],
+            ["undefined_class", "unused_local_variable"],
             "{:?}",
             code_names(&report)
         );
@@ -10738,13 +12294,18 @@ mod tests {
         let report = report(
             "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.red => 2, Color.green => 3, Color.blue => 4 }; }",
         );
-        assert_eq!(code_names(&report), ["unreachable_switch_case"]);
+        // `x` is unread (the official read-only use rule), before the
+        // duplicate-case row.
+        assert_eq!(
+            code_names(&report),
+            ["unused_local_variable", "unreachable_switch_case"]
+        );
         // The repeated case's `=>` (the expression-case anchor).
         let arrow_at = u32::try_from(
             "enum Color { red, green, blue } void f(Color c) { var x = switch (c) { Color.red => 1, Color.red ".len(),
         )
         .unwrap();
-        assert_eq!(report.diagnostics[0].range.offset, arrow_at);
+        assert_eq!(report.diagnostics[1].range.offset, arrow_at);
     }
 
     /// A typed variable pattern binds its local for the body: the bound
@@ -10930,9 +12491,15 @@ mod tests {
         let missing = report(
             "sealed class S {} class A extends S {} class B extends S {} void f(S? s) { switch (s) { case A a: break; case B b: break; } }",
         );
+        // The case variables `a`/`b` are unread (the official read-only
+        // use rule), after the exhaustiveness row.
         assert_eq!(
             code_names(&missing),
-            ["non_exhaustive_switch_statement"],
+            [
+                "non_exhaustive_switch_statement",
+                "unused_local_variable",
+                "unused_local_variable",
+            ],
             "{:?}",
             code_names(&missing)
         );
@@ -10944,9 +12511,10 @@ mod tests {
         let with_null = report(
             "sealed class S {} class A extends S {} class B extends S {} void f(S? s) { switch (s) { case A a: break; case B b: break; case null: break; } }",
         );
+        // The case variables `a`/`b` are unread.
         assert_eq!(
-            with_null.diagnostics.len(),
-            0,
+            code_names(&with_null),
+            ["unused_local_variable", "unused_local_variable"],
             "{:?}",
             code_names(&with_null)
         );
@@ -10957,8 +12525,11 @@ mod tests {
     /// statement switch without a default emits nothing.
     #[test]
     fn nullable_non_sealed_statement_switch_stays_unconditional() {
+        // The case variable `c` is unread (the official read-only use
+        // rule); the exhaustiveness gate stays off for the non-sealed
+        // nullable scrutinee.
         let report = report("class C {} void f(C? c) { switch (c) { case C c: break; } }");
-        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+        assert_eq!(code_names(&report), ["unused_local_variable"]);
     }
 
     /// `NonNullableStaticType.isSubtypeOf` (static_type.dart:415-421):
@@ -11004,15 +12575,18 @@ mod tests {
             "class int {} sealed class S {} class A extends S {} sealed class Base extends S { int x = 0; } class B extends Base {} \
              void f(S s) { var v = switch (s) { A() => 1, B(x: int _) => 2 }; }",
         );
-        assert_eq!(covered.diagnostics.len(), 0, "{:?}", code_names(&covered));
+        // `v` is unread (the official read-only use rule); the `int _`
+        // wildcard never reports.
+        assert_eq!(code_names(&covered), ["unused_local_variable"]);
 
         let narrower = report(
             "class int {} class num {} sealed class S {} class A extends S {} sealed class Base extends S { num x = 0; } class B extends Base {} \
              void f(S s) { var v = switch (s) { A() => 1, B(x: int _) => 2 }; }",
         );
+        // `v` is unread, before the exhaustiveness row.
         assert_eq!(
             code_names(&narrower),
-            ["non_exhaustive_switch_expression"],
+            ["unused_local_variable", "non_exhaustive_switch_expression"],
             "{:?}",
             code_names(&narrower)
         );
@@ -11028,14 +12602,22 @@ mod tests {
             "sealed class S {} class A extends S {} class B extends S {} \
              void f(S s) { var v = switch (s) { A() => 1, B(:var x) => 2 }; }",
         );
+        // `v` and the bound field variable `x` are unread (the official
+        // read-only use rule).
         assert_eq!(
-            type_free.diagnostics.len(),
-            0,
-            "{:?}",
-            code_names(&type_free)
+            code_names(&type_free),
+            ["unused_local_variable", "unused_local_variable"]
         );
         let opaque = report("void f(S s) { var v = switch (s) { A() => 1, B(:var x) => 2 }; }");
-        assert_eq!(code_names(&opaque), ["undefined_class"]);
+        // `v` and `x` are unread, after the unresolved parameter type.
+        assert_eq!(
+            code_names(&opaque),
+            [
+                "undefined_class",
+                "unused_local_variable",
+                "unused_local_variable",
+            ]
+        );
     }
 
     // —— restricted nullable projections (the Null|value fold) ———————————
@@ -11100,7 +12682,8 @@ mod tests {
         let covered = report(
             "sealed class S {} enum E implements S { a, b } mixin M on S {} void f(S s) { switch (s) { case E.a: break; case E.b: break; case M m: break; } }",
         );
-        assert_eq!(covered.diagnostics.len(), 0, "{:?}", code_names(&covered));
+        // The case variable `m` is unread (the official read-only use rule).
+        assert_eq!(code_names(&covered), ["unused_local_variable"]);
 
         let missing = report(
             "sealed class S {} enum E implements S { a, b } mixin M on S {} void f(S s) { switch (s) { case E.a: break; case E.b: break; } }",
@@ -11134,8 +12717,10 @@ mod tests {
     /// A bare `_` still covers the whole context (no leaf of its own).
     #[test]
     fn bare_wildcard_covers_the_context() {
+        // `x` is unread (the official read-only use rule); the `_`
+        // wildcard never reports.
         let report = report("class C {} void f(C c) { var x = switch (c) { _ => 1 }; }");
-        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+        assert_eq!(code_names(&report), ["unused_local_variable"]);
     }
 
     // —— #279: the constant-evaluation family ———————————————————————————
@@ -11185,11 +12770,16 @@ mod tests {
             "{:?}",
             code_names(&rep)
         );
-        // The local/formal shape proves non-constancy too.
+        // The local/formal shape proves non-constancy too; the const
+        // local `y` is never read (the official read-only use rule), and
+        // the const verdict anchors at the offending subexpression `l`.
         let rep = report("void m() { var l = 1; const y = l; }");
         assert_eq!(
             code_names(&rep),
-            ["const_initialized_with_non_constant_value"],
+            [
+                "unused_local_variable",
+                "const_initialized_with_non_constant_value",
+            ],
             "{:?}",
             code_names(&rep)
         );
@@ -11233,10 +12823,14 @@ mod tests {
             "class int {} class C { const C(int v); } \
              void m() { var l = 1; const a = C(l); const b = const C(l); }",
         );
+        // The const locals `a`/`b` are never read (the official read-only
+        // use rule); the argument verdicts anchor at their `l` arguments.
         assert_eq!(
             code_names(&rep),
             [
+                "unused_local_variable",
                 "const_with_non_constant_argument",
+                "unused_local_variable",
                 "const_with_non_constant_argument",
             ],
             "{:?}",
@@ -11262,13 +12856,15 @@ mod tests {
     /// documented under-report direction.
     #[test]
     fn const_creation_type_folds_to_its_container() {
+        // `ok` is never read (the official read-only use rule); the const
+        // chain itself stays clean.
         let rep = report(
             "class C { const C(); } \
              const x = C(); \
              const w = x; \
              void m() { C ok = x; }",
         );
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        assert_eq!(code_names(&rep), ["unused_local_variable"]);
     }
 
     /// A container without a const constructor and an unresolvable name
@@ -11305,11 +12901,13 @@ mod tests {
             rep.diagnostics[0].message,
             "Methods can't be invoked in constant expressions."
         );
-        // A local callable faults the same way.
+        // A local callable faults the same way; the const local `y` is
+        // never read (the official read-only use rule), before the
+        // invocation anchor.
         let rep = report("void m() { var g = 1; const y = g(); }");
         assert_eq!(
             code_names(&rep),
-            ["const_eval_method_invocation"],
+            ["unused_local_variable", "const_eval_method_invocation"],
             "{:?}",
             code_names(&rep)
         );
@@ -11326,23 +12924,40 @@ mod tests {
              const c = {l: 1}; \
              const d = (l,); }",
         );
+        // The const locals `a`/`b`/`c`/`d` are never read (the official
+        // read-only use rule); each element verdict anchors at its `l`
+        // element, interleaving in source order.
         assert_eq!(
             code_names(&rep),
             [
+                "unused_local_variable",
                 "non_constant_list_element",
+                "unused_local_variable",
                 "non_constant_set_element",
+                "unused_local_variable",
                 "non_constant_map_element",
+                "unused_local_variable",
                 "non_constant_record_field",
             ],
             "{:?}",
             code_names(&rep)
         );
         // Clean elements stay silent, including the fault-deciding lazy
-        // shapes (`false && l` never evaluates its right operand).
+        // shapes (`false && l` never evaluates its right operand); the
+        // const locals `e`/`f`/`g` are unread.
         let rep = report(
             "void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }",
         );
-        assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            code_names(&rep),
+            [
+                "unused_local_variable",
+                "unused_local_variable",
+                "unused_local_variable",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 
     /// The `constEval*` fault family overrides the site default, one code
@@ -11386,10 +13001,15 @@ mod tests {
             "{:?}",
             code_names(&rep)
         );
+        // The const local `h` is never read (the official read-only use
+        // rule); the verdict anchors at the interpolated `l`.
         let rep = report("void m() { var l = 1; const h = 'a${l}'; }");
         assert_eq!(
             code_names(&rep),
-            ["const_initialized_with_non_constant_value"],
+            [
+                "unused_local_variable",
+                "const_initialized_with_non_constant_value",
+            ],
             "{:?}",
             code_names(&rep)
         );
@@ -11420,21 +13040,27 @@ mod tests {
             "class int {} class String {} const z = 1; \
              void m() { int ok = z; String bad = z; }",
         );
+        // `ok`/`bad` are never read (the official read-only use rule);
+        // `bad`'s initializer reports the assignment.
         assert_eq!(
             code_names(&rep),
-            ["invalid_assignment"],
+            [
+                "unused_local_variable",
+                "unused_local_variable",
+                "invalid_assignment",
+            ],
             "{:?}",
             code_names(&rep)
         );
         assert_eq!(
-            rep.diagnostics[0].message,
+            rep.diagnostics[2].message,
             "A value of type 'int' can't be assigned to a variable of type 'String'."
         );
         // Enum constants fold to their container too (the negative face
         // against a user class defers — outside the final-primitive
-        // table).
+        // table); `ok` is never read.
         let rep = report("enum E { a, b } void m() { E ok = E.a; }");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        assert_eq!(code_names(&rep), ["unused_local_variable"]);
     }
 
     /// Deferral shapes never fabricate a verdict: interpolation text,
@@ -12161,7 +13787,9 @@ mod tests {
     fn dead_local_declaration_emits_at_its_name() {
         let source = "void f() { return; var x = 1; }";
         let report = report(source);
-        assert_eq!(code_names(&report), ["dead_code"]);
+        // The dead declaration's `x` is also never read (the official
+        // read-only use rule); both rows anchor at `x`, dead_code first.
+        assert_eq!(code_names(&report), ["dead_code", "unused_local_variable"]);
         assert_eq!(dead_code_offsets(&report), [offset_of(source, "x")]);
     }
 
@@ -12173,7 +13801,12 @@ mod tests {
     fn closure_return_does_not_kill_the_enclosing_tail() {
         let source = "void f() { var h = () { return; 1; }; 2; }";
         let report = report(source);
-        assert_eq!(code_names(&report), ["dead_code"]);
+        // `h` is never read (the official read-only use rule), before the
+        // dead-statement row inside the closure.
+        assert_eq!(
+            code_names(&report),
+            ["unused_local_variable", "dead_code"]
+        );
         assert_eq!(dead_code_offsets(&report), [offset_of(source, "1;")]);
     }
 
@@ -12345,9 +13978,12 @@ mod tests {
             &namespaces,
             &index,
         );
+        // The `n1` import contributes nothing `main` references (`T` is
+        // only used inside `n2` through its own import): the official
+        // `unused_import` fires at its URI, before the override row.
         assert_eq!(
             code_names(&report),
-            ["invalid_override"],
+            ["unused_import", "invalid_override"],
             "{:?}",
             code_names(&report)
         );
@@ -12675,5 +14311,364 @@ mod tests {
             "{}",
             stacked.message
         );
+    }
+    // —— #504: the usage cluster ————————————————————————————————————————
+
+    /// An unread local reports; a plain read spares; a write alone never
+    /// uses; the useless-statement reads (`!v;`, `v++;`) never count.
+    ///
+    /// Hand-trace: `dead` has no hit; `live`'s argument read counts; `gone`
+    /// takes only the write (the local hit cancels at the assignment);
+    /// `discarded`'s two reads both land in statement windows whose parent
+    /// shape is a unary form (`_isUsefulRead`).
+    #[test]
+    fn unused_local_variable_reports_and_reads_spare() {
+        let r = report(
+            "class int {} void take(int x) {} \
+             void main() { int dead = 0; int live = 0; take(live); \
+             int gone = 0; gone = 1; int discarded = 0; !discarded; discarded++; }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "unused_local_variable",
+                "unused_local_variable",
+                "unused_local_variable"
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The value of the local variable 'dead' isn't used."
+        );
+    }
+
+    /// `v;` and `v + 1;` are useful reads (the official `_isUsefulRead`
+    /// spares everything but the unary statement shapes).
+    #[test]
+    fn plain_and_operator_reads_spare_the_local() {
+        // Both reads are useful per the official `_isUsefulRead` (a plain
+        // statement expression and a binary-operator operand), so the
+        // local never reports `unused_local_variable`; `class int {}`
+        // declares no `+`, so the operator read reports the oracle's
+        // `undefined_operator` at the site.
+        let r = report("class int {} void main() { int v = 0; v; v + 1; }");
+        assert_eq!(code_names(&r), ["undefined_operator"], "{:?}", code_names(&r));
+    }
+
+    /// The wildcard-variables face: an all-underscores name never reports;
+    /// a mixed name still does.
+    #[test]
+    fn wildcard_locals_never_report() {
+        let r = report("class int {} void main() { var _ = 1; int _z = 2; }");
+        assert_eq!(code_names(&r), ["unused_local_variable"], "{:?}", code_names(&r));
+        assert!(
+            r.diagnostics[0].message.contains("'_z'"),
+            "{}",
+            r.diagnostics[0].message
+        );
+    }
+
+    /// A pattern-variable-declaration group reports all-or-nothing: one
+    /// used member spares the rest (official `visitPatternVariableDeclaration`).
+    #[test]
+    fn pattern_groups_report_all_or_nothing() {
+        let r = report("void main() { var (a, b) = (1, 2); }");
+        assert_eq!(
+            code_names(&r),
+            ["unused_local_variable", "unused_local_variable"],
+            "{:?}",
+            code_names(&r)
+        );
+        // The local `int` stands in for the core type (the harness has no
+        // seeded dart:core); the read of `a` spares the whole pattern group
+        // (official visitPatternVariableDeclaration all-or-nothing).
+        let r2 = report("class int {} void take(int x) {} void main() { var (a, b) = (1, 2); take(a); }");
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+    }
+
+    /// An unreferenced local function reports `unused_element`; its own
+    /// self-reference never counts (`_enclosingExec`), but an outer
+    /// invocation does.
+    #[test]
+    fn unused_local_function_reports_unused_element() {
+        let r = report("void main() { void inner() {} }");
+        assert_eq!(code_names(&r), ["unused_element"], "{:?}", code_names(&r));
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The declaration 'inner' isn't referenced."
+        );
+        let r2 = report("void main() { void inner() {} inner(); }");
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+    }
+
+    /// Private top-level functions and classes report when nothing outside
+    /// themselves references them; public names never do.
+    #[test]
+    fn unused_private_library_declarations_report() {
+        let r = report("void _dead() {} class _Gone {} void main() {}");
+        assert_eq!(
+            code_names(&r),
+            ["unused_element", "unused_element"],
+            "{:?}",
+            code_names(&r)
+        );
+        let r2 = report("void _live() {} class _Kept {} void main() { _live(); _Kept(); }");
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+    }
+
+    /// The `unused_field` rule reads only: a write never spares, a read
+    /// anywhere in the library does (the implicit-getter face).
+    #[test]
+    fn unused_field_reads_only() {
+        let r = report(
+            "class int {} class _C { int _read = 0; int _written = 0; int _dead = 0; int live = 0; \
+             int f() => _read; int g() => live; void w() { _written = 1; } } \
+             void main() { _C().f(); _C().g(); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_field", "unused_field"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The value of the field '_written' isn't used."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The value of the field '_dead' isn't used."
+        );
+    }
+
+    /// Optional parameters of private executables report when no body use
+    /// resolves to them and no invocation supplies them: positionally by
+    /// given-count, named by name.
+    #[test]
+    fn unused_optional_parameters_report() {
+        let r = report(
+            "class int {} class _C { void _m(int a, [int b = 0]) {} void _n(int a, {int c = 0}) {} } \
+             void main() { _C()._m(1); _C()._n(1); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_element_parameter", "unused_element_parameter"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "A value for optional parameter 'b' isn't ever given."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "A value for optional parameter 'c' isn't ever given."
+        );
+        let r2 = report(
+            "class int {} class _C { void _m(int a, [int b = 0]) {} } void main() { _C()._m(1, 2); }",
+        );
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+        let r3 = report(
+            "class int {} class _C { void _m(int a, [int b = 0]) { b; } } void main() { _C()._m(1); }",
+        );
+        assert!(code_names(&r3).is_empty(), "{:?}", code_names(&r3));
+    }
+
+    /// A named constructor's optional parameter reports when never given
+    /// (the class keeps more than one constructor); the invocation spares
+    /// the constructor itself.
+    #[test]
+    fn unused_named_constructor_parameter_reports() {
+        let r = report(
+            "class int {} class _D { _D.named([int x = 0]); _D.other(); } \
+             void main() { _D.named(); _D.other(); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_element_parameter"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "A value for optional parameter 'x' isn't ever given."
+        );
+    }
+
+    // —— #505: the import/flow cluster ———————————————————————————————————
+
+    /// An import that contributed nothing reports at its URI; the same
+    /// import with a used prefix stays silent.
+    #[test]
+    fn unused_import_reports_at_the_uri() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let source = "import 'other.dart'; void main() {}";
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let other = builder.intern("package:t/other.dart");
+        builder.declare(other, strings.intern("thing"), file);
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(other),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        let r = diagnose(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert_eq!(code_names(&r), ["unused_import"], "{:?}", code_names(&r));
+        assert_eq!(r.diagnostics[0].message, "Unused import: 'other.dart'.");
+    }
+
+    #[test]
+    fn used_prefix_import_stays_silent() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let source = "import 'other.dart' as p; void main() { p.thing; }";
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let other = builder.intern("package:t/other.dart");
+        builder.declare(other, strings.intern("thing"), file);
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(other),
+                prefix: Some(strings.intern("p")),
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        let r = diagnose(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert!(
+            !code_names(&r).contains(&"unused_import"),
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The catch-variable routing: `on T catch (e)` without a stack trace
+    /// reports the clause; a stack trace variable always reports when
+    /// unread; a plain `catch (e)` auto-uses its exception.
+    #[test]
+    fn unused_catch_variables_route_by_kind() {
+        let r = report(
+            "class int {} void main() { try {} on int catch (e) {} try {} catch (e2, st) {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_catch_clause", "unused_catch_stack"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The exception variable 'e' isn't used, so the 'catch' clause can be removed."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The stack trace variable 'st' isn't used and can be removed."
+        );
+    }
+
+    /// A catch-all clause followed by more clauses makes the tail dead
+    /// (`_CatchClausesVerifier.nextCatchClause`); the span covers the
+    /// following clauses.
+    #[test]
+    fn dead_catch_tail_reports() {
+        let r = report(
+            "class int {} class Object {} void main() { try {} on Object catch (e) {} on int {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_catch_clause", "dead_code_catch_following_catch"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// A `??` whose left operand is strictly non-nullable anchors the
+    /// report at the right operand; `??=` anchors at the value. Both reads
+    /// count (the assignment target never loses its use).
+    #[test]
+    fn dead_null_aware_right_operands_report() {
+        let r = report("class int {} void main() { int x = 1; int y = 2; x ?? y; y ??= x; }");
+        assert_eq!(
+            code_names(&r),
+            ["dead_null_aware_expression", "dead_null_aware_expression"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// Labels declare through the labeled-statement scope chain: a
+    /// `break` into an outer scope spares that label, the unreferenced one
+    /// reports at its own statement end.
+    #[test]
+    fn unused_labels_report() {
+        let r = report(
+            "void main() { used: for (;;) { break used; } dead: for (;;) { break used; } }",
+        );
+        assert_eq!(code_names(&r), ["unused_label"], "{:?}", code_names(&r));
+        assert_eq!(r.diagnostics[0].message, "The label 'dead' isn't used.");
     }
 }
