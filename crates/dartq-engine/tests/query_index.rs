@@ -25,6 +25,17 @@ fn analyze(engine: &mut dartq_engine::Engine) {
         .expect("analyze");
 }
 
+/// Registers the fixture's files through the content overlay — the engine's
+/// only content entry (nothing is resident until a `set_content` batch
+/// applies; discovery is itself just a `set_content` batch) — then runs the
+/// first analyze. This is the population path every maintained capture and
+/// library surface enters through.
+fn populate_and_analyze(fixture: &Fixture, engine: &mut dartq_engine::Engine) {
+    engine.set_content(&fixture.path("lib/main.dart"), MAIN.as_bytes());
+    engine.set_content(&fixture.path("lib/greeter.dart"), GREETER.as_bytes());
+    analyze(engine);
+}
+
 #[test]
 fn query_is_empty_before_the_first_analyze() {
     let fixture = Fixture::new(&[("lib/main.dart", MAIN), ("lib/greeter.dart", GREETER)]);
@@ -38,7 +49,7 @@ fn query_is_empty_before_the_first_analyze() {
 fn query_tracks_spans_across_signature_stable_edits() {
     let fixture = Fixture::new(&[("lib/main.dart", MAIN), ("lib/greeter.dart", GREETER)]);
     let mut engine = fixture.engine();
-    analyze(&mut engine);
+    populate_and_analyze(&fixture, &mut engine);
 
     // The declaration: top-level `greet` in the greeter, `greet` at offset
     // 17 (`// header\n` + `String `), and the one reference from main's
@@ -86,7 +97,7 @@ fn query_tracks_spans_across_signature_stable_edits() {
 fn query_drops_removed_files() {
     let fixture = Fixture::new(&[("lib/main.dart", MAIN), ("lib/greeter.dart", GREETER)]);
     let mut engine = fixture.engine();
-    analyze(&mut engine);
+    populate_and_analyze(&fixture, &mut engine);
     assert_eq!(engine.query_symbols("greet").decls.len(), 1);
 
     engine
