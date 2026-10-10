@@ -23,20 +23,24 @@
 //! The rust-analyzer reverse-dependency posture (`base-db/src/input.rs`
 //! `transitive_rev_deps`): the import graph is inverted once per query —
 //! [`RevImportGraph`], the shared flat-CSR build the amortized batch
-//! queries and the T8 explain stage reuse — and a worklist drains
-//! the importers. The visited and direct-semantic marks
-//! are dense `Vec<bool>`s over the id space — O(1) probes, no hashing
-//! (library ids are a dense arena space, so a hashed set would only add
-//! overhead). Output is deterministic: every section sorts by its path.
+//! queries and the T8 explain stage reuse — and worklists drain
+//! the importers. The visited and semantic marks are dense `Vec<bool>`s
+//! over the id space — O(1) probes, no hashing (library ids are a dense
+//! arena space, so a hashed set would only add overhead). Output is
+//! deterministic: every section sorts by its path.
 //!
-//! # The signature seam (#282)
+//! # The signature gate (#282/#316/#338)
 //!
-//! [`FileSnapshot`] carries what the v1 proxy can see — the content hash
-//! ([`content_hash`], blake3) and the library-face name set. The two
-//! verdict functions ([`api_changed`] and [`symbol_signature_changed`]) are
-//! the seam the real `SignatureHash` gate replaces (PRD §11.3,
-//! `FileElements::api_signature`): the report shape, the tag rule, and the
-//! call sites stay when the gate lands.
+//! [`FileSnapshot`] carries the content hash ([`content_hash`], blake3),
+//! the API signature digest (the engine's `ApiSignature` as raw bytes —
+//! the element face folded with the directive face, PRD §11.3), and the
+//! library-face name set. The file-level verdict ([`api_changed`]) is the
+//! signature inequality alone: the digest already folds everything a
+//! downstream library resolves against, so a body-only edit (hash moves,
+//! signature stable) stays content-only without a name-set conjunct. The
+//! per-symbol verdict ([`symbol_signature_changed`]) remains a name-presence
+//! proxy until member-level signature evidence lands (documented at its
+//! definition).
 
 use std::cmp::Ordering;
 
@@ -52,15 +56,32 @@ use crate::rev_import_graph::RevImportGraph;
 pub const IMPACT_SCHEMA_VERSION: u32 = 1;
 
 /// The content hash of one file's bytes — the identity [`FileSnapshot`]
-/// compares. blake3: collision-resistant, fast, already the workspace's
-/// content-id hash family.
+/// carries alongside the API signature. blake3: collision-resistant, fast,
+/// already the workspace's content-id hash family.
 #[must_use]
 pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-/// What the v1 proxy sees of one library's state: the content identity and
-/// the library-face (top-level) declared names.
+/// The library-level API signature: blake3-128 over the member digests in
+/// member order (defining file first, then parts in part-directive order —
+/// the order the library's content identity folds). Fixed-width entries need
+/// no framing; the digest is order-sensitive, so a part reorder moves it,
+/// exactly as it moves the library's resolution surface.
+#[must_use]
+pub fn fold_api_signatures(members: &[[u8; 16]]) -> [u8; 16] {
+    let mut bytes = Vec::with_capacity(members.len() * 16);
+    for member in members {
+        bytes.extend_from_slice(member);
+    }
+    let digest = blake3::hash(&bytes);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
+}
+
+/// What the query sees of one library's state: the content identity, the
+/// API signature digest, and the library-face (top-level) declared names.
 ///
 /// The name set is the sorted, deduplicated [`StringId`]s of the library's
 /// face rows (a multi-file library folds its parts before querying). The
@@ -69,6 +90,12 @@ pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
 pub struct FileSnapshot {
     /// The content identity ([`content_hash`] over the library's bytes).
     pub content_hash: [u8; 32],
+    /// The API signature digest (#316/#338): the engine's `ApiSignature` as
+    /// raw bytes (`as_bytes()` — deliberately not the type, so this query
+    /// carries no dartq-semantic dependency edge), folded across the
+    /// library's members by [`fold_api_signatures`]. Folds the element face
+    /// with the directive face; `api_changed` verdicts on it alone.
+    pub api_signature: [u8; 16],
     /// The library-face names, ascending, deduplicated — asserted by
     /// [`impact`] in every build (the verdicts are merge walks over it).
     pub top_level_names: Box<[StringId]>,
@@ -89,14 +116,18 @@ pub struct LibraryChange {
 impl LibraryChange {
     /// The one-shot posture: no baseline exists, so the query assesses what
     /// an API-level edit to `current` would affect — every current face
-    /// name counts as changed and the API verdict is `true` (direct
-    /// importers tag semantic). The daemon path passes real diffs instead.
+    /// name counts as changed and the API verdict is `true` (importers at
+    /// every hop tag semantic). The daemon path passes real diffs instead.
+    /// The before side carries all-zero digests — no-baseline sentinels
+    /// (a real blake3 digest never answers all-zero), so the signature
+    /// verdict and the name diff both fire by construction.
     #[must_use]
     pub fn hypothetical(library: u32, current: FileSnapshot) -> Self {
         Self {
             library,
             before: FileSnapshot {
                 content_hash: [0; 32],
+                api_signature: [0; 16],
                 top_level_names: Box::from([]),
             },
             after: current,
@@ -125,8 +156,11 @@ pub struct ImpactReport {
 pub struct ChangedSymbol {
     /// The stable path reference (`label|name`, PRD §15.7).
     pub symbol: String,
-    /// Whether the symbol's signature changed (the v1 proxy verdict — see
-    /// [`symbol_signature_changed`]).
+    /// Whether the symbol's signature changed. Member-level proxy (see
+    /// [`symbol_signature_changed`]): it keys on the name's presence in the
+    /// face set, not on a per-symbol signature digest — member-level
+    /// signature evidence is deferred (#338 posture), and this flag stays
+    /// the proxy until that evidence lands.
     pub signature_changed: bool,
 }
 
@@ -169,19 +203,26 @@ pub struct EnvironmentImpact {
 }
 
 /// The file-level API-change verdict — the aggregate the semantic tag keys
-/// on. The v1 proxy: the content moved **and** the top-level name set moved
-/// with it. #282 replaces the name-set compare with the `api_signature`
-/// compare; a comment- or body-only edit (hash moves, set stable) stays
-/// content-only.
+/// on: the API signature moved (#316/#338). The signature comparison stands
+/// alone, deliberately without a content-hash conjunct: the digest already
+/// folds the element face with the directive face, so the conjunct would
+/// only cause false negatives — a signature can move while the content hash
+/// holds (a signature reframe across an engine upgrade: every byte
+/// identical, the baked digest reframed) and must still verdict as an API
+/// change. A body-only edit needs no conjunct to stay content-only: the
+/// signature is stable under it by construction.
 #[must_use]
 pub fn api_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
-    before.content_hash != after.content_hash && before.top_level_names != after.top_level_names
+    before.api_signature != after.api_signature
 }
 
-/// The per-symbol signature verdict — the #282 seam's per-name half. The v1
-/// proxy keys on the name's presence: an added or removed declaration is a
-/// signature change; a body edit under a stable name is invisible until the
-/// `SignatureHash` gate lands.
+/// The per-symbol signature verdict — the member-level half of the gate.
+/// Proxy until member-level signature evidence lands (#338 defers it): it
+/// keys on the name's presence, so an added or removed declaration is a
+/// signature change while a body edit under a stable name is invisible —
+/// and so is a signature-bearing edit (default value, type refinement)
+/// under a stable name. The file-level [`api_changed`] verdict carries the
+/// real signal until per-symbol digests exist.
 ///
 /// `before` and `after` must be ascending and deduplicated (the
 /// [`FileSnapshot`] contract) — `binary_search` on unsorted input answers
@@ -225,6 +266,29 @@ fn diff_names(before: &[StringId], after: &[StringId]) -> Vec<StringId> {
     diff.extend_from_slice(&before[i..]);
     diff.extend_from_slice(&after[j..]);
     diff
+}
+
+/// The transitive semantic marks (L3): `true` for every library reachable
+/// across the reverse import graph from an API-changing seed — importers at
+/// every hop resolve against the moved face, so the tag floods past the
+/// direct edge.
+fn semantic_flood<'a>(
+    count: u32,
+    api: &[bool],
+    importers_of: impl Fn(usize) -> &'a [u32],
+) -> Vec<bool> {
+    let mut semantic = vec![false; api.len()];
+    let mut flood: Vec<u32> = (0..count).filter(|&lib| api[lib as usize]).collect();
+    while let Some(lib) = flood.pop() {
+        for &importer in importers_of(lib as usize) {
+            if semantic[importer as usize] {
+                continue;
+            }
+            semantic[importer as usize] = true;
+            flood.push(importer);
+        }
+    }
+    semantic
 }
 
 /// Answers the impact query over `changes` (PRD §15.4).
@@ -281,10 +345,11 @@ pub fn impact<'a>(
     let graph = RevImportGraph::build(library_count, imports_of);
     let importers_of = |lib: usize| graph.importers_of(lib);
 
-    // Seed marks, then the direct-semantic marks: the first hop out of an
-    // API-changing library. Transitively reached importers stay
-    // content-only — the v1 proxy sees only the direct edge (the L2 gate
-    // refines the propagation).
+    // Seed marks, then the semantic propagation (L3, #338): a signature
+    // change floods the reverse import graph, so importers at every hop
+    // downstream of an API-changing library carry the Semantic tag — each
+    // of them resolves against the moved face. Libraries reached only
+    // through body-only changes stay content-only.
     let mut seed_changed = vec![false; library_count];
     let mut api = vec![false; library_count];
     for change in changes {
@@ -297,14 +362,7 @@ pub fn impact<'a>(
         seed_changed[lib] = true;
         api[lib] = api_changed(&change.before, &change.after);
     }
-    let mut direct_semantic = vec![false; library_count];
-    for (lib, &is_api) in api.iter().enumerate() {
-        if is_api {
-            for &importer in importers_of(lib) {
-                direct_semantic[importer as usize] = true;
-            }
-        }
-    }
+    let semantic = semantic_flood(count, &api, importers_of);
 
     // The closure: seeds pre-marked, importers drained worklist-style.
     let mut visited = seed_changed.clone();
@@ -322,8 +380,8 @@ pub fn impact<'a>(
     }
 
     // Changed rows: the name-set diff per change, each row's verdict from
-    // the seam. Honest no-op changes (equal hashes, equal sets) yield no
-    // rows and a content-only closure. Duplicate entries for one library
+    // the seam. Honest no-op changes (equal snapshots) yield no rows and a
+    // content-only closure. Duplicate entries for one library
     // resolve last-wins — the api marks already overwrite that way — so
     // the superseded entries ship no rows and contradictory symbol rows
     // are impossible by construction.
@@ -356,7 +414,7 @@ pub fn impact<'a>(
         .filter(|&lib| visited[lib as usize] && !seed_changed[lib as usize])
         .map(|lib| AffectedTarget {
             path: label_of(lib).to_string(),
-            impact: if direct_semantic[lib as usize] {
+            impact: if semantic[lib as usize] {
                 ImpactLevel::Semantic
             } else {
                 ImpactLevel::ContentOnly
@@ -414,8 +472,16 @@ mod tests {
             names.iter().map(|name| strings.intern(name)).collect();
         top_level_names.sort_unstable();
         top_level_names.dedup();
+        // The signature rides the face the way the real producer's does: a
+        // digest of the face itself — stable under body edits (the tests
+        // move `content_hash` alone), moving when the name set moves.
+        let face = names.join(",");
+        let digest = blake3::hash(face.as_bytes());
+        let mut api_signature = [0u8; 16];
+        api_signature.copy_from_slice(&digest.as_bytes()[..16]);
         FileSnapshot {
-            content_hash: content_hash(names.join(",").as_bytes()),
+            content_hash: content_hash(face.as_bytes()),
+            api_signature,
             top_level_names: top_level_names.into_boxed_slice(),
         }
     }
@@ -424,11 +490,12 @@ mod tests {
         &[]
     }
 
-    /// Acceptance core: an API-level change in `a` (a name added) marks the
-    /// direct importer `b` semantic, the transitive `c` content-only, and
-    /// lists `a_test` in AffectedTests.
+    /// Acceptance core: an API-level change in `a` floods the reverse
+    /// import graph — the direct importer `b`, the transitive `c`, and the
+    /// direct test import `a_test` all carry the Semantic tag (L3), and
+    /// `a_test` lists in AffectedTests.
     #[test]
-    fn api_change_tags_direct_semantic_and_transitive_content_only() {
+    fn api_change_propagates_semantic_to_every_hop() {
         let fx = fixture();
         // a=0, b=1 imports a, c=2 imports b, t=3 imports a.
         let imports: [&[u32]; 4] = [&[], &[0], &[1], &[0]];
@@ -469,9 +536,9 @@ mod tests {
             vec![
                 ("a_test.dart", ImpactLevel::Semantic),
                 ("b.dart", ImpactLevel::Semantic),
-                ("c.dart", ImpactLevel::ContentOnly),
+                ("c.dart", ImpactLevel::Semantic),
             ],
-            "direct importers semantic, the transitive hop content-only"
+            "the signature flood reaches every downstream hop"
         );
         assert_eq!(
             report
@@ -488,6 +555,66 @@ mod tests {
                 compatible: true,
             }]
         );
+    }
+
+    /// The flood boundary: a body-only change (hash moves, signature
+    /// stable) visits its importers but leaves every one of them
+    /// content-only — at every hop, not just the direct edge.
+    #[test]
+    fn body_only_change_stays_content_only_at_every_hop() {
+        let fx = fixture();
+        // a=0 body-only, b=1 imports a, c=2 imports b.
+        let imports: [&[u32]; 3] = [&[], &[0], &[1]];
+        let tests = TestGraph::default();
+        let mut after = snapshot(&fx.strings, &["fa"]);
+        after.content_hash = content_hash(b"reformatted");
+        let changes = [LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after,
+        }];
+        let report = impact(
+            3,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart", "c.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &changes,
+        );
+        assert!(report.changed.is_empty(), "no name moved, no rows");
+        assert_eq!(
+            report
+                .affected
+                .iter()
+                .map(|row| (row.path.as_str(), row.impact))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b.dart", ImpactLevel::ContentOnly),
+                ("c.dart", ImpactLevel::ContentOnly),
+            ],
+            "visited, but the signature never moved"
+        );
+        assert!(report.affected_tests.is_empty(), "no test graph here");
+    }
+
+    /// The verdict rule (#316/#338): the signature alone. A body-only edit
+    /// (hash moves, signature stable) is not an API change; a signature
+    /// move over a stable hash — the engine-upgrade reframe — is one,
+    /// exactly the case the content-hash conjunct the rule replaced would
+    /// have suppressed.
+    #[test]
+    fn api_changed_verdicts_on_the_signature_alone() {
+        let fx = fixture();
+        let before = snapshot(&fx.strings, &["fa"]);
+        let mut body_edit = before.clone();
+        body_edit.content_hash = content_hash(b"body");
+        assert!(!api_changed(&before, &body_edit));
+
+        let mut reframed = before.clone();
+        reframed.api_signature = fold_api_signatures(&[[1; 16]]);
+        assert_eq!(reframed.content_hash, before.content_hash);
+        assert!(api_changed(&before, &reframed));
+        assert!(!api_changed(&before, &before));
     }
 
     /// A body-only edit (hash moves, name set stable) yields no Changed

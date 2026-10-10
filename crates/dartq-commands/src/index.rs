@@ -106,8 +106,7 @@ pub fn run(dir: &Path, sdk: Option<&Path>, full: bool) -> Result<IndexRun, Index
     let (mut config, _dir) = engine_config(dir, sdk)?;
     let collector = Arc::new(IndexCollector::default());
     config.semdiag = Some(collector.clone() as Arc<dyn SemanticDiagnoser>);
-    let mut engine = Engine::new(config)
-        .map_err(|error| IndexError::Engine(error.to_string()))?;
+    let mut engine = Engine::new(config).map_err(|error| IndexError::Engine(error.to_string()))?;
     prelude(&mut engine)?;
     Ok(IndexRun {
         files: collector.files.load(Ordering::Relaxed),
@@ -129,21 +128,19 @@ struct IndexCollector {
 }
 
 impl SemanticDiagnoser for IndexCollector {
-    fn diagnose_library(&self, view: LibraryView<'_>, _out: &mut Vec<dartq_diagnostics::Diagnostic>) {
+    fn diagnose_library(
+        &self,
+        view: LibraryView<'_>,
+        _out: &mut Vec<dartq_diagnostics::Diagnostic>,
+    ) {
         self.libraries.fetch_add(1, Ordering::Relaxed);
         self.files.fetch_add(view.files.len(), Ordering::Relaxed);
 
-        let mut builder = dartq_index::LibraryBuilder::new(
-            view.graph_library,
-            view.graph,
-            view.namespaces,
-        );
+        let mut builder =
+            dartq_index::LibraryBuilder::new(view.graph_library, view.graph, view.namespaces);
         for &file in view.files {
             let facts = view.facts.get(&file).expect("analyzed member");
-            let bytes = view
-                .store
-                .get(facts.content())
-                .expect("resident content");
+            let bytes = view.store.get(facts.content()).expect("resident content");
             let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
             // The apply-phase version derivation (the engine capture's): the
             // owning package's version, or the default when the file belongs
@@ -164,11 +161,13 @@ impl SemanticDiagnoser for IndexCollector {
                 ParserFeatures::from_feature_set(FeatureSet::for_language_version(settled)),
                 view.strings,
             );
-            self.symbols.fetch_add(captured.index.len(), Ordering::Relaxed);
+            self.symbols
+                .fetch_add(captured.index.len(), Ordering::Relaxed);
             builder.add_file(&captured);
         }
         let surface = builder.finish();
-        self.references.fetch_add(surface.refs().len(), Ordering::Relaxed);
+        self.references
+            .fetch_add(surface.refs().len(), Ordering::Relaxed);
     }
 }
 
@@ -187,9 +186,18 @@ mod tests {
         let root = workspace(
             "index",
             &[
-                ("lib/a.dart", "class Foo {\n  void meth() {}\n}\nvoid top() {}\n"),
-                ("lib/b.dart", "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  top();\n}\n"),
-                ("lib/c.dart", "import 'a.dart';\nvoid other() {\n  var f2 = Foo();\n}\n"),
+                (
+                    "lib/a.dart",
+                    "class Foo {\n  void meth() {}\n}\nvoid top() {}\n",
+                ),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  top();\n}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'a.dart';\nvoid other() {\n  var f2 = Foo();\n}\n",
+                ),
             ],
         );
         let run = run(&root, Some(&root.join("sdk")), true).expect("index run");

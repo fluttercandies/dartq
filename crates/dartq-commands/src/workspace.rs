@@ -46,7 +46,10 @@ pub fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), 
 ///
 /// [`WorkspaceError`] when the SDK, the package directory, or the pub
 /// faces are unusable.
-pub fn engine_config(dir: &Path, sdk: Option<&Path>) -> Result<(EngineConfig, PathBuf), WorkspaceError> {
+pub fn engine_config(
+    dir: &Path,
+    sdk: Option<&Path>,
+) -> Result<(EngineConfig, PathBuf), WorkspaceError> {
     let sdk_root = sdk
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
@@ -65,10 +68,17 @@ pub fn engine_config(dir: &Path, sdk: Option<&Path>) -> Result<(EngineConfig, Pa
         ))
     })?;
     let config_dir = dir.join(".dart_tool");
-    let (config, lock, pubspec) = load_workspace_faces(&dir, &config_dir)
-        .map_err(WorkspaceError)?;
-    let graph = build_graph(&config, &lock, &pubspec, &BTreeMap::new(), None, &config_dir)
-        .map_err(|error| WorkspaceError(error.to_string()))?;
+    let (config, lock, pubspec) =
+        load_workspace_faces(&dir, &config_dir).map_err(WorkspaceError)?;
+    let graph = build_graph(
+        &config,
+        &lock,
+        &pubspec,
+        &BTreeMap::new(),
+        None,
+        &config_dir,
+    )
+    .map_err(|error| WorkspaceError(error.to_string()))?;
     let packages = PackageTable::build(&config, &graph, &config_dir)
         .map_err(|error| WorkspaceError(error.to_string()))?;
     let sdk_snapshot = SdkSnapshot::load(&sdk_root, None).map_err(|error| {
@@ -136,8 +146,7 @@ pub(crate) mod test_fixture {
     /// Writes the workspace faces plus `libraries` (path relative to the
     /// root, content) and returns the root. `tag` namespaces the temp dir.
     pub(crate) fn workspace(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("dq_cmd_{tag}_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dq_cmd_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let write = |relative: &str, content: &str| {
             let path = root.join(relative);

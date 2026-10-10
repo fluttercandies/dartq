@@ -1622,9 +1622,8 @@ mod tests {
                 )
                 .expect("valid config"),
             );
-            let lock =
-                LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
-                    .expect("valid lock");
+            let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+                .expect("valid lock");
             let root_pubspec =
                 Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
                     .expect("valid pubspec");
@@ -1665,7 +1664,9 @@ mod tests {
         if !state.pending.contains_key(&file) {
             state.pending_order.push(file);
         }
-        state.pending.insert(file, PendingChange::Set(text.to_owned()));
+        state
+            .pending
+            .insert(file, PendingChange::Set(text.to_owned()));
         file
     }
 
@@ -1700,12 +1701,14 @@ mod tests {
         // Precondition: the two orders genuinely disagree, otherwise this
         // test pins nothing.
         let path_bytes = |file: FileId| {
-            state
-                .files
-                .path(file)
-                .map_or(Vec::new(), |path| path.as_os_str().as_encoded_bytes().to_vec())
+            state.files.path(file).map_or(Vec::new(), |path| {
+                path.as_os_str().as_encoded_bytes().to_vec()
+            })
         };
-        assert!(path_bytes(spaced) < path_bytes(banged), "space < '!' as path bytes");
+        assert!(
+            path_bytes(spaced) < path_bytes(banged),
+            "space < '!' as path bytes"
+        );
         assert!(
             state.canonical_uris[&banged] < state.canonical_uris[&spaced],
             "canonical-URI order must disagree with path order for the pin to bite"
@@ -1713,13 +1716,21 @@ mod tests {
 
         let lib_spaced = state.library_of_file[&spaced];
         let lib_banged = state.library_of_file[&banged];
-        assert_ne!(lib_spaced, lib_banged, "two defining libraries stay distinct");
+        assert_ne!(
+            lib_spaced, lib_banged,
+            "two defining libraries stay distinct"
+        );
         assert_eq!(
             state.library_of_file[&part], lib_spaced,
             "the path-smaller claimant wins the ambiguous part"
         );
         assert_eq!(
-            state.libraries.info(lib_spaced).expect("live").parts.as_slice(),
+            state
+                .libraries
+                .info(lib_spaced)
+                .expect("live")
+                .parts
+                .as_slice(),
             &[part]
         );
     }
@@ -1800,6 +1811,9 @@ mod tests {
             expected.extend_from_slice(&(lexeme.len() as u64).to_le_bytes());
             expected.extend_from_slice(lexeme.as_bytes());
         }
-        assert_eq!(face, expected, "the raw byte rides inside its framed lexeme");
+        assert_eq!(
+            face, expected,
+            "the raw byte rides inside its framed lexeme"
+        );
     }
 }

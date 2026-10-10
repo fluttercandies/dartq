@@ -70,10 +70,16 @@ pub fn compat(
     // oracle convention) and the target containment check compares like
     // with like.
     let canonical_dir = dir.canonicalize().map_err(|_| {
-        CompatError::Usage(format!("Directory or file doesn't exist: {}", dir.display()))
+        CompatError::Usage(format!(
+            "Directory or file doesn't exist: {}",
+            dir.display()
+        ))
     })?;
     let canonical_target = target.canonicalize().map_err(|_| {
-        CompatError::Usage(format!("Directory or file doesn't exist: {}", target.display()))
+        CompatError::Usage(format!(
+            "Directory or file doesn't exist: {}",
+            target.display()
+        ))
     })?;
     if canonical_target.extension() != Some(std::ffi::OsStr::new("dart"))
         || !canonical_target.starts_with(&canonical_dir)
@@ -157,7 +163,11 @@ fn analyze_axis(
     // The read-after-write: the matrix reflects the analyzed state only.
     let mut on_event = |_: dartq_engine::EngineEvent| {};
     let diags = engine
-        .analyze(&[], &mut on_event, &dartq_engine::CancellationToken::default())
+        .analyze(
+            &[],
+            &mut on_event,
+            &dartq_engine::CancellationToken::default(),
+        )
         .map_err(|_: dartq_engine::Cancelled| CompatError::Internal("analysis cancelled".into()))?;
 
     // The verdict input: ERROR-severity diagnostics only, laid out through

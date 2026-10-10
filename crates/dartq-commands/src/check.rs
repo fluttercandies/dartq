@@ -428,7 +428,8 @@ mod tests {
         assert_eq!(run.loc(), 2);
         assert_eq!(run.diagnostics().len(), 1, "broken.dart's syntax error");
         assert_eq!(
-            run.diagnostics()[0].code.name, "expected_token",
+            run.diagnostics()[0].code.name,
+            "expected_token",
             "canonical order puts the one diagnostic forward"
         );
 

@@ -150,7 +150,11 @@ mod tests {
             g.offsets.windows(2).all(|pair| pair[0] <= pair[1]),
             "offsets are monotone"
         );
-        assert_eq!(g.offsets[4] as usize, g.importers.len(), "last offset is the edge count");
+        assert_eq!(
+            g.offsets[4] as usize,
+            g.importers.len(),
+            "last offset is the edge count"
+        );
         assert_eq!(g.importers_of(0), &[1, 2, 3], "rows ascending");
         assert_eq!(g.importers_of(1), &[2]);
         assert!(g.importers_of(2).is_empty());

@@ -56,7 +56,7 @@ use dartq_diagnostics::Diagnostic;
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
-use dartq_source::{FileId, FileTable, LineIndex, MemorySourceStore, SourceStore};
+use dartq_source::{FileId, FileTable, LineIndex, MemorySourceStore, SourceStore, StringTable};
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 
@@ -403,6 +403,26 @@ impl Engine {
     pub fn content(&self, file: FileId) -> Option<&[u8]> {
         let facts = self.state.residency.get(&file)?;
         self.state.store.get(facts.content)
+    }
+
+    /// The resident facts of one file — the baked API signature, the
+    /// element model, the directives, the syntax + URI-layer diagnostics,
+    /// the line index — or `None` when the file is not resident. The read
+    /// face batch queries assemble over (#341's accessor face): a query
+    /// reads what analysis already computed instead of re-deriving it.
+    #[must_use]
+    pub fn file_facts(&self, file: FileId) -> Option<&state::UnitFacts> {
+        self.state.residency.get(&file).map(Arc::as_ref)
+    }
+
+    /// The engine's intern table — the one table every resident fact's
+    /// `StringId`s resolve against. Mutex-guarded interning makes sharing
+    /// it the contract: a query reading resident facts resolves (and, on
+    /// its own additions, interns) here, exactly the documented
+    /// `query_symbols` posture — the only side effect is interning.
+    #[must_use]
+    pub fn strings(&self) -> &StringTable {
+        &self.state.strings
     }
 
     /// Distinct contents the store currently holds — the entry-count half of

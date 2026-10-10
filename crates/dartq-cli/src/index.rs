@@ -44,9 +44,7 @@ pub(crate) fn run_entry(args: &IndexArgs) -> u8 {
 }
 
 fn run(args: &IndexArgs, out: &mut impl Write) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_checked(args, out)
-    }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_checked(args, out)));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -71,7 +69,11 @@ fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
     };
 
     let written = out
-        .write_all(serde_json::to_string(&built.to_json()).expect("IndexRun serializes").as_bytes())
+        .write_all(
+            serde_json::to_string(&built.to_json())
+                .expect("IndexRun serializes")
+                .as_bytes(),
+        )
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush());
     if let Err(error) = written {

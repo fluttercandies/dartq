@@ -369,10 +369,9 @@ fn check(args: &CheckArgs) -> u8 {
     // stdout kept empty — a partial diagnostic set must never masquerade as a
     // valid {0,1,2,3} result.
     let analyze_at = Instant::now();
-    let analyzed =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dartq_commands::check::analyze_files(&files)
-        }));
+    let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dartq_commands::check::analyze_files(&files)
+    }));
     let analyze_ms = elapsed_ms(analyze_at.elapsed());
     let run = match analyzed {
         Ok(Ok(run)) => run,
@@ -678,7 +677,8 @@ fn load_overlays(specs: &[String], dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>
                     .map_err(|error| format!("reading overlay stdin failed: {error}"))?;
                 bytes
             } else {
-                fs::read(file).map_err(|error| format!("reading overlay `{file}` failed: {error}"))?
+                fs::read(file)
+                    .map_err(|error| format!("reading overlay `{file}` failed: {error}"))?
             };
             Ok((path, bytes))
         })
@@ -729,7 +729,9 @@ fn daemon(args: &DaemonArgs) -> u8 {
     // thread over the package directory (PRD §16.7 mode 3).
     let stdin = io::BufReader::new(io::stdin());
     let stdout = io::BufWriter::new(io::stdout().lock());
-    let watch = args.watch.then(|| dartq_daemon::WatchOptions::new(args.dir.clone()));
+    let watch = args
+        .watch
+        .then(|| dartq_daemon::WatchOptions::new(args.dir.clone()));
     match dartq_daemon::run(stdin, stdout, session, watch) {
         Ok(code) => code,
         Err(error) => {
@@ -1676,7 +1678,11 @@ mod tests {
 
         // Missing local file → usage tier.
         let missing = AnalyzeArgs {
-            overlays: vec![format!("{}={}", target.display(), root.join("nope").display())],
+            overlays: vec![format!(
+                "{}={}",
+                target.display(),
+                root.join("nope").display()
+            )],
             ..analyze_args(&root, AnalyzeFormat::Machine, None)
         };
         assert_eq!(analyze_run(&missing, &mut Vec::new()), exit::USAGE);
@@ -1891,12 +1897,18 @@ mod tests {
         // name-keyed and already kinded).
         let mut symbol_out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut symbol_out),
+            query_symbol_run(
+                &symbol_args(&root, QueryFormat::Machine, "Foo"),
+                &mut symbol_out
+            ),
             exit::CLEAN
         );
         let mut references_out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_references_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut references_out),
+            query_references_run(
+                &symbol_args(&root, QueryFormat::Machine, "Foo"),
+                &mut references_out
+            ),
             exit::CLEAN
         );
         assert_eq!(
@@ -1992,7 +2004,10 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
         assert!(args.sdk.is_none());
         assert!(matches!(args.format, ExplainFormat::Json), "json default");
-        assert!(matches!(args.verbosity, Verbosity::Compact), "compact default");
+        assert!(
+            matches!(args.verbosity, Verbosity::Compact),
+            "compact default"
+        );
 
         let parsed = parse_args_of(&[
             "explain",
@@ -2038,7 +2053,9 @@ mod tests {
     /// The name token's start offset in `source` (ASCII sources, so byte
     /// offset = UTF-16 offset).
     fn explain_offset(source: &str, needle: &str) -> u32 {
-        source.find(needle).unwrap_or_else(|| panic!("{needle} in source")) as u32
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} in source")) as u32
     }
 
     fn explain_args(root: &Path, verbosity: Verbosity, symbol: &str) -> ExplainArgs {
@@ -2075,13 +2092,13 @@ mod tests {
 
         // Compact: the full section set.
         let mut out: Vec<u8> = Vec::new();
-        let code = explain_run(
-            &explain_args(&root, Verbosity::Compact, "Dog"),
-            &mut out,
-        );
+        let code = explain_run(&explain_args(&root, Verbosity::Compact, "Dog"), &mut out);
         assert_eq!(code, exit::CLEAN);
         let line = String::from_utf8(out).expect("UTF-8");
-        assert!(line.ends_with('\n') && line.lines().count() == 1, "one JSON line");
+        assert!(
+            line.ends_with('\n') && line.lines().count() == 1,
+            "one JSON line"
+        );
         let json: serde_json::Value =
             serde_json::from_str(line.trim_end()).expect("the report parses");
         assert_eq!(json["schema_version"], 1);
@@ -2122,7 +2139,10 @@ mod tests {
             json["dependencies"],
             serde_json::json!([{ "path": main }, { "path": dog_test }])
         );
-        assert_eq!(json["affected_tests"], serde_json::json!([{ "path": dog_test }]));
+        assert_eq!(
+            json["affected_tests"],
+            serde_json::json!([{ "path": dog_test }])
+        );
 
         // Minimal: the declaration locators stay, the arrays swap for counts.
         let mut out: Vec<u8> = Vec::new();

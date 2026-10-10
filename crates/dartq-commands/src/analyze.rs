@@ -44,7 +44,9 @@ pub(crate) struct Prelude {
 /// [`Engine::analyze`] pass (the read-after-write every query face reflects).
 pub(crate) fn prelude(engine: &mut Engine) -> Result<Prelude, AnalyzeError> {
     let started = std::time::Instant::now();
-    let stats = engine.discover_workspace().map_err(AnalyzeError::Discovery)?;
+    let stats = engine
+        .discover_workspace()
+        .map_err(AnalyzeError::Discovery)?;
     let discovery = started.elapsed();
 
     let mut analyzed = (0_usize, 0_usize);

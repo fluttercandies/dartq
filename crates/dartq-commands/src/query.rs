@@ -39,10 +39,7 @@ pub struct SymbolRun<'a> {
 /// # Errors
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
-pub fn symbol<'a>(
-    engine: &'a mut Engine,
-    name: &str,
-) -> Result<SymbolRun<'a>, AnalyzeError> {
+pub fn symbol<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
     let _ = prelude(engine)?;
     Ok(symbol_after_analysis(engine, name))
 }
@@ -52,7 +49,10 @@ pub fn symbol<'a>(
 /// read's cost). The rows borrow the engine's resident data.
 #[must_use]
 pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
-    let SymbolAnswer { mut decls, mut refs } = engine.query_symbols(name);
+    let SymbolAnswer {
+        mut decls,
+        mut refs,
+    } = engine.query_symbols(name);
     let layout = EngineLayout::over(
         engine,
         decls
@@ -79,7 +79,11 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
                     .cmp(crate::layout::path_key(layout.file_path(b.file)))
             })
     });
-    SymbolRun { decls, refs, layout }
+    SymbolRun {
+        decls,
+        refs,
+        layout,
+    }
 }
 
 /// The `query callers` face (PRD §15.2): the invocation-shaped subset of the
@@ -115,7 +119,8 @@ pub fn callers<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, 
 #[must_use]
 pub fn callers_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
     let mut run = symbol_after_analysis(engine, name);
-    run.refs.retain(|reference| reference.kind == RefKind::Invoked);
+    run.refs
+        .retain(|reference| reference.kind == RefKind::Invoked);
     run
 }
 
@@ -234,11 +239,7 @@ mod tests {
         let run = callers(&mut engine, "Foo").expect("query");
         assert_eq!(run.decls.len(), 1, "the declaration rows stay");
         assert_eq!(run.decls[0].name, "Foo");
-        let refs: Vec<(RefKind, u32)> = run
-            .refs
-            .iter()
-            .map(|r| (r.kind, r.range.offset))
-            .collect();
+        let refs: Vec<(RefKind, u32)> = run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
         assert_eq!(
             refs,
             vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
@@ -274,11 +275,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
 
         let run = symbol(&mut engine, "Foo").expect("query");
-        let refs: Vec<(RefKind, u32)> = run
-            .refs
-            .iter()
-            .map(|r| (r.kind, r.range.offset))
-            .collect();
+        let refs: Vec<(RefKind, u32)> = run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
         assert_eq!(
             refs,
             vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],

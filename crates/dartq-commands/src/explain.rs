@@ -82,7 +82,8 @@ pub fn explain(
     let collector = Arc::new(ExplainCollector::new(symbol.to_owned()));
     let (mut config, _dir) = engine_config(dir, sdk)?;
     config.semdiag = Some(collector.clone() as Arc<dyn SemanticDiagnoser>);
-    let mut engine = Engine::new(config).map_err(|error| ExplainError::Engine(error.to_string()))?;
+    let mut engine =
+        Engine::new(config).map_err(|error| ExplainError::Engine(error.to_string()))?;
     prelude(&mut engine)?;
     Ok(explain_after_analysis(&engine, &collector, verbosity))
 }
@@ -122,12 +123,10 @@ pub fn explain_after_analysis(
     ids.extend(harvest.surfaces.iter().map(|(_, file, _)| *file));
     ids.extend(harvest.refs.iter().map(|row| row.file));
     ids.extend(harvest.supers.iter().flat_map(|(_, targets)| {
-        targets
-            .iter()
-            .filter_map(|target| match target {
-                TargetRef::Decl(file, _) => Some(*file),
-                TargetRef::Name(_) => None,
-            })
+        targets.iter().filter_map(|target| match target {
+            TargetRef::Decl(file, _) => Some(*file),
+            TargetRef::Name(_) => None,
+        })
     }));
     ids.sort_unstable();
     ids.dedup();
@@ -146,13 +145,14 @@ pub fn explain_after_analysis(
         .surfaces
         .iter()
         .flat_map(|(library, file, surface)| {
-            surface.iter().filter(|row| row.name == sym).map(move |row| {
-                SymbolDeclHit {
+            surface
+                .iter()
+                .filter(|row| row.name == sym)
+                .map(move |row| SymbolDeclHit {
                     library: *library,
                     file: *file,
                     decl: row,
-                }
-            })
+                })
         })
         .collect();
     let report = query::explain(
@@ -284,14 +284,16 @@ impl SemanticDiagnoser for ExplainCollector {
             builder.add_file(&captured);
         }
         let surface = builder.finish();
-        harvest
-            .refs
-            .extend(surface.refs().iter().filter(|row| row.target_name == queried).map(
-                |row| RefRow {
+        harvest.refs.extend(
+            surface
+                .refs()
+                .iter()
+                .filter(|row| row.target_name == queried)
+                .map(|row| RefRow {
                     target_name: local,
                     ..*row
-                },
-            ));
+                }),
+        );
         for file in hit_files {
             let targets = surface
                 .supertypes_of(file, queried)
@@ -345,7 +347,9 @@ mod tests {
     /// The name token's start offset in `source` (ASCII sources, so byte
     /// offset = UTF-16 offset).
     fn offset(source: &str, needle: &str) -> u32 {
-        source.find(needle).unwrap_or_else(|| panic!("{needle} in source")) as u32
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} in source")) as u32
     }
 
     /// End-to-end over the real engine + workspace fixture: the report
@@ -464,7 +468,10 @@ mod tests {
         assert_eq!(json["references"], json!([]));
         assert_eq!(json["dependencies"], json!([]));
         assert_eq!(json["affected_tests"], json!([]));
-        assert!(json.get("counts").is_none(), "counts are a minimal-tier field");
+        assert!(
+            json.get("counts").is_none(),
+            "counts are a minimal-tier field"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

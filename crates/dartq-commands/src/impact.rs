@@ -10,11 +10,16 @@
 //!   defining-file basenames (dartq-index's derivation: imports primary,
 //!   the `*_test.dart` convention fallback);
 //! * the **file snapshot** folds the seed library's member files — blake3
-//!   over the member hashes, the library-face declaration names. Per member
-//!   the persisted-facts hint decides the derivation: a snapshot hit is
-//!   `materialize`d through the #341 load faces and read off the restored
-//!   element model; a genuine miss re-derives the same two columns by
-//!   scan+capture (the dartq-index capture pass).
+//!   over the member hashes, the blake3-128 fold of the member API
+//!   signatures (dartq-ai's [`dartq_ai::impact::fold_api_signatures`]), the
+//!   library-face declaration names. Per member the persisted-facts hint
+//!   decides the read face: a snapshot hit is `materialize`d through the
+//!   #341 load faces; a genuine miss reads the engine's resident facts
+//!   through the #341 accessor face ([`dartq_engine::Engine::file_facts`])
+//!   — the analysis prelude has already computed them, so no member is
+//!   ever re-scanned (the retired scan+capture seed also carried a
+//!   language-version drift: it re-fixed the default version where the
+//!   engine settles each file's own).
 //!
 //! One-shot posture: a CLI run holds no baseline, so the seed enters the
 //! query as a **hypothetical** API-level change ([`LibraryChange::hypothetical`])
@@ -27,22 +32,12 @@ use std::path::{Path, PathBuf};
 
 use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
 use dartq_engine::state::persist::PersistedFacts;
-use dartq_engine::{Engine, LibraryId};
-use dartq_index::{TestGraph, capture};
-use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
-use dartq_parser::ParserFeatures;
-use dartq_scanner::{ScanConfig, scan};
+use dartq_engine::{Engine, LibraryId, UnitFacts};
+use dartq_index::TestGraph;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
-
-/// The scan configuration of every non-version-gated capture face (the
-/// workspace default: triple shift and augmentations on).
-const SCAN_CONFIG: ScanConfig = ScanConfig {
-    enable_triple_shift: true,
-    enable_augmentations: true,
-};
 
 /// Why an impact run aborts: target problems are the CLI's usage tier,
 /// prelude failures the internal tier.
@@ -138,9 +133,13 @@ pub fn impact_after_analysis_with_persisted_facts(
         .expect("live seed library");
     let idents = library_identities(engine, &libraries);
 
-    let strings = StringTable::new();
+    // One intern table for the whole answer: the engine's own — resident
+    // facts' `StringId`s are native to it, and materializing a payload
+    // re-interns into it idempotently (Mutex-guarded `intern`, the
+    // documented query posture: the only side effect is interning).
+    let strings = engine.strings();
     let mut restored = FileTable::new();
-    let current = library_surface(engine, &members, &strings, persisted, &mut restored);
+    let current = library_surface(engine, &members, strings, persisted, &mut restored);
 
     // The substrate over the engine's faces, then the query.
     let neighbors = |library: u32| -> &[u32] {
@@ -157,7 +156,7 @@ pub fn impact_after_analysis_with_persisted_facts(
         neighbors,
         |library| -> &str { idents[library as usize].as_deref().expect("live library") },
         &tests,
-        &strings,
+        strings,
         &[change],
     ))
 }
@@ -188,22 +187,23 @@ pub(crate) fn library_identities(
 }
 
 /// The folded surface of one library over its member files: blake3 over the
-/// member content hashes, the library-face declaration names. Per member
-/// the persisted hint decides the derivation: a hit `materialize`s the
-/// payload through the #341 load faces and reads the two columns off the
-/// restored facts; a miss re-derives them by scan+capture (parse-surface
-/// capture proceeds through scan diagnostics — the under-report bias; this
-/// face produces no diagnostics of its own).
+/// member content hashes, the blake3-128 fold of the member API signatures,
+/// the library-face declaration names. Per member the persisted hint decides
+/// the read face: a hit `materialize`s the payload through the #341 load
+/// faces; a miss reads the engine's resident facts through the #341
+/// accessor face — analysis has already computed them, so nothing is
+/// re-derived (parse-surface diagnostics play no role: this face produces
+/// no diagnostics of its own).
 ///
 /// The equivalence the fold stands on: both arms answer for the same
 /// resident bytes — the content identity is the same blake3 over the same
-/// bytes, and the restored element model's face set (every named container
-/// plus every non-type-parameter top-level declaration, setters under their
-/// `name=` spelling) is the capture pass's `is_library_face` set — so a
-/// generation whose entries match the workspace folds into the seed's
-/// exact snapshot. The `restored` table takes the payload's file
-/// references (directive targets, diagnostic files); the surface face
-/// reads none of them, but `materialize` mints ids through it by contract.
+/// bytes, the face sets coincide (the materialized element model and the
+/// engine's residency are equal for equal content), and the signature
+/// columns are the same baked digest — so a generation whose entries match
+/// the workspace folds into the seed's exact snapshot. The `restored` table
+/// takes the payload's file references (directive targets, diagnostic
+/// files); the surface face reads none of them, but `materialize` mints ids
+/// through it by contract.
 fn library_surface(
     engine: &Engine,
     members: &[FileId],
@@ -211,8 +211,27 @@ fn library_surface(
     persisted: PersistedFactsHint<'_>,
     restored: &mut FileTable,
 ) -> FileSnapshot {
+    /// The library-face names of one unit's element model: every named
+    /// container plus every non-type-parameter top-level declaration,
+    /// setters under their `name=` spelling — the capture filter's mirror.
+    /// The kind rides its derived Debug spelling because dartq-commands
+    /// does not depend on dartq-semantic (the engine owns the element
+    /// model); a rename that breaks the spelling fails the impact
+    /// equivalence test instead of leaking the name.
+    fn face_names(facts: &UnitFacts, names: &mut Vec<StringId>) {
+        names.extend(facts.elements.containers().map(|(name, _)| name));
+        names.extend(
+            facts
+                .elements
+                .declarations()
+                .filter(|(_, decl)| format!("{:?}", decl.kind) != "TypeParam")
+                .map(|(name, _)| name),
+        );
+    }
+
     let mut names: Vec<StringId> = Vec::new();
     let mut folded = Vec::with_capacity(members.len() * 32);
+    let mut signatures = Vec::with_capacity(members.len());
     for &file in members {
         let bytes = engine.content(file).expect("resident member");
         // The content identity rides the query contract's 32-byte blake3
@@ -221,46 +240,31 @@ fn library_surface(
         // fold's.
         folded.extend_from_slice(&content_hash(bytes));
         let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-        match persisted(text) {
-            Some(payload) => {
-                let facts = payload.materialize(text, strings, &mut |path| restored.intern(path));
-                names.extend(facts.elements.containers().map(|(name, _)| name));
-                names.extend(
-                    facts
-                        .elements
-                        .declarations()
-                        // Type parameters are declaration-scoped, not
-                        // library faces — the capture filter's mirror. The
-                        // kind rides its derived Debug spelling because
-                        // dartq-commands does not depend on dartq-semantic
-                        // (the engine owns the element model); a rename
-                        // that breaks the spelling fails the impact
-                        // equivalence test instead of leaking the name.
-                        .filter(|(_, decl)| format!("{:?}", decl.kind) != "TypeParam")
-                        .map(|(name, _)| name),
-                );
-            }
-            None => {
-                let scanned = scan(text, SCAN_CONFIG, file);
-                let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-                    DEFAULT_LANGUAGE_VERSION,
-                ));
-                let captured = capture(file, text, &scanned.tokens, features, strings);
-                names.extend(
-                    captured
-                        .index
-                        .decls()
-                        .iter()
-                        .filter(|row| row.is_library_face())
-                        .map(|row| row.name),
-                );
-            }
-        }
+        let signature = if let Some(payload) = persisted(text) {
+            // The signature column off the payload bytes before the
+            // materializing move (`materialize` consumes the payload).
+            let signature = payload.api_signature;
+            let facts = payload.materialize(text, strings, &mut |path| restored.intern(path));
+            face_names(&facts, &mut names);
+            signature
+        } else {
+            // The engine's residency is the authority here: the
+            // analysis prelude computed these facts, so a snapshot miss
+            // costs one map read — no rescan, no re-intern (the names'
+            // `StringId`s are native to the query's table — the
+            // engine's own), and no language-version drift (the file's
+            // settled feature set rode the analysis).
+            let facts = engine.file_facts(file).expect("resident member facts");
+            face_names(facts, &mut names);
+            *facts.api_signature().as_bytes()
+        };
+        signatures.push(signature);
     }
     names.sort_unstable();
     names.dedup();
     FileSnapshot {
         content_hash: content_hash(&folded),
+        api_signature: query::fold_api_signatures(&signatures),
         top_level_names: names.into_boxed_slice(),
     }
 }
@@ -269,18 +273,31 @@ fn library_surface(
 mod tests {
     use super::*;
     use crate::workspace::{open_engine, test_fixture::workspace};
-    use dartq_index::DeclKind;
+    use dartq_index::{DeclKind, capture};
+    use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
+    use dartq_parser::ParserFeatures;
+    use dartq_scanner::{ScanConfig, scan};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
 
+    /// The scan configuration of every non-version-gated capture face (the
+    /// workspace default: triple shift and augmentations on) — the payload
+    /// projection's capture pass.
+    const SCAN_CONFIG: ScanConfig = ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: true,
+    };
+
     /// Projects one file's facts onto the persisted payload the saver
     /// writes. The engine's resident facts are crate-private, so the
-    /// projection reuses the same capture pass the seed arm reads: every
-    /// library-face row becomes an element column entry (containers vs
-    /// top-level declarations, names on the per-entry string slice, kinds
-    /// in the persisted spellings) — the shape the load arm's derivation
-    /// consumes.
+    /// projection re-derives the face rows with the same capture pass
+    /// analysis uses: every library-face row becomes an element column
+    /// entry (containers vs top-level declarations, names on the per-entry
+    /// string slice, kinds in the persisted spellings) — the shape the load
+    /// arm's derivation consumes. The signature column is a fixture
+    /// simplification (all-zero): it rides the payload but never reaches
+    /// the report, whose verdicts key on the name sets.
     fn persisted_facts(text: &str, file: FileId, strings: &StringTable) -> PersistedFacts {
         let scanned = scan(text, SCAN_CONFIG, file);
         let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(

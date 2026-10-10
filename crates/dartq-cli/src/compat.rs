@@ -321,7 +321,10 @@ mod tests {
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         let matrix = json["matrix"].as_array().expect("matrix");
         assert_eq!(matrix.len(), 2, "one row per declared context");
-        assert_eq!(matrix[0]["sdk"], "3.13.1", "file order: `new` declared first");
+        assert_eq!(
+            matrix[0]["sdk"], "3.13.1",
+            "file order: `new` declared first"
+        );
         assert_eq!(matrix[0]["compatible"], true);
         assert_eq!(matrix[1]["sdk"], "3.5.0");
         assert_eq!(matrix[1]["compatible"], false);

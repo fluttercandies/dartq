@@ -164,7 +164,10 @@ pub fn compat_axis_roots(
     };
     if contexts.is_empty() {
         for context in &config.contexts {
-            push_unique(&mut axes, resolve_locator(&context.label, &context.sdk, dir)?);
+            push_unique(
+                &mut axes,
+                resolve_locator(&context.label, &context.sdk, dir)?,
+            );
         }
         return Ok(axes);
     }
@@ -180,11 +183,12 @@ pub fn compat_axis_roots(
                     .map(|context| context.label.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                ConfigError::Invalid(format!(
-                    "unknown context `{label}` (declared: {declared})"
-                ))
+                ConfigError::Invalid(format!("unknown context `{label}` (declared: {declared})"))
             })?;
-        push_unique(&mut axes, resolve_locator(&context.label, &context.sdk, dir)?);
+        push_unique(
+            &mut axes,
+            resolve_locator(&context.label, &context.sdk, dir)?,
+        );
     }
     Ok(axes)
 }
@@ -280,7 +284,9 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         None | Some(serde_yaml::Value::Null) => {}
         Some(declared) => {
             let declared = declared.as_mapping().ok_or_else(|| {
-                ConfigError::Invalid("dartq.yaml: `contexts` must be a label → context mapping".into())
+                ConfigError::Invalid(
+                    "dartq.yaml: `contexts` must be a label → context mapping".into(),
+                )
             })?;
             for (key, entry) in declared {
                 let Some(label) = key.as_str() else {
@@ -288,9 +294,10 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
                         "dartq.yaml: `contexts` keys must be strings".into(),
                     ));
                 };
-                let context: RawContext = serde_yaml::from_value(entry.clone()).map_err(|error| {
-                    ConfigError::Invalid(format!("dartq.yaml: context `{label}`: {error}"))
-                })?;
+                let context: RawContext =
+                    serde_yaml::from_value(entry.clone()).map_err(|error| {
+                        ConfigError::Invalid(format!("dartq.yaml: context `{label}`: {error}"))
+                    })?;
                 contexts.push(ContextConfig {
                     label: label.to_owned(),
                     sdk: context.sdk,
@@ -407,7 +414,11 @@ mod tests {
     fn absent_or_defaults_only_config_stays_byte_identical() {
         let root = fixture("absent");
         assert!(load(&root).expect("absent is none").is_none());
-        assert!(compat_axis_roots(&root, &[], &[]).expect("no axes").is_empty());
+        assert!(
+            compat_axis_roots(&root, &[], &[])
+                .expect("no axes")
+                .is_empty()
+        );
 
         let target = root.join("lib/a.dart");
         let roots = vec![root.join("sdks/old"), root.join("sdks/new")];
@@ -433,7 +444,11 @@ mod tests {
             config.generated.expect("generated").patterns,
             Some(vec!["*.g.dart".to_owned()])
         );
-        assert!(compat_axis_roots(&root, &[], &[]).expect("no axes").is_empty());
+        assert!(
+            compat_axis_roots(&root, &[], &[])
+                .expect("no axes")
+                .is_empty()
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -447,8 +462,8 @@ mod tests {
             &root,
             "contexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
         );
-        let axes = compat_axis_roots(&root, &[root.join("sdks/new")], &["old".to_owned()])
-            .expect("axes");
+        let axes =
+            compat_axis_roots(&root, &[root.join("sdks/new")], &["old".to_owned()]).expect("axes");
         assert_eq!(axes, vec![root.join("sdks/new"), root.join("sdks/old")]);
 
         let axes = compat_axis_roots(
@@ -477,9 +492,18 @@ mod tests {
     fn bad_config_shapes_are_structured_errors() {
         let root = fixture("errors");
         for (yaml, needle) in [
-            ("contexts:\n  bad:\n    sdk: registry:foo\n", "unsupported sdk locator `registry:foo`"),
-            ("contexts:\n  bad:\n    sdk: \"fvm:\"\n", "empty fvm version"),
-            ("contexts: [a, b]\n", "`contexts` must be a label → context mapping"),
+            (
+                "contexts:\n  bad:\n    sdk: registry:foo\n",
+                "unsupported sdk locator `registry:foo`",
+            ),
+            (
+                "contexts:\n  bad:\n    sdk: \"fvm:\"\n",
+                "empty fvm version",
+            ),
+            (
+                "contexts: [a, b]\n",
+                "`contexts` must be a label → context mapping",
+            ),
             ("version: 2\n", "unsupported dartq.yaml version: 2"),
         ] {
             write_config(&root, yaml);
@@ -496,10 +520,7 @@ mod tests {
         assert!(error.to_string().contains("no dartq.yaml"), "{error}");
         // A malformed file is the same structured tier.
         write_config(&bare, "contexts: {a: [unclosed\n");
-        assert!(matches!(
-            load(&bare),
-            Err(ConfigError::Invalid(_))
-        ));
+        assert!(matches!(load(&bare), Err(ConfigError::Invalid(_))));
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&bare).ok();
     }

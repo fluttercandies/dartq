@@ -19,8 +19,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
-use dartq_commands::fix::{self, EditOutcome, FileFixes};
 use dartq_commands::discover::DiscoverError;
+use dartq_commands::fix::{self, EditOutcome, FileFixes};
 
 use crate::exit;
 
@@ -190,8 +190,8 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
     use crate::{Cli, Command};
+    use clap::Parser as _;
 
     /// The CLI face: defaults and flags; the zero-fix run prints the human
     /// summary (machine face stays silent) and exits clean; a missing

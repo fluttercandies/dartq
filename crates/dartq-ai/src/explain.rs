@@ -544,10 +544,7 @@ mod tests {
             name,
             kind,
             unnamed_extension_member: false,
-            range: SourceRange {
-                offset,
-                length: 3,
-            },
+            range: SourceRange { offset, length: 3 },
             container,
         }
     }
@@ -558,10 +555,7 @@ mod tests {
             target_file: target,
             target_name: name,
             kind,
-            range: SourceRange {
-                offset,
-                length: 3,
-            },
+            range: SourceRange { offset, length: 3 },
             qualified: false,
         }
     }
@@ -596,7 +590,12 @@ mod tests {
     }
 
     fn labels(lib: u32) -> &'static str {
-        ["package:t/a.dart", "package:t/b.dart", "package:t/c.dart", "package:t/a_test.dart"][lib as usize]
+        [
+            "package:t/a.dart",
+            "package:t/b.dart",
+            "package:t/c.dart",
+            "package:t/a_test.dart",
+        ][lib as usize]
     }
 
     fn file_labels(file: FileId) -> &'static str {
@@ -613,11 +612,9 @@ mod tests {
             }
         };
         let importers = RevImportGraph::build(4, imports);
-        let tests = TestGraph::build(
-            4,
-            imports,
-            |lib| Some(labels(lib).rsplit('/').next().unwrap_or("x")),
-        );
+        let tests = TestGraph::build(4, imports, |lib| {
+            Some(labels(lib).rsplit('/').next().unwrap_or("x"))
+        });
         (importers, tests)
     }
 
@@ -838,10 +835,7 @@ mod tests {
         let fx = fixture();
         let (importers, tests) = graphs();
         let object = fx.strings.intern("Object");
-        let supers = vec![
-            TargetRef::Decl(fx.file_a, fx.bar),
-            TargetRef::Name(object),
-        ];
+        let supers = vec![TargetRef::Decl(fx.file_a, fx.bar), TargetRef::Name(object)];
         let report = explain(
             "Foo",
             Verbosity::Compact,
@@ -903,7 +897,11 @@ mod tests {
         let declaration = compact.declaration.expect("declaration");
         assert_eq!(declaration.container.as_deref(), Some("Foo"));
         assert_eq!(declaration.kind, "method");
-        assert_eq!(compact.methods, Some(Vec::new()), "members are Foo's, not area's");
+        assert_eq!(
+            compact.methods,
+            Some(Vec::new()),
+            "members are Foo's, not area's"
+        );
 
         let minimal = explain(
             "area",
