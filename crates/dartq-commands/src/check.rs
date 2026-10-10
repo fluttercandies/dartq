@@ -77,6 +77,13 @@ impl CheckRun {
 /// [`crate::discover::discover`]). A read/decode failure aborts the run —
 /// a partial diagnostic set must never masquerade as a valid result.
 ///
+/// Duplicate spellings are analyzed once: the discovery set's dedup is
+/// component-wise, so a file whose spellings differ as component vectors (a
+/// `..`-carrying explicit arg next to its walked entry, or a symlink whose
+/// target is also walked) arrives twice; the canonical-dedup face below
+/// keeps one analyzed id per file, the oracle walk's canonical-path dedup
+/// (context_root.dart:119-129).
+///
 /// # Errors
 ///
 /// Source read or UTF-8 decode failure.
@@ -90,6 +97,9 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
     let mut diags = Vec::new();
     for path in files {
         let (canonical, source) = read_source(path)?;
+        if files_state.file_id(&canonical).is_some() {
+            continue;
+        }
         let file = files_state.push(&source, &canonical);
         // Relative directive targets compose against the canonical file's
         // directory (canonical paths are absolute, so the parent exists).
@@ -148,6 +158,13 @@ impl FileSet {
         self.indexes.push(LineIndex::new(source));
         self.sources.push(source.to_owned());
         file
+    }
+
+    /// The id previously interned for `path` (canonicalized by the caller),
+    /// if any — the canonical-dedup face of [`Self::push`].
+    #[must_use]
+    pub fn file_id(&self, path: &Path) -> Option<FileId> {
+        self.table.try_file_id(path)
     }
 }
 
@@ -826,6 +843,72 @@ mod tests {
         // interpolated and percent-encoded URIs, and the scheme-carrying
         // `dart:`/`package:` imports all stay silent.
         assert_eq!(run.diagnostics().len(), 4);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Canonical dedup over the discovery set (context_root.dart:119-129):
+    /// one file reachable under two component-distinct spellings — the
+    /// `dartq check lib lib/../lib/a.dart` double-mention shape, where the
+    /// explicit arg carries a `..` segment the walked entry lacks — is
+    /// analyzed and emitted once. (A `./`-carrying spelling compares EQUAL
+    /// component-wise to the plain one — Path/PathBuf equality and ordering
+    /// are component-wise — so `.` spellings never enter the set as
+    /// duplicates in the first place.) Before the dedup the second pass
+    /// tripped the FileSet index invariant in debug builds and doubled the
+    /// rows in release.
+    #[test]
+    fn analyze_files_dedupes_duplicate_spellings() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_dup_{}", std::process::id()));
+        fs::create_dir_all(root.join("lib")).expect("mkdir");
+        fs::write(root.join("lib/broken.dart"), "void f() { x }\n").expect("write");
+
+        let mut files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        // A second spelling of the same file: the component vectors differ
+        // (`..` is kept by Path comparison), the disk file is one.
+        files.insert(root.join("lib/../lib/broken.dart"));
+        assert_eq!(files.len(), 2, "the raw spellings both sit in the set");
+
+        let run = analyze_files(&files).expect("check core");
+        assert_eq!(run.file_count(), 1, "one file analyzed");
+        assert_eq!(run.diagnostics().len(), 1, "one emission, not two");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The symlink half of the dedup: a symlinked `.dart` file whose target
+    /// is also walked (the discovery set legitimately carries both raw paths
+    /// — the oracle's walk includes linked files) resolves to one canonical
+    /// id. The fixture mirrors the CLI's
+    /// `discover_includes_symlinked_files_not_symlinked_dirs` tree.
+    #[cfg(unix)]
+    #[test]
+    fn analyze_files_dedupes_symlinked_duplicates() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("dq_cmd_symlink_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("a.dart"), "void f() { x }\n").expect("write");
+        symlink(root.join("a.dart"), root.join("b.dart")).expect("link");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        assert_eq!(
+            files,
+            BTreeSet::from([root.join("a.dart"), root.join("b.dart")]),
+            "the walk carries both raw paths (linked files are analyzed)"
+        );
+
+        let run = analyze_files(&files).expect("check core");
+        assert_eq!(run.file_count(), 1, "one canonical id behind both links");
+        assert_eq!(run.diagnostics().len(), 1, "one emission");
+        assert!(
+            run.output()
+                .files
+                .file_path(run.diagnostics()[0].file)
+                .ends_with("a.dart"),
+            "the canonical target's spelling is the printed one"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
