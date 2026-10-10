@@ -30,6 +30,35 @@
 //!   or a nested group map; unknown shapes ignored. A `linter:` key that is
 //!   present but not a map marks the section invalid, which *clears* the
 //!   rules merged so far (`_applyLinterSection`, parser:278-289).
+//! - **Severity overrides** — `analyzer.errors` is a per-code action map
+//!   (`_ParsedErrorProcessorsData.parse`, `analysis_options_parse_model.dart`
+//!   :541-631): the action is stringified and lowercased
+//!   (`ErrorConfig._processMap`, `source/error_processor.dart`:36-54), and
+//!   `ignore`/`false` filters the code out while `error`/`warning`/`info`
+//!   re-levels it (`severityMap`, `error_processor.dart`:14-18); any other
+//!   scalar contributes nothing. The include chain merges per code, a nearer
+//!   file's entry replacing the farther one (`_applyErrorProcessors`'
+//!   `processorsByCode` rebuild, parser:219-230), and the application point
+//!   defers to the override before the declared severity (`computeSeverity`,
+//!   `analyzer_cli error_severity.dart`:14-26) — a filtered code is dropped
+//!   from the output entirely.
+//! - **Cannot-ignore** — `analyzer.cannot-ignore` lists the codes that
+//!   `// ignore:` comments cannot suppress (`_ParsedCannotIgnoreData.parse`,
+//!   parse_model:346-405; `_applyCannotIgnore`, parser:173-197): explicit
+//!   names lowercase into the set, while a severity name (`error`/`warning`/
+//!   `info`) marks every registry code whose effective severity — this
+//!   file's `errors` overrides first, else the registry severity, since the
+//!   errors section applies before cannot-ignore (parser:166-167) — equals
+//!   it. Enforcement is the suppression gate shape
+//!   (library_analyzer.dart:552-563): a code in the set survives every
+//!   ignore-comment suppression.
+//! - **Language strictness scalars** — `analyzer.language.strict-casts` /
+//!   `strict-inference` / `strict-raw-types` parse as booleans (YAML
+//!   booleans or `true`/`false` strings, the `toBool` conversion,
+//!   util/yaml.dart:156-169), set-if-present across the chain
+//!   (`_ParsedLanguageData.parse`, parse_model:904-998; `_applyLanguage`,
+//!   parser:250-260). Parsed and exposed only — the semantic consumption is
+//!   #480's.
 //! - Unknown keys and unreadable or malformed files are tolerated — the
 //!   official reports options-file diagnostics on a separate surface and
 //!   still produces effective options (missing include → skipped).
@@ -43,6 +72,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_yaml::Value;
 
+use dartq_diagnostics::{CodeRegistry, Severity};
 use dartq_pub::PackageConfig;
 
 /// The options file name the analyzer locates walking up from a context
@@ -51,14 +81,32 @@ const OPTIONS_FILE_NAME: &str = "analysis_options.yaml";
 
 /// One package root's fully merged analysis options (the
 /// `ResolvedAnalysisOptions` slice PRD §12.1 names, limited to the sections
-/// this engine consumes: the lint rule set and the exclude globs; scalar
-/// sections such as `strict-casts` join when their consumers land).
+/// this engine consumes: the lint rule set, the exclude globs, the
+/// `errors`/`cannot-ignore` severity face, and the language strictness
+/// scalars — the latter parsed and exposed only, #480 consumes them).
 #[derive(Debug, Default)]
 pub struct AnalysisOptions {
     /// Effective enabled lint rule names — the union across the include
     /// chain with nearer entries winning per name, sorted and deduplicated
     /// (the data the lint engine resolves its enable set from).
     pub lint_rules: Vec<String>,
+    /// `analyzer.language.strict-casts` (`parse_model:904-998`), merged
+    /// set-if-present across the include chain. Parsed and exposed only;
+    /// #480 consumes it.
+    pub strict_casts: Option<bool>,
+    /// `analyzer.language.strict-inference`, same merge and caveat as
+    /// [`AnalysisOptions::strict_casts`].
+    pub strict_inference: Option<bool>,
+    /// `analyzer.language.strict-raw-types`, same merge and caveat as
+    /// [`AnalysisOptions::strict_casts`].
+    pub strict_raw_types: Option<bool>,
+    /// Per-code severity overrides, keyed by lowercased code name; `None`
+    /// filters the code, `Some` re-levels it (the official
+    /// `ErrorProcessor` list's per-code map form).
+    severity_overrides: FxHashMap<String, Option<Severity>>,
+    /// Lowercased codes `// ignore:` comments cannot suppress (the official
+    /// `unignorableDiagnosticCodeNames`).
+    unignorable: FxHashSet<String>,
     /// Precompiled exclude globs, each anchored to its declaring file's
     /// directory (official `LocatedGlob`).
     excludes: Vec<ExcludeGlob>,
@@ -128,6 +176,37 @@ impl AnalysisOptions {
     #[must_use]
     pub fn is_excluded(&self, path: &Path) -> bool {
         self.excludes.iter().any(|glob| glob.matches(path))
+    }
+
+    /// The severity one diagnostic surfaces at: an `analyzer.errors`
+    /// override for `code` (lowercase name) defers to it — `None` drops the
+    /// diagnostic from the output, `Some` re-levels it — and without one the
+    /// declared severity stands (`computeSeverity`,
+    /// `analyzer_cli error_severity.dart`:14-26: "if there is a processor
+    /// for this error, defer to it").
+    #[must_use]
+    pub fn processed_severity(&self, code: &str, declared: Severity) -> Option<Severity> {
+        match self.severity_overrides.get(code) {
+            Some(action) => *action,
+            None => Some(declared),
+        }
+    }
+
+    /// Whether `// ignore:`-comment suppression may drop `code` (lowercase
+    /// name): codes in the `analyzer.cannot-ignore` set survive every
+    /// suppression (library_analyzer.dart:552-563 — "don't allow
+    /// un-ignorable codes to be ignored"). The suppression faces consult
+    /// this at the same application point as [`AnalysisOptions::processed_severity`].
+    #[must_use]
+    pub fn is_ignorable(&self, code: &str) -> bool {
+        !self.unignorable.contains(code)
+    }
+
+    /// Whether any `analyzer.errors` override merged in (the
+    /// severity-application fast path decides with this: without overrides
+    /// the application is the identity).
+    pub(crate) fn has_severity_overrides(&self) -> bool {
+        !self.severity_overrides.is_empty()
     }
 
     /// The compiled exclude globs, in declaration order (far to near). The
@@ -201,6 +280,14 @@ struct MergeState {
     /// Rule name → enabled; insertion order is irrelevant (the built set is
     /// sorted).
     rules: FxHashMap<String, bool>,
+    /// Per-code severity overrides; a nearer file's entry overwrites the
+    /// code (the `processorsByCode` rebuild, parser:219-230).
+    errors: FxHashMap<String, Option<Severity>>,
+    /// The accumulated `unignorableDiagnosticCodeNames` (lowercased).
+    unignorable: FxHashSet<String>,
+    strict_casts: Option<bool>,
+    strict_inference: Option<bool>,
+    strict_raw_types: Option<bool>,
     excludes: Vec<ExcludeGlob>,
     /// Deduplication key of the official `Set<AnalysisOptionsExcludePattern>`:
     /// (declaring file, pattern).
@@ -242,7 +329,10 @@ impl MergeState {
     }
 
     /// Applies one parsed file's own sections (the official
-    /// `_ApplyState.apply`, the sections this engine consumes).
+    /// `_ApplyState.apply`, the sections this engine consumes). The section
+    /// order mirrors `_applyAnalyzer` (parser:164-171) where it matters:
+    /// `errors` before `cannot-ignore`, so the severity arms see this
+    /// file's re-levels.
     fn apply_local(&mut self, yaml: &Value, declaring_dir: &Path) {
         let Some(map) = yaml.as_mapping() else {
             return;
@@ -262,6 +352,10 @@ impl MergeState {
             }
             Some(_) => self.rules.clear(),
         }
+        for (code, action) in severity_override_entries(map) {
+            self.errors.insert(code, action);
+        }
+        apply_cannot_ignore(map, &mut self.unignorable, &self.errors);
         if let Some(patterns) = exclude_patterns(map) {
             for pattern in patterns {
                 if self
@@ -273,6 +367,10 @@ impl MergeState {
                 }
             }
         }
+        let (casts, inference, raw_types) = language_scalars(map);
+        self.strict_casts = casts.or(self.strict_casts);
+        self.strict_inference = inference.or(self.strict_inference);
+        self.strict_raw_types = raw_types.or(self.strict_raw_types);
     }
 
     /// Freezes the merged state: enabled rule names, sorted (the canonical
@@ -287,6 +385,11 @@ impl MergeState {
         names.dedup();
         AnalysisOptions {
             lint_rules: names,
+            strict_casts: self.strict_casts,
+            strict_inference: self.strict_inference,
+            strict_raw_types: self.strict_raw_types,
+            severity_overrides: self.errors,
+            unignorable: self.unignorable,
             excludes: self.excludes,
         }
     }
@@ -350,6 +453,153 @@ fn exclude_patterns(map: &serde_yaml::Mapping) -> Option<impl Iterator<Item = St
         ),
         _ => None,
     }
+}
+
+/// The `analyzer.errors` per-code actions (`_ParsedErrorProcessorsData.parse`,
+/// `analysis_options_parse_model.dart`:541-631): a map of string code →
+/// scalar action, the action stringified and lowercased
+/// (`ErrorConfig._processMap`, `error_processor.dart`:36-54) —
+/// `ignore`/`false` filters the code (`ignoreSynonyms`,
+/// `analysis_options_file.dart`:46), `error`/`warning`/`info` re-levels it
+/// (`severityMap`, `error_processor.dart`:14-18), and any other scalar
+/// contributes nothing (the official reports and skips). The merged code is
+/// lowercased (the `ErrorProcessor` constructor, `error_processor.dart`:71);
+/// non-string keys and non-map sections are skipped/invalid.
+fn severity_override_entries(map: &serde_yaml::Mapping) -> Vec<(String, Option<Severity>)> {
+    let Some(entries) = map
+        .get(Value::from("analyzer"))
+        .and_then(|analyzer| analyzer.as_mapping())
+        .and_then(|analyzer| analyzer.get(Value::from("errors")))
+        .and_then(|errors| errors.as_mapping())
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let code = key.as_str()?.to_lowercase();
+            let action = action_scalar(value)?;
+            let action = match action.as_str() {
+                "ignore" | "false" => None,
+                "error" => Some(Severity::Error),
+                "warning" => Some(Severity::Warning),
+                "info" => Some(Severity::Info),
+                _ => return None,
+            };
+            Some((code, action))
+        })
+        .collect()
+}
+
+/// One `errors` action scalar, stringified and lowercased the way
+/// `valueNode.value.toString().toLowerCase()` does: strings verbatim, YAML
+/// booleans as `true`/`false` (so bare `code: false` filters); everything
+/// else (numbers, null, containers) is illegal.
+fn action_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_lowercase()),
+        Value::Bool(enabled) => Some(if *enabled { "true" } else { "false" }.to_owned()),
+        _ => None,
+    }
+}
+
+/// Applies one file's `analyzer.cannot-ignore` list (the official
+/// `_applyCannotIgnore`, parser:173-197): a severity name marks every
+/// registry code whose effective severity — `errors`, the overrides merged
+/// through this file, else the registry severity — equals it; every other
+/// name lowercases into the unignorable set (names are not
+/// registry-validated there either).
+fn apply_cannot_ignore(
+    map: &serde_yaml::Mapping,
+    unignorable: &mut FxHashSet<String>,
+    errors: &FxHashMap<String, Option<Severity>>,
+) {
+    let Some(names) = cannot_ignore_names(map) else {
+        return;
+    };
+    let arms: Vec<Severity> = names
+        .iter()
+        .filter_map(|name| severity_of_name(name))
+        .collect();
+    if !arms.is_empty() {
+        let registry = CodeRegistry::builtin();
+        for arm in arms {
+            for code in registry.iter() {
+                let effective = match errors.get(code.name) {
+                    Some(Some(severity)) => Some(*severity),
+                    Some(None) => None,
+                    None => Some(code.dtype.severity()),
+                };
+                if effective == Some(arm) {
+                    unignorable.insert(code.name.to_owned());
+                }
+            }
+        }
+    }
+    for name in names {
+        if severity_of_name(&name).is_none() {
+            unignorable.insert(name.to_lowercase());
+        }
+    }
+}
+
+/// The `analyzer.cannot-ignore` name strings (`_ParsedCannotIgnoreData.parse`,
+/// parse_model:346-405): list-only, string entries only, everything else
+/// ignored.
+fn cannot_ignore_names(map: &serde_yaml::Mapping) -> Option<Vec<String>> {
+    let analyzer = map.get(Value::from("analyzer"))?.as_mapping()?;
+    match analyzer.get(Value::from("cannot-ignore")) {
+        Some(Value::Sequence(list)) => Some(
+            list.iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The severity a `cannot-ignore` arm names (`severityMap[name]`,
+/// error_processor.dart:14-18 — case-sensitive, so `ERROR` is an explicit
+/// code name, not an arm).
+fn severity_of_name(name: &str) -> Option<Severity> {
+    match name {
+        "error" => Some(Severity::Error),
+        "warning" => Some(Severity::Warning),
+        "info" => Some(Severity::Info),
+        _ => None,
+    }
+}
+
+/// The `analyzer.language` strictness booleans (`_ParsedLanguageData.parse`,
+/// parse_model:904-998): map-only section; the three strict-* keys parse
+/// through the `toBool` conversion (util/yaml.dart:156-169 — YAML booleans
+/// or `true`/`false` strings, case-insensitive), non-boolean values and
+/// unknown keys contribute nothing. `(casts, inference, raw_types)`.
+fn language_scalars(map: &serde_yaml::Mapping) -> (Option<bool>, Option<bool>, Option<bool>) {
+    let Some(language) = map
+        .get(Value::from("analyzer"))
+        .and_then(|analyzer| analyzer.as_mapping())
+        .and_then(|analyzer| analyzer.get(Value::from("language")))
+        .and_then(|language| language.as_mapping())
+    else {
+        return (None, None, None);
+    };
+    let parse = |key: &str| -> Option<bool> {
+        match language.get(Value::from(key)) {
+            Some(Value::Bool(value)) => Some(*value),
+            Some(Value::String(text)) => match text.to_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    (
+        parse("strict-casts"),
+        parse("strict-inference"),
+        parse("strict-raw-types"),
+    )
 }
 
 /// The `include:` URI strings of one options file: a single string or a list

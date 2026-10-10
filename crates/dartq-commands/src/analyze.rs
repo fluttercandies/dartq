@@ -89,10 +89,7 @@ pub struct AnalyzeRun<'a> {
 /// # Errors
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
-pub fn run<'a>(
-    engine: &'a mut Engine,
-    roots: &[PathBuf],
-) -> Result<AnalyzeRun<'a>, AnalyzeError> {
+pub fn run<'a>(engine: &'a mut Engine, roots: &[PathBuf]) -> Result<AnalyzeRun<'a>, AnalyzeError> {
     run_overlaid(engine, &[], roots)
 }
 
@@ -135,7 +132,11 @@ pub fn run_overlaid<'a>(
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache) =
         analyze_pass(engine)?;
     if !roots.is_empty() {
-        diagnostics.extend(crate::lints::analyze_lints(engine, roots));
+        // The lint rows ride the same severity face as the engine rows
+        // (`analyzer.errors` re-levels and filters them identically — the
+        // engine pass already applied it to its own output).
+        let lint_rows = crate::lints::analyze_lints(engine, roots);
+        diagnostics.extend(engine.apply_severity_options(lint_rows));
     }
     let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
@@ -250,7 +251,8 @@ mod tests {
             (hits, (plain.file_count, plain.loc))
         };
         let (bare_hits, bare_facts) = {
-            let bare = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("bare run");
+            let bare =
+                run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("bare run");
             (hits(&bare.diagnostics), (bare.file_count, bare.loc))
         };
         assert_eq!(bare_hits, plain_hits, "no overlays: the plain run");
@@ -296,6 +298,53 @@ mod tests {
             "oracle order inside one library: severity, path, offset, message"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The commands output wiring: the lint rows ride the same severity
+    /// face as the engine rows — `run_overlaid` applies the governing
+    /// options' `errors` overrides to them — so an option re-level surfaces
+    /// in the oracle-ordered set and an `ignore` filter drops the engine
+    /// row (`computeSeverity`, analyzer_cli error_severity.dart:14-26).
+    #[test]
+    fn run_overlaid_applies_errors_overrides_to_output_rows() {
+        let root = workspace(
+            "analyze_severity",
+            &[("lib/bad.dart", "var x = new Object();\nvar ok = unknown;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            concat!(
+                "analyzer:\n",
+                "  errors:\n",
+                "    unnecessary_new: error\n",
+                "    undefined_identifier: ignore\n",
+                "linter:\n",
+                "  rules:\n",
+                "    - unnecessary_new\n",
+            ),
+        )
+        .expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+        let rows: Vec<(String, Severity)> = run
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name.to_owned(), d.severity))
+            .collect();
+        // The lint row (INFO by rule shape) re-leveled to ERROR by the
+        // options override.
+        assert!(
+            rows.contains(&("unnecessary_new".to_owned(), Severity::Error)),
+            "the lint row rides the severity face: {rows:?}"
+        );
+        // The engine-pass row filtered out by the options override.
+        assert!(
+            rows.iter().all(|(code, _)| code != "undefined_identifier"),
+            "the ignore filter drops the engine row: {rows:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

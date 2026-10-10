@@ -321,3 +321,284 @@ fn per_root_options_inherit_or_override() {
     assert!(member_b.is_excluded(&dir.path("member_b/local/x.dart")));
     assert!(!member_b.is_excluded(&dir.path("shared/x.dart")));
 }
+
+/// The `errors` map merges per code with nearest-wins over the include
+/// chain (`_applyErrorProcessors`' `processorsByCode` rebuild, parser:219-230
+/// — local processors overwrite the include-merged ones because includes
+/// apply first, parser:384-408), and the application point defers to the
+/// override before the declared severity (`computeSeverity`,
+/// `analyzer_cli error_severity.dart`:14-26).
+#[test]
+fn errors_overrides_merge_nearest_wins() {
+    let dir = TempDir::new("errors_chain");
+    // The far file re-levels two codes; the near file re-levels one of them
+    // again — the near value must win for that code only.
+    dir.write(
+        "far.yaml",
+        "analyzer:\n  errors:\n    undefined_identifier: warning\n    dead_code: error\n",
+    );
+    dir.write(
+        "near.yaml",
+        "include: far.yaml\nanalyzer:\n  errors:\n    undefined_identifier: info\n",
+    );
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    // `undefined_identifier` (registry ERROR, DiagnosticType::CompileTimeError):
+    // the nearer `info` replaced the farther `warning`.
+    assert_eq!(
+        options.processed_severity("undefined_identifier", dartq_diagnostics::Severity::Error),
+        Some(dartq_diagnostics::Severity::Info)
+    );
+    // `dead_code` (registry WARNING): only the far file moved it.
+    assert_eq!(
+        options.processed_severity("dead_code", dartq_diagnostics::Severity::Warning),
+        Some(dartq_diagnostics::Severity::Error)
+    );
+    // No override: the declared severity stands (error_severity.dart:24).
+    assert_eq!(
+        options.processed_severity("prefer_single_quotes", dartq_diagnostics::Severity::Info),
+        Some(dartq_diagnostics::Severity::Info)
+    );
+}
+
+/// The `errors` action parsing (`_ParsedErrorProcessorsData.parse`,
+/// parse_model:541-631, stringified lowercased through
+/// `ErrorConfig._processMap`, error_processor.dart:36-54): `ignore`/`false`
+/// filter the code (`ignoreSynonyms`, `analysis_options_file.dart`:46 — a bare
+/// YAML `false` stringifies to "false" too), severity words re-level
+/// case-insensitively, and any other scalar contributes nothing.
+#[test]
+fn errors_ignore_false_filter_and_scalar_shapes() {
+    let dir = TempDir::new("errors_actions");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    undefined_identifier: ignore\n",
+            "    dead_code: false\n",
+            "    prefer_single_quotes: ERROR\n",
+            "    unused_local_variable: fatal\n",
+            "    duplicate_definition: true\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    // Both ignore synonyms filter (processed severity None — the diagnostic
+    // is dropped from the output, error_severity.dart:20-22).
+    assert_eq!(
+        options.processed_severity("undefined_identifier", dartq_diagnostics::Severity::Error),
+        None
+    );
+    assert_eq!(
+        options.processed_severity("dead_code", dartq_diagnostics::Severity::Warning),
+        None
+    );
+    // Severity words are lowercased before the severityMap lookup.
+    assert_eq!(
+        options.processed_severity("prefer_single_quotes", dartq_diagnostics::Severity::Info),
+        Some(dartq_diagnostics::Severity::Error)
+    );
+    // `fatal` and `true` are neither ignore synonyms nor severities: the
+    // entries contribute nothing and the declared severity stands.
+    assert_eq!(
+        options.processed_severity(
+            "unused_local_variable",
+            dartq_diagnostics::Severity::Warning
+        ),
+        Some(dartq_diagnostics::Severity::Warning)
+    );
+    assert_eq!(
+        options.processed_severity("duplicate_definition", dartq_diagnostics::Severity::Error),
+        Some(dartq_diagnostics::Severity::Error)
+    );
+}
+
+/// Re-leveling covers all three severities (`severityMap`,
+/// error_processor.dart:14-18) regardless of the declared severity, and the
+/// codes lowercased at merge (`ErrorProcessor` constructor,
+/// `error_processor.dart`:71) match case-insensitively in the file.
+#[test]
+fn errors_relevel_to_each_severity() {
+    let dir = TempDir::new("errors_levels");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    undefined_identifier: warning\n",
+            "    DEAD_CODE: info\n",
+            "    prefer_single_quotes: error\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    let error = dartq_diagnostics::Severity::Error;
+    let warning = dartq_diagnostics::Severity::Warning;
+    let info = dartq_diagnostics::Severity::Info;
+    assert_eq!(
+        options.processed_severity("undefined_identifier", error),
+        Some(warning)
+    );
+    assert_eq!(options.processed_severity("dead_code", warning), Some(info));
+    assert_eq!(
+        options.processed_severity("prefer_single_quotes", info),
+        Some(error)
+    );
+}
+
+/// The `cannot-ignore` face (`_ParsedCannotIgnoreData.parse`,
+/// parse_model:346-405; `_applyCannotIgnore`, parser:173-197): explicit
+/// names lowercase into the unignorable set; a severity arm marks every
+/// registry code whose effective severity — this file's `errors` overrides
+/// first, else the registry severity, since `errors` applies before
+/// `cannot-ignore` (parser:166-167) — equals it. Enforcement is the
+/// suppression gate shape (library_analyzer.dart:552-563).
+#[test]
+fn cannot_ignore_explicit_names_and_severity_arms() {
+    let dir = TempDir::new("cannot_ignore");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  cannot-ignore:\n",
+            "    - undefined_identifier\n",
+            "    - DEAD_CODE\n",
+            "    - info\n",
+            "  errors:\n",
+            "    duplicate_definition: info\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    // Explicit names, matched lowercased (parser:193 `name.toLowerCase()`):
+    // ignore comments cannot suppress either.
+    assert!(!options.is_ignorable("undefined_identifier"));
+    assert!(!options.is_ignorable("dead_code"));
+    // Everything else stays suppressible — including the ERROR-severity
+    // codes the `info` arm does not reach.
+    assert!(options.is_ignorable("unused_local_variable"));
+    // The `info` arm: registry INFO codes (`prefer_single_quotes` is a LINT →
+    // Info) become unignorable, and `duplicate_definition` joins through its
+    // this-file re-level to info (the errors-before-cannot-ignore order,
+    // parser:166-167) despite its registry severity being ERROR.
+    assert!(!options.is_ignorable("prefer_single_quotes"));
+    assert!(!options.is_ignorable("duplicate_definition"));
+    // A WARNING-severity registry code (`unused_local_variable` is
+    // STATIC_WARNING) stays outside the `info` arm.
+    assert!(options.is_ignorable("unused_local_variable"));
+}
+
+/// The language strictness scalars (`_ParsedLanguageData.parse`,
+/// parse_model:904-998, applied set-if-present by `_applyLanguage`,
+/// parser:250-260): booleans and `true`/`false` strings both parse
+/// (`toBool`, util/yaml.dart:156-169), unknown keys and non-boolean values
+/// contribute nothing, and absent sections leave all three `None`.
+#[test]
+fn language_scalars_parse_and_expose() {
+    let dir = TempDir::new("language_scalars");
+    dir.write(
+        "full.yaml",
+        concat!(
+            "analyzer:\n",
+            "  language:\n",
+            "    strict-casts: true\n",
+            "    strict-inference: false\n",
+            "    strict-raw-types: true\n",
+        ),
+    );
+    dir.write(
+        "partial.yaml",
+        concat!(
+            "include: full.yaml\n",
+            "analyzer:\n",
+            "  language:\n",
+            "    strict-casts: \"false\"\n",
+            "    not-a-scalar-key: true\n",
+            "    strict-raw-types: maybe\n",
+        ),
+    );
+
+    let full = AnalysisOptions::load(&dir.path("full.yaml"), &empty_config(), &dir.0);
+    assert_eq!(full.strict_casts, Some(true));
+    assert_eq!(full.strict_inference, Some(false));
+    assert_eq!(full.strict_raw_types, Some(true));
+
+    // The nearer file overrides `strict-casts` (set-if-present, the
+    // `_applyLanguage` scalar posture); the unknown key and the non-boolean
+    // `maybe` contribute nothing, so `strict-raw-types` inherits the far
+    // value.
+    let partial = AnalysisOptions::load(&dir.path("partial.yaml"), &empty_config(), &dir.0);
+    assert_eq!(partial.strict_casts, Some(false));
+    assert_eq!(partial.strict_inference, Some(false));
+    assert_eq!(partial.strict_raw_types, Some(true));
+
+    let absent = TempDir::new("language_absent");
+    absent.write("analysis_options.yaml", "linter:\n  rules: []\n");
+    let none = AnalysisOptions::load(
+        &absent.path("analysis_options.yaml"),
+        &empty_config(),
+        &absent.0,
+    );
+    assert_eq!(none.strict_casts, None);
+    assert_eq!(none.strict_inference, None);
+    assert_eq!(none.strict_raw_types, None);
+}
+
+/// The output face wiring: `Engine::analyze` applies the governing options'
+/// `errors` overrides to every row — a filtered code never surfaces and a
+/// re-leveled code surfaces at its new severity (`computeSeverity`,
+/// `analyzer_cli error_severity.dart`:14-26, at the CLI's output processing).
+#[test]
+fn engine_analyze_applies_errors_overrides() {
+    use common::Fixture;
+
+    // Two reliable engine-pass rows: the semantic `undefined_identifier`
+    // and the semantic `duplicate_definition` (both COMPILE_TIME_ERROR →
+    // registry ERROR).
+    let fixture = Fixture::new(&[(
+        "lib/main.dart",
+        "void main() {\n  var ok = unknown;\n}\nvoid dup() {}\nvoid dup() {}\n",
+    )]);
+    std::fs::write(
+        fixture.path("analysis_options.yaml"),
+        concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    undefined_identifier: warning\n",
+            "    duplicate_definition: ignore\n",
+        ),
+    )
+    .expect("options");
+
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+
+    let rows: Vec<(String, dartq_diagnostics::Severity)> = diagnostics
+        .iter()
+        .map(|d| (d.code.name.to_owned(), d.severity))
+        .collect();
+    // The semantic ERROR row re-leveled to WARNING.
+    assert!(
+        rows.contains(&(
+            "undefined_identifier".to_owned(),
+            dartq_diagnostics::Severity::Warning
+        )),
+        "the override re-levels the row: {rows:?}"
+    );
+    // The `ignore`-filtered code dropped from the output entirely.
+    assert!(
+        rows.iter().all(|(code, _)| code != "duplicate_definition"),
+        "the ignore filter drops the row: {rows:?}"
+    );
+}

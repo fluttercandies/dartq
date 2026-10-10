@@ -261,14 +261,59 @@ impl Engine {
         on_event: &mut dyn FnMut(EngineEvent),
         cancel: &CancellationToken,
     ) -> Result<Vec<Diagnostic>, Cancelled> {
-        pipeline::analyze(
+        let diagnostics = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
             self.semdiag.as_deref(),
             targets,
             on_event,
             cancel,
-        )
+        )?;
+        Ok(self.apply_severity_options(diagnostics))
+    }
+
+    /// Applies the governing `analysis_options` severity face to an output
+    /// set: every row is re-leveled or dropped per its file's
+    /// `analyzer.errors` overrides ([`analysis_options::AnalysisOptions::processed_severity`],
+    /// the official `computeSeverity`). The engine runs this over its own
+    /// analyze output (the diagnostics output face) and the lint stage runs
+    /// it over its rows, so each output row passes through exactly once.
+    ///
+    /// Root attribution is the discovery rule: the longest `options`-keyed
+    /// package root containing the file's path; a file under no root (an
+    /// overlay outside the packages) has no options and keeps its row.
+    #[must_use]
+    pub fn apply_severity_options(&self, diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+        // The identity fast path: no root declares an `errors` section, so
+        // every row's processed severity is its declared one (cannot-ignore
+        // gates ignore-comment suppression, not this face).
+        if !self
+            .state
+            .options
+            .values()
+            .any(|options| options.has_severity_overrides())
+        {
+            return diagnostics;
+        }
+        let mut roots: Vec<&PathBuf> = self.state.options.keys().collect();
+        roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+        diagnostics
+            .into_iter()
+            .filter_map(|mut diagnostic| {
+                let path = self.state.files.path(diagnostic.file)?;
+                let options = roots
+                    .iter()
+                    .find(|root| path.starts_with(**root))
+                    .and_then(|root| self.state.options.get(*root));
+                diagnostic.severity = match options {
+                    Some(options) => {
+                        options.processed_severity(diagnostic.code.name, diagnostic.severity)?
+                    }
+                    None => diagnostic.severity,
+                };
+                Some(diagnostic)
+            })
+            .collect()
     }
 
     /// The `query symbol` face (PRD §20.3): every declaration of `name`
