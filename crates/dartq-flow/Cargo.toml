@@ -10,14 +10,14 @@ readme = "README.md"
 keywords = ["dart", "flow-analysis"]
 
 [dependencies]
-dartq-parser = { path = "../dartq-parser" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-source = { path = "../dartq-source" }
+dartq-parser = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-dartq-language = { path = "../dartq-language" }
-dartq-scanner = { path = "../dartq-scanner" }
+dartq-language = { workspace = true }
+dartq-scanner = { workspace = true }
 
 [lints]
 workspace = true

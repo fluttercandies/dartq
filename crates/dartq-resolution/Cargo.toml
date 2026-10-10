@@ -10,10 +10,10 @@ readme = "README.md"
 keywords = ["dart"]
 
 [dependencies]
-dartq-diagnostics = { path = "../dartq-diagnostics" }
-dartq-pub = { path = "../dartq-pub" }
-dartq-sdk = { path = "../dartq-sdk" }
-dartq-source = { path = "../dartq-source" }
+dartq-diagnostics = { workspace = true }
+dartq-pub = { workspace = true }
+dartq-sdk = { workspace = true }
+dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 

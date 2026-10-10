@@ -10,14 +10,14 @@ readme = "README.md"
 keywords = ["dart", "index"]
 
 [dependencies]
-dartq-parser = { path = "../dartq-parser" }
-dartq-resolution = { path = "../dartq-resolution" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-source = { path = "../dartq-source" }
+dartq-parser = { workspace = true }
+dartq-resolution = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-dartq-language = { path = "../dartq-language" }
+dartq-language = { workspace = true }
 
 [lints]
 workspace = true

@@ -11,22 +11,22 @@ keywords = ["dart", "analyzer"]
 categories = ["development-tools"]
 
 [dependencies]
-dartq-ai = { path = "../dartq-ai" }
-dartq-diagnostics = { path = "../dartq-diagnostics" }
-dartq-engine = { path = "../dartq-engine" }
-dartq-index = { path = "../dartq-index" }
-dartq-language = { path = "../dartq-language" }
-dartq-lints = { path = "../dartq-lints" }
-dartq-package = { path = "../dartq-package" }
-dartq-parser = { path = "../dartq-parser" }
-dartq-plugin = { path = "../dartq-plugin" }
-dartq-pub = { path = "../dartq-pub" }
-dartq-resolution = { path = "../dartq-resolution" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-schema = { path = "../dartq-schema" }
-dartq-sdk = { path = "../dartq-sdk" }
-dartq-semantic = { path = "../dartq-semantic" }
-dartq-source = { path = "../dartq-source" }
+dartq-ai = { workspace = true }
+dartq-diagnostics = { workspace = true }
+dartq-engine = { workspace = true }
+dartq-index = { workspace = true }
+dartq-language = { workspace = true }
+dartq-lints = { workspace = true }
+dartq-package = { workspace = true }
+dartq-parser = { workspace = true }
+dartq-plugin = { workspace = true }
+dartq-pub = { workspace = true }
+dartq-resolution = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-schema = { workspace = true }
+dartq-sdk = { workspace = true }
+dartq-semantic = { workspace = true }
+dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

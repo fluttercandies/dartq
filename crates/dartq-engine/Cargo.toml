@@ -4,21 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "The dartq analysis engine: one context, two-phase content updates, topologically ordered recompute, and merged syntax and semantic diagnostics."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "analyzer", "incremental", "analysis"]
 
 [dependencies]
 blake3 = { workspace = true }
-dartq-diagnostics = { path = "../dartq-diagnostics" }
-dartq-index = { path = "../dartq-index" }
-dartq-language = { path = "../dartq-language" }
-dartq-package = { path = "../dartq-package" }
-dartq-parser = { path = "../dartq-parser" }
-dartq-pub = { path = "../dartq-pub" }
-dartq-resolution = { path = "../dartq-resolution" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-semantic = { path = "../dartq-semantic" }
-dartq-sdk = { path = "../dartq-sdk" }
-dartq-snapshot = { path = "../dartq-snapshot" }
-dartq-source = { path = "../dartq-source" }
+dartq-diagnostics = { workspace = true }
+dartq-index = { workspace = true }
+dartq-language = { workspace = true }
+dartq-package = { workspace = true }
+dartq-parser = { workspace = true }
+dartq-pub = { workspace = true }
+dartq-resolution = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-semantic = { workspace = true }
+dartq-sdk = { workspace = true }
+dartq-snapshot = { workspace = true }
+dartq-source = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }

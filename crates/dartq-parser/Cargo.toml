@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Fault-tolerant recursive-descent parser for Dart: token table in, parser listener events out, with recovery mirroring the official parser."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "parser", "recursive-descent"]
 
 [dependencies]
-dartq-diagnostics = { path = "../dartq-diagnostics" }
-dartq-language = { path = "../dartq-language" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-source = { path = "../dartq-source" }
+dartq-diagnostics = { workspace = true }
+dartq-language = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-source = { workspace = true }
 
 [lints]
 workspace = true

@@ -29,6 +29,7 @@ members = [
     "crates/dartq-cli",
     "crates/dartq-schema",
     "tests/harness",
+    "tools/corpus-gen",
 ]
 
 [workspace.package]
@@ -56,6 +57,32 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
+
+# Internal crates: path plus version so member manifests consume them via
+# `dartq-xxx = { workspace = true }` (cargo publish requires a version on
+# every path dependency).
+dartq-ai = { path = "crates/dartq-ai", version = "0.1.0" }
+dartq-ast = { path = "crates/dartq-ast", version = "0.1.0" }
+dartq-commands = { path = "crates/dartq-commands", version = "0.1.0" }
+dartq-daemon = { path = "crates/dartq-daemon", version = "0.1.0" }
+dartq-diagnostics = { path = "crates/dartq-diagnostics", version = "0.1.0" }
+dartq-engine = { path = "crates/dartq-engine", version = "0.1.0" }
+dartq-flow = { path = "crates/dartq-flow", version = "0.1.0" }
+dartq-index = { path = "crates/dartq-index", version = "0.1.0" }
+dartq-language = { path = "crates/dartq-language", version = "0.1.0" }
+dartq-lints = { path = "crates/dartq-lints", version = "0.1.0" }
+dartq-package = { path = "crates/dartq-package", version = "0.1.0" }
+dartq-parser = { path = "crates/dartq-parser", version = "0.1.0" }
+dartq-plugin = { path = "crates/dartq-plugin", version = "0.1.0" }
+dartq-pub = { path = "crates/dartq-pub", version = "0.1.0" }
+dartq-resolution = { path = "crates/dartq-resolution", version = "0.1.0" }
+dartq-scanner = { path = "crates/dartq-scanner", version = "0.1.0" }
+dartq-schema = { path = "crates/dartq-schema", version = "0.1.0" }
+dartq-sdk = { path = "crates/dartq-sdk", version = "0.1.0" }
+dartq-semantic = { path = "crates/dartq-semantic", version = "0.1.0" }
+dartq-snapshot = { path = "crates/dartq-snapshot", version = "0.1.0" }
+dartq-source = { path = "crates/dartq-source", version = "0.1.0" }
+dartq-types = { path = "crates/dartq-types", version = "0.1.0" }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"

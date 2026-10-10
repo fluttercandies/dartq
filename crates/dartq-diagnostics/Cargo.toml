@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["dart", "diagnostics"]
 
 [dependencies]
-dartq-source = { path = "../dartq-source" }
+dartq-source = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -19,7 +19,7 @@ serde_json = { workspace = true }
 blake3 = { workspace = true }
 # Equality pin between the hand-written constants and the semantic table's
 # dual definitions (code.rs tests)
-dartq-semantic = { path = "../dartq-semantic" }
+dartq-semantic = { workspace = true }
 
 [lints]
 workspace = true

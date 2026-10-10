@@ -10,8 +10,8 @@ readme = "README.md"
 keywords = ["dart", "sdk"]
 
 [dependencies]
-dartq-language = { path = "../dartq-language" }
-dartq-source = { path = "../dartq-source" }
+dartq-language = { workspace = true }
+dartq-source = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

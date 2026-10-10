@@ -15,9 +15,9 @@ categories = ["parser-implementations"]
 # before #11/#12/#17 land, the scanner internally uses shape-identical local types
 # (LanguageVersion / Diagnostic / LineIndex); after they land, only the type
 # sources are swapped.
-dartq-language = { path = "../dartq-language" }
-dartq-source = { path = "../dartq-source" }
-dartq-diagnostics = { path = "../dartq-diagnostics" }
+dartq-language = { workspace = true }
+dartq-source = { workspace = true }
+dartq-diagnostics = { workspace = true }
 
 [lints]
 workspace = true

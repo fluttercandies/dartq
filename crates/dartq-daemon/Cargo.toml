@@ -10,24 +10,24 @@ readme = "README.md"
 
 [dependencies]
 crossbeam-channel = { workspace = true }
-dartq-commands = { path = "../dartq-commands" }
-dartq-diagnostics = { path = "../dartq-diagnostics" }
-dartq-engine = { path = "../dartq-engine" }
-dartq-plugin = { path = "../dartq-plugin" }
-dartq-snapshot = { path = "../dartq-snapshot" }
-dartq-source = { path = "../dartq-source" }
+dartq-commands = { workspace = true }
+dartq-diagnostics = { workspace = true }
+dartq-engine = { workspace = true }
+dartq-plugin = { workspace = true }
+dartq-snapshot = { workspace = true }
+dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-dartq-package = { path = "../dartq-package" }
-dartq-pub = { path = "../dartq-pub" }
-dartq-sdk = { path = "../dartq-sdk" }
+dartq-package = { workspace = true }
+dartq-pub = { workspace = true }
+dartq-sdk = { workspace = true }
 # The session-economics answers (query symbols/since) validate against the
 # published schema in the overlay-scenario test.
-dartq-schema = { path = "../dartq-schema" }
+dartq-schema = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Built-in Dart lint rules: the syntax-visible slice of the package:lints recommended and core sets, with ignore-comment suppression."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "linter", "lints", "static-analysis"]
 
 [dependencies]
-dartq-ast = { path = "../dartq-ast" }
-dartq-parser = { path = "../dartq-parser" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-source = { path = "../dartq-source" }
+dartq-ast = { workspace = true }
+dartq-parser = { workspace = true }
+dartq-scanner = { workspace = true }
+dartq-source = { workspace = true }
 memchr = { workspace = true }
 rustc-hash = { workspace = true }
 

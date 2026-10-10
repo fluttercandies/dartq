@@ -14,7 +14,7 @@ serde_json = { workspace = true }
 # Alignment tests only: the published schemas must accept what the real
 # producers emit. dartq-schema itself has zero dartq-* runtime dependencies.
 [dev-dependencies]
-dartq-ai = { path = "../dartq-ai" }
+dartq-ai = { workspace = true }
 
 [lints]
 workspace = true

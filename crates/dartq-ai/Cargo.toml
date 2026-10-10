@@ -10,8 +10,8 @@ readme = "README.md"
 
 [dependencies]
 blake3 = { workspace = true }
-dartq-index = { path = "../dartq-index" }
-dartq-source = { path = "../dartq-source" }
+dartq-index = { workspace = true }
+dartq-source = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

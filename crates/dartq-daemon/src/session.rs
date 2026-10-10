@@ -1353,7 +1353,7 @@ impl Session {
                     .expect("the job receiver outlives the sends below");
             }
             drop(sender);
-            let mut results = thread::scope(|scope| {
+            let results = thread::scope(|scope| {
                 let handles: Vec<_> = (1..workers)
                     .map(|_| {
                         let receiver = receiver.clone();
