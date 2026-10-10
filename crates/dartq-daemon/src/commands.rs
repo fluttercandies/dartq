@@ -101,6 +101,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use dartq_commands::analyze::AnalyzeError;
 use dartq_commands::compat::CompatError;
@@ -229,6 +230,22 @@ impl Request {
             | Self::Query { context, .. }
             | Self::Impact { context, .. } => context.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
+        }
+    }
+
+    /// The request's verbosity tier. Every face carries one; the read task
+    /// uses it to partition the fan-out (full-tier answers write the
+    /// short-id table and answer on the session thread).
+    pub(crate) fn verbosity(&self) -> Verbosity {
+        match self {
+            Self::Index { verbosity, .. }
+            | Self::Analyze { verbosity, .. }
+            | Self::Check { verbosity, .. }
+            | Self::Query { verbosity, .. }
+            | Self::Impact { verbosity, .. }
+            | Self::Explain { verbosity, .. }
+            | Self::Fix { verbosity, .. }
+            | Self::Compat { verbosity, .. } => *verbosity,
         }
     }
 }
@@ -581,8 +598,20 @@ impl<'a> Changes<'a> {
 /// session; `announced` remembers which ids the client has already seen a
 /// `symbols` preamble for, so later answers back-reference without
 /// re-announcing.
+///
+/// The table is mutex-guarded (the engine `StringTable`'s sharing posture)
+/// so it can ride the shared read view into the answer workers. The
+/// writers — full-verbosity answers, the only faces that assign ids — are
+/// answered on the session thread (the read task's serial partition), so
+/// id assignment stays drain-order deterministic; the lock exists for the
+/// `Sync` bound, not for parallel interning.
 #[derive(Default)]
 pub(crate) struct SymbolTable {
+    inner: Mutex<SymbolIds>,
+}
+
+#[derive(Default)]
+struct SymbolIds {
     ids: FxHashMap<String, String>,
     announced: FxHashSet<String>,
     next: u32,
@@ -599,10 +628,16 @@ impl SymbolTable {
     /// answer's shape. Returns whether any substitution landed (the caller
     /// does nothing more — the `symbols` preamble is attached here).
     pub(crate) fn shorten(
-        &mut self,
+        &self,
         answer: &mut Value,
         spots: &'static [(&'static str, &'static str)],
     ) -> bool {
+        let mut inner = self.inner.lock().expect("symbol table mutex poisoned");
+        let SymbolIds {
+            ids,
+            announced,
+            next,
+        } = &mut *inner;
         // Occurrence counts in first-seen order (deterministic id assignment).
         let mut order: Vec<String> = Vec::new();
         let mut counts: FxHashMap<String, usize> = FxHashMap::default();
@@ -631,8 +666,8 @@ impl SymbolTable {
             let cost = |id: &str| id.len() + path.len() + SYMBOL_ENTRY_COST;
             // Commits happen inline in plan order, so the next fresh id is
             // always `next + 1`.
-            let id = match self.ids.get(path) {
-                Some(id) if self.announced.contains(id) => {
+            let id = match ids.get(path) {
+                Some(id) if announced.contains(id) => {
                     if path.len() > id.len() {
                         id.clone()
                     } else {
@@ -647,17 +682,17 @@ impl SymbolTable {
                     id.clone()
                 }
                 None => {
-                    let candidate = format!("s{}", self.next + 1);
+                    let candidate = format!("s{}", *next + 1);
                     let savings = count * path.len().saturating_sub(candidate.len());
                     if savings <= cost(&candidate) {
                         continue;
                     }
-                    self.ids.insert(path.clone(), candidate.clone());
-                    self.next += 1;
+                    ids.insert(path.clone(), candidate.clone());
+                    *next += 1;
                     candidate
                 }
             };
-            if self.announced.insert(id.clone()) {
+            if announced.insert(id.clone()) {
                 announce.push((id.clone(), path.clone()));
             }
             substitutions.push((path.clone(), id));
@@ -718,13 +753,15 @@ pub(crate) struct Drain<'a> {
     /// The requesting agent's overlay paths (`dartq/check`'s engine view
     /// answers over the discovered set plus these; empty for base groups).
     pub overlay_paths: &'a [PathBuf],
-    /// The session symbol table (short-id economics, full tier).
-    pub symbols: &'a mut SymbolTable,
+    /// The session symbol table (short-id economics, full tier). Shared:
+    /// the read view crosses into the answer workers, and full-tier
+    /// shortening — the only writer — runs on the session thread.
+    pub symbols: &'a SymbolTable,
 }
 
-/// Answers one staged request at the drain. `&mut` only for the symbol
-/// table's economics; everything else reads.
-pub(crate) fn answer(drain: &mut Drain<'_>, request: &Request) -> Result<Value, SessionError> {
+/// Answers one staged request at the drain. Shared borrows throughout: the
+/// read task fans coalesced requests out to the answer workers over these.
+pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, SessionError> {
     match request {
         Request::Index { verbosity, .. } => Ok(index_answer(drain, *verbosity)),
         Request::Analyze { verbosity, .. } => Ok(analyze_answer(drain, *verbosity)),
@@ -777,7 +814,7 @@ fn session_answer(
     mut answer: Value,
     verbosity: Verbosity,
     since: Option<u64>,
-    drain: &mut Drain<'_>,
+    drain: &Drain<'_>,
     spots: &'static [(&'static str, &'static str)],
 ) -> Value {
     if verbosity == Verbosity::Full {
@@ -858,7 +895,7 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 /// severity-first printed order (the entries are sorted where the read
 /// task builds them); the other faces mirror the engine's canonical
 /// (file, offset) order.
-pub(crate) fn analyze_answer(drain: &mut Drain<'_>, verbosity: Verbosity) -> Value {
+pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
     let diagnostics: Vec<Value> = drain
         .entries
         .iter()
@@ -922,7 +959,7 @@ fn check_row(
 /// The base view's check answer: the M0 disk pipeline (scan+parse over the
 /// discovered file set), rows filtered by the delta cursor when one came.
 fn check_disk_view(
-    drain: &mut Drain<'_>,
+    drain: &Drain<'_>,
     paths: &[PathBuf],
     verbosity: Verbosity,
     since: Option<u64>,
@@ -956,7 +993,7 @@ fn check_disk_view(
 /// restricted to the discovered paths plus the agent's own overlay paths
 /// (agent-introduced files are not on disk to discover).
 fn check_engine_view(
-    drain: &mut Drain<'_>,
+    drain: &Drain<'_>,
     paths: &[PathBuf],
     verbosity: Verbosity,
     since: Option<u64>,
@@ -991,12 +1028,7 @@ fn check_engine_view(
 // dartq/query — the symbol index face (CLI path labels)
 // ---------------------------------------------------------------------------
 
-fn query_answer(
-    drain: &mut Drain<'_>,
-    name: &str,
-    verbosity: Verbosity,
-    since: Option<u64>,
-) -> Value {
+fn query_answer(drain: &Drain<'_>, name: &str, verbosity: Verbosity, since: Option<u64>) -> Value {
     let mut run = query::symbol_after_analysis(drain.engine, name);
     if let Some(since) = since {
         run.decls.retain(|decl| {
@@ -1072,7 +1104,7 @@ fn query_answer(
 // ---------------------------------------------------------------------------
 
 fn impact_answer(
-    drain: &mut Drain<'_>,
+    drain: &Drain<'_>,
     target: &Path,
     _verbosity: Verbosity,
     since: Option<u64>,
@@ -1147,7 +1179,7 @@ const EXPLAIN_SPOTS: &[(&str, &str)] = &[
 /// Workspace or SDK assembly failure is the usage tier (`InvalidParams`);
 /// discovery failure or cancellation the internal tier.
 fn explain_answer(
-    drain: &mut Drain<'_>,
+    drain: &Drain<'_>,
     symbol: &str,
     verbosity: Verbosity,
     since: Option<u64>,

@@ -42,6 +42,7 @@ rust-version = "1.96"
 # crates consume them via `name = { workspace = true }`.
 blake3 = "1"
 clap = { version = "4.6.6", features = ["derive"] }
+crossbeam-channel = "0.5"
 filetime = "0.2"
 hex = "0.4"
 libc = "0.2"

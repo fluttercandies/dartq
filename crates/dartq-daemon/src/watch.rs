@@ -37,10 +37,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use crossbeam_channel::Sender;
 use rustc_hash::FxHashMap;
 
 use dartq_commands::discover::{DiscoverError, discover};
@@ -251,7 +251,6 @@ fn watch_loop(options: &WatchOptions, sender: Sender<Vec<Incoming>>, stop: &Atom
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
-    use std::sync::mpsc;
     use std::time::Duration;
 
     /// A workspace with one tracked file and nothing else in it. The
@@ -374,7 +373,7 @@ mod tests {
     #[test]
     fn watch_thread_delivers_batch_and_stops_on_drop() {
         let (root, main) = workspace("thread");
-        let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
+        let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
         let watcher = Watcher::spawn(
             WatchOptions {
                 root: root.clone(),
@@ -415,7 +414,7 @@ mod tests {
     #[test]
     fn watch_thread_reports_creations_and_deletions() {
         let (root, _main) = workspace("thread-rediscover");
-        let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
+        let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
         let watcher = Watcher::spawn(
             WatchOptions {
                 root: root.clone(),

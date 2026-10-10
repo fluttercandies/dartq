@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, FileId};
 use dartq_plugin::{
-    PluginDiagnostic, PluginRuntime, RuntimeError, SpawnSpec, Severity as PluginSeverity,
+    PluginDiagnostic, PluginRuntime, RuntimeError, Severity as PluginSeverity, SpawnSpec,
     crash_diagnostic, discover,
 };
 use dartq_source::{FileTable, LineIndex};
@@ -56,7 +56,10 @@ const DRAIN_BUDGET: Duration = Duration::from_millis(50);
 ///
 /// Dropping the set without [`PluginSet::shutdown`] kills the child
 /// processes (the runtime's `Drop`) without the graceful handshake — the
-/// session end must call [`PluginSet::shutdown`].
+/// session end must call [`PluginSet::shutdown`]. `Default` is the empty
+/// set: the session takes the set at teardown (`mem::take`), and an
+/// all-skipped discovery leaves the empty default in place.
+#[derive(Default)]
 pub struct PluginSet {
     plugins: Vec<PluginSlot>,
 }
@@ -173,12 +176,10 @@ impl PluginSet {
                 .and_then(|()| runtime.wait_diagnostics(DRAIN_BUDGET));
             match outcome {
                 Ok(rows) if !rows.is_empty() => {
-                    cycle
-                        .findings
-                        .push(PluginBatch {
-                            name: slot.name.clone(),
-                            rows,
-                        });
+                    cycle.findings.push(PluginBatch {
+                        name: slot.name.clone(),
+                        rows,
+                    });
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -364,7 +365,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     use dartq_diagnostics::{
-        CodeInfo, DiagnosticType, DARTQ_PLUGIN_CRASHED, Severity as EngineSeverity, SourceRange,
+        CodeInfo, DARTQ_PLUGIN_CRASHED, DiagnosticType, Severity as EngineSeverity, SourceRange,
     };
 
     use super::*;
@@ -452,7 +453,10 @@ mod tests {
             CodeInfo::new("test/row", "TEST_ROW", DiagnosticType::Tool, false),
             message,
             file,
-            SourceRange { offset: 0, length: 2 },
+            SourceRange {
+                offset: 0,
+                length: 2,
+            },
             None,
         )
     }
@@ -499,7 +503,14 @@ mod tests {
             .iter()
             .map(|(_, d)| (d.code.as_str(), d.source.as_str()))
             .collect();
-        assert_eq!(keys, [("shared/code", "dartq"), ("shared/code", "echo"), ("shared/code", "echo")]);
+        assert_eq!(
+            keys,
+            [
+                ("shared/code", "dartq"),
+                ("shared/code", "echo"),
+                ("shared/code", "echo")
+            ]
+        );
         let starts: Vec<(u32, u32)> = merged[1..]
             .iter()
             .map(|(_, d)| (d.range.start.line, d.range.start.character))
@@ -535,8 +546,20 @@ mod tests {
         // "ab\ncd\ne": offset 3 starts line 2 col 1; the row's end offset 5
         // (the newline terminating line 2) answers line 2 col 3 — one-based
         // line_col answers, LSP zero-based positions out.
-        assert_eq!(row.diagnostic.range.start, lsp::Position { line: 1, character: 0 });
-        assert_eq!(row.diagnostic.range.end, lsp::Position { line: 1, character: 2 });
+        assert_eq!(
+            row.diagnostic.range.start,
+            lsp::Position {
+                line: 1,
+                character: 0
+            }
+        );
+        assert_eq!(
+            row.diagnostic.range.end,
+            lsp::Position {
+                line: 1,
+                character: 2
+            }
+        );
         assert_eq!(row.diagnostic.severity, 2);
         assert_eq!(row.diagnostic.code, "echo/roundtrip");
         assert_eq!(row.diagnostic.source, "echo");
@@ -569,7 +592,13 @@ mod tests {
         let crash = &first.crashes[0];
         assert_eq!(crash.code.name, DARTQ_PLUGIN_CRASHED.name);
         assert_eq!(crash.severity, EngineSeverity::Error);
-        assert_eq!(crash.range, SourceRange { offset: 0, length: 0 });
+        assert_eq!(
+            crash.range,
+            SourceRange {
+                offset: 0,
+                length: 0
+            }
+        );
         assert_eq!(crash.file, a);
         assert!(crash.message.contains("plugin `echo`"));
 
@@ -596,10 +625,7 @@ mod tests {
     #[test]
     fn launch_skips_broken_manifests_and_empty_workspaces() {
         let workspace = TempWorkspace::new("broken");
-        workspace.write_plugin(
-            "bad_json",
-            &[("dartq_plugin.json", "{not json")],
-        );
+        workspace.write_plugin("bad_json", &[("dartq_plugin.json", "{not json")]);
         workspace.write_plugin(
             "no_script",
             &[(
@@ -631,8 +657,8 @@ mod tests {
             .is_ok();
         assert!(dart_ok, "dart is not on PATH");
 
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../dartq-plugin-host/bin/echo_plugin.dart");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host/bin/echo_plugin.dart");
         let workspace = TempWorkspace::new("live");
         let manifest = format!(
             r#"{{"name": "echo", "version": "0.1.0", "entrypoint": "{}",
@@ -665,7 +691,10 @@ mod tests {
         assert_eq!(batch.rows.len(), 1);
         let row = &batch.rows[0];
         assert_eq!(row.code, "echo/roundtrip");
-        assert_eq!(row.file, files.path(a).unwrap_or(Path::new("")).to_string_lossy());
+        assert_eq!(
+            row.file,
+            files.path(a).unwrap_or(Path::new("")).to_string_lossy()
+        );
 
         set.shutdown();
     }

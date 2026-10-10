@@ -7,11 +7,13 @@
 //! # Runtime posture
 //!
 //! Zero async, zero tokio: the engine is CPU-bound and synchronous, so the
-//! shell is std threads + a channel. The channel is [`std::sync::mpsc`] —
-//! the topology is strictly one reader → one consumer, so `mpsc` is exactly
-//! sufficient and keeps the dependency tree unchanged (crossbeam-channel is
-//! not in the workspace lock; swapping it in would be a one-line change if a
-//! multi-consumer topology ever lands).
+//! shell is std threads + a channel. The intake channel is
+//! `crossbeam-channel` — one reader (plus the optional watch thread) → one
+//! consumer, with the multi-producer channel the topology actually is, and
+//! the select surface the answer pool's results ride (#487). Read answering
+//! fans out across worker threads over the shared engine view (each read
+//! task's analyzed view is `&`-shared; writes and analyses stay
+//! single-owner); the main loop remains the only writer.
 //!
 //! # Protocol face (the milestone's minimal typed surface)
 //!

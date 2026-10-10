@@ -17,15 +17,15 @@
 
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
 
+use crossbeam_channel::RecvTimeoutError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use dartq_commands::Verbosity;
-use dartq_commands::fix::{self, PluginHosts};
+use dartq_commands::fix;
 
 use crate::codec::{self, FrameError};
 use crate::commands;
@@ -88,7 +88,7 @@ where
     R: Read + Send + 'static,
     W: Write + 'static,
 {
-    let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
+    let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
     // Held for the session's lifetime: dropping it at return stops and
     // joins the watch thread. A send past a dead receiver ends the thread
     // on its own, too.
@@ -101,9 +101,6 @@ where
     let mut lifecycle = Lifecycle::Uninitialized;
     // Set only by `exit`; every other break falls through to `EXIT_CLEAN`.
     let mut exit_code: Option<u8> = None;
-    // The plugin-dispatch faces' host set: launched at the first
-    // `dartq/fix`/`dartq/assists` request, shut down when the session ends.
-    let mut fix_hosts = FixHosts::new(session.workspace_root());
 
     // Ends when the reader thread disconnects or a notification breaks out.
     loop {
@@ -145,9 +142,7 @@ where
         for incoming in batch {
             match incoming {
                 Incoming::Message(Message::Request(request)) => {
-                    if let Some(response) =
-                        handle_request(&mut lifecycle, &mut session, &mut fix_hosts, request)
-                    {
+                    if let Some(response) = handle_request(&mut lifecycle, &mut session, request) {
                         write_message(&mut output, &Message::Response(response))?;
                     }
                 }
@@ -205,9 +200,10 @@ where
     // #306: the clean-shutdown write, window or no window.
     session.flush_snapshot();
 
-    // The plugin hosts' graceful teardown: `shutdown` per live runtime
-    // (the handshake; `Drop` alone is kill-only). Errors log inside.
-    fix_hosts.shutdown();
+    // The plugins' graceful teardown (both the cycle-fed set and the fix
+    // faces' hosts): `shutdown` per live runtime (the handshake; `Drop`
+    // alone is kill-only). Errors log inside.
+    session.shutdown_plugins();
 
     if reader.is_finished() {
         let _ = reader.join();
@@ -223,7 +219,7 @@ where
 /// batch, decided by the transport's read granularity instead of a race
 /// between this thread's per-frame sends and the main loop's drain.
 #[allow(clippy::needless_pass_by_value)]
-fn reader_loop<R: Read>(mut input: BufReader<R>, sender: mpsc::Sender<Vec<Incoming>>) {
+fn reader_loop<R: Read>(mut input: BufReader<R>, sender: crossbeam_channel::Sender<Vec<Incoming>>) {
     loop {
         let mut batch = Vec::new();
         let end = loop {
@@ -282,46 +278,11 @@ enum Lifecycle {
     ShutDown,
 }
 
-/// The plugin-dispatch faces' host set (PRD §14): lazily launched at the
-/// first `dartq/fix`/`dartq/assists` request — a session that never fixes
-/// never pays the plugins' spawn handshakes — and shut down when the
-/// session ends. Discovery runs under the session's workspace root (the
-/// `<root>/plugins/` convention).
-struct FixHosts {
-    root: PathBuf,
-    hosts: Option<PluginHosts>,
-}
-
-impl FixHosts {
-    fn new(root: &Path) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            hosts: None,
-        }
-    }
-
-    /// The live host set, launching it on first use (the manifest budgets'
-    /// spawn + handshake cost lands on the first plugin-needing request).
-    fn get_or_launch(&mut self) -> &mut PluginHosts {
-        self.hosts
-            .get_or_insert_with(|| PluginHosts::launch(&self.root))
-    }
-
-    /// The graceful teardown; errors log inside (`shutdown` per live
-    /// runtime — `Drop` alone is kill-only).
-    fn shutdown(self) {
-        if let Some(hosts) = self.hosts {
-            hosts.shutdown();
-        }
-    }
-}
-
 /// Answers a request, or `None` when the request queued onto the session's
 /// scheduler and is answered by the turn's drain instead.
 fn handle_request(
     lifecycle: &mut Lifecycle,
     session: &mut Session,
-    fix_hosts: &mut FixHosts,
     request: Request,
 ) -> Option<Response> {
     let id = request.id;
@@ -389,25 +350,15 @@ fn handle_request(
         // The plugin-dispatch faces answer at intake too: their work is
         // disk reads plus plugin-process requests (`request/fixes` under
         // the manifests' budgets), never engine analysis — no scheduler
-        // task, no cancel surface. The host set launches at the first
-        // request that needs it; the session end shuts it down.
+        // task, no cancel surface. The session-owned host set launches at
+        // the first request that needs it; the session end shuts it down.
         (Lifecycle::Ready, "dartq/fix") => {
             let params = request.params.unwrap_or(Value::Null);
-            Some(fix_response(
-                fix_hosts,
-                &params,
-                session.workspace_root(),
-                id,
-            ))
+            Some(fix_response(session, &params, id))
         }
         (Lifecycle::Ready, "dartq/assists") => {
             let params = request.params.unwrap_or(Value::Null);
-            Some(assists_response(
-                fix_hosts,
-                &params,
-                session.workspace_root(),
-                id,
-            ))
+            Some(assists_response(session, &params, id))
         }
         (Lifecycle::Ready, method) if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
@@ -508,13 +459,8 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
 /// The `dartq/fix` intake dispatch: the §15.6 documents over the requested
 /// paths — built-in lint rows plus the plugin hosts' proposals, every row
 /// provenance-tagged, and the hosts' failures in `errors` when any host
-/// died. Paths resolve against the session's workspace root.
-fn fix_response(
-    fix_hosts: &mut FixHosts,
-    params: &Value,
-    root: &Path,
-    id: jsonrpc::RequestId,
-) -> Response {
+/// died. Paths resolve against the session workspace root.
+fn fix_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Response {
     #[derive(Deserialize)]
     struct FixParams {
         paths: Vec<PathBuf>,
@@ -533,12 +479,13 @@ fn fix_response(
     if decoded.paths.is_empty() {
         return invalid("paths must be a non-empty array".into());
     }
+    let root = session.workspace_root().to_path_buf();
     let paths: Vec<PathBuf> = decoded
         .paths
         .into_iter()
-        .map(|path| resolve_path(root, path))
+        .map(|path| resolve_path(&root, path))
         .collect();
-    let hosts = fix_hosts.get_or_launch();
+    let hosts = session.fix_hosts();
     match commands::fix_answer(&paths, decoded.verbosity, hosts) {
         Ok(answer) => Response::ok(id, answer),
         Err(error) => answer_error(id, &error),
@@ -548,12 +495,7 @@ fn fix_response(
 /// The `dartq/assists` intake dispatch: the plugin hosts' location-directed
 /// proposals for one file (`request/fixes` at `[offset, offset + length)`),
 /// anchored against the file's on-disk text.
-fn assists_response(
-    fix_hosts: &mut FixHosts,
-    params: &Value,
-    root: &Path,
-    id: jsonrpc::RequestId,
-) -> Response {
+fn assists_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Response {
     #[derive(Deserialize)]
     struct AssistsParams {
         path: PathBuf,
@@ -569,14 +511,15 @@ fn assists_response(
     if let Err(message) = commands::reject_disk_view_only(params, "dartq/assists") {
         return invalid(message);
     }
+    let root = session.workspace_root().to_path_buf();
     let decoded = match serde_json::from_value::<AssistsParams>(params.clone()) {
         Ok(mut decoded) => {
-            decoded.path = resolve_path(root, decoded.path);
+            decoded.path = resolve_path(&root, decoded.path);
             decoded
         }
         Err(error) => return invalid(error.to_string()),
     };
-    let hosts = fix_hosts.get_or_launch();
+    let hosts = session.fix_hosts();
     match fix::assists(&decoded.path, decoded.offset, decoded.length, hosts) {
         Ok(answer) => Response::ok(id, fix::assists_json(&answer, decoded.verbosity)),
         Err(dartq_commands::discover::DiscoverError::Missing(path)) => {
