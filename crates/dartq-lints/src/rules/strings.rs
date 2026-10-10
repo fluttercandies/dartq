@@ -262,6 +262,105 @@ pub(crate) mod unnecessary_string_escapes {
         &['"', '\'', '$', '\\', 'n', 'r', 'f', 'b', 't', 'v', 'x', 'u'];
 }
 
+pub(crate) mod unnecessary_string_interpolations {
+    use dartq_ast::NodeKind;
+    use dartq_scanner::TokenKind;
+
+    use super::{Check, Group, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_string_interpolations.dart:31-56`
+    /// — a string interpolation of exactly three elements (empty leading and
+    /// trailing string segments around one expression) whose expression has
+    /// static type `String` (non-nullable) reports at the whole literal; the
+    /// interpolated form of an adjacent-strings chain never reports
+    /// (`node.parent is AdjacentStrings`, :42).
+    ///
+    /// Approximation (documented): the static-type question is answered for
+    /// the one face that is decidable from syntax — the sole interpolation
+    /// expression is itself a complete plain string literal (a single `String`
+    /// token inside `${...}`), which is always non-nullable `String`. The
+    /// `$identifier` face and multi-token expressions (`'$name'` over a
+    /// `String` variable, `'${expr.path}'` — the official corpus's main
+    /// family) need the element model and under-report. `this` is excluded
+    /// even in its one-token form: its type is the enclosing class, never
+    /// `String`. The adjacency guard reads the token before the literal's
+    /// opening quote (a `String` segment or `CloseCurly` — the two ways a
+    /// preceding literal can end) exactly where the official reads the
+    /// `AdjacentStrings` parent. Message: `diagnostic.g.dart`
+    /// `unnecessaryStringInterpolations`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_string_interpolations",
+        group: Group::Recommended,
+        problem: "Unnecessary use of string interpolation.",
+        correction: "Try replacing the string literal with the variable name.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let tokens = c.unit.tokens;
+        let range = c.unit.ast.token_range(node);
+        if range.len() < 2 {
+            return; // a plain (non-interpolated) literal is one token
+        }
+        let start = range.start;
+        // Empty leading segment (:48): the opening `String` token is the bare
+        // quote run — `'''` and friends, no raw prefix, no escaped content.
+        if !tokens
+            .get(start as usize)
+            .is_some_and(|t| t.kind == TokenKind::String && is_quote_run(c.lexeme(start)))
+        {
+            return;
+        }
+        // Adjacent strings (:42): a preceding literal ends in one of two
+        // token shapes; either makes this interpolation the interpolated
+        // element of an `AdjacentStrings` chain, which never reports.
+        if start > 0
+            && tokens
+                .get(start as usize - 1)
+                .is_some_and(|t| matches!(t.kind, TokenKind::String | TokenKind::CloseCurly))
+        {
+            return;
+        }
+        match tokens.get(start as usize + 1).map(|t| t.kind) {
+            // `'$id'`: the sole expression is one identifier token; its type
+            // is unknown to syntax, so the face under-reports (:50-53 keeps
+            // `'$x'` over a `String` variable unflagged here).
+            Some(TokenKind::StringInterpolationIdentifier) => {}
+            // `'${...}'`: the sole expression must be exactly one complete
+            // string literal — a single `String` token filling the `${...}`
+            // group, then the bare closing quote run ending the literal
+            // (:44-47, three elements).
+            Some(TokenKind::StringInterpolationExpression) => {
+                let Some(close) = tokens.matching_end(start as usize + 1) else {
+                    return;
+                };
+                let close = close as u32;
+                let sole_string = close == start + 3
+                    && tokens
+                        .get(close as usize + 1)
+                        .is_some_and(|t| t.kind == TokenKind::String)
+                    && is_quote_run(c.lexeme(close + 1))
+                    && close + 2 == range.end;
+                if sole_string {
+                    let span = c.utf16_span(node);
+                    c.report(span, &[]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `lexeme` is a bare quote run: `'` / `"` or their triple forms
+    /// (the empty leading/trailing segment value, :47-48). Raw strings start
+    /// with `r` and never interpolate.
+    fn is_quote_run(lexeme: &str) -> bool {
+        let bytes = lexeme.as_bytes();
+        (bytes.len() == 1 || bytes.len() == 3) && bytes.iter().all(|&b| b == bytes[0])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -410,5 +509,113 @@ mod tests {
         let f = fixture(r#"var s = "a\'${name}b\'";"#);
         let lints = f.run(&one_rule("unnecessary_string_escapes"));
         assert_eq!(lints.len(), 2);
+    }
+
+    // —— unnecessary_string_interpolations ————————————————————————————————
+    // The rule reads the literal's flat token range; the fixture mounts one
+    // `StringLiteral` span per literal (the collapse-map §3.5 contract) over
+    // a scanned source.
+
+    /// One whole-literal `StringLiteral` span over tokens `[first, last]`.
+    fn interp_fixture(source: &str, first: u32, last: u32) -> Fixture {
+        Fixture::build(source, |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.leaf_span(NodeKind::StringLiteral, first, last + 1);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        })
+    }
+
+    fn interp_hits(source: &str, first: u32, last: u32) -> Vec<crate::engine::Lint> {
+        interp_fixture(source, first, last).run(&one_rule("unnecessary_string_interpolations"))
+    }
+
+    /// `'${'x'}'` — the sole interpolation expression is a plain string
+    /// literal, so the whole literal reports (:54-56, the literal face of
+    /// `test_unnecessaryInterpolation_single`).
+    #[test]
+    fn interp_of_a_string_literal_reports() {
+        let source = "var s = '${'x'}';";
+        // 0:var 1:s 2:= 3:' 4:${ 5:'x' 6:} 7:' 8:; — five literal tokens.
+        let lints = interp_hits(source, 3, 7);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary use of string interpolation.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try replacing the string literal with the variable name.".to_owned())
+        );
+        // The report covers the whole literal, not the inner expression.
+        assert_eq!(lints[0].range.start, 8);
+        assert_eq!(lints[0].range.end, 16);
+    }
+
+    /// `'$name'` over an unknown-typed identifier under-reports — the
+    /// static-type face is resolution-bound (:50-53).
+    #[test]
+    fn interp_of_an_identifier_passes() {
+        // 3:' 4:$ 5:name 6:'
+        assert!(interp_hits("var s = '$name';", 3, 6).is_empty());
+    }
+
+    /// A non-empty leading segment (`'x$a'`) keeps its interpolation
+    /// (:54-56, `test_necessaryInterpolation_single`).
+    #[test]
+    fn interp_with_leading_text_passes() {
+        // 3:'x 4:$ 5:a 6:'
+        assert!(interp_hits("var s = 'x$a';", 3, 6).is_empty());
+    }
+
+    /// Multi-token expressions stay unflagged (the property face is
+    /// resolution-bound; syntax alone only sees a composite expression).
+    #[test]
+    fn interp_of_a_composite_expression_passes() {
+        // 3:' 4:${ 5:a 6:. 7:length 8:} 9:'
+        assert!(interp_hits("var s = '${a.length}';", 3, 9).is_empty());
+    }
+
+    /// A nested interpolated literal inside `${...}` is multi-token — the
+    /// documented under-report face.
+    #[test]
+    fn interp_of_an_interpolated_literal_passes() {
+        // 3:' 4:${ 5:'a 6:$ 7:b 8:' 9:} 10:'
+        assert!(interp_hits("var s = '${'a$b'}';", 3, 10).is_empty());
+    }
+
+    /// The interpolated element of an adjacent-strings chain never reports
+    /// (:42, `test_necessaryInterpolation_adjacentStrings`): the token
+    /// before the second literal is the first literal's closing quote.
+    #[test]
+    fn interp_inside_adjacent_strings_passes() {
+        let source = "var b = 'x' '${'y'}';";
+        // 0:var 1:b 2:= 3:'x' | 4:' 5:${ 6:'y' 7:} 8:' 9:;
+        let f = Fixture::build(source, |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.leaf_span(NodeKind::StringLiteral, 3, 4);
+            b.leaf_span(NodeKind::StringLiteral, 4, 9);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(f.run(&one_rule("unnecessary_string_interpolations")).is_empty());
+    }
+
+    /// `'$this'` interpolates the enclosing object — never `String` (:50-53).
+    #[test]
+    fn interp_of_this_passes() {
+        // 3:' 4:$ 5:this 6:'
+        assert!(interp_hits("var s = '$this';", 3, 6).is_empty());
+    }
+
+    /// Multiline and double-quoted forms report on the same shape.
+    #[test]
+    fn interp_of_a_literal_multiline_and_double_quoted_report() {
+        // 0:''' 1:${ 2:'y' 3:} 4:'''
+        assert_eq!(interp_hits("'''${'y'}'''", 0, 4).len(), 1);
+        // 0:" 1:${ 2:'y' 3:} 4:"
+        assert_eq!(interp_hits(r#""${'y'}""#, 0, 4).len(), 1);
+    }
+
+    /// Raw strings never interpolate — nothing to report.
+    #[test]
+    fn raw_braces_pass() {
+        // The raw literal is one token.
+        assert!(interp_hits(r"r'${'y'}'", 0, 0).is_empty());
     }
 }

@@ -18,6 +18,7 @@ pub(crate) mod expressions;
 pub(crate) mod flow;
 pub(crate) mod names;
 pub(crate) mod pubspec;
+pub(crate) mod regexp;
 pub(crate) mod strings;
 pub(crate) mod types;
 

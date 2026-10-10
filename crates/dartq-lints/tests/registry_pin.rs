@@ -165,12 +165,34 @@ fn registry_fits_the_enable_set_word_count() {
 }
 
 /// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3,
-/// 12 #353-completion, 4 #315-wave-3 and 4 #435-release-gate-seam rules make
-/// 72 registered — every `package:lints` member is either here or
-/// documented-blocked in the crate docs.
+/// 12 #353-completion, 4 #315-wave-3, 4 #435-release-gate-seam and 5 #478
+/// pure-AST rules make 77 registered — every `package:lints` member is
+/// either here or documented-blocked in the crate docs.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 72);
+    assert_eq!(RULES.len(), 77);
+}
+
+/// The two camelCase registry spellings are the yaml/LintNames forms
+/// byte-for-byte (`prefer_iterable_whereType` /
+/// `prefer_for_elements_to_map_fromIterable`), and their machine-form
+/// rendering is the oracle's `emitMachineFormat` convention
+/// (`pkg/dartdev/lib/src/commands/analyze.dart:605`,
+/// `error.code?.toUpperCase()`) — the JSON writer emits `code.name`
+/// verbatim, the machine writer the uppercased form.
+#[test]
+fn camel_case_rule_names_pin_their_code_strings() {
+    for (name, machine) in [
+        ("prefer_iterable_whereType", "PREFER_ITERABLE_WHERETYPE"),
+        (
+            "prefer_for_elements_to_map_fromIterable",
+            "PREFER_FOR_ELEMENTS_TO_MAP_FROMITERABLE",
+        ),
+    ] {
+        let id = rule_by_name(name).unwrap_or_else(|| panic!("{name} must stay registered"));
+        assert_eq!(RULES[id.0 as usize].name, name);
+        assert_eq!(name.to_uppercase(), machine);
+    }
 }
 
 #[test]

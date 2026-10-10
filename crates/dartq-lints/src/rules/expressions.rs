@@ -1708,6 +1708,209 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
     }
 }
 
+pub(crate) mod prefer_final_fields {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, member_name};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_final_fields.dart` — a
+    /// private non-`final` field never mutated reports when it is
+    /// initialized at its declaration or set by every constructor of its
+    /// class (field formals and field initializers count as setting;
+    /// :52-84). The mutated set is library-wide and collected before the
+    /// decision (`afterLibrary`, :85-112); the report sits on the variable
+    /// declaration. Message: `diagnostic.g.dart` `preferFinalFields`.
+    ///
+    /// Approximations (documented — the official runs on resolved elements
+    /// across the whole library; this is one unit, name-level):
+    /// - Mutations are bare-name writes: assignment targets (any operator)
+    ///   and `++`/`--` operands. Pattern-assignment writes (`(_x,) = ...`)
+    ///   and cascade-section writes (`.._x = 1`) are not scanned, so a field
+    ///   mutated only there over-reports; a same-named LOCAL mutated
+    ///   anywhere marks the field mutated and under-reports. Index writes
+    ///   (`_x[0] = 1`) do not count — matching the official, whose
+    ///   `writeElement` for them is the `[]=` method, not the field.
+    /// - Private-ness is the leading underscore; the setter-override
+    ///   exemption (`_overridesField`, :147-158) is element-bound and
+    ///   skipped, so a field overriding a superclass setter over-reports.
+    /// - The cross-unit half of the official library scan
+    ///   (`_fieldsFromParameters` — primary-constructor declaring formals,
+    ///   :114-131) is out of the substrate and under-reports.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_final_fields",
+        group: Group::Recommended,
+        problem: "The private field {0} could be 'final'.",
+        correction: "Try making the field 'final'.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    /// One candidate: the declaration node, its name, whether the
+    /// declaration carries an initializer, and the enclosing
+    /// `DeclarationBody` (the constructor set faces scan its constructors).
+    struct Candidate<'a> {
+        declaration: u32,
+        name: &'a str,
+        has_initializer: bool,
+        class_body: u32,
+    }
+
+    fn check(c: &mut Check<'_>) {
+        let Some(root) = c.unit.ast.root() else {
+            return;
+        };
+        let mut candidates: Vec<Candidate<'_>> = Vec::new();
+        let mut mutated: Vec<&str> = Vec::new();
+        scan(c, root, None, &mut candidates, &mut mutated);
+        for candidate in &candidates {
+            if mutated.contains(&candidate.name) {
+                continue;
+            }
+            // The constructors of the field's own class (:62-71). Factories
+            // are `ConstructorDeclaration`s in the official and count for
+            // the "set in every constructor" question; they never set.
+            let constructors: Vec<u32> = c
+                .collect_direct(candidate.class_body)
+                .into_iter()
+                .filter(|&member| {
+                    matches!(c.kind(member), NodeKind::Constructor | NodeKind::Factory)
+                })
+                .collect();
+            let set =
+                |ctor: u32| sets_field(c, ctor, candidate.name);
+            let set_any = constructors.iter().copied().any(set);
+            let set_all = constructors.iter().copied().all(set);
+            if !(set_any && set_all) && !candidate.has_initializer {
+                continue;
+            }
+            let range = c.utf16_span(candidate.declaration);
+            c.report(range, &[candidate.name]);
+        }
+    }
+
+    /// The one-pass unit walk: candidates from `Fields` declarations and
+    /// mutations from bare-name writes. Enum and extension-type bodies are
+    /// skipped whole (the official excludes their fields, :98/:118-121);
+    /// top-level declarations are not fields and never match.
+    fn scan<'a>(
+        c: &Check<'a>,
+        node: u32,
+        class_body: Option<u32>,
+        candidates: &mut Vec<Candidate<'a>>,
+        mutated: &mut Vec<&'a str>,
+    ) {
+        match c.kind(node) {
+            NodeKind::EnumDeclaration | NodeKind::ExtensionTypeDeclaration => return,
+            NodeKind::DeclarationBody => {
+                for kid in c.collect_direct(node) {
+                    scan(c, kid, Some(node), candidates, mutated);
+                }
+                return;
+            }
+            NodeKind::Fields => {
+                for declaration in c.collect_direct(node) {
+                    if c.kind(declaration) != NodeKind::VariablesDeclaration {
+                        continue;
+                    }
+                    let keyword = c
+                        .payload(declaration)
+                        .first()
+                        .copied()
+                        .unwrap_or(NONE_TOKEN);
+                    if keyword != NONE_TOKEN && matches!(c.lexeme(keyword), "final" | "const") {
+                        continue;
+                    }
+                    let Some(body) = class_body else { continue };
+                    for var in c.collect_direct(declaration) {
+                        if c.kind(var) != NodeKind::InitializedIdentifier {
+                            continue;
+                        }
+                        let Some(name) = member_name(c, var) else { continue };
+                        let name = c.lexeme(c.head_token(name));
+                        if !name.starts_with('_') {
+                            continue;
+                        }
+                        let has_initializer = c
+                            .collect_direct(var)
+                            .iter()
+                            .any(|&kid| c.kind(kid) == NodeKind::VariableInitializer);
+                        candidates.push(Candidate {
+                            declaration: var,
+                            name,
+                            has_initializer,
+                            class_body: body,
+                        });
+                    }
+                }
+            }
+            NodeKind::Assignment => {
+                if let Some(&lhs) = c.collect_direct(node).first()
+                    && c.kind(lhs) == NodeKind::Identifier
+                {
+                    mutated.push(c.lexeme(c.head_token(lhs)));
+                }
+            }
+            NodeKind::UnaryPrefix | NodeKind::UnaryPostfix => {
+                let op = c.lexeme(c.head_token(node));
+                if op == "++" || op == "--" {
+                    let Some(parent) = c.unit.ast.parent(node) else {
+                        return;
+                    };
+                    let siblings = c.collect_direct(parent);
+                    let Some(pos) = siblings.iter().position(|&sibling| sibling == node) else {
+                        return;
+                    };
+                    // The prefix operator parses before its operand, the
+                    // postfix operator after it.
+                    let operand = match c.kind(node) {
+                        NodeKind::UnaryPrefix => siblings.get(pos + 1),
+                        _ => pos.checked_sub(1).and_then(|i| siblings.get(i)),
+                    };
+                    if let Some(&operand) = operand
+                        && c.kind(operand) == NodeKind::Identifier
+                    {
+                        mutated.push(c.lexeme(c.head_token(operand)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        for kid in c.collect_direct(node) {
+            scan(c, kid, class_body, candidates, mutated);
+        }
+    }
+
+    /// Whether `ctor` sets `name`: a `this.name` field formal or a field
+    /// initializer of the name (:129-146).
+    fn sets_field(c: &Check<'_>, ctor: u32, name: &str) -> bool {
+        let window = c.children(ctor);
+        (window.start..window.end).any(|id| match c.kind(id) {
+            NodeKind::FormalParameter => {
+                let receiver = c.payload(id).first().copied().unwrap_or(NONE_TOKEN);
+                receiver != NONE_TOKEN
+                    && c.lexeme(receiver) == "this"
+                    && c
+                        .payload(id)
+                        .get(1)
+                        .is_some_and(|&name_token| c.lexeme(name_token) == name)
+            }
+            NodeKind::Initializer => initializer_set_name(c, id) == Some(name),
+            _ => false,
+        })
+    }
+
+    /// The field name an initializer entry sets: the entry head token is the
+    /// bare form's name; `this.x = e` names two tokens later.
+    fn initializer_set_name<'a>(c: &'a Check<'a>, init: u32) -> Option<&'a str> {
+        let head = c.head_token(init);
+        let name_token = match c.lexeme(head) {
+            "this" => head + 2,
+            _ => head,
+        };
+        let token = c.unit.tokens.get(name_token as usize)?;
+        (token.kind == dartq_scanner::TokenKind::Identifier).then(|| c.lexeme(name_token))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -3581,5 +3784,571 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("unnecessary_this")).is_empty());
+    }
+
+    // —— prefer_final_fields ——————————————————————————————————————————————
+    // Fixtures over the collapse-map §3.3 contracts (`Fields` >
+    // `VariablesDeclaration` > `InitializedIdentifier` > `VariableInitializer`,
+    // `Constructor` > `FormalParameters`/`Initializers`).
+
+    /// `class C { int _x = 0; }` — the candidate fixture; `extra` appends
+    /// unit-level siblings (mutation statements, more constructors).
+    fn field_fixture(
+        extra: impl FnOnce(&mut dartq_ast::AstBuilder, &dartq_scanner::TokenTable),
+    ) -> Fixture {
+        Fixture::build(
+            "class C {\n  int _x = 0;\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.end(NodeKind::DeclarationBody, 8);
+                b.end(NodeKind::ClassDeclaration, 8);
+                b.end(NodeKind::TopLevelDeclaration, 9);
+                extra(b, t);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        )
+    }
+
+    fn field_hits(f: &Fixture) -> Vec<crate::engine::Lint> {
+        f.run(&one_rule("prefer_final_fields"))
+    }
+
+    /// An assignment statement over the field name, as a unit-level sibling.
+    fn assignment_statement(b: &mut dartq_ast::AstBuilder, name_at: u32, eq_at: u32, value_at: u32) {
+        b.begin(NodeKind::ExpressionStatement, name_at);
+        b.begin(NodeKind::Assignment, name_at);
+        b.patch(0, eq_at);
+        identifier(b, name_at, name_at + 1);
+        b.leaf(NodeKind::LiteralInt, value_at);
+        b.end(NodeKind::Assignment, value_at + 1);
+        b.end(NodeKind::ExpressionStatement, value_at + 2);
+    }
+
+    /// An initialized private field reports on its declaration
+    /// (prefer_final_fields_test.dart `initialized`).
+    #[test]
+    fn initialized_private_field_reports() {
+        let f = field_fixture(|_b, _t| {});
+        let lints = field_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "The private field _x could be 'final'.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try making the field 'final'.".to_owned())
+        );
+        // The report covers the declaration `_x = 0` (bytes 16..22).
+        assert_eq!(lints[0].range.start, 16);
+        assert_eq!(lints[0].range.end, 22);
+    }
+
+    /// An assignment anywhere marks the field mutated (`mutated`).
+    #[test]
+    fn assignment_blocks() {
+        // The statement sits past the class: `_x14 =15 116 ;17`.
+        let source = "class C {\n  int _x = 0;\n}\n_x = 1;";
+        let f = Fixture::build(source, |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.begin(NodeKind::VariableInitializer, 5);
+            b.leaf(NodeKind::LiteralInt, 6);
+            b.end(NodeKind::VariableInitializer, 7);
+            b.end(NodeKind::InitializedIdentifier, 7);
+            b.end(NodeKind::VariablesDeclaration, 8);
+            b.end(NodeKind::Fields, 8);
+            b.end(NodeKind::DeclarationBody, 8);
+            b.end(NodeKind::ClassDeclaration, 8);
+            b.end(NodeKind::TopLevelDeclaration, 9);
+            assignment_statement(b, 9, 10, 11);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+    }
+
+    /// `++` marks the field mutated too (`incrementAndDecrement`) — the
+    /// prefix operator parses before its operand.
+    #[test]
+    fn increment_blocks() {
+        // c0..{8 | ++9 _x10 ;11
+        let f = Fixture::build("class C {\n  int _x = 0;\n}\n++_x;", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.begin(NodeKind::VariableInitializer, 5);
+            b.leaf(NodeKind::LiteralInt, 6);
+            b.end(NodeKind::VariableInitializer, 7);
+            b.end(NodeKind::InitializedIdentifier, 7);
+            b.end(NodeKind::VariablesDeclaration, 8);
+            b.end(NodeKind::Fields, 8);
+            b.end(NodeKind::DeclarationBody, 8);
+            b.end(NodeKind::ClassDeclaration, 8);
+            b.end(NodeKind::TopLevelDeclaration, 9);
+            b.begin(NodeKind::ExpressionStatement, 9);
+            b.leaf(NodeKind::UnaryPrefix, 9);
+            identifier(b, 10, 11);
+            b.end(NodeKind::ExpressionStatement, 12);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+    }
+
+    /// A field formal in every constructor counts as setting
+    /// (`fieldFormalInParameter`).
+    #[test]
+    fn field_formal_set_reports() {
+        // c0 l1 a2 s3 s4 ␣5 C6 {7 int8 _x9 ;10 C11 (12 this13 .14 _x15 )16 ;17 }18
+        let source = "class C {\n  int _x;\n  C(this._x);\n}\n";
+        let f = Fixture::build(source, |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.end(NodeKind::InitializedIdentifier, 5);
+            b.end(NodeKind::VariablesDeclaration, 6);
+            b.end(NodeKind::Fields, 6);
+            b.begin(NodeKind::Constructor, 6);
+            b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+            b.patch(1, NONE);
+            b.patch(2, 7);
+            b.patch(3, NONE);
+            identifier(b, 6, 7);
+            b.begin(NodeKind::FormalParameters, 7);
+            b.begin(NodeKind::FormalParameter, 8);
+            b.patch(0, 8);
+            b.patch(1, 10);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.patch(4, dartq_parser::FormalParameterKind::RequiredPositional as u32);
+            b.leaf(NodeKind::NoType, 10);
+            b.end(NodeKind::FormalParameter, 11);
+            b.end(NodeKind::FormalParameters, 11);
+            b.leaf(NodeKind::EmptyBody, 12);
+            b.end(NodeKind::Constructor, 13);
+            b.end(NodeKind::DeclarationBody, 13);
+            b.end(NodeKind::ClassDeclaration, 14);
+            b.end(NodeKind::TopLevelDeclaration, 14);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// A field initializer in every constructor counts as setting
+    /// (`fieldInitializer`) — the bare and `this.`-prefixed entry forms.
+    #[test]
+    fn field_initializer_set_reports() {
+        // Bare form: `C() : _x = 0;` — c0..C6 (7 )8 :9 _x10 =11 012 ;13 }14
+        let bare = Fixture::build("class C {\n  int _x;\n  C() : _x = 0;\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.end(NodeKind::InitializedIdentifier, 5);
+            b.end(NodeKind::VariablesDeclaration, 6);
+            b.end(NodeKind::Fields, 6);
+            b.begin(NodeKind::Constructor, 6);
+            b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+            b.patch(1, NONE);
+            b.patch(2, 7);
+            b.patch(3, 9);
+            identifier(b, 6, 7);
+            b.begin(NodeKind::FormalParameters, 7);
+            b.end(NodeKind::FormalParameters, 8);
+            b.begin(NodeKind::Initializers, 9);
+            b.begin(NodeKind::Initializer, 10);
+            b.begin(NodeKind::FieldInitializer, 11);
+            b.patch(0, 11);
+            b.leaf(NodeKind::LiteralInt, 12);
+            b.end(NodeKind::FieldInitializer, 13);
+            b.end(NodeKind::Initializer, 13);
+            b.end(NodeKind::Initializers, 13);
+            b.leaf(NodeKind::EmptyBody, 13);
+            b.end(NodeKind::Constructor, 14);
+            b.end(NodeKind::DeclarationBody, 14);
+            b.end(NodeKind::ClassDeclaration, 15);
+            b.end(NodeKind::TopLevelDeclaration, 15);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert_eq!(field_hits(&bare).len(), 1);
+        // `this.` form: the entry head is the `this` keyword; the name sits
+        // two tokens later.
+        let this_form = Fixture::build("class C {\n  int _x;\n  C() : this._x = 0;\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.end(NodeKind::InitializedIdentifier, 5);
+            b.end(NodeKind::VariablesDeclaration, 6);
+            b.end(NodeKind::Fields, 6);
+            b.begin(NodeKind::Constructor, 6);
+            b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+            b.patch(1, NONE);
+            b.patch(2, 7);
+            b.patch(3, 9);
+            identifier(b, 6, 7);
+            b.begin(NodeKind::FormalParameters, 7);
+            b.end(NodeKind::FormalParameters, 8);
+            b.begin(NodeKind::Initializers, 9);
+            b.begin(NodeKind::Initializer, 10);
+            b.begin(NodeKind::FieldInitializer, 13);
+            b.patch(0, 13);
+            b.leaf(NodeKind::LiteralInt, 15);
+            b.end(NodeKind::FieldInitializer, 16);
+            b.end(NodeKind::Initializer, 16);
+            b.end(NodeKind::Initializers, 16);
+            b.leaf(NodeKind::EmptyBody, 16);
+            b.end(NodeKind::Constructor, 17);
+            b.end(NodeKind::DeclarationBody, 17);
+            b.end(NodeKind::ClassDeclaration, 18);
+            b.end(NodeKind::TopLevelDeclaration, 18);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert_eq!(field_hits(&this_form).len(), 1);
+    }
+
+    /// Set in some constructors only — never reports (`notPassedInAll`).
+    #[test]
+    fn set_in_some_constructors_only_passes() {
+        // c0..{7 int8 _x9 ;10 C11 (12 this13 .14 _x15 )16 ;17 C18 .19 n20
+        // (21 )22 ;23 }24
+        let f = Fixture::build(
+            "class C {\n  int _x;\n  C(this._x);\n  C.n();\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 6);
+                b.end(NodeKind::Fields, 6);
+                // The setting constructor: `C(this._x);`.
+                b.begin(NodeKind::Constructor, 6);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 7);
+                b.patch(3, NONE);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::FormalParameter, 8);
+                b.patch(0, 8);
+                b.patch(1, 10);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, dartq_parser::FormalParameterKind::RequiredPositional as u32);
+                b.leaf(NodeKind::NoType, 10);
+                b.end(NodeKind::FormalParameter, 11);
+                b.end(NodeKind::FormalParameters, 11);
+                b.leaf(NodeKind::EmptyBody, 12);
+                b.end(NodeKind::Constructor, 13);
+                // The unset named constructor: `C.n();`.
+                b.begin(NodeKind::Constructor, 13);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, 15);
+                b.patch(2, 16);
+                b.patch(3, NONE);
+                identifier(b, 13, 14);
+                b.begin(NodeKind::FormalParameters, 16);
+                b.end(NodeKind::FormalParameters, 18);
+                b.leaf(NodeKind::EmptyBody, 19);
+                b.end(NodeKind::Constructor, 20);
+                b.end(NodeKind::DeclarationBody, 20);
+                b.end(NodeKind::ClassDeclaration, 21);
+                b.end(NodeKind::TopLevelDeclaration, 21);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        );
+        assert!(field_hits(&f).is_empty());
+    }
+
+    /// Public fields, `final`/`const` fields, unset unassigned fields, and
+    /// top-level variables never report.
+    #[test]
+    fn non_candidates_pass() {
+        // Public name.
+        let f = Fixture::build("class C {\n  int x = 0;\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.begin(NodeKind::VariableInitializer, 5);
+            b.leaf(NodeKind::LiteralInt, 6);
+            b.end(NodeKind::VariableInitializer, 7);
+            b.end(NodeKind::InitializedIdentifier, 7);
+            b.end(NodeKind::VariablesDeclaration, 8);
+            b.end(NodeKind::Fields, 8);
+            b.end(NodeKind::DeclarationBody, 8);
+            b.end(NodeKind::ClassDeclaration, 8);
+            b.end(NodeKind::TopLevelDeclaration, 9);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+        // `final` keyword on the declaration.
+        let f = Fixture::build("class C {\n  final int _x = 0;\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, 3);
+            b.leaf_span(NodeKind::Type, 4, 5);
+            b.begin(NodeKind::InitializedIdentifier, 5);
+            identifier(b, 5, 6);
+            b.begin(NodeKind::VariableInitializer, 6);
+            b.leaf(NodeKind::LiteralInt, 7);
+            b.end(NodeKind::VariableInitializer, 8);
+            b.end(NodeKind::InitializedIdentifier, 8);
+            b.end(NodeKind::VariablesDeclaration, 9);
+            b.end(NodeKind::Fields, 9);
+            b.end(NodeKind::DeclarationBody, 9);
+            b.end(NodeKind::ClassDeclaration, 9);
+            b.end(NodeKind::TopLevelDeclaration, 10);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+        // Unset, never assigned.
+        let f = Fixture::build("class C {\n  int _x;\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Fields, 2);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 3);
+            b.patch(0, NONE);
+            b.leaf_span(NodeKind::Type, 3, 4);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.end(NodeKind::InitializedIdentifier, 5);
+            b.end(NodeKind::VariablesDeclaration, 6);
+            b.end(NodeKind::Fields, 6);
+            b.end(NodeKind::DeclarationBody, 6);
+            b.end(NodeKind::ClassDeclaration, 6);
+            b.end(NodeKind::TopLevelDeclaration, 7);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+        // Top-level declarations are not fields.
+        let f = Fixture::build("var _x = 0;\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelFields, 0);
+            b.begin(NodeKind::VariablesDeclaration, 0);
+            b.patch(0, NONE);
+            b.begin(NodeKind::InitializedIdentifier, 0);
+            identifier(b, 0, 1);
+            b.begin(NodeKind::VariableInitializer, 2);
+            b.leaf(NodeKind::LiteralInt, 3);
+            b.end(NodeKind::VariableInitializer, 4);
+            b.end(NodeKind::InitializedIdentifier, 4);
+            b.end(NodeKind::VariablesDeclaration, 5);
+            b.end(NodeKind::TopLevelFields, 5);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
+    }
+
+    /// An assignment inside a constructor body is still a mutation.
+    #[test]
+    fn constructor_body_assignment_blocks() {
+        // c0..{7 int8 _x9 ;10 C11 (12 )13 {14 _x15 =16 017 ;18 }19 }20
+        let f = Fixture::build(
+            "class C {\n  int _x = 0;\n  C() { _x = 0; }\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, 11);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.end(NodeKind::FormalParameters, 11);
+                b.begin(NodeKind::BlockBody, 11);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 11);
+                b.begin(NodeKind::ExpressionStatement, 12);
+                b.begin(NodeKind::Assignment, 12);
+                b.patch(0, 13);
+                identifier(b, 12, 13);
+                b.leaf(NodeKind::LiteralInt, 14);
+                b.end(NodeKind::Assignment, 15);
+                b.end(NodeKind::ExpressionStatement, 16);
+                b.end(NodeKind::Block, 16);
+                b.end(NodeKind::BlockBody, 17);
+                b.end(NodeKind::Constructor, 18);
+                b.end(NodeKind::DeclarationBody, 18);
+                b.end(NodeKind::ClassDeclaration, 19);
+                b.end(NodeKind::TopLevelDeclaration, 19);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        );
+        assert!(field_hits(&f).is_empty());
+    }
+
+    /// Enum fields stay out (`PreferFinalFieldsEnum`) — the walk skips the
+    /// enum declaration whole.
+    #[test]
+    fn enum_fields_pass() {
+        let f = Fixture::build("enum E { a }\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::EnumDeclaration, 0);
+            b.patch(0, NONE);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::EnumBody, 3);
+            b.begin(NodeKind::Fields, 4);
+            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+            b.begin(NodeKind::VariablesDeclaration, 4);
+            b.patch(0, NONE);
+            b.begin(NodeKind::InitializedIdentifier, 4);
+            identifier(b, 4, 5);
+            b.end(NodeKind::InitializedIdentifier, 5);
+            b.end(NodeKind::VariablesDeclaration, 6);
+            b.end(NodeKind::Fields, 6);
+            b.end(NodeKind::EnumBody, 7);
+            b.end(NodeKind::EnumDeclaration, 8);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(field_hits(&f).is_empty());
     }
 }

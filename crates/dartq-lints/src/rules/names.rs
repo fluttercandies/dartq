@@ -694,6 +694,429 @@ pub(crate) mod no_wildcard_variable_uses {
     }
 }
 
+pub(crate) mod avoid_types_as_parameter_names {
+    use super::{Check, Group, NodeKind, RuleSpec, utf16_start_of};
+
+    /// The dart:core type names every scope resolves to a class (the bare
+    /// lexical face of the official's element test — `ClassElement`
+    /// membership). The official additionally matches user-declared types,
+    /// typedefs, extension types, and in-scope type parameters through
+    /// resolution (`resolveNameInScope`, avoid_types_as_parameter_names.dart:
+    /// 118-131); those are out of the syntax face and under-report.
+    /// `dynamic` is excluded faithfully: the dynamic element is none of the
+    /// official's accepted element kinds.
+    const BUILTIN_TYPES: &[&str] = &[
+        "int", "double", "num", "bool", "String", "List", "Map", "Set", "Iterable", "Object",
+        "Symbol", "Type", "Function", "Never", "Record", "Enum",
+    ];
+
+    const FORMAL_PROBLEM: &str = "The parameter name '{0}' matches a visible type name.";
+    const FORMAL_CORRECTION: &str =
+        "Try adding a name for the parameter or changing the parameter name to not match an existing type.";
+    const TYPE_PROBLEM: &str = "The type parameter name '{0}' matches a visible type name.";
+    const TYPE_CORRECTION: &str =
+        "Try changing the type parameter name to not match an existing type.";
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_types_as_parameter_names.dart`
+    /// — a parameter named like a visible type reports at the name. Three
+    /// registration faces (:42-47): formal parameter lists, catch clauses
+    /// (the exception parameter only), and type parameter lists; the two
+    /// diagnostic codes split formal vs type-parameter
+    /// (`avoidTypesAsParameterNamesFormalParameter` /
+    /// `...TypeParameter`, `diagnostic.g.dart`).
+    ///
+    /// Approximation (documented): the official resolves the name in scope
+    /// and accepts class / extension-type / type-alias / non-wildcard
+    /// type-parameter elements; the lexical face matches the dart:core
+    /// built-in type list (`BUILTIN_TYPES`), so user-declared type names
+    /// under-report. The formal faces keep the official's `hasImplicitType`
+    /// gate (:63-72 — a written type annotation opts out) and its
+    /// field-formal exclusion (:68 — `this.x`/`super.x` parameters never
+    /// report); the catch face (:49-59) applies neither. The method-type-
+    /// parameter shadow exemption (:87-98) is resolution-bound and vanishes:
+    /// built-ins resolve to classes, never to a shadowed type parameter.
+    /// Primary-constructor declaring formals (whose name creates a field,
+    /// the official `test_constructor_primary_declaring` no-hit) over-report.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_types_as_parameter_names",
+        group: Group::Core,
+        problem: FORMAL_PROBLEM,
+        correction: FORMAL_CORRECTION,
+        kinds: &[NodeKind::FormalParameter, NodeKind::TypeVariable],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::FormalParameter => check_parameter(c),
+            NodeKind::TypeVariable => check_type_variable(c),
+            _ => {}
+        }
+    }
+
+    fn check_parameter(c: &mut Check<'_>) {
+        let node = c.node();
+        let name_token = c.payload(node).get(1).copied();
+        let Some(name_token) = name_token else {
+            return;
+        };
+        let name = c.lexeme(name_token);
+        if !BUILTIN_TYPES.contains(&name) {
+            return;
+        }
+        let catch_clause = c.path.iter().rev().skip(1).take(2).any(|&ancestor| {
+            c.kind(ancestor) == NodeKind::CatchClause
+        });
+        if catch_clause {
+            // The catch face checks the exception parameter only (:49-59) —
+            // the first formal under the clause (the stack-trace parameter
+            // is never named-checked).
+            let clause = c
+                .path
+                .iter()
+                .rev()
+                .copied()
+                .find(|&ancestor| c.kind(ancestor) == NodeKind::CatchClause);
+            let Some(clause) = clause else { return };
+            let window = c.children(clause);
+            let first = (window.start..window.end)
+                .find(|&id| c.kind(id) == NodeKind::FormalParameter);
+            if first != Some(node) {
+                return;
+            }
+        } else {
+            // `hasImplicitType` (:63-72): a written type annotation (the
+            // `Type`/`FunctionType`/`RecordType` child) opts out; `NoType`
+            // marks the implicit face. Only `this.`-formals are excluded
+            // (:68 — `FieldFormalParameterElement`); a `super.`-formal is a
+            // `SuperFormalParameterElement` and keeps reporting (the
+            // official `test_super`).
+            let typed = c.collect_direct(node).into_iter().any(|kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+                )
+            });
+            let field_formal = c
+                .payload(node)
+                .first()
+                .copied()
+                .filter(|&token| token != crate::rules::NONE_TOKEN)
+                .is_some_and(|token| c.lexeme(token) == "this");
+            if typed || field_formal {
+                return;
+            }
+        }
+        report_at_token(c, name_token, FORMAL_PROBLEM, FORMAL_CORRECTION);
+    }
+
+    fn check_type_variable(c: &mut Check<'_>) {
+        let node = c.node();
+        // The name is the variable's identifier — the first Identifier-kind
+        // token of the span (a variance prefix would precede it).
+        let range = c.unit.ast.token_range(node);
+        let Some(name_token) = (range.start..range.end).find(|&t| {
+            c.unit
+                .tokens
+                .get(t as usize)
+                .is_some_and(|token| token.kind == dartq_scanner::TokenKind::Identifier)
+        }) else {
+            return;
+        };
+        if !BUILTIN_TYPES.contains(&c.lexeme(name_token)) {
+            return;
+        }
+        report_at_token(c, name_token, TYPE_PROBLEM, TYPE_CORRECTION);
+    }
+
+    /// `reportAtToken(name)` with the variant's message texts.
+    fn report_at_token(c: &mut Check<'_>, token: u32, problem: &str, correction: &str) {
+        let name = c.lexeme(token);
+        let start = utf16_start_of(c, token);
+        let end = start + name.encode_utf16().count() as u32;
+        c.report_texts(start..end, problem, correction, &[name]);
+    }
+}
+
+pub(crate) mod use_super_parameters {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::NONE_TOKEN;
+
+    /// The body-child kinds of a constructor declaration (collapse map
+    /// §3.3/§3.9).
+    const BODY_KINDS: [NodeKind; 8] = [
+        NodeKind::BlockBody,
+        NodeKind::Block,
+        NodeKind::EmptyBody,
+        NodeKind::ExpressionBody,
+        NodeKind::NoBody,
+        NodeKind::SkippedBody,
+        NodeKind::NativeFunctionBody,
+        NodeKind::InvalidFunctionBody,
+    ];
+
+    const SINGLE_PROBLEM: &str = "Parameter '{0}' could be a super parameter.";
+    const SINGLE_CORRECTION: &str = "Trying converting '{0}' to a super parameter.";
+    const MULTIPLE_PROBLEM: &str = "Parameters '{0}' could be super parameters.";
+    const MULTIPLE_CORRECTION: &str = "Trying converting '{0}' to super parameters.";
+
+    /// Official: `pkg/linter/lib/src/rules/use_super_parameters.dart:64-107`
+    /// — the last super-constructor invocation of a constructor's
+    /// initializer list decides: positional bare-identifier arguments that
+    /// name constructor parameters — unreferenced in the body, in source
+    /// order, never repeated — could be super parameters, reported on the
+    /// constructor's name range (`ConstructorDeclaration.errorRange`, the
+    /// class-name-plus-name span).
+    ///
+    /// Approximation (documented): the named-parameter conversion face
+    /// (`_checkNamedParameter`, :232-271) needs the super constructor's own
+    /// parameter list (element resolution) and the type-assignability check
+    /// (`typeSystem.isAssignableTo`, :260-266) — both out of the syntax
+    /// face, so named arguments never contribute (under-report). Body
+    /// references are name-level: every bare `Identifier` of the parameter's
+    /// name counts except property positions (`obj.a`, prefixed names) and
+    /// named-argument labels — a shadowing local of the same name
+    /// over-counts (conservative, under-reports the conversion). A same-
+    /// named field beside the parameter resolves to the parameter in the
+    /// official too, so the name match is exact there. The `super_parameters`
+    /// feature gate (shipped, :43) is always on.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_super_parameters",
+        group: Group::Recommended,
+        problem: SINGLE_PROBLEM,
+        correction: SINGLE_CORRECTION,
+        kinds: &[NodeKind::Constructor],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(parameters) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return;
+        };
+        let initializers = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::Initializers);
+        let body = kids
+            .iter()
+            .copied()
+            .filter(|&kid| BODY_KINDS.contains(&c.kind(kid)))
+            .next_back();
+        // The last super invocation decides (:79-84 — `initializers.reversed`
+        // first `SuperConstructorInvocation`).
+        let Some(super_invocation) = initializers.and_then(|list| {
+            c.collect_direct(list)
+                .into_iter()
+                .rev()
+                .find(|&init| is_super_invocation(c, init))
+        }) else {
+            return;
+        };
+        let Some(arguments) = c
+            .collect_direct(super_invocation)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Arguments)
+        else {
+            return;
+        };
+        // The parameter table in source order: `(name, index, in a named
+        // group)`. Any field formal bails the positional conversion entirely
+        // (`parameter is FieldFormalParameter → return []`, :164); any super
+        // formal is a bad state (`is SuperFormalParameter → return null`,
+        // :166) — under the name-level face both are receiver formals, and
+        // either kind present means the report never fires.
+        let mut table: Vec<(&str, usize, bool)> = Vec::new();
+        let mut index = 0usize;
+        let mut receiver_formal = false;
+        let mut collect = |param: u32, named_group: bool| {
+            if c.payload(param).first() != Some(&NONE_TOKEN) {
+                receiver_formal = true;
+                return;
+            }
+            let Some(&name_token) = c.payload(param).get(1) else {
+                return;
+            };
+            table.push((c.lexeme(name_token), index, named_group));
+            index += 1;
+        };
+        for kid in c.collect_direct(parameters) {
+            match c.kind(kid) {
+                NodeKind::FormalParameter => collect(kid, false),
+                NodeKind::OptionalFormalParameters => {
+                    let named_group = c.lexeme(c.head_token(kid)) == "{";
+                    for param in c.collect_direct(kid) {
+                        collect(param, named_group);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if receiver_formal {
+            return;
+        }
+        // Positional bare-identifier super arguments only (:150-153 — other
+        // expression shapes leave no convertible positional parameters).
+        let mut converted: Vec<&str> = Vec::new();
+        let mut matched_index = 0usize;
+        let mut seen: Vec<&str> = Vec::new();
+        for &arg in c.collect_direct(arguments).iter() {
+            if c.kind(arg) == NodeKind::NamedArgument {
+                continue;
+            }
+            if c.kind(arg) != NodeKind::Identifier {
+                return;
+            }
+            let name = c.lexeme(c.head_token(arg));
+            // Used more than once (:159-161).
+            if seen.contains(&name) {
+                return;
+            }
+            seen.push(name);
+            // An argument that names no parameter is not a formal element —
+            // a bad state (:155-156).
+            let Some((param_index, named_group)) =
+                table.iter().find(|entry| entry.0 == name).map(|e| (e.1, e.2))
+            else {
+                return;
+            };
+            if named_group {
+                // `paramPassedToSuper.isNamed → return null` (:157-158).
+                return;
+            }
+            if body.is_some_and(|body| is_referenced(c, body, name)) {
+                // `referencedParameters.contains → return []` (:169).
+                return;
+            }
+            // Out-of-order parameters leave no convertible list (:178-180).
+            if param_index < matched_index {
+                return;
+            }
+            matched_index = param_index;
+            converted.push(name);
+        }
+        if converted.is_empty() {
+            return;
+        }
+        // `ConstructorDeclaration.errorRange` (ast.dart:10801-10804): the
+        // span from the return type (the first `Identifier` child) through
+        // the constructor name (the second, when written).
+        let names: Vec<u32> = kids
+            .iter()
+            .copied()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .collect();
+        let Some(&return_type) = names.first() else {
+            return;
+        };
+        let end_token = c.unit.ast.token_range(names.get(1).copied().unwrap_or(return_type)).end - 1;
+        let range = utf16_start(c, c.head_token(return_type))..utf16_end(c, end_token);
+        // The official fills `{0}` with the bare parameter name (:93-98);
+        // the multiple form fills it with the pre-quoted
+        // `quotedAndCommaSeparatedWithAnd` list, so the rendered text
+        // carries the quotes twice — mirrored verbatim.
+        if converted.len() == 1 {
+            let name = converted[0];
+            c.report_texts(range, SINGLE_PROBLEM, SINGLE_CORRECTION, &[name]);
+        } else {
+            let joined = quoted_and_comma_separated_with_and(&converted);
+            c.report_texts(range, MULTIPLE_PROBLEM, MULTIPLE_CORRECTION, &[&joined]);
+        }
+    }
+
+    /// Whether the initializer is a super-constructor invocation: it wraps a
+    /// `super` expression (the named `super.named(...)` form stays out of
+    /// the name-level face — an identifier/dot chain beside `super` bails
+    /// through the missing bare-`Arguments`-only shape).
+    fn is_super_invocation(c: &Check<'_>, init: u32) -> bool {
+        c.kind(init) == NodeKind::Initializer
+            && c.collect_direct(init)
+                .into_iter()
+                .any(|kid| c.kind(kid) == NodeKind::SuperExpression)
+    }
+
+    /// The name-level body-reference scan: any bare `Identifier` of `name`
+    /// in `body`'s subtree, except property positions (`obj.a`, prefixed
+    /// names) and named-argument labels.
+    fn is_referenced(c: &Check<'_>, body: u32, name: &str) -> bool {
+        for kid in c.collect_direct(body) {
+            if c.kind(kid) == NodeKind::Identifier
+                && c.lexeme(c.head_token(kid)) == name
+                && !is_property_position(c, kid, body)
+            {
+                return true;
+            }
+            if is_referenced(c, kid, name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `node` sits in a non-reference identifier position under its
+    /// parent: a property name after a dot, or a named-argument label.
+    fn is_property_position(c: &Check<'_>, node: u32, root: u32) -> bool {
+        if node == root {
+            return false;
+        }
+        let Some(parent) = c.unit.ast.parent(node) else {
+            return false;
+        };
+        match c.kind(parent) {
+            NodeKind::DotAccess | NodeKind::Qualified => {
+                c.collect_direct(parent).first() != Some(&node)
+            }
+            NodeKind::NamedArgument => c.collect_direct(parent).first() == Some(&node),
+            _ => false,
+        }
+    }
+
+    /// `IterableOfStringExtension.quotedAndCommaSeparatedWithAnd`
+    /// (`pkg/analyzer/lib/src/utilities/extensions/string.dart:88-135`):
+    /// `'a'` / `'a' and 'b'` / `'a', 'b', and 'c'`.
+    fn quoted_and_comma_separated_with_and(names: &[&str]) -> String {
+        match names.len() {
+            0 => String::new(),
+            1 => format!("'{}'", names[0]),
+            2 => format!("'{}' and '{}'", names[0], names[1]),
+            _ => {
+                let mut joined = String::new();
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        joined.push_str(", ");
+                    }
+                    if i + 1 == names.len() {
+                        joined.push_str("and ");
+                    }
+                    joined.push('\'');
+                    joined.push_str(name);
+                    joined.push('\'');
+                }
+                joined
+            }
+        }
+    }
+
+    fn utf16_start(c: &Check<'_>, token: u32) -> u32 {
+        c.unit
+            .tokens
+            .get(token as usize)
+            .expect("token outside the table")
+            .utf16_offset
+    }
+
+    /// Exclusive UTF-16 end of `token`'s lexeme.
+    fn utf16_end(c: &Check<'_>, token: u32) -> u32 {
+        let start = utf16_start(c, token);
+        start + c.lexeme(token).encode_utf16().count() as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1494,5 +1917,528 @@ mod tests {
         );
         f.features.wildcard_variables = false;
         assert!(f.run(&one_rule("no_wildcard_variable_uses")).is_empty());
+    }
+
+    // —— avoid_types_as_parameter_names / use_super_parameters ————————————
+    // Fixtures over the collapse-map §3.3 contracts: the `FormalParameter`
+    // payload words (`receiver`/`name`/`init_start`/`init_end`/`kind`), the
+    // `Type`/`NoType` child, and the `Constructor` child order
+    // (`Identifier`s, `FormalParameters`, `Initializers`, body).
+
+    use dartq_ast::AstBuilder;
+    use dartq_parser::FormalParameterKind;
+
+    /// One `FormalParameter` in a `FormalParameters` wrapper: `type_at` is
+    /// the written type token or `NONE` (implicit), `receiver_at` the
+    /// `this.`/`super.` token or `NONE`.
+    fn formal(
+        b: &mut AstBuilder,
+        type_at: u32,
+        name_at: u32,
+        receiver_at: u32,
+        end_at: u32,
+    ) {
+        // The span head is the leftmost written piece: type, receiver, name.
+        let head = if type_at != NONE {
+            type_at
+        } else if receiver_at != NONE {
+            receiver_at
+        } else {
+            name_at
+        };
+        b.begin(NodeKind::FormalParameter, head);
+        b.patch(0, receiver_at);
+        b.patch(1, name_at);
+        b.patch(2, NONE);
+        b.patch(3, NONE);
+        b.patch(4, FormalParameterKind::RequiredPositional as u32);
+        if type_at == NONE {
+            b.leaf(NodeKind::NoType, name_at);
+        } else {
+            b.leaf_span(NodeKind::Type, type_at, type_at + 1);
+        }
+        b.end(NodeKind::FormalParameter, end_at);
+    }
+
+    fn avoid_hits(f: &Fixture) -> Vec<crate::engine::Lint> {
+        f.run(&one_rule("avoid_types_as_parameter_names"))
+    }
+
+    /// A built-in type name as an untyped function-typed parameter reports
+    /// with the formal message (`test_functionTypedParameter_missingName`).
+    #[test]
+    fn types_as_params_report() {
+        // v0 o1 i2 d3 f4 (5 v6 o7 i8 d9 g10 (11 int12 )13 )14
+        let f = Fixture::build("void f(void g(int)) {}", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::FormalParameters, 5);
+            formal(b, NONE, 6, NONE, 7);
+            b.end(NodeKind::FormalParameters, 8);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        let lints = avoid_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The parameter name 'int' matches a visible type name."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some(
+                "Try adding a name for the parameter or changing the parameter name to not match an existing type."
+                    .to_owned()
+            )
+        );
+        // The report sits on the name token `int` (bytes 14..17).
+        assert_eq!(lints[0].range.start, 14);
+        assert_eq!(lints[0].range.end, 17);
+    }
+
+    /// A typed parameter of the same name opts out
+    /// (`test_functionTypedParameter_noShadowing` — `hasImplicitType`).
+    #[test]
+    fn typed_parameters_pass() {
+        // The written type occupies the name slot's token in this minimal
+        // shape; the `Type` child is what the read contract keys on.
+        let f = Fixture::build("void f(void g(int)) {}", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::FormalParameters, 5);
+            formal(b, 6, 6, NONE, 7);
+            b.end(NodeKind::FormalParameters, 8);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(avoid_hits(&f).is_empty());
+    }
+
+    /// `this.`-formals are excluded (the `FieldFormalParameterElement` test,
+    /// the official `test_fieldFormalParameter_missingType`).
+    #[test]
+    fn field_formals_pass() {
+        // C0 (1 this2 .3 String4 )5
+        let f = Fixture::build("C(this.String);", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::FormalParameters, 1);
+            formal(b, NONE, 4, 2, 6);
+            b.end(NodeKind::FormalParameters, 6);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(avoid_hits(&f).is_empty());
+    }
+
+    /// `super.`-formals keep reporting (a `SuperFormalParameterElement` is
+    /// not a field formal — the official `test_super`).
+    #[test]
+    fn super_formals_report() {
+        // B0 (1 super2 .3 String4 )5
+        let f = Fixture::build("B(super.String);", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::FormalParameters, 1);
+            formal(b, NONE, 4, 2, 6);
+            b.end(NodeKind::FormalParameters, 6);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        let lints = avoid_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert!(lints[0].message.contains("'String'"));
+    }
+
+    /// The catch face checks the exception parameter only — the
+    /// stack-trace parameter never reports.
+    #[test]
+    fn catch_exception_parameter_reports() {
+        // try0 {1 }2 catch3 (4 int5 )6
+        let f = Fixture::build("try {} catch (int) {}", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::CatchClause, 3);
+            b.patch(0, NONE);
+            b.patch(1, NONE);
+            formal(b, NONE, 5, NONE, 6);
+            b.end(NodeKind::CatchClause, 7);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert_eq!(avoid_hits(&f).len(), 1);
+        // try0 {1 }2 catch3 (4 e5 ,6 int7 )8 — the second parameter.
+        let stack_trace = Fixture::build("try {} catch (e, int) {}", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::CatchClause, 3);
+            b.patch(0, NONE);
+            b.patch(1, NONE);
+            formal(b, NONE, 5, NONE, 6);
+            formal(b, NONE, 7, NONE, 8);
+            b.end(NodeKind::CatchClause, 9);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(avoid_hits(&stack_trace).is_empty());
+    }
+
+    /// The type-parameter face reports with its own message
+    /// (`test_typeParameter_function`).
+    #[test]
+    fn type_parameters_report() {
+        // v0 o1 i2 d3 f4 <5 int6 >7 — the name token sits at 3.
+        let f = Fixture::build("void f<int>() {}", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TypeVariable, 3);
+            b.patch(0, NONE);
+            b.patch(1, NONE);
+            b.end(NodeKind::TypeVariable, 4);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        let lints = avoid_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The type parameter name 'int' matches a visible type name."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try changing the type parameter name to not match an existing type.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, 7);
+        assert_eq!(lints[0].range.end, 10);
+    }
+
+    // —— use_super_parameters ————————————————————————————————————————————
+
+    fn super_hits(f: &Fixture) -> Vec<crate::engine::Lint> {
+        f.run(&one_rule("use_super_parameters"))
+    }
+
+    /// Class `A` with `A(int x);`, then the `B` constructor the rule reads.
+    /// `constructor` builds `B`'s `Constructor` node (open at the caller).
+    fn single_super_fixture(constructor: impl FnOnce(&mut AstBuilder)) -> Fixture {
+        Fixture::build(
+            "class A { A(int x); }\nclass B extends A {\n  B(int x) : super(x);\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                // —— class A ——
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                formal(b, 5, 6, NONE, 7);
+                b.end(NodeKind::FormalParameters, 7);
+                b.leaf(NodeKind::EmptyBody, 8);
+                b.end(NodeKind::Method, 9);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 11);
+                // —— class B ——
+                b.begin(NodeKind::TopLevelDeclaration, 10);
+                identifier(b, 11, 12);
+                b.begin(NodeKind::ClassDeclaration, 10);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 14);
+                b.begin(NodeKind::Constructor, 15);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 16);
+                b.patch(3, 20);
+                constructor(b);
+                b.end(NodeKind::Constructor, 26);
+                b.end(NodeKind::DeclarationBody, 26);
+                b.end(NodeKind::ClassDeclaration, 27);
+                b.end(NodeKind::TopLevelDeclaration, 27);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        )
+    }
+
+    /// `B(int x) : super(x);` — the default constructor body the fixture
+    /// builder mounts (identifier, parameters, the super invocation, empty
+    /// body).
+    fn default_b_constructor(b: &mut AstBuilder) {
+        identifier(b, 15, 16);
+        b.begin(NodeKind::FormalParameters, 16);
+        formal(b, 17, 18, NONE, 19);
+        b.end(NodeKind::FormalParameters, 19);
+        b.begin(NodeKind::Initializers, 20);
+        b.begin(NodeKind::Initializer, 21);
+        b.leaf(NodeKind::SuperExpression, 21);
+        b.begin(NodeKind::Arguments, 22);
+        identifier(b, 23, 24);
+        b.end(NodeKind::Arguments, 25);
+        b.end(NodeKind::Initializer, 25);
+        b.end(NodeKind::Initializers, 25);
+        b.leaf(NodeKind::EmptyBody, 25);
+    }
+
+    /// A single convertible positional parameter reports on the
+    /// constructor's name range (`positionalParameters_single`).
+    #[test]
+    fn super_parameter_single_reports() {
+        let f = single_super_fixture(default_b_constructor);
+        let lints = super_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Parameter 'x' could be a super parameter.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Trying converting 'x' to a super parameter.".to_owned())
+        );
+        // The error range is the constructor's `B` name token (bytes 44..45).
+        assert_eq!(lints[0].range.start, 44);
+        assert_eq!(lints[0].range.end, 45);
+    }
+
+    /// Two convertible parameters join with the official comma-and form.
+    #[test]
+    fn super_parameter_multiple_join() {
+        let f = Fixture::build(
+            "class A { A(int x, int y); }\nclass B extends A {\n  B(int x, int y) : super(x, y);\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                formal(b, 5, 6, NONE, 7);
+                formal(b, 8, 9, NONE, 10);
+                b.end(NodeKind::FormalParameters, 11);
+                b.leaf(NodeKind::EmptyBody, 11);
+                b.end(NodeKind::Method, 12);
+                b.end(NodeKind::DeclarationBody, 12);
+                b.end(NodeKind::ClassDeclaration, 13);
+                b.end(NodeKind::TopLevelDeclaration, 13);
+                b.begin(NodeKind::TopLevelDeclaration, 13);
+                identifier(b, 14, 15);
+                b.begin(NodeKind::ClassDeclaration, 13);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 17);
+                b.begin(NodeKind::Constructor, 18);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 19);
+                b.patch(3, 26);
+                identifier(b, 18, 19);
+                b.begin(NodeKind::FormalParameters, 19);
+                formal(b, 20, 21, NONE, 22);
+                formal(b, 23, 24, NONE, 25);
+                b.end(NodeKind::FormalParameters, 25);
+                b.begin(NodeKind::Initializers, 26);
+                b.begin(NodeKind::Initializer, 27);
+                b.leaf(NodeKind::SuperExpression, 27);
+                b.begin(NodeKind::Arguments, 28);
+                identifier(b, 29, 30);
+                identifier(b, 31, 32);
+                b.end(NodeKind::Arguments, 33);
+                b.end(NodeKind::Initializer, 33);
+                b.end(NodeKind::Initializers, 33);
+                b.leaf(NodeKind::EmptyBody, 33);
+                b.end(NodeKind::Constructor, 34);
+                b.end(NodeKind::DeclarationBody, 34);
+                b.end(NodeKind::ClassDeclaration, 35);
+                b.end(NodeKind::TopLevelDeclaration, 35);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        );
+        let lints = super_hits(&f);
+        assert_eq!(lints.len(), 1);
+        // The official argument fill puts the pre-quoted list into the
+        // quoted `{0}` slot, so the rendered text doubles the quotes.
+        assert_eq!(
+            lints[0].message,
+            "Parameters ''x' and 'y'' could be super parameters."
+        );
+    }
+
+    /// A body reference blocks the conversion (`_referencedParameters`).
+    #[test]
+    fn referenced_parameter_passes() {
+        let f = single_super_fixture(|b| {
+            identifier(b, 15, 16);
+            b.begin(NodeKind::FormalParameters, 16);
+            formal(b, 17, 18, NONE, 19);
+            b.end(NodeKind::FormalParameters, 19);
+            b.begin(NodeKind::Initializers, 20);
+            b.begin(NodeKind::Initializer, 21);
+            b.leaf(NodeKind::SuperExpression, 21);
+            b.begin(NodeKind::Arguments, 22);
+            identifier(b, 23, 24);
+            b.end(NodeKind::Arguments, 25);
+            b.end(NodeKind::Initializer, 25);
+            b.end(NodeKind::Initializers, 25);
+            // The body references `x` (token 23): `{ x; }`.
+            b.begin(NodeKind::BlockBody, 25);
+            b.patch(0, NONE);
+            b.patch(1, NONE);
+            b.begin(NodeKind::Block, 25);
+            b.begin(NodeKind::ExpressionStatement, 25);
+            identifier(b, 23, 24);
+            b.end(NodeKind::ExpressionStatement, 26);
+            b.end(NodeKind::Block, 26);
+            b.end(NodeKind::BlockBody, 26);
+        });
+        assert!(super_hits(&f).is_empty());
+    }
+
+    /// A `this.`-formal anywhere aborts the positional conversion
+    /// (`parameter is FieldFormalParameter → return []`).
+    #[test]
+    fn field_formal_aborts() {
+        let f = Fixture::build(
+            "class A { A(int x); }\nclass B extends A {\n  B(int x, this.y) : super(x);\n}\n",
+            |b, t| {
+                b.begin(NodeKind::CompilationUnit, 0);
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                formal(b, 5, 6, NONE, 7);
+                b.end(NodeKind::FormalParameters, 7);
+                b.leaf(NodeKind::EmptyBody, 8);
+                b.end(NodeKind::Method, 9);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 10);
+                b.end(NodeKind::TopLevelDeclaration, 11);
+                b.begin(NodeKind::TopLevelDeclaration, 10);
+                identifier(b, 11, 12);
+                b.begin(NodeKind::ClassDeclaration, 10);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 14);
+                b.begin(NodeKind::Constructor, 15);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 16);
+                b.patch(3, 24);
+                identifier(b, 15, 16);
+                b.begin(NodeKind::FormalParameters, 16);
+                formal(b, 17, 18, NONE, 19);
+                // `this.y` — the receiver token is `this`.
+                b.begin(NodeKind::FormalParameter, 20);
+                b.patch(0, 20);
+                b.patch(1, 22);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, FormalParameterKind::RequiredPositional as u32);
+                b.leaf(NodeKind::NoType, 22);
+                b.end(NodeKind::FormalParameter, 23);
+                b.end(NodeKind::FormalParameters, 23);
+                b.begin(NodeKind::Initializers, 24);
+                b.begin(NodeKind::Initializer, 25);
+                b.leaf(NodeKind::SuperExpression, 25);
+                b.begin(NodeKind::Arguments, 26);
+                identifier(b, 27, 28);
+                b.end(NodeKind::Arguments, 29);
+                b.end(NodeKind::Initializer, 29);
+                b.end(NodeKind::Initializers, 29);
+                b.leaf(NodeKind::EmptyBody, 29);
+                b.end(NodeKind::Constructor, 30);
+                b.end(NodeKind::DeclarationBody, 30);
+                b.end(NodeKind::ClassDeclaration, 31);
+                b.end(NodeKind::TopLevelDeclaration, 31);
+                b.end(NodeKind::CompilationUnit, t.len() as u32);
+            },
+        );
+        assert!(super_hits(&f).is_empty());
+    }
+
+    /// A non-identifier positional argument leaves no convertible
+    /// parameters.
+    #[test]
+    fn non_identifier_argument_passes() {
+        let f = single_super_fixture(|b| {
+            identifier(b, 15, 16);
+            b.begin(NodeKind::FormalParameters, 16);
+            formal(b, 17, 18, NONE, 19);
+            b.end(NodeKind::FormalParameters, 19);
+            b.begin(NodeKind::Initializers, 20);
+            b.begin(NodeKind::Initializer, 21);
+            b.leaf(NodeKind::SuperExpression, 21);
+            b.begin(NodeKind::Arguments, 22);
+            identifier(b, 23, 24);
+            b.leaf(NodeKind::LiteralInt, 24);
+            b.end(NodeKind::Arguments, 25);
+            b.end(NodeKind::Initializer, 25);
+            b.end(NodeKind::Initializers, 25);
+            b.leaf(NodeKind::EmptyBody, 25);
+        });
+        assert!(super_hits(&f).is_empty());
+    }
+
+    /// An argument naming a `{...}`-group parameter is a bad state
+    /// (`paramPassedToSuper.isNamed → return null`).
+    #[test]
+    fn named_group_parameter_passes() {
+        // c0 l1 a2 s3 s4 ␣5 B6 {7 ␣8 B9 (10 {11 int12 x13 }14 )15 :16
+        // super17 (18 x19 )20 ;21 ␣}22
+        let f = Fixture::build("class B {\n  B({int x}) : super(x);\n}\n", |b, t| {
+            b.begin(NodeKind::CompilationUnit, 0);
+            b.begin(NodeKind::TopLevelDeclaration, 0);
+            identifier(b, 1, 2);
+            b.begin(NodeKind::ClassDeclaration, 0);
+            b.patch(0, 0);
+            b.patch(1, NONE);
+            b.patch(2, NONE);
+            b.patch(3, NONE);
+            b.begin(NodeKind::DeclarationBody, 2);
+            b.begin(NodeKind::Constructor, 3);
+            b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+            b.patch(1, NONE);
+            b.patch(2, 4);
+            b.patch(3, 10);
+            identifier(b, 3, 4);
+            b.begin(NodeKind::FormalParameters, 4);
+            b.begin(NodeKind::OptionalFormalParameters, 5);
+            formal(b, 6, 7, NONE, 8);
+            b.end(NodeKind::OptionalFormalParameters, 8);
+            b.end(NodeKind::FormalParameters, 9);
+            b.begin(NodeKind::Initializers, 10);
+            b.begin(NodeKind::Initializer, 11);
+            b.leaf(NodeKind::SuperExpression, 11);
+            b.begin(NodeKind::Arguments, 12);
+            identifier(b, 13, 14);
+            b.end(NodeKind::Arguments, 15);
+            b.end(NodeKind::Initializer, 15);
+            b.end(NodeKind::Initializers, 15);
+            b.leaf(NodeKind::EmptyBody, 15);
+            b.end(NodeKind::Constructor, 16);
+            b.end(NodeKind::DeclarationBody, 16);
+            b.end(NodeKind::ClassDeclaration, 17);
+            b.end(NodeKind::TopLevelDeclaration, 17);
+            b.end(NodeKind::CompilationUnit, t.len() as u32);
+        });
+        assert!(super_hits(&f).is_empty());
     }
 }

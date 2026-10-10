@@ -69,7 +69,7 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the #435 release-gate seam tranche. Order is registry
+/// All rules through the #478 pure-AST tranche. Order is registry
 /// order ([`RuleId`] assignment), grouped core-first then alphabetically
 /// within each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
@@ -77,6 +77,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::empty::avoid_empty_else::SPEC,
     &crate::rules::directives::avoid_relative_lib_imports::SPEC,
     &crate::rules::types::avoid_shadowing_type_parameters::SPEC,
+    &crate::rules::names::avoid_types_as_parameter_names::SPEC,
     &crate::rules::names::camel_case_extensions::SPEC,
     &crate::rules::names::camel_case_types::SPEC,
     &crate::rules::flow::SPEC,
@@ -98,6 +99,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::flow::type_literal_in_constant_pattern::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
+    &crate::rules::regexp::valid_regexps::SPEC,
     // —— recommended (`.third/lints/lib/recommended.yaml`) ——
     &crate::rules::expressions::avoid_function_literals_in_foreach_calls::SPEC,
     &crate::rules::declarations::avoid_init_to_null::SPEC,
@@ -120,6 +122,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::collections::prefer_collection_literals::SPEC,
     &crate::rules::expressions::prefer_conditional_assignment::SPEC,
     &crate::rules::expressions::prefer_contains::SPEC,
+    &crate::rules::expressions::prefer_final_fields::SPEC,
     &crate::rules::collections::prefer_for_elements_to_map_from_iterable::SPEC,
     &crate::rules::declarations::prefer_function_declarations_over_variables::SPEC,
     &crate::rules::expressions::prefer_if_null_operators::SPEC,
@@ -143,9 +146,11 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::declarations::unnecessary_nullable_for_final_variable_declarations::SPEC,
     &crate::rules::expressions::unnecessary_this::SPEC,
     &crate::rules::strings::unnecessary_string_escapes::SPEC,
+    &crate::rules::strings::unnecessary_string_interpolations::SPEC,
     &crate::rules::declarations::type_init_formals::SPEC,
     &crate::rules::collections::unnecessary_to_list_in_spreads::SPEC,
     &crate::rules::declarations::use_function_type_syntax_for_parameters::SPEC,
+    &crate::rules::names::use_super_parameters::SPEC,
     &crate::rules::flow::use_rethrow_when_possible::SPEC,
 ];
 
