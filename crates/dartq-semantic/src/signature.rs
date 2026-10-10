@@ -16,7 +16,8 @@
 //!   entries are skipped — declaration-scoped, not a library face, matching
 //!   the library-graph feeding rule);
 //! * every named container: kind, type-parameter count, `sealed`, superclass
-//!   name, interface names, enum constants **in declaration order** (the
+//!   name, the `with`/`on`/`implements` clause lists, enum constants **in
+//!   declaration order** (the
 //!   exhaustiveness witness order is semantic), and every member with its
 //!   full executable shape;
 //! * the merged extension-member pool.
@@ -237,6 +238,16 @@ impl<'a> Face<'a> {
         } else {
             "instance"
         });
+        self.field(if entry.is_abstract {
+            "abstract"
+        } else {
+            "concrete"
+        });
+        self.field(if entry.is_external {
+            "external"
+        } else {
+            "local"
+        });
         self.uint(u64::from(entry.type_params));
         for param in &entry.type_param_names {
             self.name(*param);
@@ -305,7 +316,9 @@ impl<'a> Face<'a> {
                 members,
                 type_params,
                 sealed,
-                interfaces,
+                with_clause,
+                implements_clause,
+                on_clause,
                 enum_constants,
                 constructors,
                 has_unnamed_constructor,
@@ -325,9 +338,19 @@ impl<'a> Face<'a> {
                 Some(superclass) => self.name(*superclass),
                 None => self.field("no-superclass"),
             }
-            self.usize(interfaces.len());
-            for interface in interfaces {
-                self.name(*interface);
+            // Clause lists in fixed order (with, on, implements), each in
+            // written declaration order.
+            self.usize(with_clause.len());
+            for supertype in with_clause {
+                self.name(*supertype);
+            }
+            self.usize(on_clause.len());
+            for supertype in on_clause {
+                self.name(*supertype);
+            }
+            self.usize(implements_clause.len());
+            for supertype in implements_clause {
+                self.name(*supertype);
             }
             self.usize(enum_constants.len());
             for constant in enum_constants {

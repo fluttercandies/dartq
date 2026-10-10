@@ -97,8 +97,11 @@ struct OpenContainer {
     type_params: u16,
     /// The `sealed` modifier was present on the class header.
     sealed: bool,
-    /// The header's `with`/`implements` type names, in written order.
-    interfaces: Vec<StringId>,
+    /// The header's clause type names, per clause family and in written
+    /// order (the `with`/`implements`/`on` split).
+    with_clause: Vec<StringId>,
+    implements_clause: Vec<StringId>,
+    on_clause: Vec<StringId>,
     /// The enum's constants in declaration order.
     enum_constants: Vec<StringId>,
     /// The named constructor selectors declared so far, and whether an
@@ -115,12 +118,24 @@ struct CtorCapture {
     has_unnamed: bool,
 }
 
+/// The clause family a buffered header-window name belongs to; the parser's
+/// clause-boundary events (`handle_class_with_clause` /
+/// `handle_enum_with_clause` / `handle_mixin_on` / `handle_implements`)
+/// decide it.
+enum HeaderClause {
+    With,
+    Implements,
+    On,
+}
+
 /// A class member executable between `begin_method` and `end_method`.
 struct PendingMember {
     /// Lookup spelling, kind, and the name token's span; `None` when the name
     /// is unrecoverable.
     shape: Option<(StringId, MemberKind, SourceRange)>,
     is_static: bool,
+    /// The `external` modifier was present.
+    is_external: bool,
     type_params: u16,
     /// The member's own type-parameter names, in declaration order.
     type_param_names: Vec<StringId>,
@@ -153,8 +168,14 @@ struct Builder<'src, 'tab> {
     /// A class-family header is open (`with`/`implements` type names route
     /// to [`Builder::header_interfaces`]).
     in_class_header: bool,
-    /// The buffered `with`/`implements` type names of the open header.
+    /// The header type names buffered since the last clause boundary; the
+    /// clause events (`handle_class_with_clause` / `handle_mixin_on` /
+    /// `handle_implements`, ...) drain it into the matching clause list.
     header_interfaces: Vec<StringId>,
+    /// The open field group's `abstract`/`external` modifiers (`begin_fields`
+    /// latches, `end_fields` clears).
+    field_abstract: bool,
+    field_external: bool,
     /// The current field group's static bit (`None` = no group open).
     field_static: Option<bool>,
     pending_member: Option<PendingMember>,
@@ -210,6 +231,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             containers: Vec::new(),
             in_class_header: false,
             header_interfaces: Vec::new(),
+            field_abstract: false,
+            field_external: false,
             field_static: None,
             pending_member: None,
             pending_top: None,
@@ -328,7 +351,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             members: FxHashMap::default(),
             type_params: header_type_params,
             sealed: false,
-            interfaces: Vec::new(),
+            with_clause: Vec::new(),
+            implements_clause: Vec::new(),
+            on_clause: Vec::new(),
             enum_constants: Vec::new(),
             ctor_named: Vec::new(),
             ctor_has_unnamed: true,
@@ -372,7 +397,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 members,
                 type_params: open.type_params,
                 sealed: open.sealed,
-                interfaces: open.interfaces,
+                with_clause: open.with_clause,
+                implements_clause: open.implements_clause,
+                on_clause: open.on_clause,
                 enum_constants: open.enum_constants,
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor: open.ctor_has_unnamed,
@@ -392,18 +419,35 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Ends the declaration-header window (`handle_class_header` /
-    /// `handle_enum_header` / `handle_mixin_header`): the buffered
-    /// `with`/`implements`/`on` names join the open container.
+    /// `handle_enum_header` / `handle_mixin_header`): residue joins the
+    /// container's `implements` list. The clause events normally drain the
+    /// window first, so what reaches here is recovery residue — plus a
+    /// named mixin application's `implements` names (its header close fires
+    /// no `handle_implements` event).
     fn end_header_window(&mut self) {
         self.in_class_header = false;
         let buffered = std::mem::take(&mut self.header_interfaces);
         if let Some(open) = self.containers.last_mut() {
-            open.interfaces.extend(buffered);
+            open.implements_clause.extend(buffered);
         }
     }
 
-    /// Buffers one header `with`/`implements` type name (declarations.rs
-    /// :1129-1172): subclass-edge sources toward sealed supertypes.
+    /// Drains the names buffered since the last clause boundary into the
+    /// open container's `which` clause list (the parser fires a boundary
+    /// event after each clause's type list).
+    fn commit_header_clause(&mut self, which: HeaderClause) {
+        let buffered = std::mem::take(&mut self.header_interfaces);
+        if let Some(open) = self.containers.last_mut() {
+            match which {
+                HeaderClause::With => open.with_clause.extend(buffered),
+                HeaderClause::Implements => open.implements_clause.extend(buffered),
+                HeaderClause::On => open.on_clause.extend(buffered),
+            }
+        }
+    }
+
+    /// Buffers one header clause type name (declarations.rs:1129-1172); the
+    /// clause-boundary events later decide the family it belongs to.
     fn buffer_header_interface(&mut self, name: Option<StringId>) {
         if let Some(name) = name {
             self.header_interfaces.push(name);
@@ -782,7 +826,33 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn handle_named_mixin_application_with_clause(&mut self, _with: Token) {
         // The head type fired between `begin_named_mixin_application` and
         // this event; the `with` list itself is not the superclass.
-        self.builder.borrow_mut().commit_super_candidate();
+        let mut builder = self.builder.borrow_mut();
+        builder.commit_super_candidate();
+        builder.commit_header_clause(HeaderClause::With);
+    }
+
+    fn handle_class_with_clause(&mut self, _with_keyword: Token) {
+        self.builder
+            .borrow_mut()
+            .commit_header_clause(HeaderClause::With);
+    }
+
+    fn handle_enum_with_clause(&mut self, _with_keyword: Token) {
+        self.builder
+            .borrow_mut()
+            .commit_header_clause(HeaderClause::With);
+    }
+
+    fn handle_mixin_on(&mut self, _on: Option<Token>, _count: usize) {
+        self.builder
+            .borrow_mut()
+            .commit_header_clause(HeaderClause::On);
+    }
+
+    fn handle_implements(&mut self, _implements: Option<Token>, _count: usize) {
+        self.builder
+            .borrow_mut()
+            .commit_header_clause(HeaderClause::Implements);
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
@@ -841,6 +911,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if let Some((name, range)) = name_with_range {
                     let ty = builder.field_group_ty();
                     let is_static = builder.field_static.unwrap_or(false);
+                    let is_abstract = builder.field_abstract;
+                    let is_external = builder.field_external;
                     if context == IdentifierContext::TopLevelVariableDeclaration {
                         builder.declare_top(
                             name,
@@ -859,6 +931,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
                                     is_static,
+                                    is_abstract,
+                                    is_external,
                                     type_params: 0,
                                     type_param_names: Box::default(),
                                     var_ty: ty,
@@ -892,6 +966,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             slot.insert(MemberEntry {
                                 kind: MemberKind::Field,
                                 is_static: true,
+                                is_abstract: false,
+                                is_external: false,
                                 type_params: 0,
                                 type_param_names: Box::default(),
                                 var_ty: Ty::UNKNOWN,
@@ -974,6 +1050,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     ) {
         let mut builder = self.builder.borrow_mut();
         builder.field_static = Some(static_kw.is_some());
+        builder.field_abstract = _abstract_kw.is_some();
+        builder.field_external = _external_kw.is_some();
     }
 
     fn end_fields(
@@ -994,6 +1072,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
+        builder.field_abstract = false;
+        builder.field_external = false;
     }
 
     fn end_top_level_fields(
@@ -1013,6 +1093,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
+        builder.field_abstract = false;
+        builder.field_external = false;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1036,6 +1118,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.pending_member = Some(PendingMember {
             shape,
             is_static: static_kw.is_some(),
+            is_external: _external_kw.is_some(),
             type_params: 0,
             type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
@@ -1063,6 +1146,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 let entry = MemberEntry {
                     kind,
                     is_static: pending.is_static,
+                    is_abstract: false,
+                    is_external: pending.is_external,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,

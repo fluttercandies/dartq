@@ -120,6 +120,8 @@ pub struct PersistedFormals {
 pub struct PersistedMemberEntry {
     pub kind: PersistedMemberKind,
     pub is_static: bool,
+    pub is_abstract: bool,
+    pub is_external: bool,
     pub type_params: u16,
     pub type_param_names: Vec<u32>,
     pub var_ty: PersistedTy,
@@ -134,7 +136,9 @@ pub struct PersistedContainer {
     pub members: Vec<(u32, PersistedMemberEntry)>,
     pub type_params: u16,
     pub sealed: bool,
-    pub interfaces: Vec<u32>,
+    pub with_clause: Vec<u32>,
+    pub implements_clause: Vec<u32>,
+    pub on_clause: Vec<u32>,
     pub enum_constants: Vec<u32>,
     pub constructors: Vec<u32>,
     pub has_unnamed_constructor: bool,
@@ -242,6 +246,8 @@ impl<'a> Slice<'a> {
                 MemberKind::Field => PersistedMemberKind::Field,
             },
             is_static: entry.is_static,
+            is_abstract: entry.is_abstract,
+            is_external: entry.is_external,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
             var_ty: self.ty(&entry.var_ty),
@@ -443,7 +449,9 @@ impl PersistedContainer {
                 .collect(),
             type_params: container.type_params,
             sealed: container.sealed,
-            interfaces: s.ids(&container.interfaces),
+            with_clause: s.ids(&container.with_clause),
+            implements_clause: s.ids(&container.implements_clause),
+            on_clause: s.ids(&container.on_clause),
             enum_constants: s.ids(&container.enum_constants),
             constructors: s.ids(&container.constructors),
             has_unnamed_constructor: container.has_unnamed_constructor,
@@ -467,7 +475,13 @@ impl PersistedContainer {
                 .collect(),
             type_params: self.type_params,
             sealed: self.sealed,
-            interfaces: self.interfaces.iter().map(|&at| ids[at as usize]).collect(),
+            with_clause: self.with_clause.iter().map(|&at| ids[at as usize]).collect(),
+            implements_clause: self
+                .implements_clause
+                .iter()
+                .map(|&at| ids[at as usize])
+                .collect(),
+            on_clause: self.on_clause.iter().map(|&at| ids[at as usize]).collect(),
             enum_constants: self
                 .enum_constants
                 .iter()
@@ -493,6 +507,8 @@ impl PersistedMemberEntry {
                 PersistedMemberKind::Field => MemberKind::Field,
             },
             is_static: self.is_static,
+            is_abstract: self.is_abstract,
+            is_external: self.is_external,
             type_params: self.type_params,
             type_param_names: self
                 .type_param_names
@@ -552,6 +568,8 @@ mod tests {
         let member = |text: &str| MemberEntry {
             kind: MemberKind::Method,
             is_static: false,
+            is_abstract: false,
+            is_external: false,
             type_params: 1,
             type_param_names: Box::new([name(text)]),
             var_ty: Ty::Unknown,
@@ -597,7 +615,9 @@ mod tests {
                     .collect(),
                 type_params: 2,
                 sealed: true,
-                interfaces: vec![name("I")],
+                with_clause: Vec::new(),
+                implements_clause: vec![name("I")],
+                on_clause: Vec::new(),
                 enum_constants: Vec::new(),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,

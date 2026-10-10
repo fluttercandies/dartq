@@ -740,9 +740,12 @@ struct Engine<'a> {
     pending_decl_ty: Option<Ty>,
     /// Per open type-argument group: the type head it belongs to, when the
     /// group follows a type-annotation identifier (`C<int> x`, `const
-    /// C<int>()`, `p.C<int>`). A group without a head belongs to an
-    /// expression (`g<int>()`, `g<int>`).
-    group_heads: Vec<Option<(StringId, SourceRange)>>,
+    /// C<int>()`, `p.C<int>`), plus the row-stack height at `<` — the rows
+    /// pushed inside the group are its own type arguments (unresolved ones
+    /// report as `TypeUse` rows), so the head the group applies to sits at
+    /// `base - 1`. A headless group belongs to an expression (`g<int>()`,
+    /// `g<int>`).
+    group_heads: Vec<(Option<(StringId, SourceRange)>, usize)>,
     /// The type head awaiting its group (`C` of `C<int>`), armed at the
     /// identifier and moved into `group_heads` at `begin_type_arguments`.
     pending_type_head: Option<(StringId, SourceRange)>,
@@ -801,6 +804,12 @@ struct Engine<'a> {
     non_type_pos: u32,
     /// Suppression depth inside `new`/`const`/implicit-creation expressions.
     ctor_pos: u32,
+    /// The open constructor reference's segments `(class, ctor-selector)`:
+    /// the wave-3 parser emits reference heads as `ConstructorReference`
+    /// type uses (resolved names push no row), so the reference's
+    /// type-argument group is matched to its head through this state
+    /// instead of the row stack. Cleared at `end_constructor_reference`.
+    creation_ref: Option<(StringId, Option<StringId>)>,
     /// Interned reserved-member spellings (populated once in [`Engine::new`]:
     /// the hot `resolve_bare` path compares ids, never re-interns).
     object_members: [StringId; OBJECT_MEMBERS.len()],
@@ -939,6 +948,7 @@ impl<'a> Engine<'a> {
             type_prefix: None,
             non_type_pos: 0,
             ctor_pos: 0,
+            creation_ref: None,
             object_members,
             enum_synth_members,
             builtin_types,
@@ -1997,20 +2007,49 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.get(callee) else {
             return;
         };
-        let declared = match &row.shape {
+        let name = row.name;
+        let qualified = row.qualified;
+        let shape = row.shape.clone();
+        if let RowShape::Bare(BareInfo::Container {
+            name,
+            kind: ContainerKind::Extension,
+        }) = &shape
+        {
+            // An explicit extension override reached through the send
+            // (`Ex<int>(list)`) — the group's deferred check dispatches by
+            // shape here (`extension_member_resolver.dart:380`).
+            return self.check_extension_arity(*name, count, range);
+        }
+        let declared = match &shape {
+            // The wave-3 member shape: the send closes before the
+            // dot-access event merges `receiver.name`, so the callee is an
+            // unmerged member placeholder (qualified, unresolved) with the
+            // receiver row directly below — classify the receiver and walk
+            // its members (`c.m<D>()` reports `m`).
+            RowShape::Bare(BareInfo::Plain { .. }) if qualified => {
+                let recv = callee.checked_sub(1).and_then(|i| self.rows.get(i)).map_or(
+                    Receiver::Unknown,
+                    |below| match &below.shape {
+                        RowShape::Bare(info) => Engine::receiver_of_bare(*info),
+                        RowShape::Receiver(recv) => *recv,
+                        _ => Receiver::Unknown,
+                    },
+                );
+                self.member_exec_arity(&recv, name)
+            }
             // A top-level function (`g<int>()`); only real functions carry a
             // parameter list — getters stay silent.
             RowShape::Bare(BareInfo::Plain { .. }) => self
-                .top_level_decl(row.name)
+                .top_level_decl(name)
                 .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
                 .map(|d| (d.type_params, ExecKind::Function)),
-            RowShape::Member { recv } => self.member_exec_arity(recv, row.name),
+            RowShape::Member { recv } => self.member_exec_arity(recv, name),
             _ => None,
         };
         if let Some((declared, kind)) = declared
             && declared != count
         {
-            let name_text = self.strings.resolve(row.name).to_string();
+            let name_text = self.strings.resolve(name).to_string();
             self.emit4(
                 SemanticCode::WrongNumberOfTypeArgumentsElement(kind),
                 range,
@@ -2077,15 +2116,13 @@ impl<'a> Engine<'a> {
     /// M1 cannot name (the getter kind word, the `_function` type display) —
     /// suppress.
     fn consume_type_argument_application(&mut self) {
-        let callee = self.rows.len().checked_sub(1);
-        let Some(pos) = callee.and_then(|callee| {
-            self.deferred_args
-                .iter()
-                .position(|(row, _, _)| *row == callee)
-        }) else {
+        // The application applies to the most recent expression group —
+        // its head row was resolved at `end_type_arguments` through the
+        // group's base mark, so the group's own `TypeUse` rows above it
+        // never hide the entry (LIFO, as in [`Engine::end_implicit_creation`]).
+        let Some((row_index, count, range)) = self.deferred_args.pop() else {
             return;
         };
-        let (row_index, count, range) = self.deferred_args.remove(pos);
         let Some(row) = self.rows.get(row_index) else {
             return;
         };
@@ -2282,12 +2319,10 @@ impl<'a> Engine<'a> {
         };
         // A type head makes the group an annotation or a creation type
         // reference.
-        match self.group_heads.pop() {
-            Some(Some((head, _head_range))) => {
-                self.check_annotation_arity(head, count, range);
-                return;
-            }
-            Some(None) | None => {}
+        let (head, base) = self.group_heads.pop().unwrap_or((None, 0));
+        if let Some((head, _head_range)) = head {
+            self.check_annotation_arity(head, count, range);
+            return;
         }
         // An enum constant's constructor arguments (`a<int>()`).
         if let Some(declared) = self.in_enum_element
@@ -2300,6 +2335,35 @@ impl<'a> Engine<'a> {
                 &count.to_string(),
                 "",
             );
+            return;
+        }
+        // The wave-3 constructor-reference shape, checked before the row
+        // stack: reference heads fire as `ConstructorReference` type uses
+        // (a resolved name pushes no row, so the stack may be empty) — the
+        // reference's own group matches through `creation_ref`. `C<int>`
+        // checks the class face (base code); `C.named<int>` reports
+        // `_constructor` for any count (constructors never declare type
+        // parameters; the class face must resolve — a missing class already
+        // reports `undefined_class`).
+        if self.ctor_pos > 0
+            && let Some((class, ctor)) = self.creation_ref
+        {
+            match ctor {
+                Some(ctor) => {
+                    if !matches!(self.resolve_bare(class), BareInfo::Missing { .. }) {
+                        let class = self.strings.resolve(class).to_string();
+                        let ctor = self.strings.resolve(ctor).to_string();
+                        self.emit3(
+                            SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+                            range,
+                            &class,
+                            &ctor,
+                            "",
+                        );
+                    }
+                }
+                None => self.check_annotation_arity(class, count, range),
+            }
             return;
         }
         let Some(callee) = self.rows.len().checked_sub(1) else {
@@ -2348,19 +2412,7 @@ impl<'a> Engine<'a> {
                     // Explicit extension override `Ext<int>(list)` — any
                     // arity mismatch reports at the group
                     // (`extension_member_resolver.dart:380`).
-                    let name = *name;
-                    if let Some(declared) = self.declared_type_params_of_container(name)
-                        && declared != count
-                    {
-                        let name_text = self.strings.resolve(name).to_string();
-                        self.emit3(
-                            SemanticCode::WrongNumberOfTypeArgumentsExtension,
-                            range,
-                            &name_text,
-                            &declared.to_string(),
-                            &count.to_string(),
-                        );
-                    }
+                    self.check_extension_arity(*name, count, range);
                 }
                 RowShape::Bare(BareInfo::Container { name, .. }) => {
                     let name = *name;
@@ -2374,11 +2426,34 @@ impl<'a> Engine<'a> {
             }
             return;
         }
-        if matches!(
-            self.rows[callee].shape,
-            RowShape::Bare(_) | RowShape::Member { .. }
-        ) {
-            self.deferred_args.push((callee, count, range));
+        // The head row the group applies to is the last row pushed before
+        // `<` (`base - 1`); rows pushed inside the group are its own type
+        // arguments — unresolved ones are `TypeUse` rows. An unresolved head
+        // pushes its own `TypeUse` row, which the deferred checks then
+        // ignore; a row from an older expression never matches.
+        let Some(target) = base.checked_sub(1).and_then(|i| self.rows.get(i)) else {
+            return;
+        };
+        if matches!(target.shape, RowShape::Bare(_) | RowShape::Member { .. }) {
+            self.deferred_args.push((base - 1, count, range));
+        }
+    }
+
+    /// The explicit extension override's type-argument check
+    /// (`extension_member_resolver.dart:380`): any arity mismatch reports
+    /// `_extension` at the group.
+    fn check_extension_arity(&mut self, name: StringId, count: u16, range: SourceRange) {
+        if let Some(declared) = self.declared_type_params_of_container(name)
+            && declared != count
+        {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit3(
+                SemanticCode::WrongNumberOfTypeArgumentsExtension,
+                range,
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
         }
     }
 
@@ -4832,6 +4907,14 @@ impl ParserListener for DiagnoseListener<'_> {
             C::ConstructorReference => {
                 if let Some(name) = name {
                     engine.push_type_use(name, token.range, TypeHead::Bare);
+                    engine.creation_ref = Some((name, None));
+                }
+            }
+            C::ConstructorReferenceContinuation => {
+                if let Some(name) = name
+                    && let Some(r) = engine.creation_ref.as_mut()
+                {
+                    r.1 = Some(name);
                 }
             }
             C::LocalVariableDeclaration => {
@@ -5656,7 +5739,8 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_type_arguments(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
         let head = engine.pending_type_head.take();
-        engine.group_heads.push(head);
+        let base = engine.rows.len();
+        engine.group_heads.push((head, base));
     }
 
     fn end_type_arguments(&mut self, count: usize, begin: Token, end: Token) {
@@ -5922,9 +6006,14 @@ impl ParserListener for DiagnoseListener<'_> {
         _end: Token,
         context: ConstructorReferenceContext,
     ) {
+        let mut engine = self.engine.borrow_mut();
         if context == ConstructorReferenceContext::Const {
-            self.engine.borrow_mut().arm_const_ctor_gate(start);
+            engine.arm_const_ctor_gate(start);
         }
+        // The reference closed — its segments stop matching type-argument
+        // groups (a plain invocation's group inside `new C(...)`'s
+        // arguments must not).
+        engine.creation_ref = None;
     }
 
     fn begin_await_expression(&mut self, token: Token) {
@@ -6436,7 +6525,9 @@ impl NameWorld<'_> {
         if let Some(superclass) = container.superclass {
             edges.push(superclass);
         }
-        edges.extend(container.interfaces.iter().copied());
+        edges.extend(container.with_clause.iter().copied());
+        edges.extend(container.implements_clause.iter().copied());
+        edges.extend(container.on_clause.iter().copied());
         edges
     }
 
@@ -6495,7 +6586,10 @@ impl NameWorld<'_> {
             let Some(declared) = self.container(decl) else {
                 continue;
             };
-            let edge = declared.superclass == Some(name) || declared.interfaces.contains(&name);
+            let edge = declared.superclass == Some(name)
+                || declared.with_clause.contains(&name)
+                || declared.implements_clause.contains(&name)
+                || declared.on_clause.contains(&name);
             if edge {
                 subtypes.push(NameTy::Named(decl, false));
             }
@@ -7262,19 +7356,15 @@ mod tests {
     /// A creation type reference reports the base code too
     /// (oracle `test_const_nonGeneric`).
     ///
-    /// Hand-trace: `const` raises `ctor_pos`; `C` fires `Expression` (a
-    /// creation head, never a type reference) resolving as a container; the
-    /// group's head slot is empty and the `ctor_pos` branch checks the
-    /// container's count (0) against 1 → base code. `new C()` stays silent.
+    /// Wave-3 event shape: `C` fires `ConstructorReference` inside the
+    /// `const` context (a resolved head pushes no row), so the group checks
+    /// the class face through `creation_ref` — declared count (0) against 1
+    /// → base code at the group. `new C()` stays silent.
     ///
-    /// RED (parser gap, #339): the `const` statement probe
-    /// (`parse_expression_statement_or_const_declaration` →
-    /// `compute_type`) consumes `C<A>` as a declaration type, so
-    /// `const C<A>();` parses as a const-declaration head instead of a
-    /// const-creation expression — the engine receives no creation head or
-    /// type-argument events at all (observed output: `[]`). Un-reds when
-    /// `compute_type` refuses the `Type<args>(` shape in expression-statement
-    /// context (the official `(`-follower veto).
+    /// Oracle (single-file `dart analyze --format=machine` run): the same
+    /// fixture also reports `const_with_non_const` on the `const` keyword —
+    /// outside the modeled subset (the `const_with_non_const*` family is
+    /// deferred), so the modeled report is the base code alone.
     #[test]
     fn creation_arity_reports_base_code() {
         let report = report("class A {} class C {} void f() { new C(); const C<A>(); }");
@@ -7288,11 +7378,16 @@ mod tests {
     /// Type arguments on a named constructor segment report `_constructor`:
     /// constructors never declare type parameters (`ast_rewrite.dart:549`).
     ///
-    /// Hand-trace: `parse_constructor_reference` keeps `C` and `named`
-    /// unmerged on the row stack (no dot event inside the reference), so the
-    /// `ctor_pos` branch sees two bare rows — the class face (a resolved
-    /// class container) then the segment — and reports the pair. `D`
-    /// resolves, so no other code fires.
+    /// Wave-3 event shape: `C` fires `ConstructorReference` and `named`
+    /// fires `ConstructorReferenceContinuation` — both land in
+    /// `creation_ref` (resolved heads push no rows), so the group reports
+    /// the `(class, ctor)` pair for any count while the class face
+    /// resolves. `D` resolves, so no other code fires.
+    ///
+    /// Oracle (single-file `dart analyze --format=machine` run):
+    /// `WRONG_NUMBER_OF_TYPE_ARGUMENTS_CONSTRUCTOR` on `<D>` —
+    /// "The constructor 'C.named' doesn't have type parameters." — the only
+    /// diagnostic; matched exactly.
     #[test]
     fn named_constructor_type_args_report_constructor_code() {
         let report = report("class D {} class C { C.named(); } void f() { new C.named<D>(); }");
@@ -7351,18 +7446,17 @@ mod tests {
     /// An invoked generic member method reports `_element` with the `method`
     /// kind word through the send path.
     ///
-    /// Hand-trace: `c.m<D>()` keeps a normal send (dot access, not an
-    /// implicit creation): the group defers, `consume_send` matches the
-    /// deferred entry to `m`'s callee row, and the member walk finds `m`'s
-    /// declared count (2) → `_element`/`method`. `c`'s declared type comes
-    /// from the formal binding.
+    /// Wave-3 event shape: the send closes with the group deferred against
+    /// `m`'s unmerged member placeholder row, and only then does the
+    /// dot-access event merge `c.m` — the deferred check classifies the
+    /// receiver from the row below the placeholder and walks `C`'s members,
+    /// finding `m` with 2 type parameters against the given 1. `D`
+    /// resolves, so no other code fires.
     ///
-    /// RED (parser gap, #339): the statement declaration-probe's
-    /// `compute_type` consumes `c.m<D>` as a (prefixed, parameterized) type,
-    /// so `c.m<D>();` parses as a declaration head — the engine sees a
-    /// missing type use (`undefined_class`) and no send/type-argument
-    /// events. Un-reds when `compute_type` stops at the `.` of an
-    /// expression-statement head (`c.` can never open a declaration).
+    /// Oracle (single-file `dart analyze --format=machine` run):
+    /// `WRONG_NUMBER_OF_TYPE_ARGUMENTS_ELEMENT` on `<D>` — "The method 'm'
+    /// is declared with 2 type parameters, but 1 type arguments are
+    /// given." — the only diagnostic; matched exactly.
     #[test]
     fn member_invocation_arity_reports_element_method() {
         let report = report("class D {} class C { void m<T, U>() {} } void f(C c) { c.m<D>(); }");
@@ -7421,45 +7515,57 @@ mod tests {
     /// `_element` naming `call` with the `method` kind word (the oracle's
     /// `_getCallMethod` resolves the `call` method element).
     ///
-    /// Hand-trace: `c`'s row snapshots its declared type `C`; the
-    /// application event walks `C.call`, finds a method with 1 type
-    /// parameter, and checks it against the given 2.
+    /// Wave-3 event shape: the statement parses as a send closed at `<`
+    /// followed by a real type-argument group and its application event —
+    /// the group defers against the row at the group's base mark (`c`'s,
+    /// below its own `TypeUse` argument rows), and the application walks
+    /// `C.call`, finding a method with 1 type parameter against the given
+    /// 2.
     ///
-    /// RED (parser gap, #339): `c<A, A>;` in statement position has no
-    /// declaration shape, but the `<` group is not rescanned as type
-    /// arguments either — the statement parses as relational operators
-    /// (`c < A`, `,`, `A >` …), producing `undefined_class` ×2,
-    /// `undefined_operator`, `undefined_identifier`. Same family as
-    /// `function_reference_arity` (the `<A, A>` complex-group scan in
-    /// expression context). Un-reds with the same parser fix.
+    /// Oracle (single-file `dart analyze --format=machine` run): the same
+    /// fixture reports `WRONG_NUMBER_OF_TYPE_ARGUMENTS_ELEMENT` on
+    /// `<A, A>` followed by `NON_TYPE_AS_TYPE_ARGUMENT` ×2 on the `A`
+    /// arguments (this fixture defines no `A`). The type-argument miss code
+    /// is outside the modeled subset — the rows report the modeled
+    /// stand-in `undefined_class` — so the modeled report is the element
+    /// code then the two stand-ins, in the oracle's order.
     #[test]
     fn implicit_call_reference_reports_element_call() {
         let report = report("class C { T call<T>(T x) => x; } void f(C c) { c<A, A>; }");
         assert_eq!(
             code_names(&report),
-            ["wrong_number_of_type_arguments_element"]
+            [
+                "wrong_number_of_type_arguments_element",
+                "undefined_class",
+                "undefined_class",
+            ]
         );
         assert_eq!(
             report.diagnostics[0].message,
             "The method 'call' is declared with 1 type parameters, but 2 type arguments are given."
         );
+        // The group span `<A, A>`, then the two argument names.
+        assert_eq!(report.diagnostics[0].range.offset, 48);
+        assert_eq!(report.diagnostics[0].range.length, 6);
+        assert_eq!(report.diagnostics[1].range.offset, 49);
+        assert_eq!(report.diagnostics[1].range.length, 1);
+        assert_eq!(report.diagnostics[2].range.offset, 52);
+        assert_eq!(report.diagnostics[2].range.length, 1);
     }
 
     /// An explicit extension override with mismatched type arguments reports
     /// `_extension` (`extension_member_resolver.dart:380`).
     ///
-    /// Hand-trace: `Ex<A>(a)` parses as an implicit creation; the group's
-    /// `ctor_pos` branch resolves `Ex` as an extension container and checks
-    /// its declared count (0) against 1 immediately. The trailing `(a)` runs
-    /// under `ctor_pos` (callee `None`) and stays silent.
+    /// Wave-3 event shape: `Ex<A>(a);` parses as a plain invocation — no
+    /// implicit-creation events — so the group defers against `Ex`'s
+    /// container row and the send's deferred check dispatches the extension
+    /// face: declared count (0) against 1, reported at the group. The
+    /// trailing `(a)` stays silent.
     ///
-    /// RED (parser gap, #339): the statement declaration-probe's
-    /// `compute_type` consumes `Ex<A>` as a parameterized type and the `(`
-    /// follower reads as an invocation-headed declaration, so the statement
-    /// parses as a declaration head — no identifier, type-argument, or
-    /// creation events reach the engine (observed output: `[]`). Un-reds
-    /// with the same `Type<args>(` expression-statement veto as
-    /// `creation_arity`.
+    /// Oracle (single-file `dart analyze --format=machine` run): the same
+    /// fixture also reports `extension_override_without_access` on
+    /// `Ex<A>(a)` — outside the modeled subset, so the modeled report is
+    /// `_extension` alone.
     #[test]
     fn extension_override_arity_reports_extension_code() {
         let report = report("class A {} extension Ex on A {} void f(A a) { Ex<A>(a); }");

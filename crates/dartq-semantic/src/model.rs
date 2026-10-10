@@ -249,6 +249,10 @@ pub struct MemberEntry {
     pub kind: MemberKind,
     /// `static` member (enum constants are static).
     pub is_static: bool,
+    /// The `abstract` modifier was present (abstract fields).
+    pub is_abstract: bool,
+    /// The `external` modifier was present (external members).
+    pub is_external: bool,
     /// The member's own type parameters (`void m<T>()`); 0 when absent.
     pub type_params: u16,
     /// The member's own type-parameter names, in declaration order (the
@@ -281,9 +285,14 @@ pub struct Container {
     /// The `sealed` modifier was present (the exhaustiveness splitter,
     /// `types/sealed.dart`).
     pub sealed: bool,
-    /// The `with`/`implements` type names as written (subclass-edge sources
-    /// toward sealed supertypes).
-    pub interfaces: Vec<StringId>,
+    /// The `with` mixin-application names as written (class/enum application
+    /// order; a named mixin application's `with` list included).
+    pub with_clause: Vec<StringId>,
+    /// The `implements` interface names as written (interface edges).
+    pub implements_clause: Vec<StringId>,
+    /// The `on` constraint names of a mixin, as written (constraint checks,
+    /// not supertype edges); empty for every other container kind.
+    pub on_clause: Vec<StringId>,
     /// An enum's constants in declaration order (the exhaustiveness
     /// witness order follows it, `types/enum.dart`); empty elsewhere.
     pub enum_constants: Vec<StringId>,
