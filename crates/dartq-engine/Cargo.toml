@@ -31,6 +31,10 @@ harness = false
 name = "incremental_p95"
 harness = false
 
+[[bench]]
+name = "query_symbols"
+harness = false
+
 [dev-dependencies]
 serde_json = { workspace = true }
 

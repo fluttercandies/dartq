@@ -3,12 +3,15 @@
 //! `wrong_number_of_*` families reach [`Engine::analyze`](crate::Engine::analyze)
 //! without the caller assembling an adapter (#236).
 //!
-//! Per member file the fold re-derives the apply-phase per-file inputs —
-//! the owning-package language version, the settled `@dart` rescan
-//! ([`l1::scan_unit`]), and the token table — then diagnoses the unit
-//! against the analyze-built graph namespaces. The capture is local to the
-//! call (the #210 per-query posture): nothing persists between libraries,
-//! so peak cost is one library's parse.
+//! Per member file the fold reads the persisted scan face
+//! ([`LibraryView::scanned`], keyed by the facts key the apply recompute
+//! filled) — the owning-package language version and the settled `@dart`
+//! rescan resolve to a cache hit, never a re-scan; a cache miss (a face
+//! evicted above the cap) re-derives the identical face locally. The fold
+//! then diagnoses the unit against the analyze-built graph namespaces.
+//! The token tables themselves persist in the bounded scanned cache: one
+//! keystroke on a part-heavy library parses its members' faces, it does not
+//! re-scan them.
 //!
 //! # The element index scope
 //!
@@ -79,11 +82,21 @@ impl SemanticDiagnoser for Diagnoser {
             let facts = &library.facts[&file];
             let bytes = library.store.get(facts.content).expect("resident content");
             let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-            let version = l1::language_version_for(library.packages, library.file_table, file);
-            let (feature_set, scanned, _) = l1::scan_unit(text, version, file);
+            // The persisted scan face; a miss (eviction above the cache cap)
+            // re-derives the identical face — the scan the apply recompute
+            // would have run.
+            let local;
+            let (feature_set, tokens) = if let Some(face) = library.scanned.get(&file) {
+                (face.features, &face.tokens)
+            } else {
+                let version = l1::language_version_for(library.packages, library.file_table, file);
+                let (feature_set, face, _) = l1::scan_unit(text, version, file);
+                local = face;
+                (feature_set, &local.tokens)
+            };
             let report = dartq_semantic::diagnose(
                 text,
-                &scanned.tokens,
+                tokens,
                 ParserFeatures::from_feature_set(feature_set),
                 library.strings,
                 file,

@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,12 +121,55 @@ impl Fixture {
         })
         .expect("engine")
     }
+
+    /// The same engine with the default semantic diagnoser wired — the
+    /// posture the incremental keystroke path actually runs (the semdiag
+    /// fold is the hot path the scanned-face cache serves).
+    pub fn diagnosing_engine(&self) -> Engine {
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&self.root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: self.packages.clone(),
+            pub_config: Arc::clone(&self.config),
+            config_dir: self.config_dir.clone(),
+            semdiag: Some(dartq_engine::semdiag::diagnoser()),
+        })
+        .expect("engine")
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// A defining file plus `parts` cross-referencing part files — the
+/// part-heavy library shape the audit names as the incremental
+/// multiplier's worst case (one keystroke re-derives every member's face).
+/// Each part declares a function and a class, and every part but the first
+/// calls its predecessor (same-library scope both the semdiag fold and the
+/// captures walk).
+pub fn part_library(parts: usize) -> Vec<(String, String)> {
+    let mut main = String::from("library;\n");
+    for i in 1..=parts {
+        let _ = write!(main, "part 'p{i:03}.dart';\n");
+    }
+    main.push_str("\nvoid top() {\n  print(g001(1));\n}\n");
+    let mut libraries = Vec::with_capacity(parts + 1);
+    libraries.push(("lib/main.dart".to_string(), main));
+    for i in 1..=parts {
+        let seed = if i == 1 {
+            "0".to_string()
+        } else {
+            format!("g{i:03}(0) - {i}")
+        };
+        let body = format!(
+            "part of 'main.dart';\n\nint g{i:03}(int x) => x + {seed};\n\nclass C{i:03} {{\n  int m{i:03}() => g{i:03}(1);\n}}\n"
+        );
+        libraries.push((format!("lib/p{i:03}.dart"), body));
+    }
+    libraries
 }
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

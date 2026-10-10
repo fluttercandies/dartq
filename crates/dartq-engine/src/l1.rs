@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::event::{EngineEvent, RevalidateGate};
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, LibraryId,
-    LibraryInfo, PendingChange, SDK_TARGET, UnitFacts,
+    LibraryInfo, PendingChange, SDK_TARGET, ScannedFace, UnitFacts,
 };
 
 /// The outcome of one apply (engine-api-spec §1.2 `AffectedReport` payload).
@@ -72,6 +72,9 @@ pub(crate) fn apply(
             }
             Some(PendingChange::Remove) => {
                 if state.residency.remove(&file).is_some() {
+                    // The maintained index inputs drop with residency: a
+                    // removed file's capture must not serve a later query.
+                    state.captures.remove(&file);
                     removed.push(file);
                 }
             }
@@ -80,6 +83,13 @@ pub(crate) fn apply(
     }
     debug_assert!(pending.is_empty(), "drained entries must all be consumed");
     let changed_files: Vec<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
+    // The recapture queue: every changed file's declaration spans may have
+    // moved (a body edit under a stable signature keeps its library clean
+    // but shifts offsets), so recapture tracks changed files, not dirty
+    // libraries. Gate hits (identical bytes) recapture nothing.
+    for file in &changed_files {
+        state.mark_captures_dirty(*file);
+    }
 
     on_event(EngineEvent::OverlayApplied {
         changed: changed_files.clone(),
@@ -234,11 +244,7 @@ fn recompute_facts(
     // it must re-run the per-file steps under the one sequential resolver.
     let mut hits: Vec<(usize, Arc<UnitFacts>)> = Vec::new();
     for (index, (_, content, _)) in changed.iter().enumerate() {
-        let key = FactsKey {
-            content: *content,
-            feature_fingerprint: FeatureSet::for_language_version(versions[index]).fingerprint(),
-            semantic_version: FACTS_SEMANTIC_VERSION,
-        };
+        let key = facts_key(&state.packages, &state.files, changed[index].0, *content);
         if let Some(facts) = state.cached_facts(key) {
             hits.push((index, facts));
         } else if let Some(&template) = first_miss.get(&key) {
@@ -253,17 +259,17 @@ fn recompute_facts(
     // the pure fan-out: no shared mutable state but the StringTable's
     // interning lock.
     let sources: Vec<&str> = changed.iter().map(|(_, _, text)| text.as_str()).collect();
-    let computed: Vec<(usize, FactsKey, UnitFacts)> = misses
+    let computed: Vec<(usize, FactsKey, UnitFacts, ScannedFace)> = misses
         .par_iter()
         .map(|(index, key)| {
-            let facts = compute_unit(
+            let (facts, face) = compute_unit(
                 changed[*index].0,
                 changed[*index].1,
                 sources[*index],
                 versions[*index],
                 &state.strings,
             );
-            (*index, *key, facts)
+            (*index, *key, facts, face)
         })
         .collect();
 
@@ -285,7 +291,16 @@ fn recompute_facts(
         &resident,
     );
     let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
-    for (index, key, mut facts) in computed {
+    // Scanned faces wait for the resolver's `&mut FileTable` borrow to end
+    // (same deferred-insert discipline as `to_cache`).
+    let mut scanned_to_cache: Vec<(FactsKey, ScannedFace)> = Vec::with_capacity(computed.len());
+    for (index, key, mut facts, face) in computed {
+        // The scan face persists under the same key (batch siblings and
+        // cross-batch hits share it): the semdiag fold and the index
+        // captures parse through these tokens instead of re-scanning every
+        // member of every dirty library (the audit's per-analyze
+        // re-scan multiplication).
+        scanned_to_cache.push((key, face));
         // The cache holds the pure face, pre-resolution: resolution is a
         // per-file step, so caching its results would serve one file's
         // targets (and URI diagnostics) to every same-content successor.
@@ -308,6 +323,9 @@ fn recompute_facts(
         slots[index] = Some((Arc::new(derived), true));
     }
     drop(resolver);
+    for (key, face) in scanned_to_cache {
+        state.cache_scanned(key, face);
+    }
     for (key, facts) in to_cache {
         state.cache_facts(key, facts);
     }
@@ -337,7 +355,7 @@ fn derive_facts(template: &UnitFacts, file: FileId, resolver: &mut UriResolver<'
     derived
 }
 
-/// The per-file language version: the owning package's version, or the
+/// The file's language version: the owning package's version, or the
 /// default when the file belongs to no package (engine-api-spec §1.1) — the
 /// engine's single source of truth for file → package attribution, shared by
 /// the apply recompute and the semantic-seam fold.
@@ -354,15 +372,37 @@ pub(crate) fn language_version_for(
         .unwrap_or(DEFAULT_LANGUAGE_VERSION)
 }
 
+/// The facts/scanned cache key of a resident file: the `AstKey` triple
+/// (PRD §5.3) derived from the file's content and its package-derived
+/// feature fingerprint. The single derivation both the apply recompute and
+/// the drained consumers share, so a cache entry is always found under the
+/// key it was stored under.
+pub(crate) fn facts_key(
+    packages: &IdentityTable,
+    files: &FileTable,
+    file: FileId,
+    content: ContentId,
+) -> FactsKey {
+    let version = language_version_for(packages, files, file);
+    FactsKey {
+        content,
+        feature_fingerprint: FeatureSet::for_language_version(version).fingerprint(),
+        semantic_version: FACTS_SEMANTIC_VERSION,
+    }
+}
+
 /// The pure per-file pipeline: the shared scan face ([`scan_unit`]), then
-/// directive diet walk, parse diagnostics, element collection.
+/// directive diet walk, parse diagnostics, element collection. Returns the
+/// facts plus the scan face (tokens + settled feature set) — the face
+/// persists in the scanned cache so the analyze-phase consumers parse these
+/// tokens instead of re-scanning the file.
 fn compute_unit(
     file: FileId,
     content: ContentId,
     text: &str,
     version: LanguageVersion,
     strings: &StringTable,
-) -> UnitFacts {
+) -> (UnitFacts, ScannedFace) {
     let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file);
     diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
     // The single allocation of the element model: every later consumer
@@ -378,14 +418,19 @@ fn compute_unit(
     let (directives, directive_region) = extract_directives(text, &scanned.tokens, strings);
     let face = directive_face(text, &scanned.tokens, directive_region);
 
-    UnitFacts {
+    let facts = UnitFacts {
         content,
         api_signature: unit_signature(&elements, &face, strings),
         directives,
         elements,
         diagnostics,
         line_index: scanned.line_index,
-    }
+    };
+    let scanned_face = ScannedFace {
+        tokens: scanned.tokens,
+        features: feature_set,
+    };
+    (facts, scanned_face)
 }
 
 /// The file's API signature (PRD §11.3, #282): the canonical element-face
@@ -1312,6 +1357,9 @@ fn reform_libraries(state: &mut EngineState) -> bool {
     let retired_any = !retired.is_empty();
     for id in retired {
         state.results.remove(&id);
+        // The reference surface goes with the retired library; a returning
+        // (recycled) id rebuilds it at its next LibraryAnalyzed point.
+        state.library_surfaces.remove(&id);
     }
     for (id, info) in infos {
         state.libraries.set_info(id, info);

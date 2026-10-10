@@ -65,7 +65,7 @@ pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
 pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
 pub use scheduler::{DrainReport, Task};
-pub use state::{DirectiveFacts, DirectiveKind, LibraryId, UnitFacts};
+pub use state::{DirectiveFacts, DirectiveKind, LibraryId, ScannedFace, UnitFacts};
 
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
 /// of PRD §5.4's six context fields — store, SDK, packages — plus the pub
@@ -231,19 +231,20 @@ impl Engine {
 
     /// The `query symbol` face (PRD §20.3): every declaration of `name`
     /// across the workspace plus every resolved reference to those
-    /// declarations, answered through the dartq-index query faces
-    /// (#201/#122) built over the current analyzed state.
+    /// declarations, answered from the maintained index state (the per-file
+    /// captures and per-library reference surfaces analyze keeps fresh at
+    /// the `LibraryAnalyzed` point — no recapture per query).
     ///
     /// Read-after-write contract: the answer reflects the latest
     /// [`Engine::analyze`] — callers analyze first, and a query never
     /// applies the overlay, re-analyzes, or otherwise mutates derived state
     /// (the only side effect is interning `name`). Querying before the
-    /// first analyze (no resolution stage yet) answers an empty set. Names
-    /// resolve against the engine's intern table at this boundary; the rows
-    /// borrow, never clone.
+    /// first analyze answers an empty set. Names resolve against the
+    /// engine's intern table at this boundary; the rows borrow, never
+    /// clone.
     #[must_use]
     pub fn query_symbols(&self, name: &str) -> SymbolAnswer<'_> {
-        query::symbols(&self.state, self.graph.as_ref(), name)
+        query::symbols(&self.state, name)
     }
 
     /// PRD §17.2 discovery face: package roots (from the identity table)
@@ -520,8 +521,8 @@ impl CsrGraph {
 /// documents what these fields guarantee). The per-unit faces a
 /// `dartq_semantic::diagnose` fold needs ride here: source text
 /// ([`LibraryView::store`] + the facts' content ids) and the token table
-/// (re-derived through the apply-phase scan face — the #210 per-query
-/// posture, no persistent token residency).
+/// (the persisted scan face of [`LibraryView::scanned`], filled by the
+/// apply-phase recompute — a miss re-derives the identical face locally).
 pub struct LibraryView<'a> {
     /// The engine library id.
     pub library: LibraryId,
@@ -544,8 +545,15 @@ pub struct LibraryView<'a> {
     pub packages: &'a PackageTable,
     /// The interned paths (file → path for the package attribution).
     pub file_table: &'a FileTable,
-    /// The import namespaces of the current graph (built once per analyze).
+    /// The import namespaces of the current graph (built once per graph
+    /// generation).
     pub namespaces: &'a dartq_resolution::Namespaces,
+    /// The member files' persisted scan faces (token table + settled
+    /// feature set, keyed by [`FileId`]); entries exist for cache hits the
+    /// engine resolved before the call. A missing entry means the fold
+    /// derives the face itself (`l1::scan_unit`) — the map never blocks a
+    /// diagnoser that scans its own tokens.
+    pub scanned: FxHashMap<FileId, Arc<crate::state::ScannedFace>>,
 }
 
 /// The semantic diagnostics plug point (#120/#121).

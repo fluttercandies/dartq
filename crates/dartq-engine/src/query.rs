@@ -1,6 +1,8 @@
 //! The `query symbol` face (PRD §20.3; index-design-spec §8–§10): the
-//! workspace symbol index answered through the dartq-index query faces
-//! (#201/#122) over the current analyzed state.
+//! workspace symbol index answered from the engine's maintained index
+//! state — the per-file captures (declaration surface + raw sites) and the
+//! per-library reference surfaces analyze keeps current at the
+//! `LibraryAnalyzed` point.
 //!
 //! # Freshness contract
 //!
@@ -8,32 +10,25 @@
 //! produced: callers run analyze first (the read-after-write), and a query
 //! never applies the overlay, re-analyzes, or otherwise mutates derived
 //! state — the only side effect is interning the queried name. Querying
-//! before the first analyze (no resolution stage yet) answers an empty set.
+//! before the first analyze answers an empty set. Reference surfaces track
+//! the completed-library partition of the latest analyze exactly (a
+//! cancelled analyze leaves the not-yet-recomputed libraries on their
+//! previous surfaces, the same partition their cached diagnostic results
+//! keep).
 //!
-//! # Build shape
+//! # Cost shape
 //!
-//! The index is built fresh per query, per library, on the batch fan-out
-//! (the analyze recompute's posture): member files are captured with the
-//! apply-phase per-file derivation (owning-package language version, the
-//! shared `l1::scan_unit` `@dart` override settlement), resolved through
-//! the analyze-built graph namespaces, and folded into [`SymbolIndex`]
-//! faces. Captures drop
-//! inside each fan-out job, so peak residency is one library's parse plus
-//! the row-sized finished surfaces. Incremental index maintenance in the L1
-//! cascade is deliberately out of scope here; this face is independent of
-//! it and stays correct against whatever analyzed state exists.
+//! The answer assembles in O(rows of the answer): declaration rows come
+//! straight from the maintained captures (ascending file — the deterministic
+//! order `SymbolIndex` prescribed), reference rows from the maintained
+//! surfaces (ascending library). No scan, no parse, no namespace rebuild —
+//! the whole-workspace recapture this face used to run per query died with
+//! the maintained index (the audit's query-path multiplication).
 
-use dartq_index::{
-    DeclRow, FileCapture, FileIndex, LibraryBuilder, LibraryIndex, SymbolDecl, SymbolIndex, capture,
-};
-use dartq_language::DEFAULT_LANGUAGE_VERSION;
-use dartq_parser::ParserFeatures;
-use dartq_resolution::Namespaces;
+use dartq_index::{DeclRow, RefRow};
 use dartq_source::{FileId, SourceRange};
-use rayon::prelude::*;
 
-use crate::pipeline;
-use crate::state::{EngineState, LibraryId};
+use crate::state::EngineState;
 
 pub use dartq_index::{DeclKind, RefKind};
 
@@ -82,101 +77,53 @@ pub struct RefHit {
     pub range: SourceRange,
 }
 
-/// One fan-out job's output: the graph-library key of the finished
-/// reference surface plus the declaration surfaces to register.
-type BuiltLibrary = (
-    dartq_resolution::LibraryId,
-    LibraryIndex,
-    Vec<(FileId, FileIndex)>,
-);
-
-/// Answers a by-name symbol query over the analyzed state (module docs for
-/// the freshness and build contracts).
-pub(crate) fn symbols<'a>(
-    state: &'a EngineState,
-    resolved: Option<&pipeline::ResolvedGraph>,
-    name: &str,
-) -> SymbolAnswer<'a> {
-    let Some(resolved) = resolved else {
-        return SymbolAnswer {
-            decls: Vec::new(),
-            refs: Vec::new(),
-        };
-    };
+/// Answers a by-name symbol query over the maintained index state (module
+/// docs for the freshness and cost contracts).
+pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a> {
     // The queried name interns once; every lookup below runs on the id.
     let id = state.strings.intern(name);
-    let namespaces = Namespaces::build(&resolved.graph);
 
-    // Per-library build on the batch fan-out: each job captures its member
-    // files, resolves their sites through the shared namespaces, and drops
-    // the captures before returning the row-sized surfaces.
-    let jobs: Vec<(LibraryId, dartq_resolution::LibraryId)> = state
-        .libraries
-        .live()
-        .filter_map(|library| {
-            resolved
-                .graph_ids
-                .get(&library)
-                .copied()
-                .map(|graph_library| (library, graph_library))
-        })
-        .collect();
-    let built: Vec<BuiltLibrary> = jobs
-        .par_iter()
-        .map(|&(library, graph_library)| {
-            let info = state.libraries.info(library).expect("live library");
-            let captures: Vec<FileCapture> = crate::pipeline::member_files(info)
-                .par_iter()
-                .map(|&file| capture_file(state, file))
-                .collect();
-            let mut builder = LibraryBuilder::new(graph_library, &resolved.graph, &namespaces);
-            for member in &captures {
-                builder.add_file(member);
-            }
-            let files = captured_files(captures);
-            (graph_library, builder.finish(), files)
-        })
-        .collect();
-
-    let mut index = SymbolIndex::default();
-    for (library, surface, files) in built {
-        for (file, file_index) in files {
-            index.insert_file(file, file_index);
-        }
-        index.insert_library(library, surface);
-    }
-
-    // Materialize the answer: ids resolve to borrowed spellings, rows stay
-    // `Copy` — no per-row allocation.
+    // Declaration rows from the maintained captures, ascending by file
+    // (`BTreeMap` order — the deterministic order the per-query
+    // `SymbolIndex` build produced). Equal-name rows of one file are
+    // contiguous, so a last-wins check deduplicates the reference probes.
     let mut decls: Vec<DeclHit<'a>> = Vec::new();
     let mut targets: Vec<FileId> = Vec::new();
-    for SymbolDecl { file, decl } in index.symbols(id) {
-        let container = (decl.container != DeclRow::NONE).then(|| {
-            state.strings.resolve(
-                index
-                    .file(file)
-                    .expect("indexed file")
-                    .row(decl.container)
-                    .name,
-            )
-        });
-        decls.push(DeclHit {
-            file,
-            kind: decl.kind,
-            name: state.strings.resolve(decl.name),
-            container,
-            range: decl.range,
-        });
-        // Equal-name rows of one file are contiguous in the iteration, so a
-        // last-wins check deduplicates the reference probes below.
+    for (&file, capture) in &state.captures {
+        let Some(rows) = capture.index.by_name(id) else {
+            continue;
+        };
+        for decl in rows {
+            let container = (decl.container != DeclRow::NONE).then(|| {
+                state
+                    .strings
+                    .resolve(capture.index.row(decl.container).name)
+            });
+            decls.push(DeclHit {
+                file,
+                kind: decl.kind,
+                name: state.strings.resolve(decl.name),
+                container,
+                range: decl.range,
+            });
+        }
         if targets.last() != Some(&file) {
             targets.push(file);
         }
     }
+
+    // Reference rows from the maintained surfaces, ascending by library —
+    // the same order the per-query build's `SymbolIndex::references` served.
     let refs: Vec<RefHit> = targets
         .iter()
-        .flat_map(|&file| index.references(file, id))
-        .map(|row| RefHit {
+        .flat_map(|&file| {
+            state
+                .library_surfaces
+                .values()
+                .filter_map(move |surface| surface.references_of(file, id))
+                .flatten()
+        })
+        .map(|row: &RefRow| RefHit {
             target_file: row.target_file,
             kind: row.kind,
             qualified: row.qualified,
@@ -184,44 +131,4 @@ pub(crate) fn symbols<'a>(
         })
         .collect();
     SymbolAnswer { decls, refs }
-}
-
-/// Splits the captures into their persistable halves (file id + declaration
-/// surface); the raw sites died with the library build above.
-fn captured_files(captures: Vec<FileCapture>) -> Vec<(FileId, FileIndex)> {
-    captures
-        .into_iter()
-        .map(|captured| (captured.file, captured.index))
-        .collect()
-}
-
-/// Captures one resident file's declaration and reference surface: the
-/// apply-phase per-file derivation (owning-package language version, the
-/// shared `l1::scan_unit` `@dart` override settlement — an above-latest
-/// override drops here too, and its warning is not baked, the capture face
-/// produces no diagnostics) feeding the dartq-index capture pass. The parse
-/// is local to this call; only interned ids leave.
-fn capture_file(state: &EngineState, file: FileId) -> FileCapture {
-    let facts = &state.residency[&file];
-    let bytes = state.store.get(facts.content).expect("resident content");
-    let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-    // The apply-phase version derivation (l1::language_version_for): the
-    // owning package's version, or the default when the file belongs to no
-    // package.
-    let version = state
-        .packages
-        .containing(state.files.path(file).expect("interned path"))
-        .and_then(|identity| identity.language_version)
-        .map_or(
-            DEFAULT_LANGUAGE_VERSION,
-            dartq_pub::LanguageVersion::into_inner,
-        );
-    let (feature_set, scanned, _) = crate::l1::scan_unit(text, version, file);
-    capture(
-        file,
-        text,
-        &scanned.tokens,
-        ParserFeatures::from_feature_set(feature_set),
-        &state.strings,
-    )
 }

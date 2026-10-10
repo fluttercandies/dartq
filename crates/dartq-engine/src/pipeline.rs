@@ -7,32 +7,47 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::Diagnostic;
+use dartq_index::FileCapture;
 use dartq_resolution::{
     Combinators, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
     ResolutionCode, ResolvedTarget,
 };
 use dartq_semantic::MicroKind;
-use dartq_source::{FileId, FileTable};
+use dartq_source::{FileId, FileTable, StringTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cancel::{CancellationToken, Cancelled};
 use crate::event::EngineEvent;
 use crate::l1;
-use crate::state::{DirectiveKind, EngineState, LibraryId, LibraryInfo, LibraryResult};
+use crate::state::{
+    DirectiveKind, EngineState, FactsKey, LibraryId, LibraryInfo, LibraryResult, ScannedFace,
+};
 use crate::{CsrGraph, LibraryView, SemanticDiagnoser};
 
 /// The resolution pipeline stage: the interned library graph
 /// (dartq-resolution) over the current library set and the engine-library →
 /// graph-library mapping. The semantic seam reads per-file element models
 /// through `LibraryView::facts`; this stage carries only the cross-library
-/// face.
+/// face. The graph's import namespaces build once per generation, on first
+/// use — every dirty-library seam, surface rebuild, and query between graph
+/// rebuilds shares them.
 pub(crate) struct ResolvedGraph {
     pub graph: LibraryGraph,
     pub graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId>,
+    namespaces: OnceLock<Namespaces>,
+}
+
+impl ResolvedGraph {
+    /// The graph's import namespaces (built once per graph generation).
+    pub(crate) fn namespaces(&self) -> &Namespaces {
+        self.namespaces
+            .get_or_init(|| Namespaces::build(&self.graph))
+    }
 }
 
 /// The analyze driver (engine-api-spec §1.3): phase 1 is always
@@ -49,6 +64,11 @@ pub(crate) fn analyze(
     cancel: &CancellationToken,
 ) -> Result<Vec<Diagnostic>, Cancelled> {
     l1::apply(state, on_event);
+    // The maintained index inputs refresh before anything consumes them:
+    // changed files recapture (declaration spans move under body edits the
+    // L2 gate keeps library-clean), so the query faces and the dirty
+    // libraries' surface rebuilds below read current captures.
+    drain_captures(state);
 
     if state.structure_dirty || graph.is_none() {
         *graph = (!state.residency.is_empty()).then(|| build_library_graph(state));
@@ -67,13 +87,17 @@ pub(crate) fn analyze(
     let resolved = graph.as_ref();
 
     // The semantic seam's shared context (#236): the import namespaces every
-    // per-library fold resolves through, built once when a diagnoser is
-    // configured and there is work — a per-library build would square the
-    // cost, and a clean workset needs none. The element models stay
-    // un-cloned here: the fold indexes only its own library's members (see
-    // `semdiag`), so no per-analyze workspace-wide copy exists.
-    let seam = (semdiag.is_some() && !order.is_empty())
-        .then(|| Namespaces::build(&resolved.expect("graph exists when libraries exist").graph));
+    // per-library fold resolves through, built once per graph generation and
+    // shared by the surface rebuilds below — a per-library or per-analyze
+    // build would multiply the cost, and a clean workset needs none. The
+    // element models stay un-cloned here: the fold indexes only its own
+    // library's members (see `semdiag`), so no per-analyze workspace-wide
+    // copy exists.
+    let seam = (semdiag.is_some() && !order.is_empty()).then(|| {
+        resolved
+            .expect("graph exists when libraries exist")
+            .namespaces()
+    });
 
     let computed: Vec<Option<(Duration, Vec<Diagnostic>)>> = order
         .par_iter()
@@ -87,7 +111,7 @@ pub(crate) fn analyze(
                 state,
                 resolved.expect("graph exists when libraries exist"),
                 semdiag,
-                seam.as_ref(),
+                seam,
                 *library,
             );
             Some((start.elapsed(), diagnostics))
@@ -97,12 +121,17 @@ pub(crate) fn analyze(
     // Store completed results and emit their events in work order. The run
     // enters the cache in canonical order — sorted once per recompute — and
     // moves in without a clone; every later analyze merges the stored runs
-    // as-is (see `merge_canonical`).
+    // as-is (see `merge_canonical`). The library's symbol-index surface
+    // rebuilds at the same point (index-design-spec §6/§8: whole-unit
+    // replacement at the `LibraryAnalyzed` point, the Engine owning dirty
+    // scheduling) — so `query_symbols` serves maintained surfaces instead of
+    // recapturing the whole workspace per query.
     let mut completed: FxHashSet<LibraryId> = FxHashSet::default();
     for (library, slot) in order.iter().zip(computed) {
         let Some((duration, mut diagnostics)) = slot else {
             continue;
         };
+        let resolved = resolved.expect("graph exists when libraries exist");
         diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
         let info = state.libraries.info(*library).expect("live library");
         state.results.insert(
@@ -114,6 +143,8 @@ pub(crate) fn analyze(
                 diagnostics,
             },
         );
+        let surface = library_surface(state, resolved, *library, info);
+        state.library_surfaces.insert(*library, surface);
         completed.insert(*library);
         on_event(EngineEvent::LibraryAnalyzed {
             library: *library,
@@ -205,6 +236,13 @@ fn diagnose_library(
     }
     if let Some(diagnoser) = semdiag {
         let namespaces = seam.expect("seam context exists when a diagnoser is configured");
+        // The persisted scan faces of the members (apply-phase recompute):
+        // hits ride in as refcount bumps, misses fall back to a local scan
+        // inside the fold — no per-member re-scan on the hot path either way.
+        let scanned: FxHashMap<FileId, Arc<ScannedFace>> = members
+            .iter()
+            .filter_map(|&file| scanned_face(state, file).map(|face| (file, face)))
+            .collect();
         let view = LibraryView {
             library,
             files: &members,
@@ -217,10 +255,111 @@ fn diagnose_library(
             packages: &state.packages,
             file_table: &state.files,
             namespaces,
+            scanned,
         };
         diagnoser.diagnose_library(view, &mut out);
     }
     out
+}
+
+/// The persisted scan face of a resident file, under the exact key the apply
+/// recompute stored it under ([`l1::facts_key`]).
+fn scanned_face(state: &EngineState, file: FileId) -> Option<Arc<ScannedFace>> {
+    let facts = state.residency.get(&file)?;
+    let key = l1::facts_key(&state.packages, &state.files, file, facts.content);
+    state.cached_scanned(key)
+}
+
+/// Rebuilds a library's symbol-index reference surface at its
+/// `LibraryAnalyzed` point: the member captures (fresh from the drain)
+/// resolve through the graph namespaces — whole-unit replacement, the shape
+/// `query_symbols` serves.
+fn library_surface(
+    state: &EngineState,
+    resolved: &ResolvedGraph,
+    library: LibraryId,
+    info: &LibraryInfo,
+) -> dartq_index::LibraryIndex {
+    let mut builder = dartq_index::LibraryBuilder::new(
+        resolved.graph_ids[&library],
+        &resolved.graph,
+        resolved.namespaces(),
+    );
+    for file in member_files(info) {
+        builder.add_file(&state.captures[&file]);
+    }
+    builder.finish()
+}
+
+/// Recaptures every file whose facts moved since the last analyze (the
+/// apply-phase [`crate::state::EngineState::mark_captures_dirty`] queue):
+/// one capture per actually-changed file per analyze, replacing the per-
+/// query whole-workspace recapture. Files removed since the queue entry
+/// (change then removal between analyzes) filter out here.
+///
+/// Each job resolves the file's persisted scan face — a cache hit, or a
+/// local scan whose face feeds back into the cache — and captures the
+/// declaration + raw-site surface through those tokens. The parallel phase
+/// reads shared state only; the maps fill in one sequential pass.
+fn drain_captures(state: &mut EngineState) {
+    let mut dirty = state.take_capture_dirty();
+    if dirty.is_empty() {
+        return;
+    }
+    dirty.sort_unstable();
+    dirty.dedup();
+    dirty.retain(|file| state.residency.contains_key(file));
+    if dirty.is_empty() {
+        return;
+    }
+    let captured: Vec<(FileId, FileCapture, Option<(FactsKey, ScannedFace)>)> = dirty
+        .par_iter()
+        .map(|&file| {
+            let facts = &state.residency[&file];
+            let bytes = state.store.get(facts.content).expect("resident content");
+            let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
+            let key = l1::facts_key(&state.packages, &state.files, file, facts.content);
+            if let Some(face) = state.cached_scanned(key) {
+                (
+                    file,
+                    capture_surface(file, text, &face, &state.strings),
+                    None,
+                )
+            } else {
+                let version = l1::language_version_for(&state.packages, &state.files, file);
+                let (feature_set, scanned, _) = l1::scan_unit(text, version, file);
+                let face = ScannedFace {
+                    tokens: scanned.tokens,
+                    features: feature_set,
+                };
+                let capture = capture_surface(file, text, &face, &state.strings);
+                (file, capture, Some((key, face)))
+            }
+        })
+        .collect();
+    for (file, capture, miss) in captured {
+        if let Some((key, face)) = miss {
+            state.cache_scanned(key, face);
+        }
+        state.captures.insert(file, Arc::new(capture));
+    }
+}
+
+/// Captures one resident file's declaration and reference surface through a
+/// scan face (index-design-spec §8: parse-only, the official Layer A face).
+fn capture_surface(
+    file: FileId,
+    text: &str,
+    face: &ScannedFace,
+    strings: &StringTable,
+) -> FileCapture {
+    dartq_index::capture(
+        file,
+        text,
+        &face.tokens,
+        dartq_parser::ParserFeatures::from_feature_set(face.features),
+        strings,
+    )
 }
 
 /// The dart:core public face the engine's implicit core import resolves
@@ -444,7 +583,11 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         }
     }
     let graph = builder.finish();
-    ResolvedGraph { graph, graph_ids }
+    ResolvedGraph {
+        graph,
+        graph_ids,
+        namespaces: OnceLock::new(),
+    }
 }
 
 /// The defining file plus the parts, part-directive order.

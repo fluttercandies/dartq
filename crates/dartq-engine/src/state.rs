@@ -2,16 +2,19 @@
 //! pending overlay, the library arena with its reverse-import index, the
 //! per-library result cache, and the bounded per-file facts cache.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dartq_diagnostics::Diagnostic;
+use dartq_index::{FileCapture, LibraryIndex};
+use dartq_language::FeatureSet;
 use dartq_package::PackageTable as IdentityTable;
 use dartq_pub::PackageConfig;
 use dartq_resolution::{
     Combinators, PackageTable as UriPackageTable, ResolutionCode, ResolvedTarget, UriResolver,
 };
+use dartq_scanner::TokenTable;
 use dartq_sdk::SdkSnapshot;
 use dartq_semantic::FileElements;
 use dartq_source::{
@@ -46,6 +49,15 @@ pub(crate) const SDK_TARGET: &str = "vm";
 /// keeps the overhead a bounded fraction of input memory (memory law, PRD
 /// §14): insertion beyond the cap evicts oldest-first.
 const FACTS_CACHE_CAP: usize = 1024;
+
+/// Scanned-face-cache capacity in entries, same discipline as
+/// [`FACTS_CACHE_CAP`] (the scan face is the token table the semdiag fold
+/// and the index captures consume — the engine perf charter: one keystroke
+/// on a part-heavy library must not re-scan every member). Token tables
+/// cost a small multiple of the source bytes, so the cap — not residency —
+/// bounds the footprint; workspaces above the cap fall back to per-consumer
+/// scans for the coldest entries.
+const SCANNED_CACHE_CAP: usize = 1024;
 
 /// Dead-content tally that triggers one content-store sweep (mark-sweep,
 /// the rust-analyzer vfs GC posture). Every apply orphans content ids —
@@ -169,6 +181,19 @@ impl UnitFacts {
             .any(|directive| directive.kind == DirectiveKind::Library)
             && self.part_of().is_some()
     }
+}
+
+/// The persisted scan face of one `(content, feature set)` identity: the
+/// token table the parser-level consumers (the semdiag fold, the index
+/// captures) parse through, plus the *settled* feature set (the `@dart`
+/// override applied — `l1::scan_unit`'s output). A pure function of the
+/// [`FactsKey`] inputs, so the cache entry serves every consumer that would
+/// otherwise re-derive it per dirty library or per query.
+pub struct ScannedFace {
+    /// The settled token table (override rescans included).
+    pub tokens: TokenTable,
+    /// The feature set in force after override settlement.
+    pub features: FeatureSet,
 }
 
 /// One library of the analysis set: a defining file plus its parts in
@@ -400,6 +425,30 @@ pub(crate) struct EngineState {
     /// is path-free by contract, PRD §5.3). Bounded, `FACTS_CACHE_CAP`.
     facts_cache: FxHashMap<FactsKey, Arc<UnitFacts>>,
     facts_order: VecDeque<FactsKey>,
+    /// Memoized scan faces keyed by the same [`FactsKey`] triple as the
+    /// facts cache: the token table + settled feature set the semdiag fold
+    /// and the index captures parse through. Filled at the apply recompute
+    /// (the one place a scan runs) and drained consumers fall back to a
+    /// local scan on a miss. Bounded, `SCANNED_CACHE_CAP`.
+    scanned: FxHashMap<FactsKey, Arc<ScannedFace>>,
+    scanned_order: VecDeque<FactsKey>,
+    /// The maintained symbol-index inputs (index-design-spec §6/§8 — the
+    /// Engine owns dirty scheduling, the index never invalidates itself):
+    /// one capture per resident file (declaration surface + raw sites, the
+    /// latter feeding `LibraryBuilder` on every dirty-library rebuild), and
+    /// one reference surface per live library. The captures replace whole
+    /// when a file's content moves and drop when it leaves residency; the
+    /// surfaces rebuild at the `LibraryAnalyzed` point of each analyze
+    /// (pipeline) and drop with their library at retirement. Bounded by
+    /// residency and the live library set respectively.
+    pub(crate) captures: BTreeMap<FileId, Arc<FileCapture>>,
+    pub(crate) library_surfaces: BTreeMap<LibraryId, LibraryIndex>,
+    /// Resident files whose content moved since the last analyze — the
+    /// recapture queue the analyze phase drains. A body edit with a stable
+    /// API signature keeps its library clean (the L2 win) but still moves
+    /// declaration spans, so recapture tracks changed files directly, not
+    /// dirty libraries.
+    capture_dirty: Vec<FileId>,
     /// Dead-content tally since the last store sweep — the amortization
     /// signal of [`GC_DEAD_THRESHOLD`] (never a liveness decision; the sweep
     /// itself checks real references).
@@ -452,6 +501,11 @@ impl EngineState {
             options,
             facts_cache: FxHashMap::default(),
             facts_order: VecDeque::new(),
+            scanned: FxHashMap::default(),
+            scanned_order: VecDeque::new(),
+            captures: BTreeMap::new(),
+            library_surfaces: BTreeMap::new(),
+            capture_dirty: Vec::new(),
             gc_debt: 0,
         })
     }
@@ -480,6 +534,41 @@ impl EngineState {
         if self.facts_cache.insert(key, facts).is_none() {
             self.facts_order.push_back(key);
         }
+    }
+
+    /// Scanned-face lookup.
+    pub(crate) fn cached_scanned(&self, key: FactsKey) -> Option<Arc<ScannedFace>> {
+        self.scanned.get(&key).cloned()
+    }
+
+    /// Scanned-face insert with the facts cache's oldest-first cap
+    /// eviction. No GC tally: a scanned face holds interned ids and token
+    /// tables, never a store `ContentId`, so its eviction cannot orphan
+    /// content.
+    pub(crate) fn cache_scanned(&mut self, key: FactsKey, face: ScannedFace) {
+        if self.scanned.len() >= SCANNED_CACHE_CAP && !self.scanned.contains_key(&key) {
+            while self.scanned.len() >= SCANNED_CACHE_CAP {
+                let Some(oldest) = self.scanned_order.pop_front() else {
+                    break;
+                };
+                self.scanned.remove(&oldest);
+            }
+        }
+        if self.scanned.insert(key, Arc::new(face)).is_none() {
+            self.scanned_order.push_back(key);
+        }
+    }
+
+    /// Files whose facts moved since the last analyze (apply queues them;
+    /// the analyze phase drains and recaptures).
+    pub(crate) fn mark_captures_dirty(&mut self, file: FileId) {
+        self.capture_dirty.push(file);
+    }
+
+    /// Takes the recapture queue. The caller filters out files that left
+    /// residency (a change followed by a removal between analyzes).
+    pub(crate) fn take_capture_dirty(&mut self) -> Vec<FileId> {
+        std::mem::take(&mut self.capture_dirty)
     }
 
     /// Amortized content-store collection (mark-sweep): tallies the content
