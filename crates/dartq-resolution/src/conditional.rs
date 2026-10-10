@@ -1,43 +1,37 @@
 //! Conditional-URI selection for configurable import/export directives
-//! (PRD §9.4), pinned to the official evaluation on both faces.
+//! (PRD §9.4), pinned to the differential oracle — `dart analyze` — not the
+//! CFE.
 //!
-//! # Selection rule (official, cited)
+//! # Oracle pin (frozen)
 //!
-//! A configurable directive `import 'a.dart' if (n == 'v') 'b.dart' …`
-//! selects its URI by scanning the configurations **in source order** and
-//! taking the **first** whose condition holds; if none holds, the directive's
-//! **primary URI** (the first, unconditioned string literal) is the fallback:
+//! 1. Each `if (name)` / `if (name == 'value')` clause tests the written
+//!    `=` string; the bare form tests `"true"` (`valueOrTrue`,
+//!    `unlinked_data.dart:327-334`; CFE `outline_builder.dart:801`).
+//! 2. No forking — one analysis per file. The oracle builds its context
+//!    with EMPTY declared variables when no `-D` is passed
+//!    (`driver.dart:583-593`, `DeclaredVariables.fromMap({})`);
+//!    `dart.library.*` is never auto-populated.
+//! 3. Selection scans the configurations in source order and the FIRST
+//!    clause with `declaredVariables[name] == tested value` wins
+//!    (`file_state.dart:738-764`; `selectedConfigurationUri ??=` keeps the
+//!    first match). Exact string equality; an undeclared name never
+//!    matches.
+//! 4. No match → the primary URI (the first, unconditioned string
+//!    literal; `file_state.dart:759` `selected: selectedConfigurationUri
+//!    ?? primaryUri`).
+//! 5. Only the selected URI is analyzed and diagnosed; unmatched branch
+//!    URIs are kept for navigation but never read; a missing selected
+//!    target reports `uri_does_not_exist` at the directive's URI literal.
+//! 6. Documented divergence, deliberately not followed: the CFE evaluates
+//!    `dart.library.X` against SDK target availability
+//!    (`source_loader.dart:451-483`), so `dart compile` selects `b.dart`
+//!    for `import 'a.dart' if (dart.library.io) 'b.dart';` while the
+//!    oracle — dartq's differential truth — selects `a.dart`.
 //!
-//! - CFE: `fragment_factory_impl.dart:921-929` — `for (config in
-//!   configurations) { if (getLibrarySupportValue(config.dottedName) ==
-//!   config.condition) { uri = config.importUri; break; } }`, with `uri`
-//!   starting as the default URI (`outline_builder.dart:751-752`, "For a
-//!   conditional import, this is the default URI").
-//! - Analyzer (the differential oracle): `file_state.dart:738-764` —
-//!   `selected = selectedConfigurationUri ?? primaryUri` (`??=` keeps the
-//!   first match).
-//!
-//! # Condition evaluation (official, cited)
-//!
-//! A condition's tested value is the written `=` string, or `"true"` for the
-//! bare form (`outline_builder.dart:801`; analyzer `valueOrTrue`,
-//! `unlinked_data.dart:327-334` — an empty written value reads back as
-//! `"true"`, folded into [`Configuration`] at construction). The dotted name
-//! must be a `dart.library.` qualifier (`kernel/lib/target/targets.dart
-//! :215-224`); the compared environment value is `"true"` when the named
-//! library is available for the target and nothing (never equal) otherwise
-//! (`source_loader.dart:451-483`). The [`PlatformSet`] carries exactly that
-//! target-derived `"true"` table — derived from the SDK's `libraries.json`
-//! rows (key domain = public library names, PRD §7.2), never hardcoded.
-//!
-//! Known oracle divergence, deliberately following the analyzer: for a
-//! non-`dart.library.` name the CFE's `getLibrarySupportValue` returns `""`,
-//! so a written `if (foo == '')` would match under `dart compile`; the
-//! analyzer's declared-variables comparison never matches an undeclared
-//! name, and dart analyze is the oracle dartq differentiates against.
+//! Under the engine's empty default context (today's oracle truth, no
+//! `-D` surface) every condition misses and the primary URI always wins.
 
-use dartq_sdk::SdkLibraries;
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 /// One `if (name == 'value') 'uri'` clause of a configurable directive.
 ///
@@ -48,8 +42,8 @@ use rustc_hash::FxHashSet;
 /// and evaluation compares against `"true"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Configuration {
-    /// The condition's dotted name, as written (`dart.library.io`,
-    /// `dart.tool.…`, a `-D` name — no normalization; matching is exact).
+    /// The condition's dotted name, as written (`dart.library.io`, a `-D`
+    /// name — no normalization; matching compares it verbatim).
     pub dotted_name: Box<str>,
     /// The `=` value of the condition; `None` for the bare form (a written
     /// `''` normalizes to `None` too — see the type's docs).
@@ -73,53 +67,9 @@ impl Configuration {
     }
 
     /// The condition's tested value: the written `=` string, or `"true"`
-    /// for the bare form (`outline_builder.dart:801`, `valueOrTrue`).
+    /// for the bare form (`valueOrTrue`).
     fn expected(&self) -> &str {
         self.value.as_deref().unwrap_or("true")
-    }
-}
-
-/// The `dart.library.*` availability table of one target segment (PRD §9.4):
-/// the library names for which `dart.library.<name>` evaluates to `"true"`.
-///
-/// Derived at engine-assembly time from the SDK's `libraries.json` rows —
-/// a name is available when its row sits in the target segment's effective
-/// library set with `support_conditional_import` set (`source_loader.dart
-/// :451-483` reads the same rows; key domain = public library names, PRD
-/// §7.2). An unknown segment yields an empty set, under which every
-/// condition is unmatched and primary URIs are selected.
-///
-/// Construction is one pass over the segment's library table; evaluation is
-/// a hash lookup per tested name.
-#[derive(Clone, Debug, Default)]
-pub struct PlatformSet {
-    available: FxHashSet<Box<str>>,
-}
-
-impl PlatformSet {
-    /// Derives the availability table of target segment `segment` (e.g.
-    /// `"vm"`) from the `libraries.json` parse result.
-    #[must_use]
-    pub fn from_segment(libraries: &SdkLibraries, segment: &str) -> Self {
-        let Some(target) = libraries.targets.get(segment) else {
-            return Self::default();
-        };
-        let available: FxHashSet<Box<str>> = target
-            .libraries
-            .iter()
-            .filter(|(_, info)| info.support_conditional_import)
-            .map(|(name, _)| Box::from(name.as_str()))
-            .collect();
-        Self { available }
-    }
-
-    /// Whether `dart.library.<library>` holds for this target
-    /// (`source_loader.dart:451-483`): the library has a row in the target
-    /// segment's effective set with `support_conditional_import` set.
-    /// Unknown names are `false`.
-    #[must_use]
-    pub fn available(&self, library: &str) -> bool {
-        self.available.contains(library)
     }
 }
 
@@ -131,30 +81,33 @@ impl PlatformSet {
 /// `configs[index].uri`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectedUri {
-    /// No configuration matched: use the primary URI — the official
-    /// fallback (`fragment_factory_impl.dart:921-929` keeps the default
-    /// `uri`; `file_state.dart:762` `selectedConfigurationUri ?? primaryUri`).
+    /// No configuration matched: use the primary URI — the oracle fallback
+    /// (`file_state.dart:759` `selected: selectedConfigurationUri ??
+    /// primaryUri`).
     Primary,
     /// `configs[index]` was the first matching configuration.
     Configuration(usize),
 }
 
-/// Selects the configured URI of a directive (PRD §9.4): source order, first
-/// configuration whose dotted name is `dart.library.<name>` with `name`
-/// available on `platform` and whose expected value is `"true"`; otherwise
-/// the primary URI ([`SelectedUri::Primary`], the official fallback).
+/// Selects the configured URI of a directive (PRD §9.4, the oracle pin):
+/// source order, first configuration whose full dotted name is declared in
+/// `declared` with exactly the tested value ([`Configuration::expected`];
+/// `file_state.dart:738-764`); otherwise the primary URI
+/// ([`SelectedUri::Primary`], `file_state.dart:759`).
 ///
 /// Pure and allocation-free: all comparisons are borrowed string equality.
-/// Non-`dart.library.` names never match here — the `-D` declared-variables
-/// face of the environment is a separate axis (analysis options), not part
-/// of the platform table.
+/// An undeclared name never matches — under the engine's empty default
+/// map (the no-`-D` oracle context) nothing matches at all.
 #[must_use]
-pub fn resolve_conditional(configs: &[Configuration], platform: &PlatformSet) -> SelectedUri {
+pub fn resolve_conditional(
+    configs: &[Configuration],
+    declared: &FxHashMap<String, String>,
+) -> SelectedUri {
     for (index, config) in configs.iter().enumerate() {
-        let Some(library) = config.dotted_name.strip_prefix("dart.library.") else {
-            continue;
-        };
-        if platform.available(library) && config.expected() == "true" {
+        if declared
+            .get(&*config.dotted_name)
+            .is_some_and(|value| value == config.expected())
+        {
             return SelectedUri::Configuration(index);
         }
     }
@@ -164,171 +117,107 @@ pub fn resolve_conditional(configs: &[Configuration], platform: &PlatformSet) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dartq_sdk::{SdkLibrary, TargetLibraries};
-    use std::collections::BTreeMap;
 
-    /// A `SdkLibraries` with a `vm` segment exposing `io` plus two rows the
-    /// loader would carry with `support_conditional_import: false` (an
-    /// opt-out row and an `_`-prefixed one, which the real loader forces
-    /// `false` at parse time), and a `web` segment exposing `html`; mirrors
-    /// the post-parse libraries.json row shape.
-    fn sdk_libraries() -> SdkLibraries {
-        let library = || SdkLibrary {
-            uri: "x/x.dart".into(),
-            patches: Vec::new(),
-            support_conditional_import: true,
-            support_direct_import: dartq_sdk::Importability::Always,
-        };
-        let unsupported = || SdkLibrary {
-            support_conditional_import: false,
-            ..library()
-        };
-        let mut vm: BTreeMap<String, SdkLibrary> = BTreeMap::new();
-        vm.insert("io".into(), library());
-        vm.insert("_vm_internal".into(), unsupported());
-        vm.insert("io_blocked".into(), unsupported());
-        let mut web: BTreeMap<String, SdkLibrary> = BTreeMap::new();
-        web.insert("html".into(), library());
-        SdkLibraries {
-            targets: BTreeMap::from([
-                ("vm".into(), TargetLibraries { libraries: vm }),
-                ("web".into(), TargetLibraries { libraries: web }),
-            ]),
+    fn declared(pairs: &[(&str, &str)]) -> FxHashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The pin's anchor shape under the oracle-default EMPTY context:
+    /// `import 'a.dart' if (dart.library.io) 'b.dart';` selects the primary
+    /// `a.dart` — the declared map carries no `dart.library.*` rows, so no
+    /// condition matches (steps 2 + 4). The CFE would pick the branch on
+    /// the VM — the documented divergence (step 6).
+    #[test]
+    fn empty_context_selects_primary() {
+        let configs = [
+            Configuration::new("dart.library.io", None, "b.dart"),
+            Configuration::new("dart.library.html", None, "c.dart"),
+        ];
+        assert_eq!(
+            resolve_conditional(&configs, &FxHashMap::default()),
+            SelectedUri::Primary
+        );
+    }
+
+    /// A bare `if (name)` tests `"true"` exactly: it matches a declared
+    /// `name=true` and nothing else (`valueOrTrue`, step 1); an undeclared
+    /// name never matches (step 3).
+    #[test]
+    fn bare_condition_tests_true() {
+        let configs = [Configuration::new("dart.library.io", None, "b.dart")];
+        let context = declared(&[("dart.library.io", "true")]);
+        assert_eq!(
+            resolve_conditional(&configs, &context),
+            SelectedUri::Configuration(0)
+        );
+        let context = declared(&[("dart.library.io", "TRUE")]);
+        assert_eq!(
+            resolve_conditional(&configs, &context),
+            SelectedUri::Primary,
+            "no case folding"
+        );
+        let context = declared(&[("other", "true")]);
+        assert_eq!(
+            resolve_conditional(&configs, &context),
+            SelectedUri::Primary,
+            "an undeclared name never matches"
+        );
+    }
+
+    /// `if (name == 'value')` matches exact string equality against the
+    /// declared value (step 3).
+    #[test]
+    fn written_value_is_exact_equality() {
+        let context = declared(&[("flutter.mode", "release")]);
+        let configs = [Configuration::new(
+            "flutter.mode",
+            Some("release"),
+            "b.dart",
+        )];
+        assert_eq!(
+            resolve_conditional(&configs, &context),
+            SelectedUri::Configuration(0)
+        );
+        for value in ["Release", "releases", "true"] {
+            let configs = [Configuration::new("flutter.mode", Some(value), "b.dart")];
+            assert_eq!(
+                resolve_conditional(&configs, &context),
+                SelectedUri::Primary,
+                "`{value}` is not the declared `release`"
+            );
         }
     }
 
-    fn vm() -> PlatformSet {
-        PlatformSet::from_segment(&sdk_libraries(), "vm")
-    }
-
-    /// An available library matches the bare condition (tri-state: match).
+    /// Source order, first match wins; an earlier clause whose value misses
+    /// never shadows a later match (`selectedConfigurationUri ??=`, step 3).
     #[test]
-    fn available_library_matches() {
-        let configs = [Configuration::new("dart.library.io", None, "io.dart")];
-        assert_eq!(
-            resolve_conditional(&configs, &vm()),
-            SelectedUri::Configuration(0)
-        );
-        assert!(vm().available("io"));
-    }
-
-    /// A library present on another segment but not this one does not match;
-    /// the primary URI is the fallback (tri-state: no-match fallback).
-    #[test]
-    fn unavailable_library_falls_back_to_primary() {
-        let configs = [Configuration::new("dart.library.html", None, "html.dart")];
-        assert_eq!(resolve_conditional(&configs, &vm()), SelectedUri::Primary);
-        assert!(!vm().available("html"));
-    }
-
-    /// An unknown library key is `false` and never matches
-    /// (`source_loader.dart:470-482`: absent → `null`, never equal).
-    #[test]
-    fn unknown_library_key_is_false() {
-        let configs = [Configuration::new(
-            "dart.library.nonexistent",
-            None,
-            "x.dart",
-        )];
-        assert_eq!(resolve_conditional(&configs, &vm()), SelectedUri::Primary);
-        assert!(!vm().available("nonexistent"));
-    }
-
-    /// First match in source order wins; later matches never override.
-    #[test]
-    fn first_match_wins_in_chain() {
+    fn first_match_wins_in_source_order() {
+        let context = declared(&[("a", "x"), ("b", "y")]);
         let configs = [
-            Configuration::new("dart.library.io", None, "io.dart"),
-            Configuration::new("dart.library.html", None, "html.dart"),
+            Configuration::new("a", Some("nope"), "a.dart"),
+            Configuration::new("b", Some("y"), "b.dart"),
+            Configuration::new("b", Some("y"), "c.dart"),
         ];
         assert_eq!(
-            resolve_conditional(&configs, &vm()),
-            SelectedUri::Configuration(0)
-        );
-        let web = PlatformSet::from_segment(&sdk_libraries(), "web");
-        assert_eq!(
-            resolve_conditional(&configs, &web),
-            SelectedUri::Configuration(1),
-            "on web the io condition misses and html is the first match"
+            resolve_conditional(&configs, &context),
+            SelectedUri::Configuration(1)
         );
     }
 
-    /// Non-`dart.library.` names never match the platform table; the
-    /// analyzer oracle never matches an undeclared name either.
+    /// No match falls back to the primary URI (step 4); an empty
+    /// configuration list is trivially primary.
     #[test]
-    fn non_dart_library_names_never_match() {
-        let configs = [
-            Configuration::new("foo", None, "a.dart"),
-            Configuration::new("foo", Some(""), "b.dart"),
-            Configuration::new("dart.tool.dart2js", None, "c.dart"),
-        ];
-        assert_eq!(resolve_conditional(&configs, &vm()), SelectedUri::Primary);
-    }
-
-    /// `support_conditional_import: false` removes the name from the table
-    /// (the `_`-prefixed rows are forced `false` at parse time upstream).
-    #[test]
-    fn conditional_import_support_gates_availability() {
-        let platform = vm();
-        assert!(!platform.available("io_blocked"));
-        assert!(
-            !platform.available("_vm_internal"),
-            "`_`-prefixed internal names are parse-time forced false"
-        );
-        let configs = [
-            Configuration::new("dart.library.io_blocked", None, "a.dart"),
-            Configuration::new("dart.library._vm_internal", None, "b.dart"),
-        ];
+    fn no_match_falls_back_to_primary() {
+        let context = declared(&[("a", "x")]);
+        let configs = [Configuration::new("a", Some("y"), "b.dart")];
         assert_eq!(
-            resolve_conditional(&configs, &platform),
+            resolve_conditional(&configs, &context),
             SelectedUri::Primary
         );
-    }
-
-    /// An unknown segment derives an empty table: every condition misses.
-    #[test]
-    fn unknown_segment_matches_nothing() {
-        let platform = PlatformSet::from_segment(&sdk_libraries(), "wasm");
-        assert!(
-            !platform.available("io"),
-            "unknown segment derives an empty table"
-        );
-        let configs = [Configuration::new("dart.library.io", None, "io.dart")];
-        assert_eq!(
-            resolve_conditional(&configs, &platform),
-            SelectedUri::Primary
-        );
-    }
-
-    /// The comparison is exact string equality against `"true"`
-    /// (`source_loader.dart:453-455` `"true"`; no case folding, no other
-    /// spellings).
-    #[test]
-    fn comparison_is_exact_string_equality() {
-        let platform = vm();
-        let configs = [Configuration::new("dart.library.io", Some("1"), "a.dart")];
-        assert_eq!(
-            resolve_conditional(&configs, &platform),
-            SelectedUri::Primary
-        );
-        let configs = [Configuration::new(
-            "dart.library.io",
-            Some("True"),
-            "a.dart",
-        )];
-        assert_eq!(
-            resolve_conditional(&configs, &platform),
-            SelectedUri::Primary
-        );
-        let configs = [Configuration::new(
-            "dart.library.io",
-            Some("true"),
-            "a.dart",
-        )];
-        assert_eq!(
-            resolve_conditional(&configs, &platform),
-            SelectedUri::Configuration(0)
-        );
+        assert_eq!(resolve_conditional(&[], &context), SelectedUri::Primary);
     }
 
     /// A written `= ''` is the absent test: `valueOrTrue` reads `''` back as
@@ -336,20 +225,15 @@ mod tests {
     #[test]
     fn written_empty_value_is_the_absent_test() {
         assert_eq!(
-            Configuration::new("dart.library.io", Some(""), "cfg.dart").value,
+            Configuration::new("a", Some(""), "cfg.dart").value,
             None,
             "`= ''` folds into the bare form"
         );
-        let configs = [Configuration::new("dart.library.io", Some(""), "cfg.dart")];
+        let context = declared(&[("a", "true")]);
+        let configs = [Configuration::new("a", Some(""), "cfg.dart")];
         assert_eq!(
-            resolve_conditional(&configs, &vm()),
+            resolve_conditional(&configs, &context),
             SelectedUri::Configuration(0)
         );
-    }
-
-    /// An empty configuration list selects the primary URI.
-    #[test]
-    fn empty_configs_select_primary() {
-        assert_eq!(resolve_conditional(&[], &vm()), SelectedUri::Primary);
     }
 }

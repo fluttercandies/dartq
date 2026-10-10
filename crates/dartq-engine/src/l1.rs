@@ -299,6 +299,7 @@ fn recompute_facts(
         &state.uri_packages,
         &state.sdk,
         SDK_TARGET,
+        &state.declared_variables,
         &mut state.files,
         &resident,
     );

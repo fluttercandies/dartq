@@ -36,7 +36,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// switched to length-prefixed lexeme framing (#398 F12) — the baked
 /// signature bytes changed for every file with a directive region, so
 /// v3-cached entries and snapshots must not survive the upgrade.
-const FACTS_SHAPE_VERSION: u32 = 4;
+/// v5: conditional-URI evaluation flipped from the CFE target-availability
+/// table to the oracle's declared-variables semantics (#455) —
+/// v4-cached entries for files with configurable directives carry the
+/// wrong selected URIs and must not survive the upgrade.
+const FACTS_SHAPE_VERSION: u32 = 5;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
@@ -424,6 +428,12 @@ pub(crate) struct EngineState {
     pub uri_packages: UriPackageTable,
     /// SDK snapshot; `dart:` targets resolve against [`SDK_TARGET`].
     pub sdk: SdkSnapshot,
+    /// Declared variables (`DeclaredVariables`) of the conditional-import
+    /// evaluation: the `-D name=value` pairs configurable directives test
+    /// against. Empty today — the no-`-D` oracle context
+    /// (`driver.dart:583-593`), under which every configurable directive
+    /// resolves its primary URI; the CLI define surface populates this.
+    pub declared_variables: FxHashMap<String, String>,
     /// Content-addressed byte storage, engine-owned (`Send + Sync` so the
     /// fan-out can hold `&EngineState`; jobs never touch the store —
     /// they receive owned source strings).
@@ -539,6 +549,7 @@ impl EngineState {
             packages,
             uri_packages,
             sdk,
+            declared_variables: FxHashMap::default(),
             store,
             files: FileTable::new(),
             strings: StringTable::new(),
@@ -657,12 +668,14 @@ impl EngineState {
     }
 
     /// A URI resolver over the engine's package table, SDK snapshot, and file
-    /// table; `dart:` URIs dispatch against [`SDK_TARGET`]. Resolution interns
-    /// directive targets into [`Self::files`], hence the exclusive borrow.
-    /// `resident` is the file-state existence face — which interned ids hold
-    /// content in the analyzed world (disk files and declared overlays);
-    /// resolution codes missing-target diagnostics only against it. Faces
-    /// that never probe existence (e.g. `canonical_uri`) pass `&|_| false`.
+    /// table; `dart:` URIs dispatch against [`SDK_TARGET`], conditional
+    /// directives evaluate against [`Self::declared_variables`]. Resolution
+    /// interns directive targets into [`Self::files`], hence the exclusive
+    /// borrow. `resident` is the file-state existence face — which interned
+    /// ids hold content in the analyzed world (disk files and declared
+    /// overlays); resolution codes missing-target diagnostics only against
+    /// it. Faces that never probe existence (e.g. `canonical_uri`) pass
+    /// `&|_| false`.
     pub(crate) fn uri_resolver<'a>(
         &'a mut self,
         resident: &'a dyn Fn(FileId) -> bool,
@@ -671,6 +684,7 @@ impl EngineState {
             &self.uri_packages,
             &self.sdk,
             SDK_TARGET,
+            &self.declared_variables,
             &mut self.files,
             resident,
         )
