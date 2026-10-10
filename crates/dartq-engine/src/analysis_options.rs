@@ -59,9 +59,34 @@
 //!   (`_ParsedLanguageData.parse`, parse_model:904-998; `_applyLanguage`,
 //!   parser:250-260). Parsed and exposed only — the semantic consumption is
 //!   #480's.
-//! - Unknown keys and unreadable or malformed files are tolerated — the
-//!   official reports options-file diagnostics on a separate surface and
-//!   still produces effective options (missing include → skipped).
+//! - **Self-diagnostics (#457)** — the options file's own problems surface
+//!   instead of degrading silently. The official reports every options
+//!   diagnostic on the *initial* file: include-chain rows directly at the
+//!   initial include span (`_AnalysisOptionsIncludeWalker`, `include_walker.dart`
+//!   :121-151 — a missing include reports `include_file_not_found` and stops
+//!   that edge; a parsed include resolving back to the initial file reports
+//!   `recursive_include_file`, :161-171; a chain cycle not through the initial
+//!   file is `included_file_warning`, a wrapping face dartq has not built),
+//!   while the initial file's local shape problems report their raw codes
+//!   (`invalid_section_format`, `unsupported_option`, `undefined_lint`,
+//!   `analysis_options_parse_model.dart`) and *included* files' local problems
+//!   are wrapped the same way — so local rows are recorded for the initial
+//!   file only. Codes and message templates are verbatim from the pinned
+//!   registry (`diagnostic.g.dart`), all `STATIC_WARNING` → WARNING. `serde_yaml`
+//!   keeps no spans, so rows anchor at the token text's first occurrence in
+//!   the initial file (`anchor_span`); the `(code, file)` differential face is
+//!   exact regardless. `undefined_lint` needs the lint registry, which lives
+//!   in dartq-lints (an engine dependency would cycle) — the engine records
+//!   the initial file's declared rule names ([`AnalysisOptions::declared_rules`])
+//!   and the CLI face (dartq-commands) validates them against
+//!   `rule_by_name`. Rows ride the same severity face as every other output
+//!   row (`Engine::analyze` appends them before `apply_severity_options`), and
+//!   the options file — never resident as Dart — resolves its rows' positions
+//!   through the engine's layout fallback (`Engine::content`/`line_index` over
+//!   the text + [`LineIndex`] captured at load).
+//! - Unreadable or malformed files are tolerated — the official reports them
+//!   (`included_file_parse_error` / YAML errors, faces dartq has not built)
+//!   and still produces effective options (missing include → skipped).
 //!
 //! The whole face is pure functions over paths + YAML: testable without the
 //! CLI, and cold-path (workspace assembly), so clarity beats micro-cost.
@@ -72,12 +97,123 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_yaml::Value;
 
-use dartq_diagnostics::{CodeRegistry, Severity};
+use dartq_diagnostics::{
+    CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, FileId, Severity, SourceRange,
+};
 use dartq_pub::PackageConfig;
+use dartq_source::{LineIndex, byte_offset_to_utf16, utf16_len_of};
 
 /// The options file name the analyzer locates walking up from a context
 /// root (`ContextLocator.locate`).
 const OPTIONS_FILE_NAME: &str = "analysis_options.yaml";
+
+// The options-file self-diagnostic codes, verbatim from the pinned registry
+// (`diagnostic.g.dart`, dart 3.15 main): include_file_not_found :7757-7776,
+// recursive_include_file :14675-14697, invalid_section_format :9708-9722,
+// undefined_lint :16988-17001, unsupported_option :17832-17905 (the three
+// variants share one name/machine form; the variant is the correction text).
+// All STATIC_WARNING rows, published docs — the severity is the single
+// `DiagnosticType::severity` derivation at the emit sites.
+
+/// `The URI '{0}' included in '{1}' can't be found when analyzing '{2}'.`
+/// (include_walker.dart:124-134.)
+const INCLUDE_FILE_NOT_FOUND: CodeInfo = CodeInfo::new(
+    "include_file_not_found",
+    "INCLUDE_FILE_NOT_FOUND",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `The URI '{0}' included in '{1}' includes '{1}', creating a circular
+/// reference.` (include_walker.dart:161-171.)
+const RECURSIVE_INCLUDE_FILE: CodeInfo = CodeInfo::new(
+    "recursive_include_file",
+    "RECURSIVE_INCLUDE_FILE",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `Invalid format for the '{0}' section.`
+const INVALID_SECTION_FORMAT: CodeInfo = CodeInfo::new(
+    "invalid_section_format",
+    "INVALID_SECTION_FORMAT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `The option '{1}' isn't supported by '{0}'.`
+const UNSUPPORTED_OPTION: CodeInfo = CodeInfo::new(
+    "unsupported_option",
+    "UNSUPPORTED_OPTION",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `'{0}' isn't a recognized lint rule.` (parse_model:1245-1251; emitted by
+/// the CLI face, which owns the lint-registry seam.)
+pub const UNDEFINED_LINT: CodeInfo = CodeInfo::new(
+    "undefined_lint",
+    "UNDEFINED_LINT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// One options-file self-diagnostic recorded during a load: the registry
+/// code identity, the verbatim rendered texts, and the anchor span in the
+/// initial options file (UTF-16; [`OptionsIssue::to_diagnostic`] completes
+/// the row).
+#[derive(Debug, Clone)]
+pub struct OptionsIssue {
+    pub code: CodeInfo,
+    pub message: String,
+    pub correction: Option<String>,
+    pub offset: u32,
+    pub length: u32,
+}
+
+impl OptionsIssue {
+    /// The engine diagnostic row. Severity is the code's registry family
+    /// severity — every options-file code is `STATIC_WARNING` → WARNING.
+    #[must_use]
+    pub fn to_diagnostic(&self, file: FileId) -> Diagnostic {
+        Diagnostic::new(
+            self.code.dtype.severity(),
+            self.code,
+            self.message.clone(),
+            file,
+            SourceRange {
+                offset: self.offset,
+                length: self.length,
+            },
+            self.correction.clone(),
+        )
+    }
+
+    /// The `undefined_lint` row for one declared-but-unregistered rule name
+    /// (parse_model:1245-1251 — the registry check fires before the entry's
+    /// value is even looked at, so disabled names report too).
+    #[must_use]
+    pub fn undefined_lint(rule: &DeclaredRule) -> Self {
+        OptionsIssue {
+            code: UNDEFINED_LINT,
+            message: format!("'{}' isn't a recognized lint rule.", rule.name),
+            correction: Some("Try using the name of a recognized lint rule.".to_owned()),
+            offset: rule.offset,
+            length: rule.length,
+        }
+    }
+}
+
+/// A lint name declared by the initial file's own `linter.rules`, with its
+/// anchor span — the `undefined_lint` candidate list. The engine holds no
+/// lint registry (that lives in dartq-lints, and an engine dependency would
+/// cycle), so validity is the caller's seam.
+#[derive(Debug, Clone)]
+pub struct DeclaredRule {
+    pub name: String,
+    pub offset: u32,
+    pub length: u32,
+}
 
 /// One package root's fully merged analysis options (the
 /// `ResolvedAnalysisOptions` slice PRD §12.1 names, limited to the sections
@@ -110,6 +246,22 @@ pub struct AnalysisOptions {
     /// Precompiled exclude globs, each anchored to its declaring file's
     /// directory (official `LocatedGlob`).
     excludes: Vec<ExcludeGlob>,
+    /// The initial options file this merge loaded, normalized — the file
+    /// every recorded row attributes to. Empty for the synthesized default
+    /// (no options file in the root's ancestry).
+    pub file_path: PathBuf,
+    /// The initial file's text and line index, captured at load so the
+    /// output faces resolve the rows' positions through the engine's layout
+    /// fallback (the file is never resident as Dart).
+    pub(crate) layout: Option<(Arc<str>, LineIndex)>,
+    /// Self-diagnostics recorded during the load (include-chain rows at
+    /// every depth; local shape rows for the initial file only), in walk
+    /// order — the output face sorts them canonically.
+    pub issues: Vec<OptionsIssue>,
+    /// Lint names the initial file's own `linter.rules` declares, in
+    /// declaration order (`undefined_lint` candidates; validity is the
+    /// caller's registry seam).
+    pub declared_rules: Vec<DeclaredRule>,
 }
 
 /// One compiled exclude pattern plus the directory it is relative to
@@ -236,12 +388,21 @@ impl AnalysisOptions {
     /// Loads and merges the options file at `path`. Total: an unreadable or
     /// malformed file, a missing include, or a cycle all degrade to
     /// "that input contributes nothing" (official observable behavior); the
-    /// returned options are always usable.
+    /// returned options are always usable, and the degradation that the
+    /// official surfaces as a diagnostic is recorded on
+    /// [`AnalysisOptions::issues`].
     #[must_use]
     pub fn load(path: &Path, packages: &PackageConfig, config_dir: &Path) -> AnalysisOptions {
-        let mut merge = MergeState::default();
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let normalized = dartq_pub::normalize(path);
+        let mut merge = MergeState {
+            initial: normalized.clone(),
+            initial_text: Arc::from(text.as_str()),
+            context_root: normalized.parent().unwrap_or(Path::new("")).to_path_buf(),
+            ..MergeState::default()
+        };
         let mut chain = FxHashSet::default();
-        merge.apply_file(path, &mut chain, packages, config_dir);
+        merge.apply_file(&normalized, &mut chain, packages, config_dir);
         merge.build()
     }
 
@@ -292,9 +453,37 @@ struct MergeState {
     /// Deduplication key of the official `Set<AnalysisOptionsExcludePattern>`:
     /// (declaring file, pattern).
     exclude_keys: FxHashSet<(PathBuf, String)>,
+    /// The normalized initial file: include-chain rows resolve back to it
+    /// (`recursive_include_file`), local rows record only for it, and every
+    /// row attributes to it (`include_walker.dart` reports all rows on the
+    /// initial file).
+    initial: PathBuf,
+    /// The initial file's text — the span anchor every row searches.
+    initial_text: Arc<str>,
+    /// The initial file's directory — the `contextRootPath` message argument
+    /// of `include_file_not_found` (walker :126-131). For the dominant
+    /// single-package shape the options file sits at the context root, so
+    /// this matches the official argument exactly.
+    context_root: PathBuf,
+    issues: Vec<OptionsIssue>,
+    declared_rules: Vec<DeclaredRule>,
 }
 
 impl MergeState {
+    /// Records one row, anchored at `token`'s first occurrence in the
+    /// initial file (the span stand-in — `serde_yaml` keeps no node spans;
+    /// see the module docs).
+    fn record(&mut self, code: CodeInfo, token: &str, message: String, correction: Option<String>) {
+        let (offset, length) = anchor_span(&self.initial_text, token);
+        self.issues.push(OptionsIssue {
+            code,
+            message,
+            correction,
+            offset,
+            length,
+        });
+    }
+
     /// The official `_applyParsedFiles`: apply every resolvable include
     /// first, then this file's own data — depth-first, near data last.
     fn apply_file(
@@ -305,7 +494,9 @@ impl MergeState {
         config_dir: &Path,
     ) {
         if !chain.insert(file.to_path_buf()) {
-            return; // recursive include: contributes once (parser:395)
+            return; // chain cycle not through the initial file: contributes
+            // once (parser:395); the official row is
+            // `included_file_warning`, a face dartq has not built.
         }
         let Ok(text) = std::fs::read_to_string(file) else {
             chain.remove(file);
@@ -315,16 +506,52 @@ impl MergeState {
             chain.remove(file);
             return;
         };
+        let is_initial = file == self.initial;
 
         for uri in include_uris(&yaml) {
-            let Some(included) = resolve_include(&uri, file, packages, config_dir) else {
-                continue; // missing include: skipped (official reports, keeps going)
-            };
-            self.apply_file(&included, chain, packages, config_dir);
+            match resolve_include(&uri, file, packages, config_dir) {
+                // The edge decision order mirrors `_walkInclude`
+                // (include_walker.dart:121-151): a missing target reports
+                // `include_file_not_found` and stops the edge; a parsed
+                // target resolving back to the initial file reports
+                // `recursive_include_file` and stops it too (:161-171 —
+                // missing wins for unresolvable edges because recursion is
+                // only reached for parsed ones); anything else recurses.
+                Some(included) if included.is_file() => {
+                    if included == self.initial {
+                        self.record(
+                            RECURSIVE_INCLUDE_FILE,
+                            &uri,
+                            format!(
+                                "The URI '{uri}' included in '{}' includes '{}', \
+                                 creating a circular reference.",
+                                file.display(),
+                                file.display()
+                            ),
+                            Some(
+                                "Try changing the chain of 'include's to break the circularity."
+                                    .to_owned(),
+                            ),
+                        );
+                    } else {
+                        self.apply_file(&included, chain, packages, config_dir);
+                    }
+                }
+                _ => self.record(
+                    INCLUDE_FILE_NOT_FOUND,
+                    &uri,
+                    format!(
+                        "The URI '{uri}' included in '{}' can't be found when analyzing '{}'.",
+                        file.display(),
+                        self.context_root.display()
+                    ),
+                    None,
+                ),
+            }
         }
 
         let declaring_dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
-        self.apply_local(&yaml, &declaring_dir);
+        self.apply_local(&yaml, &declaring_dir, is_initial);
         chain.remove(file);
     }
 
@@ -332,8 +559,10 @@ impl MergeState {
     /// `_ApplyState.apply`, the sections this engine consumes). The section
     /// order mirrors `_applyAnalyzer` (parser:164-171) where it matters:
     /// `errors` before `cannot-ignore`, so the severity arms see this
-    /// file's re-levels.
-    fn apply_local(&mut self, yaml: &Value, declaring_dir: &Path) {
+    /// file's re-levels. Local shape problems record for the initial file
+    /// only (an included file's rows are officially wrapped — see the
+    /// module docs).
+    fn apply_local(&mut self, yaml: &Value, declaring_dir: &Path, is_initial: bool) {
         let Some(map) = yaml.as_mapping() else {
             return;
         };
@@ -348,6 +577,10 @@ impl MergeState {
                     .filter(|rules| !rules.is_null())
                 {
                     apply_rules(rules, &mut self.rules);
+                    if is_initial {
+                        self.declared_rules
+                            .extend(declared_rule_names(rules, &self.initial_text));
+                    }
                 }
             }
             Some(_) => self.rules.clear(),
@@ -371,6 +604,9 @@ impl MergeState {
         self.strict_casts = casts.or(self.strict_casts);
         self.strict_inference = inference.or(self.strict_inference);
         self.strict_raw_types = raw_types.or(self.strict_raw_types);
+        if is_initial {
+            self.issues.extend(local_issues(map, &self.initial_text));
+        }
     }
 
     /// Freezes the merged state: enabled rule names, sorted (the canonical
@@ -383,6 +619,7 @@ impl MergeState {
             .collect();
         names.sort();
         names.dedup();
+        let line_index = LineIndex::new(&self.initial_text);
         AnalysisOptions {
             lint_rules: names,
             strict_casts: self.strict_casts,
@@ -391,6 +628,10 @@ impl MergeState {
             severity_overrides: self.errors,
             unignorable: self.unignorable,
             excludes: self.excludes,
+            file_path: self.initial,
+            layout: Some((self.initial_text, line_index)),
+            issues: self.issues,
+            declared_rules: self.declared_rules,
         }
     }
 }
@@ -600,6 +841,281 @@ fn language_scalars(map: &serde_yaml::Mapping) -> (Option<bool>, Option<bool>, O
         parse("strict-inference"),
         parse("strict-raw-types"),
     )
+}
+
+// --- Local shape rows (the initial file's own sections, #457) ---
+
+/// The `analyzer` keys the official supports (`analyzerOptions`,
+/// analysis_options_file.dart:99-108, in the set literal's insertion order —
+/// the proposal text follows it).
+const ANALYZER_OPTIONS: [&str; 8] = [
+    "cannot-ignore",
+    "enable-experiment",
+    "errors",
+    "exclude",
+    "language",
+    "optional-checks",
+    "plugins",
+    "strong-mode",
+];
+
+/// The `analyzer.language` keys (`languageOptions`, `analysis_options_file.dart`
+/// :103-107).
+const LANGUAGE_OPTIONS: [&str; 3] = ["strict-casts", "strict-inference", "strict-raw-types"];
+
+/// The legal `errors` action values, in the official list order with its
+/// duplicate preserved verbatim — `errorProcessorLegalValues` is
+/// `[...ignoreSynonyms, ...trueOrFalse, ...severities]` (parse_model:55-59)
+/// over `['ignore', 'false']` + `['true', 'false']` + `severityMap.keys`
+/// (error_processor.dart:14-19: error, info, warning) — and the correction
+/// text prints the list as-is.
+const ERROR_ACTIONS: [&str; 7] = [
+    "ignore", "false", "true", "false", "error", "info", "warning",
+];
+
+/// The lowercased actions that carry meaning (`ignoreSynonyms` filter,
+/// `severityMap` re-levels; anything else contributes nothing and reports).
+const EFFECTIVE_ERROR_ACTIONS: [&str; 5] = ["ignore", "false", "error", "info", "warning"];
+
+/// The initial file's local shape rows — one walk over the sections this
+/// engine consumes, mirroring the official shapes: `analyzer` (`parse_model`
+/// :263-305: null-tolerant, non-map → row, unknown scalar keys →
+/// `unsupported_option`), `errors` (:551-612: non-map or container
+/// key/value → row, illegal action → `unsupported_option` with the legal
+/// values), `cannot-ignore` (:356-397: non-list or non-string entry → row),
+/// `exclude` (:644-670: same shape), `language` (:916-970: null-tolerant,
+/// non-map → row, unknown key → `unsupported_option`, container value → row
+/// naming the option), `linter` (:1130-1184: null-tolerant, non-map → row,
+/// unknown key → singular `unsupported_option`). Scalar non-string `errors`
+/// keys report `unrecognized_error_code`, non-boolean `language` values
+/// report `unsupported_value` — faces dartq has not built, silent here; the
+/// sections the engine does not consume (code-style, formatter, plugins,
+/// enable-experiment, strong-mode, optional-checks) are silent too.
+fn local_issues(map: &serde_yaml::Mapping, text: &str) -> Vec<OptionsIssue> {
+    let mut issues = Vec::new();
+    let analyzer = match map.get(Value::from("analyzer")) {
+        None | Some(Value::Null) => None,
+        Some(Value::Mapping(analyzer)) => {
+            for key in analyzer.keys() {
+                if let Some(name) = key.as_str()
+                    && !ANALYZER_OPTIONS.contains(&name)
+                {
+                    push_unsupported(&mut issues, text, name, "analyzer", &ANALYZER_OPTIONS);
+                }
+            }
+            Some(analyzer)
+        }
+        Some(_) => {
+            push_invalid_section(&mut issues, text, "analyzer", "analyzer");
+            None
+        }
+    };
+    if let Some(analyzer) = analyzer {
+        // `errors` (:551-612).
+        match analyzer.get(Value::from("errors")) {
+            None => {}
+            Some(Value::Mapping(entries)) => {
+                for (key, value) in entries {
+                    // A container key is an invalid section entry
+                    // (:577-582); a scalar non-string key is
+                    // `unrecognized_error_code` (silent).
+                    if matches!(key, Value::Mapping(_) | Value::Sequence(_)) {
+                        push_invalid_section(&mut issues, text, "errors", "errors");
+                        continue;
+                    }
+                    // The action stringifies (`valueNode.value.toString()`,
+                    // :600) — booleans, numbers, and null too.
+                    let Some(action) = yaml_scalar_text(value) else {
+                        push_invalid_section(&mut issues, text, "errors", "errors");
+                        continue;
+                    };
+                    if !EFFECTIVE_ERROR_ACTIONS.contains(&action.to_lowercase().as_str()) {
+                        push_unsupported(&mut issues, text, &action, "errors", &ERROR_ACTIONS);
+                    }
+                }
+            }
+            Some(_) => push_invalid_section(&mut issues, text, "errors", "errors"),
+        }
+        // `cannot-ignore` (:356-397) — not null-tolerant (`valueAt` returns
+        // the node, so a present-but-empty entry is a scalar).
+        match analyzer.get(Value::from("cannot-ignore")) {
+            None => {}
+            Some(Value::Sequence(list)) => {
+                for entry in list {
+                    if entry.as_str().is_none() {
+                        push_invalid_section(&mut issues, text, "cannot-ignore", "cannot-ignore");
+                    }
+                }
+            }
+            Some(_) => push_invalid_section(&mut issues, text, "cannot-ignore", "cannot-ignore"),
+        }
+        // `exclude` (:644-670) — same not-null-tolerant shape.
+        match analyzer.get(Value::from("exclude")) {
+            None => {}
+            Some(Value::Sequence(list)) => {
+                for entry in list {
+                    if entry.as_str().is_none() {
+                        push_invalid_section(&mut issues, text, "exclude", "exclude");
+                    }
+                }
+            }
+            Some(_) => push_invalid_section(&mut issues, text, "exclude", "exclude"),
+        }
+        // `language` (:916-970) — null-tolerant.
+        match analyzer.get(Value::from("language")) {
+            None | Some(Value::Null) => {}
+            Some(Value::Mapping(language)) => {
+                for (key, value) in language {
+                    let Some(name) = key.as_str() else {
+                        continue;
+                    };
+                    if !LANGUAGE_OPTIONS.contains(&name) {
+                        push_unsupported(&mut issues, text, name, "language", &LANGUAGE_OPTIONS);
+                    } else if matches!(value, Value::Mapping(_) | Value::Sequence(_)) {
+                        // A container value is an invalid section (:933-940,
+                        // sectioned by the option name); a non-boolean
+                        // scalar is `unsupported_value` (silent).
+                        push_invalid_section(&mut issues, text, name, name);
+                    }
+                }
+            }
+            Some(_) => push_invalid_section(&mut issues, text, "language", "language"),
+        }
+    }
+    // `linter` (:1130-1184) — null-tolerant; the unknown-key proposal is
+    // singular (`linterOptions` = {'rules'}).
+    match map.get(Value::from("linter")) {
+        None | Some(Value::Null) => {}
+        Some(Value::Mapping(linter)) => {
+            for key in linter.keys() {
+                if let Some(name) = key.as_str()
+                    && name != "rules"
+                {
+                    push_unsupported(&mut issues, text, name, "linter", &["rules"]);
+                }
+            }
+        }
+        Some(_) => push_invalid_section(&mut issues, text, "linter", "linter"),
+    }
+    issues
+}
+
+/// Records one `invalid_section_format` row (`Invalid format for the '{0}'
+/// section.`, registry :9708-9722), anchored at `token`.
+fn push_invalid_section(issues: &mut Vec<OptionsIssue>, text: &str, section: &str, token: &str) {
+    let (offset, length) = anchor_span(text, token);
+    issues.push(OptionsIssue {
+        code: INVALID_SECTION_FORMAT,
+        message: format!("Invalid format for the '{section}' section."),
+        correction: None,
+        offset,
+        length,
+    });
+}
+
+/// Records one `unsupported_option` row (`The option '{1}' isn't supported
+/// by '{0}'.`, registry :17832-17905) with the correction matching the
+/// legal-value count — singular (`unsupportedOptionWithLegalValue`) or the
+/// `quotedAndCommaSeparatedWithAnd` proposal (`…WithLegalValues`).
+fn push_unsupported(
+    issues: &mut Vec<OptionsIssue>,
+    text: &str,
+    option: &str,
+    section: &str,
+    legal: &[&str],
+) {
+    let correction = match legal {
+        [one] => format!("Try using the only supported option: '{one}', or removing the option."),
+        _ => format!(
+            "Try using one of the supported options: {}.",
+            proposal(legal)
+        ),
+    };
+    let (offset, length) = anchor_span(text, option);
+    issues.push(OptionsIssue {
+        code: UNSUPPORTED_OPTION,
+        message: format!("The option '{option}' isn't supported by '{section}'."),
+        correction: Some(correction),
+        offset,
+        length,
+    });
+}
+
+/// The `quotedAndCommaSeparatedWithAnd` form (string.dart:72-107): one
+/// element bare-quoted, two joined by ` and `, three or more comma-separated
+/// with the Oxford comma before `and`.
+fn proposal(values: &[&str]) -> String {
+    match values {
+        [] => String::new(),
+        [one] => format!("'{one}'"),
+        [first, second] => format!("'{first}' and '{second}'"),
+        _ => {
+            let mut parts: Vec<String> = values.iter().map(|value| format!("'{value}'")).collect();
+            let last = parts.pop().expect("non-empty above");
+            format!("{}, and {}", parts.join(", "), last)
+        }
+    }
+}
+
+/// The `valueNode.value.toString()` form of one scalar: strings verbatim,
+/// booleans as `true`/`false`, numbers in their decimal form, null as
+/// `null`; containers are no scalar and report instead.
+fn yaml_scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(enabled) => Some(if *enabled { "true" } else { "false" }.to_owned()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Null => Some("null".to_owned()),
+        _ => None,
+    }
+}
+
+/// The lint names the initial file's own `linter.rules` declares
+/// (`_parseLocalRules`, parse_model:1224-1378): list entries and map keys —
+/// a `name:` entry with a null value returns before the registry check
+/// (:1252-1253), group maps are not descended (the local parse validates
+/// top-level entries only; the merge keeps its config.dart recursion), and
+/// non-string names are skipped (:1238-1239).
+fn declared_rule_names(rules: &Value, text: &str) -> Vec<DeclaredRule> {
+    let mut names = Vec::new();
+    let mut push = |name: &str| {
+        let (offset, length) = anchor_span(text, name);
+        names.push(DeclaredRule {
+            name: name.to_owned(),
+            offset,
+            length,
+        });
+    };
+    match rules {
+        Value::Sequence(list) => {
+            for entry in list {
+                if let Some(name) = entry.as_str() {
+                    push(name);
+                }
+            }
+        }
+        Value::Mapping(map) => {
+            for (key, value) in map {
+                if let Some(name) = key.as_str()
+                    && !value.is_null()
+                {
+                    push(name);
+                }
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
+/// UTF-16 `(offset, length)` of `token`'s first occurrence in `text` — the
+/// span stand-in for the official node spans (`serde_yaml` keeps none; see
+/// the module docs). `(0, 0)` when the token does not occur.
+fn anchor_span(text: &str, token: &str) -> (u32, u32) {
+    match text.find(token) {
+        Some(byte) => (byte_offset_to_utf16(text, byte), utf16_len_of(token)),
+        None => (0, 0),
+    }
 }
 
 /// The `include:` URI strings of one options file: a single string or a list

@@ -670,8 +670,9 @@ fn topo_order(state: &EngineState, dirty: &[LibraryId]) -> Vec<LibraryId> {
 /// and correction as deterministic tiebreakers, in the exact field order of
 /// the retired owned-key sort. Everything compares in place (path bytes from
 /// the file table, texts from the diagnostics), so neither the store-time
-/// run sort nor the analyze-time merge materializes a key.
-fn compare_canonical(files: &FileTable, a: &Diagnostic, b: &Diagnostic) -> Ordering {
+/// run sort nor the analyze-time merge materializes a key. Also the merge
+/// key when the options-file rows join the analyze output (lib.rs, #457).
+pub(crate) fn compare_canonical(files: &FileTable, a: &Diagnostic, b: &Diagnostic) -> Ordering {
     let path = |diagnostic: &Diagnostic| {
         files
             .path(diagnostic.file)

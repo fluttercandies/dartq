@@ -602,3 +602,458 @@ fn engine_analyze_applies_errors_overrides() {
         "the ignore filter drops the row: {rows:?}"
     );
 }
+
+// --- Options-file self-diagnostics (#457) ---
+
+/// A missing include (relative or `package:`) reports `include_file_not_found`
+/// at every edge (`_walkInclude`, include_walker.dart:121-134; registry row
+/// `diagnostic.g.dart`:7757-7776 — `STATIC_WARNING`, message names the URI, the
+/// declaring file, and the context root) while the merge still degrades to
+/// "contributes nothing". The row anchors at the URI text's first occurrence.
+#[test]
+fn missing_include_reports_include_file_not_found() {
+    let dir = TempDir::new("notfound");
+    let text = "include:\n  - missing.yaml\n  - package:nope/absent.yaml\nlinter:\n  rules:\n    - kept_rule\n";
+    dir.write("analysis_options.yaml", text);
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.lint_rules, vec!["kept_rule"]);
+    let including = dir.path("analysis_options.yaml").display().to_string();
+    let expected = [
+        (
+            "missing.yaml",
+            13,
+            format!(
+                "The URI 'missing.yaml' included in '{including}' can't be found when \
+                 analyzing '{}'.",
+                dir.0.display()
+            ),
+        ),
+        (
+            "package:nope/absent.yaml",
+            30,
+            format!(
+                "The URI 'package:nope/absent.yaml' included in '{including}' can't be \
+                 found when analyzing '{}'.",
+                dir.0.display()
+            ),
+        ),
+    ];
+    assert_eq!(options.issues.len(), expected.len(), "{:?}", options.issues);
+    for (issue, (uri, offset, message)) in options.issues.iter().zip(&expected) {
+        assert_eq!(issue.code.name, "include_file_not_found");
+        assert_eq!(issue.code.machine, "INCLUDE_FILE_NOT_FOUND");
+        assert_eq!(
+            issue.code.dtype,
+            dartq_diagnostics::DiagnosticType::StaticWarning
+        );
+        assert!(issue.code.has_published_docs, "registry :7757 publishes it");
+        assert_eq!(issue.message, *message);
+        assert_eq!(issue.correction, None);
+        assert_eq!(issue.offset, *offset, "anchor at the URI text of {uri}");
+        assert_eq!(
+            issue.length,
+            u32::try_from(uri.chars().map(char::len_utf16).sum::<usize>()).expect("u32"),
+        );
+    }
+}
+
+/// The edge decision order mirrors `_walkInclude` (`include_walker.dart`
+/// :121-151) and `_walkParsedInclude` (:153-188): a parsed include resolving
+/// back to the *initial* file reports `recursive_include_file` (:161-171,
+/// registry diagnostic.g.dart:14675-14697) and stops the edge; a chain cycle
+/// that does not pass through the initial file is `included_file_warning` —
+/// a wrapping face dartq has not built — so it stays silent; missing wins
+/// for unresolvable edges because recursion is only reached for parsed ones.
+#[test]
+fn recursive_include_reports_back_to_initial_and_chain_cycles_stay_silent() {
+    let dir = TempDir::new("recursive");
+    dir.write("a.yaml", "include: b.yaml\n");
+    dir.write("b.yaml", "include: a.yaml\n");
+
+    let options = AnalysisOptions::load(&dir.path("a.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "recursive_include_file");
+    let b = dir.path("b.yaml").display().to_string();
+    assert_eq!(
+        issue.message,
+        format!(
+            "The URI 'a.yaml' included in '{b}' includes '{b}', creating a circular \
+             reference."
+        )
+    );
+    assert_eq!(
+        issue.correction.as_deref(),
+        Some("Try changing the chain of 'include's to break the circularity.")
+    );
+
+    // The indirect cycle b → c → b never passes through the initial file:
+    // the official row would be `includedFileWarning` (walker :176-188),
+    // silent here, and the walk still terminates.
+    let deep = TempDir::new("chain_cycle");
+    deep.write("a.yaml", "include: b.yaml\n");
+    deep.write("b.yaml", "include: c.yaml\n");
+    deep.write("c.yaml", "include: b.yaml\n");
+    let options = AnalysisOptions::load(&deep.path("a.yaml"), &empty_config(), &deep.0);
+    assert!(
+        options.issues.is_empty(),
+        "chain cycles are the wrapped face, not built: {:?}",
+        options.issues
+    );
+}
+
+/// Include-chain rows attribute to the *initial* file at every depth (the
+/// official reports them on the initial diagnostic reporter, `include_walker`
+/// .dart:125-133), while the message names the declaring file of the broken
+/// edge (`includingFilePath`, walker :129).
+#[test]
+fn include_chain_rows_attribute_to_the_initial_file() {
+    let dir = TempDir::new("chain_attr");
+    dir.write("near.yaml", "include: mid.yaml\n");
+    dir.write("mid.yaml", "include: far.yaml\n");
+    dir.write("far.yaml", "include: missing.yaml\n");
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "include_file_not_found");
+    let far = dir.path("far.yaml").display().to_string();
+    assert_eq!(
+        issue.message,
+        format!(
+            "The URI 'missing.yaml' included in '{far}' can't be found when analyzing \
+             '{}'.",
+            dir.0.display()
+        )
+    );
+    // Attribution: the initial file's own path (rows attribute there, and
+    // `file_path` is what the output face interns).
+    assert_eq!(options.file_path, dir.path("near.yaml"));
+}
+
+/// An included file's local shape problems are officially wrapped into
+/// `included_file_warning` (include_walker.dart:236-247) — a face dartq has
+/// not built — so they stay silent through the includer's load, while the
+/// included file's own load reports them (`_walk` reports local diagnostics
+/// directly for the initial file, walker :74-76).
+#[test]
+fn included_file_local_problems_stay_silent_for_the_includer() {
+    let dir = TempDir::new("wrapped");
+    dir.write("near.yaml", "include: far.yaml\n");
+    dir.write("far.yaml", "linter: 42\n");
+
+    let near = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+    assert!(
+        near.issues.is_empty(),
+        "wrapped faces are not built: {:?}",
+        near.issues
+    );
+
+    let far = AnalysisOptions::load(&dir.path("far.yaml"), &empty_config(), &dir.0);
+    assert_eq!(far.issues.len(), 1);
+    assert_eq!(far.issues[0].code.name, "invalid_section_format");
+    assert_eq!(
+        far.issues[0].message,
+        "Invalid format for the 'linter' section."
+    );
+}
+
+/// The invalid-section shapes of the sections the engine consumes
+/// (`_ParsedAnalyzerData.parse` parse_model:266-272, errors :551-557,
+/// cannot-ignore :356-362, exclude :644-650, language :919-925) report
+/// `invalid_section_format` with the section name, and the merged options
+/// still degrade exactly as before (the rows add no merge behavior).
+#[test]
+fn invalid_section_shapes_report_rows() {
+    let dir = TempDir::new("invalid_sections");
+    dir.write("top.yaml", "analyzer: 42\nlinter: 42\n");
+    dir.write(
+        "sections.yaml",
+        "analyzer:\n  errors: 42\n  exclude: 42\n  cannot-ignore: 42\n  language: 42\n",
+    );
+
+    let top = AnalysisOptions::load(&dir.path("top.yaml"), &empty_config(), &dir.0);
+    let mut names: Vec<&str> = top
+        .issues
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "Invalid format for the 'analyzer' section.",
+            "Invalid format for the 'linter' section."
+        ]
+    );
+
+    let nested = AnalysisOptions::load(&dir.path("sections.yaml"), &empty_config(), &dir.0);
+    let mut names: Vec<&str> = nested
+        .issues
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "Invalid format for the 'cannot-ignore' section.",
+            "Invalid format for the 'errors' section.",
+            "Invalid format for the 'exclude' section.",
+            "Invalid format for the 'language' section.",
+        ]
+    );
+    for issue in &nested.issues {
+        assert_eq!(issue.code.name, "invalid_section_format");
+        assert_eq!(issue.correction, None);
+    }
+}
+
+/// The unsupported-option family (`_reportUnsupportedSectionKeys`,
+/// parse_model:13-37, and the errors-action check :599-612) with verbatim
+/// correction forms: singular for one legal value (`linter` → `rules`),
+/// the `quotedAndCommaSeparatedWithAnd` proposal otherwise (string.dart
+/// :72-107 — Oxford comma at three or more), and the errors list verbatim
+/// with its duplicate `false` and the error→info→warning `severityMap`
+/// order (parse_model:55-59, error_processor.dart:14-19). Null sections:
+/// `errors`/`exclude`/`cannot-ignore` report (valueAt returns the node,
+/// parse_model:547-556), `language` and `linter` are null-tolerant
+/// (:918, :1132).
+#[test]
+fn unsupported_options_report_verbatim_rows() {
+    let dir = TempDir::new("unsupported");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  bogus: true\n",
+            "  language:\n",
+            "    wrong-key: true\n",
+            "    strict-casts: [1]\n",
+            "  errors:\n",
+            "    dead_code: fatal\n",
+            "    dup: [1]\n",
+            "linter:\n",
+            "  notrules: true\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    let expected: Vec<(&str, &str, &str)> = vec![
+        (
+            "unsupported_option",
+            "The option 'bogus' isn't supported by 'analyzer'.",
+            "Try using one of the supported options: 'cannot-ignore', \
+             'enable-experiment', 'errors', 'exclude', 'language', \
+             'optional-checks', 'plugins', and 'strong-mode'.",
+        ),
+        (
+            "unsupported_option",
+            "The option 'fatal' isn't supported by 'errors'.",
+            "Try using one of the supported options: 'ignore', 'false', 'true', \
+             'false', 'error', 'info', and 'warning'.",
+        ),
+        (
+            "invalid_section_format",
+            "Invalid format for the 'errors' section.",
+            "",
+        ),
+        (
+            "unsupported_option",
+            "The option 'wrong-key' isn't supported by 'language'.",
+            "Try using one of the supported options: 'strict-casts', \
+             'strict-inference', and 'strict-raw-types'.",
+        ),
+        (
+            "invalid_section_format",
+            "Invalid format for the 'strict-casts' section.",
+            "",
+        ),
+        (
+            "unsupported_option",
+            "The option 'notrules' isn't supported by 'linter'.",
+            "Try using the only supported option: 'rules', or removing the option.",
+        ),
+    ];
+    let actual: Vec<(&str, &str, Option<&str>)> = options
+        .issues
+        .iter()
+        .map(|issue| {
+            (
+                issue.code.name,
+                issue.message.as_str(),
+                issue.correction.as_deref(),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, &str, Option<&str>)> = expected
+        .into_iter()
+        .map(|(code, message, correction)| {
+            (
+                code,
+                message,
+                if correction.is_empty() {
+                    None
+                } else {
+                    Some(correction)
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected, "{:?}", options.issues);
+
+    // Null sections: the not-null-tolerant trio reports, language and
+    // linter do not (parse_model:918/:1132 vs :547-556/:640-649/:352-361).
+    let nulls = TempDir::new("null_sections");
+    nulls.write(
+        "analysis_options.yaml",
+        "analyzer:\n  errors:\n  exclude:\n  cannot-ignore:\n  language:\nlinter:\n",
+    );
+    let options = AnalysisOptions::load(
+        &nulls.path("analysis_options.yaml"),
+        &empty_config(),
+        &nulls.0,
+    );
+    let mut names: Vec<&str> = options
+        .issues
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "Invalid format for the 'cannot-ignore' section.",
+            "Invalid format for the 'errors' section.",
+            "Invalid format for the 'exclude' section.",
+        ]
+    );
+}
+
+/// The `undefined_lint` candidate recording (`_parseLocalRules`,
+/// parse_model:1224-1378): list entries and map keys declare; a `name:`
+/// entry with a null value returns before the registry check (:1252-1253),
+/// group maps are not descended (the local parse validates top-level
+/// entries only), and non-string list entries are skipped (:1238-1239).
+#[test]
+fn declared_rule_names_record_for_the_registry_seam() {
+    let dir = TempDir::new("declared");
+    dir.write(
+        "list.yaml",
+        "linter:\n  rules:\n    - known_one\n    - unknown_one\n    - 42\n",
+    );
+    dir.write(
+        "map.yaml",
+        "linter:\n  rules:\n    unknown_two: false\n    null_rule:\n    group_key:\n      inner: true\n",
+    );
+
+    let list = AnalysisOptions::load(&dir.path("list.yaml"), &empty_config(), &dir.0);
+    let names: Vec<&str> = list
+        .declared_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(names, ["known_one", "unknown_one"]);
+
+    let map = AnalysisOptions::load(&dir.path("map.yaml"), &empty_config(), &dir.0);
+    let names: Vec<&str> = map
+        .declared_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["unknown_two", "group_key"],
+        "null values return before the check (parse_model:1252-1253); a group value is \
+         not null, so its key checks too — only its children are not descended"
+    );
+    // The anchor span points at the name's first occurrence.
+    assert_eq!(map.declared_rules[0].offset, 21);
+    assert_eq!(map.declared_rules[0].length, 11);
+}
+
+/// The engine output face: `Engine::analyze` appends the recorded rows,
+/// attributed to the options file itself, at the registry severity, with
+/// the file's positions resolvable through the engine's read faces — and
+/// the rows ride the severity face, so an `analyzer.errors` override on the
+/// code name filters it (`computeSeverity` parity, `error_severity.dart`
+/// :14-26).
+#[test]
+fn engine_analyze_emits_and_relevels_options_rows() {
+    use common::Fixture;
+    use dartq_diagnostics::Severity;
+
+    // Row emission: a broken include surfaces through analyze(), attributed
+    // to the options file with real positions.
+    let fixture = Fixture::new(&[("lib/keep.dart", "void keep() {}\n")]);
+    std::fs::write(
+        fixture.path("analysis_options.yaml"),
+        "include: missing.yaml\nlinter:\n  rules:\n    - avoid_empty_else\n",
+    )
+    .expect("options");
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+    let options_path = fixture.path("analysis_options.yaml");
+    let rows: Vec<(&str, &Severity)> = diagnostics
+        .iter()
+        .map(|d| (d.code.name, &d.severity))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("include_file_not_found", &Severity::Warning)],
+        "{rows:?}"
+    );
+    let row = diagnostics
+        .iter()
+        .find(|d| d.code.name == "include_file_not_found")
+        .expect("row present");
+    let file = engine
+        .file_table()
+        .try_file_id(&options_path)
+        .expect("options file interned");
+    assert_eq!(row.file, file);
+    assert_eq!(row.range.offset, 9);
+    assert_eq!(row.range.length, 12);
+    // The layout faces resolve the options file even though it is never
+    // resident as Dart.
+    assert_eq!(
+        engine.content(file),
+        Some("include: missing.yaml\nlinter:\n  rules:\n    - avoid_empty_else\n".as_bytes())
+    );
+    assert_eq!(
+        engine.line_index(file).map(|i| i.line_col_utf16(
+            std::str::from_utf8(engine.content(file).expect("content")).expect("utf8"),
+            9
+        )),
+        Some((1, 10))
+    );
+
+    // The severity face: the code's own override filters the row.
+    let filtered = Fixture::new(&[("lib/keep.dart", "void keep() {}\n")]);
+    std::fs::write(
+        filtered.path("analysis_options.yaml"),
+        "include: missing.yaml\nanalyzer:\n  errors:\n    include_file_not_found: ignore\n",
+    )
+    .expect("options");
+    let mut engine = filtered.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.code.name != "include_file_not_found"),
+        "the override filters the options row: {diagnostics:?}"
+    );
+}

@@ -261,7 +261,7 @@ impl Engine {
         on_event: &mut dyn FnMut(EngineEvent),
         cancel: &CancellationToken,
     ) -> Result<Vec<Diagnostic>, Cancelled> {
-        let diagnostics = pipeline::analyze(
+        let mut diagnostics = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
             self.semdiag.as_deref(),
@@ -269,7 +269,54 @@ impl Engine {
             on_event,
             cancel,
         )?;
+        self.append_options_diagnostics(&mut diagnostics);
         Ok(self.apply_severity_options(diagnostics))
+    }
+
+    /// Appends the options-file self-diagnostics (#457) to an output set:
+    /// one row per issue recorded during each distinct loaded file's merge,
+    /// attributed to the options file itself (the official reports every
+    /// options diagnostic on the initial file — `include_walker.dart` reports
+    /// include-chain rows at the initial include span, `parse_model` reports
+    /// local rows at their nodes). The rows ride the same severity face as
+    /// everything else (`analyzer.errors` re-levels or filters them by their
+    /// own code names, the official `computeSeverity` scope). The loaded
+    /// files are interned here even without issues so the CLI's
+    /// `undefined_lint` face can attribute against the same table.
+    ///
+    /// Cold path: runs only when some options file recorded issues.
+    fn append_options_diagnostics(&mut self, diagnostics: &mut Vec<Diagnostic>) {
+        // Intern every loaded options file once (the CLI's `undefined_lint`
+        // face attributes against the same table), keeping the
+        // issue-carrying ones deduplicated by their shared load.
+        let mut seen = FxHashSet::default();
+        let mut loaded: Vec<(FileId, &analysis_options::AnalysisOptions)> = Vec::new();
+        for options in self.state.options.values() {
+            if options.file_path.as_os_str().is_empty() {
+                continue;
+            }
+            let file = self.state.files.intern(&options.file_path);
+            if !options.issues.is_empty() && seen.insert(Arc::as_ptr(options)) {
+                loaded.push((file, options));
+            }
+        }
+        if loaded.is_empty() {
+            return;
+        }
+        let mut rows: Vec<Diagnostic> = loaded
+            .into_iter()
+            .flat_map(|(file, options)| {
+                options
+                    .issues
+                    .iter()
+                    .map(move |issue| issue.to_diagnostic(file))
+            })
+            .collect();
+        rows.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
+        // The engine rows leave the pipeline canonically sorted; the merged
+        // set stays canonical for the rows' (rare, cold) addition.
+        diagnostics.extend(rows);
+        diagnostics.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
     }
 
     /// Applies the governing `analysis_options` severity face to an output
@@ -476,20 +523,38 @@ impl Engine {
         self.state.options.get(root).map(Arc::as_ref)
     }
 
-    /// The line index of a resident file.
+    /// The line index of a resident file. Options-file rows resolve through
+    /// the options face: their file is never resident as Dart, and the
+    /// captured load-time index is the positions source
+    /// ([`analysis_options::AnalysisOptions`] layout).
     #[must_use]
     pub fn line_index(&self, file: FileId) -> Option<&LineIndex> {
+        if let Some(facts) = self.state.residency.get(&file) {
+            return Some(&facts.line_index);
+        }
+        let path = self.state.files.path(file)?;
         self.state
-            .residency
-            .get(&file)
-            .map(|facts| &facts.line_index)
+            .options
+            .values()
+            .find(|options| options.file_path == path)
+            .and_then(|options| options.layout.as_ref())
+            .map(|(_, index)| index)
     }
 
-    /// The resident bytes of a file.
+    /// The resident bytes of a file. Options-file rows resolve through the
+    /// options face (see [`Engine::line_index`]).
     #[must_use]
     pub fn content(&self, file: FileId) -> Option<&[u8]> {
-        let facts = self.state.residency.get(&file)?;
-        self.state.store.get(facts.content)
+        if let Some(facts) = self.state.residency.get(&file) {
+            return self.state.store.get(facts.content);
+        }
+        let path = self.state.files.path(file)?;
+        self.state
+            .options
+            .values()
+            .find(|options| options.file_path == path)
+            .and_then(|options| options.layout.as_ref())
+            .map(|(text, _)| text.as_bytes())
     }
 
     /// The resident facts of one file — the baked API signature, the

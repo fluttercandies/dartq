@@ -6,11 +6,13 @@
 //! computation is spent on sorting.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, FileLayoutProvider as _};
+use dartq_engine::analysis_options;
 use dartq_engine::{CancellationToken, Cancelled, Engine, EngineEvent};
 use thiserror::Error;
 
@@ -137,6 +139,13 @@ pub fn run_overlaid<'a>(
         // engine pass already applied it to its own output).
         let lint_rows = crate::lints::analyze_lints(engine, roots);
         diagnostics.extend(engine.apply_severity_options(lint_rows));
+        // The `undefined_lint` rows ride the same face: the lint registry
+        // lives in dartq-lints (the engine holds no registry), so validity
+        // is resolved here, at the lint stage's application point.
+        let undefined_rows = undefined_lint_rows(engine, roots);
+        if !undefined_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(undefined_rows));
+        }
     }
     let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
@@ -150,6 +159,37 @@ pub fn run_overlaid<'a>(
         libraries_from_cache,
         layout,
     })
+}
+
+/// The `undefined_lint` rows (#457): every lint name an options file's own
+/// `linter.rules` declares that the dartq-lints registry does not know
+/// (`_parseLocalRules`, analysis_options_parse_model.dart:1245-1251 — the
+/// registry check fires before the entry's value is read, so a disabled
+/// `name: false` reports too; `name:` with a null value returns before the
+/// check and does not). The engine records the candidates and their anchors
+/// at load; this face validates them against `rule_by_name` and emits rows
+/// attributed to the options file itself. Distinct loaded files yield once
+/// (two roots sharing one options file are one parse, officially too).
+fn undefined_lint_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for root in roots {
+        let Some(options) = engine.options_for_root(root) else {
+            continue;
+        };
+        if options.declared_rules.is_empty() || !seen.insert(options.file_path.clone()) {
+            continue;
+        }
+        let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
+            continue;
+        };
+        for rule in &options.declared_rules {
+            if dartq_lints::rule_by_name(&rule.name).is_none() {
+                rows.push(analysis_options::OptionsIssue::undefined_lint(rule).to_diagnostic(file));
+            }
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -345,6 +385,82 @@ mod tests {
             rows.iter().all(|(code, _)| code != "undefined_identifier"),
             "the ignore filter drops the engine row: {rows:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `undefined_lint` face end to end (#457): the options file's own
+    /// `linter.rules` names validate against the dartq-lints registry at the
+    /// lint stage's application point (`_parseLocalRules`,
+    /// analysis_options_parse_model.dart:1245-1251 — the check fires before
+    /// the entry value is read, so a disabled `name: false` reports while a
+    /// null `name:` does not), rows attribute to the options file itself at
+    /// WARNING with the verbatim texts, and the layout resolves their
+    /// positions through the engine's options face.
+    #[test]
+    fn run_overlaid_reports_undefined_lint_rows() {
+        let root = workspace(
+            "analyze_undefined_lint",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let options_text = concat!(
+            "linter:\n",
+            "  rules:\n",
+            "    avoid_empty_else: true\n",
+            "    not_a_lint: false\n",
+            "    unknown_one: false\n",
+            "    null_rule:\n",
+        );
+        std::fs::write(root.join("analysis_options.yaml"), options_text).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let options_path = root.join("analysis_options.yaml");
+        let expected_path = options_path.to_string_lossy().into_owned();
+        let rows: Vec<(String, &str, Severity, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_lint")
+            .map(|d| {
+                (
+                    run.layout.file_path(d.file).to_string_lossy().into_owned(),
+                    d.message.as_str(),
+                    d.severity,
+                    d.range.offset,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    expected_path.clone(),
+                    "'not_a_lint' isn't a recognized lint rule.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("not_a_lint").expect("anchor")).expect("u32"),
+                ),
+                (
+                    expected_path,
+                    "'unknown_one' isn't a recognized lint rule.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("unknown_one").expect("anchor")).expect("u32"),
+                ),
+            ],
+            "a disabled name reports, a null name does not, a known name never: {rows:?}"
+        );
+        for row in run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_lint")
+        {
+            assert_eq!(row.code.machine, "UNDEFINED_LINT");
+            assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+            assert_eq!(
+                row.correction.as_deref(),
+                Some("Try using the name of a recognized lint rule.")
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }
