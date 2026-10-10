@@ -46,6 +46,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// missing-target diagnostic attributes to the branch literal; v5 payloads
 /// carry no clause rows, so a restored configurable directive would lose
 /// its fork decision input.
+/// v7: combinators carry their written token sequence with per-token UTF-16
+/// spans (#539) — the undefined-combinator-name report anchors (one report
+/// per written token, at its captured span); v6 payloads restore span-less
+/// through the span-less constructor, so a warm start would regress the
+/// reports to offset-0 anchors and lose written order and duplicates.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -62,7 +67,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// already forced through a compile review by the exhaustive `of`/`restore`
 /// matches; they change the on-disk schema all the same, so they bump this
 /// version too.)
-const FACTS_SHAPE_VERSION: u32 = 6;
+const FACTS_SHAPE_VERSION: u32 = 7;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with

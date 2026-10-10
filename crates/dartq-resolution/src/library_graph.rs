@@ -257,12 +257,17 @@ impl Combinators {
         }
     }
 
-    /// The clause list in source order. Clause name sets carry the
-    /// constructor-expanded spellings ([`Self::new`]); the facts-snapshot
-    /// persistence face round-trips through this view.
-    #[must_use]
-    pub fn clauses(&self) -> &[CombinatorClause] {
-        &self.clauses
+    /// The written token sequence — `(name, hidden, span)` per token, in
+    /// written order, duplicates preserved. The facts-snapshot projection
+    /// face (#539): the expanded clause sets this struct stores are sorted
+    /// and deduplicated, so the written surface is unreadable from them;
+    /// the payload carries this sequence instead and rebuilds through
+    /// [`Self::with_spans`], keeping a warm start's undefined-combinator
+    /// reports on the cold capture's anchors.
+    pub fn written(&self) -> impl Iterator<Item = (StringId, bool, SourceRange)> + '_ {
+        self.written
+            .iter()
+            .map(|token| (token.name, token.hidden, token.span))
     }
 
     /// The interned `name=` spelling of the written bare identifier `name`,

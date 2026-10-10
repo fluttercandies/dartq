@@ -260,9 +260,11 @@ pub struct PersistedDirective {
     /// The `as` prefix text.
     pub prefix: Option<String>,
     pub deferred: bool,
-    /// The `show`/`hide` clauses in source order, names as written (bare
-    /// identifiers — the constructor re-derives the `name=` setter
-    /// spellings on restore).
+    /// The `show`/`hide` clauses in source order, each carrying its written
+    /// token sequence: names as written (bare identifiers, written order,
+    /// duplicates preserved — the constructor re-derives the `name=` setter
+    /// spellings on restore) with the tokens' captured UTF-16 spans (#539,
+    /// the undefined-combinator report anchors).
     pub combinators: Vec<PersistedCombinator>,
     /// The dotted name of `library a.b;` / `part of a.b;`.
     pub name: Option<String>,
@@ -310,7 +312,14 @@ pub enum PersistedTarget {
 pub struct PersistedCombinator {
     /// `hide` when set, `show` otherwise.
     pub hide: bool,
+    /// The clause's names as written: written order, duplicates preserved
+    /// (the stored clause sets are sorted and deduplicated, so this
+    /// sequence can only come from [`Combinators::written`]).
     pub names: Vec<String>,
+    /// UTF-16 span per written name, index-locked to [`Self::names`] —
+    /// the cold capture's report anchors (#539), rebuilt through
+    /// `Combinators::with_spans` on restore.
+    pub name_spans: Vec<PersistedRange>,
 }
 
 /// Mirror of the frozen §4.2 resolution code set; an exhaustive match on
@@ -433,21 +442,7 @@ impl PersistedDirective {
             code: directive.code.map(PersistedResolutionCode::of),
             prefix: directive.prefix.map(|id| strings.resolve(id).to_owned()),
             deferred: directive.deferred,
-            combinators: directive
-                .combinators
-                .clauses()
-                .iter()
-                .map(|clause| match clause {
-                    CombinatorClause::Show(names) => PersistedCombinator {
-                        hide: false,
-                        names: written_names(names, strings),
-                    },
-                    CombinatorClause::Hide(names) => PersistedCombinator {
-                        hide: true,
-                        names: written_names(names, strings),
-                    },
-                })
-                .collect(),
+            combinators: written_clauses(directive.combinators.written(), strings),
             name: directive.name.as_ref().map(|name| name.to_string()),
             configurations: directive
                 .configurations
@@ -500,18 +495,29 @@ impl PersistedDirective {
             code: self.code.map(PersistedResolutionCode::resolve),
             prefix: self.prefix.as_deref().map(|text| strings.intern(text)),
             deferred: self.deferred,
-            combinators: Combinators::new(
+            combinators: Combinators::with_spans(
                 self.combinators.into_iter().map(|clause| {
+                    // Written order and duplicates ride verbatim; the
+                    // constructor re-expands the `name=` setter spellings
+                    // and re-sorts the clause sets exactly as the cold
+                    // capture did (l1.rs walk_import_export → the same
+                    // `with_spans` face).
                     let names: Box<[StringId]> = clause
                         .names
                         .iter()
                         .map(|text| strings.intern(text))
                         .collect();
-                    if clause.hide {
+                    let spans: Box<[SourceRange]> = clause
+                        .name_spans
+                        .iter()
+                        .map(|span| span.source_range())
+                        .collect();
+                    let combinator = if clause.hide {
                         CombinatorClause::Hide(names)
                     } else {
                         CombinatorClause::Show(names)
-                    }
+                    };
+                    (combinator, spans)
                 }),
                 strings,
             ),
@@ -620,17 +626,35 @@ impl<'a> Files<'a> {
     }
 }
 
-/// The written (bare) names of one expanded clause: [`Combinators::new`]
-/// appends each base name's `name=` setter spelling, and the combinator
-/// grammar admits no `=`, so the `=`-suffixed entries are exactly the
-/// derived spellings — dropping them keeps the payload at the written
-/// surface, and the constructor re-expands identically on restore.
-fn written_names(names: &[StringId], strings: &StringTable) -> Vec<String> {
-    names
-        .iter()
-        .filter(|id| !strings.resolve(**id).ends_with('='))
-        .map(|id| strings.resolve(*id).to_owned())
-        .collect()
+/// The written combinator clauses in payload form (#539): the directive's
+/// written token sequence — what the cold capture (l1.rs
+/// `walk_import_export` → `Combinators::with_spans`) recorded — grouped
+/// into consecutive same-kind runs, written order and duplicates preserved,
+/// each token with its captured span. The stored clause name sets cannot be
+/// projected directly: they are expanded (sorted, deduplicated, `name=`
+/// setter spellings appended), so the written surface only exists on
+/// [`Combinators::written`]. Adjacent same-kind clauses merge into one run
+/// — invisible outside `Combinators` (every query face keys on kind plus
+/// membership, and restore rebuilds the identical written sequence).
+fn written_clauses(
+    written: impl Iterator<Item = (StringId, bool, SourceRange)>,
+    strings: &StringTable,
+) -> Vec<PersistedCombinator> {
+    let mut clauses: Vec<PersistedCombinator> = Vec::new();
+    for (name, hidden, span) in written {
+        match clauses.last_mut() {
+            Some(clause) if clause.hide == hidden => {
+                clause.names.push(strings.resolve(name).to_owned());
+                clause.name_spans.push(PersistedRange::of(span));
+            }
+            _ => clauses.push(PersistedCombinator {
+                hide: hidden,
+                names: vec![strings.resolve(name).to_owned()],
+                name_spans: vec![PersistedRange::of(span)],
+            }),
+        }
+    }
+    clauses
 }
 
 #[cfg(test)]
@@ -661,7 +685,8 @@ mod tests {
         r#"{"api_signature":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"directives":["#,
         r#"{"kind":"Import","uri":"package:a/a.dart","uri_span":{"offset":0,"length":18},"#,
         r#""target":{"File":0},"code":"UriDoesNotExist","prefix":"p","deferred":true,"#,
-        r#""combinators":[{"hide":false,"names":["showOnly"]},{"hide":true,"names":["hideMe"]}],"#,
+        r#""combinators":[{"hide":false,"names":["showOnly"],"name_spans":[{"offset":40,"#,
+        r#""length":8}]},{"hide":true,"names":["hideMe"],"name_spans":[{"offset":53,"length":6}]}],"#,
         r#""name":"main","configurations":[{"dotted_name":"dart.library.io","value":null,"#,
         r#""uri":"io.dart","uri_span":{"offset":20,"length":9}},{"dotted_name":"flutter.mode","#,
         r#""value":"release","uri":"release.dart","uri_span":{"offset":36,"length":14}}]}],"#,
@@ -705,10 +730,18 @@ mod tests {
                     PersistedCombinator {
                         hide: false,
                         names: vec!["showOnly".to_owned()],
+                        name_spans: vec![PersistedRange::of(SourceRange {
+                            offset: 40,
+                            length: 8,
+                        })],
                     },
                     PersistedCombinator {
                         hide: true,
                         names: vec!["hideMe".to_owned()],
+                        name_spans: vec![PersistedRange::of(SourceRange {
+                            offset: 53,
+                            length: 6,
+                        })],
                     },
                 ],
                 name: Some("main".to_owned()),
@@ -1372,5 +1405,270 @@ mod tests {
             directive.combinators.has_show(),
             facts.directives[0].combinators.has_show()
         );
+    }
+
+    /// The written combinator sequence survives the payload round trip
+    /// (#539): written order, duplicates (one name written twice → two
+    /// tokens with distinct spans), and the captured UTF-16 spans — the
+    /// warm face equals the cold capture's (`Combinators::with_spans`,
+    /// the l1.rs `walk_import_export` posture), which is the sequence the
+    /// undefined-combinator reports iterate.
+    #[test]
+    fn combinator_written_sequence_round_trips_with_spans() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let target = files.intern(Path::new("/w/lib/other.dart"));
+        let alpha = strings.intern("alpha");
+        let beta = strings.intern("beta");
+        // The cold capture of `show alpha, alpha, beta hide alpha;` (the
+        // name spans are token-accurate UTF-16 offsets): the duplicated
+        // `alpha` carries two distinct anchors.
+        let clause_input: Vec<(CombinatorClause, Box<[SourceRange]>)> = vec![
+            (
+                CombinatorClause::Show(Box::new([alpha, alpha, beta])),
+                Box::new([
+                    SourceRange {
+                        offset: 39,
+                        length: 5,
+                    },
+                    SourceRange {
+                        offset: 46,
+                        length: 5,
+                    },
+                    SourceRange {
+                        offset: 53,
+                        length: 4,
+                    },
+                ]),
+            ),
+            (
+                CombinatorClause::Hide(Box::new([alpha])),
+                Box::new([SourceRange {
+                    offset: 63,
+                    length: 5,
+                }]),
+            ),
+        ];
+        let combinators = Combinators::with_spans(clause_input, &strings);
+        let directives = vec![DirectiveFacts {
+            kind: DirectiveKind::Import,
+            uri: Some("package:other/other.dart".into()),
+            uri_span: SourceRange {
+                offset: 7,
+                length: 26,
+            },
+            target: ResolvedTarget::Resolved(target),
+            code: None,
+            prefix: None,
+            deferred: false,
+            combinators,
+            name: None,
+            configurations: Box::default(),
+            configuration_spans: Box::default(),
+        }];
+        let source = "import 'package:other/other.dart' show alpha, alpha, beta hide alpha;\n";
+        let facts = UnitFacts {
+            content: content_hash(source.as_bytes()),
+            api_signature: ApiSignature::from_bytes([5; 16]),
+            directives,
+            elements: Arc::new(dartq_semantic::FileElements::default()),
+            diagnostics: Vec::new(),
+            line_index: LineIndex::new(source),
+        };
+
+        let payload = PersistedFacts::of(&facts, &strings, &files);
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let decoded: PersistedFacts = serde_json::from_slice(&bytes).expect("deserialize");
+
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
+            restored_files.intern(path)
+        });
+
+        let written = |facts: &UnitFacts, strings: &StringTable| {
+            facts.directives[0]
+                .combinators
+                .written()
+                .map(|(name, hidden, span)| (strings.resolve(name).to_owned(), hidden, span))
+                .collect::<Vec<_>>()
+        };
+        let cold = written(&facts, &strings);
+        let warm = written(&restored, &restored_strings);
+        assert_eq!(
+            warm, cold,
+            "the warm written face equals the cold capture's: order, \
+             duplicates, and spans intact"
+        );
+        assert_eq!(
+            warm,
+            vec![
+                (
+                    "alpha".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 39,
+                        length: 5
+                    }
+                ),
+                (
+                    "alpha".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 46,
+                        length: 5
+                    }
+                ),
+                (
+                    "beta".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 53,
+                        length: 4
+                    }
+                ),
+                (
+                    "alpha".to_owned(),
+                    true,
+                    SourceRange {
+                        offset: 63,
+                        length: 5
+                    }
+                ),
+            ],
+            "the duplicated name rides as two tokens at distinct anchors"
+        );
+
+        // The decision faces behave identically on the restored clause
+        // sets (`hide alpha` rejects it despite the show listing).
+        let restored_alpha = restored_strings.intern("alpha");
+        let restored_beta = restored_strings.intern("beta");
+        assert!(!restored.directives[0].combinators.allows(restored_alpha));
+        assert!(restored.directives[0].combinators.allows(restored_beta));
+        assert!(restored.directives[0].combinators.has_show());
+    }
+
+    /// The version-bump contract (#539, the #512 precedent):
+    /// `FACTS_SHAPE_VERSION` folds into `FACTS_SEMANTIC_VERSION`, which
+    /// keys the generation header's directory hash — a payload written by
+    /// an older shape cannot even be named by a newer engine's load. The
+    /// miss is clean (the accelerator invariant): nothing is staged, the
+    /// old generation stays intact for a same-version reader, and the warm
+    /// start recomputes from source, yielding the spanned written face the
+    /// new shape persists.
+    #[test]
+    fn warm_start_misses_cleanly_on_a_schema_version_change() {
+        let config_dir = graph_config_dir();
+        let root = config_dir.parent().expect("fixture root").to_path_buf();
+        let main_path = root.join("lib/main.dart");
+        let other_path = root.join("lib/other.dart");
+        let main_src = "import 'other.dart' show alpha, alpha, beta hide alpha;\nvoid main() { alpha(); beta(); }\n";
+        let other_src = "int alpha() => 1;\nint beta() => 2;\n";
+
+        let pub_config = Arc::new(PackageConfig::parse(GRAPH_CONFIG).expect("valid config"));
+        let build_engine = || {
+            Engine::new(EngineConfig {
+                store: memory_store(),
+                sdk: sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES),
+                packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
+                pub_config: Arc::clone(&pub_config),
+                config_dir: config_dir.clone(),
+                semdiag: None,
+                target: "vm".to_owned(),
+                declared_variables: FxHashMap::default(),
+            })
+            .expect("engine")
+        };
+        let mut saved_engine = build_engine();
+        saved_engine.set_content(&main_path, main_src.as_bytes());
+        saved_engine.set_content(&other_path, other_src.as_bytes());
+        let mut on_event = |_event: EngineEvent| {};
+        let cancel = CancellationToken::new();
+        saved_engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+
+        let cache = snapshot_cache_dir();
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(cache.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        assert_eq!(saved_engine.save_facts_snapshot(&store).expect("save"), 2);
+
+        let header = saved_engine.snapshot_header();
+        assert!(
+            store.load::<PersistedFacts>(&header).is_some(),
+            "the saved generation loads under its own header"
+        );
+        let mut moved = header.clone();
+        moved.semantic_version += 1;
+        assert!(
+            store.load::<PersistedFacts>(&moved).is_none(),
+            "a schema-version change forks the generation hash — the old \
+             payload is unreachable, the documented invalidation path"
+        );
+
+        // The warm start therefore recomputes from source, and the fresh
+        // capture produces the spanned written face the new shape carries.
+        let mut warm_engine = build_engine();
+        let main_warm = warm_engine.set_content(&main_path, main_src.as_bytes());
+        warm_engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+        let facts = warm_engine.file_facts(main_warm).expect("resident");
+        let written: Vec<(String, bool, SourceRange)> = facts.directives[0]
+            .combinators
+            .written()
+            .map(|(name, hidden, span)| {
+                (
+                    warm_engine.state.strings.resolve(name).to_owned(),
+                    hidden,
+                    span,
+                )
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![
+                (
+                    "alpha".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 25,
+                        length: 5
+                    }
+                ),
+                (
+                    "alpha".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 32,
+                        length: 5
+                    }
+                ),
+                (
+                    "beta".to_owned(),
+                    false,
+                    SourceRange {
+                        offset: 39,
+                        length: 4
+                    }
+                ),
+                (
+                    "alpha".to_owned(),
+                    true,
+                    SourceRange {
+                        offset: 49,
+                        length: 5
+                    }
+                ),
+            ],
+            "the recompute (the version miss's outcome) yields the spanned \
+             written sequence"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache);
     }
 }
