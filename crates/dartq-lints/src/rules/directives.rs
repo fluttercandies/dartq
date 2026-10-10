@@ -456,6 +456,63 @@ pub(crate) mod use_string_in_part_of_directives {
     }
 }
 
+pub(crate) mod provide_deprecation_message {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/provide_deprecation_message.dart:32-42`
+    /// — an annotation whose element is the dart:core `deprecated` constant
+    /// and which carries no argument list reports at the annotation.
+    ///
+    /// Approximation (documented): the element pin is taken from the name —
+    /// the last name segment lexeme `deprecated` — so a user-declared
+    /// `deprecated` constant over-reports and the dart:core pin is dropped
+    /// (the `library_annotations` pragma-branch precedent). Message:
+    /// `diagnostic.g.dart` `provideDeprecationMessage`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "provide_deprecation_message",
+        group: Group::Core,
+        problem: "Missing a deprecation message.",
+        correction: "Try using the constructor to provide a message ('@Deprecated(\"message\")').",
+        kinds: &[NodeKind::Metadata],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        // `node.arguments == null` (:40). A bare `@deprecated` has no
+        // Arguments child; `@deprecated()` keeps it and passes.
+        if kids.iter().any(|&kid| c.kind(kid) == NodeKind::Arguments) {
+            return;
+        }
+        // `elementAnnotation.isDeprecated` through the name face: the last
+        // name segment (`@deprecated` bare, `@a.deprecated` prefixed — the
+        // official resolves through any import prefix, so the prefixed face
+        // over-approximates exactly like the pragma branch).
+        let name = kids
+            .iter()
+            .find(|&&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::Qualified));
+        let Some(name) = name else {
+            return;
+        };
+        let segment = match c.kind(*name) {
+            NodeKind::Identifier => c.lexeme(c.head_token(*name)),
+            _ => c
+                .collect_direct(*name)
+                .into_iter()
+                .rev()
+                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                .map(|kid| c.lexeme(c.head_token(kid)))
+                .unwrap_or_default(),
+        };
+        if segment != "deprecated" {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::engine::Features;
@@ -964,5 +1021,97 @@ mod tests {
             }),
         );
         assert!(hits(&part, "use_string_in_part_of_directives").is_empty());
+    }
+
+    // —— provide_deprecation_message ———————————————————————————————————————
+
+    /// `test/rules/provide_deprecation_message_test.dart` — a bare
+    /// `@deprecated` reports at the annotation.
+    #[test]
+    fn bare_deprecated_reports() {
+        let source = "@deprecated var x = 1;";
+        // @0 deprecated1 var2 x3 =4 15 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Metadata, 0);
+                b.patch(0, NONE);
+                identifier(b, 1, 2);
+                b.end(NodeKind::Metadata, 2);
+                b.begin(NodeKind::VariablesDeclaration, 2);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 3);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::VariableInitializer, 4);
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 7);
+            }),
+        );
+        let lints = f.run(&one_rule("provide_deprecation_message"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Missing a deprecation message.");
+        assert_eq!(
+            lints[0].correction,
+            Some(
+                "Try using the constructor to provide a message ('@Deprecated(\"message\")')."
+                    .to_owned()
+            )
+        );
+    }
+
+    /// An argument list (even empty) keeps the message slot; the `Deprecated`
+    /// constructor already carries one.
+    #[test]
+    fn deprecated_with_arguments_passes() {
+        let source = "@deprecated() var x = 1;";
+        // @0 deprecated1 (2 )3 var4 x5 =6 17 ;8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Metadata, 0);
+                b.patch(0, NONE);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::Arguments, 2);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::Metadata, 4);
+                b.begin(NodeKind::VariablesDeclaration, 4);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 5);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::VariableInitializer, 6);
+                b.leaf(NodeKind::LiteralInt, 7);
+                b.end(NodeKind::VariableInitializer, 8);
+                b.end(NodeKind::InitializedIdentifier, 8);
+                b.end(NodeKind::VariablesDeclaration, 9);
+            }),
+        );
+        assert!(f.run(&one_rule("provide_deprecation_message")).is_empty());
+
+        let constructor = "@Deprecated('m') var x = 1;";
+        // @0 Deprecated1 (2 'm'3 )4 var5 ...
+        let f = Fixture::build(
+            constructor,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Metadata, 0);
+                b.patch(0, NONE);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::Arguments, 2);
+                b.leaf_span(NodeKind::StringLiteral, 3, 4);
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::Metadata, 5);
+                b.begin(NodeKind::VariablesDeclaration, 5);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 6);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::VariableInitializer, 7);
+                b.leaf(NodeKind::LiteralInt, 8);
+                b.end(NodeKind::VariableInitializer, 9);
+                b.end(NodeKind::InitializedIdentifier, 9);
+                b.end(NodeKind::VariablesDeclaration, 10);
+            }),
+        );
+        assert!(f.run(&one_rule("provide_deprecation_message")).is_empty());
     }
 }

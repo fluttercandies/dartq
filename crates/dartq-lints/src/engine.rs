@@ -16,7 +16,7 @@ use dartq_source::LineIndex;
 
 use crate::comments::Comments;
 use crate::ignore::IgnoreInfo;
-use crate::registry::{EnableSet, RULES, RuleId};
+use crate::registry::{EnableSet, RULES, RuleId, rule_by_name};
 
 /// The language-feature bits a rule may query. Features the caller does not
 /// know are treated per their shipped defaults; the caller pins the bits it
@@ -83,6 +83,19 @@ pub struct Lint {
 /// past this many hits a run stops reporting. Structural bound on the sink.
 const MAX_LINTS_PER_FILE: usize = 10_000;
 
+/// A wildcard local/parameter declaration: the byte range of the `_`-name and
+/// the byte range of the scope it binds over. `no_wildcard_variable_uses`
+/// reads the table (with the feature off, a `_` local/parameter binds, and a
+/// bare use of it reports — no_wildcard_variable_uses.dart:37-42 flags
+/// Local/Formal elements only, so fields/getters never enter the table).
+#[derive(Clone, Debug)]
+pub struct WildcardScope {
+    /// The declared name's byte range (all underscores).
+    pub name: core::ops::Range<usize>,
+    /// The byte range of the scope the declaration binds over.
+    pub scope: core::ops::Range<usize>,
+}
+
 /// Kind -> rule dispatch. Built once from the static table; a node whose
 /// kind has no registered rules costs one empty-Vec test.
 static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock::new(|| {
@@ -113,6 +126,14 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
     };
     let comments = Comments::extract(unit.source, unit.tokens);
     let ignore = IgnoreInfo::parse(unit.source, &comments);
+    // The wildcard table is collected inside the same DFS (one `Identifier`
+    // kind test per node) and only when the one rule that reads it runs —
+    // the rule registers only with the wildcard feature OFF
+    // (no_wildcard_variable_uses.dart:36-38).
+    let no_wildcard = rule_by_name("no_wildcard_variable_uses")
+        .is_some_and(|id| enabled.is_enabled(id))
+        && !unit.features.wildcard_variables;
+    let mut wildcards: Vec<WildcardScope> = Vec::new();
 
     let mut out = Vec::new();
 
@@ -124,17 +145,78 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
     let mut stack: Vec<(u32, usize)> = Vec::new();
     let mut path: Vec<u32> = vec![root];
     let direct = core::cell::RefCell::new(Vec::new());
-    dispatch(unit, &comments, &ignore, &path, enabled, &direct, &mut out);
+    dispatch(
+        unit, &comments, &ignore, &path, enabled, &direct, &wildcards, &mut out,
+    );
     push_direct(unit.ast, root, &mut stack, &direct, path.len());
 
     while let Some((node, depth)) = stack.pop() {
         path.truncate(depth);
         path.push(node);
-        dispatch(unit, &comments, &ignore, &path, enabled, &direct, &mut out);
+        if no_wildcard {
+            collect_wildcard(unit, &path, &mut wildcards);
+        }
+        dispatch(
+            unit, &comments, &ignore, &path, enabled, &direct, &wildcards, &mut out,
+        );
         push_direct(unit.ast, node, &mut stack, &direct, path.len());
     }
 
     out
+}
+
+/// Records one wildcard local/parameter declaration. Only the three element
+/// faces the official rule flags enter the table (`LocalVariableElement` /
+/// `FormalParameterElement` / catch parameter — the official test's
+/// `test_field`/`test_getter` faces stay out); the scope is the declaration's
+/// binding extent: the innermost enclosing block/for-in/catch clause for
+/// locals and catch parameters, the enclosing function for parameters.
+fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>) {
+    const LOCAL_SCOPES: [NodeKind; 3] = [NodeKind::Block, NodeKind::ForIn, NodeKind::CatchClause];
+    const FUNCTION_SCOPES: [NodeKind; 7] = [
+        NodeKind::Method,
+        NodeKind::TopLevelMethod,
+        NodeKind::Constructor,
+        NodeKind::Factory,
+        NodeKind::FunctionExpression,
+        NodeKind::LocalFunctionDeclaration,
+        NodeKind::PrimaryConstructorBody,
+    ];
+
+    let node = *path.last().expect("collect on a node");
+    if unit.ast.kind(node) != NodeKind::Identifier {
+        return;
+    }
+    // Identifier payload word 0 is the context discriminant (collapse map
+    // §3.5 Identifier row).
+    let Some(&ctx) = unit.ast.payload(node).first() else {
+        return;
+    };
+    let scopes: &[NodeKind] = match ctx {
+        c if c == dartq_parser::IdentifierContext::LocalVariableDeclaration as u32 => &LOCAL_SCOPES,
+        c if c == dartq_parser::IdentifierContext::CatchParameter as u32 => &LOCAL_SCOPES[2..],
+        c if c == dartq_parser::IdentifierContext::FormalParameterDeclaration as u32 => {
+            &FUNCTION_SCOPES
+        }
+        _ => return,
+    };
+    let name_bytes = byte_span(unit.tokens, unit.ast, node);
+    let name = &unit.source[name_bytes.clone()];
+    if !name.bytes().all(|b| b == b'_') {
+        return;
+    }
+    let scope = path
+        .iter()
+        .rev()
+        .find(|&&ancestor| scopes.contains(&unit.ast.kind(ancestor)))
+        .map(|&ancestor| byte_span(unit.tokens, unit.ast, ancestor));
+    let Some(scope) = scope else {
+        return;
+    };
+    out.push(WildcardScope {
+        name: name_bytes,
+        scope,
+    });
 }
 
 /// Pushes the direct children of `id` onto the work stack, last child first
@@ -164,6 +246,7 @@ fn push_direct(
 }
 
 /// Dispatches the rules registered for the path's last node.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     unit: &Unit<'_>,
     comments: &Comments,
@@ -171,6 +254,7 @@ fn dispatch(
     path: &[u32],
     enabled: &EnableSet,
     direct: &core::cell::RefCell<Vec<u32>>,
+    wildcards: &[WildcardScope],
     out: &mut Vec<Lint>,
 ) {
     let current = *path.last().expect("dispatch on a node");
@@ -186,6 +270,7 @@ fn dispatch(
             comments,
             ignore,
             path,
+            wildcards,
             rule: RuleId(rule),
             direct,
             out: &mut *out,
@@ -204,6 +289,9 @@ pub struct Check<'a> {
     pub ignore: &'a IgnoreInfo,
     /// Ancestor path, root first, current node last.
     pub path: &'a [u32],
+    /// The wildcard local/parameter declaration table (`no_wildcard_variable_
+    /// uses`; empty unless that rule runs with the wildcard feature off).
+    pub wildcards: &'a [WildcardScope],
     /// The rule being dispatched.
     pub rule: RuleId,
     /// Shared direct-children scratch (one buffer per run, refilled per

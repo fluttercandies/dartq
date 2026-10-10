@@ -626,7 +626,7 @@ pub(crate) mod prefer_contains {
     /// `getIntValue` restricted to int literals: decimal/hex with
     /// separators, optionally negated by a prefix `-` (the source form of
     /// `-1` in an expression).
-    fn int_value(c: &Check<'_>, node: u32) -> Option<i64> {
+    pub(super) fn int_value(c: &Check<'_>, node: u32) -> Option<i64> {
         let (negative, literal) = if c.kind(node) == NodeKind::UnaryPrefix {
             // `UnaryPrefix` is a width-0 kind; the operator is the span
             // head (the `prefer_is_not_operator` precedent).
@@ -719,6 +719,522 @@ pub(crate) mod prefer_contains {
             }
         }
         Some(true)
+    }
+}
+
+pub(crate) mod unnecessary_const {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{const_keyword, in_const_context};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_const.dart:38-77` — a
+    /// `const` keyword on a literal / instance creation already inside a
+    /// constant context reports at the keyword.
+    ///
+    /// The context face is the official `constantContext` walk (ported as
+    /// [`crate::rules::in_const_context`] — the rule declares
+    /// `canUseParsedResult`, so the walk is the whole story). The visitor's
+    /// `ConstantPattern` exemptions are structural with our payload layout: a
+    /// constant pattern owns the `const` keyword itself (`ConstantPattern`
+    /// head-when-present, collapse map §3.7), so the wrapped expression
+    /// carries none and never dispatches. Dot-shorthand const invocations
+    /// (`case const .new()`) are likewise pattern-owned and skip. Message:
+    /// `diagnostic.g.dart` `unnecessaryConst`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_const",
+        group: Group::Recommended,
+        problem: "Unnecessary 'const' keyword.",
+        correction: "Try removing the keyword.",
+        kinds: &[
+            NodeKind::ConstExpression,
+            NodeKind::ConstLiteral,
+            NodeKind::ListLiteral,
+            NodeKind::SetOrMapLiteral,
+            NodeKind::RecordLiteral,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `keyword == null || keyword.type != CONST` bails (:57-59).
+        let Some(keyword) = const_keyword(c, node) else {
+            return;
+        };
+        // `node.inConstantContext` (:60-62).
+        if !in_const_context(c) {
+            return;
+        }
+        let start = c
+            .unit
+            .tokens
+            .get(keyword as usize)
+            .expect("const keyword outside the token table")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+}
+
+pub(crate) mod prefer_is_empty {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{first_child, in_const_context};
+
+    const USE_IS_EMPTY_PROBLEM: &str =
+        "Use 'isEmpty' instead of 'length' to test whether the collection is empty.";
+    const USE_IS_EMPTY_CORRECTION: &str = "Try rewriting the expression to use 'isEmpty'.";
+    const USE_IS_NOT_EMPTY_PROBLEM: &str =
+        "Use 'isNotEmpty' instead of 'length' to test whether the collection is empty.";
+    const USE_IS_NOT_EMPTY_CORRECTION: &str = "Try rewriting the expression to use 'isNotEmpty'.";
+    const ALWAYS_FALSE_PROBLEM: &str =
+        "The comparison is always 'false' because the length is always greater than or equal to 0.";
+    const ALWAYS_TRUE_PROBLEM: &str =
+        "The comparison is always 'true' because the length is always greater than or equal to 0.";
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_is_empty.dart:59-239` — a
+    /// `length` access compared against a small int literal reports per the
+    /// four-code matrix (`_check`, :111-226), mirrored verbatim including the
+    /// constant-on-the-left asymmetry.
+    ///
+    /// Approximations (documented): the receiver type check
+    /// (`implementsInterface(Iterable/Map/String)`, :229-234) is dropped —
+    /// the `prefer_contains` precedent, so a user `length` getter
+    /// over-reports; `getIntValue` reads int literals only, so constant
+    /// expressions under-report. The const-context bails (:93-108) port
+    /// through [`crate::rules::in_const_context`] and the const-constructor
+    /// initializer face. Messages: `diagnostic.g.dart`
+    /// `preferIsEmptyUseIsEmpty`/`preferIsEmptyUseIsNotEmpty`/
+    /// `preferIsEmptyAlwaysFalse`/`preferIsEmptyAlwaysTrue`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_is_empty",
+        group: Group::Core,
+        problem: USE_IS_EMPTY_PROBLEM,
+        correction: USE_IS_EMPTY_CORRECTION,
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let operands = c.collect_direct(node);
+        if operands.len() < 2 {
+            return;
+        }
+        let op = c.lexeme(c.payload(node).first().copied().expect("binary op"));
+        let (value, constant_on_right, length_access) = {
+            // Right literal first (:64-71).
+            match super::prefer_contains::int_value(c, operands[1]) {
+                Some(value) => (value, true, is_length_access(c, operands[0])),
+                None => match super::prefer_contains::int_value(c, operands[0]) {
+                    Some(value) => (value, false, is_length_access(c, operands[1])),
+                    None => return,
+                },
+            }
+        };
+        if !length_access {
+            return;
+        }
+        // The const-context bails (:93-108): a const constructor initializer
+        // or any constant context.
+        if in_const_context(c) || in_const_constructor_initializer(c) {
+            return;
+        }
+        let (problem, correction) = match (value, constant_on_right, op) {
+            // `value == 0` (:113-146) — the official matrix branches only on
+            // the operator here; the `value == 1` arms (:147-167) split on
+            // the constant side.
+            (0, _, "==" | "<=") | (1, true, "<") | (1, false, ">") => {
+                (USE_IS_EMPTY_PROBLEM, Some(USE_IS_EMPTY_CORRECTION))
+            }
+            (0, _, ">" | "!=") | (1, true, ">=") | (1, false, "<=") => {
+                (USE_IS_NOT_EMPTY_PROBLEM, Some(USE_IS_NOT_EMPTY_CORRECTION))
+            }
+            (0, _, "<") => (ALWAYS_FALSE_PROBLEM, None),
+            (0, _, ">=") => (ALWAYS_TRUE_PROBLEM, None),
+            // `value < 0` (:168-225).
+            (v, true, "==" | "<=" | "<") if v < 0 => (ALWAYS_FALSE_PROBLEM, None),
+            (v, true, "!=" | ">=" | ">") if v < 0 => (ALWAYS_TRUE_PROBLEM, None),
+            (v, false, "==" | ">=" | ">") if v < 0 => (ALWAYS_FALSE_PROBLEM, None),
+            (v, false, "!=" | "<=" | "<") if v < 0 => (ALWAYS_TRUE_PROBLEM, None),
+            _ => return,
+        };
+        let range = c.utf16_span(node);
+        c.report_texts(range, problem, correction.unwrap_or_default(), &[]);
+    }
+
+    /// `_isLengthAccess` (:228-240): a `length` property access on a target,
+    /// through parens and `as`.
+    fn is_length_access(c: &Check<'_>, operand: u32) -> bool {
+        let mut current = operand;
+        while matches!(
+            c.kind(current),
+            NodeKind::ParenthesizedExpression | NodeKind::AsExpression
+        ) {
+            let Some(inner) = first_child(c, current) else {
+                return false;
+            };
+            current = inner;
+        }
+        if c.kind(current) != NodeKind::DotAccess {
+            return false;
+        }
+        let access = c.collect_direct(current);
+        let (Some(target), Some(name)) = (access.first().copied(), access.last().copied()) else {
+            return false;
+        };
+        c.kind(name) == NodeKind::Identifier
+            && c.lexeme(c.head_token(name)) == "length"
+            && target != name
+    }
+
+    /// The constructor-initializer bail (:93-102): inside an initializer
+    /// whose constructor is const the comparison is exempt (a non-const
+    /// constructor's initializer proceeds).
+    fn in_const_constructor_initializer(c: &Check<'_>) -> bool {
+        let mut path = c.path.iter().rev();
+        while let Some(&ancestor) = path.next() {
+            if matches!(
+                c.kind(ancestor),
+                NodeKind::FieldInitializer | NodeKind::Initializer
+            ) {
+                // The initializer's constructor is the enclosing declaration.
+                for &outer in path {
+                    if c.kind(outer) == NodeKind::Constructor {
+                        return c.lexeme(c.head_token(outer)) == "const";
+                    }
+                }
+                return false;
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod prefer_is_not_empty {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::first_child;
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_is_not_empty.dart:31-63` —
+    /// `!x.isEmpty` reports at the prefix expression.
+    ///
+    /// Approximation (documented): the element checks (the property resolves
+    /// to `isEmpty` and its interface declares `isNotEmpty`, :57-62) are
+    /// taken from the accessed name — a user class with `isEmpty` but no
+    /// `isNotEmpty` over-reports. Message: `diagnostic.g.dart`
+    /// `preferIsNotEmpty`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_is_not_empty",
+        group: Group::Core,
+        problem: "Use 'isNotEmpty' rather than negating the result of 'isEmpty'.",
+        correction: "Try rewriting the expression to use 'isNotEmpty'.",
+        kinds: &[NodeKind::UnaryPrefix],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `prefix.type != BANG` bails (:44-46); the operator is the width-0
+        // kind's span head.
+        if c.lexeme(c.head_token(node)) != "!" {
+            return;
+        }
+        // `node.operand.unParenthesized` (:48).
+        let Some(operand) = first_child(c, node) else {
+            return;
+        };
+        let mut operand = operand;
+        while c.kind(operand) == NodeKind::ParenthesizedExpression {
+            let Some(inner) = first_child(c, operand) else {
+                return;
+            };
+            operand = inner;
+        }
+        // `PropertyAccess`/`PrefixedIdentifier` (:50-55) — a `DotAccess`
+        // whose last child names `isEmpty`.
+        if c.kind(operand) != NodeKind::DotAccess {
+            return;
+        }
+        let Some(name) = c.collect_direct(operand).last().copied() else {
+            return;
+        };
+        if c.kind(name) != NodeKind::Identifier || c.lexeme(c.head_token(name)) != "isEmpty" {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod avoid_function_literals_in_foreach_calls {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_function_literals_in_foreach_calls.dart:31-105`
+    /// — `x.forEach((e) { … })` reports at the method name.
+    ///
+    /// Approximations (documented): the receiver type check
+    /// (`_isIterable`, :44-45) is dropped — the `prefer_contains` precedent,
+    /// so a user class with a one-parameter `forEach` over-reports. The
+    /// closure-arity gate stands in for the type gate's `Map.forEach` face:
+    /// a valid `Iterable.forEach` closure has exactly one parameter, and a
+    /// multi-parameter closure (the `map.forEach((k, v) …)` shape) skips.
+    /// The null-aware-chain bail (:87) reads the null-aware bits along the
+    /// access chain; `containsNullAwareInvocationInChain` farther out
+    /// under-reports on exotic chains. Message: `diagnostic.g.dart`
+    /// `avoidFunctionLiteralsInForeachCalls`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_function_literals_in_foreach_calls",
+        group: Group::Recommended,
+        problem: "Function literals shouldn't be passed to 'forEach'.",
+        correction: "Try using a 'for' loop.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
+        else {
+            return;
+        };
+        // `node.methodName.token.value() == 'forEach'` with a target
+        // (:82-84).
+        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return;
+        };
+        let name = match c.kind(*callee) {
+            NodeKind::DotAccess | NodeKind::Qualified => {
+                let access = c.collect_direct(*callee);
+                match access.last().copied() {
+                    Some(name)
+                        if c.kind(name) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(name)) == "forEach" =>
+                    {
+                        name
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        // `arguments.isNotEmpty && arguments.first is FunctionExpression`
+        // (:85-86) — a named first argument is not a literal.
+        let args = c.collect_direct(kids[args_pos]);
+        let Some(&first) = args.first() else {
+            return;
+        };
+        if c.kind(first) != NodeKind::FunctionExpression {
+            return;
+        }
+        // The closure-arity stand-in for the type gate: a multi-parameter
+        // closure is the `Map.forEach` face (a type error on a real
+        // Iterable), never the flagged shape.
+        let closure_params = c
+            .collect_direct(first)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .map(|params| c.collect_direct(params).len());
+        if closure_params != Some(1) {
+            return;
+        }
+        // The chain guards: no null-aware access below (:87), no method
+        // chaining in the target (:31-43), not inside a cascade (:45-48).
+        if chain_has_null_aware(c) || has_method_chaining(c, *callee) || inside_cascade(c) {
+            return;
+        }
+        let range = c.utf16_span(name);
+        c.report(range, &[]);
+    }
+
+    /// `containsNullAwareInvocationInChain` (:87): any `?.`/`?..` on the
+    /// chain this invocation belongs to — the access below and the
+    /// invocation/access spine above, up to the nearest boundary.
+    fn chain_has_null_aware(c: &Check<'_>) -> bool {
+        for &ancestor in c.path.iter().rev() {
+            match c.kind(ancestor) {
+                NodeKind::DotAccess | NodeKind::CascadeAccess => {
+                    if c.payload(ancestor).get(1).copied().unwrap_or(0) != 0 {
+                        return true;
+                    }
+                }
+                NodeKind::Send | NodeKind::Arguments => {}
+                // A statement (or anything else) ends the chain.
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `_hasMethodChaining` (:31-43): the target chain contains a method
+    /// invocation.
+    fn has_method_chaining(c: &Check<'_>, callee: u32) -> bool {
+        let mut target = c.collect_direct(callee).first().copied();
+        while let Some(current) = target {
+            match c.kind(current) {
+                NodeKind::Send => return true,
+                // PrefixedIdentifier → prefix; PropertyAccess → target.
+                NodeKind::DotAccess | NodeKind::Qualified => {
+                    target = c.collect_direct(current).first().copied();
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `_isInsideCascade` (:45-48): the nearest statement-or-cascade
+    /// ancestor is a cascade.
+    fn inside_cascade(c: &Check<'_>) -> bool {
+        for &ancestor in c.path.iter().rev() {
+            match c.kind(ancestor) {
+                NodeKind::Cascade => return true,
+                NodeKind::ExpressionStatement
+                | NodeKind::ReturnStatement
+                | NodeKind::IfStatement
+                | NodeKind::WhileStatement
+                | NodeKind::DoWhileStatement
+                | NodeKind::ForStatement
+                | NodeKind::ForIn
+                | NodeKind::YieldStatement
+                | NodeKind::LabeledStatement
+                | NodeKind::SwitchCase => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod prefer_interpolation_to_compose_strings {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_interpolation_to_compose_strings.dart:32-88`
+    /// — an adjacent `(literal, value)` pair in a `+` chain reports over the
+    /// pair span.
+    ///
+    /// Approximations (documented): the left-operand String type check
+    /// (`leftOperand.staticType.isDartCoreString`, :85) is approximated by
+    /// the chain-face guarantees — with a literal on either side and valid
+    /// code, the left operand is a string unless a user `operator+` class
+    /// shadows (which over-reports). Chains report once at the chain root;
+    /// the official's per-node re-visit would re-report inner pairs.
+    /// Raw strings and both-literal pairs pass verbatim (:70-75); a
+    /// `toString` invocation with arguments passes (:78-82). Message:
+    /// `diagnostic.g.dart` `preferInterpolationToComposeStrings`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_interpolation_to_compose_strings",
+        group: Group::Recommended,
+        problem: "Use interpolation to compose strings and values.",
+        correction: "Try using string interpolation to build the composite string.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // Only the chain root flattens (the official `chainedAdditions` walk
+        // re-reports from every inner node; once per chain is the anchor).
+        if c.lexeme(c.payload(node).first().copied().expect("binary op")) != "+" {
+            return;
+        }
+        let is_inner_plus = c.ancestor(1).is_some_and(|parent| {
+            c.kind(parent) == NodeKind::BinaryExpression
+                && c.lexeme(c.payload(parent).first().copied().expect("binary op")) == "+"
+        });
+        if is_inner_plus {
+            return;
+        }
+        let chain = flatten(c, node);
+        let mut skip_next = false;
+        for pair in chain.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            let left_literal = c.kind(left) == NodeKind::StringLiteral;
+            let right_literal = c.kind(right) == NodeKind::StringLiteral;
+            // OK(#735): neither side is a literal.
+            if !left_literal && !right_literal {
+                continue;
+            }
+            // OK(#2490): a raw string on either side.
+            if (left_literal && is_raw(c, left)) || (right_literal && is_raw(c, right)) {
+                continue;
+            }
+            // OK: both literals (prefer_adjacent_string_concatenation's face).
+            if left_literal && right_literal {
+                continue;
+            }
+            // OK(sdk#52610): a `toString` invocation with arguments.
+            if is_to_string_with_arguments(c, left) || is_to_string_with_arguments(c, right) {
+                continue;
+            }
+            // `leftOperand.staticType?.isDartCoreString` — true for a
+            // literal, presumed for the non-literal face (the documented
+            // operator+ divergence).
+            let start = c.utf16_span(left).start;
+            let end = c.utf16_span(right).end;
+            c.report(start..end, &[]);
+            // The official skips the pair consuming the reported right
+            // operand (:86-88).
+            skip_next = true;
+        }
+    }
+
+    /// The flattened `+` chain (`chainedAdditions`, :90-98).
+    fn flatten(c: &Check<'_>, node: u32) -> Vec<u32> {
+        let kids = c.collect_direct(node);
+        let mut chain = Vec::new();
+        let left = kids.first().copied();
+        if let Some(left) = left {
+            if c.kind(left) == NodeKind::BinaryExpression
+                && c.lexeme(c.payload(left).first().copied().expect("binary op")) == "+"
+            {
+                chain = flatten(c, left);
+            } else {
+                chain.push(left);
+            }
+        }
+        if let Some(right) = kids.get(1).copied() {
+            chain.push(right);
+        }
+        chain
+    }
+
+    /// `SimpleStringLiteral.isRaw`: the literal opens with `r`.
+    fn is_raw(c: &Check<'_>, literal: u32) -> bool {
+        c.lexeme(c.head_token(literal)).starts_with('r')
+    }
+
+    /// `isToStringInvocationWithArguments`: a `toString` call with a
+    /// non-empty argument list.
+    fn is_to_string_with_arguments(c: &Check<'_>, node: u32) -> bool {
+        if c.kind(node) != NodeKind::Send {
+            return false;
+        }
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
+        else {
+            return false;
+        };
+        if c.collect_direct(kids[args_pos]).is_empty() {
+            return false;
+        }
+        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return false;
+        };
+        match c.kind(*callee) {
+            NodeKind::Identifier => c.lexeme(c.head_token(*callee)) == "toString",
+            NodeKind::DotAccess | NodeKind::Qualified => c
+                .collect_direct(*callee)
+                .last()
+                .filter(|&&name| c.kind(name) == NodeKind::Identifier)
+                .is_some_and(|&name| c.lexeme(c.head_token(name)) == "toString"),
+            _ => false,
+        }
     }
 }
 
@@ -1685,5 +2201,460 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("prefer_contains")).is_empty());
+    }
+
+    // —— unnecessary_const ————————————————————————————————————————————————
+
+    /// The official `constantContext` face: a const-marked literal under a
+    /// const variable declaration reports (`test_constConstructor` family —
+    /// `const c = [!const!] C()`).
+    #[test]
+    fn unnecessary_const_reports_inside_const_declaration() {
+        let source = "const x = [const A()];";
+        // const0 x1 =2 [3 const4 A5 (6 )7 ]8 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::ListLiteral, 3);
+                b.patch(0, NONE);
+                b.begin(NodeKind::ConstExpression, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::Arguments, 6);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::ConstExpression, 8);
+                b.end(NodeKind::ListLiteral, 9);
+                b.end(NodeKind::VariableInitializer, 9);
+                b.end(NodeKind::InitializedIdentifier, 9);
+                b.end(NodeKind::VariablesDeclaration, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_const"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary 'const' keyword.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    /// A const expression under a non-const declaration stays
+    /// (`final x = const [1]` — the official `VariableDeclarationList` branch
+    /// stops the walk without the keyword).
+    #[test]
+    fn unnecessary_const_final_declaration_passes() {
+        let source = "final x = const [1];";
+        // final0 x1 =2 const3 [4 15 ]6 ;7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::ConstExpression, 3);
+                b.begin(NodeKind::ListLiteral, 4);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::ListLiteral, 7);
+                b.end(NodeKind::ConstExpression, 7);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_const")).is_empty());
+    }
+
+    /// A const-marked literal with no const ancestor stays
+    /// (`final x = const [1]` again exercises the list-literal dispatch
+    /// through the payload keyword).
+    #[test]
+    fn unnecessary_const_list_literal_keyword_face() {
+        let source = "final x = const [1];";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::ListLiteral, 3);
+                b.patch(0, tok(source, t, "const", 0));
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::ListLiteral, 7);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_const")).is_empty());
+    }
+
+    // —— prefer_is_empty ———————————————————————————————————————————————————
+
+    /// `test/rules/prefer_is_empty_test.dart` `test_prefersIsEmptyOverLength0`
+    /// — `x.length == 0` reports with the isEmpty rewrite.
+    #[test]
+    fn prefer_is_empty_reports_length_eq_zero() {
+        let source = "x.length == 0;";
+        // x0 .1 length2 ==3 04 ;5
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 3);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                b.end(NodeKind::BinaryExpression, 6);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_is_empty"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'isEmpty' instead of 'length' to test whether the collection is empty."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try rewriting the expression to use 'isEmpty'.".to_owned())
+        );
+    }
+
+    /// A value outside the matrix passes (`== 2`); the always-true face
+    /// carries its own text and no correction (`x.length >= -1`).
+    #[test]
+    fn prefer_is_empty_matrix_faces() {
+        let plain = "x.length == 2;";
+        let f = Fixture::build(
+            plain,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 3);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                b.end(NodeKind::BinaryExpression, 6);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_is_empty")).is_empty());
+
+        let source = "x.length >= -1;";
+        // x0 .1 length2 >=3 -4 15 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 3);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::UnaryPrefix, 4);
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::UnaryPrefix, 7);
+                b.end(NodeKind::BinaryExpression, 7);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_is_empty"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The comparison is always 'true' because the length is always greater than or equal to 0."
+        );
+        assert_eq!(lints[0].correction, None);
+    }
+
+    // —— prefer_is_not_empty ———————————————————————————————————————————————
+
+    /// `test/rules/prefer_is_not_empty_test.dart` `test_notIsEmpty` — the
+    /// negated `isEmpty` reports at the prefix.
+    #[test]
+    fn prefer_is_not_empty_reports_bang_is_empty() {
+        let source = "!x.isEmpty;";
+        // !0 x1 .2 isEmpty3 ;4
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::UnaryPrefix, 0);
+                b.begin(NodeKind::DotAccess, 1);
+                b.patch(0, 2);
+                b.patch(1, 0);
+                identifier(b, 1, 2);
+                identifier(b, 3, 4);
+                b.end(NodeKind::DotAccess, 4);
+                b.end(NodeKind::UnaryPrefix, 5);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_is_not_empty"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'isNotEmpty' rather than negating the result of 'isEmpty'."
+        );
+    }
+
+    /// A negated `isNotEmpty` (or any other property) passes.
+    #[test]
+    fn prefer_is_not_empty_other_property_passes() {
+        let source = "!x.isNotEmpty;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::UnaryPrefix, 0);
+                b.begin(NodeKind::DotAccess, 1);
+                b.patch(0, 2);
+                b.patch(1, 0);
+                identifier(b, 1, 2);
+                identifier(b, 3, 4);
+                b.end(NodeKind::DotAccess, 4);
+                b.end(NodeKind::UnaryPrefix, 5);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
+    }
+
+    // —— avoid_function_literals_in_foreach_calls ——————————————————————————
+
+    /// `test/rules/avoid_function_literals_in_foreach_calls_test.dart`
+    /// `test forEach with function literal` — the method name reports.
+    #[test]
+    fn foreach_literal_reports_the_method_name() {
+        let source = "x.forEach((e) {});";
+        // x0 .1 forEach2 (3 e4 )5 {6 }7 )8 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::FunctionExpression, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.begin(NodeKind::FormalParameter, 3);
+                b.patch(0, NONE);
+                b.patch(1, 4);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 4, 5);
+                b.end(NodeKind::FormalParameter, 6);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::BlockBody, 6);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 6);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::BlockBody, 8);
+                b.end(NodeKind::FunctionExpression, 8);
+                b.end(NodeKind::Arguments, 9);
+                b.end(NodeKind::Send, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_function_literals_in_foreach_calls"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Function literals shouldn't be passed to 'forEach'."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+    }
+
+    /// The `Map.forEach` face — a two-parameter closure — passes through the
+    /// arity gate, and a cascade section passes through the cascade guard.
+    #[test]
+    fn foreach_two_params_and_cascade_pass() {
+        let source = "map.forEach((k, v) {});";
+        // map0 .1 forEach2 (3 k4 ,5 v6 )7 {8 }9 )10 ;11
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::FunctionExpression, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.begin(NodeKind::FormalParameter, 3);
+                b.patch(0, NONE);
+                b.patch(1, 4);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 4, 5);
+                b.end(NodeKind::FormalParameter, 5);
+                b.begin(NodeKind::FormalParameter, 6);
+                b.patch(0, NONE);
+                b.patch(1, 6);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 6, 7);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::BlockBody, 8);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 8);
+                b.end(NodeKind::Block, 10);
+                b.end(NodeKind::BlockBody, 10);
+                b.end(NodeKind::FunctionExpression, 10);
+                b.end(NodeKind::Arguments, 11);
+                b.end(NodeKind::Send, 11);
+                b.end(NodeKind::ExpressionStatement, 12);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+                .is_empty()
+        );
+
+        let cascade = "x..forEach((e) {});";
+        // x0 ..1 forEach2 (3 e4 )5 {6 }7 )8 ;9
+        let f = Fixture::build(
+            cascade,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Cascade, 1);
+                b.begin(NodeKind::CascadeAccess, 2);
+                b.patch(0, 2);
+                b.patch(1, 0);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::FunctionExpression, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.begin(NodeKind::FormalParameter, 3);
+                b.patch(0, NONE);
+                b.patch(1, 4);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 4, 5);
+                b.end(NodeKind::FormalParameter, 6);
+                b.end(NodeKind::FormalParameters, 6);
+                b.begin(NodeKind::BlockBody, 6);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 6);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::BlockBody, 8);
+                b.end(NodeKind::FunctionExpression, 8);
+                b.end(NodeKind::Arguments, 9);
+                b.end(NodeKind::Send, 9);
+                b.end(NodeKind::CascadeAccess, 9);
+                b.end(NodeKind::Cascade, 9);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+                .is_empty()
+        );
+    }
+
+    // —— prefer_interpolation_to_compose_strings ———————————————————————————
+
+    /// `'a' + b` reports over the pair span.
+    #[test]
+    fn interpolation_reports_literal_plus_value() {
+        let source = "'a' + b;";
+        // 'a'0 +1 b2 ;3
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "+", 0));
+                b.leaf_span(NodeKind::StringLiteral, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::BinaryExpression, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_interpolation_to_compose_strings"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use interpolation to compose strings and values."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 3));
+    }
+
+    /// Both literals and a raw string pass (:70-75).
+    #[test]
+    fn interpolation_both_literals_and_raw_pass() {
+        let source = "'a' + 'b';";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(source, t, "+", 0));
+                b.leaf_span(NodeKind::StringLiteral, 0, 1);
+                b.leaf_span(NodeKind::StringLiteral, 2, 3);
+                b.end(NodeKind::BinaryExpression, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .is_empty()
+        );
+
+        let raw = "'a' + r'b';";
+        // 'a'0 +1 r'b'2 ;3
+        let f = Fixture::build(
+            raw,
+            unit_of(|b, t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, tok(raw, t, "+", 0));
+                b.leaf_span(NodeKind::StringLiteral, 0, 1);
+                b.leaf_span(NodeKind::StringLiteral, 2, 3);
+                b.end(NodeKind::BinaryExpression, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .is_empty()
+        );
     }
 }

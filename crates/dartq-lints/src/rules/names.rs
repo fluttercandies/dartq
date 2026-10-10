@@ -626,6 +626,70 @@ pub(crate) mod file_names {
     }
 }
 
+pub(crate) mod no_wildcard_variable_uses {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use dartq_parser::IdentifierContext;
+
+    /// Official: `pkg/linter/lib/src/rules/no_wildcard_variable_uses.dart:36-77`
+    /// — with the wildcard-variables feature OFF (`hasWildcardVariablesFeature
+    /// Enabled` bails the registration, :36-38) a use of a `_`-named local
+    /// variable or formal parameter reports at the use.
+    ///
+    /// The element test (`LocalVariableElement` / `FormalParameterElement`,
+    /// :72-76) is the binding test: the use reports only when a wildcard
+    /// local/parameter binds over it. The engine collects that table in the
+    /// same DFS ([`crate::engine::WildcardScope`] — locals over their innermost
+    /// block/for-in/catch clause, parameters over their function, catch
+    /// parameters over the catch clause; fields and getters never bind, so
+    /// `print(_)` beside a `_` field stays silent exactly like the official
+    /// `test_field`). Pattern-bound wildcard variables under-report
+    /// (declaration-context identifiers are excluded, mirroring the official
+    /// `test_localVar` shape where only the use reports). Message:
+    /// `diagnostic.g.dart` `noWildcardVariableUses`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_wildcard_variable_uses",
+        group: Group::Core,
+        problem: "The referenced identifier is a wildcard.",
+        correction: "Use an identifier name that is not a wildcard.",
+        kinds: &[NodeKind::Identifier],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // Feature gate: with wildcards on, `_` never binds, so there is no
+        // wildcard use to flag — the official never registers (:36-38).
+        if c.unit.features.wildcard_variables {
+            return;
+        }
+        let node = c.node();
+        // Uses only: the expression contexts (the official `test_localVar`
+        // reports the `print(_)` use, never the declaration).
+        let Some(&ctx) = c.payload(node).first() else {
+            return;
+        };
+        if ctx != IdentifierContext::Expression as u32
+            && ctx != IdentifierContext::ExpressionContinuation as u32
+        {
+            return;
+        }
+        if !super::is_just_underscores(c.lexeme(c.head_token(node))) {
+            return;
+        }
+        let name = c.lexeme(c.head_token(node));
+        let use_start = c.byte_span(node).start;
+        let bound = c.wildcards.iter().any(|w| {
+            &c.unit.source[w.name.clone()] == name
+                && w.scope.start <= use_start
+                && use_start < w.scope.end
+        });
+        if !bound {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1335,5 +1399,96 @@ mod tests {
         let mut f = Fixture::build("var x;", unit_of(|_b, _t| {}));
         f.path = std::path::PathBuf::from("file1.dart");
         assert!(f.run(&one_rule("file_names")).is_empty());
+    }
+
+    // —— no_wildcard_variable_uses —————————————————————————————————————————
+
+    /// `test/rules/no_wildcard_variable_uses_test.dart` `test_localVar` —
+    /// with the wildcard feature off, a use of a `_` parameter reports.
+    #[test]
+    fn wildcard_use_reports_with_feature_off() {
+        let source = "f(int _) { _; }";
+        // f0 (1 int2 _3 )4 {5 _6 ;7 }8
+        let mut f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::LocalFunctionDeclaration, 0);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::FormalParameter, 1);
+                b.patch(0, NONE);
+                b.patch(1, 3);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.begin(NodeKind::Identifier, 3);
+                b.patch(
+                    0,
+                    dartq_parser::IdentifierContext::FormalParameterDeclaration as u32,
+                );
+                b.end(NodeKind::Identifier, 4);
+                b.end(NodeKind::FormalParameter, 4);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::Block, 5);
+                b.begin(NodeKind::ExpressionStatement, 6);
+                identifier(b, 6, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::LocalFunctionDeclaration, 9);
+            }),
+        );
+        f.features.wildcard_variables = false;
+        let lints = f.run(&one_rule("no_wildcard_variable_uses"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "The referenced identifier is a wildcard.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+    }
+
+    /// With the feature on (the shipped default) `_` never binds and the
+    /// rule stays silent; a bare `_` with no wildcard declaration is also
+    /// silent (the field/getter faces of the official `test_field`).
+    #[test]
+    fn wildcard_use_passes_with_feature_on_or_without_binding() {
+        let source = "f(int _) { _; }";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::LocalFunctionDeclaration, 0);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::FormalParameter, 1);
+                b.patch(0, NONE);
+                b.patch(1, 3);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.begin(NodeKind::Identifier, 3);
+                b.patch(
+                    0,
+                    dartq_parser::IdentifierContext::FormalParameterDeclaration as u32,
+                );
+                b.end(NodeKind::Identifier, 4);
+                b.end(NodeKind::FormalParameter, 4);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::Block, 5);
+                b.begin(NodeKind::ExpressionStatement, 6);
+                identifier(b, 6, 7);
+                b.end(NodeKind::ExpressionStatement, 8);
+                b.end(NodeKind::Block, 8);
+                b.end(NodeKind::LocalFunctionDeclaration, 9);
+            }),
+        );
+        // The shipped default: wildcards on, rule inert.
+        assert!(f.run(&one_rule("no_wildcard_variable_uses")).is_empty());
+
+        let unbound = "_;";
+        let mut f = Fixture::build(
+            unbound,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                identifier(b, 0, 1);
+                b.end(NodeKind::ExpressionStatement, 2);
+            }),
+        );
+        f.features.wildcard_variables = false;
+        assert!(f.run(&one_rule("no_wildcard_variable_uses")).is_empty());
     }
 }

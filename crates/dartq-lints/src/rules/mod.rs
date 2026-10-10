@@ -206,6 +206,108 @@ pub(crate) fn is_field_name_shortcut(c: &Check<'_>, pattern: u32) -> bool {
 /// The `TOKEN_NONE` sentinel as stored in payload words.
 pub(crate) const NONE_TOKEN: u32 = dartq_ast::TOKEN_NONE;
 
+/// Whether the current node sits inside a constant context, answering the
+/// official `inConstantContext` for the parsed AST. The official computation
+/// (`pkg/analyzer/lib/src/dart/ast/ast.dart:17858-17918`, `constantContext`)
+/// is a parent walk with a fixed transparent set — ported node-for-node over
+/// the collapse kinds (the official rule declares `canUseParsedResult`, so
+/// the walk is the parse-time face, not a resolution product):
+///
+/// - const-context roots: an annotation ([`NodeKind::Metadata`]), an enum
+///   element (`EnumConstantArguments`), an old-style `case` label
+///   ([`NodeKind::SwitchCase`]), a const-marked [`NodeKind::ConstantPattern`]
+///   (without `const` the pattern is *not* a context and the walk stops), and
+///   a const-marked `const` expression / literal / [`NodeKind::VariablesDeclaration`];
+/// - transparent: expressions and the argument/map-entry/spread/null-aware
+///   wrappers around them, plus the variable-declaration chain the official
+///   `VariableDeclaration` transparency covers
+///   ([`NodeKind::InitializedIdentifier`] / [`NodeKind::VariableInitializer`]);
+/// - anything else stops the walk: `false`.
+///
+/// The node's own const keyword never counts (`includeSelf: false`).
+pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
+    for &ancestor in c.path.iter().take(c.path.len() - 1).rev() {
+        match c.kind(ancestor) {
+            NodeKind::Metadata | NodeKind::EnumElement | NodeKind::SwitchCase => return true,
+            // Without its own `const` a constant pattern is not a context and
+            // the official walk stops (`return null`); a non-const variable
+            // declaration list stops the same way.
+            NodeKind::ConstantPattern | NodeKind::VariablesDeclaration => {
+                return head_is_const(c, ancestor);
+            }
+            NodeKind::ConstExpression
+            | NodeKind::ConstLiteral
+            | NodeKind::ListLiteral
+            | NodeKind::SetOrMapLiteral
+            | NodeKind::RecordLiteral => {
+                if const_keyword(c, ancestor).is_some() {
+                    return true;
+                }
+            }
+            // The official transparent set: every expression kind plus the
+            // argument/element wrappers and the variable-declaration chain.
+            NodeKind::Arguments
+            | NodeKind::NamedArgument
+            | NodeKind::MapEntry
+            | NodeKind::Spread
+            | NodeKind::NullAwareElement
+            | NodeKind::IfControlFlow
+            | NodeKind::ThenControlFlow
+            | NodeKind::ElseControlFlow
+            | NodeKind::InitializedIdentifier
+            | NodeKind::VariableInitializer
+            | NodeKind::Send
+            | NodeKind::ImplicitCreation
+            | NodeKind::DotAccess
+            | NodeKind::Qualified
+            | NodeKind::Cascade
+            | NodeKind::CascadeAccess
+            | NodeKind::ParenthesizedExpression
+            | NodeKind::BinaryExpression
+            | NodeKind::Assignment
+            | NodeKind::UnaryPrefix
+            | NodeKind::UnaryPostfix
+            | NodeKind::NonNullAssert
+            | NodeKind::Conditional
+            | NodeKind::AsExpression
+            | NodeKind::IsExpression
+            | NodeKind::AwaitExpression
+            | NodeKind::ThrowExpression
+            | NodeKind::Identifier
+            | NodeKind::ThisExpression
+            | NodeKind::SuperExpression
+            | NodeKind::StringLiteral
+            | NodeKind::NewExpression => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The explicit `const` keyword of a const-carrying expression node, or
+/// `None`. Const expressions/carry literals keep the keyword as a payload
+/// word (collapse map §3.5 `LiteralListHandle`/`RecordLiteralEnd`/
+/// `LiteralSetOrMapHandle`/`ConstExpressionEnd` rows); the keyword-less forms
+/// are transparent.
+pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
+    match c.kind(node) {
+        NodeKind::ConstExpression | NodeKind::ConstLiteral => {
+            head_is_const(c, node).then(|| c.head_token(node))
+        }
+        NodeKind::ListLiteral | NodeKind::SetOrMapLiteral | NodeKind::RecordLiteral => {
+            let keyword = c.payload(node).first().copied()?;
+            (keyword != NONE_TOKEN).then_some(keyword)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node`'s span head lexeme is the `const` keyword (the head-when-
+/// present eliminations of collapse map §1).
+fn head_is_const(c: &Check<'_>, node: u32) -> bool {
+    c.lexeme(c.head_token(node)) == "const"
+}
+
 /// The last token of `id`'s span (the span's `end` is exclusive).
 pub(crate) fn tail_token(c: &Check<'_>, id: u32) -> u32 {
     c.unit.ast.token_range(id).end - 1

@@ -164,11 +164,12 @@ fn registry_fits_the_enable_set_word_count() {
     );
 }
 
-/// The slice pin: 18 wave-1 + 18 wave-2 rules + 6 directive-milestone rules
-/// + 10 wave-3 rules = 52 registered.
+/// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3
+/// and 12 #353-completion rules make 64 registered — every `package:lints`
+/// member is either here or documented-blocked in the crate docs.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 52);
+    assert_eq!(RULES.len(), 64);
 }
 
 #[test]

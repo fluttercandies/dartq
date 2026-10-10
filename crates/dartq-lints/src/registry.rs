@@ -69,7 +69,7 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the wave-3 tranche. Order is registry order
+/// All rules through the #353 completion tranche. Order is registry order
 /// ([`RuleId`] assignment), grouped core-first then alphabetically within
 /// each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
@@ -86,12 +86,18 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::declarations::hash_and_equals::SPEC,
     &crate::rules::directives::library_annotations::SPEC,
     &crate::rules::flow::no_duplicate_case_values::SPEC,
+    &crate::rules::names::no_wildcard_variable_uses::SPEC,
     &crate::rules::names::non_constant_identifier_names::SPEC,
     &crate::rules::declarations::prefer_generic_function_type_aliases::SPEC,
+    &crate::rules::expressions::prefer_is_empty::SPEC,
+    &crate::rules::expressions::prefer_is_not_empty::SPEC,
+    &crate::rules::collections::prefer_iterable_where_type::SPEC,
     &crate::rules::declarations::prefer_typing_uninitialized_variables::SPEC,
+    &crate::rules::directives::provide_deprecation_message::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
     // —— recommended (`.third/lints/lib/recommended.yaml`) ——
+    &crate::rules::expressions::avoid_function_literals_in_foreach_calls::SPEC,
     &crate::rules::declarations::avoid_init_to_null::SPEC,
     &crate::rules::declarations::avoid_return_types_on_setters::SPEC,
     &crate::rules::flow::avoid_returning_null_for_void::SPEC,
@@ -108,20 +114,26 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::collections::prefer_collection_literals::SPEC,
     &crate::rules::expressions::prefer_conditional_assignment::SPEC,
     &crate::rules::expressions::prefer_contains::SPEC,
+    &crate::rules::collections::prefer_for_elements_to_map_from_iterable::SPEC,
     &crate::rules::declarations::prefer_function_declarations_over_variables::SPEC,
     &crate::rules::expressions::prefer_if_null_operators::SPEC,
     &crate::rules::collections::prefer_inlined_adds::SPEC,
+    &crate::rules::expressions::prefer_interpolation_to_compose_strings::SPEC,
     &crate::rules::expressions::prefer_is_not_operator::SPEC,
     &crate::rules::expressions::prefer_null_aware_operators::SPEC,
     &crate::rules::collections::prefer_spread_collections::SPEC,
+    &crate::rules::declarations::recursive_getters::SPEC,
     &crate::rules::docs::slash_for_doc_comments::SPEC,
     &crate::rules::strings::unnecessary_brace_in_string_interps::SPEC,
+    &crate::rules::expressions::unnecessary_const::SPEC,
     &crate::rules::declarations::unnecessary_constructor_name::SPEC,
+    &crate::rules::declarations::unnecessary_getters_setters::SPEC,
     &crate::rules::declarations::unnecessary_late::SPEC,
     &crate::rules::directives::unnecessary_library_name::SPEC,
     &crate::rules::expressions::unnecessary_new::SPEC,
     &crate::rules::expressions::unnecessary_null_aware_assignments::SPEC,
     &crate::rules::expressions::unnecessary_null_in_if_null_operators::SPEC,
+    &crate::rules::declarations::unnecessary_nullable_for_final_variable_declarations::SPEC,
     &crate::rules::strings::unnecessary_string_escapes::SPEC,
     &crate::rules::declarations::type_init_formals::SPEC,
     &crate::rules::collections::unnecessary_to_list_in_spreads::SPEC,

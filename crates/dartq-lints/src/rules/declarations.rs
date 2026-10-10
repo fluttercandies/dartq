@@ -723,6 +723,437 @@ pub(crate) mod type_init_formals {
     }
 }
 
+pub(crate) mod recursive_getters {
+    use super::{Check, Group, NodeKind, RuleSpec, get_set_token};
+
+    /// Official: `pkg/linter/lib/src/rules/recursive_getters.dart:31-95` — a
+    /// getter (no parameter list) whose body references itself reports at
+    /// the reference.
+    ///
+    /// Approximation (documented): the element identity (`node.element !=
+    /// element`, :57-60) is taken as the same-lexeme read inside the
+    /// nearest enclosing getter, so a local or nested function of the same
+    /// name shadowing the getter over-reports (the user-shadowed family;
+    /// the official `isSelfReference` element check excludes it). The
+    /// const-literal subtree skip (:61-70) covers erroneous code only and
+    /// is dropped. Message: `diagnostic.g.dart` `recursiveGetters`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "recursive_getters",
+        group: Group::Recommended,
+        problem: "The getter '{0}' recursively returns itself.",
+        correction: "Try changing the value being returned.",
+        kinds: &[NodeKind::Identifier],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // Reads only (the official flags `SimpleIdentifier` references; a
+        // declaration or label position never reads the getter).
+        let Some(&ctx) = c.payload(node).first() else {
+            return;
+        };
+        if ctx != dartq_parser::IdentifierContext::Expression as u32 {
+            return;
+        }
+        // `isSelfReference` parent guards (:57-64): a `prefixed`/`obj.x`
+        // access never self-references; `this.x` does.
+        if let Some(parent) = c.ancestor(1) {
+            match c.kind(parent) {
+                NodeKind::DotAccess => {
+                    let kids = c.collect_direct(parent);
+                    let name_side = kids.last() == Some(&node);
+                    let target_this = kids
+                        .first()
+                        .is_some_and(|&target| c.kind(target) == NodeKind::ThisExpression);
+                    if !(name_side && target_this) {
+                        return;
+                    }
+                }
+                NodeKind::Qualified => return,
+                _ => {}
+            }
+        }
+        // The nearest enclosing getter with no parameter list
+        // (:78-85: `parameters != null` bails).
+        let getter = c.path.iter().rev().copied().find(|&ancestor| {
+            matches!(
+                c.kind(ancestor),
+                NodeKind::Method | NodeKind::TopLevelMethod
+            )
+        });
+        let Some(getter) = getter else {
+            return;
+        };
+        if get_set_token(c, getter) != Some("get") {
+            return;
+        }
+        // No parameters: no FormalParameters child (a getter's grammar has
+        // none; the official's `node.parameters != null`).
+        if c.children(getter)
+            .any(|kid| c.kind(kid) == NodeKind::FormalParameters)
+        {
+            return;
+        }
+        // The reference must sit in the getter's body (:86-89 walk the body).
+        let body = c
+            .collect_direct(getter)
+            .into_iter()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::ExpressionBody | NodeKind::BlockBody));
+        let Some(body) = body else {
+            return;
+        };
+        let name = c.lexeme(c.head_token(node));
+        // The getter's own name, through the name child (the span head can
+        // be the return type / `get` keyword).
+        let Some(getter_name) = super::member_name(c, getter) else {
+            return;
+        };
+        if c.lexeme(c.head_token(getter_name)) != name {
+            return;
+        }
+        let body_span = c.byte_span(body);
+        if !body_span.contains(&c.byte_span(node).start) {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[name]);
+    }
+}
+
+pub(crate) mod unnecessary_getters_setters {
+    use super::{Check, Group, NodeKind, RuleSpec, get_set_token};
+    use crate::rules::first_child;
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_getters_setters.dart:41-97`
+    /// — a getter/setter pair of the same name whose bodies are the trivial
+    /// field wrap (getter reads a private same-class field, setter assigns
+    /// it from the lone parameter) reports at the getter name; neither
+    /// member may carry annotations.
+    ///
+    /// Approximation (documented): the field identity (`staticElement
+    /// isGetterElement` + same enclosing class, ast.dart
+    /// `_checkForSimpleGetter`) is taken as a same-lexeme private field
+    /// declared in the same class body, so a same-named local shadowing the
+    /// field inside a trivial body over-reports (the user-shadowed family).
+    /// Message: `diagnostic.g.dart` `unnecessaryGettersSetters`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_getters_setters",
+        group: Group::Recommended,
+        problem: "Unnecessary use of getter and setter to wrap a field.",
+        correction: "Try removing the getter and setter and renaming the field.",
+        kinds: &[
+            NodeKind::ClassDeclaration,
+            NodeKind::ExtensionTypeDeclaration,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.body case BlockClassBody body` (:55-58) — the member list.
+        let Some(body) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
+        else {
+            return;
+        };
+        let members = c.collect_direct(body);
+        // Build the getter/setter maps (:62-72) and the private field names.
+        let mut fields: Vec<&str> = Vec::new();
+        for &member in &members {
+            if c.kind(member) == NodeKind::Fields {
+                collect_field_names(c, member, &mut fields);
+            }
+        }
+        for (i, &member) in members.iter().enumerate() {
+            if c.kind(member) != NodeKind::Method || get_set_token(c, member) != Some("get") {
+                continue;
+            }
+            // Names come from the name children (the span head may be the
+            // return type / `get` keyword).
+            let Some(name_node) = super::member_name(c, member) else {
+                continue;
+            };
+            let getter_name = c.lexeme(c.head_token(name_node));
+            let Some(setter) = members.iter().copied().find(|&other| {
+                c.kind(other) == NodeKind::Method
+                    && get_set_token(c, other) == Some("set")
+                    && super::member_name(c, other)
+                        .is_some_and(|name| c.lexeme(c.head_token(name)) == getter_name)
+            }) else {
+                continue;
+            };
+            // `metadata.annotations.isEmpty` on both (:96-99) — the star
+            // sibling before the member.
+            if has_annotations(c, &members, i) || has_annotations_of(c, &members, setter) {
+                continue;
+            }
+            if !is_simple_getter(c, member, &fields) || !is_simple_setter(c, setter, &fields) {
+                continue;
+            }
+            // The getter's name reports (:101).
+            let start = c
+                .unit
+                .tokens
+                .get(c.head_token(name_node) as usize)
+                .expect("name outside the token table")
+                .utf16_offset;
+            c.report(start..start, &[]);
+        }
+    }
+
+    /// The private field names declared by a `Fields` member.
+    fn collect_field_names<'a>(c: &Check<'a>, fields: u32, out: &mut Vec<&'a str>) {
+        for decl in c.collect_direct(fields) {
+            if c.kind(decl) != NodeKind::VariablesDeclaration {
+                continue;
+            }
+            for var in c.collect_direct(decl) {
+                if c.kind(var) != NodeKind::InitializedIdentifier {
+                    continue;
+                }
+                if let Some(name) = crate::rules::member_name(c, var) {
+                    let lexeme = c.lexeme(c.head_token(name));
+                    if lexeme.starts_with('_') {
+                        out.push(lexeme);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the member at `index`'s left sibling is a metadata star.
+    fn has_annotations(c: &Check<'_>, members: &[u32], index: usize) -> bool {
+        index > 0 && c.kind(members[index - 1]) == NodeKind::MetadataStar
+    }
+
+    fn has_annotations_of(c: &Check<'_>, members: &[u32], member: u32) -> bool {
+        members
+            .iter()
+            .position(|&m| m == member)
+            .is_some_and(|index| has_annotations(c, members, index))
+    }
+
+    /// The expression a trivial body yields: an expression body's expression,
+    /// or the sole statement's child (`statement_kind` = the required single
+    /// statement).
+    fn sole_body_expression(c: &Check<'_>, kids: &[u32], statement_kind: NodeKind) -> Option<u32> {
+        if let Some(&body) = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::ExpressionBody)
+        {
+            return first_child(c, body);
+        }
+        let body = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::BlockBody)?;
+        // The statements live under the body's `Block` child.
+        let block = c
+            .collect_direct(*body)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Block)?;
+        let statements = c.collect_direct(block);
+        (statements.len() == 1 && c.kind(statements[0]) == statement_kind)
+            .then(|| first_child(c, statements[0]))
+            .flatten()
+    }
+
+    /// `isSimpleGetter` (ast.dart): the body expression (or a single
+    /// return's expression) is a bare private same-class field identifier.
+    fn is_simple_getter(c: &Check<'_>, getter: u32, fields: &[&str]) -> bool {
+        let kids = c.collect_direct(getter);
+        let Some(expression) = sole_body_expression(c, &kids, NodeKind::ReturnStatement) else {
+            return false;
+        };
+        simple_field_read(c, expression, fields)
+    }
+
+    /// `isSimpleSetter` (ast.dart): the body statement assigns a bare
+    /// private same-class field from the lone parameter.
+    fn is_simple_setter(c: &Check<'_>, setter: u32, fields: &[&str]) -> bool {
+        let kids = c.collect_direct(setter);
+        let Some(expression) = sole_body_expression(c, &kids, NodeKind::ExpressionStatement) else {
+            return false;
+        };
+        if c.kind(expression) != NodeKind::Assignment
+            || c.lexeme(
+                c.payload(expression)
+                    .first()
+                    .copied()
+                    .expect("assignment op"),
+            ) != "="
+        {
+            return false;
+        }
+        let operands = c.collect_direct(expression);
+        if operands.len() < 2 {
+            return false;
+        }
+        let (lhs, rhs) = (operands[0], operands[1]);
+        if !simple_field_read(c, lhs, fields) {
+            return false;
+        }
+        // `rightElement == parameters.first` (:92-96 in ast.dart).
+        let params = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .copied();
+        let Some(params) = params else {
+            return false;
+        };
+        let param_list = c.collect_direct(params);
+        if param_list.len() != 1 {
+            return false;
+        }
+        let Some(param_name) = parameter_name(c, param_list[0]) else {
+            return false;
+        };
+        c.kind(rhs) == NodeKind::Identifier && c.lexeme(c.head_token(rhs)) == param_name
+    }
+
+    /// A bare identifier naming a private field of this class.
+    fn simple_field_read(c: &Check<'_>, expression: u32, fields: &[&str]) -> bool {
+        c.kind(expression) == NodeKind::Identifier && {
+            let lexeme = c.lexeme(c.head_token(expression));
+            lexeme.starts_with('_') && fields.contains(&lexeme)
+        }
+    }
+
+    /// A formal parameter's name (`FormalParameter` word 1, or the
+    /// function-typed form's identifier child).
+    fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
+        match c.kind(parameter) {
+            NodeKind::FormalParameter => {
+                let name = c.payload(parameter).get(1).copied()?;
+                (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
+            }
+            NodeKind::FunctionTypedFormalParameter => {
+                let name = crate::rules::member_name(c, parameter)?;
+                Some(c.lexeme(c.head_token(name)))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) mod unnecessary_nullable_for_final_variable_declarations {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::first_child;
+    use dartq_parser::MemberKind;
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_nullable_for_final_variable_declarations.dart:35-117`
+    /// — a `final`/`const` declaration with a nullable written type whose
+    /// initializer is non-nullable reports at the variable name.
+    ///
+    /// Approximation (documented): the initializer face
+    /// (`initializerType.isNonNullable`) is taken as a non-null literal —
+    /// numbers, strings, booleans, collection literals, const expressions —
+    /// so `final int? x = compute()` (a non-null non-literal) under-reports
+    /// until type inference lands (the `no_duplicate_case_values`
+    /// constant-evaluation precedent). Fields keep the official
+    /// private-or-static gate (:83-88). Message: `diagnostic.g.dart`
+    /// `unnecessaryNullableForFinalVariableDeclarations`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_nullable_for_final_variable_declarations",
+        group: Group::Recommended,
+        problem: "Type could be non-nullable.",
+        correction: "Try changing the type to be non-nullable.",
+        kinds: &[NodeKind::VariablesDeclaration],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `isFinal || isConst` (:97): the head token, or the token after a
+        // `late` head.
+        let head = c.head_token(node);
+        let keyword = match c.lexeme(head) {
+            "final" | "const" => head,
+            "late" => head + 1,
+            _ => return,
+        };
+        if !matches!(c.lexeme(keyword), "final" | "const") {
+            return;
+        }
+        // `declaredElement.type is DynamicType` bails (:101-103) — an
+        // unwritten type is the `NoType` child.
+        let Some(type_node) = first_child(c, node) else {
+            return;
+        };
+        if c.kind(type_node) != NodeKind::Type {
+            return;
+        }
+        // The written `?` is the type's last span token (collapse map §3.8
+        // Type row, #174).
+        let type_range = c.unit.ast.token_range(type_node);
+        if type_range.is_empty() || c.lexeme(type_range.end - 1) != "?" {
+            return;
+        }
+        // Fields: private or static only (:83-88).
+        let is_field = c
+            .ancestor(1)
+            .is_some_and(|parent| c.kind(parent) == NodeKind::Fields);
+        if is_field {
+            let parent = c.ancestor(1).expect("checked above");
+            let is_static = c.payload(parent).first() == Some(&(MemberKind::StaticField as u32));
+            let is_private = c
+                .collect_direct(node)
+                .iter()
+                .any(|&var| c.lexeme(c.head_token(var)).starts_with('_'));
+            if !is_static && !is_private {
+                return;
+            }
+        }
+        for var in c.collect_direct(node) {
+            if c.kind(var) != NodeKind::InitializedIdentifier {
+                continue;
+            }
+            // `variable.initializer?.staticType` (:105) — an uninitialized
+            // variable bails per-variable.
+            let Some(initializer) = c
+                .collect_direct(var)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer)
+                .and_then(|init| first_child(c, init))
+            else {
+                continue;
+            };
+            if !is_non_null_literal(c, initializer) {
+                continue;
+            }
+            // `rule.reportAtToken(variable.name)` (:110).
+            let Some(name_node) = crate::rules::member_name(c, var) else {
+                continue;
+            };
+            let start = c
+                .unit
+                .tokens
+                .get(c.head_token(name_node) as usize)
+                .expect("name outside the token table")
+                .utf16_offset;
+            c.report(start..start, &[]);
+        }
+    }
+
+    /// The non-null literal face: any literal form but `null`.
+    fn is_non_null_literal(c: &Check<'_>, expression: u32) -> bool {
+        matches!(
+            c.kind(expression),
+            NodeKind::LiteralInt
+                | NodeKind::LiteralDouble
+                | NodeKind::LiteralBool
+                | NodeKind::StringLiteral
+                | NodeKind::ListLiteral
+                | NodeKind::SetOrMapLiteral
+                | NodeKind::RecordLiteral
+                | NodeKind::ConstExpression
+                | NodeKind::ConstLiteral
+        )
+    }
+}
+
 // —— shared helpers ———————————————————————————————————————————————————————
 
 /// The `get`/`set` keyword token of a member declaration, by lexeme.
@@ -2098,5 +2529,295 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("type_init_formals")).is_empty());
+    }
+
+    // —— recursive_getters —————————————————————————————————————————————————
+
+    /// `test/rules/recursive_getters_test.dart` `test_recursiveGetter` — a
+    /// getter returning its own name reports at the reference.
+    #[test]
+    fn recursive_getter_reports_the_self_reference() {
+        let source = "int get x => x;";
+        // int0 get1 x2 =>3 x4 ;5
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "get", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::ExpressionBody, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 4, 5);
+                b.end(NodeKind::ExpressionBody, 6);
+                b.end(NodeKind::TopLevelMethod, 6);
+            }),
+        );
+        let lints = f.run(&one_rule("recursive_getters"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The getter 'x' recursively returns itself."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    /// A different name passes, and a property access on another target is
+    /// never a self-reference (`isSelfReference`, :57-64).
+    #[test]
+    fn recursive_getter_other_names_pass() {
+        let source = "int get x => y;";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "get", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::ExpressionBody, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 4, 5);
+                b.end(NodeKind::ExpressionBody, 6);
+                b.end(NodeKind::TopLevelMethod, 6);
+            }),
+        );
+        assert!(f.run(&one_rule("recursive_getters")).is_empty());
+    }
+
+    // —— unnecessary_getters_setters ———————————————————————————————————————
+
+    /// `test/rules/unnecessary_getters_setters_test.dart` — the trivial
+    /// private-field wrap reports at the getter name.
+    #[test]
+    fn trivial_getter_setter_pair_reports() {
+        let source = "class C { int _x = 0; int get x => _x; set x(int v) { _x = v; } }";
+        // class0 C1 {2 int3 _x4 =5 06 ;7 int8 get9 x10 =>11 _x12 ;13 set14 x15 (16 int17 v18 )19 {20 _x21 =22 v23 ;24 }25 }26
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                // int _x = 0;
+                b.begin(NodeKind::Fields, 3);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                // int get x => _x;
+                b.begin(NodeKind::Method, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 8, 9);
+                identifier(b, 10, 11);
+                b.begin(NodeKind::ExpressionBody, 11);
+                b.patch(0, 11);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ExpressionBody, 14);
+                b.end(NodeKind::Method, 14);
+                // set x(int v) { _x = v; }
+                b.begin(NodeKind::Method, 14);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "set", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::NoType, 14);
+                identifier(b, 15, 16);
+                b.begin(NodeKind::FormalParameters, 16);
+                b.begin(NodeKind::FormalParameter, 16);
+                b.patch(0, NONE);
+                b.patch(1, 18);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 17, 18);
+                identifier(b, 18, 19);
+                b.end(NodeKind::FormalParameter, 20);
+                b.end(NodeKind::FormalParameters, 20);
+                b.begin(NodeKind::BlockBody, 20);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 20);
+                b.begin(NodeKind::ExpressionStatement, 20);
+                b.begin(NodeKind::Assignment, 20);
+                b.patch(0, 22);
+                identifier(b, 21, 22);
+                identifier(b, 23, 24);
+                b.end(NodeKind::Assignment, 25);
+                b.end(NodeKind::ExpressionStatement, 25);
+                b.end(NodeKind::Block, 26);
+                b.end(NodeKind::BlockBody, 26);
+                b.end(NodeKind::Method, 26);
+                b.end(NodeKind::DeclarationBody, 26);
+                b.end(NodeKind::ClassDeclaration, 27);
+                b.end(NodeKind::TopLevelDeclaration, 27);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_getters_setters"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of getter and setter to wrap a field."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 10));
+    }
+
+    /// A getter not reading the field the setter writes passes
+    /// (`_checkForSimpleGetter`'s identity face).
+    #[test]
+    fn getter_returning_something_else_passes() {
+        let source = "class C { int _x = 0; int get x => _other; }";
+        // class0 C1 {2 int3 _x4 =5 06 ;7 int8 get9 x10 =>11 _other12 ;13 }14
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 3);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Method, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 8, 9);
+                identifier(b, 10, 11);
+                b.begin(NodeKind::ExpressionBody, 11);
+                b.patch(0, 11);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ExpressionBody, 14);
+                b.end(NodeKind::Method, 14);
+                b.end(NodeKind::DeclarationBody, 14);
+                b.end(NodeKind::ClassDeclaration, 15);
+                b.end(NodeKind::TopLevelDeclaration, 15);
+            }),
+        );
+        // No setter pair at all — the getter alone never reports.
+        assert!(f.run(&one_rule("unnecessary_getters_setters")).is_empty());
+    }
+
+    // —— unnecessary_nullable_for_final_variable_declarations ——————————————
+
+    /// A `final` declaration with a nullable type and a non-null literal
+    /// initializer reports at the name.
+    #[test]
+    fn unnecessary_nullable_reports_literal_initializer() {
+        let source = "final int? x = 1;";
+        // final0 int1 ?2 x3 =4 15 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 1, 3);
+                b.begin(NodeKind::InitializedIdentifier, 3);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::VariableInitializer, 4);
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 7);
+            }),
+        );
+        let lints = f.run(&one_rule(
+            "unnecessary_nullable_for_final_variable_declarations",
+        ));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Type could be non-nullable.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 3));
+    }
+
+    /// A null initializer and a non-literal initializer pass (the
+    /// documented literal-subset face).
+    #[test]
+    fn unnecessary_nullable_null_and_dynamic_initializers_pass() {
+        let source = "final int? x = null;";
+        // final0 int1 ?2 x3 =4 null5 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 1, 3);
+                b.begin(NodeKind::InitializedIdentifier, 3);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::VariableInitializer, 4);
+                b.leaf(NodeKind::LiteralNull, 5);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 7);
+            }),
+        );
+        assert!(
+            f.run(&one_rule(
+                "unnecessary_nullable_for_final_variable_declarations"
+            ))
+            .is_empty()
+        );
+
+        let computed = "final int? x = y;";
+        let f = Fixture::build(
+            computed,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 1, 3);
+                b.begin(NodeKind::InitializedIdentifier, 3);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::VariableInitializer, 4);
+                identifier(b, 5, 6);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 7);
+            }),
+        );
+        assert!(
+            f.run(&one_rule(
+                "unnecessary_nullable_for_final_variable_declarations"
+            ))
+            .is_empty()
+        );
     }
 }

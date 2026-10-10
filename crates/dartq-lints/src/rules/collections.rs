@@ -341,6 +341,285 @@ pub(crate) mod unnecessary_to_list_in_spreads {
     }
 }
 
+pub(crate) mod prefer_iterable_where_type {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, first_child};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_iterable_whereType.dart:31-83`
+    /// — `x.where((e) => e is T)` (or the single-return block form) reports
+    /// at the method name.
+    ///
+    /// Approximation (documented): the receiver type check
+    /// (`implementsInterface('Iterable')`, :48-49) is dropped — the
+    /// `prefer_contains` precedent — so a user class with a `where` method
+    /// over-reports. Message: `diagnostic.g.dart` `preferIterableWheretype`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_iterable_whereType",
+        group: Group::Core,
+        problem: "Use 'whereType' to filter elements by type.",
+        correction: "Try using 'whereType' rather than 'where'.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments | NodeKind::NoArguments))
+        else {
+            return;
+        };
+        // `node.methodName.name != 'where'` with a target bails (:47).
+        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return;
+        };
+        let name = match c.kind(*callee) {
+            NodeKind::DotAccess | NodeKind::Qualified => {
+                let access = c.collect_direct(*callee);
+                match access.last().copied() {
+                    Some(name)
+                        if c.kind(name) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(name)) == "where" =>
+                    {
+                        name
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        // `args.length != 1` bails (:50-51).
+        let args = c.collect_direct(kids[args_pos]);
+        if args.len() != 1 {
+            return;
+        }
+        // `arg is FunctionExpression` (:52).
+        if c.kind(args[0]) != NodeKind::FunctionExpression {
+            return;
+        }
+        if !is_type_test_closure(c, args[0]) {
+            return;
+        }
+        let range = c.utf16_span(name);
+        c.report(range, &[]);
+    }
+
+    /// The closure shape (:53-81): one parameter, an expression body (or a
+    /// single-return block body) whose unparenthesized expression is `e is T`
+    /// (no `is!`) with the parameter as the tested expression.
+    fn is_type_test_closure(c: &Check<'_>, closure: u32) -> bool {
+        let kids = c.collect_direct(closure);
+        let params = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters);
+        let Some(params) = params else {
+            return false;
+        };
+        if c.collect_direct(*params).len() != 1 {
+            return false;
+        }
+        let param_name = parameter_name(c, c.collect_direct(*params)[0]);
+        let Some(param_name) = param_name else {
+            #[cfg(test)]
+            eprintln!(
+                "DBG param_name=None params_kids={:?}",
+                c.collect_direct(
+                    c.collect_direct(closure)
+                        .iter()
+                        .copied()
+                        .find(|&k| c.kind(k) == NodeKind::FormalParameters)
+                        .unwrap()
+                )
+            );
+            return false;
+        };
+        let body = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::ExpressionBody)
+            .copied();
+        let expression = if let Some(body) = body {
+            first_child(c, body)
+        } else {
+            // `hasSingleExpressionBody`: one `return` statement.
+            let body = kids
+                .iter()
+                .find(|&&kid| c.kind(kid) == NodeKind::BlockBody)
+                .copied();
+            let Some(body) = body else {
+                return false;
+            };
+            // The statements live under the body's `Block` child.
+            let Some(block) = c
+                .collect_direct(body)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Block)
+            else {
+                return false;
+            };
+            let statements = c.collect_direct(block);
+            if statements.len() != 1 || c.kind(statements[0]) != NodeKind::ReturnStatement {
+                return false;
+            }
+            first_child(c, statements[0])
+        };
+        let Some(expression) = expression else {
+            return false;
+        };
+        let mut expression = expression;
+        while c.kind(expression) == NodeKind::ParenthesizedExpression {
+            let Some(inner) = first_child(c, expression) else {
+                return false;
+            };
+            expression = inner;
+        }
+        if c.kind(expression) != NodeKind::IsExpression {
+            return false;
+        }
+        // `expression.notOperator == null` (:71).
+        if c.payload(expression).first().copied().unwrap_or(0) != 0 {
+            return false;
+        }
+        let Some(tested) = first_child(c, expression) else {
+            return false;
+        };
+        c.kind(tested) == NodeKind::Identifier && c.lexeme(c.head_token(tested)) == param_name
+    }
+
+    /// A simple formal parameter's name (`FormalParameter` payload word 1,
+    /// collapse map §3.3).
+    fn parameter_name<'a>(c: &'a Check<'a>, parameter: u32) -> Option<&'a str> {
+        if c.kind(parameter) != NodeKind::FormalParameter {
+            return None;
+        }
+        let name = c.payload(parameter).get(1).copied()?;
+        (name != NONE_TOKEN).then(|| c.lexeme(name))
+    }
+}
+
+pub(crate) mod prefer_for_elements_to_map_from_iterable {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::first_child;
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_for_elements_to_map_fromIterable.dart:31-90`
+    /// — a `Map.fromIterable(a, key: …, value: …)` creation whose key and
+    /// value arguments are single-parameter single-expression closures
+    /// reports at the creation.
+    ///
+    /// Approximation (documented): the constructor element pin
+    /// (`element.enclosingElement != typeProvider.mapElement`, :46-49) is
+    /// taken from the `Map.fromIterable` name, so a user-defined `Map` class
+    /// over-reports (the `prefer_collection_literals` precedent). Message:
+    /// `diagnostic.g.dart` `preferForElementsToMapFromiterable`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_for_elements_to_map_fromIterable",
+        group: Group::Recommended,
+        problem: "Use 'for' elements when building maps from iterables.",
+        correction: "Try using a collection literal with a 'for' element.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
+        else {
+            return;
+        };
+        // `element.name != 'fromIterable'` through the name face: a
+        // `Map.fromIterable` callee is a `Qualified` type/constructor pair.
+        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return;
+        };
+        if c.kind(*callee) != NodeKind::Qualified {
+            return;
+        }
+        let qualified = c.collect_direct(*callee);
+        let (Some(type_name), Some(ctor)) = (qualified.first().copied(), qualified.last().copied())
+        else {
+            return;
+        };
+        if c.kind(type_name) != NodeKind::Identifier
+            || c.kind(ctor) != NodeKind::Identifier
+            || c.lexeme(c.head_token(type_name)) != "Map"
+            || c.lexeme(c.head_token(ctor)) != "fromIterable"
+        {
+            return;
+        }
+        // `arguments.length != 3` bails (:57-59).
+        let args = c.collect_direct(kids[args_pos]);
+        if args.len() != 3 {
+            return;
+        }
+        // The key/value closure extraction (:61-67, the TODO's named-args-
+        // anywhere face kept positional).
+        let second = args[1];
+        let third = args[2];
+        let key = extract_closure(c, "key", second).or_else(|| extract_closure(c, "key", third));
+        let value =
+            extract_closure(c, "value", third).or_else(|| extract_closure(c, "value", second));
+        if key.is_none() || value.is_none() {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+
+    /// `_extractClosure` (:71-88): a named argument whose expression (no
+    /// parens) is a one-required-parameter function expression with a single
+    /// expression body.
+    fn extract_closure(c: &Check<'_>, name: &str, argument: u32) -> Option<()> {
+        if c.kind(argument) != NodeKind::NamedArgument {
+            return None;
+        }
+        let kids = c.collect_direct(argument);
+        let label = kids.first().copied()?;
+        if c.kind(label) != NodeKind::Identifier || c.lexeme(c.head_token(label)) != name {
+            return None;
+        }
+        let mut expression = *kids.get(1)?;
+        while c.kind(expression) == NodeKind::ParenthesizedExpression {
+            expression = first_child(c, expression)?;
+        }
+        if c.kind(expression) != NodeKind::FunctionExpression {
+            return None;
+        }
+        let kids = c.collect_direct(expression);
+        // One parameter, required (not inside the optional wrapper — the
+        // official `parameters.first.isRequired`; a required-named closure
+        // parameter under-reports through this face).
+        let params = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .copied()?;
+        if c.collect_direct(params).len() != 1 {
+            return None;
+        }
+        // `hasSingleExpressionBody`: an expression body, or one return.
+        let has_expression_body = kids
+            .iter()
+            .any(|&kid| c.kind(kid) == NodeKind::ExpressionBody)
+            || kids.iter().any(|&kid| c.kind(kid) == NodeKind::BlockBody) && {
+                let body = kids
+                    .iter()
+                    .find(|&&kid| c.kind(kid) == NodeKind::BlockBody)
+                    .copied()?;
+                // The statements live under the body's `Block` child.
+                let block = c
+                    .collect_direct(body)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Block)?;
+                let statements = c.collect_direct(block);
+                statements.len() == 1 && c.kind(statements[0]) == NodeKind::ReturnStatement
+            };
+        has_expression_body.then_some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -816,6 +1095,241 @@ mod tests {
         );
         assert!(
             f.run(&one_rule("unnecessary_to_list_in_spreads"))
+                .is_empty()
+        );
+    }
+
+    // —— prefer_iterable_whereType —————————————————————————————————————————
+
+    /// `test/rules/prefer_iterable_whereType_test.dart` `test_whereType` —
+    /// `x.where((e) => e is int)` reports at the method name.
+    #[test]
+    fn where_type_reports_a_type_test_closure() {
+        let source = "x.where((e) => e is int);";
+        // x0 .1 where2 (3 (4 e5 )6 =>7 e8 is9 int10 )11 ;12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::FunctionExpression, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::FormalParameter, 4);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 5, 6);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::ExpressionBody, 7);
+                b.patch(0, 7);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::IsExpression, 8);
+                b.patch(0, 0);
+                identifier(b, 8, 9);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::IsExpression, 11);
+                b.end(NodeKind::ExpressionBody, 11);
+                b.end(NodeKind::FunctionExpression, 12);
+                b.end(NodeKind::Arguments, 12);
+                b.end(NodeKind::Send, 12);
+                b.end(NodeKind::ExpressionStatement, 13);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_iterable_whereType"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'whereType' to filter elements by type."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+    }
+
+    /// An `is!` closure and a foreign-parameter test pass (:71-79).
+    #[test]
+    fn where_type_not_is_and_foreign_param_pass() {
+        let source = "x.where((e) => e is! int);";
+        // x0 .1 where2 (3 (4 e5 )6 =>7 e8 is!9 int10 )11 ;12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::FunctionExpression, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::FormalParameter, 4);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 5, 6);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::ExpressionBody, 7);
+                b.patch(0, 7);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::IsExpression, 8);
+                b.patch(0, 1);
+                identifier(b, 8, 9);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::IsExpression, 11);
+                b.end(NodeKind::ExpressionBody, 11);
+                b.end(NodeKind::FunctionExpression, 12);
+                b.end(NodeKind::Arguments, 12);
+                b.end(NodeKind::Send, 12);
+                b.end(NodeKind::ExpressionStatement, 13);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+    }
+
+    // —— prefer_for_elements_to_map_fromIterable ———————————————————————————
+
+    /// `Map.fromIterable(x, key: …, value: …)` with two single-expression
+    /// closures reports at the creation.
+    #[test]
+    fn map_from_iterable_reports_with_both_closures() {
+        let source = "Map.fromIterable(x, key: (e) => e, value: (e) => e);";
+        // Map0 .1 fromIterable2 (3 x4 ,5 key6 :7 (8 e9 )10 =>11 e12 ,13 value14 :15 (16 e17 )18 =>19 e20 )21 ;22
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 3);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::NamedArgument, 5);
+                b.patch(0, 7);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::FunctionExpression, 8);
+                b.begin(NodeKind::FormalParameters, 8);
+                b.begin(NodeKind::FormalParameter, 8);
+                b.patch(0, NONE);
+                b.patch(1, 9);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 9, 10);
+                b.end(NodeKind::FormalParameter, 11);
+                b.end(NodeKind::FormalParameters, 11);
+                b.begin(NodeKind::ExpressionBody, 11);
+                b.patch(0, 11);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ExpressionBody, 13);
+                b.end(NodeKind::FunctionExpression, 13);
+                b.end(NodeKind::NamedArgument, 13);
+                b.begin(NodeKind::NamedArgument, 13);
+                b.patch(0, 15);
+                identifier(b, 14, 15);
+                b.begin(NodeKind::FunctionExpression, 16);
+                b.begin(NodeKind::FormalParameters, 16);
+                b.begin(NodeKind::FormalParameter, 16);
+                b.patch(0, NONE);
+                b.patch(1, 17);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 17, 18);
+                b.end(NodeKind::FormalParameter, 19);
+                b.end(NodeKind::FormalParameters, 19);
+                b.begin(NodeKind::ExpressionBody, 19);
+                b.patch(0, 19);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 20, 21);
+                b.end(NodeKind::ExpressionBody, 22);
+                b.end(NodeKind::FunctionExpression, 22);
+                b.end(NodeKind::NamedArgument, 22);
+                b.end(NodeKind::Arguments, 22);
+                b.end(NodeKind::Send, 23);
+                b.end(NodeKind::ExpressionStatement, 23);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_for_elements_to_map_fromIterable"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'for' elements when building maps from iterables."
+        );
+    }
+
+    /// A missing value closure (two arguments) passes (:57-69).
+    #[test]
+    fn map_from_iterable_without_value_closure_passes() {
+        let source = "Map.fromIterable(x, key: (e) => e);";
+        // Map0 .1 fromIterable2 (3 x4 ,5 key6 :7 (8 e9 )10 =>11 e12 )13 ;14
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 3);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::NamedArgument, 5);
+                b.patch(0, 7);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::FunctionExpression, 8);
+                b.begin(NodeKind::FormalParameters, 8);
+                b.begin(NodeKind::FormalParameter, 8);
+                b.patch(0, NONE);
+                b.patch(1, 9);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                identifier(b, 9, 10);
+                b.end(NodeKind::FormalParameter, 11);
+                b.end(NodeKind::FormalParameters, 11);
+                b.begin(NodeKind::ExpressionBody, 11);
+                b.patch(0, 11);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ExpressionBody, 14);
+                b.end(NodeKind::FunctionExpression, 14);
+                b.end(NodeKind::NamedArgument, 14);
+                b.end(NodeKind::Arguments, 14);
+                b.end(NodeKind::Send, 15);
+                b.end(NodeKind::ExpressionStatement, 15);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
                 .is_empty()
         );
     }
