@@ -364,6 +364,13 @@ pub struct Container {
     /// `false` — the `undefined_constructor_in_initializer` /
     /// `undefined_enum_constructor` unnamed-selector queries read it.
     pub has_unnamed_constructor: bool,
+    /// Constructor formals by lookup spelling: the selector for a named
+    /// constructor (`A.named` → `named`), the container's own name for the
+    /// unnamed face (`A()` → `A` — the same spelling a creation's folded
+    /// head row carries). The `unused_element_parameter` constructor face
+    /// reads it (`unused_local_elements_verifier.dart:780-792` walks every
+    /// formal list, constructors included).
+    pub ctor_formals: FxHashMap<StringId, Box<Formals>>,
 }
 
 /// One top-level declaration.

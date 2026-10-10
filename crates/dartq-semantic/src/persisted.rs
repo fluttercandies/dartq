@@ -146,6 +146,11 @@ pub struct PersistedContainer {
     pub enum_constants: Vec<u32>,
     pub constructors: Vec<u32>,
     pub has_unnamed_constructor: bool,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no constructor formals (the
+    /// #539 additive-field discipline).
+    #[serde(default)]
+    pub ctor_formals: Vec<(u32, Box<PersistedFormals>)>,
 }
 
 /// One extension application face in payload form (the implicit-application
@@ -508,6 +513,11 @@ impl PersistedContainer {
             enum_constants: s.ids(&container.enum_constants),
             constructors: s.ids(&container.constructors),
             has_unnamed_constructor: container.has_unnamed_constructor,
+            ctor_formals: container
+                .ctor_formals
+                .iter()
+                .map(|(name, formals)| (s.id(*name), Box::new(s.formals(formals))))
+                .collect(),
         }
     }
 
@@ -571,6 +581,11 @@ impl PersistedContainer {
                 .map(|&at| ids[at as usize])
                 .collect(),
             has_unnamed_constructor: self.has_unnamed_constructor,
+            ctor_formals: self
+                .ctor_formals
+                .into_iter()
+                .map(|(at, formals)| (ids[at as usize], Box::new(into_formals(*formals, ids))))
+                .collect(),
         }
     }
 }
@@ -711,6 +726,12 @@ mod tests {
                 enum_constants: Vec::new(),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,
+                ctor_formals: [(name("named"), Box::new(Formals {
+                    positional: Box::new([]),
+                    named: Box::new([]),
+                }))]
+                .into_iter()
+                .collect(),
             },
         );
         elements.container_order.push(name("C"));

@@ -254,11 +254,12 @@
 //! # Still deferred
 //!
 //! `undefined_referenced_parameter` (`@UseResult(unless:)` check,
-//! `annotation_verifier.dart:519-541`), `undefined_hidden_name` /
-//! `undefined_shown_name` (directives are consumed diet-style and the
-//! combinator model carries clause names without source spans — both arrive
-//! with the directive milestone) and the unnamed-selector message variants of
-//! the two constructor rows. `wrong_number_of_parameters_for_setter` is emitted here although
+//! `annotation_verifier.dart:519-541`) and the unnamed-selector message
+//! variants of the two constructor rows. (`undefined_hidden_name` /
+//! `undefined_shown_name` left this list with the directive milestone: the
+//! engine pipeline emits them from the resolution graph's export scopes —
+//! `dartq-engine` `diagnose_library` + `LibraryGraph::
+//! undefined_combinator_names`.) `wrong_number_of_parameters_for_setter` is emitted here although
 //! the oracle fires it from the parser: dartq's parser does not emit the code
 //! yet, and when it does, the collector-side emission must be removed or the
 //! code double-reports. Every deferral under-reports.
@@ -985,6 +986,7 @@ struct Engine<'a> {
     /// The open pattern-nesting stack (`begin_pattern`/`end_pattern`
     /// brackets); each frame collects the leaf restrictions it spans.
     pattern_stack: Vec<PatternFrame>,
+    pending_binary_operand: bool,
     /// The number of currently open patterns.
     pattern_depth: usize,
     /// Completed root restrictions per open case (switch cases only).
@@ -998,6 +1000,18 @@ struct Engine<'a> {
     /// The in-flight constant pattern's classification, armed by the
     /// literal/identifier events inside it.
     pending_const: Option<Restriction>,
+    /// The in-flight constant pattern's static type and anchor, armed by
+    /// the same literal events (the `hasPrimitiveEquality` shapes:
+    /// int/double/String/bool/Null; enum tails classify at the pattern's
+    /// end — `visitConstantPattern`'s `_canBeEqual` inputs,
+    /// constant_verifier.dart:140-165).
+    pending_const_ty: Option<Ty>,
+    pending_const_at: Option<SourceRange>,
+    /// Per open `==`/`!=` comparison: the row-stack mark at the operator
+    /// (the left operand's row sits at `mark - 1`, the right's is the last
+    /// row at the close) and the operator span — the
+    /// `_checkForInvariantNullComparison` inputs.
+    null_cmp_groups: Vec<(usize, SourceRange)>,
     /// The `switch` keyword of the open switch statement/expression (the
     /// non-exhaustive anchor; the block events only carry the `{`).
     switch_kw_latch: Option<SourceRange>,
@@ -1190,7 +1204,14 @@ struct Engine<'a> {
     field_read_rows: FxHashSet<u32>,
     /// The container of the constructor/factory being parsed (`None`
     /// outside one).
-    ctor_pending: Option<StringId>,
+    /// The open constructor/factory's container id plus the provisional
+    /// declaration site the constructor face registered at its head (the
+    /// class-name token — the unnamed constructor's own spelling). The
+    /// selector continuation rewrites the site in place (`A.named` is one
+    /// site named `named`, never a second push); factories carry no
+    /// provisional (their optional parameters stay out of the
+    /// `unused_element_parameter` face).
+    ctor_pending: Option<(StringId, Option<usize>)>,
     /// The top-level function declaration site awaiting its setter
     /// spelling fix-up at `end_top_level_method`.
     open_toplevel_site: Option<usize>,
@@ -1288,10 +1309,14 @@ impl<'a> Engine<'a> {
             return_mark: None,
             switches: Vec::new(),
             pattern_stack: Vec::new(),
+            pending_binary_operand: false,
             pattern_depth: 0,
             pattern_roots: Vec::new(),
             case_sink_open: false,
             pending_const: None,
+            pending_const_ty: None,
+            pending_const_at: None,
+            null_cmp_groups: Vec::new(),
             switch_kw_latch: None,
             in_cascade: false,
             invokes: Vec::new(),
@@ -1605,6 +1630,317 @@ impl<'a> Engine<'a> {
         ));
     }
 
+    /// Stages one two-argument diagnostic (the disjointness pair's type
+    /// displays).
+    fn stage_typed(&mut self, code: SemanticCode, range: SourceRange, a0: &str, a1: &str) {
+        let correction = code.correction_message("");
+        self.report.usage.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message(a0, a1),
+            self.file,
+            range,
+            correction,
+        ));
+    }
+
+    /// The name-level subtype relation over semantic types
+    /// ([`NameWorld::is_subtype_of`], the declared-edge lattice).
+    fn name_subtype(&self, sub: Ty, sup: Ty) -> bool {
+        self.name_world().is_subtype_of(
+            &NameTy::from_semantic(sub),
+            &NameTy::from_semantic(sup),
+        )
+    }
+
+    /// The name-level `canBeSubtypeOf`
+    /// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion).
+    fn name_can_be_subtype(&self, sub: Ty, sup: Ty) -> bool {
+        self.name_world().can_be_subtype_of(
+            &NameTy::from_semantic(sub),
+            &NameTy::from_semantic(sup),
+        )
+    }
+
+    /// The name-level `_canBeEqual` ([`NameWorld::can_be_equal`]).
+    fn name_can_be_equal(&self, constant: Ty, value: Ty) -> bool {
+        self.name_world()
+            .can_be_equal(&NameTy::from_semantic(constant), &NameTy::from_semantic(value))
+    }
+
+    /// The nearest operand row below the type-use rows the `is`/`as` type
+    /// may have pushed (unresolved type operands land as `TypeUse` rows).
+    fn operand_row(&self) -> Option<&Row> {
+        let mut index = self.rows.len().checked_sub(1)?;
+        while matches!(self.rows[index].shape, RowShape::TypeUse(..)) {
+            index = index.checked_sub(1)?;
+        }
+        self.rows.get(index)
+    }
+
+    /// `unnecessary_cast` on the expression form (`_isUnnecessaryCast`,
+    /// best_practices_verifier.dart:1708-1741, mirrored from
+    /// `TypeSystem::is_unnecessary_cast` in dartq-types): the operand type
+    /// must already equal the cast type structurally, with `dynamic` and
+    /// bare `Function` targets excluded (there the explicit cast is the
+    /// recommended spelling) and unresolved sides answering no.
+    fn check_unnecessary_cast(&mut self, at: SourceRange, operand: Ty, cast: Option<Ty>) {
+        let Some(cast) = cast else { return };
+        if operand == Ty::Unknown || cast == Ty::Unknown || cast == Ty::Dynamic {
+            return;
+        }
+        if operand != cast {
+            return;
+        }
+        if let Ty::Named { name, .. } = cast {
+            // The bare `Function` target keeps its cast (the port's
+            // `is_bare_function_id` arm).
+            if name == self.intern("Function") {
+                return;
+            }
+        }
+        self.stage_usage(SemanticCode::UnnecessaryCast, at, "");
+    }
+
+    /// The `is`/`is!` verdict walk (`_checkAllTypeChecks`,
+    /// best_practices_verifier.dart:987-1041, mirrored from
+    /// `TypeSystem::type_check_verdict`): unresolved sides are informative;
+    /// `x is dynamic` is constant-true; `is Null` is the
+    /// `type_check_with_null` family, downgraded to the constant row when
+    /// the operand is the `null` literal; a provable subtype is
+    /// constant-true, `is!` reporting the complement's polarity.
+    fn check_type_check(&mut self, at: SourceRange, negated: bool) {
+        let Some(checked) = self.armed_ty else { return };
+        let verdict = if checked == Ty::Dynamic {
+            Some(true)
+        } else if checked == Ty::Unknown {
+            None
+        } else if checked == Ty::Null {
+            // The `is Null` family (`_checkAllTypeChecks`'s `Null` arm)
+            // — unless the operand is the `null` literal, where the
+            // check is constant instead (the same walk's `null` arm:
+            // `Null <: Null` answers `true`).
+            let null_literal = self
+                .operand_row()
+                .is_some_and(|row| row.ty == Ty::Null && matches!(row.shape, RowShape::Value));
+            if null_literal {
+                // `Null <: T` decides the literal check's polarity.
+                Some(self.name_subtype(Ty::Null, checked))
+            } else {
+                self.stage_type_check_null(at, negated);
+                return;
+            }
+        } else {
+            let Some(operand) = self.operand_row() else { return };
+            if operand.ty == Ty::Unknown {
+                return;
+            }
+            // A non-matching pair is informative — the official order has
+            // no subtype-negative verdict (`TypeSystem::type_check_verdict`'s
+            // doc): only the constant-true answer reports here, with `is!`
+            // mapping to the 'false' row below.
+            if !self.name_subtype(operand.ty, checked) {
+                return;
+            }
+            Some(true)
+        };
+        let Some(constant_true) = verdict else { return };
+        let code = match (constant_true, negated) {
+            (true, false) | (false, true) => SemanticCode::UnnecessaryTypeCheckTrue,
+            (true, true) | (false, false) => SemanticCode::UnnecessaryTypeCheckFalse,
+        };
+        self.stage_usage(code, at, "");
+    }
+
+    /// The `is Null` family (`_checkAllTypeChecks`'s `Null` arm,
+    /// best_practices_verifier.dart:1022-1036): the polarity picks the
+    /// row.
+    fn stage_type_check_null(&mut self, at: SourceRange, negated: bool) {
+        let code = if negated {
+            SemanticCode::TypeCheckWithNotNull
+        } else {
+            SemanticCode::TypeCheckWithNull
+        };
+        self.stage_usage(code, at, "");
+    }
+
+    /// The `e!` pair (`visitNullAssertionExpression`,
+    /// best_practices_verifier.dart:795-799, and the
+    /// `_checkForUnnecessaryNullAware` gate, error_verifier.dart:
+    /// 7668-7718): a `Null`-typed operand always throws
+    /// (`null_check_always_fails`); a strictly-non-nullable operand makes
+    /// the `!` dead (`unnecessary_non_null_assertion`). Exclusive — only
+    /// the `Null` class fails the assertion.
+    fn check_null_assert(&mut self, at: SourceRange) {
+        let Some(row) = self.rows.last() else { return };
+        if row.ty == Ty::Null {
+            self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
+        } else if row.ty.is_strictly_non_nullable() {
+            self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
+        }
+    }
+
+    /// `_checkForInvariantNullComparison`
+    /// (best_practices_verifier.dart:1216-1281, mirrored from
+    /// `TypeSystem::is_unnecessary_null_comparison`): one side is the
+    /// `null` literal and the other's type is strictly non-nullable —
+    /// `==` is constant-false, `!=` constant-true. `super`/`this`
+    /// receivers answer never-null without a type (the official's AST
+    /// arm); an extension override suppresses, which the name level
+    /// cannot see and skips with the rest of the untyped shapes.
+    fn check_null_comparison(&mut self, negated: bool) {
+        let Some((mark, _op_range)) = self.null_cmp_groups.pop() else {
+            return;
+        };
+        let Some(right) = self.rows.last() else { return };
+        let Some(left) = mark.checked_sub(1).and_then(|index| self.rows.get(index)) else {
+            return;
+        };
+        let right_is_null = right.ty == Ty::Null && matches!(right.shape, RowShape::Value);
+        let left_is_null = left.ty == Ty::Null && matches!(left.shape, RowShape::Value);
+        let operand = if right_is_null {
+            left
+        } else if left_is_null {
+            right
+        } else {
+            return;
+        };
+        let never_null = operand.ty.is_strictly_non_nullable()
+            || matches!(
+                operand.shape,
+                RowShape::Receiver(Receiver::Super { .. } | Receiver::This { .. })
+            );
+        if !never_null {
+            return;
+        }
+        let code = if negated {
+            SemanticCode::UnnecessaryNullComparisonTrue
+        } else {
+            SemanticCode::UnnecessaryNullComparisonFalse
+        };
+        let range = operand.range;
+        self.stage_usage(code, range, "");
+    }
+
+    /// The cast-pattern pair (shared_type_analyzer.dart:145-152 and
+    /// `checkPatternNeverMatchesValueType`'s Cast kind,
+    /// type_analyzer.dart:723-756): a matched type already below the
+    /// target makes the cast dead (`unnecessary_cast_pattern`); a matched
+    /// type no value of which can inhabit the target proves the pattern
+    /// dead (`pattern_never_matches_value_type`). The two are exclusive
+    /// (`canBeSubtypeOf ⊇ isSubtypeOf`). Root patterns only: a nested
+    /// pattern's matched type is the enclosing property's column, which
+    /// the name level does not descend (the under-report).
+    fn check_cast_pattern(&mut self, at: SourceRange, cast: Option<Ty>) {
+        let Some(cast) = cast else { return };
+        if cast == Ty::Unknown {
+            return;
+        }
+        if !self.case_sink_open || self.pattern_stack.len() != 1 {
+            return;
+        }
+        let Some(ctx) = self.switches.last() else { return };
+        let matched = ctx.scrutinee;
+        if matched == Ty::Unknown {
+            return;
+        }
+        if self.name_subtype(matched, cast) {
+            // The official gate is `isSubtypeOf && castType is not
+            // InvalidType` — a `dynamic` target reports like any other.
+            self.stage_usage(SemanticCode::UnnecessaryCastPattern, at, "");
+            return;
+        }
+        if !self.name_can_be_subtype(matched, cast) {
+            let a0 = self.ty_display(matched);
+            let a1 = self.ty_display(cast);
+            self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
+        }
+    }
+
+    /// `checkPatternNeverMatchesValueType`'s DeclaredVariable/Wildcard/
+    /// Object kinds (type_analyzer.dart:723-756): a required type no
+    /// matched value can inhabit proves the pattern dead. Root patterns
+    /// and refutable contexts only (the official's
+    /// `irrefutableContext == null` gate; declaration patterns suppress).
+    fn check_pattern_never_matches(&mut self, at: SourceRange, required: Ty) {
+        if required == Ty::Unknown || required == Ty::Dynamic {
+            return;
+        }
+        if !self.case_sink_open || self.pattern_stack.len() != 1 {
+            return;
+        }
+        let Some(ctx) = self.switches.last() else { return };
+        let matched = ctx.scrutinee;
+        if matched == Ty::Unknown {
+            return;
+        }
+        if !self.name_can_be_subtype(matched, required) {
+            let a0 = self.ty_display(matched);
+            let a1 = self.ty_display(required);
+            self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
+        }
+    }
+
+    /// The null-check/assert pattern pair
+    /// (shared_type_analyzer.dart:129-139): over a non-nullable matched
+    /// type both forms are dead. The official's irrefutable-context error
+    /// takes precedence there, so only refutable contexts (open switch
+    /// cases) report; root patterns only, as in
+    /// [`Self::check_pattern_never_matches`].
+    fn check_null_pattern(&mut self, at: SourceRange, is_assert: bool) {
+        if !self.case_sink_open || self.pattern_stack.len() != 1 {
+            return;
+        }
+        let Some(ctx) = self.switches.last() else { return };
+        if !ctx.scrutinee.is_strictly_non_nullable() {
+            return;
+        }
+        let code = if is_assert {
+            SemanticCode::UnnecessaryNullAssertPattern
+        } else {
+            SemanticCode::UnnecessaryNullCheckPattern
+        };
+        self.stage_usage(code, at, "");
+    }
+
+    /// `visitConstantPattern`'s gate (constant_verifier.dart:140-165,
+    /// mirrored from `TypeSystem::can_be_equal`): the
+    /// `hasPrimitiveEquality` constants — int/double/String/bool/Null and
+    /// enum tails, exactly the arming sites — report when the matched
+    /// value's type can never equal the constant's type. The
+    /// int-constant-vs-double-value cross (the official's JavaScript
+    /// note, a name-level question the declaration-opaque face cannot
+    /// answer) answers "possible" before the relation.
+    ///
+    /// The visitor descends into logical-or/and operands with the same
+    /// matched type, so constant leaves under binary-operand frames check
+    /// like root leaves (`case true || null:`); field sub-pattern frames
+    /// suppress — their matched type is the property column, which the
+    /// name level does not descend into (the under-report).
+    fn check_constant_pattern(&mut self, constant: Option<Ty>, at: Option<SourceRange>) {
+        let (Some(constant), Some(at)) = (constant, at) else { return };
+        if !self.case_sink_open || !self.pattern_stack.iter().skip(1).all(|f| f.binary) {
+            return;
+        }
+        let Some(ctx) = self.switches.last() else { return };
+        let matched = ctx.scrutinee;
+        if matched == Ty::Unknown {
+            return;
+        }
+        if let (Ty::Named { name: c, .. }, Ty::Named { name: v, .. }) = (constant, matched) {
+            let (int, double) = (self.primitive_ids[0], self.primitive_ids[1]);
+            if (c == int && v == double) || (c == double && v == int) {
+                return;
+            }
+        }
+        if self.name_can_be_equal(constant, matched) {
+            return;
+        }
+        let a0 = self.ty_display(matched);
+        let a1 = self.ty_display(constant);
+        self.stage_typed(SemanticCode::ConstantPatternNeverMatchesValueType, at, &a0, &a1);
+    }
+
     /// The bare lookup spelling of a site name (setters live under `name=`
     /// in the sites; the use index carries plain names).
     fn bare_name(&self, spelling: StringId) -> StringId {
@@ -1775,8 +2111,13 @@ impl<'a> Engine<'a> {
                 .index
                 .get(self.file)
                 .and_then(|f| f.container(c))
-                .and_then(|x| x.members.get(&site.name))
-                .and_then(|m| m.formals.as_deref()),
+                .and_then(|x| {
+                    if matches!(site.kind, DeclKind::Constructor { .. }) {
+                        x.ctor_formals.get(&site.name).map(Box::as_ref)
+                    } else {
+                        x.members.get(&site.name).and_then(|m| m.formals.as_deref())
+                    }
+                }),
             None => self
                 .index
                 .get(self.file)
@@ -4537,7 +4878,13 @@ impl<'a> Engine<'a> {
                 // function-typed shape the model can render: getters, fields,
                 // and unknown receivers suppress. A name that is no member at
                 // all is the constructor-reference shape `C<...>.named` — the
-                // base type-argument code against the container.
+                // base type-argument code against the container. A
+                // created-instance receiver carries the created class's face
+                // (`C().m<int, String>`): the target is type-agnostic —
+                // `InvocationTargetFunctionTypedExpression.orNull` accepts
+                // any function-typed expression
+                // (type_instantiation_target.dart:148-155) — mirroring
+                // `member_exec_arity`'s Created arm.
                 let container = match *recv {
                     Receiver::This { container, .. }
                     | Receiver::Super { container, .. }
@@ -4547,7 +4894,8 @@ impl<'a> Engine<'a> {
                     }
                     | Receiver::Container {
                         name: container, ..
-                    } => Some(container),
+                    }
+                    | Receiver::Created { name: container, .. } => Some(container),
                     _ => None,
                 };
                 let Some(container) = container else {
@@ -7444,7 +7792,22 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.open_member_static = false;
         engine.open_toplevel_site = None;
         engine.open_exec_site = None;
-        engine.ctor_pending = engine.container_context().map(|(c, _)| c);
+        // The constructor's site opens at its head under the class-name
+        // spelling (the unnamed face's own name, and the folded creation
+        // row's spelling a `_C()` invocation marks given under); the
+        // selector continuation rewrites it in place for `C.named`. A
+        // recovered head registers no site (the suppression direction).
+        let container = engine.container_context().map(|(c, _)| c);
+        engine.ctor_pending = container.map(|c| {
+            let site = engine.name_of(_name).and_then(|name| {
+                Some(engine.note_decl_site(
+                    name,
+                    _name.range,
+                    DeclKind::Constructor { container: c },
+                ))
+            });
+            (c, site)
+        });
         engine.push_executable_frame(true);
     }
 
@@ -7497,7 +7860,10 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.open_member_static = false;
         engine.open_toplevel_site = None;
         engine.open_exec_site = None;
-        engine.ctor_pending = engine.container_context().map(|(c, _)| c);
+        // No provisional site: a factory's optional parameters stay out of
+        // the `unused_element_parameter` face (its given-matching needs
+        // factory-invocation rows).
+        engine.ctor_pending = engine.container_context().map(|(c, _)| (c, None));
         engine.push_executable_frame(false);
     }
 
@@ -7925,14 +8291,28 @@ impl ParserListener for DiagnoseListener<'_> {
                 // The named constructor selector (`A.named`): the site joins
                 // only under an open constructor/factory (the same context
                 // also fires for qualified method heads, which never declare
-                // a constructor).
-                if let (Some(name), Some(container)) = (name, engine.ctor_pending) {
-                    let site = engine.note_decl_site(
-                        name,
-                        token.range,
-                        DeclKind::Constructor { container },
-                    );
-                    engine.open_exec_site = Some(site);
+                // a constructor). A constructor rewrites its provisional
+                // head site in place — one site per constructor, now named
+                // by the selector (the spelling a `C.named()` creation
+                // marks given under); a factory registers its own site here
+                // (no provisional was opened).
+                if let (Some(name), Some((container, provisional))) = (name, engine.ctor_pending) {
+                    match provisional {
+                        Some(site) => {
+                            let entry = &mut engine.decl_sites[site];
+                            entry.name = name;
+                            entry.range = token.range;
+                            engine.open_exec_site = Some(site);
+                        }
+                        None => {
+                            let site = engine.note_decl_site(
+                                name,
+                                token.range,
+                                DeclKind::Constructor { container },
+                            );
+                            engine.open_exec_site = Some(site);
+                        }
+                    }
                 }
             }
             C::TypedefDeclaration => {
@@ -8109,6 +8489,12 @@ impl ParserListener for DiagnoseListener<'_> {
         if text == "??" {
             engine.begin_if_null(operator.range);
         }
+        if text == "==" || text == "!=" {
+            // The comparison walk parks the left operand's row index (the
+            // `_checkForInvariantNullComparison` mark).
+            let mark = engine.rows.len();
+            engine.null_cmp_groups.push((mark, operator.range));
+        }
         if USER_OPERATORS.contains(&text) {
             let op = engine.intern(text);
             engine.mark_operator(op, operator.range);
@@ -8120,8 +8506,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.const_capture.end_binary(end.range);
-        if engine.text_of(_operator) == Some("??") {
-            engine.end_if_null();
+        match engine.text_of(_operator) {
+            Some("??") => engine.end_if_null(),
+            Some("==") => engine.check_null_comparison(false),
+            Some("!=") => engine.check_null_comparison(true),
+            _ => {}
         }
     }
 
@@ -8183,19 +8572,28 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
         self.flow.borrow_mut().handle_is_operator(is_operator, _not);
 
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .not_constant(is_operator.range);
+        // The type just parsed stays armed (`end_is_operator_type` never
+        // takes it): the verdict walk decides here, at the official
+        // `visitIsExpression` site (`_checkAllTypeChecks`,
+        // best_practices_verifier.dart:987-1041).
+        let mut engine = self.engine.borrow_mut();
+        engine.check_type_check(is_operator.range, _not.is_some());
+        engine.const_capture.not_constant(is_operator.range);
     }
 
     fn handle_as_operator(&mut self, operator: Token) {
         self.flow.borrow_mut().handle_as_operator(operator);
 
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .opaque_leaf(operator.range);
+        let mut engine = self.engine.borrow_mut();
+        // Pattern casts report through `handle_cast_pattern`; the
+        // expression form is `visitAsExpression`'s `_isUnnecessaryCast`
+        // (best_practices_verifier.dart:170-183, 1708-1741).
+        if engine.pattern_depth == 0 {
+            let cast_ty = engine.armed_ty;
+            let operand = engine.operand_row().map_or(Ty::Unknown, |row| row.ty);
+            engine.check_unnecessary_cast(operator.range, operand, cast_ty);
+        }
+        engine.const_capture.opaque_leaf(operator.range);
     }
 
     // —— suppression brackets —————————————————————————————————————————
@@ -8461,10 +8859,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.pattern_depth += 1;
+        let binary = std::mem::take(&mut engine.pending_binary_operand);
         engine.pattern_stack.push(PatternFrame {
             leaves: Vec::new(),
             or_ops: 0,
             fields: Vec::new(),
+            binary,
         });
     }
 
@@ -8492,6 +8892,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_binary_pattern(&mut self, operator: Token) {
         let mut engine = self.engine.borrow_mut();
+        // The operand pattern parses next; its bracket frame inherits the
+        // binary context (the scrutinee stays the matched type).
+        engine.pending_binary_operand = true;
         let is_or = engine.text_of(operator) == Some("||");
         if is_or && let Some(frame) = engine.pattern_stack.last_mut() {
             frame.or_ops += 1;
@@ -8503,16 +8906,24 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_cast_pattern(&mut self, _operator: Token) {
         let mut engine = self.engine.borrow_mut();
         // `p as X` covers X's values (official `castPatternToSpace`).
-        let leaf = match engine.armed_ty.take() {
+        let leaf = match engine.armed_ty {
             Some(Ty::Named { name, nullable }) => Restriction::Named(name, nullable),
             _ => Restriction::Unknown,
         };
+        // The still-armed type is the cast target: the pair at
+        // shared_type_analyzer.dart:129-152 (and the Cast kind of
+        // `checkPatternNeverMatchesValueType`).
+        let cast_ty = engine.armed_ty;
+        engine.check_cast_pattern(_operator.range, cast_ty);
         engine.pattern_leaf(leaf);
+        // The armed type was the cast pattern's — never a declaration's.
+        engine.armed_ty = None;
     }
 
     fn handle_null_assert_pattern(&mut self, _bang: Token) {
         // `p!` covers the non-null side of the context.
         let mut engine = self.engine.borrow_mut();
+        engine.check_null_pattern(_bang.range, true);
         let leaf = match NameTy::from_semantic(
             engine.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
         ) {
@@ -8527,6 +8938,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // a nullable context already covers null; a non-null context
         // unions with it.
         let mut engine = self.engine.borrow_mut();
+        engine.check_null_pattern(_question.range, false);
         let leaf = match NameTy::from_semantic(
             engine.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
         ) {
@@ -8566,7 +8978,11 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .begin_constant_pattern(_const_keyword);
 
-        self.engine.borrow_mut().pending_const = None;
+        let mut engine = self.engine.borrow_mut();
+        engine.pending_const = None;
+        // Stale literal armings from sibling list/map elements die here.
+        engine.pending_const_ty = None;
+        engine.pending_const_at = None;
     }
 
     fn end_constant_pattern(&mut self, _const_keyword: Option<Token>) {
@@ -8577,6 +8993,22 @@ impl ParserListener for DiagnoseListener<'_> {
             .pending_const
             .take()
             .unwrap_or_else(|| engine.classify_constant_tail());
+        // The literal-armed type and anchor, else the enum-tail
+        // classification's (its constant's type is its enum;
+        // `visitConstantPattern`'s `_canBeEqual` inputs,
+        // constant_verifier.dart:140-165).
+        let constant = engine.pending_const_ty.take().or_else(|| match leaf {
+            Restriction::EnumValue(enum_name, _) => Some(Ty::Named {
+                name: enum_name,
+                nullable: false,
+            }),
+            _ => None,
+        });
+        let at = engine
+            .pending_const_at
+            .take()
+            .or_else(|| engine.rows.last().map(|row| row.range));
+        engine.check_constant_pattern(constant, at);
         engine.pattern_leaf(leaf);
     }
 
@@ -8599,6 +9031,16 @@ impl ParserListener for DiagnoseListener<'_> {
         } else {
             None
         };
+        // The Object kind of `checkPatternNeverMatchesValueType`
+        // (type_analyzer.dart:723-756): the head type is the pattern's
+        // required type.
+        if let Some(head) = head {
+            let required = Ty::Named {
+                name: head,
+                nullable: false,
+            };
+            engine.check_pattern_never_matches(first_identifier.range, required);
+        }
         let fields = engine
             .pattern_stack
             .last_mut()
@@ -8646,6 +9088,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // `PatternVariableDeclaration` group reports all-or-nothing.
         if let Some(name) = engine.name_of(variable) {
             engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
+            // The DeclaredVariable kind of `checkPatternNeverMatchesValueType`
+            // (type_analyzer.dart:723-756) reads the still-armed declared
+            // type before the binding consumes it.
+            let required = engine.armed_ty;
+            if let Some(required) = required {
+                engine.check_pattern_never_matches(variable.range, required);
+            }
             match engine.armed_ty.take() {
                 Some(Ty::Named {
                     name: ty_name,
@@ -8681,6 +9130,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // official wildcard converts through its type); a bare `_` (or
         // `var _`) covers the context: no leaf.
         let mut engine = self.engine.borrow_mut();
+        // The Wildcard kind of `checkPatternNeverMatchesValueType`
+        // (type_analyzer.dart:723-756) reads the still-armed declared
+        // type.
+        if let Some(required) = engine.armed_ty {
+            engine.check_pattern_never_matches(_wildcard.range, required);
+        }
         let Some(Ty::Named { name, nullable }) = engine.armed_ty.take() else {
             return;
         };
@@ -8919,8 +9374,18 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_literal_int(&mut self, token: Token) {
         self.flow.borrow_mut().handle_literal_int(token);
 
-        self.engine.borrow_mut().push_primitive_row(token, 0);
-        self.engine.borrow_mut().const_int_literal(token);
+        let mut engine = self.engine.borrow_mut();
+        engine.push_primitive_row(token, 0);
+        engine.const_int_literal(token);
+        // The constant-pattern face: an int literal's static type
+        // (`hasPrimitiveEquality`, constant_verifier.dart:140-165).
+        if engine.pattern_depth > 0 {
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[0],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(token.range);
+        }
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
@@ -8928,15 +9393,31 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_literal_int_with_separators(token);
 
-        self.engine.borrow_mut().push_primitive_row(token, 0);
-        self.engine.borrow_mut().const_int_literal(token);
+        let mut engine = self.engine.borrow_mut();
+        engine.push_primitive_row(token, 0);
+        engine.const_int_literal(token);
+        if engine.pattern_depth > 0 {
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[0],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(token.range);
+        }
     }
 
     fn handle_literal_double(&mut self, token: Token) {
         self.flow.borrow_mut().handle_literal_double(token);
 
-        self.engine.borrow_mut().push_primitive_row(token, 1);
-        self.engine.borrow_mut().const_double_literal(token);
+        let mut engine = self.engine.borrow_mut();
+        engine.push_primitive_row(token, 1);
+        engine.const_double_literal(token);
+        if engine.pattern_depth > 0 {
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[1],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(token.range);
+        }
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
@@ -8944,8 +9425,16 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_literal_double_with_separators(token);
 
-        self.engine.borrow_mut().push_primitive_row(token, 1);
-        self.engine.borrow_mut().const_double_literal(token);
+        let mut engine = self.engine.borrow_mut();
+        engine.push_primitive_row(token, 1);
+        engine.const_double_literal(token);
+        if engine.pattern_depth > 0 {
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[1],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(token.range);
+        }
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
@@ -8955,6 +9444,11 @@ impl ParserListener for DiagnoseListener<'_> {
         if engine.pattern_depth > 0 {
             let is_true = engine.text_of(token) == Some("true");
             engine.pending_const = Some(Restriction::BoolValue(is_true));
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[3],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(token.range);
         }
         engine.push_primitive_row(token, 3);
         engine.const_bool_literal(token);
@@ -8966,6 +9460,8 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         if engine.pattern_depth > 0 {
             engine.pending_const = Some(Restriction::Null);
+            engine.pending_const_ty = Some(Ty::Null);
+            engine.pending_const_at = Some(token.range);
         }
         engine.push_null_row(token);
         engine.const_null_literal(token);
@@ -9000,6 +9496,16 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.const_string_end(interpolation_count, begin, end.range);
         }
         engine.push_primitive_row(end, 4);
+        // A plain string literal's constant-pattern static type; an
+        // interpolated one is not a `hasPrimitiveEquality` constant
+        // (constant_verifier.dart:140-165).
+        if engine.pattern_depth > 0 && interpolation_count == 0 {
+            engine.pending_const_ty = Some(Ty::Named {
+                name: engine.primitive_ids[4],
+                nullable: false,
+            });
+            engine.pending_const_at = Some(end.range);
+        }
     }
 
     fn end_literal_symbol(&mut self, hash: Token, _identifier_count: usize) {
@@ -9249,10 +9755,13 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_non_null_assert_expression(bang);
 
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .non_null_assert(bang.range);
+        let mut engine = self.engine.borrow_mut();
+        // The operand's row is the stack top (the postfix operand parsed
+        // just before the `!` event): `visitNullAssertionExpression`'s
+        // pair (best_practices_verifier.dart:795-799,
+        // error_verifier.dart:7668-7718).
+        engine.check_null_assert(bang.range);
+        engine.const_capture.non_null_assert(bang.range);
     }
 
     // —— flow fan-out: events the diagnoser does not consume itself ———
@@ -9762,6 +10271,12 @@ struct PatternFrame {
     leaves: Vec<Restriction>,
     or_ops: usize,
     fields: Vec<ObjectField>,
+    /// The frame is a logical-or/and operand: its matched type is still
+    /// the switch scrutinee, so constant leaves under it check against the
+    /// same space as root leaves (field sub-pattern frames are `false` —
+    /// their matched type is the property column, which the name level
+    /// does not descend into).
+    binary: bool,
 }
 
 /// One object-pattern field's drained sub-restrictions (empty for a
@@ -10044,6 +10559,164 @@ impl ExhaustivenessWorld for NameWorld<'_> {
 }
 
 impl NameWorld<'_> {
+    /// Whether some runtime value can inhabit both regions:
+    /// `canBeSubtypeOf` (type_system.dart:150-330), the verified
+    /// `TypeSystem::can_be_subtype_of` port mirrored at name level — the
+    /// mutual-exclusion companion of [`ExhaustivenessWorld::is_subtype_of`].
+    /// The Null arms decide before everything (type_system.dart:160-169),
+    /// which is the pinned corner where the two relations legitimately
+    /// disagree: `Never <: Null` (subtype.dart:299-301) yet no `Never`
+    /// value can sit in a `Null` slot. Undecided shapes answer `true` (the
+    /// official's conservative default, type_system.dart:324); function,
+    /// `FutureOr`, and record shapes do not exist at name level and fall
+    /// to the same default.
+    fn can_be_subtype_of(&self, left: &NameTy, right: &NameTy) -> bool {
+        let left_nullable = self.is_potentially_nullable(left);
+        let right_nullable = self.is_potentially_nullable(right);
+        if matches!(right, NameTy::Null) {
+            return left_nullable;
+        }
+        if matches!(left, NameTy::Null) {
+            return right_nullable;
+        }
+        // Both nullable meet at `null` (type_system.dart:172-174).
+        if left_nullable && right_nullable {
+            return true;
+        }
+        let (Some(left_name), Some(right_name)) =
+            (self.head_name(left), self.head_name(right))
+        else {
+            // `Never` (already a subtype of everything), top, and unknown
+            // shapes stay undecided.
+            return true;
+        };
+        if left_name == right_name {
+            // Same declaration, and the name level carries no type
+            // arguments to disagree over.
+            return true;
+        }
+        let left_non_null = NameTy::Named(left_name, false);
+        // The enum's instances are exactly its constants, typed by the
+        // enum (type_system.dart:229-241's this-type scan).
+        if self
+            .container(left_name)
+            .is_some_and(|c| c.kind == ContainerKind::Enum)
+        {
+            return self.is_subtype_of(&left_non_null, right);
+        }
+        // Closed left: its instance set is the declared subclass closure —
+        // the left instantiation itself, then every transitive subclass
+        // (type_system.dart:243-262, `allSubtypes`, element.dart:167-210).
+        if self.is_sealed_name(left_name) {
+            if self.is_subtype_of(&left_non_null, right) {
+                return true;
+            }
+            return self.any_subclass_reaches(left_name, right);
+        }
+        // Symmetric closed right (type_system.dart:263-278): the right's
+        // candidates (itself, then its transitive subclasses) must be able
+        // to view the left.
+        if self.is_sealed_name(right_name) {
+            let right_non_null = NameTy::Named(right_name, false);
+            if self.is_subtype_of(&right_non_null, &left_non_null) {
+                return true;
+            }
+            return self.any_subclass_reaches(right_name, &left_non_null);
+        }
+        true
+    }
+
+    /// Whether any transitive in-file subclass of the closed `root` can
+    /// reach `target` (the official candidate scan's subclass half,
+    /// type_system.dart:243-262): a sealed root's subclass tree is fully
+    /// known even through non-sealed intermediate nodes, so the walk
+    /// follows plain extends/with/implements edges instead of the
+    /// exhaustiveness walk's sealed-gated direct set — a direct-only scan
+    /// misses deep members (`sealed S` → open `Base` → `B`) and answers a
+    /// false mutual exclusion. The visited set replays the oracle's cycle
+    /// guards (element.dart:167-210).
+    fn any_subclass_reaches(&self, root: StringId, target: &NameTy) -> bool {
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(root);
+        let mut queue = self.direct_subcontainers(root);
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if self.is_subtype_of(&NameTy::Named(current, false), target) {
+                return true;
+            }
+            queue.extend(self.direct_subcontainers(current));
+        }
+        false
+    }
+
+    /// The in-file containers directly extending/with/implementing/on
+    /// `name` (the same edge scan [`Self::name_subtypes`] uses, without
+    /// its sealed gate).
+    fn direct_subcontainers(&self, name: StringId) -> Vec<StringId> {
+        let mut out = Vec::new();
+        for &decl in self.container_order() {
+            if decl == name {
+                continue;
+            }
+            let Some(declared) = self.container(decl) else {
+                continue;
+            };
+            let edge = declared.superclass == Some(name)
+                || declared.with_clause.contains(&name)
+                || declared.implements_clause.contains(&name)
+                || declared.on_clause.contains(&name);
+            if edge {
+                out.push(decl);
+            }
+        }
+        out
+    }
+
+    /// `isPotentiallyNullable` (type_system.dart:1260): everything except
+    /// the non-nullable shapes.
+    fn is_potentially_nullable(&self, ty: &NameTy) -> bool {
+        !matches!(
+            ty,
+            NameTy::Named(_, false)
+                | NameTy::TopNonNullable
+                | NameTy::EnumValue(..)
+                | NameTy::BoolValue(_)
+                | NameTy::Never
+        )
+    }
+
+    /// The declaration head a restricted shape answers through (the enum
+    /// arm's this-type; the boolean constants' `bool`).
+    fn head_name(&self, ty: &NameTy) -> Option<StringId> {
+        match ty {
+            NameTy::Named(name, _)
+            | NameTy::EnumValue(name, _)
+            | NameTy::EnumValueOrNull(name, _) => Some(*name),
+            NameTy::BoolValue(_) | NameTy::BoolOrNull(_) => Some(self.bool_id),
+            _ => None,
+        }
+    }
+
+    /// `_canBeEqual` (constant_verifier.dart:561-596, the
+    /// `TypeSystem::can_be_equal` port mirrored at name level): `false`
+    /// proves `constant == value` always answers `false`. Only interface
+    /// and `Null` constants reach the relation (the official's gate);
+    /// named/`Null` values decide through the declared subtype relation
+    /// (the greatest closure is the identity without type parameters);
+    /// every other shape answers `true` (the official's type-parameter
+    /// and non-interface fallbacks).
+    fn can_be_equal(&self, constant: &NameTy, value: &NameTy) -> bool {
+        if !matches!(constant, NameTy::Named(..) | NameTy::Null) {
+            return true;
+        }
+        match value {
+            NameTy::Named(..) | NameTy::Null => self.is_subtype_of(constant, value),
+            _ => true,
+        }
+    }
+
     /// The unit's container record for `name`.
     fn container(&self, name: StringId) -> Option<&Container> {
         self.index.get(self.file).and_then(|f| f.container(name))
@@ -11236,6 +11909,174 @@ mod tests {
         );
     }
 
+    // —— #537: the m1-gate r2 faces (corpus lib/targeted shapes) ——————————
+    // The r2 record's five oracle-only misses, pinned on the corpus shapes.
+    // Every fixture carries the harness's core stubs (`class int {}`,
+    // `class String {}`, `void print(x) {}` — `report()` has no core
+    // library): without them the group's `int`/`String` arguments land as
+    // `TypeUse(Missing)` rows — each an `undefined_class` at pass 2 AND a
+    // phantom row that displaces the true callee in `end_type_arguments`'
+    // creation-branch last-row scan, silently killing the arity check. The
+    // oracle citations are the record's measured message samples
+    // (dart 3.13.1, goal #125's drift table): the invocation family reports
+    // `_element` (type_instantiation_target.dart:40,
+    // `InvocationTargetExecutableElement`), applied non-invoked groups
+    // report `_function` (:139, `InvocationTargetFunctionTypedExpression`)
+    // or the type-defining base code (:221), and explicit extension
+    // applications report `_extension` (:116).
+
+    /// A no-keyword constructor reference `C<int, String>.named` reports the
+    /// base type-argument code against the class face — the `_constructor`
+    /// variant stays unreachable for it (goal #125 drift: the keyword shapes
+    /// own that code; r2 corpus `wrong_number_of_type_arguments_constructor`).
+    ///
+    /// Hand-trace: `C` parses as a send whose `<`-group fails the `(`-only
+    /// gate (expressions.rs:1570-1577), so `parse_method_type_args_block`
+    /// (:256) re-reads the group — follower `.` passes `_mayFollowTypeArgs`
+    /// (:674) — and the group defers against `C`'s container row
+    /// (end_type_arguments' `base - 1`); the application event consumes it
+    /// through the `Bare(Container)` arm → `check_annotation_arity`. The
+    /// `.named` selector resolves through the creation face
+    /// (check_container_member's constructor exclusion) and stays silent;
+    /// `c` is read by `print`.
+    #[test]
+    fn constructor_reference_arity_reports_base_code() {
+        let report = report(
+            "class int {} class String {} void print(x) {} class C<T> { C.named(); } void main() { var c = C<int, String>.named; print(c); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type 'C' is declared with 1 type parameters, but 2 type arguments were given."
+        );
+        // The group span `<int, String>`.
+        assert_eq!(report.diagnostics[0].range.offset, 95);
+        assert_eq!(report.diagnostics[0].range.length, 13);
+    }
+
+    /// A static-method invocation through the class (`C.sm<int, String>()`)
+    /// reports `_element` with the `method` kind word (r2 corpus
+    /// `wrong_number_of_type_arguments_element`, the drift's measured
+    /// canonical invocation shape).
+    ///
+    /// Hand-trace: the `.sm` dot-access merges into a `Member{recv}` row
+    /// before the group (expressions.rs:439-445), the group defers against
+    /// it, and `consume_send`'s deferred check walks `C`'s members
+    /// (`check_invocation_arity`'s `Member` arm) finding `sm` with 1 type
+    /// parameter against the given 2.
+    #[test]
+    fn static_invocation_arity_reports_element_method() {
+        let report = report(
+            "class int {} class String {} void print(x) {} class C<T> { static int sm<T>() => 0; } void main() { print(C.sm<int, String>()); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'sm' is declared with 1 type parameters, but 2 type arguments are given."
+        );
+        // The group span `<int, String>`.
+        assert_eq!(report.diagnostics[0].range.offset, 110);
+        assert_eq!(report.diagnostics[0].range.length, 13);
+    }
+
+    /// An explicit extension application with an invocation
+    /// (`E<int, String>(1).g`) reports `_extension` at the group (r2 corpus
+    /// `wrong_number_of_type_arguments_extension`).
+    ///
+    /// Hand-trace: `E` followed by `<...>(` is a send-head group, so
+    /// end_type_arguments' creation branch classifies the head — `E`'s
+    /// `Container{Extension}` row, once the stubs keep the group's type
+    /// arguments from stacking `TypeUse` rows over it — dispatching the
+    /// extension face (declared 1 against the given 2). The trailing `.g`
+    /// reads the extension's own member — silent.
+    #[test]
+    fn extension_application_arity_reports_extension_code() {
+        let report = report(
+            "class int {} class String {} void print(x) {} extension E<T> on int { int get g => 1; } void f() { print(E<int, String>(1).g); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_extension"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The extension 'E' is declared with 1 type parameters, but 2 type arguments were given."
+        );
+        // The group span `<int, String>`.
+        assert_eq!(report.diagnostics[0].range.offset, 106);
+        assert_eq!(report.diagnostics[0].range.length, 13);
+    }
+
+    /// A static-method property-access tear-off (`C.sm<int, String>`)
+    /// reports `_function` leading with the uninstantiated signature
+    /// (r2 corpus `wrong_number_of_type_arguments_function`).
+    ///
+    /// Hand-trace: the merged `Member{recv: Container{C}}` row defers the
+    /// group; no `(` follows, so the application event consumes it
+    /// (`consume_type_argument_application`'s `Member` arm) and the method
+    /// face renders its captured signature `int Function<T>()`.
+    #[test]
+    fn static_tearoff_arity_reports_function_code() {
+        let report = report(
+            "class int {} class String {} void print(x) {} class C<T> { static int sm<T>() => 0; } void main() { var g = C.sm<int, String>; print(g); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_function"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type of this function is 'int Function<T>()', which has 1 type parameters, but 2 type arguments were given."
+        );
+        // The group span `<int, String>`.
+        assert_eq!(report.diagnostics[0].range.offset, 112);
+        assert_eq!(report.diagnostics[0].range.length, 13);
+    }
+
+    /// An instance-method property-access tear-off (`C().m<int, String>`)
+    /// reports `_function` too — the `_method` variant stays unreachable
+    /// (goal #125 drift, r2 corpus `wrong_number_of_type_arguments_method`).
+    ///
+    /// Hand-trace: `C()`'s callee is Member-filtered out of `pending_send`
+    /// (begin_arguments' ctor_pos gate), so the container row survives the
+    /// send unf folded and the `.m` merge classifies it
+    /// (`Receiver::Container`) — the group defers, the application event
+    /// renders `m`'s captured signature, identical to the static tear-off's
+    /// report.
+    #[test]
+    fn method_tearoff_arity_reports_function_code() {
+        let report = report(
+            "class int {} class String {} void print(x) {} class C { int m<T>() => 0; } void main() { var h = C().m<int, String>; print(h); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_function"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The type of this function is 'int Function<T>()', which has 1 type parameters, but 2 type arguments were given."
+        );
+        // The group span `<int, String>`.
+        assert_eq!(report.diagnostics[0].range.offset, 102);
+        assert_eq!(report.diagnostics[0].range.length, 13);
+    }
+
     // —— batch 2 (#121): static-nullability four ——————————————————————————
 
     /// `null` into a non-nullable target reports `invalid_assignment`
@@ -11270,15 +12111,9 @@ mod tests {
     ///
     /// Hand-trace: `int x = null` checks the single-row initializer against
     /// the group type → `invalid_assignment`; `int? y = null` is Right Top
-    /// (subtype.dart:263) → silent.
-    ///
-    /// RED (parser gap, #339): a nullable declared type followed by an
-    /// initializer (`int? y = null;`) loses the declaration: the `?`-type
-    /// plus `=`-initializer statement shape parses as the expression
-    /// `int ? y …`, `y` never binds, and its name surfaces as
-    /// `undefined_identifier` (probe: `int? y = 1;` alone reports it too;
-    /// `int? y;` without an initializer parses fine). Un-reds when the
-    /// declaration probe accepts `Type? name =` as a variable declaration.
+    /// (subtype.dart:263) → silent. The nullable-declaration-plus-
+    /// initializer shape parses since the #339 declaration probe accepted
+    /// `Type? name =` (the RED note below the old expectation is retired).
     #[test]
     fn declaration_initializer_null_reports_invalid_assignment() {
         let report = report("class int {} void f() { int x = null; int? y = null; }");
@@ -12240,17 +13075,39 @@ mod tests {
     /// Hand-trace: the `1` constant is the unknown space (never a
     /// must-match), so the sealed walk must expand its subtypes — the
     /// exact shape the cycle breaks. Both verdicts are exhaustive (no
-    /// witness over a sealed closure), so nothing emits.
+    /// witness over a sealed closure), so only the constant-pattern rows
+    /// emit: an `int` constant can never equal an `S`/`A` value
+    /// (`visitConstantPattern`'s `_canBeEqual` gate,
+    /// constant_verifier.dart:140-165).
     #[test]
     fn cyclic_sealed_hierarchy_terminates_without_false_positive() {
         let self_cycle =
             report("sealed class S extends S {} void f(S s) { var x = switch (s) { 1 => 2 }; }");
-        // `x` is unread (the official read-only use rule).
-        assert_eq!(code_names(&self_cycle), ["unused_local_variable"]);
+        // `x` is unread (the official read-only use rule); the constant
+        // row anchors after it in source order.
+        assert_eq!(
+            code_names(&self_cycle),
+            ["unused_local_variable", "constant_pattern_never_matches_value_type"],
+            "{:?}",
+            code_names(&self_cycle)
+        );
+        assert_eq!(
+            self_cycle.diagnostics[1].message,
+            "The matched value type 'S' can never be equal to this constant of type 'int'."
+        );
         let mutual_cycle = report(
             "sealed class A extends B {} sealed class B extends A {} void f(A a) { var x = switch (a) { 1 => 2 }; }",
         );
-        assert_eq!(code_names(&mutual_cycle), ["unused_local_variable"]);
+        assert_eq!(
+            code_names(&mutual_cycle),
+            ["unused_local_variable", "constant_pattern_never_matches_value_type"],
+            "{:?}",
+            code_names(&mutual_cycle)
+        );
+        assert_eq!(
+            mutual_cycle.diagnostics[1].message,
+            "The matched value type 'A' can never be equal to this constant of type 'int'."
+        );
     }
 
     /// An unresolvable scrutinee skips the whole exhaustiveness check (the
@@ -12636,28 +13493,50 @@ mod tests {
     /// Hand-trace: the fold space covers `{true, null}` only
     /// (`NullableStaticType(_BoolValueStaticType)`, static_type.dart:350);
     /// lowering it to `bool?` would swallow `false` on both questions.
+    /// Both `null` constants additionally carry
+    /// `constant_pattern_never_matches_value_type` (a `null` constant can
+    /// never equal a `bool` value — `visitConstantPattern`'s `_canBeEqual`
+    /// gate), independent of the covering verdicts.
     #[test]
     fn bool_value_nullable_keeps_the_restriction() {
         let report = report(
             "class bool {} void f(bool b) { switch (b) { case true || null: break; case null: break; } }",
         );
+        let mut names = code_names(&report);
+        names.sort();
         assert_eq!(
-            code_names(&report),
-            ["unreachable_switch_case", "non_exhaustive_switch_statement"],
+            names,
+            [
+                "constant_pattern_never_matches_value_type",
+                "constant_pattern_never_matches_value_type",
+                "non_exhaustive_switch_statement",
+                "unreachable_switch_case",
+            ],
             "{:?}",
             code_names(&report)
         );
         // The `false` gap, not a swallowed one.
+        let gap = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "non_exhaustive_switch_statement")
+            .expect("non-exhaustive row present");
         assert_eq!(
-            report.diagnostics[1].message,
+            gap.message,
             "The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'false'."
         );
-        // `case null` anchors at its own `case` keyword.
+        // The unreachable verdict anchors at its own `case` keyword
+        // (constant_verifier.dart:1076-1085).
         let null_case_at = u32::try_from(
             "class bool {} void f(bool b) { switch (b) { case true || null: break; ".len(),
         )
         .unwrap();
-        assert_eq!(report.diagnostics[0].range.offset, null_case_at);
+        let unreachable = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "unreachable_switch_case")
+            .expect("unreachable row present");
+        assert_eq!(unreachable.range.offset, null_case_at);
     }
 
     /// The same precision for enum constants: `case E.a || null` covers
@@ -13023,18 +13902,32 @@ mod tests {
 
     /// `is` is not on the spec's constant-expression list (the site
     /// default reports); `as` is, and its unknown result defers —
-    /// `(1 as int) + 1` stays clean.
+    /// `(1 as int) + 1` stays clean on the const side. Both lines
+    /// additionally carry the provably-check family's rows, which the
+    /// oracle co-fires: `1 is int` is constant-true
+    /// (`unnecessary_type_check`), `1 as int` a dead cast
+    /// (`unnecessary_cast`).
     #[test]
     fn is_reports_and_as_defers() {
         let rep = report("class int {} const x = 1 is int;");
+        let mut names = code_names(&rep);
+        names.sort();
         assert_eq!(
-            code_names(&rep),
-            ["const_initialized_with_non_constant_value"],
+            names,
+            [
+                "const_initialized_with_non_constant_value",
+                "unnecessary_type_check"
+            ],
             "{:?}",
             code_names(&rep)
         );
         let rep = report("class int {} const y = 1 as int; const z = (1 as int) + 1;");
-        assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_cast", "unnecessary_cast"],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 
     /// A clean const variable's type folds from its initializer: `const
@@ -14503,6 +15396,38 @@ mod tests {
         );
     }
 
+    /// The given-parameter faces spare the report: one supplied positional
+    /// at the invocation marks the parameter given (the merged `.named`
+    /// member row's spelling), and the unnamed constructor's face
+    /// fires/spares under its class-name key (the folded `Created` head
+    /// row's spelling). `_C`'s single constructor stays unreported itself
+    /// (the >1-constructor rule), the parameter pass runs regardless.
+    #[test]
+    fn unused_constructor_parameters_spare_when_given() {
+        let r = report(
+            "class int {} class _D { _D.named([int x = 0]); _D.other(); } \
+             void main() { _D.named(1); _D.other(); }",
+        );
+        assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+        let r2 = report(
+            "class int {} class _C { _C([int x = 0]); } void main() { _C(); }",
+        );
+        assert_eq!(
+            code_names(&r2),
+            ["unused_element_parameter"],
+            "{:?}",
+            code_names(&r2)
+        );
+        assert_eq!(
+            r2.diagnostics[0].message,
+            "A value for optional parameter 'x' isn't ever given."
+        );
+        let r3 = report(
+            "class int {} class _C { _C([int x = 0]); } void main() { _C(1); }",
+        );
+        assert!(code_names(&r3).is_empty(), "{:?}", code_names(&r3));
+    }
+
     // —— #505: the import/flow cluster ———————————————————————————————————
 
     /// An import that contributed nothing reports at its URI; the same
@@ -14676,5 +15601,272 @@ mod tests {
         );
         assert_eq!(code_names(&r), ["unused_label"], "{:?}", code_names(&r));
         assert_eq!(r.diagnostics[0].message, "The label 'dead' isn't used.");
+    }
+
+    // —— #506: the provably-check cluster —————————————————————————————————
+
+    /// `x as T` is dead only under structural type equality
+    /// (`_isUnnecessaryCast`, best_practices_verifier.dart:1708-1741):
+    /// `x as num` over `int` is a necessary cast and stays silent.
+    #[test]
+    fn unnecessary_cast_pins_equality() {
+        // The casts sit in initializers on purpose: a statement-position
+        // `x as int;` currently drops its leading operand in the parser's
+        // statement disambiguation (the `as`/`is` rescue at statements.rs
+        // parses from the `as` without rewinding; the official
+        // parser_impl.dart:10026-10046 re-parses from the statement start) —
+        // reported to the parser lane, not worked around here with a
+        // broken-shape pin.
+        let r = report(
+            "class int {} class num {} void main() { int x = 1; var a = x as int; var b = x as num; }",
+        );
+        // `a`/`b` are declared and never read: the official fires
+        // unused_local_variable for both, exactly as the port does.
+        let mut names = code_names(&r);
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "unnecessary_cast",
+                "unused_local_variable",
+                "unused_local_variable",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        let cast = r
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "unnecessary_cast")
+            .expect("the `x as int` cast is dead");
+        assert_eq!(cast.message, "Unnecessary cast.");
+        assert_eq!(cast.correction.as_deref(), Some("Try removing the cast."));
+    }
+
+    /// The type-check polarity pair (`_checkAllTypeChecks`,
+    /// best_practices_verifier.dart:987-1041): `x is T` is constant-true
+    /// over a subtype operand, `x is! T` reports the complement row.
+    #[test]
+    fn unnecessary_type_check_polarity() {
+        let r = report(
+            "class int {} void main() { int x = 1; if (x is int) {} if (x is! int) {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unnecessary_type_check", "unnecessary_type_check"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "Unnecessary type check; the result is always 'true'."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "Unnecessary type check; the result is always 'false'."
+        );
+    }
+
+    /// `is Null`/`is! Null` route to the `type_check_with_null` family;
+    /// the `null` literal keeps the family row constant and downgrades to
+    /// the type-check row (`null is Null` is always 'true', `null is! Null`
+    /// always 'false'); `null is int` stays silent — the official's
+    /// `isSubtypeOf(Null, int)` is false and the walk has no negative
+    /// verdict (best_practices_verifier.dart:987-1041).
+    #[test]
+    fn type_check_with_null_family() {
+        let r = report(
+            "class int {} void main() { int? x = null; if (x is Null) {} if (x is! Null) {} null is int; null is Null; null is! Null; }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "type_check_with_null",
+                "type_check_with_null",
+                "unnecessary_type_check",
+                "unnecessary_type_check",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "Tests for null should be done with '== null'."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "Tests for non-null should be done with '!= null'."
+        );
+        assert_eq!(
+            r.diagnostics[2].message,
+            "Unnecessary type check; the result is always 'true'."
+        );
+        assert_eq!(
+            r.diagnostics[3].message,
+            "Unnecessary type check; the result is always 'false'."
+        );
+    }
+
+    /// The `e!` pair (`visitNullAssertionExpression`,
+    /// best_practices_verifier.dart:795-799): a strictly-non-nullable
+    /// operand makes the `!` dead; a `Null`-typed operand (here the
+    /// literal) always throws. `x!;` in an expression statement is the
+    /// official's discarded read (`_isUsefulRead`,
+    /// unused_local_elements_verifier.dart:603-619 — a NullAssertion parent
+    /// under an expression statement never counts), so `x` stays unused and
+    /// the declaration reports; the `null!` operand is a value row and
+    /// marks nothing.
+    #[test]
+    fn null_assert_pair_routes_by_operand() {
+        let r = report("class int {} void main() { int x = 1; x!; null!; }");
+        assert_eq!(
+            code_names(&r),
+            [
+                "unused_local_variable",
+                "unnecessary_non_null_assertion",
+                "null_check_always_fails",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The '!' will have no effect because the receiver can't be null."
+        );
+        assert_eq!(
+            r.diagnostics[2].message,
+            "This null-check will always throw an exception because the expression will always evaluate to 'null'."
+        );
+    }
+
+    /// `_checkForInvariantNullComparison`
+    /// (best_practices_verifier.dart:1216-1281): a `null` comparison over
+    /// a never-null operand reports both orders and both polarities; a
+    /// nullable operand stays silent.
+    #[test]
+    fn unnecessary_null_comparison_orders() {
+        let r = report(
+            "class int {} void main() { int x = 1; int? y = null; x == null; x != null; null == x; y == null; }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "unnecessary_null_comparison",
+                "unnecessary_null_comparison",
+                "unnecessary_null_comparison"
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The operand can't be 'null', so the condition is always 'false'."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The operand can't be 'null', so the condition is always 'true'."
+        );
+        assert_eq!(
+            r.diagnostics[2].message,
+            "The operand can't be 'null', so the condition is always 'false'."
+        );
+    }
+
+    // —— #507: the pattern/type-space disjointness cluster —————————————————
+
+    /// A cast pattern over a matched type already below the target is dead
+    /// (shared_type_analyzer.dart:145-152): `Object?` matched, `Object?`
+    /// cast.
+    #[test]
+    fn unnecessary_cast_pattern_reports() {
+        let r = report(
+            "class Object {} void f(Object? o) { switch (o) { case _ as Object?: break; } }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unnecessary_cast_pattern"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(r.diagnostics[0].message, "Unnecessary cast pattern.");
+    }
+
+    /// A null-check/null-assert pattern over a non-nullable matched type
+    /// is dead (shared_type_analyzer.dart:129-139); over a nullable one
+    /// both stay silent.
+    #[test]
+    fn null_check_and_assert_patterns_report() {
+        let r = report(
+            "class int {} void f(int n) { switch (n) { case _?: break; } } \
+             void g(int n) { switch (n) { case _!: break; } } \
+             void h(int? n) { switch (n) { case _?: break; } } \
+             void k(int? n) { switch (n) { case _!: break; } }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unnecessary_null_check_pattern", "unnecessary_null_assert_pattern"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The null-check pattern will have no effect because the matched type isn't nullable."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The null-assert pattern will have no effect because the matched type isn't nullable."
+        );
+    }
+
+    /// The enum-left closure decides `pattern_never_matches_value_type`
+    /// (`checkPatternNeverMatchesValueType` via `canBeSubtypeOf`): no `E`
+    /// value can be an `A`, while the same-enum constant patterns stay
+    /// silent — and the fully-covered switch emits nothing else.
+    #[test]
+    fn pattern_never_matches_on_closed_left() {
+        let r = report(
+            "enum E { a, b } class A {} void f(E e) { switch (e) { case A _: break; case E.a: break; case E.b: break; } }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["pattern_never_matches_value_type"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The matched value type 'E' can never match the required type 'A'."
+        );
+    }
+
+    /// `constant_pattern_never_matches_value_type`
+    /// (constant_verifier.dart:140-165): a `String` constant can never
+    /// equal an `int` matched value; the int-constant-vs-double-value
+    /// cross answers "possible" (the official's JavaScript note).
+    #[test]
+    fn constant_pattern_never_matches_pins() {
+        let r = report(
+            "class int {} class double {} class String {} \
+             void f(int n) { switch (n) { case 'x': break; } } \
+             void g(double d) { switch (d) { case 1: break; } } \
+             void h(int n) { switch (n) { case null: break; } }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "constant_pattern_never_matches_value_type",
+                "constant_pattern_never_matches_value_type"
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The matched value type 'int' can never be equal to this constant of type 'String'."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The matched value type 'int' can never be equal to this constant of type 'Null'."
+        );
     }
 }

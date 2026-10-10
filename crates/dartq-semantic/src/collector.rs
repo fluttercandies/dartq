@@ -122,6 +122,10 @@ struct OpenContainer {
     /// unnamed constructor exists (explicit or the implicit default).
     ctor_named: Vec<StringId>,
     ctor_has_unnamed: bool,
+    /// The constructors' formal-parameter tables by lookup spelling (the
+    /// selector for `A.named`, the container's name for `A()`); flushed
+    /// into the finished [`Container::ctor_formals`].
+    ctor_formals: FxHashMap<StringId, Box<Formals>>,
 }
 
 /// The open constructor's capture: the named selectors it declares plus
@@ -236,6 +240,13 @@ struct Builder<'src, 'tab> {
     /// named selectors it declares plus its unnamed flag. `A()` records the
     /// unnamed shape; `A.named()` records `named` only.
     ctor_open: Option<CtorCapture>,
+    /// The open constructor's formal-parameter capture: its lookup spelling
+    /// (the class-name token at `begin_constructor` — the unnamed face's
+    /// key — rewritten to the selector at the continuation event) and the
+    /// depth-0 group once it closes. `attach_formals` fills it first-wins
+    /// (a body closure's own group is a no-op); `end_constructor` flushes
+    /// it into the open container's `ctor_formals`.
+    pending_ctor_formals: Option<(StringId, Option<Box<Formals>>)>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
     positional_formals: Vec<Formal>,
@@ -293,6 +304,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_top: None,
             pending_typedef: None,
             ctor_open: None,
+            pending_ctor_formals: None,
             formal_depth: 0,
             positional_formals: Vec::new(),
             named_formals: Vec::new(),
@@ -323,6 +335,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         {
             capture.has_unnamed = false;
             capture.named.push(name);
+        }
+        // The formal table's lookup key follows the selector: the unnamed
+        // face's class-name key (set at `begin_constructor`) is rewritten
+        // before any formal can fire (the selector precedes the parameter
+        // list in the header).
+        if let Some(name) = name
+            && let Some((key, _)) = &mut self.pending_ctor_formals
+        {
+            *key = name;
         }
     }
 
@@ -423,6 +444,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             enum_constants: Vec::new(),
             ctor_named: Vec::new(),
             ctor_has_unnamed: true,
+            ctor_formals: FxHashMap::default(),
         });
         // The `extends` head latches on class-family declarations only
         // (including a named mixin application's head type); enum
@@ -482,6 +504,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 enum_constants: open.enum_constants,
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor: open.ctor_has_unnamed,
+                ctor_formals: open.ctor_formals,
             });
         }
         // Extension headers capture no residue (their window's types latch
@@ -686,6 +709,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Attaches the depth-0 formal group to the pending executable, once.
+    /// The constructor arm is first-wins like the member arm: a body
+    /// closure's own group re-fires this at depth 0→1 after the header
+    /// closed, and must not displace the constructor's table.
     fn attach_formals(&mut self) {
         let formals = Formals {
             positional: std::mem::take(&mut self.positional_formals).into_boxed_slice(),
@@ -699,6 +725,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             && pending.formals.is_none()
         {
             pending.formals = Some(Box::new(formals));
+        } else if let Some((_, slot)) = &mut self.pending_ctor_formals
+            && slot.is_none()
+        {
+            *slot = Some(Box::new(formals));
         }
     }
 
@@ -1462,11 +1492,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     ) {
         let mut builder = self.builder.borrow_mut();
         // `A()` (or the head recovered): the unnamed shape until a
-        // `A.named` continuation says otherwise.
+        // `A.named` continuation says otherwise. The formal table's key is
+        // the head token's name — the class name, which is exactly the
+        // unnamed face's lookup spelling (`A()` creation rows carry it);
+        // the continuation rewrites it to the selector.
         builder.ctor_open = Some(CtorCapture {
             named: Vec::new(),
             has_unnamed: true,
         });
+        builder.pending_ctor_formals = builder
+            .capture_name(_name)
+            .map(|(key, _)| (key, None));
     }
 
     fn end_constructor(
@@ -1490,6 +1526,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // Any unnamed constructor (this one, or the implicit default the
             // container opened with) keeps the unnamed face.
             open.ctor_has_unnamed &= capture.has_unnamed;
+        }
+        // The captured formal table joins the container's constructor
+        // formals under its lookup spelling (a redirecting or body-less
+        // shape with no group simply carries nothing).
+        if let Some((key, formals)) = builder.pending_ctor_formals.take()
+            && let Some(formals) = formals
+            && let Some(open) = builder.containers.last_mut()
+        {
+            open.ctor_formals.insert(key, formals);
         }
     }
 
@@ -2092,5 +2137,55 @@ mod tests {
         assert_eq!(rep.formal.ty, Ty::named(id(&strings, "int")));
         assert!(e.members.get(&id(&strings, "m")).is_some());
         assert!(e.members.get(&id(&strings, "x")).is_none());
+    }
+
+    /// Constructor formals join the container facts under their lookup
+    /// spellings — the selector for a named constructor, the container's
+    /// own name for the unnamed face (the spellings creation invocations
+    /// mark as given: the folded `Created` head row keeps the class name,
+    /// a `C.named()` send keeps the member row `named`). One optional
+    /// section per list (the grammar allows `[...]` or `{...}`, never
+    /// both), so the named-group shape rides a third constructor.
+    #[test]
+    fn constructor_formals_carry_both_lookup_spellings() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C { C.named(int w, [int x = 0]) {} C([int y = 1]) {} \
+             C.other({int z = 2}) {} }",
+            &strings,
+        );
+        let container = elements.container(id(&strings, "C")).expect("C");
+        let diagnostics = |container: &crate::model::Container| {
+            container
+                .ctor_formals
+                .keys()
+                .map(|k| strings.resolve(*k).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let named = container
+            .ctor_formals
+            .get(&id(&strings, "named"))
+            .unwrap_or_else(|| panic!("named selector key: {:?}", diagnostics(container)));
+        assert_eq!(named.positional.len(), 2);
+        assert!(named.positional[0].required);
+        assert_eq!(named.positional[0].name, id(&strings, "w"));
+        assert!(!named.positional[1].required);
+        assert_eq!(named.positional[1].name, id(&strings, "x"));
+        assert_eq!(named.positional[1].ty, Ty::named(id(&strings, "int")));
+        let unnamed = container
+            .ctor_formals
+            .get(&id(&strings, "C"))
+            .unwrap_or_else(|| panic!("class-name key: {:?}", diagnostics(container)));
+        assert_eq!(unnamed.positional.len(), 1);
+        assert!(!unnamed.positional[0].required);
+        assert_eq!(unnamed.positional[0].name, id(&strings, "y"));
+        let other = container
+            .ctor_formals
+            .get(&id(&strings, "other"))
+            .unwrap_or_else(|| panic!("other selector key: {:?}", diagnostics(container)));
+        assert_eq!(other.positional.len(), 0);
+        assert_eq!(other.named.len(), 1);
+        assert!(!other.named[0].required);
+        assert_eq!(other.named[0].name, id(&strings, "z"));
     }
 }

@@ -329,6 +329,7 @@ impl<'a> Face<'a> {
                 enum_constants,
                 constructors,
                 has_unnamed_constructor,
+                ctor_formals,
             } = &elements.containers[&name];
             self.field("container");
             self.name(name);
@@ -395,6 +396,15 @@ impl<'a> Face<'a> {
             } else {
                 "no-unnamed"
             });
+            // The constructor formals by lookup spelling (the
+            // `unused_element_parameter` constructor face's facts): a hash
+            // map, sorted by text.
+            Self::sorted(self.strings, &mut self.inner, ctor_formals.keys().copied());
+            for j in 0..self.inner.len() {
+                let ctor_name = self.inner[j];
+                self.name(ctor_name);
+                self.formals(&ctor_formals[&ctor_name]);
+            }
             // Member names are a hash map: sort by text, then render each
             // member's full executable shape. The nested level sorts into the
             // second scratch so the container loop's iteration state survives.

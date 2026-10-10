@@ -397,6 +397,73 @@ pub enum SemanticCode {
     /// label scope targets (`_withLabelTracker`, dead_code_verifier.dart:
     /// 163-176).
     UnusedLabel,
+    // —— #506: the provably-check cluster (all `STATIC_WARNING`) ——————————
+    /// `Unnecessary cast.` — an `e as T` whose operand type already equals
+    /// `T` structurally, with neither side `dynamic` nor the target a bare
+    /// `Function` (`_isUnnecessaryCast`, best_practices_verifier.dart:
+    /// 1708-1741).
+    UnnecessaryCast,
+    /// `The '!' will have no effect because the receiver can't be null.` —
+    /// an `e!` whose operand type is strictly non-nullable
+    /// (`_checkForUnnecessaryNullAware`, error_verifier.dart:7668-7718).
+    UnnecessaryNonNullAssertion,
+    /// `Unnecessary type check; the result is always 'true'.` — an `x is T`
+    /// whose answer the static types fix at `true` (`_checkAllTypeChecks`,
+    /// best_practices_verifier.dart:987-1041); one registry code across the
+    /// polarity pair, the tier lives in the message shape.
+    UnnecessaryTypeCheckTrue,
+    /// `Unnecessary type check; the result is always 'false'.` — the `is!`
+    /// polarity of [`SemanticCode::UnnecessaryTypeCheckTrue`]: the check's
+    /// complement is the constant.
+    UnnecessaryTypeCheckFalse,
+    /// `Tests for null should be done with '== null'.` — an `x is Null`
+    /// check (`_checkAllTypeChecks`'s `Null` arm,
+    /// best_practices_verifier.dart:1022-1036); one registry code across
+    /// the pair, unique names `type_check_is_null`/`type_check_is_not_null`.
+    TypeCheckWithNull,
+    /// `Tests for non-null should be done with '!= null'.` — the `is! Null`
+    /// polarity of [`SemanticCode::TypeCheckWithNull`].
+    TypeCheckWithNotNull,
+    /// `This null-check will always throw an exception because the
+    /// expression will always evaluate to 'null'.` — an `e!` whose operand
+    /// type is exactly `Null` (`visitNullAssertionExpression`,
+    /// best_practices_verifier.dart:795-799).
+    NullCheckAlwaysFails,
+    /// `The operand can't be 'null', so the condition is always 'false'.` —
+    /// an `e == null` whose operand is provably never null
+    /// (`_checkForInvariantNullComparison`, best_practices_verifier.dart:
+    /// 1216-1281); one registry code across the operator pair, unique
+    /// names `unnecessary_null_comparison_never_null_false/true`.
+    UnnecessaryNullComparisonFalse,
+    /// `The operand can't be 'null', so the condition is always 'true'.` —
+    /// the `!=` polarity of [`SemanticCode::UnnecessaryNullComparisonFalse`].
+    UnnecessaryNullComparisonTrue,
+    // —— #507: the pattern/type-space disjointness cluster (all
+    //    `STATIC_WARNING`) ————————————————————————————————————————————————
+    /// `The matched value type '{0}' can never be equal to this constant of
+    /// type '{1}'.` — a constant pattern whose type the matched value's
+    /// type provably never equals (`_canBeEqual`, constant_verifier.dart:
+    /// 561-596, fired from `visitConstantPattern` :140-165).
+    ConstantPatternNeverMatchesValueType,
+    /// `The matched value type '{0}' can never match the required type
+    /// '{1}'.` — a Cast/DeclaredVariable/Object/Record/Wildcard pattern
+    /// whose required type no matched value can inhabit
+    /// (`checkPatternNeverMatchesValueType`, type_analyzer.dart:723-756).
+    PatternNeverMatchesValueType,
+    /// `Unnecessary cast pattern.` — a cast pattern whose matched type is
+    /// already a subtype of the cast target
+    /// (`matchedTypeIsSubtypeOfRequired`, shared_type_analyzer.dart:145-152).
+    UnnecessaryCastPattern,
+    /// `The null-check pattern will have no effect because the matched type
+    /// isn't nullable.` — a `p?` over a non-nullable matched type
+    /// (`matchedTypeIsStrictlyNonNullable`, shared_type_analyzer.dart:
+    /// 134-139).
+    UnnecessaryNullCheckPattern,
+    /// `The null-assert pattern will have no effect because the matched
+    /// type isn't nullable.` — the `p!` variant of
+    /// [`SemanticCode::UnnecessaryNullCheckPattern`]
+    /// (shared_type_analyzer.dart:129-133).
+    UnnecessaryNullAssertPattern,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -641,6 +708,47 @@ impl SemanticCode {
                 "DEAD_CODE_CATCH_FOLLOWING_CATCH",
             ),
             Self::UnusedLabel => ("unused_label", "UNUSED_LABEL"),
+            // The #506 provably-check cluster: the polarity pairs keep one
+            // registry name each (the tier lives in the message shape).
+            Self::UnnecessaryCast => ("unnecessary_cast", "UNNECESSARY_CAST"),
+            Self::UnnecessaryNonNullAssertion => (
+                "unnecessary_non_null_assertion",
+                "UNNECESSARY_NON_NULL_ASSERTION",
+            ),
+            Self::UnnecessaryTypeCheckTrue | Self::UnnecessaryTypeCheckFalse => {
+                ("unnecessary_type_check", "UNNECESSARY_TYPE_CHECK")
+            }
+            Self::TypeCheckWithNull | Self::TypeCheckWithNotNull => {
+                ("type_check_with_null", "TYPE_CHECK_WITH_NULL")
+            }
+            Self::NullCheckAlwaysFails => (
+                "null_check_always_fails",
+                "NULL_CHECK_ALWAYS_FAILS",
+            ),
+            Self::UnnecessaryNullComparisonFalse | Self::UnnecessaryNullComparisonTrue => {
+                ("unnecessary_null_comparison", "UNNECESSARY_NULL_COMPARISON")
+            }
+            // The #507 pattern/type-space disjointness cluster.
+            Self::ConstantPatternNeverMatchesValueType => (
+                "constant_pattern_never_matches_value_type",
+                "CONSTANT_PATTERN_NEVER_MATCHES_VALUE_TYPE",
+            ),
+            Self::PatternNeverMatchesValueType => (
+                "pattern_never_matches_value_type",
+                "PATTERN_NEVER_MATCHES_VALUE_TYPE",
+            ),
+            Self::UnnecessaryCastPattern => (
+                "unnecessary_cast_pattern",
+                "UNNECESSARY_CAST_PATTERN",
+            ),
+            Self::UnnecessaryNullCheckPattern => (
+                "unnecessary_null_check_pattern",
+                "UNNECESSARY_NULL_CHECK_PATTERN",
+            ),
+            Self::UnnecessaryNullAssertPattern => (
+                "unnecessary_null_assert_pattern",
+                "UNNECESSARY_NULL_ASSERT_PATTERN",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -685,7 +793,21 @@ impl SemanticCode {
             | Self::UnusedImport
             | Self::DeadNullAwareExpression
             | Self::DeadCodeCatchFollowingCatch
-            | Self::UnusedLabel => DiagnosticType::StaticWarning,
+            | Self::UnusedLabel
+            | Self::UnnecessaryCast
+            | Self::UnnecessaryNonNullAssertion
+            | Self::UnnecessaryTypeCheckTrue
+            | Self::UnnecessaryTypeCheckFalse
+            | Self::TypeCheckWithNull
+            | Self::TypeCheckWithNotNull
+            | Self::NullCheckAlwaysFails
+            | Self::UnnecessaryNullComparisonFalse
+            | Self::UnnecessaryNullComparisonTrue
+            | Self::ConstantPatternNeverMatchesValueType
+            | Self::PatternNeverMatchesValueType
+            | Self::UnnecessaryCastPattern
+            | Self::UnnecessaryNullCheckPattern
+            | Self::UnnecessaryNullAssertPattern => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -731,6 +853,52 @@ impl SemanticCode {
             }
             Self::DeadCodeCatchFollowingCatch => {
                 "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached."
+                    .to_string()
+            }
+            // The #506 provably-check cluster and the #507 disjointness
+            // cluster: verbatim oracle problemMessages
+            // (diagnostic.g.dart, the families cited in the variant docs).
+            Self::UnnecessaryCast => "Unnecessary cast.".to_string(),
+            Self::UnnecessaryNonNullAssertion => {
+                "The '!' will have no effect because the receiver can't be null.".to_string()
+            }
+            Self::UnnecessaryTypeCheckTrue => {
+                "Unnecessary type check; the result is always 'true'.".to_string()
+            }
+            Self::UnnecessaryTypeCheckFalse => {
+                "Unnecessary type check; the result is always 'false'.".to_string()
+            }
+            Self::TypeCheckWithNull => {
+                "Tests for null should be done with '== null'.".to_string()
+            }
+            Self::TypeCheckWithNotNull => {
+                "Tests for non-null should be done with '!= null'.".to_string()
+            }
+            Self::NullCheckAlwaysFails => {
+                "This null-check will always throw an exception because the expression will always evaluate to 'null'."
+                    .to_string()
+            }
+            Self::UnnecessaryNullComparisonFalse => {
+                "The operand can't be 'null', so the condition is always 'false'.".to_string()
+            }
+            Self::UnnecessaryNullComparisonTrue => {
+                "The operand can't be 'null', so the condition is always 'true'.".to_string()
+            }
+            Self::ConstantPatternNeverMatchesValueType => {
+                format!(
+                    "The matched value type '{a0}' can never be equal to this constant of type '{a1}'."
+                )
+            }
+            Self::PatternNeverMatchesValueType => {
+                format!("The matched value type '{a0}' can never match the required type '{a1}'.")
+            }
+            Self::UnnecessaryCastPattern => "Unnecessary cast pattern.".to_string(),
+            Self::UnnecessaryNullCheckPattern => {
+                "The null-check pattern will have no effect because the matched type isn't nullable."
+                    .to_string()
+            }
+            Self::UnnecessaryNullAssertPattern => {
+                "The null-assert pattern will have no effect because the matched type isn't nullable."
                     .to_string()
             }
             Self::UndefinedAnnotation => {
@@ -1110,6 +1278,40 @@ impl SemanticCode {
                 "Try removing the label, or using it in either a 'break' or 'continue' statement."
                     .to_string(),
             ),
+            // The #506/#507 clusters' verbatim oracle correctionMessages
+            // (diagnostic.g.dart, the families cited in the variant docs);
+            // `null_check_always_fails` carries none.
+            Self::UnnecessaryCast => Some("Try removing the cast.".to_string()),
+            Self::UnnecessaryNonNullAssertion => {
+                Some("Try removing the '!' operator.".to_string())
+            }
+            Self::UnnecessaryTypeCheckTrue | Self::UnnecessaryTypeCheckFalse => Some(
+                "Try correcting the type check, or removing the type check.".to_string(),
+            ),
+            Self::TypeCheckWithNull => {
+                Some("Try replacing the 'is Null' check with '== null'.".to_string())
+            }
+            Self::TypeCheckWithNotNull => {
+                Some("Try replacing the 'is! Null' check with '!= null'.".to_string())
+            }
+            Self::UnnecessaryNullComparisonFalse => Some(
+                "Try removing the condition, an enclosing condition, or the whole conditional statement."
+                    .to_string(),
+            ),
+            Self::UnnecessaryNullComparisonTrue => Some("Remove the condition.".to_string()),
+            Self::ConstantPatternNeverMatchesValueType => Some(
+                "Try a constant of the same type as the matched value type.".to_string(),
+            ),
+            Self::PatternNeverMatchesValueType => {
+                Some("Try using a different pattern.".to_string())
+            }
+            Self::UnnecessaryCastPattern => Some("Try removing the cast pattern.".to_string()),
+            Self::UnnecessaryNullCheckPattern => Some(
+                "Try replacing the null-check pattern with its nested pattern.".to_string(),
+            ),
+            Self::UnnecessaryNullAssertPattern => Some(
+                "Try replacing the null-assert pattern with its nested pattern.".to_string(),
+            ),
             _ => None,
         }
     }
@@ -1250,6 +1452,22 @@ mod tests {
             SemanticCode::UnusedImport,
             SemanticCode::DeadNullAwareExpression,
             SemanticCode::DeadCodeCatchFollowingCatch,
+            // The #506 provably-check cluster and the #507 disjointness
+            // cluster.
+            SemanticCode::UnnecessaryCast,
+            SemanticCode::UnnecessaryNonNullAssertion,
+            SemanticCode::UnnecessaryTypeCheckTrue,
+            SemanticCode::UnnecessaryTypeCheckFalse,
+            SemanticCode::TypeCheckWithNull,
+            SemanticCode::TypeCheckWithNotNull,
+            SemanticCode::NullCheckAlwaysFails,
+            SemanticCode::UnnecessaryNullComparisonFalse,
+            SemanticCode::UnnecessaryNullComparisonTrue,
+            SemanticCode::ConstantPatternNeverMatchesValueType,
+            SemanticCode::PatternNeverMatchesValueType,
+            SemanticCode::UnnecessaryCastPattern,
+            SemanticCode::UnnecessaryNullCheckPattern,
+            SemanticCode::UnnecessaryNullAssertPattern,
         ];
         for code in codes {
             let info = code.code_info();
