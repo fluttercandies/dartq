@@ -60,6 +60,25 @@
 //! expressions (one pushed row) so compound operands never lend their type
 //! to the whole expression.
 //!
+//! # The inheritance-override family (#453)
+//!
+//! Name-level `invalid_override` (`inheritance_override.dart:498-546`
+//! `_checkDeclaredMember`): each instance-member declaration of a class,
+//! mixin, or enum is compared against the nearest same-named non-static
+//! member of every direct super-face (the supertype, the `with` mixins in
+//! application order, the `implements` interfaces, and a mixin's `on`
+//! constraints). The verdict chain is kind equality, positional arity,
+//! named-parameter set, then type comparability — a kind mismatch skips
+//! (other checks own it), an unresolvable or cyclic face chain suppresses,
+//! and [`Ty::assignable_from`]'s `None` (distinct named types, unknowns)
+//! suppresses: two types a subclass relation could still relate never
+//! report. Emissions run from the parse listener off the completed element
+//! model, anchored at the member's name span, once per failing face.
+//! Signature texts in the message render the name-level shape we have
+//! (`void Function(int)`-form); the oracle's instantiated function types
+//! are a documented text divergence. Generic-method type-parameter
+//! compatibility and getter/setter cross-shape conflicts under-report.
+
 //! # The frozen-family emit matrix (batch 1 #120, batch 2 #197)
 //!
 //! The batch-1 core (bare names, type positions, prefixed invocations,
@@ -1030,6 +1049,28 @@ impl<'a> Engine<'a> {
         ));
     }
 
+    /// The five-placeholder emit (`message5`).
+    #[allow(clippy::too_many_arguments)] // the template's five slots, one each
+    fn emit5(
+        &mut self,
+        code: SemanticCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+        a2: &str,
+        a3: &str,
+        a4: &str,
+    ) {
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message5(a0, a1, a2, a3, a4),
+            self.file,
+            range,
+            None,
+        ));
+    }
+
     fn record_miss(&mut self, name: StringId, range: SourceRange, qualified: bool, kind: NameUse) {
         self.report.names.push(NameRow {
             name,
@@ -1470,6 +1511,283 @@ impl<'a> Engine<'a> {
             return Walk::ChainBroken;
         };
         self.walk_members(superclass, member)
+    }
+
+    // —— invalid_override (#453: the inheritance-override family) ——————
+
+    /// Checks one instance-member declaration against the container's direct
+    /// super-faces (`.third/dart-sdk`
+    /// `pkg/analyzer/lib/src/error/inheritance_override.dart:498-546`
+    /// `_checkDeclaredMember`): for each face, the nearest same-named
+    /// non-static member; kind mismatches skip (other checks own them), and
+    /// a decidable name-level signature conflict emits `invalid_override` at
+    /// the member's name span. Every unresolvable hop, cycle, or
+    /// incomparable type suppresses — the under-report direction, never a
+    /// false positive.
+    ///
+    /// Runs from the parse listener, so the element model (built by the
+    /// earlier `collect`) is complete and the declaration's name token
+    /// supplies the anchor span. Emissions repeat per failing face, matching
+    /// the oracle's per-superinterface loop.
+    fn check_override(&mut self, spelling: StringId, range: SourceRange) {
+        // Member declarations parse inside a container frame; extensions and
+        // extension types have no inheritance faces.
+        let Some((container, kind)) = self.container_context() else {
+            return;
+        };
+        if matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        ) {
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        let Some(entry) = decl.members.get(&spelling) else {
+            return;
+        };
+        if entry.is_static {
+            return;
+        }
+        // A duplicate (second) declaration keeps the first entry in the
+        // model — this span's signature is not the one recorded, and the
+        // duplicate_definition owns that report.
+        if elements
+            .duplicates()
+            .iter()
+            .any(|d| d.name == spelling && d.range == range)
+        {
+            return;
+        }
+        // The direct super-faces, in the oracle's order: the supertype, the
+        // `with` mixins in application order, the `implements` interfaces,
+        // and the `on` constraints (mixins only — the model leaves the clause
+        // empty for every other kind).
+        let mut faces = Vec::with_capacity(
+            usize::from(decl.superclass.is_some())
+                + decl.with_clause.len()
+                + decl.implements_clause.len()
+                + decl.on_clause.len(),
+        );
+        faces.extend(decl.superclass);
+        faces.extend(decl.with_clause.iter().copied());
+        faces.extend(decl.implements_clause.iter().copied());
+        faces.extend(decl.on_clause.iter().copied());
+        for face in faces {
+            let Some((inherited, face_name)) = self.face_member(face, spelling) else {
+                // Unresolvable or cyclic face chain: suppression territory
+                // (recovery residue in a clause lands here too).
+                continue;
+            };
+            if inherited.kind != entry.kind {
+                continue;
+            }
+            if Self::override_broken(entry, inherited) {
+                let display = self.strings.resolve(spelling);
+                let display = display.strip_suffix('=').unwrap_or(display);
+                let container_text = self.strings.resolve(container);
+                let declared_text = self.override_signature_text(entry);
+                let face_text = self.strings.resolve(face_name);
+                let inherited_text = self.override_signature_text(inherited);
+                let code = if entry.kind == MemberKind::Setter {
+                    SemanticCode::InvalidOverrideSetter
+                } else {
+                    SemanticCode::InvalidOverride
+                };
+                self.emit5(
+                    code,
+                    range,
+                    display,
+                    container_text,
+                    &declared_text,
+                    face_text,
+                    &inherited_text,
+                );
+            }
+        }
+    }
+
+    /// The nearest non-static `spelling` member on `face`'s chain: the face
+    /// container itself, then direct-superclass name edges (each hop
+    /// resolved file-locally first, then through the namespace; the visited
+    /// set guards cycles). `None` = an unresolvable or cyclic hop — the
+    /// caller suppresses rather than reports.
+    fn face_member(
+        &self,
+        face: StringId,
+        spelling: StringId,
+    ) -> Option<(&'a MemberEntry, StringId)> {
+        let mut name = face;
+        let mut owner = self.file;
+        let mut seen = FxHashSet::default();
+        loop {
+            if !seen.insert(name) {
+                return None;
+            }
+            let (found, found_owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                owner,
+                name,
+            )?;
+            if let Some(entry) = found.members.get(&spelling)
+                && !entry.is_static
+            {
+                return Some((entry, name));
+            }
+            name = found.superclass?;
+            owner = found_owner;
+        }
+    }
+
+    /// The name-level signature verdict: `true` only when the equal-kind
+    /// members are decuably incompatible — a positional-arity mismatch, a
+    /// named-parameter set mismatch, or a nullability-decidable type
+    /// conflict. An incomparable type pair ([`Ty::assignable_from`]'s
+    /// `None`) suppresses: two distinct named types could still relate
+    /// through an unseen subclass edge, and an untyped shape declares
+    /// nothing to compare.
+    fn override_broken(declared: &MemberEntry, inherited: &MemberEntry) -> bool {
+        // A field's face is its declared type; every executable's is its
+        // return type.
+        let member_ty = |e: &MemberEntry| {
+            if e.kind == MemberKind::Field {
+                e.var_ty
+            } else {
+                e.return_ty
+            }
+        };
+        match (declared.formals.as_deref(), inherited.formals.as_deref()) {
+            (Some(a), Some(b)) => {
+                // Positional arity, then the named set: both decidable at
+                // the name level.
+                if a.positional.len() != b.positional.len()
+                    || a.named.len() != b.named.len()
+                    || a.named.iter().any(|f| b.named_formal(f.name).is_none())
+                {
+                    return true;
+                }
+                // Parameter types are contravariant: the declared parameter
+                // must accept the inherited parameter's values.
+                for (d, i) in a.positional.iter().zip(&b.positional) {
+                    match d.ty.assignable_from(i.ty) {
+                        Some(false) => return true,
+                        Some(true) => {}
+                        None => return false,
+                    }
+                }
+                for d in &a.named {
+                    let Some(i) = b.named_formal(d.name) else {
+                        return false;
+                    };
+                    match d.ty.assignable_from(i.ty) {
+                        Some(false) => return true,
+                        Some(true) => {}
+                        None => return false,
+                    }
+                }
+            }
+            (None, None) => {}
+            // A parameter-list mix on equal kinds is recovery residue.
+            _ => return false,
+        }
+        // The result type is covariant: the declared result must fit the
+        // inherited one.
+        matches!(
+            member_ty(inherited).assignable_from(member_ty(declared)),
+            Some(false)
+        )
+    }
+
+    /// The member's name-level signature text (the message's type slots, in
+    /// the oracle's function-type shape): nullary faces render
+    /// `{ty} Function()`, methods render their parameter list, setters
+    /// `void Function({ty})`. Absent declared types render `dynamic` — the
+    /// implicit declared type the oracle would display.
+    fn override_signature_text(&self, entry: &MemberEntry) -> String {
+        match entry.kind {
+            MemberKind::Method => {
+                let params = match entry.formals.as_deref() {
+                    Some(formals) => {
+                        let mut parts: Vec<String> = formals
+                            .positional
+                            .iter()
+                            .map(|f| self.declared_ty_text(f.ty))
+                            .collect();
+                        if !formals.named.is_empty() {
+                            let named = formals
+                                .named
+                                .iter()
+                                .map(|f| {
+                                    let text = format!(
+                                        "{} {}",
+                                        self.declared_ty_text(f.ty),
+                                        self.strings.resolve(f.name)
+                                    );
+                                    if f.required {
+                                        format!("required {text}")
+                                    } else {
+                                        text
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            parts.push(format!("{{{named}}}"));
+                        }
+                        parts.join(", ")
+                    }
+                    None => String::new(),
+                };
+                format!(
+                    "{} Function({params})",
+                    self.declared_ty_text(entry.return_ty)
+                )
+            }
+            MemberKind::Getter | MemberKind::Field => {
+                let ty = if entry.kind == MemberKind::Field {
+                    entry.var_ty
+                } else {
+                    entry.return_ty
+                };
+                format!("{} Function()", self.declared_ty_text(ty))
+            }
+            MemberKind::Setter => {
+                let ty = entry
+                    .formals
+                    .as_deref()
+                    .and_then(|f| f.positional.first())
+                    .map_or(Ty::UNKNOWN, |p| p.ty);
+                format!("void Function({})", self.declared_ty_text(ty))
+            }
+        }
+    }
+
+    /// The declared-type text as the oracle renders it: `dynamic` for an
+    /// absent type (the implicit declared type), `Null`/`void` keep their
+    /// spellings, a named type gains the syntactic `?`. Unlike
+    /// [`Engine::ty_display`] (whose unknowns stay empty for its
+    /// suppression-shaped callers), an override signature always names its
+    /// types.
+    fn declared_ty_text(&self, ty: Ty) -> String {
+        match ty {
+            Ty::Unknown | Ty::Dynamic => "dynamic".to_string(),
+            Ty::Null => "Null".to_string(),
+            Ty::Void => "void".to_string(),
+            Ty::Named { name, nullable } => {
+                let text = self.strings.resolve(name);
+                if nullable {
+                    format!("{text}?")
+                } else {
+                    text.to_string()
+                }
+            }
+        }
     }
 
     // —— row stack ———————————————————————————————————————————————————
@@ -4641,13 +4959,29 @@ impl ParserListener for DiagnoseListener<'_> {
         static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
         _var_final_or_const: Option<Token>,
-        _get_or_set: Option<Token>,
-        _name: Token,
+        get_or_set: Option<Token>,
+        name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
         self.engine
             .borrow_mut()
             .push_executable_frame(static_kw.is_none());
+        // The `invalid_override` check runs at the declaration head: the
+        // element model is already complete (`collect` parsed before this
+        // pass), and this event carries the name token whose span anchors
+        // the emission. Setters live under `name=` in the model.
+        let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
+        let Some(name) = engine.name_of(name) else {
+            return;
+        };
+        let is_setter = get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
+        let spelling = if is_setter {
+            engine.setter_spelling(name)
+        } else {
+            name
+        };
+        engine.check_override(spelling, name_range);
     }
 
     fn end_method(
@@ -4973,10 +5307,14 @@ impl ParserListener for DiagnoseListener<'_> {
             // Field groups (class fields, enum body fields, top-level
             // variables): const groups queue the names for their
             // initializer windows; non-const top-level variables join the
-            // provable non-const set.
+            // provable non-const set. Class fields also enter the
+            // invalid_override check (their face is the declared type).
             C::FieldDeclaration | C::TopLevelVariableDeclaration => {
                 if let Some(name) = name {
                     engine.const_decl_name(name, true);
+                    if context == C::FieldDeclaration {
+                        engine.check_override(name, token.range);
+                    }
                 }
             }
             _ => {}
@@ -9312,5 +9650,238 @@ mod tests {
         // `d` interpolates an unknown constant (`b` folds deferred) —
         // clean; `w` reads a deferred creation — clean.
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    // —— invalid_override (#453) ——————————————————————————————————————
+
+    /// An equal-kind method whose positional arity differs from the
+    /// inherited member emits `invalid_override` at the declaring member's
+    /// name span.
+    ///
+    /// Hand-trace: `B.f` (1 positional) vs the nearest `f` on the `A` face
+    /// (0 positional) — the arity arm decides before any type question.
+    #[test]
+    fn arity_mismatch_emits_invalid_override() {
+        let rep =
+            report("class int {} class A { void f() {} } class B extends A { void f(int x) {} }");
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function()')."
+        );
+    }
+
+    /// An equal-arity method whose named-parameter set differs from the
+    /// inherited member emits too.
+    #[test]
+    fn named_set_mismatch_emits_invalid_override() {
+        let rep = report(
+            "class int {} class A { void f(int x) {} } \
+             class B extends A { void f(int x, {int y}) {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.f' ('void Function(int, {int y})') isn't a valid override of 'A.f' ('void Function(int)')."
+        );
+    }
+
+    /// The type arm emits only when nullability decides: a nullable getter
+    /// result over a non-nullable one is a decidable violation; two
+    /// distinct non-nullable named types are incomparable at the name
+    /// level (`assignable_from` answers `None`) — suppress, the
+    /// documented under-report direction.
+    #[test]
+    fn type_verdict_follows_assignable_from() {
+        let rep = report(
+            "class int {} class A { int get f => 1; } class B extends A { int? get f => 2; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.f' ('int? Function()') isn't a valid override of 'A.f' ('int Function()')."
+        );
+        let rep = report(
+            "class int {} class String {} class A { String f() => 'x'; } \
+             class B extends A { int f() => 1; }",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// Static members take no part in overriding: a static inherited
+    /// member is invisible to the face walk, and a static declaration is
+    /// skipped before any comparison.
+    #[test]
+    fn static_members_are_skipped() {
+        let rep = report(
+            "class int {} class A { static void f() {} } class B extends A { void f(int x) {} }",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        let rep = report(
+            "class int {} class A { void f() {} } class B extends A { static void f(int x) {} }",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// An unresolvable superclass suppresses the whole check for its
+    /// dependents — the chain break is suppression territory, never a
+    /// report. (The broken superclass edge also makes every member walk
+    /// from `B` chain-break, so the header's own unresolved name stays
+    /// silent under the same false-positive defense.)
+    #[test]
+    fn unresolved_superclass_suppresses() {
+        let rep = report("class B extends Missing { void f(int x) {} } class int {}");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// A mixin's `on` constraints are super-faces for its own members: a
+    /// mixin member clashing with an `on`-type member emits.
+    #[test]
+    fn mixin_on_constraint_is_a_super_face() {
+        let rep = report("class int {} class A { void f(int x) {} } mixin M on A { void f() {} }");
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'M.f' ('void Function()') isn't a valid override of 'A.f' ('void Function(int)')."
+        );
+    }
+
+    /// A field's face is its declared type: a nullable field type over a
+    /// non-nullable inherited field emits (the FieldDeclaration hook).
+    #[test]
+    fn field_over_field_decidable_nullability_emits() {
+        let rep = report("class int {} class A { int x = 1; } class B extends A { int? x = 2; }");
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.x' ('int? Function()') isn't a valid override of 'A.x' ('int Function()')."
+        );
+    }
+
+    /// The setter variant keeps the `invalid_override` code name and
+    /// swaps the message text; a decidable contravariant parameter
+    /// conflict (non-nullable declared setter parameter over a nullable
+    /// inherited one) emits.
+    #[test]
+    fn setter_variant_keeps_the_code_name() {
+        let rep = report(
+            "class int {} class A { set f(int? x) {} } class B extends A { set f(int y) {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "The setter 'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function(int?)')."
+        );
+    }
+
+    /// The residency widening pays off: a superclass in another resident
+    /// library (same package, two files) resolves through the namespace
+    /// hop, so the override verdict fires across the file seam.
+    #[test]
+    fn cross_file_superclass_emits() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        let source_a = "class A { void f() {} }";
+        let source_m = "import 'a.dart'; class int {} class B extends A { void f(int x) {} }";
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned_a = dartq_scanner::scan(
+            source_a,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_a,
+        );
+        let scanned_m = dartq_scanner::scan(
+            source_m,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_m,
+        );
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:t/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, _) in elements_a.declarations() {
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let rep = diagnose(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function()')."
+        );
     }
 }

@@ -250,6 +250,19 @@ pub enum SemanticCode {
     ConstEvalMethodInvocation,
     /// `The compile-time constant expression depends on itself.`
     RecursiveCompileTimeConstant,
+    // —— #453: the inheritance-override family (all `COMPILE_TIME_ERROR`) ——
+    /// `'{1}.{0}' ('{2}') isn't a valid override of '{3}.{0}' ('{4}').` — an
+    /// instance method, getter, operator, or field face whose name-level
+    /// signature is decuably incompatible with the same-named instance
+    /// member of a direct superinterface (`inheritance_override.dart:498-546`
+    /// `_checkDeclaredMember`). `{2}`/`{4}` render the name-level signature
+    /// we have; the oracle's instantiated function types stay a documented
+    /// text divergence.
+    InvalidOverride,
+    /// `The setter '{1}.{0}' ('{2}') isn't a valid override of '{3}.{0}'
+    /// ('{4}').` — the same verdict for setters (`invalidOverrideSetter`,
+    /// `diagnostic.g.dart:9616-9631`): one code name, dedicated text.
+    InvalidOverrideSetter,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -432,6 +445,12 @@ impl SemanticCode {
                 "recursive_compile_time_constant",
                 "RECURSIVE_COMPILE_TIME_CONSTANT",
             ),
+            // The override family shares one code name; the setter text is a
+            // message-shape distinction (`invalidOverrideSetter` keeps the
+            // `invalid_override` name in the registry).
+            Self::InvalidOverride | Self::InvalidOverrideSetter => {
+                ("invalid_override", "INVALID_OVERRIDE")
+            }
         };
         let dtype = self.dtype();
         // The function variant is the one wrong-number template without a
@@ -623,6 +642,10 @@ impl SemanticCode {
             // The four-placeholder `_element` row routes through `message4`
             // (the kind word leads); real emissions go through `emit4`.
             Self::WrongNumberOfTypeArgumentsElement(kind) => self.message4(kind.word(), a0, a1, ""),
+            // The five-placeholder override rows route through `message5`.
+            Self::InvalidOverride | Self::InvalidOverrideSetter => {
+                self.message5(a0, a1, "", "", "")
+            }
         }
     }
 
@@ -738,6 +761,24 @@ impl SemanticCode {
             _ => self.message(a0, a1),
         }
     }
+
+    /// The verbatim oracle `problemMessage` for the five-placeholder
+    /// `invalid_override` templates (`diagnostic.g.dart:9556-9571` and the
+    /// setter text at :9616-9631): the member and its container name the
+    /// declared face, the two signature texts fill the type slots.
+    #[must_use]
+    pub fn message5(self, a0: &str, a1: &str, a2: &str, a3: &str, a4: &str) -> String {
+        match self {
+            Self::InvalidOverride => {
+                format!("'{a1}.{a0}' ('{a2}') isn't a valid override of '{a3}.{a0}' ('{a4}').")
+            }
+            Self::InvalidOverrideSetter => format!(
+                "The setter '{a1}.{a0}' ('{a2}') isn't a valid override of '{a3}.{a0}' ('{a4}')."
+            ),
+            // Other rows keep their own (shorter) templates.
+            _ => self.message(a0, a1),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -806,6 +847,8 @@ mod tests {
             SemanticCode::ConstEvalPrimitiveEquality,
             SemanticCode::ConstEvalMethodInvocation,
             SemanticCode::RecursiveCompileTimeConstant,
+            SemanticCode::InvalidOverride,
+            SemanticCode::InvalidOverrideSetter,
         ];
         for code in codes {
             let info = code.code_info();
@@ -814,6 +857,11 @@ mod tests {
             assert!(!code.message3("x", "y", "z").is_empty(), "{}", info.name);
             assert!(
                 !code.message4("x", "y", "z", "w").is_empty(),
+                "{}",
+                info.name
+            );
+            assert!(
+                !code.message5("x", "y", "z", "w", "v").is_empty(),
                 "{}",
                 info.name
             );
@@ -920,6 +968,8 @@ mod tests {
             SemanticCode::ConstEvalPrimitiveEquality,
             SemanticCode::ConstEvalMethodInvocation,
             SemanticCode::RecursiveCompileTimeConstant,
+            SemanticCode::InvalidOverride,
+            SemanticCode::InvalidOverrideSetter,
         ];
         for code in codes {
             assert_eq!(
@@ -1053,6 +1103,27 @@ mod tests {
         assert_eq!(
             SemanticCode::UnreachableSwitchDefault.message("", ""),
             "This default clause is covered by the previous cases."
+        );
+        // The #453 override templates: one code name, two message shapes.
+        assert_eq!(
+            SemanticCode::InvalidOverride.message5(
+                "foo",
+                "B",
+                "void Function(int)",
+                "A",
+                "void Function()"
+            ),
+            "'B.foo' ('void Function(int)') isn't a valid override of 'A.foo' ('void Function()')."
+        );
+        assert_eq!(
+            SemanticCode::InvalidOverrideSetter.message5(
+                "foo",
+                "B",
+                "void Function(int?)",
+                "A",
+                "void Function(int)"
+            ),
+            "The setter 'B.foo' ('void Function(int?)') isn't a valid override of 'A.foo' ('void Function(int)')."
         );
     }
 
