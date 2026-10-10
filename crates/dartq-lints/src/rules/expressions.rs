@@ -9,7 +9,7 @@ use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
-use crate::rules::{NONE_TOKEN, first_child, token_seq_equal};
+use crate::rules::{NONE_TOKEN, first_child, slice, token_seq_equal};
 
 pub(crate) mod unnecessary_new {
     use super::{Check, Group, NodeKind, RuleSpec};
@@ -1573,7 +1573,7 @@ pub(crate) mod same_file {
 }
 
 pub(crate) mod null_closures {
-    use super::{Check, Group, NodeKind, RuleSpec, same_file};
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
 
     /// Official: `pkg/linter/lib/src/rules/null_closures.dart` — a `null`
     /// passed in a closure position of a known core API reports at the
@@ -1724,15 +1724,10 @@ pub(crate) mod null_closures {
                 args.zip(creation_slots(c, &decls, &kids))
             }
             // A plain send owns nothing — rebuild from the owner slice.
-            NodeKind::Send => c.ancestor(1).and_then(|parent| {
-                let kids = c.collect_direct(parent);
-                let pos = kids.iter().position(|&kid| kid == node)?;
-                let args = *kids.get(pos.checked_sub(1)?)?;
-                if c.kind(args) != NodeKind::Arguments {
-                    // A `NoArguments` send is a function tear-off.
-                    return None;
-                }
-                send_slots(c, &decls, &kids, pos).map(|s| (args, s))
+            NodeKind::Send => slice::owner_slice(c).and_then(|(kids, pos)| {
+                let (head, args) = slice::send_parts(c, &kids, pos)?;
+                // A `None` argument list is a function tear-off.
+                send_slots(c, &decls, &kids, head, pos).and_then(|s| Some((args?, s)))
             }),
             _ => return,
         };
@@ -1784,34 +1779,19 @@ pub(crate) mod null_closures {
     }
 
     /// The send face over the owner slice with the invocation send at
-    /// `pos`: the argument list sits immediately before it and the callee
-    /// head before that (skipping the type-argument wrapper). A trailing
-    /// same-span `DotAccess` marker switches to the member faces.
+    /// `pos` and its callee head at `head`: a trailing same-span
+    /// `DotAccess` marker switches to the member faces.
     fn send_slots<'a>(
         c: &'a Check<'a>,
         decls: &same_file::Decls,
         kids: &[u32],
+        head: usize,
         pos: usize,
     ) -> Option<Slots> {
-        let mut head = pos.checked_sub(2)?;
-        while matches!(
-            c.kind(kids[head]),
-            NodeKind::TypeArguments | NodeKind::NoTypeArguments
-        ) {
-            head = head.checked_sub(1)?;
-        }
         if c.kind(kids[head]) != NodeKind::Identifier {
             return None;
         }
-        let member_face = match kids.get(pos + 1) {
-            Some(&access)
-                if c.kind(access) == NodeKind::DotAccess
-                    && c.utf16_span(access) == c.utf16_span(kids[pos]) =>
-            {
-                Some(access)
-            }
-            _ => None,
-        };
+        let member_face = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match member_face {
             None => unnamed_slots(c, decls, c.lexeme(c.head_token(kids[head]))),
             Some(access) => member_slots(c, decls, kids, head, access),
@@ -1834,30 +1814,14 @@ pub(crate) mod null_closures {
         sel: usize,
         _access: u32,
     ) -> Option<Slots> {
-        if sel < 4 {
+        let group_start = sel.checked_sub(4)?;
+        if !slice::is_tear_off_group(c, kids, group_start) {
             return None;
         }
         let member = c.lexeme(c.head_token(kids[sel]));
-        let group = [kids[sel - 4], kids[sel - 3], kids[sel - 2], kids[sel - 1]];
-        if !matches!(
-            (
-                c.kind(group[0]),
-                c.kind(group[1]),
-                c.kind(group[2]),
-                c.kind(group[3])
-            ),
-            (
-                NodeKind::Identifier,
-                NodeKind::NoTypeArguments | NodeKind::TypeArguments,
-                NodeKind::NoArguments,
-                NodeKind::Send
-            )
-        ) {
-            return None;
-        }
-        let written = c.lexeme(c.head_token(group[0]));
+        let written = c.lexeme(c.head_token(kids[group_start]));
         named_slots(c, decls, written, member).or_else(|| {
-            let verdict = same_file::written_type(c, group[0], written)
+            let verdict = same_file::written_type(c, kids[group_start], written)
                 .map_or(same_file::Verdict::NotCore, |ty| {
                     same_file::resolve(c, decls, ty, CORE_TYPES)
                 });
@@ -1887,11 +1851,8 @@ pub(crate) mod null_closures {
             }
             // The marker anchors at the value head: `name : value` are
             // three consecutive tokens, so the name is the identifier two
-            // tokens back.
-            let value_head = c.head_token(marker);
-            let Some(name_idx) = pieces[..j].iter().rposition(|&p| {
-                c.kind(p) == NodeKind::Identifier && c.head_token(p) + 2 == value_head
-            }) else {
+            // tokens back (`slice::named_arg_name`).
+            let Some(name_idx) = slice::named_arg_name(c, &pieces, j) else {
                 continue;
             };
             consumed[name_idx] = true;
@@ -4316,6 +4277,17 @@ mod tests {
 
     fn field_hits(f: &Fixture) -> Vec<crate::engine::Lint> {
         f.run(&one_rule("prefer_final_fields"))
+    }
+
+    /// Through the production bridge: a private initialized field never
+    /// mutated reports at the variable declaration (the candidate walk
+    /// reads the real `Fields` tiling).
+    #[test]
+    fn final_fields_reports_on_real_parse() {
+        let f = Fixture::parse("class C {\n  int _x = 0;\n}\n");
+        let lints = field_hits(&f);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "The private field _x could be 'final'.");
     }
 
     /// An assignment statement over the field name, as a unit-level sibling.

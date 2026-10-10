@@ -9,7 +9,7 @@ use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
-use crate::rules::{NONE_TOKEN, first_child, member_name, type_before};
+use crate::rules::{NONE_TOKEN, first_child, member_name, slice, type_before};
 
 pub(crate) mod avoid_return_types_on_setters {
     use super::{Check, Group, NodeKind, RuleSpec};
@@ -284,7 +284,7 @@ pub(crate) mod prefer_generic_function_type_aliases {
 }
 
 pub(crate) mod unnecessary_constructor_name {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, Group, NodeKind, RuleSpec, slice};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_constructor_name.dart`
     /// — a written `.new` constructor name reports at the name token. Faces
@@ -295,11 +295,12 @@ pub(crate) mod unnecessary_constructor_name {
     /// name is absent or `new` (the canonical unnamed name, :43-50) —
     /// non-constructor members never count — and the extension-type
     /// exemption (:51-58) bails on a secondary constructor whose primary
-    /// constructor carries no name. The instance-creation face dispatches
-    /// on `Send` with a `Qualified` callee — a syntax-only proxy for
-    /// `InstanceCreationExpression` (the production tiling keeps no
-    /// `Qualified` child on sends, so the face stays on hand-built
-    /// shapes). Message: `diagnostic.g.dart` `unnecessaryConstructorName`.
+    /// constructor carries no name. The instance-creation face (:59-62)
+    /// reads the owner slice (`rules::slice`): the `.new` member invocation
+    /// over a bare receiver, `Foo.new(…)` — a constructor tear-off is no
+    /// instance creation, and prefixed or chained receivers fail the
+    /// bare-receiver group check (the documented conservative family).
+    /// Message: `diagnostic.g.dart` `unnecessaryConstructorName`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_constructor_name",
         group: Group::Recommended,
@@ -318,7 +319,7 @@ pub(crate) mod unnecessary_constructor_name {
         match c.kind(node) {
             NodeKind::Constructor => check_declaration(c, node),
             NodeKind::PrimaryConstructor => check_primary(c, node),
-            NodeKind::Send => check_creation(c, node),
+            NodeKind::Send => check_creation(c),
             _ => {}
         }
     }
@@ -451,32 +452,33 @@ pub(crate) mod unnecessary_constructor_name {
         c.report(start..start, &[]);
     }
 
-    fn check_creation(c: &mut Check<'_>, node: u32) {
-        let callee = c.direct_children(node).iter().copied().find(|&kid| {
-            !matches!(
-                c.kind(kid),
-                NodeKind::Arguments | NodeKind::NoArguments | NodeKind::TypeApplication
-            )
-        });
-        let Some(callee) = callee else {
+    fn check_creation(c: &mut Check<'_>) {
+        // The production tiling keeps no children on the send: the `.new`
+        // invocation reads the owner slice — argument list at `pos - 1`
+        // (`None` is a constructor tear-off, not an instance creation),
+        // the `.new` name head before that, and the bare-receiver tear-off
+        // group behind the name.
+        let Some((kids, pos)) = slice::owner_slice(c) else {
             return;
         };
-        if c.kind(callee) != NodeKind::Qualified {
-            return;
-        }
-        let Some(name) = c
-            .direct_children(callee)
-            .iter()
-            .copied()
-            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
-            .nth(1)
-        else {
+        let Some((head, args)) = slice::send_parts(c, &kids, pos) else {
             return;
         };
-        if c.lexeme(c.head_token(name)) != "new" {
+        let Some(_) = args else {
+            return;
+        };
+        let Some(group_start) = head.checked_sub(4) else {
+            return;
+        };
+        if !slice::is_tear_off_group(c, &kids, group_start) {
             return;
         }
-        let token = c.head_token(name);
+        if c.kind(kids[head]) != NodeKind::Identifier
+            || c.lexeme(c.head_token(kids[head])) != "new"
+        {
+            return;
+        }
+        let token = c.head_token(kids[head]);
         let start = c
             .unit
             .tokens
@@ -1956,6 +1958,25 @@ mod tests {
         assert!(f.run(&one_rule("unnecessary_late")).is_empty());
     }
 
+    /// The static-field face through the production bridge: the bridge's
+    /// `Fields` word 0 is the `MemberKind` discriminant and the `late`
+    /// head contract holds on real parses; the instance face on the same
+    /// parse path stays silent.
+    #[test]
+    fn unnecessary_late_static_field_reports_on_real_parse() {
+        let f = Fixture::parse("class A {\n  static late var x = 1;\n}\n");
+        let lints = f.run(&one_rule("unnecessary_late"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary 'late' modifier.");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "late", 0))
+        );
+
+        let f = Fixture::parse("class A {\n  late var x = 1;\n}\n");
+        assert!(f.run(&one_rule("unnecessary_late")).is_empty());
+    }
+
     /// Static fields report (`unnecessary_late.dart:36-45`).
     #[test]
     fn unnecessary_late_static_field_reports() {
@@ -2330,6 +2351,32 @@ mod tests {
             1,
             "a field sibling is not an unnamed constructor"
         );
+    }
+
+    /// `Foo.new(1)` reports at the `new` name token through the production
+    /// bridge (the creation face reads the owner slice: the `.new` member
+    /// invocation over a bare receiver, `rules::slice`).
+    #[test]
+    fn creation_face_reports_dot_new() {
+        let f = Fixture::parse("void f() { Foo.new(1); }\n");
+        let lints = f.run(&one_rule("unnecessary_constructor_name"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "new", 0))
+        );
+    }
+
+    /// A constructor tear-off (`Foo.new` without the invocation) is not an
+    /// instance creation, and a chained receiver fails the bare-receiver
+    /// group check — the documented conservative family.
+    #[test]
+    fn creation_face_tearoff_and_chained_pass() {
+        let f = Fixture::parse("void f() { g(Foo.new); }\n");
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+
+        let f = Fixture::parse("void f() { a.b.new(1); }\n");
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
     }
 
     /// The primary-constructor face (:70-80): a `.new` primary name

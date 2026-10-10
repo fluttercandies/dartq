@@ -9,13 +9,14 @@
 //! Approximations (documented):
 //! - The creation face is written-name matching. The official resolves the
 //!   constructor (`element.name == 'RegExp' && element.library.isDartCore`,
-//!   :48-50); here the callee chain must be exactly the bare identifier
+//!   :48-50); here the callee head must be exactly the bare identifier
 //!   `RegExp`, over the three creation shapes the parser produces — the
-//!   implicit call `RegExp(...)` (a `Send` whose callee and arguments are the
-//!   siblings ending at it), `const RegExp(...)` (the same `Send` under a
+//!   implicit call `RegExp(...)` (a `Send` reading the owner slice,
+//!   `rules::slice`), `const RegExp(...)` (the same `Send` under a
 //!   `ConstExpression`), and `new RegExp(...)` (a `ConstructorReference`
-//!   inside the `NewExpression`). Prefixed and named-constructor references
-//!   under-report; a user class named `RegExp` over-reports.
+//!   inside the `NewExpression`). Prefixed and chained callees trail a
+//!   same-span `DotAccess` marker and stay silent; a user class named
+//!   `RegExp` over-reports.
 //! - The validation face ports the runtime parser's decision order
 //!   (`RegExp(source, unicode: unicode)` throwing `FormatException`) as a
 //!   recursive-descent accept/reject walk over the ECMAScript pattern
@@ -31,9 +32,10 @@
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
+use crate::rules::slice;
 
 pub(crate) mod valid_regexps {
-    use super::{creation_parts, is_valid, string_value};
+    use super::{creation_parts, is_valid, slice, string_value};
     use crate::engine::Check;
     use crate::registry::{Group, RuleSpec};
     use dartq_ast::NodeKind;
@@ -54,7 +56,7 @@ pub(crate) mod valid_regexps {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let (callee, args) = creation_parts(c, node);
-        // The callee chain is exactly the bare identifier `RegExp` (the
+        // The callee head is exactly the bare identifier `RegExp` (the
         // documented name-level approximation of the resolved-element test).
         let Some(callee) = callee else {
             return;
@@ -65,30 +67,31 @@ pub(crate) mod valid_regexps {
         let Some(args) = args else {
             return; // argument-less tear-off shape: nothing to validate
         };
-        // `unicode: true` named argument (:52-60) — the value must be the
-        // `true` literal (`isTrue`).
-        let unicode = c.collect_direct(args).iter().any(|&arg| {
-            c.kind(arg) == NodeKind::NamedArgument && {
-                let parts = c.collect_direct(arg);
-                c.kind(*parts.first().unwrap_or(&arg)) == NodeKind::Identifier
-                    && c.lexeme(c.head_token(parts[0])) == "unicode"
-                    && parts
-                        .get(1)
-                        .is_some_and(|&value| {
-                            c.kind(value) == NodeKind::LiteralBool
-                                && c.lexeme(c.head_token(value)) == "true"
-                        })
-            }
-        });
-        // `args.first` (:62) — the first positional argument; named arguments
-        // come last in legal Dart, so the first non-named child is it.
-        let Some(&source) = c
-            .collect_direct(args)
-            .iter()
-            .find(|&&arg| c.kind(arg) != NodeKind::NamedArgument)
-        else {
+        let pieces = c.collect_direct(args);
+        let arguments = slice::arguments(c, &pieces);
+        if arguments.is_empty() {
             return;
-        };
+        }
+        // `unicode: true` named argument (:52-60) — the value must be the
+        // `true` literal (`isTrue`); the named group is
+        // `name value NamedArgument`.
+        let unicode = arguments.iter().any(|group| {
+            let marker = group.end - 1;
+            group.len() == 3
+                && c.kind(pieces[marker]) == NodeKind::NamedArgument
+                && c.kind(pieces[group.start]) == NodeKind::Identifier
+                && c.lexeme(c.head_token(pieces[group.start])) == "unicode"
+                && c.kind(pieces[group.start + 1]) == NodeKind::LiteralBool
+                && c.lexeme(c.head_token(pieces[group.start + 1])) == "true"
+        });
+        // `args.first` (:62) — the first argument; named arguments come
+        // last in legal Dart, so a leading named group is not a string
+        // literal and the face skips.
+        let first = &arguments[0];
+        if c.kind(pieces[first.end - 1]) == NodeKind::NamedArgument {
+            return;
+        }
+        let source = pieces[first.start];
         // `sourceExpression is StringLiteral` + `stringValue != null` (:63-65):
         // interpolation makes the value unknown and the face skips.
         if c.kind(source) != NodeKind::StringLiteral {
@@ -104,30 +107,33 @@ pub(crate) mod valid_regexps {
     }
 }
 
-/// The callee chain and the argument list of a creation-shaped call: a
-/// `Send` reads its callee and arguments from the siblings ending at it (the
-/// bridge builds the call leaf last), a `NewExpression` from its children.
-/// The callee is `Some` only when the chain reduces to the single-name forms
-/// the rule matches — one `Identifier` (implicit/const face) or one
-/// `ConstructorReference` holding exactly one `Identifier` (the `new` face).
+/// The callee head and the argument list of a creation-shaped call: a
+/// `Send` reads the owner slice (`rules::slice` — the argument list sits at
+/// `pos - 1`, the callee head before that), a `NewExpression` from its
+/// children. The callee is `Some` only for the single-name forms the rule
+/// matches — one `Identifier` head without a trailing `DotAccess` (a
+/// prefixed or chained callee stays silent — the conservative family), or
+/// one `ConstructorReference` holding exactly one `Identifier` (the `new`
+/// face).
 fn creation_parts(c: &Check<'_>, node: u32) -> (Option<u32>, Option<u32>) {
     match c.kind(node) {
         NodeKind::Send => {
-            let Some(parent) = c.ancestor(1) else {
+            let Some((kids, pos)) = slice::owner_slice(c) else {
                 return (None, None);
             };
-            let siblings = c.collect_direct(parent);
-            let Some(pos) = siblings.iter().position(|&s| s == node) else {
+            // A `None` argument list is a tear-off (`RegExp;`) — no creation.
+            let Some((head, Some(args))) = slice::send_parts(c, &kids, pos) else {
                 return (None, None);
             };
-            let (chain, args) = match pos {
-                0 => (&siblings[..0], None),
-                _ => match c.kind(siblings[pos - 1]) {
-                    NodeKind::Arguments => (&siblings[..pos - 1], Some(siblings[pos - 1])),
-                    _ => (&siblings[..pos], None),
-                },
-            };
-            (chain.first().copied(), args)
+            // A prefixed or chained callee trails a same-span `DotAccess`
+            // marker — the conservative family stays silent.
+            if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
+                return (None, None);
+            }
+            (
+                (c.kind(kids[head]) == NodeKind::Identifier).then_some(kids[head]),
+                Some(args),
+            )
         }
         NodeKind::NewExpression => {
             let kids = c.collect_direct(node);
@@ -1042,45 +1048,38 @@ mod tests {
         assert_eq!(lints[0].range.start, 19);
     }
 
-    /// `unicode: true` flips the validator into strict mode (the named
-    /// argument carries its label and value as children).
+    /// `unicode: true` flips the validator into strict mode, through the
+    /// production bridge: the named argument flattens as
+    /// `name value NamedArgument` pieces in the argument list and the name
+    /// re-anchors two tokens back (`rules::slice`).
     #[test]
     fn unicode_flag_is_read() {
-        // 3:RegExp 4:( 5:r'\q' 6:, 7:unicode 8:: 9:true 10:) 11:;
-        let source = "var s = RegExp(r'\\q', unicode: true);";
-        let f = Fixture::build(source, |b, t| {
-            b.begin(NodeKind::CompilationUnit, 0);
-            b.begin(NodeKind::ExpressionStatement, 0);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::Arguments, 4);
-            b.leaf_span(NodeKind::StringLiteral, 5, 6);
-            b.begin(NodeKind::NamedArgument, 7);
-            b.patch(0, 8);
-            identifier(b, 7, 8);
-            b.leaf(NodeKind::LiteralBool, 9);
-            b.end(NodeKind::NamedArgument, 11);
-            b.end(NodeKind::Arguments, 11);
-            b.leaf_span(NodeKind::Send, 3, 11);
-            b.end(NodeKind::ExpressionStatement, 12);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
-        });
+        let f = Fixture::parse("var s = RegExp(r'\\q', unicode: true);\n");
         assert_eq!(
             rule_hits(&f).len(),
             1,
             "unicode mode rejects the identity escape"
         );
         // Without the flag the same literal is a valid annex-B pattern.
-        let lenient = Fixture::build("var s = RegExp(r'\\q');", |b, t| {
-            b.begin(NodeKind::CompilationUnit, 0);
-            b.begin(NodeKind::ExpressionStatement, 0);
-            identifier(b, 3, 4);
-            b.begin(NodeKind::Arguments, 4);
-            b.leaf_span(NodeKind::StringLiteral, 5, 6);
-            b.end(NodeKind::Arguments, 7);
-            b.leaf_span(NodeKind::Send, 3, 7);
-            b.end(NodeKind::ExpressionStatement, 8);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
-        });
+        let lenient = Fixture::parse("var s = RegExp(r'\\q');\n");
         assert!(rule_hits(&lenient).is_empty());
+    }
+
+    /// A prefixed callee trails the same-span `DotAccess` marker — the
+    /// conservative family stays silent (the official resolves the element
+    /// to dart:core).
+    #[test]
+    fn prefixed_callee_skips() {
+        let f = Fixture::parse("var s = core.RegExp('(');\n");
+        assert!(rule_hits(&f).is_empty());
+    }
+
+    /// The callee head reads off the owner slice: a nested creation still
+    /// reports (`print(RegExp('('))` — the head walk skips the outer
+    /// argument list).
+    #[test]
+    fn nested_callee_reports() {
+        let f = Fixture::parse("void f() { print(RegExp('(')); }\n");
+        assert_eq!(rule_hits(&f).len(), 1);
     }
 }

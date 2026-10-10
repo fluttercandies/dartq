@@ -22,8 +22,8 @@ use std::path::Path;
 use dartq_ast::{AstBuilder, NodeKind, SyntaxTable, TOKEN_NONE};
 use dartq_parser::{
     AssertKind, ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind,
-    ExperimentalFlag, FormalParameterKind, IdentifierContext, ParserFeatures, ParserListener,
-    TokenSpan,
+    ExperimentalFlag, FormalParameterKind, IdentifierContext, MemberKind, ParserFeatures,
+    ParserListener, TokenSpan,
 };
 use dartq_scanner::{ScanConfig, TokenTable, scan};
 use dartq_source::LineIndex;
@@ -180,9 +180,13 @@ pub(crate) struct AstListener {
     /// `const` (when present) is the span head, so the node seals at the end
     /// event with the operand adopted.
     pending_constant_pattern: Option<u32>,
-    /// `ObjectPattern` stays open between `handle_object_pattern` and
-    /// `handle_object_pattern_fields` (the fields parse between them).
-    object_pattern_open: bool,
+    /// `ObjectPattern` fields-first deferral: the fields parse and seal
+    /// BEFORE `handle_object_pattern` fires (official order,
+    /// parser_impl.dart:11847-11848), so the fields event stashes the child
+    /// window start (arena tail) and exclusive end; the object-pattern event
+    /// pops the marker and reassembles, exactly the official builder's
+    /// `_ObjectPatternFields` pop (ast_builder.dart:5362-5410).
+    object_pattern_pending: Option<(u32, u32)>,
     /// `IsExpression`/`AsExpression` defer their seal to the operator handle
     /// event that immediately follows the end event and carries the word.
     deferred_seal: Option<NodeKind>,
@@ -781,11 +785,11 @@ impl ParserListener for AstListener {
 
     fn end_fields(
         &mut self,
-        kind: DeclarationKind,
+        _kind: DeclarationKind,
         _abstract_kw: Option<TokenSpan>,
         _augment_kw: Option<TokenSpan>,
         _external_kw: Option<TokenSpan>,
-        _static_kw: Option<TokenSpan>,
+        static_kw: Option<TokenSpan>,
         _covariant_kw: Option<TokenSpan>,
         _late_kw: Option<TokenSpan>,
         _var_final_or_const: Option<TokenSpan>,
@@ -793,7 +797,17 @@ impl ParserListener for AstListener {
         _begin: TokenSpan,
         end: TokenSpan,
     ) {
-        self.b.patch(0, kind as u32);
+        // Word 0 is the `MemberKind` discriminant (collapse map §3.3; the
+        // official builder derives it the same way from the event's
+        // declaration family + the static modifier, member_kind.dart —
+        // fields only have the static/instance pair here; top-level fields
+        // seal as `TopLevelFields` in `end_top_level_fields`).
+        let member_kind = if static_kw.is_some() {
+            MemberKind::StaticField
+        } else {
+            MemberKind::NonStaticField
+        };
+        self.b.patch(0, member_kind as u32);
         self.end_incl(NodeKind::Fields, end);
     }
 
@@ -2666,20 +2680,28 @@ impl ParserListener for AstListener {
         dot: Option<TokenSpan>,
         second_identifier: Option<TokenSpan>,
     ) {
-        // Opens the container; the fields parse after this event and seal at
-        // handle_object_pattern_fields.
-        self.b.begin(NodeKind::ObjectPattern, self.t(first_identifier.id));
+        // The fields sealed before this event (official
+        // parser_impl.dart:11848 fires it after parseObjectPatternRest);
+        // reassemble the node over the stashed field window — the official
+        // builder pops its `_ObjectPatternFields` marker here
+        // (ast_builder.dart:5362-5397).
+        let (first_child, end) = self
+            .object_pattern_pending
+            .take()
+            .expect("handle_object_pattern without a preceding fields event");
+        self.b.begin_with_first_child(
+            NodeKind::ObjectPattern,
+            self.t(first_identifier.id),
+            first_child,
+        );
         self.b.patch(0, self.t(first_identifier.id));
         self.patch_token(1, dot);
         self.patch_token(2, second_identifier);
-        self.object_pattern_open = true;
+        self.b.end(NodeKind::ObjectPattern, end);
     }
 
     fn handle_object_pattern_fields(&mut self, _count: usize, _begin: TokenSpan, end: TokenSpan) {
-        if self.object_pattern_open {
-            self.object_pattern_open = false;
-            self.end_incl(NodeKind::ObjectPattern, end);
-        }
+        self.object_pattern_pending = Some((self.b.len() as u32, self.t(end.id) + 1));
     }
 
     fn handle_wildcard_pattern(&mut self, keyword: Option<TokenSpan>, wildcard: TokenSpan) {
@@ -2872,6 +2894,30 @@ mod tests {
             let _ = parsed.unit(None);
             let _ = label;
         }
+    }
+
+    #[test]
+    fn object_pattern_with_fields_survives_the_bridge() {
+        // Regression: object-pattern fields sealed before the container
+        // event (official order, parser_impl.dart:11848); the bridge must
+        // reassemble fields-first or every case expression panics. The tree
+        // must carry the ObjectPattern with its PatternFields, and the lint
+        // face must read pattern variables through it.
+        let source = "void f(Object o) {\n  if (o case Rect(w: var BadName)) print(1);\n}\n";
+        let kinds: Vec<NodeKind> = walk(source).into_iter().map(|(kind, _)| kind).collect();
+        assert!(kinds.contains(&NodeKind::ObjectPattern), "object pattern produced");
+        assert!(kinds.contains(&NodeKind::PatternField), "field produced");
+        let hits = hits(source, "non_constant_identifier_names");
+        assert_eq!(hits.len(), 1, "pattern variable name checked");
+    }
+
+    #[test]
+    fn empty_object_pattern_survives_the_bridge() {
+        // The zero-field variant seals with an empty child window.
+        let source = "void f(Object o) {\n  if (o case Rect()) print(1);\n}\n";
+        let kinds: Vec<NodeKind> = walk(source).into_iter().map(|(kind, _)| kind).collect();
+        assert!(kinds.contains(&NodeKind::ObjectPattern));
+        assert!(!kinds.contains(&NodeKind::PatternField));
     }
 
     #[test]

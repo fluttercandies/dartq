@@ -2,16 +2,18 @@
 //! `prefer_spread_collections`, `prefer_collection_literals`,
 //! `unnecessary_to_list_in_spreads`.
 //!
-//! Cascade shape (collapse map §3.5 CascadeEnd): a [`NodeKind::Cascade`]
-//! node's direct children are its sections; the target expression is the
-//! sibling preceding the Cascade among the parent's children (the cascade
-//! operator is the token right after the target's last token). A cascaded
-//! invocation is therefore `Send` → `CascadeAccess` → `Cascade`.
+//! Cascade shape (production tiling, `rules::slice`): a [`NodeKind::Cascade`]
+//! opens at the `..` before its first section parses, so the section's
+//! invocation pieces tile flat inside the cascade window; the
+//! [`NodeKind::CascadeAccess`] marker seals after the first section's send.
+//! A cascaded section send's owner is therefore the cascade itself, and the
+//! first section is the piece run before the marker.
 
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
+use crate::rules::slice;
 
 /// The direct sibling immediately before `id` (the cascade target slot).
 fn sibling_before(c: &Check<'_>, id: u32) -> Option<u32> {
@@ -24,23 +26,31 @@ fn sibling_before(c: &Check<'_>, id: u32) -> Option<u32> {
     kid_pos.checked_sub(1).map(|prev| kids[prev])
 }
 
-/// The `(method name node, arguments node)` of a `Send` invocation: the
-/// callee expression nodes precede the argument list (collapse map §3.5
-/// `PositionalArgumentHandle` D1).
-fn invocation_parts(c: &Check<'_>, send: u32) -> Option<(u32, u32)> {
-    let kids = c.collect_direct(send);
-    let args_pos = kids
-        .iter()
-        .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments | NodeKind::NoArguments))?;
-    let args = kids[args_pos];
-    let name = *kids.get(args_pos.checked_sub(1)?)?;
-    Some((name, args))
+/// The `(method name node, arguments node)` of a cascaded section's
+/// invocation over the production tiling: the section's pieces tile flat
+/// into the [`NodeKind::Cascade`] window (it opens at the `..` before the
+/// section parses), with the [`NodeKind::CascadeAccess`] marker sealing
+/// after the section's send. Rebuilt over the owner slice — the send reads
+/// its parts through [`slice::send_parts`] (`rules::slice`).
+fn invocation_parts(c: &Check<'_>, kids: &[u32], pos: usize) -> Option<(u32, u32)> {
+    let (head, args) = slice::send_parts(c, kids, pos)?;
+    let args = args?;
+    if c.kind(kids[head]) != NodeKind::Identifier {
+        return None;
+    }
+    Some((kids[head], args))
 }
 
-/// Whether the cascade section `access` opens the cascade
-/// (`sections.first == invocation`, prefer_inlined_adds.dart:47-52).
-fn is_first_section(c: &Check<'_>, cascade: u32, access: u32) -> bool {
-    c.collect_direct(cascade).first() == Some(&access)
+/// Whether the cascade section containing the send at `pos` opens the
+/// cascade (`sections.first == invocation`, prefer_inlined_adds.dart:47-52):
+/// the first section's pieces precede its [`NodeKind::CascadeAccess`]
+/// marker; later sections follow it (or a DotAccess-led index section with
+/// no marker at all, which is never a send-led first section).
+fn is_first_section(c: &Check<'_>, kids: &[u32], pos: usize) -> bool {
+    match kids.iter().position(|&kid| c.kind(kid) == NodeKind::CascadeAccess) {
+        Some(marker) => pos < marker,
+        None => false,
+    }
 }
 
 /// The syntactic const-context approximation (the official
@@ -63,32 +73,59 @@ fn in_const_context(c: &Check<'_>, above: usize) -> bool {
 
 /// The shared gate: a first cascaded `add`/`addAll` section with one
 /// argument on a list-literal target. Returns the method-name node and the
-/// argument list node.
-fn cascaded_add(c: &Check<'_>, send: u32, name: &str) -> Option<(u32, u32)> {
-    let (method, args) = invocation_parts(c, send)?;
-    if c.kind(method) != NodeKind::Identifier || c.lexeme(c.head_token(method)) != name {
+/// argument list node. The production tiling puts the section's pieces
+/// flat inside the cascade window, so the send reads the owner slice and
+/// `isCascaded` is the parent being the cascade.
+fn cascaded_add(c: &Check<'_>, name: &str) -> Option<(u32, u32)> {
+    let (kids, pos) = slice::owner_slice(c)?;
+    // `invocation.isCascaded` (:27-29): a section send's owner is the
+    // cascade itself.
+    if c.kind(c.ancestor(1)?) != NodeKind::Cascade {
         return None;
     }
-    // `invocation.isCascaded` (:27-29).
-    let access = c.ancestor(1)?;
-    if c.kind(access) != NodeKind::CascadeAccess {
+    let (method, args) = invocation_parts(c, &kids, pos)?;
+    if c.lexeme(c.head_token(method)) != name {
         return None;
     }
-    let cascade = c.ancestor(2)?;
-    if c.kind(cascade) != NodeKind::Cascade || !is_first_section(c, cascade, access) {
+    if !is_first_section(c, &kids, pos) {
         return None;
     }
     // The cascade target must be a list literal (:42-52 / :44-50).
-    if !matches!(sibling_before(c, cascade), Some(target) if c.kind(target) == NodeKind::ListLiteral)
+    if !matches!(sibling_before(c, c.ancestor(1)?), Some(target) if c.kind(target) == NodeKind::ListLiteral)
     {
         return None;
     }
     // Exactly one argument (:28-29).
-    (c.collect_direct(args).len() == 1).then_some((method, args))
+    (slice::arguments(c, &c.collect_direct(args)).len() == 1).then_some((method, args))
+}
+
+/// Whether the first argument is a list literal: a leading type-argument
+/// piece may tile beside the literal, and a named argument is a
+/// `NamedExpression` — never a literal (the official
+/// `arguments.first is! ListLiteral`).
+fn first_argument_list_literal(c: &Check<'_>, args: u32) -> bool {
+    let pieces = c.collect_direct(args);
+    let groups = slice::arguments(c, &pieces);
+    let Some(first) = groups.first() else {
+        return false;
+    };
+    let group = &pieces[first.clone()];
+    match group {
+        [only] => c.kind(*only) == NodeKind::ListLiteral,
+        [tyargs, only]
+            if matches!(
+                c.kind(*tyargs),
+                NodeKind::NoTypeArguments | NodeKind::TypeArguments
+            ) =>
+        {
+            c.kind(*only) == NodeKind::ListLiteral
+        }
+        _ => false,
+    }
 }
 
 pub(crate) mod prefer_inlined_adds {
-    use super::{Check, Group, NodeKind, RuleSpec, cascaded_add};
+    use super::{Check, Group, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_inlined_adds.dart:22-58` —
     /// the first cascaded `add`/`addAll` on a list literal with one argument
@@ -106,19 +143,16 @@ pub(crate) mod prefer_inlined_adds {
     };
 
     fn check(c: &mut Check<'_>) {
-        let node = c.node();
         let Some((method, args)) =
-            cascaded_add(c, node, "add").or_else(|| cascaded_add(c, node, "addAll"))
+            cascaded_add(c, "add").or_else(|| cascaded_add(c, "addAll"))
         else {
             return;
         };
         let add_all = c.lexeme(c.head_token(method)) == "addAll";
-        if add_all {
+        if add_all && !first_argument_list_literal(c, args) {
             // A list-literal argument is inlined here; anything else is the
             // spread rule's finding (:53-55).
-            if c.kind(c.collect_direct(args)[0]) != NodeKind::ListLiteral {
-                return;
-            }
+            return;
         }
         let range = c.utf16_span(method);
         if add_all {
@@ -140,7 +174,10 @@ pub(crate) mod prefer_inlined_adds {
 }
 
 pub(crate) mod prefer_spread_collections {
-    use super::{Check, Group, NodeKind, RuleSpec, cascaded_add, in_const_context};
+    use super::{
+        Check, Group, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal,
+        in_const_context,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/prefer_spread_collections.dart:22-55`
     /// — the first cascaded `addAll` on a non-constant list literal whose
@@ -157,8 +194,7 @@ pub(crate) mod prefer_spread_collections {
     };
 
     fn check(c: &mut Check<'_>) {
-        let node = c.node();
-        let Some((method, args)) = cascaded_add(c, node, "addAll") else {
+        let Some((method, args)) = cascaded_add(c, "addAll") else {
             return;
         };
         // `target.inConstantContext` (:46-49) — syntactic approximation on
@@ -166,7 +202,7 @@ pub(crate) mod prefer_spread_collections {
         if in_const_context(c, c.path.len()) {
             return;
         }
-        if c.kind(c.collect_direct(args)[0]) == NodeKind::ListLiteral {
+        if first_argument_list_literal(c, args) {
             // Handled by prefer_inlined_adds (:50-53).
             return;
         }
@@ -176,7 +212,7 @@ pub(crate) mod prefer_spread_collections {
 }
 
 pub(crate) mod prefer_collection_literals {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, Group, NodeKind, RuleSpec, slice};
     use crate::rules::expressions::same_file;
 
     const PROBLEM: &str = "Unnecessary constructor invocation.";
@@ -240,13 +276,10 @@ pub(crate) mod prefer_collection_literals {
                 owned_creation(c, &decls, &kids, args)
             }
             // A plain send owns nothing — rebuild from the owner slice.
-            NodeKind::Send => c.ancestor(1).is_some_and(|parent| {
-                let kids = c.collect_direct(parent);
-                let Some(pos) = kids.iter().position(|&kid| kid == node) else {
-                    return false;
-                };
-                send_face(c, &decls, &kids, pos)
-            }),
+            NodeKind::Send => match slice::owner_slice(c) {
+                Some((kids, pos)) => send_face(c, &decls, &kids, pos),
+                None => false,
+            },
             _ => false,
         };
         if !report {
@@ -311,43 +344,26 @@ pub(crate) mod prefer_collection_literals {
     /// The send face over the owner slice with the invocation send at
     /// `pos`: the argument list sits immediately before it and the callee
     /// head before that (skipping the type-argument wrapper). A trailing
-    /// same-span `DotAccess` marker switches to the member faces.
+    /// same-span `DotAccess` marker switches to the member faces. A
+    /// `NoArguments` send is a tear-off — no invocation, no face.
     fn send_face(c: &Check<'_>, decls: &same_file::Decls, kids: &[u32], pos: usize) -> bool {
-        let Some(&args) = pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+        let Some((head, args)) = slice::send_parts(c, kids, pos) else {
             return false;
         };
-        let Some(mut head) = pos.checked_sub(2) else {
-            return false;
-        };
-        while matches!(
-            c.kind(kids[head]),
-            NodeKind::TypeArguments | NodeKind::NoTypeArguments
-        ) {
-            match head.checked_sub(1) {
-                Some(next) => head = next,
-                None => return false,
-            }
-        }
         if c.kind(kids[head]) != NodeKind::Identifier {
             return false;
         }
-        let access = match kids.get(pos + 1) {
-            Some(&access)
-                if c.kind(access) == NodeKind::DotAccess
-                    && c.utf16_span(access) == c.utf16_span(kids[pos]) =>
-            {
-                Some(access)
-            }
-            _ => None,
-        };
         let selector = c.lexeme(c.head_token(kids[head]));
-        match access {
-            None => unnamed_face(c, decls, selector, args),
-            Some(_) if selector == "from" || selector == "of" => {
+        let access = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
+        match (access, args) {
+            (None, Some(args)) => unnamed_face(c, decls, selector, args),
+            (Some(_), Some(args)) if selector == "from" || selector == "of" => {
                 named_face(c, decls, kids, head, args)
             }
-            Some(access) if selector == "toSet" => to_set_face(c, kids, head, access),
-            Some(_) => false,
+            (Some(access), Some(_)) if selector == "toSet" => {
+                to_set_face(c, kids, head, access)
+            }
+            _ => false,
         }
     }
 
@@ -361,27 +377,13 @@ pub(crate) mod prefer_collection_literals {
         sel: usize,
         args: u32,
     ) -> bool {
-        if sel < 4 {
+        let Some(group_start) = sel.checked_sub(4) else {
+            return false;
+        };
+        if !slice::is_tear_off_group(c, kids, group_start) {
             return false;
         }
-        let group = [kids[sel - 4], kids[sel - 3], kids[sel - 2], kids[sel - 1]];
-        if !matches!(
-            (
-                c.kind(group[0]),
-                c.kind(group[1]),
-                c.kind(group[2]),
-                c.kind(group[3])
-            ),
-            (
-                NodeKind::Identifier,
-                NodeKind::NoTypeArguments | NodeKind::TypeArguments,
-                NodeKind::NoArguments,
-                NodeKind::Send
-            )
-        ) {
-            return false;
-        }
-        let written = c.lexeme(c.head_token(group[0]));
+        let written = c.lexeme(c.head_token(kids[group_start]));
         if !NAMED_SET.contains(&written) || same_file::declares_name(c, decls, written) {
             return false;
         }
@@ -829,150 +831,47 @@ mod tests {
     use crate::testsupport::{Fixture, NONE, identifier, one_rule, unit_of, utf16_at};
 
     /// `[]..addAll([1, 2]);` — a cascaded list-literal addAll reports with
-    /// the multiple template (`test/rules/prefer_inlined_adds_test.dart`).
+    /// the multiple template (`test/rules/prefer_inlined_adds_test.dart`),
+    /// through the production bridge: the section's pieces tile flat inside
+    /// the cascade window and the method name reads off the owner slice.
     #[test]
     fn inlined_adds_reports_addall_of_list_literal() {
-        let source = "[]..addAll([1, 2]);";
-        // []0 ..1 addAll2 (3 [4 15 ,6 27 ]8 )9 ;10
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::ListLiteral, 0);
-                b.patch(0, NONE);
-                b.end(NodeKind::ListLiteral, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 1);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 2);
-                identifier(b, 2, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.begin(NodeKind::ListLiteral, 4);
-                b.patch(0, NONE);
-                b.leaf(NodeKind::LiteralInt, 5);
-                b.leaf(NodeKind::LiteralInt, 7);
-                b.end(NodeKind::ListLiteral, 9);
-                b.end(NodeKind::Arguments, 10);
-                b.end(NodeKind::Send, 10);
-                b.end(NodeKind::CascadeAccess, 10);
-                b.end(NodeKind::Cascade, 10);
-                b.end(NodeKind::ExpressionStatement, 11);
-            }),
-        );
+        let f = Fixture::parse("void f() { []..addAll([1, 2]); }\n");
         let lints = f.run(&one_rule("prefer_inlined_adds"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
             "The addition of multiple list items could be inlined."
         );
-        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+        assert_eq!(lints[0].range.start, utf16_at(&f, 7));
         assert!(f.run(&one_rule("prefer_spread_collections")).is_empty());
     }
 
     /// `[]..add(1);` — the single template.
     #[test]
     fn inlined_adds_reports_add() {
-        let source = "[]..add(1);";
-        // []0 ..1 add2 (3 14 )5 ;6
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::ListLiteral, 0);
-                b.patch(0, NONE);
-                b.end(NodeKind::ListLiteral, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 1);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 2);
-                identifier(b, 2, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.leaf(NodeKind::LiteralInt, 4);
-                b.end(NodeKind::Arguments, 6);
-                b.end(NodeKind::Send, 6);
-                b.end(NodeKind::CascadeAccess, 6);
-                b.end(NodeKind::Cascade, 6);
-                b.end(NodeKind::ExpressionStatement, 7);
-            }),
-        );
+        let f = Fixture::parse("void f() { []..add(1); }\n");
         let lints = f.run(&one_rule("prefer_inlined_adds"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
             "The addition of a list item could be inlined."
         );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
     }
 
     /// A non-first section is skipped (`sections.first == invocation`).
     #[test]
     fn inlined_adds_second_section_passes() {
-        let source = "[]..addAll(1, 2)..add(3);";
-        // []0 ..1 addAll2 (3 14 ,5 26 )7 ..8 add9 (10 311 )12 ;13
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::ListLiteral, 0);
-                b.patch(0, NONE);
-                b.end(NodeKind::ListLiteral, 1);
-                b.begin(NodeKind::Cascade, 1);
-                // Section 1: two arguments — passes the count gate.
-                b.begin(NodeKind::CascadeAccess, 1);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 2);
-                identifier(b, 2, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.leaf(NodeKind::LiteralInt, 4);
-                b.leaf(NodeKind::LiteralInt, 6);
-                b.end(NodeKind::Arguments, 8);
-                b.end(NodeKind::Send, 8);
-                b.end(NodeKind::CascadeAccess, 8);
-                // Section 2: one argument but not the first section.
-                b.begin(NodeKind::CascadeAccess, 8);
-                b.patch(0, 8);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 9);
-                identifier(b, 9, 10);
-                b.begin(NodeKind::Arguments, 10);
-                b.leaf(NodeKind::LiteralInt, 11);
-                b.end(NodeKind::Arguments, 13);
-                b.end(NodeKind::Send, 13);
-                b.end(NodeKind::CascadeAccess, 13);
-                b.end(NodeKind::Cascade, 13);
-                b.end(NodeKind::ExpressionStatement, 14);
-            }),
-        );
+        let f = Fixture::parse("void f() { []..addAll(1, 2)..add(3); }\n");
         assert!(f.run(&one_rule("prefer_inlined_adds")).is_empty());
+        assert!(f.run(&one_rule("prefer_spread_collections")).is_empty());
     }
 
     /// A non-list target passes.
     #[test]
     fn inlined_adds_non_list_target_passes() {
-        let source = "ts..add(1);";
-        // ts0 ..1 add2 (3 14 )5 ;6
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.leaf_span(NodeKind::Send, 0, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 1);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 2);
-                identifier(b, 2, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.leaf(NodeKind::LiteralInt, 4);
-                b.end(NodeKind::Arguments, 6);
-                b.end(NodeKind::Send, 6);
-                b.end(NodeKind::CascadeAccess, 6);
-                b.end(NodeKind::Cascade, 6);
-                b.end(NodeKind::ExpressionStatement, 7);
-            }),
-        );
+        let f = Fixture::parse("void f() { ts..add(1); }\n");
         assert!(f.run(&one_rule("prefer_inlined_adds")).is_empty());
     }
 
@@ -980,36 +879,14 @@ mod tests {
     /// inlined rule stays silent (list-literal gate, :53-55).
     #[test]
     fn spread_reports_addall_of_expression() {
-        let source = "[]..addAll(b);";
-        // []0 ..1 addAll2 (3 b4 )5 ;6
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::ListLiteral, 0);
-                b.patch(0, NONE);
-                b.end(NodeKind::ListLiteral, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 1);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 2);
-                identifier(b, 2, 3);
-                b.begin(NodeKind::Arguments, 3);
-                identifier(b, 4, 5);
-                b.end(NodeKind::Arguments, 6);
-                b.end(NodeKind::Send, 6);
-                b.end(NodeKind::CascadeAccess, 6);
-                b.end(NodeKind::Cascade, 6);
-                b.end(NodeKind::ExpressionStatement, 7);
-            }),
-        );
+        let f = Fixture::parse("void f() { []..addAll(b); }\n");
         let spread = f.run(&one_rule("prefer_spread_collections"));
         assert_eq!(spread.len(), 1);
         assert_eq!(
             spread[0].message,
             "The addition of multiple elements could be inlined."
         );
+        assert_eq!(spread[0].range.start, utf16_at(&f, 7));
         assert!(f.run(&one_rule("prefer_inlined_adds")).is_empty());
     }
 
@@ -1017,35 +894,7 @@ mod tests {
     /// `inConstantContext` approximation).
     #[test]
     fn spread_const_target_passes() {
-        let source = "const a = []..addAll(b);";
-        // const0 a1 =2 []3 ..4 addAll5 (6 b7 )8 ;9
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::VariablesDeclaration, 0);
-                b.patch(0, 0); // the `const` keyword
-                b.begin(NodeKind::InitializedIdentifier, 1);
-                b.begin(NodeKind::VariableInitializer, 2);
-                b.begin(NodeKind::ListLiteral, 3);
-                b.patch(0, NONE);
-                b.end(NodeKind::ListLiteral, 4);
-                b.begin(NodeKind::Cascade, 4);
-                b.begin(NodeKind::CascadeAccess, 4);
-                b.patch(0, 4);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 5);
-                identifier(b, 5, 6);
-                b.begin(NodeKind::Arguments, 6);
-                identifier(b, 7, 8);
-                b.end(NodeKind::Arguments, 9);
-                b.end(NodeKind::Send, 9);
-                b.end(NodeKind::CascadeAccess, 9);
-                b.end(NodeKind::Cascade, 9);
-                b.end(NodeKind::VariableInitializer, 9);
-                b.end(NodeKind::InitializedIdentifier, 9);
-                b.end(NodeKind::VariablesDeclaration, 10);
-            }),
-        );
+        let f = Fixture::parse("void f() { const a = []..addAll(b); }\n");
         assert!(f.run(&one_rule("prefer_spread_collections")).is_empty());
     }
 

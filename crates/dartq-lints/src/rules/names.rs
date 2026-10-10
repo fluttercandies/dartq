@@ -358,9 +358,8 @@ pub(crate) mod non_constant_identifier_names {
     /// Pattern-field variables (:124-131) report through the pattern
     /// dispatch alone — the official double-visits the same name
     /// (`visitPatternField` and `visitDeclaredVariablePattern` both check
-    /// it), one report per name is the same surface; object-pattern fields
-    /// are unproducible through the bridge (an upstream parser/bridge
-    /// pairing bug panics on them). The primary-constructor name positions
+    /// it), one report per name is the same surface. The primary-constructor
+    /// name positions
     /// (:87-91, :123-125): an extension-type representation-constructor
     /// name checks without the underscore exemption, a class primary
     /// constructor name with it.
