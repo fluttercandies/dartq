@@ -499,14 +499,14 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
 /// The plain path: the shared run, byte-pinned.
 fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
             eprintln!("error: {error}");
             return exit::USAGE;
         }
     };
-    let run = match dartq_commands::analyze::run(&mut engine) {
+    let run = match dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&dir)) {
         Ok(run) => run,
         Err(error) => {
             eprintln!("dartq: internal error: {error}");
@@ -524,7 +524,7 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
 /// renders and tiers like every sibling.
 fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
             eprintln!("error: {error}");
@@ -538,7 +538,9 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    let run = match dartq_commands::analyze::run_overlaid(&mut engine, &overlays) {
+    let run =
+        match dartq_commands::analyze::run_overlaid(&mut engine, &overlays, std::slice::from_ref(&dir))
+        {
         Ok(run) => run,
         Err(error) => {
             eprintln!("dartq: internal error: {error}");

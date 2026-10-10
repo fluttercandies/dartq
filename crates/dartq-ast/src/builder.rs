@@ -217,6 +217,116 @@ impl AstBuilder {
         });
     }
 
+    /// Number of nodes built so far (the arena tail index the next node gets).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The most recently completed node's span head, `None` before any node.
+    #[must_use]
+    pub fn last_first_token(&self) -> Option<u32> {
+        self.nodes.last().map(|h| h.first_token)
+    }
+
+    /// The most recently completed node's exclusive end token, `None` before
+    /// any node. The read face for end events that carry no end token (the
+    /// node seals right after its last child completed).
+    #[must_use]
+    pub fn last_end_token(&self) -> Option<u32> {
+        self.nodes.last().map(|h| h.end_token)
+    }
+
+    /// Arena index where the most recently completed node's subtree starts —
+    /// the node itself when childless, its `first_child` otherwise. The
+    /// bridge reads it to adopt the operand that completed before a
+    /// `beginBinaryExpression`-shaped event.
+    #[must_use]
+    pub fn last_subtree_start(&self) -> Option<u32> {
+        let last = self.nodes.last()?;
+        Some(if last.first_child == last.end_child {
+            self.nodes.len() as u32 - 1
+        } else {
+            last.first_child
+        })
+    }
+
+    /// Opens a container anchored at `first_token` that *adopts* the last
+    /// `siblings` completed sibling subtrees as its leading children: their
+    /// arena rows stay where they are, and the container's child range is
+    /// laid back to cover them (`first_child` = the oldest adopted subtree).
+    ///
+    /// The parser's event order needs this where the official builder pops
+    /// already-built operands off its own stack (`beginBinaryExpression`
+    /// fires after the left operand parsed — collapse map §3.5: "operands =
+    /// children×2"; same for `Assignment`, `Qualified`, `DottedName`,
+    /// `LabeledStatement`'s labels, `ParenthesizedCondition`'s condition).
+    /// Panics (any build) when fewer than `siblings` nodes exist — a bridge
+    /// bug, not recoverable input.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `siblings == 0` or more than the completed node count.
+    pub fn begin_adopting(&mut self, kind: NodeKind, first_token: u32, siblings: u32) {
+        assert!(siblings >= 1, "begin_adopting with no siblings to adopt");
+        debug_assert!(!self.root_sealed, "begin after the root was sealed");
+        let mut start = self
+            .last_subtree_start()
+            .expect("begin_adopting before any node completed");
+        for _ in 1..siblings {
+            debug_assert!(start > 0, "begin_adopting walks past the arena head");
+            start = {
+                let prev = start - 1;
+                let h = &self.nodes[prev as usize];
+                if h.first_child == h.end_child {
+                    prev
+                } else {
+                    h.first_child
+                }
+            };
+        }
+        self.open.push(OpenNode {
+            kind,
+            first_token,
+            first_child: start,
+            payload_start: None,
+            mod_flags: 0,
+            errored: false,
+        });
+    }
+
+    /// Opens a container anchored at `first_token` with an explicit
+    /// `first_child` — the form for adoption segments the caller tracked
+    /// itself (the `SwitchCase` case body: labels, case expressions, and
+    /// guard clauses complete before `begin_switch_case` fires, in a mix no
+    /// sibling count can walk; the listener snapshots the arena tail at the
+    /// previous case boundary and hands it here). `first_child` must not
+    /// exceed the current node count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `first_child > len` (a bridge bug).
+    pub fn begin_with_first_child(&mut self, kind: NodeKind, first_token: u32, first_child: u32) {
+        debug_assert!(!self.root_sealed, "begin after the root was sealed");
+        assert!(
+            first_child as usize <= self.nodes.len(),
+            "begin_with_first_child past the arena tail"
+        );
+        self.open.push(OpenNode {
+            kind,
+            first_token,
+            first_child,
+            payload_start: None,
+            mod_flags: 0,
+            errored: false,
+        });
+    }
+
     /// Emits a childless single-token leaf: the [`LeafShape::TokenLeaf`]
     /// kinds (a collapsed Handle whose whole content is one token, e.g.
     /// `LiteralInt`) and single-token [`LeafShape::SpanOnly`] kinds. The node

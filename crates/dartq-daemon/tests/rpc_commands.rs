@@ -169,7 +169,10 @@ fn dartq_analyze_matches_the_cli_machine_face() {
 
     // The CLI face: a fresh engine over the same workspace.
     let mut engine = dartq_engine::Engine::new(workspace.engine_config()).expect("engine");
-    let run = dartq_commands::analyze::run(&mut engine).expect("analyze core");
+    // The lint stage roots at the workspace root, exactly like the daemon
+    // session does, so both faces produce the same rows.
+    let run =
+        dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&workspace.root)).expect("analyze core");
     let expected = machine_face_rows(&run.diagnostics, &run.layout);
     assert_eq!(entries.len(), expected.len(), "one entry per machine row");
     for (entry, row) in entries.iter().zip(&expected) {

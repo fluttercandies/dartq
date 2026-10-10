@@ -874,7 +874,7 @@ impl Session {
             self.restore_base_view();
         }
 
-        let diagnostics = match self.analyze() {
+        let mut diagnostics = match self.analyze() {
             Ok(diagnostics) => diagnostics,
             Err(Cancelled) => {
                 for (id, _) in requests {
@@ -883,6 +883,14 @@ impl Session {
                 return;
             }
         };
+        // The lint stage (#355): the resident files' rows, one transient
+        // parse per file — joined before the severity-first sort so the
+        // answers keep the CLI analyze face's order.
+        let lint_roots = [self.workspace_root().to_path_buf()];
+        diagnostics.extend(dartq_commands::lints::analyze_lints(
+            self.engine(),
+            &lint_roots,
+        ));
         // The one conversion pass per group (the engine→LSP shape change is
         // the expensive half — #347's convert-once discipline, per view):
         // the publish plan and the analyze entries share it.

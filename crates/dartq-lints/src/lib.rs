@@ -164,6 +164,7 @@
 //! `.third/dart-sdk` (the fact source per AGENTS.md), with rule lists from
 //! the pinned `package:lints` in `.third/lints`.
 
+mod bridge;
 mod comments;
 mod engine;
 mod ignore;
@@ -173,7 +174,8 @@ mod rules;
 #[cfg(test)]
 mod testsupport;
 
+pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
-pub use engine::{Check, Lint, Unit, run};
+pub use engine::{Check, Features, Lint, Unit, run};
 pub use ignore::IgnoreInfo;
 pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name};

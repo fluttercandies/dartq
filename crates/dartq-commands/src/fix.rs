@@ -36,21 +36,18 @@
 //! rather than patched on faith.
 //!
 //! The rows reach [`from_lints`] through the lints layer's diagnostic
-//! face; driving that face's `run` needs the layer's `Unit`, whose AST
-//! input is the parser→AST seam (the engine-side combined-listener face
-//! #120/#121 build toward) and whose feature bits are not part of the
-//! crate's public face — so this build has no row source wired and
-//! [`collect`] reports zero patch sets. The materializer and the
-//! anchoring/apply substrate are complete and tested against the layer's
-//! row contract (see the tests: every row carries a real registry rule id
-//! and the official message, and the slice verification gates each
-//! patch), so activation is one call site in [`collect`]'s source stage.
-//! The built-in semantic fix set and the plugin source (PRD §15.6, §14)
-//! are their own faces (dartq-ai / plugin host).
+//! face: [`collect`] parses each discovered file once through the layer's
+//! production entry ([`dartq_lints::parse_unit`] — the #355 bridge) and
+//! runs the default `package:lints` posture (the fix face targets the
+//! paths you point it at, without the analyze pipeline's options
+//! context). Rules without a mechanical rewrite are never claimed, and a
+//! wired hit whose slice no longer verifies is dropped rather than
+//! patched on faith. The built-in semantic fix set and the plugin source
+//! (PRD §15.6, §14) are their own faces (dartq-ai / plugin host).
 
 use std::path::PathBuf;
 
-use dartq_lints::{Lint, RULES};
+use dartq_lints::{EnableSet, Features, Lint, RULES, parse_unit, run};
 use dartq_source::{LineIndex, utf16_len_of, utf16_offset_to_byte};
 
 use crate::discover::{self, DiscoverError};
@@ -110,18 +107,40 @@ pub enum EditOutcome {
     Stale,
 }
 
-/// The fix source stage: validates the targets through discovery and
-/// returns one fix set per patched file (files without fixes never enter
-/// the set). The row source (lint rows, then the semantic/plugin sets)
-/// plugs into the single loop below when the parser→AST bridge hands the
-/// unit trees over; this build's runs are clean zero-fix runs.
+/// The fix source stage: validates the targets through discovery, then
+/// parses each file once through the lints layer's production entry and
+/// runs the default `package:lints` posture; every hit the mechanical
+/// rewrites can materialize (and whose source slice verifies) becomes an
+/// anchored edit. One fix set per patched file — files without fixes
+/// never enter the set.
 ///
 /// # Errors
 ///
 /// [`DiscoverError`] from target discovery.
 pub fn collect(paths: &[PathBuf]) -> Result<Vec<FileFixes>, DiscoverError> {
-    let _files = discover::discover(paths)?;
-    Ok(Vec::new())
+    let files = discover::discover(paths)?;
+    let enabled = crate::lints::enable_set(None);
+    if enabled == EnableSet::none() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            // Unreadable or non-UTF-8 target: nothing to patch — the apply
+            // face re-reads and reports on its own terms.
+            continue;
+        };
+        let parsed = parse_unit(&text, Features::default());
+        let hits: Vec<Lint> = run(&parsed.unit(Some(path)), &enabled);
+        let fixes = from_lints(&hits, &text, &parsed.lines);
+        if !fixes.is_empty() {
+            out.push(FileFixes {
+                path: path.display().to_string(),
+                fixes,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

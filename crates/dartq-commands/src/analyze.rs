@@ -35,7 +35,9 @@ pub enum AnalyzeError {
 /// collectors they installed before the pass, so the yield is only the
 /// failure tier.
 pub(crate) fn prelude(engine: &mut Engine) -> Result<(), AnalyzeError> {
-    run_overlaid(engine, &[]).map(|_| ())
+    // No roots: the lint stage is skipped (query faces reflect the engine
+    // pass only).
+    run_overlaid(engine, &[], &[]).map(|_| ())
 }
 
 /// One [`Engine::analyze`] pass: the merged diagnostics, the wall-clock,
@@ -80,13 +82,18 @@ pub struct AnalyzeRun<'a> {
     pub layout: EngineLayout<'a>,
 }
 
-/// Runs the analyze face over an assembled engine.
+/// Runs the analyze face over an assembled engine. `roots` are the
+/// workspace's package roots (the lint stage resolves per-root enable sets
+/// against them).
 ///
 /// # Errors
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
-pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
-    run_overlaid(engine, &[])
+pub fn run<'a>(
+    engine: &'a mut Engine,
+    roots: &[PathBuf],
+) -> Result<AnalyzeRun<'a>, AnalyzeError> {
+    run_overlaid(engine, &[], roots)
 }
 
 /// Runs the analyze face over an engine with overlay content applied —
@@ -99,12 +106,13 @@ pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
 /// for every discovered file, and pending content ops are last-wins per
 /// path, so overlay content must enqueue after it), then each `(path,
 /// bytes)` replaces the analyzed bytes via [`Engine::set_content`] — the
-/// workspace on disk is never touched — then one analyze pass, and the
-/// same yield as [`run`]: the oracle display order plus the run facts the
-/// metrics faces report. An empty `overlays` is the plain run. The
-/// callers address discovered files by their canonical package-root path
-/// (the identity discovery interns); a path discovery never saw is
-/// interned as a new file.
+/// workspace on disk is never touched — then one analyze pass, the lint
+/// stage over the resident files (per-root enable sets via the passed
+/// package roots), and the same yield as [`run`]: the oracle display order
+/// plus the run facts the metrics faces report. An empty `overlays` is the
+/// plain run. The callers address discovered files by their canonical
+/// package-root path (the identity discovery interns); a path discovery
+/// never saw is interned as a new file.
 ///
 /// # Errors
 ///
@@ -112,6 +120,7 @@ pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
 pub fn run_overlaid<'a>(
     engine: &'a mut Engine,
     overlays: &[(PathBuf, Vec<u8>)],
+    roots: &[PathBuf],
 ) -> Result<AnalyzeRun<'a>, AnalyzeError> {
     let started = std::time::Instant::now();
     let stats = engine
@@ -125,6 +134,9 @@ pub fn run_overlaid<'a>(
 
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache) =
         analyze_pass(engine)?;
+    if !roots.is_empty() {
+        diagnostics.extend(crate::lints::analyze_lints(engine, roots));
+    }
     let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
@@ -229,7 +241,7 @@ mod tests {
         // Plain run over the discovered bytes: the on-disk error surfaces,
         // and an empty overlay list runs the same pipeline.
         let (plain_hits, plain_facts) = {
-            let plain = run(&mut engine).expect("plain run");
+            let plain = run(&mut engine, std::slice::from_ref(&root)).expect("plain run");
             let hits = hits(&plain.diagnostics);
             assert!(
                 hits.iter().any(|(_, m)| m.contains("'x'")),
@@ -238,7 +250,7 @@ mod tests {
             (hits, (plain.file_count, plain.loc))
         };
         let (bare_hits, bare_facts) = {
-            let bare = run_overlaid(&mut engine, &[]).expect("bare run");
+            let bare = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("bare run");
             (hits(&bare.diagnostics), (bare.file_count, bare.loc))
         };
         assert_eq!(bare_hits, plain_hits, "no overlays: the plain run");
@@ -248,7 +260,8 @@ mod tests {
         // never touched, and the run facts keep flowing.
         let overlays = vec![(target.clone(), b"var ok = 1;\n".to_vec())];
         let fixed_facts = {
-            let fixed = run_overlaid(&mut engine, &overlays).expect("overlaid run");
+            let fixed = run_overlaid(&mut engine, &overlays, std::slice::from_ref(&root))
+                .expect("overlaid run");
             assert!(
                 fixed.diagnostics.is_empty(),
                 "clean overlay: no diagnostics"
@@ -263,17 +276,22 @@ mod tests {
         assert_eq!(fixed_facts, plain_facts);
 
         // A broken overlay reports against the analyzed path in oracle
-        // order: the undefined-name row precedes the missing-`;` row.
+        // order. Both rows sit at offset 11 (`y`), so the message
+        // tie-break orders them; the spans themselves are the parser
+        // lane's oracle-conformant output, pinned here only to exercise
+        // the comparator (DiagnosticWithPath.compareTo,
+        // dartdev analyze.dart:686-707).
         let overlays = vec![(target, b"void g() { y }\n".to_vec())];
         let broken_hits = {
-            let broken = run_overlaid(&mut engine, &overlays).expect("overlaid run");
+            let broken = run_overlaid(&mut engine, &overlays, std::slice::from_ref(&root))
+                .expect("overlaid run");
             hits(&broken.diagnostics)
         };
         assert_eq!(
             broken_hits,
             vec![
+                (11, "Expected ';' after this.".to_owned()),
                 (11, "Undefined name 'y'.".to_owned()),
-                (13, "Expected ';' after this.".to_owned()),
             ],
             "oracle order inside one library: severity, path, offset, message"
         );

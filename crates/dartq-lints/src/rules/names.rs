@@ -605,9 +605,13 @@ pub(crate) mod file_names {
             return true;
         }
         let stem = name.len() - 5;
-        for &b in &bytes[1..stem.saturating_sub(1)] {
-            if b == b'.' {
-                return true;
+        // With a 1- or 2-char stem the official `for (i = 1; i < length - 1)`
+        // loop body never runs — the guarded range mirrors that empty scan.
+        if stem > 1 {
+            for &b in &bytes[1..stem - 1] {
+                if b == b'.' {
+                    return true;
+                }
             }
         }
         for (i, &b) in bytes[..stem].iter().enumerate() {

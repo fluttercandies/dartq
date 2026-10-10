@@ -1,6 +1,8 @@
 //! Test scaffolding: scan a source snippet and hand-build its arena AST per
-//! the collapse-map payload contracts (the parser→AST bridge lives in the
-//! engine seam; rule tests pin the read-side contract directly).
+//! the collapse-map payload contracts. Rule tests pin the read-side
+//! contract directly against hand-built trees; [`Fixture::parse`] builds
+//! through the production bridge ([`crate::parse_unit`]) for the tests
+//! that exercise the real parser→AST shape.
 
 #![cfg(test)]
 
@@ -32,6 +34,24 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// Parses `source` through the production bridge (scanner → parser →
+    /// arena, one transient [`crate::ParsedUnit`]). The path defaults to the
+    /// fixture name; overwrite `path`/`features` after construction for the
+    /// path/feature-dependent rules.
+    #[must_use]
+    pub fn parse(source: &str) -> Self {
+        let parsed = crate::parse_unit(source, Features::default());
+        Self {
+            source: parsed.source,
+            tokens: parsed.tokens,
+            ast: parsed.ast,
+            lines: parsed.lines,
+            path: PathBuf::from("lint_fixture.dart"),
+            features: parsed.features,
+            _files: FileTable::default(),
+        }
+    }
+
     /// Scans `source` and builds `tree` over the resulting token table.
     pub fn build(source: &str, tree: impl FnOnce(&mut AstBuilder, &TokenTable)) -> Self {
         let mut files = FileTable::default();
@@ -122,4 +142,20 @@ pub fn utf16_at(fixture: &Fixture, index: u32) -> u32 {
         .get(index as usize)
         .expect("token index")
         .utf16_offset
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use crate::registry::rule_by_name;
+
+    /// The real-bridge fixture: rows come out of the production parser, not
+    /// a hand-built tree.
+    #[test]
+    fn parse_fixture_runs_rules_over_the_real_tree() {
+        let fixture = Fixture::parse("void f() {\n  if (b) ; else ;\n}\n");
+        let lints = fixture.run(&one_rule("avoid_empty_else"));
+        assert_eq!(lints.len(), 1, "the else `;` reports through the bridge");
+        assert_eq!(lints[0].rule, rule_by_name("avoid_empty_else").expect("wired"));
+    }
 }

@@ -40,21 +40,21 @@
 //!
 //! # Activation
 //!
-//! The per-unit face needs the layer's [`Unit`], whose `ast` field is the
-//! parser→AST bridge's `SyntaxTable` (#355 — the M2 activation seam; no
-//! public face produces one yet, and engine residency retains neither
-//! tokens nor trees). Until it lands, no call site can produce rows; the
-//! recorded hunks are: CLI — `analyze::run_overlaid`, extend
-//! `diagnostics` from [`diagnose`] over the resident files (per-root
-//! enable set via `Engine::options_for_root`) before the sort; daemon —
-//! `session::run_group`, the same extension onto `self.analyze()`'s
-//! result before the severity-first `paired` sort. The check face stays
-//! lint-free by design (scan+parse only).
+//! [`analyze_lints`] is the production activation: it re-parses each
+//! resident file's source text transiently ([`dartq_lints::parse_unit`] —
+//! the #355 bridge; engine residency retains neither tokens nor trees) and
+//! runs the enabled rules, extending the engine's diagnostics. The CLI
+//! face calls it from `analyze::run_overlaid`, the daemon from
+//! `session::run_group`, both before their display sorts. The check face
+//! stays lint-free by design (scan+parse only).
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
-use dartq_lints::{EnableSet, Group, Lint, RULES, RuleId, Unit, run};
+use dartq_engine::Engine;
+use dartq_lints::{EnableSet, Features, Group, Lint, RULES, RuleId, Unit, parse_unit, run};
 use dartq_source::FileId;
 
 /// The whole `package:lints` slice: every registered rule ships in core or
@@ -130,11 +130,95 @@ pub fn diagnose(file: FileId, unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Diagn
         .collect()
 }
 
+/// The analyze pipeline's lint stage (#355 activation): every resident
+/// file's rows, one transient parse per file (the bridge's
+/// zero-persistent-memory ruling — nothing enters engine residency).
+///
+/// Per-file enable set: the longest `roots` entry containing the file's
+/// path wins (multi-package workspaces); the first root is the fallback,
+/// matching the engine's discovery attribution for root-level files. An
+/// empty resolved set skips the file without parsing (opt-in cost ruling).
+/// Files that are no longer resident or are not UTF-8 are skipped — the
+/// engine's own pass already reported nothing for them.
+#[must_use]
+pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
+    let mut files: Vec<FileId> = engine
+        .libraries()
+        .into_iter()
+        .flat_map(|(_, files)| files)
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+
+    // Per-root enable sets, resolved once (the engine's options table
+    // carries a default entry for roots without a file, so the no-options
+    // posture is decided by `find_for_dir`, not by `options_for_root`).
+    let mut enabled: HashMap<PathBuf, EnableSet> = HashMap::new();
+
+    let mut out = Vec::new();
+    for file in files {
+        let Some(path) = engine.file_table().path(file) else {
+            continue;
+        };
+        let Some(bytes) = engine.content(file) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let root = containing_root(path, roots);
+        let set = match enabled.get(root) {
+            Some(set) => *set,
+            None => {
+                let set = match dartq_engine::analysis_options::AnalysisOptions::find_for_dir(root)
+                {
+                    // No options file in the root's ancestry: the whole
+                    // `package:lints` slice (the mount's default posture).
+                    None => enable_set(None),
+                    Some(_) => enable_set(
+                        engine
+                            .options_for_root(root)
+                            .map(|options| options.lint_rules.as_slice()),
+                    ),
+                };
+                enabled.insert(root.to_path_buf(), set);
+                set
+            }
+        };
+        if set == EnableSet::none() {
+            continue;
+        }
+        let parsed = parse_unit(text, Features::default());
+        out.extend(diagnose(file, &parsed.unit(Some(path)), &set));
+    }
+    out
+}
+
+/// The longest `roots` entry that is a byte-prefix directory of `path`, or
+/// the first root (single-root workspaces are the dominant shape).
+fn containing_root<'a>(path: &Path, roots: &'a [PathBuf]) -> &'a Path {
+    let mut best: Option<&Path> = None;
+    for root in roots {
+        if path.starts_with(root)
+            && best.is_none_or(|longest| root.components().count() > longest.components().count())
+        {
+            best = Some(root);
+        }
+    }
+    best.unwrap_or(
+        roots
+            .first()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new("")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use dartq_diagnostics::{DiagnosticType, Severity};
+    use dartq_engine::Engine;
     use dartq_engine::analysis_options::AnalysisOptions;
     use dartq_lints::rule_by_name;
     use dartq_pub::PackageConfig;
@@ -250,4 +334,37 @@ mod tests {
         assert_eq!(bare.correction, None);
         assert_eq!(bare.range.length, 0);
     }
+
+    /// The #355 activation end to end: a fixture workspace whose only
+    /// library carries an `unnecessary_new` shape produces an INFO lint row
+    /// through the full pipeline — engine pass, transient re-parse, row
+    /// mapping, oracle order — with the semantic row of the same file.
+    #[test]
+    fn analyze_lints_rows_flow_through_the_resident_pipeline() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_activation",
+            &[("lib/bad.dart", "var x = new Object();\nvar ok = unknown;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(String, Severity, u32)> = run
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name.to_owned(), d.severity, d.range.offset))
+            .collect();
+        assert!(
+            rows.contains(&("unnecessary_new".to_owned(), Severity::Info, 8)),
+            "the lint row rides the pipeline: {rows:?}"
+        );
+        assert!(
+            rows.contains(&("undefined_identifier".to_owned(), Severity::Error, 31)),
+            "the semantic row still flows: {rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
 }

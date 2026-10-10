@@ -620,7 +620,7 @@ pub(crate) mod avoid_init_to_null {
 
 pub(crate) mod prefer_function_declarations_over_variables {
     use super::{Check, Group, NodeKind, RuleSpec, member_name};
-    use crate::rules::{NONE_TOKEN, first_child};
+    use crate::rules::{NONE_TOKEN, last_child};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
     /// — a variable initialized with a function literal reports. Fields and
@@ -658,7 +658,11 @@ pub(crate) mod prefer_function_declarations_over_variables {
         else {
             return;
         };
-        let Some(value) = first_child(c, initializer) else {
+        // The value expression is the initializer's LAST direct child (it
+        // completes last); a lambda's absent-return marker
+        // (`NoTypeVariables`) may precede the `FunctionExpression` inside
+        // the completion window, so the first-child read is not the value.
+        let Some(value) = last_child(c, initializer) else {
             return;
         };
         if c.kind(value) != NodeKind::FunctionExpression {
