@@ -99,7 +99,14 @@ void main() {
       );
       controller.add([0xFF, 0x0A]); // invalid UTF-8, then a newline
       await controller.close();
-      await expectLater(done, throwsFormatException);
+      await expectLater(
+        done,
+        throwsA(isA<PluginProtocolException>().having(
+          (error) => error.message,
+          'message',
+          contains('not valid UTF-8'),
+        )),
+      );
       expect(sent, isEmpty);
     });
 

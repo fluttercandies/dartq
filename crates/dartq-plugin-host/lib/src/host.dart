@@ -75,8 +75,16 @@ Future<void> _serveLine(
   if (raw.isEmpty) {
     return;
   }
-  // Strict UTF-8: malformed bytes throw, tearing the host down.
-  final line = utf8.decode(raw);
+  // Strict UTF-8: malformed bytes throw the typed protocol error, tearing
+  // the host down (the counterpart of the Rust codec's `ProtocolError::Utf8`).
+  final String line;
+  try {
+    line = utf8.decode(raw);
+  } on FormatException catch (error) {
+    throw PluginProtocolException(
+      'frame is not valid UTF-8: ${error.message}',
+    );
+  }
   final reply = session.handleFrame(decodeFrame(line));
   if (reply != null) {
     await send(reply.encode());

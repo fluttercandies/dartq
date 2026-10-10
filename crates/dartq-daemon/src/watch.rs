@@ -215,12 +215,22 @@ fn watch_loop(options: &WatchOptions, sender: Sender<Vec<Incoming>>, stop: &Atom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// A workspace with one tracked file and nothing else in it.
+    /// A workspace with one tracked file and nothing else in it. The
+    /// sequence suffix makes every call a unique tree: two callers passing
+    /// the same `tag`, or a crashed prior run whose pid was recycled, can
+    /// never share state — the `tag` stays in the path only for
+    /// diagnosability of leftovers (mirroring `store_root`).
     fn workspace(tag: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("dq_watch_{tag}_{}", std::process::id()));
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dq_watch_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
         let _ = fs::remove_dir_all(&root);
         let lib = root.join("lib");
         fs::create_dir_all(&lib).expect("mkdir");
@@ -397,7 +407,11 @@ mod tests {
         let deleted = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("the deletion surfaced within the window");
-        assert_eq!(watch_paths(deleted), vec![extra], "the removal is the batch");
+        assert_eq!(
+            watch_paths(deleted),
+            vec![extra],
+            "the removal is the batch"
+        );
 
         drop(watcher);
         fs::remove_dir_all(&root).ok();
