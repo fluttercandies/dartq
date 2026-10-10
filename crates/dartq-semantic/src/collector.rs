@@ -310,9 +310,16 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // The header's type variables closed before this open (official
         // event order); they belong to this container.
         let header_type_params = std::mem::take(&mut self.header_type_params);
-        // Only class-family headers carry `with`/`implements` lists; the
-        // window ends at `handle_class_header` (the `{` or `;`).
-        self.in_class_header = matches!(kind, ContainerKind::Class);
+        // Class, enum, and mixin headers carry supertype clauses; the
+        // window ends at the header-closing event (`handle_class_header` /
+        // `handle_enum_header` / `handle_mixin_header`). A named mixin
+        // application fires none of those — its buffer commits at the
+        // declaration's end instead. Extension and extension-type headers
+        // carry no subtype edges (the representation type is not one).
+        self.in_class_header = matches!(
+            kind,
+            ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
+        );
         self.header_interfaces.clear();
         self.containers.push(OpenContainer {
             name,
@@ -326,7 +333,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ctor_named: Vec::new(),
             ctor_has_unnamed: true,
         });
-        self.header_super_open = true;
+        // The `extends` head latches on class-family declarations only
+        // (including a named mixin application's head type); enum
+        // `with`/`implements` and mixin `on`/`implements` names are plain
+        // supertype edges and buffer into the interface set.
+        self.header_super_open = matches!(kind, ContainerKind::Class);
         self.super_candidate = None;
     }
 
@@ -380,9 +391,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
-    /// Ends the class-header window (`handle_class_header`): the buffered
-    /// `with`/`implements` names join the open container.
-    fn end_class_header(&mut self) {
+    /// Ends the declaration-header window (`handle_class_header` /
+    /// `handle_enum_header` / `handle_mixin_header`): the buffered
+    /// `with`/`implements`/`on` names join the open container.
+    fn end_header_window(&mut self) {
         self.in_class_header = false;
         let buffered = std::mem::take(&mut self.header_interfaces);
         if let Some(open) = self.containers.last_mut() {
@@ -624,7 +636,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
-        self.builder.borrow_mut().end_class_header();
+        self.builder.borrow_mut().end_header_window();
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
@@ -656,7 +668,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _implements: Option<Token>,
         _end: Token,
     ) {
-        self.builder.borrow_mut().close_container();
+        let builder = &mut *self.builder.borrow_mut();
+        // No header-closing event fires for a mixin application: the
+        // buffered `with`/`implements` names commit here, before the
+        // container closes and would drop them.
+        builder.end_header_window();
+        builder.close_container();
     }
 
     fn begin_mixin_declaration(
@@ -697,6 +714,19 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         self.builder.borrow_mut().close_container();
+    }
+
+    fn handle_enum_header(
+        &mut self,
+        _augment: Option<Token>,
+        _enum_keyword: Token,
+        _left_brace: Token,
+    ) {
+        self.builder.borrow_mut().end_header_window();
+    }
+
+    fn handle_mixin_header(&mut self, _mixin: Token) {
+        self.builder.borrow_mut().end_header_window();
     }
 
     fn begin_extension_declaration(

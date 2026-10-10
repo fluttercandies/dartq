@@ -751,6 +751,12 @@ struct Engine<'a> {
     pattern_depth: usize,
     /// Completed root restrictions per open case (switch cases only).
     pattern_roots: Vec<Restriction>,
+    /// A switch-case header's pattern window is open
+    /// (`begin_case_expression`/`begin_switch_expression_case` through the
+    /// pattern's completion): the only window whose root pattern feeds
+    /// exhaustiveness. Roots outside it — if-case, pattern assignments —
+    /// are not coverage questions and never enter the set.
+    case_sink_open: bool,
     /// The in-flight constant pattern's classification, armed by the
     /// literal/identifier events inside it.
     pending_const: Option<Restriction>,
@@ -847,6 +853,7 @@ impl<'a> Engine<'a> {
             pattern_stack: Vec::new(),
             pattern_depth: 0,
             pattern_roots: Vec::new(),
+            case_sink_open: false,
             pending_const: None,
             switch_kw_latch: None,
             pending_object_ty: None,
@@ -2571,6 +2578,33 @@ impl<'a> Engine<'a> {
             .unwrap_or(Restriction::Unknown)
     }
 
+    /// Closes the case-header pattern window and drains its root: the
+    /// topmost restriction is the header pattern's coverage (pushed between
+    /// the window's open and here), everything below is debris from earlier
+    /// bodies. `None` — a legacy or recovered header with no pattern —
+    /// falls back to the unknown space.
+    fn close_case_sink(&mut self) -> Option<Restriction> {
+        self.case_sink_open = false;
+        let root = self.pattern_roots.pop();
+        self.pattern_roots.clear();
+        root
+    }
+
+    /// Substitutes a captured root's type-free coverage with the
+    /// scrutinee's context type.
+    fn substitute_root(&self, root: Option<Restriction>) -> Restriction {
+        let space = root.unwrap_or(Restriction::Unknown);
+        if space == Restriction::NamedContext {
+            return match NameTy::from_semantic(
+                self.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
+            ) {
+                NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
+                _ => Restriction::Unknown,
+            };
+        }
+        space
+    }
+
     /// Opens a switch context; the scrutinee's push-time row is the last
     /// one on the row stack when the block opens. No row — the shape a
     /// complex scrutinee leaves — latches `Ty::Unknown`, and
@@ -2579,13 +2613,18 @@ impl<'a> Engine<'a> {
     /// of mis-answering.
     fn open_switch(&mut self, is_expression: bool, kw: SourceRange) {
         let scrutinee = self.rows.last().map_or(Ty::Unknown, |row| row.ty);
+        // Any roots surviving from before this switch are debris (a broken
+        // header's un-drained capture): they must never feed this switch's
+        // cases.
+        self.pattern_roots.clear();
+        self.case_sink_open = false;
         self.switches.push(SwitchCtx {
             is_expression,
             switch_kw: kw,
             scrutinee,
             cases: Vec::new(),
             default_seen: false,
-            pending_guarded: false,
+            pending_root: None,
         });
     }
 
@@ -2610,6 +2649,7 @@ impl<'a> Engine<'a> {
             index: self.index,
             file: self.file,
             strings: self.strings,
+            bool_id: self.intern("bool"),
             unknowns: std::cell::Cell::new(0),
         };
         let value = NameTy::from_semantic(ctx.scrutinee);
@@ -2665,7 +2705,18 @@ impl<'a> Engine<'a> {
                 } else {
                     SemanticCode::NonExhaustiveSwitchStatement
                 };
-                self.emit3(code, ctx.switch_kw, &ty_text, &unmatched, &suggested);
+                // The oracle row carries a correctionMessage whose `{2}` is
+                // the first witness's correction text (diagnostic.g.dart
+                // :13018/:13079, constant_verifier.dart:1104-1120); the
+                // diagnostic carries it in the correction slot.
+                self.report.diagnostics.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message3(&ty_text, &unmatched, &suggested),
+                    self.file,
+                    ctx.switch_kw,
+                    code.correction_message(&suggested),
+                ));
             }
         }
     }
@@ -4396,8 +4447,13 @@ impl ParserListener for DiagnoseListener<'_> {
         };
         let merged = Engine::collapse(frame.leaves, frame.or_ops);
         if engine.pattern_stack.is_empty() {
-            // A root pattern: only switch cases consume it.
-            engine.pattern_roots.push(merged);
+            // A root pattern: only an open case header's coverage feeds the
+            // exhaustiveness walk; other roots (if-case, pattern
+            // assignments) are dropped here, so debris can neither leak
+            // into a later case nor grow the set.
+            if engine.case_sink_open {
+                engine.pattern_roots.push(merged);
+            }
         } else if let Some(parent) = engine.pattern_stack.last_mut() {
             parent.leaves.push(merged);
         }
@@ -4551,8 +4607,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_wildcard_pattern(&mut self, _keyword: Option<Token>, _wildcard: Token) {
-        // `_` covers the context: no leaf.
-        self.engine.borrow_mut().armed_ty = None;
+        // A typed wildcard (`M _`) covers the declared type's space (the
+        // official wildcard converts through its type); a bare `_` (or
+        // `var _`) covers the context: no leaf.
+        let mut engine = self.engine.borrow_mut();
+        let Some(Ty::Named { name, nullable }) = engine.armed_ty.take() else {
+            return;
+        };
+        engine.pattern_leaf(Restriction::Named(name, nullable));
     }
 
     // —— switch statements ————————————————————————————————————————————
@@ -4577,9 +4639,28 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().report_switch();
     }
 
-    fn begin_switch_case_when_clause(&mut self, _token: Token) {
-        if let Some(ctx) = self.engine.borrow_mut().switches.last_mut() {
-            ctx.pending_guarded = true;
+    fn begin_switch_case_when_clause(&mut self, _token: Token) {}
+
+    /// The case header's pattern window opens before its pattern parses;
+    /// the root it produces is captured at [`Self::end_case_expression`].
+    fn begin_case_expression(&mut self, _case_kw: Token) {
+        self.engine.borrow_mut().case_sink_open = true;
+    }
+
+    /// One statement-case header completed: its pattern's coverage latches
+    /// here with the guard flag and the `case`-keyword anchor (the oracle's
+    /// `caseNode.keyword`, constant_verifier.dart:1076-1085). Shared-body
+    /// groups (`case A: case B:`) capture one case per header.
+    fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, _colon: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let root = engine.close_case_sink();
+        let space = engine.substitute_root(root);
+        if let Some(ctx) = engine.switches.last_mut() {
+            ctx.cases.push(NameCase {
+                space,
+                guarded: when.is_some(),
+                anchor: case_kw.range,
+            });
         }
     }
 
@@ -4590,39 +4671,19 @@ impl ParserListener for DiagnoseListener<'_> {
         default_kw: Option<Token>,
         _colon_after_default: Option<Token>,
         _statement_count: usize,
-        begin: Token,
+        _begin: Token,
         _end: Token,
     ) {
+        // The case headers already captured their spaces
+        // ([`Self::end_case_expression`]); the body-level event only
+        // latches `default` and closes any window a broken header left
+        // open.
         let mut engine = self.engine.borrow_mut();
-        if default_kw.is_some() {
-            if let Some(ctx) = engine.switches.last_mut() {
-                ctx.default_seen = true;
-            }
-            engine.pattern_roots.clear();
-            return;
-        }
-        // Old-style expression cases (`case 1 + 2:`) carry no pattern
-        // events; their constant coverage is the unknown space at name
-        // level (under-report, matching the unrepresentable-constant rule).
-        if engine.pattern_roots.is_empty() {
-            engine.pattern_roots.push(Restriction::Unknown);
-        }
-        let space = engine.pattern_roots.pop().unwrap_or(Restriction::Unknown);
-        if let Some(ctx) = engine.switches.last_mut() {
-            let mut space = space;
-            if space == Restriction::NamedContext {
-                space = match NameTy::from_semantic(ctx.scrutinee) {
-                    NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
-                    _ => Restriction::Unknown,
-                };
-            }
-            let guarded = ctx.pending_guarded;
-            ctx.pending_guarded = false;
-            ctx.cases.push(NameCase {
-                space,
-                guarded,
-                anchor: begin.range,
-            });
+        engine.case_sink_open = false;
+        if default_kw.is_some()
+            && let Some(ctx) = engine.switches.last_mut()
+        {
+            ctx.default_seen = true;
         }
     }
 
@@ -4643,6 +4704,23 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().switch_kw_latch = Some(token.range);
     }
 
+    /// The expression-case header's pattern window opens before its
+    /// pattern parses.
+    fn begin_switch_expression_case(&mut self) {
+        self.engine.borrow_mut().case_sink_open = true;
+    }
+
+    /// The expression case's pattern completed: its coverage latches now
+    /// (the guard and the `=>` anchor only exist at the case's end).
+    fn handle_switch_expression_case_pattern(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let root = engine.close_case_sink();
+        let space = engine.substitute_root(root);
+        if let Some(ctx) = engine.switches.last_mut() {
+            ctx.pending_root = Some(space);
+        }
+    }
+
     fn end_switch_expression_case(
         &mut self,
         _begin: Token,
@@ -4651,18 +4729,12 @@ impl ParserListener for DiagnoseListener<'_> {
         _end: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
-        if engine.pattern_roots.is_empty() {
-            engine.pattern_roots.push(Restriction::Unknown);
-        }
-        let space = engine.pattern_roots.pop().unwrap_or(Restriction::Unknown);
+        let space = engine
+            .switches
+            .last_mut()
+            .and_then(|ctx| ctx.pending_root.take())
+            .unwrap_or(Restriction::Unknown);
         if let Some(ctx) = engine.switches.last_mut() {
-            let mut space = space;
-            if space == Restriction::NamedContext {
-                space = match NameTy::from_semantic(ctx.scrutinee) {
-                    NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
-                    _ => Restriction::Unknown,
-                };
-            }
             ctx.cases.push(NameCase {
                 space,
                 guarded: when.is_some(),
@@ -4685,11 +4757,10 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         // An if-case's pattern events follow; the binding face works
         // through `handle_declared_variable_pattern`, and the condition
-        // itself carries no exhaustiveness question.
-        if case_kw.is_some() {
-            // The pattern's root will be dropped at `end_pattern` (no
-            // switch context consumes roots outside switches).
-        }
+        // itself carries no exhaustiveness question. Its root pattern is
+        // never captured: the case-sink window is only open across a
+        // switch-case header.
+        let _ = case_kw;
     }
 
     fn handle_enum_element(&mut self, _begin: Token, _augment: Option<Token>) {
@@ -4835,6 +4906,14 @@ enum NameTy {
     /// An enum constant: the enum's name and the constant's.
     EnumValue(StringId, StringId),
     BoolValue(bool),
+    /// The nullable projection of an enum constant
+    /// (`NullableStaticType(EnumElementStaticType)`, static_type.dart:350):
+    /// the constant plus `null`, never its siblings.
+    EnumValueOrNull(StringId, StringId),
+    /// The nullable projection of a `true`/`false` value
+    /// (`NullableStaticType(_BoolValueStaticType)`, static_type.dart:350):
+    /// the value plus `null`, never the other boolean.
+    BoolOrNull(bool),
     /// A unique unknown (relational patterns, unrepresentable constants):
     /// matched by nothing.
     Unknown(u64),
@@ -4857,8 +4936,11 @@ struct SwitchCtx {
     scrutinee: Ty,
     cases: Vec<NameCase>,
     default_seen: bool,
-    /// The in-flight case carries a `when` guard.
-    pending_guarded: bool,
+    /// The captured coverage of an in-flight switch-expression case (the
+    /// space latches at the pattern's completion, the guard and anchor at
+    /// the case's end). Statement cases capture in one step and leave this
+    /// `None`.
+    pending_root: Option<Restriction>,
 }
 
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
@@ -4957,6 +5039,9 @@ struct NameWorld<'a> {
     index: &'a ElementIndex,
     file: FileId,
     strings: &'a StringTable,
+    /// The interned `bool` spelling (`BoolValue` subtyping compares ids,
+    /// never re-interns per query).
+    bool_id: StringId,
     unknowns: std::cell::Cell<u64>,
 }
 
@@ -4997,9 +5082,16 @@ impl ExhaustivenessWorld for NameWorld<'_> {
 
     fn nullable(&self, ty: &NameTy) -> NameTy {
         match ty {
-            // The nullable projection of a name or of an enum constant's
-            // enum (constants are non-null, `constant_verifier.dart:1043`).
-            NameTy::Named(name, _) | NameTy::EnumValue(name, _) => NameTy::Named(*name, true),
+            // The nullable projection of a name.
+            NameTy::Named(name, _) => NameTy::Named(*name, true),
+            // A restricted value's projection keeps the restriction
+            // (`NullableStaticType` over the value static type,
+            // static_type.dart:350-383, `NonNullableStaticType.nullable`):
+            // it covers the value and `null`, never the siblings.
+            NameTy::EnumValue(enum_name, constant) => {
+                NameTy::EnumValueOrNull(*enum_name, *constant)
+            }
+            NameTy::BoolValue(value) => NameTy::BoolOrNull(*value),
             NameTy::TopNonNullable => NameTy::TopNullable,
             other => *other,
         }
@@ -5013,18 +5105,38 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         }
         match (sub, sup) {
             // Everything subtypes the nullable top (static_type.dart:166);
-            // `Never` subtypes everything; `Null <: T?`.
+            // `Never` subtypes everything; `Null <: T?` — through the
+            // restricted-value nullable projections too
+            // (`NullableStaticType.isSubtypeOf`, the underlying chain ends
+            // in `Never`).
             (_, NameTy::TopNullable)
             | (NameTy::Never, _)
-            | (NameTy::Null, NameTy::Named(_, true)) => true,
+            | (
+                NameTy::Null,
+                NameTy::Named(_, true) | NameTy::EnumValueOrNull(..) | NameTy::BoolOrNull(_),
+            ) => true,
             // `S <: T?` iff `S <: T` (static_type.dart:365-372); `S? <: T?`
             // likewise; `S? <: T` never (null matches no plain T).
             (NameTy::Named(sn, s), NameTy::Named(tn, t)) => (!*s || *t) && self.named_sub(*sn, *tn),
+            // The bare value fits its own nullable projection (the
+            // must-match rule: `true <: true?` through the identical
+            // restriction, types.dart:52-56).
+            (NameTy::EnumValue(en, c), NameTy::EnumValueOrNull(fn_, d)) => en == fn_ && c == d,
+            (NameTy::BoolValue(v), NameTy::BoolOrNull(w)) => v == w,
             // A constant's type is its enum, non-null.
             (NameTy::EnumValue(en, _), sup) => self.is_subtype_of(&NameTy::Named(*en, false), sup),
+            // The restricted nullable inherits the value's type edges, but
+            // only toward nullable targets (its `null` half never fits a
+            // non-nullable type).
+            (NameTy::EnumValueOrNull(en, _), NameTy::Named(tn, true)) => {
+                self.is_subtype_of(&NameTy::Named(*en, false), &NameTy::Named(*tn, true))
+            }
+            (NameTy::BoolOrNull(_), NameTy::Named(tn, true)) => self.is_subtype_of(
+                &NameTy::Named(self.bool_id, false),
+                &NameTy::Named(*tn, true),
+            ),
             (NameTy::BoolValue(_), sup) => {
-                let bool_name = self.strings.intern("bool");
-                self.is_subtype_of(&NameTy::Named(bool_name, false), sup)
+                self.is_subtype_of(&NameTy::Named(self.bool_id, false), sup)
             }
             (NameTy::TopNonNullable, NameTy::TopNonNullable) => true,
             _ => false,
@@ -5034,7 +5146,10 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     fn is_sealed(&self, ty: &NameTy) -> bool {
         match ty {
             // Nullable projections split (static_type.dart:356).
-            NameTy::Named(_, true) | NameTy::TopNullable => true,
+            NameTy::Named(_, true)
+            | NameTy::TopNullable
+            | NameTy::EnumValueOrNull(..)
+            | NameTy::BoolOrNull(_) => true,
             NameTy::Named(name, false) => self.is_sealed_name(*name),
             _ => false,
         }
@@ -5044,6 +5159,12 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         match ty {
             NameTy::Named(name, true) => vec![NameTy::Named(*name, false), NameTy::Null],
             NameTy::TopNullable => vec![NameTy::TopNonNullable, NameTy::Null],
+            // NullableStaticType.getSubtypes: the value plus `null`
+            // (static_type.dart:359-362).
+            NameTy::EnumValueOrNull(enum_name, constant) => {
+                vec![NameTy::EnumValue(*enum_name, *constant), NameTy::Null]
+            }
+            NameTy::BoolOrNull(value) => vec![NameTy::BoolValue(*value), NameTy::Null],
             NameTy::Named(name, false) => self.name_subtypes(*name),
             _ => Vec::new(),
         }
@@ -5118,7 +5239,17 @@ impl NameWorld<'_> {
                     self.strings.resolve(*constant)
                 )
             }
+            // NullableStaticType.name: the underlying head plus `?`
+            // (static_type.dart:375-378).
+            NameTy::EnumValueOrNull(enum_name, constant) => {
+                format!(
+                    "{}.{}?",
+                    self.strings.resolve(*enum_name),
+                    self.strings.resolve(*constant)
+                )
+            }
             NameTy::BoolValue(value) => value.to_string(),
+            NameTy::BoolOrNull(value) => format!("{value}?"),
             NameTy::Unknown(_) => "?".to_string(),
         }
     }
@@ -5171,7 +5302,7 @@ impl NameWorld<'_> {
     }
 
     fn is_sealed_name(&self, name: StringId) -> bool {
-        if self.strings.resolve(name) == "bool" {
+        if name == self.bool_id {
             return true;
         }
         self.container(name)
@@ -5198,7 +5329,7 @@ impl NameWorld<'_> {
     /// The closed subtype set of a sealed class or enum, in declaration
     /// order (types/sealed.dart, types/enum.dart).
     fn name_subtypes(&self, name: StringId) -> Vec<NameTy> {
-        if self.strings.resolve(name) == "bool" {
+        if name == self.bool_id {
             return vec![NameTy::BoolValue(true), NameTy::BoolValue(false)];
         }
         let Some(container) = self.container(name) else {
@@ -6948,6 +7079,12 @@ mod tests {
             d.message,
             "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
         );
+        // The oracle row's correctionMessage carries the suggested pattern
+        // as `{2}` (diagnostic.g.dart:13079).
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Try adding a default case or cases that match 'Color.blue'.")
+        );
         assert_eq!(d.severity, Severity::Error);
         let switch_at =
             u32::try_from("enum Color { red, green, blue } void f(Color c) { ".len()).unwrap();
@@ -7023,6 +7160,11 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].message,
             "The type 'Color' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Color.blue'."
+        );
+        // The expression-face correctionMessage (diagnostic.g.dart:13018).
+        assert_eq!(
+            report.diagnostics[0].correction.as_deref(),
+            Some("Try adding a wildcard pattern or cases that match 'Color.blue'.")
         );
     }
 
@@ -7211,6 +7353,178 @@ mod tests {
     #[test]
     fn record_pattern_binds_fields_without_shape_diagnostic() {
         let report = report("class C {} void f(C c) { if (c case (C a, C b)) { a; b; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    // —— case-root capture (the case-sink window) ———————————————————————
+
+    /// An if-case root before a switch never feeds its cases: roots are
+    /// captured only across a case header's pattern window, so the stale
+    /// unknown from `if (y case 42)` can neither cover a case nor trip the
+    /// empty fallback.
+    ///
+    /// Hand-trace (pre-fix): the stale root sat below the case roots; the
+    /// second case's `end_switch_case` drained it and reported a false
+    /// `non_exhaustive_switch_statement` over `bool`.
+    #[test]
+    fn stale_if_case_root_never_feeds_a_case() {
+        let report = report(
+            "class bool {} void g(bool y, bool x) { if (y case 42) {} switch (x) { case false: break; case true: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// An if-case inside one case's body never feeds the next case: each
+    /// header captures at its own `end_case_expression`, so the stale root
+    /// cannot shift the case/space pairing.
+    ///
+    /// Hand-trace (pre-fix): `case E.a`'s body if-case pushed above `E.a`'s
+    /// root and the LIFO pop handed the *next* case the wrong spaces —
+    /// a false `non_exhaustive_switch_statement` (missing `E.b`).
+    #[test]
+    fn stale_case_body_root_never_feeds_the_next_case() {
+        let report = report(
+            "class bool {} enum E { a, b } void f(bool y, E e) { switch (e) { case E.a: if (y case 42) {} case E.b: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A nested switch opens after the enclosing case's root was captured:
+    /// the `open_switch` debris-clear must not destroy live case spaces.
+    #[test]
+    fn nested_switch_preserves_the_outer_case_root() {
+        let report = report(
+            "enum E { a, b } void f(E a, E b) { switch (a) { case E.a: switch (b) { case E.a: break; case E.b: break; } case E.b: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A shared-body case group (`case A: case B:`) captures one case per
+    /// header, matching the oracle's per-`case` nodes.
+    ///
+    /// Hand-trace (pre-fix): one body event drained a single root, so the
+    /// group collapsed to its *last* header's space and `E.a` went
+    /// uncovered — a false `non_exhaustive_switch_statement`.
+    #[test]
+    fn shared_body_case_group_captures_each_header() {
+        let report =
+            report("enum E { a, b } void f(E e) { switch (e) { case E.a: case E.b: break; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A labeled duplicate case anchors `unreachable_switch_case` at the
+    /// `case` keyword itself, not the label (the oracle's
+    /// `caseNode.keyword`, constant_verifier.dart:1076-1085).
+    #[test]
+    fn labeled_case_anchors_unreachable_at_case_keyword() {
+        let report = report(
+            "enum Color { red, green } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; l: case Color.red: break; } }",
+        );
+        assert_eq!(code_names(&report), ["unreachable_switch_case"]);
+        let case_at = u32::try_from(
+            "enum Color { red, green } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; l: ".len(),
+        )
+        .unwrap();
+        assert_eq!(report.diagnostics[0].range.offset, case_at);
+    }
+
+    // —— restricted nullable projections (the Null|value fold) ———————————
+
+    /// `nullable` over a restricted value keeps the restriction: the
+    /// `Null|BoolValue(true)` fold lowers to `true?`, so `case null` after
+    /// `case true || null` is unreachable while `case false` stays
+    /// reachable and the `false` gap still reports.
+    ///
+    /// Hand-trace: the fold space covers `{true, null}` only
+    /// (`NullableStaticType(_BoolValueStaticType)`, static_type.dart:350);
+    /// lowering it to `bool?` would swallow `false` on both questions.
+    #[test]
+    fn bool_value_nullable_keeps_the_restriction() {
+        let report = report(
+            "class bool {} void f(bool b) { switch (b) { case true || null: break; case null: break; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["unreachable_switch_case", "non_exhaustive_switch_statement"],
+            "{:?}",
+            code_names(&report)
+        );
+        // The `false` gap, not a swallowed one.
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'false'."
+        );
+        // `case null` anchors at its own `case` keyword.
+        let null_case_at = u32::try_from(
+            "class bool {} void f(bool b) { switch (b) { case true || null: break; ".len(),
+        )
+        .unwrap();
+        assert_eq!(report.diagnostics[0].range.offset, null_case_at);
+    }
+
+    /// The same precision for enum constants: `case E.a || null` covers
+    /// `{E.a, null}` only — the sibling `E.b` stays reachable, and the
+    /// nullable-scrutinee statement face emits nothing else.
+    ///
+    /// Hand-trace (pre-fix): the fold lowered to `E?`, whose split covers
+    /// every constant — a false `unreachable_switch_case` on `E.b`.
+    #[test]
+    fn enum_value_nullable_keeps_the_restriction() {
+        let report = report(
+            "enum E { a, b } void f(E? e) { switch (e) { case E.a || null: break; case E.b: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    // —— enum/mixin supertype edges toward sealed classes —————————————————
+
+    /// An enum's `implements` and a mixin's `on` edge reach the sealed
+    /// splitter: both join the sealed class's closed subtype set, so
+    /// covering the enum's constants and the mixin covers everything.
+    ///
+    /// Hand-trace: `subtypes(S)` walks the unit's containers over the
+    /// superclass and interface edges → `[E, M]`; `E` splits over its
+    /// constants and `M` is covered by the typed case.
+    #[test]
+    fn enum_and_mixin_edges_split_the_sealed_class() {
+        let covered = report(
+            "sealed class S {} enum E implements S { a, b } mixin M on S {} void f(S s) { switch (s) { case E.a: break; case E.b: break; case M m: break; } }",
+        );
+        assert_eq!(covered.diagnostics.len(), 0, "{:?}", code_names(&covered));
+
+        let missing = report(
+            "sealed class S {} enum E implements S { a, b } mixin M on S {} void f(S s) { switch (s) { case E.a: break; case E.b: break; } }",
+        );
+        assert_eq!(
+            code_names(&missing),
+            ["non_exhaustive_switch_statement"],
+            "{:?}",
+            code_names(&missing)
+        );
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'M'."
+        );
+    }
+
+    /// A typed wildcard (`M _`) covers its declared type's space: the
+    /// canonical sealed-coverage style turns exhaustive.
+    ///
+    /// Hand-trace (pre-fix): the wildcard dropped its type, each case
+    /// collapsed to the context space, and the second case reported a false
+    /// `unreachable_switch_case`.
+    #[test]
+    fn typed_wildcard_covers_its_type() {
+        let report = report(
+            "sealed class S {} class A extends S {} class B extends S {} void f(S s) { switch (s) { case A _: break; case B _: break; } }",
+        );
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// A bare `_` still covers the whole context (no leaf of its own).
+    #[test]
+    fn bare_wildcard_covers_the_context() {
+        let report = report("class C {} void f(C c) { var x = switch (c) { _ => 1 }; }");
         assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
     }
 }

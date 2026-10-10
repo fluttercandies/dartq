@@ -282,8 +282,11 @@ impl<M: Clone + PartialEq + Eq + Hash + Debug> Space<M> {
                 world.is_null(&null_side.ty) && null_side.props.is_empty() && other.props.is_empty()
             };
             if fold(world, &kept[0], &kept[1]) || fold(world, &kept[1], &kept[0]) {
-                let null_side = usize::from(world.is_null(&kept[0].ty));
-                let merged = Single::full(world.nullable(&kept[1 - null_side].ty));
+                // The merged space is the nullable projection of the
+                // NON-null side (space.dart:109-117): `1` when `kept[0]`
+                // is the null side, `0` otherwise.
+                let other = usize::from(world.is_null(&kept[0].ty));
+                let merged = Single::full(world.nullable(&kept[other].ty));
                 kept = vec![merged];
             }
         }
@@ -493,6 +496,16 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
     predicates: &[Predicate<M>],
     multiple: bool,
 ) -> Option<Vec<Witness<M>>> {
+    // Row/column invariant (exhaustive.dart:121-125): every row spans the
+    // same columns as the value patterns.
+    debug_assert!(
+        case_rows
+            .iter()
+            .all(|row| row.len() == value_patterns.len()),
+        "row/column mismatch: {} value patterns, rows {:?}",
+        value_patterns.len(),
+        case_rows.iter().map(Row::len).collect::<Vec<_>>(),
+    );
     if value_patterns.is_empty() {
         // No columns left: surviving rows absorb every remaining value;
         // no rows at all means the predicate stack describes a witness.
@@ -512,7 +525,6 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
 
     let first = &value_patterns[0];
 
-    let mut witnesses: Option<Vec<Witness<M>>> = None;
     // Cycle guard, reused across the singles' walks (`clear` keeps the
     // allocation; visits are not shared between walks because a type's
     // expansion depends on `single`). `subtypes` feeds a FIFO expansion,
@@ -529,6 +541,9 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
     // type set.
     let mut visited: FxHashSet<M> = FxHashSet::default();
     for single in first.first_singles() {
+        // Witnesses are per single space (exhaustive.dart:202): the first
+        // single that yields any settles the answer (:261-263).
+        let mut witnesses: Option<Vec<Witness<M>>> = None;
         let context_ty = single.ty.clone();
         let mut stack: VecDeque<M> = VecDeque::new();
         stack.push_back(context_ty.clone());
@@ -579,8 +594,11 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
                 }
             }
         }
+        if witnesses.is_some() {
+            return witnesses;
+        }
     }
-    witnesses
+    None
 }
 
 /// `_Checker._filterByType` (exhaustive.dart:271-365): keep the rows that

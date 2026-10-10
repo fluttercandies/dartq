@@ -520,6 +520,24 @@ impl SemanticCode {
         }
     }
 
+    /// The verbatim oracle `correctionMessage` when the row declares one;
+    /// `a2` is the suggested-pattern placeholder. Carried in the
+    /// diagnostic's correction slot (`DiagnosticWithArguments`, the switch
+    /// exhaustiveness rows, diagnostic.g.dart:13018/:13079). Rows without a
+    /// correction answer `None`.
+    #[must_use]
+    pub fn correction_message(self, a2: &str) -> Option<String> {
+        match self {
+            Self::NonExhaustiveSwitchStatement => Some(format!(
+                "Try adding a default case or cases that match '{a2}'."
+            )),
+            Self::NonExhaustiveSwitchExpression => Some(format!(
+                "Try adding a wildcard pattern or cases that match '{a2}'."
+            )),
+            _ => None,
+        }
+    }
+
     /// The verbatim oracle `problemMessage` for the four-placeholder
     /// `_element` template: the kind word, the executable name, and the two
     /// counts.
@@ -732,6 +750,27 @@ mod tests {
         assert_eq!(
             SemanticCode::InvalidNullAwareOperator.message("?.", "."),
             "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
+        );
+    }
+
+    /// The correction-carrying rows answer the verbatim oracle
+    /// `correctionMessage` templates (diagnostic.g.dart:13018/:13079); the
+    /// suggested pattern fills `{2}`. Rows without a correction answer
+    /// `None`.
+    #[test]
+    fn correction_messages_carry_the_suggested_pattern() {
+        assert_eq!(
+            SemanticCode::NonExhaustiveSwitchStatement.correction_message("Color.blue"),
+            Some("Try adding a default case or cases that match 'Color.blue'.".to_string())
+        );
+        assert_eq!(
+            SemanticCode::NonExhaustiveSwitchExpression.correction_message("B"),
+            Some("Try adding a wildcard pattern or cases that match 'B'.".to_string())
+        );
+        assert_eq!(
+            SemanticCode::UnreachableSwitchCase.correction_message(""),
+            None,
+            "the no-argument row declares no correction"
         );
     }
 }
