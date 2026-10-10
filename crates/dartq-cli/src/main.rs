@@ -848,8 +848,9 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
 /// ```text
 /// DECL|file|container|kind|name|line|column|length   (container `-` when
 ///                                                     top-level; 1-based)
-/// REF|target-file|kind|qualified|offset|length       (the use site's
-///                                                     UTF-16 offset)
+/// REF|target-file|kind|qualified|offset|length|use-file
+///                                                 (offset is the use
+///                                                 site's UTF-16 offset)
 /// ```
 fn write_query_machine(
     out: &mut impl Write,
@@ -872,12 +873,13 @@ fn write_query_machine(
     for reference in refs {
         writeln!(
             out,
-            "REF|{}|{}|{}|{}|{}",
+            "REF|{}|{}|{}|{}|{}|{}",
             layout.file_path(reference.target_file).display(),
             ref_kind_name(reference.kind),
             reference.qualified,
             reference.range.offset,
             reference.range.length,
+            layout.file_path(reference.file).display(),
         )?;
     }
     Ok(())
@@ -1673,9 +1675,10 @@ mod tests {
             ],
         );
         let a = root.canonicalize().expect("root").join("lib/a.dart");
+        let b = root.canonicalize().expect("root").join("lib/b.dart");
 
         // `Foo? f` types a reference; `Foo()` is an implicit-creation
-        // invocation; both target a.dart unqualified.
+        // invocation; both target a.dart unqualified, use sites in b.dart.
         let mut out: Vec<u8> = Vec::new();
         let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out);
         assert_eq!(code, exit::CLEAN);
@@ -1683,11 +1686,13 @@ mod tests {
             String::from_utf8(out).expect("UTF-8"),
             format!(
                 "DECL|{}|-|class|Foo|1|7|3\n\
-                 REF|{}|reference|false|33|3\n\
-                 REF|{}|invoked|false|42|3\n",
+                 REF|{}|reference|false|33|3|{}\n\
+                 REF|{}|invoked|false|42|3|{}\n",
                 a.display(),
                 a.display(),
-                a.display()
+                b.display(),
+                a.display(),
+                b.display()
             )
         );
 
@@ -1760,6 +1765,7 @@ mod tests {
             ],
         );
         let a = root.canonicalize().expect("root").join("lib/a.dart");
+        let b = root.canonicalize().expect("root").join("lib/b.dart");
 
         // references == symbol rows (the index's reference surface is
         // name-keyed and already kinded).
@@ -1789,9 +1795,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("UTF-8"),
             format!(
-                "DECL|{}|-|class|Foo|1|7|3\nREF|{}|invoked|false|41|3\n",
+                "DECL|{}|-|class|Foo|1|7|3\nREF|{}|invoked|false|41|3|{}\n",
                 a.display(),
-                a.display()
+                a.display(),
+                b.display()
             )
         );
 
@@ -1804,9 +1811,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("UTF-8"),
             format!(
-                "DECL|{}|-|function|foo|4|6|3\nREF|{}|invoked|false|50|3\n",
+                "DECL|{}|-|function|foo|4|6|3\nREF|{}|invoked|false|50|3|{}\n",
                 a.display(),
-                a.display()
+                a.display(),
+                b.display()
             )
         );
 
