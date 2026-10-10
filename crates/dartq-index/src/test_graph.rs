@@ -30,6 +30,8 @@
 //! guarantees it; an out-of-range target is a caller bug and surfaces as
 //! one). Output is deterministic: `tests_of` rows ascend.
 
+use rustc_hash::FxHashMap;
+
 /// The basename suffix that marks a test file (PRD §15.4's fallback signal).
 const TEST_SUFFIX: &str = "_test.dart";
 
@@ -66,6 +68,11 @@ impl TestGraph {
         mut basename_of: impl FnMut(u32) -> Option<&'a str>,
     ) -> Self {
         let count = u32::try_from(library_count).expect("more than u32::MAX libraries");
+        // The basename index behind the naming fallback, built lazily: at
+        // most one pass over the id space, paid only when some import-less
+        // test needs the convention (an import-resolved workspace never
+        // does). Keys borrow the caller's table through 'a — no copies.
+        let mut by_basename: Option<FxHashMap<&'a str, Vec<u32>>> = None;
         // Per-tested-library rows, inverted from per-test edges.
         let mut rows: Vec<Vec<u32>> = vec![Vec::new(); library_count];
         for lib in 0..count {
@@ -80,13 +87,23 @@ impl TestGraph {
             let mut targets: Vec<u32> = imports_of(lib).to_vec();
             targets.sort_unstable();
             targets.dedup();
-            if targets.is_empty() {
+            if targets.is_empty() && !stem.is_empty() {
                 // Fallback only: the convention names the tested file when
-                // nothing resolved in the analyzed set.
-                if !stem.is_empty() {
-                    let needle = format!("{stem}.dart");
+                // nothing resolved in the analyzed set — one hash lookup
+                // instead of scanning the whole id space per test.
+                let needle = format!("{stem}.dart");
+                let index = by_basename.get_or_insert_with(|| {
+                    let mut map: FxHashMap<&'a str, Vec<u32>> = FxHashMap::default();
                     for other in 0..count {
-                        if other != lib && basename_of(other) == Some(needle.as_str()) {
+                        if let Some(name) = basename_of(other) {
+                            map.entry(name).or_default().push(other);
+                        }
+                    }
+                    map
+                });
+                if let Some(named) = index.get(needle.as_str()) {
+                    for &other in named {
+                        if other != lib {
                             targets.push(other);
                         }
                     }
@@ -148,7 +165,11 @@ mod tests {
         );
         assert_eq!(graph.tests_of(0), &[2, 3], "both tests, ascending");
         assert_eq!(graph.tests_of(1), &[3]);
-        assert_eq!(graph.tests_of(4), &[] as &[u32], "the untested library has no edges");
+        assert_eq!(
+            graph.tests_of(4),
+            &[] as &[u32],
+            "the untested library has no edges"
+        );
         // Duplicate directives dedup: `a` is listed once per test.
         assert_eq!(graph.tests_of(0).len(), 2);
     }
@@ -171,7 +192,11 @@ mod tests {
             |lib| Some(imports[lib as usize].1),
         );
         assert_eq!(graph.tests_of(0), &[2], "the convention names a.dart");
-        assert_eq!(graph.tests_of(1), &[] as &[u32], "the helper is not a tested library");
+        assert_eq!(
+            graph.tests_of(1),
+            &[] as &[u32],
+            "the helper is not a tested library"
+        );
     }
 
     /// Imports win over the convention: `a_test` resolving `b.dart` keeps
@@ -191,7 +216,11 @@ mod tests {
             |lib| Some(imports[lib as usize].1),
         );
         assert_eq!(graph.tests_of(1), &[2]);
-        assert_eq!(graph.tests_of(0), &[] as &[u32], "the fallback is suppressed");
+        assert_eq!(
+            graph.tests_of(0),
+            &[] as &[u32],
+            "the fallback is suppressed"
+        );
     }
 
     /// Non-test libraries never gain outbound edges regardless of imports,
@@ -210,7 +239,11 @@ mod tests {
         );
         assert_eq!(graph.tests_of(0), &[2], "the test's imports still count");
         assert_eq!(graph.tests_of(1), &[] as &[u32], "importer, not a test");
-        assert_eq!(graph.tests_of(2), &[] as &[u32], "no b.dart to fall back to");
+        assert_eq!(
+            graph.tests_of(2),
+            &[] as &[u32],
+            "no b.dart to fall back to"
+        );
     }
 
     /// Dead slots (no basename) contribute nothing and probe empty, and an
@@ -227,7 +260,9 @@ mod tests {
         assert_eq!(graph.tests_of(2), &[] as &[u32], "dead slot probes empty");
 
         let empty = TestGraph::build(0, |_| &[] as &[u32], |_| None);
-        let all: Vec<u32> = (0..0).flat_map(|lib| empty.tests_of(lib).to_vec()).collect();
+        let all: Vec<u32> = (0..0)
+            .flat_map(|lib| empty.tests_of(lib).to_vec())
+            .collect();
         assert!(all.is_empty(), "no libraries, no edges");
     }
 }

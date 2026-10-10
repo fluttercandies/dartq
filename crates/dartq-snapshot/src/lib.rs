@@ -14,6 +14,7 @@
 //! ```text
 //! <root>/snapshots/<generation id>/header.json    generation header (last write)
 //! <root>/snapshots/<generation id>/tables.json    StringId/FileId remap slices
+//! <root>/snapshots/<generation id>/recency        load-recency marker (touched once per load)
 //! <root>/snapshots/<generation id>/entries/<entry id>.entry
 //! ```
 //!

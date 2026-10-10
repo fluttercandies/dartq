@@ -463,6 +463,213 @@ fn capacity_evicts_the_least_recent_generation() {
     assert_eq!(snapshot.entries.len(), 1);
 }
 
+/// The termination invariant: a symlinked cycle inside a generation's tree
+/// must not recurse without bound during the capacity scan — `dir_stats`
+/// keys recursion on the entry's own file type and never resolves a link
+/// (the pre-fix code followed `path.is_dir()` into the cycle and overflowed
+/// the stack). A generation-level symlink is likewise neither counted nor
+/// evicted. The test itself is the regression: unbounded recursion aborts
+/// the process instead of returning.
+#[cfg(unix)]
+#[test]
+fn symlink_cycle_terminates_the_capacity_scan() {
+    let cache = TempCache::new("symlink-cycle");
+    let header = save_one_entry(&cache);
+    let entries = entries_dir(&cache.path, &header);
+    std::os::unix::fs::symlink(&entries, entries.join("cycle")).expect("plant cycle");
+    let snapshots = cache.path.join("snapshots");
+    std::os::unix::fs::symlink(gen_dir(&cache.path, &header), snapshots.join("linked"))
+        .expect("plant generation-level link");
+
+    cache.store(DEFAULT_CAPACITY_BYTES).enforce_capacity();
+
+    assert!(
+        gen_dir(&cache.path, &header).exists(),
+        "scan completed; the generation is intact"
+    );
+    assert!(
+        fs::symlink_metadata(snapshots.join("linked")).is_ok(),
+        "the generation-level link is never followed"
+    );
+}
+
+/// The throttle: ordinary saves never scan — the stale entries a re-save
+/// orphans linger until the byte estimate crosses capacity (or the save
+/// counter forces) an enforce, at which point the sweep aligns the
+/// generation's entry files with the just-written set.
+#[test]
+fn save_throttles_the_stale_sweep_until_enforce() {
+    let cache = TempCache::new("throttle");
+    let header = test_header();
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    store
+        .save(
+            &header,
+            &tables(),
+            &[
+                Entry {
+                    key: key(1, 10),
+                    payload: payload("a"),
+                },
+                Entry {
+                    key: key(2, 10),
+                    payload: payload("b"),
+                },
+            ],
+        )
+        .expect("save");
+    store
+        .save(
+            &header,
+            &tables(),
+            &[Entry {
+                key: key(3, 10),
+                payload: payload("c"),
+            }],
+        )
+        .expect("resave");
+
+    // Two saves, tiny estimate: below the throttle nothing scanned.
+    let dir = entries_dir(&cache.path, &header);
+    let entry_file = |k: u8| dir.join(format!("{}.entry", hex::encode(key(k, 10).id())));
+    assert!(
+        entry_file(1).exists() && entry_file(2).exists(),
+        "no scan before the throttle fires"
+    );
+
+    // A store whose first save already sits over capacity enforces — and
+    // sweeps — immediately. The just-saved generation is the newest and is
+    // never evicted, so the sweep finds its entries dir in place.
+    let store = cache.store(1);
+    store
+        .save(
+            &header,
+            &tables(),
+            &[Entry {
+                key: key(4, 10),
+                payload: payload("d"),
+            }],
+        )
+        .expect("save over capacity");
+    assert!(
+        !entry_file(1).exists() && !entry_file(2).exists(),
+        "stale swept"
+    );
+    assert!(
+        !entry_file(3).exists(),
+        "the sweep aligns entries with the written set, not with history"
+    );
+    assert!(entry_file(4).exists(), "the written entry survives");
+}
+
+/// Recency beats fitting: the newest generation is never evicted, even
+/// when the store cannot fit without it.
+#[test]
+fn enforce_never_evicts_the_newest_generation() {
+    let cache = TempCache::new("protect-newest");
+    let header_a = test_header();
+    let mut header_b = test_header();
+    header_b.package_graph_fingerprint = [8; 16];
+    let fat = TestPayload {
+        unit: "x".repeat(4096),
+        diagnostics: Vec::new(),
+    };
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    store
+        .save(
+            &header_a,
+            &tables(),
+            &[Entry {
+                key: key(1, 1),
+                payload: fat.clone(),
+            }],
+        )
+        .expect("save a");
+    store
+        .save(
+            &header_b,
+            &tables(),
+            &[Entry {
+                key: key(2, 1),
+                payload: fat,
+            }],
+        )
+        .expect("save b");
+
+    // Make A strictly older than B's fresh writes.
+    let older = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
+    for file in files_under(&gen_dir(&cache.path, &header_a)) {
+        let _ = set_file_atime(&file, older);
+        let _ = set_file_mtime(&file, older);
+    }
+
+    // Capacity smaller than either generation alone: A goes whole, B stays
+    // even though the store remains over capacity.
+    cache.store(1).enforce_capacity();
+    assert!(!gen_dir(&cache.path, &header_a).exists(), "older evicted");
+    assert!(
+        gen_dir(&cache.path, &header_b).exists(),
+        "the newest generation survives over capacity"
+    );
+}
+
+/// The enforce walk sweeps leaked temp files anywhere under the cache —
+/// crash residue never accumulates, and real files are untouched.
+#[test]
+fn enforce_sweeps_leaked_temp_files() {
+    let cache = TempCache::new("tmp-sweep");
+    let header = save_one_entry(&cache);
+    let generation = gen_dir(&cache.path, &header);
+    let entries = entries_dir(&cache.path, &header);
+    fs::write(generation.join("header.json.tmp-7-3"), b"torn").expect("plant temp");
+    fs::write(entries.join("feedbeef.entry.tmp-7-4"), b"torn").expect("plant temp");
+
+    cache.store(DEFAULT_CAPACITY_BYTES).enforce_capacity();
+
+    assert!(!generation.join("header.json.tmp-7-3").exists());
+    assert!(!entries.join("feedbeef.entry.tmp-7-4").exists());
+    assert!(generation.join("header.json").exists(), "real files intact");
+    assert_eq!(
+        fs::read_dir(entries).expect("entries").count(),
+        1,
+        "one entry left"
+    );
+}
+
+/// One load touches one marker: the generation gains a `recency` file —
+/// the LRU handle the sweep reads — and its entries are never utimed
+/// individually.
+#[test]
+fn load_touches_the_generation_recency_marker() {
+    let cache = TempCache::new("recency");
+    let header = save_one_entry(&cache);
+    let marker = gen_dir(&cache.path, &header).join("recency");
+    let entry =
+        entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(1, 10).id())));
+    assert!(!marker.exists(), "saving never touches the marker");
+
+    // Park the entry's times in the past: the load must leave them there.
+    let past = FileTime::from_system_time(SystemTime::now() - Duration::from_mins(5));
+    let _ = set_file_atime(&entry, past);
+    let _ = set_file_mtime(&entry, past);
+
+    cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .load::<TestPayload>(&header)
+        .expect("load");
+
+    assert!(marker.exists(), "the load created the marker");
+    let accessed = fs::metadata(&entry)
+        .expect("entry metadata")
+        .accessed()
+        .expect("atime");
+    assert_eq!(
+        FileTime::from_system_time(accessed),
+        past,
+        "entries are not utimed individually"
+    );
+}
+
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

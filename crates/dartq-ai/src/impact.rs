@@ -21,8 +21,9 @@
 //! # Closure mechanics
 //!
 //! The rust-analyzer reverse-dependency posture (`base-db/src/input.rs`
-//! `transitive_rev_deps`): the import graph is inverted once per query and
-//! a worklist drains the importers. The visited and direct-semantic marks
+//! `transitive_rev_deps`): the import graph is inverted once per query —
+//! a flat CSR array pair, no per-node heap rows — and a worklist drains
+//! the importers. The visited and direct-semantic marks
 //! are dense `Vec<bool>`s over the id space — O(1) probes, no hashing
 //! (library ids are a dense arena space, so a hashed set would only add
 //! overhead). Output is deterministic: every section sorts by its path.
@@ -169,8 +170,7 @@ pub struct EnvironmentImpact {
 /// content-only.
 #[must_use]
 pub fn api_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
-    before.content_hash != after.content_hash
-        && before.top_level_names != after.top_level_names
+    before.content_hash != after.content_hash && before.top_level_names != after.top_level_names
 }
 
 /// The per-symbol signature verdict — the #282 seam's per-name half. The v1
@@ -178,11 +178,7 @@ pub fn api_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
 /// signature change; a body edit under a stable name is invisible until the
 /// the `SignatureHash` gate lands.
 #[must_use]
-pub fn symbol_signature_changed(
-    before: &[StringId],
-    after: &[StringId],
-    name: StringId,
-) -> bool {
+pub fn symbol_signature_changed(before: &[StringId], after: &[StringId], name: StringId) -> bool {
     before.binary_search(&name).is_ok() != after.binary_search(&name).is_ok()
 }
 
@@ -233,15 +229,31 @@ pub fn impact<'a>(
     strings: &StringTable,
     changes: &[LibraryChange],
 ) -> ImpactReport {
-    // The inverted graph, built once (the rust-analyzer posture): edge
-    // `importer → imported` becomes `rev[imported] += importer`.
+    // The inverted graph, built once (the rust-analyzer posture) as flat
+    // CSR — two counting passes over the id space, one allocation per
+    // array; the ascending fill keeps each row's importers ascending.
+    // Edge `importer → imported` inverts to `importers_of(imported)`.
     let count = u32::try_from(library_count).expect("more than u32::MAX libraries");
-    let mut rev: Vec<Vec<u32>> = vec![Vec::new(); library_count];
+    let mut offsets = vec![0u32; library_count + 1];
     for lib in 0..count {
         for &target in imports_of(lib) {
-            rev[target as usize].push(lib);
+            offsets[target as usize + 1] += 1;
         }
     }
+    for i in 1..offsets.len() {
+        offsets[i] += offsets[i - 1];
+    }
+    let mut edges = vec![0u32; offsets[library_count] as usize];
+    let mut fill: Vec<u32> = offsets[..library_count].to_vec();
+    for lib in 0..count {
+        for &target in imports_of(lib) {
+            let slot = fill[target as usize] as usize;
+            edges[slot] = lib;
+            fill[target as usize] += 1;
+        }
+    }
+    let importers_of =
+        |lib: usize| -> &[u32] { &edges[offsets[lib] as usize..offsets[lib + 1] as usize] };
 
     // Seed marks, then the direct-semantic marks: the first hop out of an
     // API-changing library. Transitively reached importers stay
@@ -256,7 +268,7 @@ pub fn impact<'a>(
     let mut direct_semantic = vec![false; library_count];
     for (lib, &is_api) in api.iter().enumerate() {
         if is_api {
-            for &importer in &rev[lib] {
+            for &importer in importers_of(lib) {
                 direct_semantic[importer as usize] = true;
             }
         }
@@ -264,9 +276,11 @@ pub fn impact<'a>(
 
     // The closure: seeds pre-marked, importers drained worklist-style.
     let mut visited = seed_changed.clone();
-    let mut worklist: Vec<u32> = (0..count).filter(|&lib| seed_changed[lib as usize]).collect();
+    let mut worklist: Vec<u32> = (0..count)
+        .filter(|&lib| seed_changed[lib as usize])
+        .collect();
     while let Some(lib) = worklist.pop() {
-        for &importer in &rev[lib as usize] {
+        for &importer in importers_of(lib as usize) {
             if visited[importer as usize] {
                 continue;
             }
@@ -284,11 +298,7 @@ pub fn impact<'a>(
         let after = &change.after.top_level_names;
         for name in diff_names(before, after) {
             changed_rows.push(ChangedSymbol {
-                symbol: format!(
-                    "{}|{}",
-                    label_of(change.library),
-                    strings.resolve(name)
-                ),
+                symbol: format!("{}|{}", label_of(change.library), strings.resolve(name)),
                 signature_changed: symbol_signature_changed(before, after, name),
             });
         }
@@ -375,9 +385,11 @@ mod tests {
         let fx = fixture();
         // a=0, b=1 imports a, c=2 imports b, t=3 imports a.
         let imports: [&[u32]; 4] = [&[], &[0], &[1], &[0]];
-        let tests = TestGraph::build(4, |lib| imports[lib as usize], |lib| {
-            Some(["a.dart", "b.dart", "c.dart", "a_test.dart"][lib as usize])
-        });
+        let tests = TestGraph::build(
+            4,
+            |lib| imports[lib as usize],
+            |lib| Some(["a.dart", "b.dart", "c.dart", "a_test.dart"][lib as usize]),
+        );
         let changes = [LibraryChange {
             library: 0,
             before: snapshot(&fx.strings, &["fa"]),
@@ -438,9 +450,11 @@ mod tests {
     fn body_only_edit_stays_content_only() {
         let fx = fixture();
         let imports: [&[u32]; 2] = [&[], &[0]];
-        let tests = TestGraph::build(2, |lib| imports[lib as usize], |lib| {
-            Some(["a.dart", "b.dart"][lib as usize])
-        });
+        let tests = TestGraph::build(
+            2,
+            |lib| imports[lib as usize],
+            |lib| Some(["a.dart", "b.dart"][lib as usize]),
+        );
         let mut after = snapshot(&fx.strings, &["fa"]);
         after.content_hash = content_hash(b"reformatted");
         let changes = [LibraryChange {
@@ -569,10 +583,7 @@ mod tests {
             "every face name counts as changed"
         );
         assert!(
-            report
-                .changed
-                .iter()
-                .all(|row| row.signature_changed),
+            report.changed.iter().all(|row| row.signature_changed),
             "the hypothetical is an API-level edit"
         );
         assert_eq!(report.affected[0].impact, ImpactLevel::Semantic);
