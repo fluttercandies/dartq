@@ -338,52 +338,49 @@ impl Lexer<'_> {
     /// `$` followed by a non-`{` (official tokenizeInterpolatedIdentifier):
     /// a keyword-or-identifier, or the missing-identifier recovery.
     fn scan_interpolated_identifier(&mut self) {
-        match self.peek() {
-            Some('a'..='z' | 'A'..='Z' | '_') => {
-                // The `$` token is followed by a keyword-or-identifier (keywords allowed, same as official).
-                let dollar_start = self.pos - 1; // `$` is a single byte
-                self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
-                let ident_start = self.pos;
-                while matches!(self.peek(), Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_')) {
-                    self.bump();
-                }
-                let lexeme = &self.src[ident_start..self.pos];
-                let kind = match keyword_from_str(lexeme) {
-                    Some(Keyword::Augment) if !self.config.enable_augmentations => {
-                        TokenKind::Identifier
-                    }
-                    Some(kw) => TokenKind::Keyword(kw),
-                    None => TokenKind::Identifier,
-                };
-                // Type parameters cannot contain `this`: discard an open `<`
-                // group (official appendKeywordToken, abstract_scanner.dart:376-381).
-                if matches!(kind, TokenKind::Keyword(Keyword::This)) {
-                    self.discard_open_lt();
-                }
-                self.emit(kind, ident_start, self.pos - ident_start);
+        if let Some('a'..='z' | 'A'..='Z' | '_') = self.peek() {
+            // The `$` token is followed by a keyword-or-identifier (keywords allowed, same as official).
+            let dollar_start = self.pos - 1; // `$` is a single byte
+            self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
+            let ident_start = self.pos;
+            while matches!(self.peek(), Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_')) {
+                self.bump();
             }
-            _ => {
-                // Non-identifier after `$`: synthetic empty Identifier + missing_identifier
-                // (official unexpectedDollarInString → analyzer missing_identifier).
-                let dollar_start = self.pos - 1;
-                self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
-                // The pin sits at the character after `$` (official
-                // synthetic-identifier scanOffset, tokenizeInterpolatedIdentifier);
-                // at EOF it backs off one unit (translateErrorToken's
-                // `_isAtEnd` decrement) onto the 1-byte `$`. The byte cap is
-                // applied BEFORE the boundary snap: a `.min` after `pin_back`
-                // could cut a boundary-safe offset into a multi-byte
-                // character, and `TokenTable::lexeme` panics on
-                // non-boundary offsets.
-                let at = self.pin_back(self.pos.min(self.src.len().saturating_sub(1)));
-                self.emit_synthetic(TokenKind::Identifier, at, 0);
-                self.diag(
-                    dartq_diagnostics::MISSING_IDENTIFIER,
-                    || msg::MISSING_IDENTIFIER.to_owned(),
-                    at,
-                    at + 1,
-                );
+            let lexeme = &self.src[ident_start..self.pos];
+            let kind = match keyword_from_str(lexeme) {
+                Some(Keyword::Augment) if !self.config.enable_augmentations => {
+                    TokenKind::Identifier
+                }
+                Some(kw) => TokenKind::Keyword(kw),
+                None => TokenKind::Identifier,
+            };
+            // Type parameters cannot contain `this`: discard an open `<`
+            // group (official appendKeywordToken, abstract_scanner.dart:376-381).
+            if matches!(kind, TokenKind::Keyword(Keyword::This)) {
+                self.discard_open_lt();
             }
+            self.emit(kind, ident_start, self.pos - ident_start);
+        } else {
+            // Non-identifier after `$`: synthetic empty Identifier + missing_identifier
+            // (official unexpectedDollarInString → analyzer missing_identifier).
+            let dollar_start = self.pos - 1;
+            self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
+            // The pin sits at the character after `$` (official
+            // synthetic-identifier scanOffset, tokenizeInterpolatedIdentifier);
+            // at EOF it backs off one unit (translateErrorToken's
+            // `_isAtEnd` decrement) onto the 1-byte `$`. The byte cap is
+            // applied BEFORE the boundary snap: a `.min` after `pin_back`
+            // could cut a boundary-safe offset into a multi-byte
+            // character, and `TokenTable::lexeme` panics on
+            // non-boundary offsets.
+            let at = self.pin_back(self.pos.min(self.src.len().saturating_sub(1)));
+            self.emit_synthetic(TokenKind::Identifier, at, 0);
+            self.diag(
+                dartq_diagnostics::MISSING_IDENTIFIER,
+                || msg::MISSING_IDENTIFIER.to_owned(),
+                at,
+                at + 1,
+            );
         }
     }
 

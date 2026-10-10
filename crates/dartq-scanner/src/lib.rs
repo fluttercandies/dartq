@@ -74,7 +74,7 @@
 //! `_overrideVersion` (:206) and `scanner.configuration` (:222)
 //! (analyzer-8.4.1 scanner.dart:195-222). The CFE pipeline keeps the **first**
 //! match instead (`registerExplicitLanguageVersion`,
-//! `_languageVersion.isExplicit → return`, source_compilation_unit.dart:486);
+//! `_languageVersion.isExplicit → return`, `source_compilation_unit.dart:486`);
 //! that split is real and expected — dartq's parity basis for this behavior
 //! is the analyzer consumer path, and the CFE citation must not be reused for
 //! oracle alignment here.

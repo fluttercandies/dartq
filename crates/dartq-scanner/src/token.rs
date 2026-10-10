@@ -392,6 +392,11 @@ impl TokenTable {
     /// at Eof). Sequencing contract: this runs once at parse end — before it,
     /// an inserted id resolves only in the parser's side table, and no span
     /// may be derived through the table for one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the table is empty, i.e. there is no scanned Eof sentinel to
+    /// re-seat (the contract requires a fully scanned table).
     pub fn append_inserted(&mut self, inserted: impl IntoIterator<Item = Token>) {
         let eof = self
             .tokens
