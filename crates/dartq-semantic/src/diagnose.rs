@@ -43,21 +43,22 @@
 //! getter-shaped callees (whose oracle kind word M1 does not model)
 //! suppress too: the under-report direction.
 //!
-//! The static-nullability four decide on declared types only
-//! (types-nullability-spec §2–§3): the engine tracks the declared type of
-//! locals, formals, fields, top-level variables, and return types (armed by
-//! `handle_type`/`handle_void_keyword`, disarmed by `handle_no_type` — every
-//! declaration head runs one `parse_type`, so the arm cannot leak), and
-//! types expressions minimally: the `null` literal is `Null`, a name with a
-//! captured declared type is that type, everything else is `Unknown` — the
-//! oracle's `InvalidType`, which suppresses every question it touches. The
-//! decidable set is therefore exactly the nullability decisions:
-//! `null`/`T?` into a non-nullable target (`invalid_assignment`,
-//! `argument_type_not_assignable`, `return_of_invalid_type`), and `?.`/`?[`/
-//! `?..` on a strictly non-nullable receiver (`invalid_null_aware_operator`,
-//! a `STATIC_WARNING`). Assignment/initializer/argument/return checks apply
-//! only to single-row expressions (one pushed row) so compound operands
-//! never lend their type to the whole expression.
+//! The static-nullability checks decide on declared types and literal
+//! types (types-nullability-spec §2–§3): the engine tracks the declared
+//! type of locals, formals, fields, top-level variables, and return types
+//! (armed by `handle_type`/`handle_void_keyword`, disarmed by
+//! `handle_no_type` — every declaration head runs one `parse_type`, so the
+//! arm cannot leak), and types expressions minimally: the `null` literal is
+//! `Null`, the string/int/double/bool literals carry their final primitives,
+//! a name with a captured declared type is that type, everything else is
+//! `Unknown` — the oracle's `InvalidType`, which suppresses every question
+//! it touches. The decidable set is the nullability decisions
+//! (`null`/`T?` into a non-nullable target) plus the final-primitive pairs
+//! ([`FINAL_PRIMITIVES`]), and `?.`/`?[`/`?..` on a strictly non-nullable
+//! receiver (`invalid_null_aware_operator`, a `STATIC_WARNING`).
+//! Assignment/initializer/argument/return checks apply only to single-row
+//! expressions (one pushed row) so compound operands never lend their type
+//! to the whole expression.
 //!
 //! # The frozen-family emit matrix (batch 1 #120, batch 2 #197)
 //!
@@ -152,17 +153,45 @@
 //!   bodies share the switch block's frame) — a leak can only mask a miss
 //!   (under-report), never fabricate one.
 //!
-//! # Deferred frozen rows
+//! # The #350 gate closure (the remaining frozen rows)
 //!
-//! `undefined_constructor_in_initializer` / `undefined_enum_constructor`
-//! (constructors outside the M1 model), `undefined_referenced_parameter`
-//! (`@UseResult(unless:)` check, `annotation_verifier.dart:519-541`),
-//! `undefined_hidden_name` / `undefined_shown_name` (directives are consumed
-//! diet-style and the combinator model carries clause names without source
-//! spans — both arrive with the directive milestone), and `_function` (a
-//! function-typed *expression*
-//! instantiation — its message displays the function type, a shape M1 cannot
-//! render). `wrong_number_of_parameters_for_setter` is emitted here although
+//! * Assignability trio: literals carry their final-primitive types and
+//!   [`Engine::assignable`] extends [`Ty::assignable_from`] with the
+//!   final-primitive table (a value of one final primitive never fits
+//!   another; `int`/`double` fit `num`; `int`→`double` stays undecided —
+//!   the oracle's literal conversion is below the M1 facts).
+//! * `undefined_annotation`: a fully missing `MetadataReference` name,
+//!   anchored over the `@` (the 3.13.1 caliber — removed upstream in 3.14).
+//! * `undefined_constructor_in_initializer`: `super.named()` inside a
+//!   constructor-initializer list checks the superclass's constructor face
+//!   (captured per container: named selectors + the unnamed flag) and folds
+//!   the row before pass 2's super-member dispatch can mis-report it.
+//! * `undefined_enum_constructor`: an enum constant's constructor selector
+//!   checks the enum's constructor face.
+//! * The extension-override face: a container-callee send (`E('x')`,
+//!   `C()`) folds into a [`Receiver::Created`] row, so member and operator
+//!   accesses resolve against the instance-shaped face — extensions report
+//!   their dedicated trio and operator row, class creations walk the
+//!   superclass chain with the `Object` members defined.
+//! * The external-primitive member face: a receiver type that resolves to
+//!   no container but names a dart:core primitive checks
+//!   [`CORE_TYPE_MEMBERS`] instead of suppressing.
+//! * The `_function` tear-off row renders the function type from the
+//!   captured member signature (type-parameter names joined the model);
+//!   `C<...>.named`-shaped constructor references fall back to the base
+//!   type-argument code. Both fire from the type-argument application
+//!   event — the current parser consumes `id.id<...>` as a type head
+//!   (#351's gap), so the emission activates when that parse lands.
+//!
+//! # Still deferred
+//!
+//! `undefined_referenced_parameter` (`@UseResult(unless:)` check,
+//! `annotation_verifier.dart:519-541`), `undefined_hidden_name` /
+//! `undefined_shown_name` (directives are consumed diet-style and the
+//! combinator model carries clause names without source spans — both arrive
+//! with the directive milestone), the unnamed-selector message variants of
+//! the two constructor rows, and the `int`→`double` assignability
+//! decision. `wrong_number_of_parameters_for_setter` is emitted here although
 //! the oracle fires it from the parser: dartq's parser does not emit the code
 //! yet, and when it does, the collector-side emission must be removed or the
 //! code double-reports. Every deferral under-reports.
@@ -200,6 +229,164 @@ const ENUM_SYNTH_MEMBERS: [&str; 3] = ["values", "index", "name"];
 
 /// Builtin type names: always defined, independent of any import.
 const BUILTIN_TYPES: [&str; 1] = ["dynamic"];
+
+/// The dart:core primitive types whose member face the engine answers
+/// directly: their declarations are external (the library graph carries
+/// their top-level names only), so a member walk chain-breaks — but the
+/// oracle still reports a genuinely absent member on them. The listed
+/// members (instance getters/methods; setters none of them has) keep the
+/// check on the oracle's side: a name on the list is defined, everything
+/// else reports. Derived from the reference SDK (`sdk/lib/core/*.dart`).
+const CORE_TYPE_MEMBERS: [(&str, &[&str]); 5] = [
+    (
+        "int",
+        &[
+            "bitLength",
+            "isEven",
+            "isOdd",
+            "sign",
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "abs",
+            "gcd",
+            "modInverse",
+            "modPow",
+            "remainder",
+            "round",
+            "roundToDouble",
+            "floor",
+            "floorToDouble",
+            "ceil",
+            "ceilToDouble",
+            "truncate",
+            "truncateToDouble",
+            "toDouble",
+            "toInt",
+            "toStringAsFixed",
+            "toStringAsExponential",
+            "toStringAsPrecision",
+            "toRadixString",
+            "toSigned",
+            "toUnsigned",
+            "clamp",
+            "compareTo",
+            "toString",
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+        ],
+    ),
+    (
+        "double",
+        &[
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "sign",
+            "abs",
+            "round",
+            "roundToDouble",
+            "floor",
+            "floorToDouble",
+            "ceil",
+            "ceilToDouble",
+            "truncate",
+            "truncateToDouble",
+            "toInt",
+            "toDouble",
+            "toStringAsFixed",
+            "toStringAsExponential",
+            "toStringAsPrecision",
+            "clamp",
+            "compareTo",
+            "toString",
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+        ],
+    ),
+    (
+        "num",
+        &[
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "sign",
+            "abs",
+            "remainder",
+            "round",
+            "roundToDouble",
+            "floor",
+            "floorToDouble",
+            "ceil",
+            "ceilToDouble",
+            "truncate",
+            "truncateToDouble",
+            "toInt",
+            "toDouble",
+            "toStringAsFixed",
+            "toStringAsExponential",
+            "toStringAsPrecision",
+            "clamp",
+            "compareTo",
+            "toString",
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+        ],
+    ),
+    (
+        "String",
+        &[
+            "codeUnits",
+            "isEmpty",
+            "isNotEmpty",
+            "length",
+            "runes",
+            "allMatches",
+            "codeUnitAt",
+            "compareTo",
+            "contains",
+            "endsWith",
+            "indexOf",
+            "lastIndexOf",
+            "matchAsPrefix",
+            "padLeft",
+            "padRight",
+            "replaceAll",
+            "replaceFirst",
+            "replaceFirstMapped",
+            "replaceAllMapped",
+            "split",
+            "splitMapJoin",
+            "startsWith",
+            "substring",
+            "toLowerCase",
+            "toUpperCase",
+            "trim",
+            "trimLeft",
+            "trimRight",
+            "toString",
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+        ],
+    ),
+    (
+        "bool",
+        &["toString", "hashCode", "runtimeType", "noSuchMethod"],
+    ),
+];
+
+/// The dart:core primitives whose assignability the name level decides: a
+/// value typed by one of these names never fits another (the types are
+/// final — no user subclass or implementation can close the gap). `num` is
+/// the one supertype edge (`int`/`double` fit it).
+const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", "String"];
 
 /// User-definable binary operators (operator-name spellings the model keeps).
 const USER_OPERATORS: [&str; 16] = [
@@ -367,6 +554,11 @@ enum Receiver {
     /// A declaration-typed name (`C c; c.m()`); `ty` is the declared type
     /// the static-nullability checks read.
     Typed { type_name: StringId, ty: Ty },
+    /// A folded creation/extension-override result (`C()`, `E('x')`): the
+    /// container the send resolves against, with the instance-shaped face —
+    /// superclass chains and `Object` members apply, the static-face
+    /// dispatch does not.
+    Created { name: StringId, kind: ContainerKind },
     /// Unknown type — checks are skipped (under-report).
     Unknown,
 }
@@ -412,6 +604,11 @@ struct Frame {
     var_types: FxHashMap<StringId, Ty>,
     /// `type_params` length to truncate back to when this frame closes.
     type_mark: usize,
+    /// The row-stack length when this frame opened: type parameters that
+    /// join mid-header (a method's own `<T>`, parsed after its return type)
+    /// rewrite their not-yet-scoped `undefined_class` rows only above this
+    /// mark, never an outer declaration's stale row.
+    row_mark: usize,
 }
 
 enum FrameKind {
@@ -591,6 +788,15 @@ struct Engine<'a> {
     /// `name` → `name=` lookup spellings already interned (write targets
     /// repeat across a unit; the cache is bounded by their distinct names).
     setter_ids: FxHashMap<StringId, StringId>,
+    /// The five final primitives' interned names (the assignability table
+    /// and the literal types compare ids, never text).
+    primitive_ids: [StringId; 5],
+    /// The open constructor-initializer list depth (`super.named()` in an
+    /// initializer is the `undefined_constructor_in_initializer` shape).
+    initializer_depth: u32,
+    /// The `@` token of the open metadata entry (the
+    /// `undefined_annotation` anchor spans `@` through the name).
+    annotation_at: Option<SourceRange>,
 }
 
 impl<'a> Engine<'a> {
@@ -611,6 +817,7 @@ impl<'a> Engine<'a> {
         let object_members = OBJECT_MEMBERS.map(|m| strings.intern(m));
         let enum_synth_members = ENUM_SYNTH_MEMBERS.map(|m| strings.intern(m));
         let builtin_types = BUILTIN_TYPES.map(|m| strings.intern(m));
+        let primitive_ids = FINAL_PRIMITIVES.map(|m| strings.intern(m));
         Self {
             graph,
             namespaces,
@@ -653,6 +860,9 @@ impl<'a> Engine<'a> {
             enum_synth_members,
             builtin_types,
             setter_ids: FxHashMap::default(),
+            primitive_ids,
+            initializer_depth: 0,
+            annotation_at: None,
         }
     }
 
@@ -727,6 +937,7 @@ impl<'a> Engine<'a> {
 
     fn push_frame(&mut self, kind: FrameKind) {
         let type_mark = self.type_params.len();
+        let row_mark = self.rows.len();
         let pending = std::mem::take(&mut self.pending_type_params);
         self.type_params.extend(pending);
         self.frames.push(Frame {
@@ -734,6 +945,7 @@ impl<'a> Engine<'a> {
             locals: FxHashSet::default(),
             var_types: FxHashMap::default(),
             type_mark,
+            row_mark,
         });
     }
 
@@ -857,11 +1069,29 @@ impl<'a> Engine<'a> {
         self.push_frame(FrameKind::Block);
     }
 
-    /// Enters a type parameter's scope: parked until the declaration's
-    /// frame opens ([`Engine::push_frame`] drains), whose `type_mark`
-    /// truncates it away on pop.
+    /// Enters a type parameter's scope. A declaration whose frame is already
+    /// open (a method's own `<T>` parses after its return type; function
+    /// expressions open before theirs) joins the frame's `type_params`
+    /// directly — the frame's `type_mark` truncates it on pop — and
+    /// re-scopes the signature type rows that resolved `Missing` before the
+    /// parameter existed. Container headers parse their variables before
+    /// `begin_*_declaration`, so those park for the frame that owns them.
     fn push_type_parameter(&mut self, name: StringId) {
-        self.pending_type_params.push(name);
+        let Some(mark) = self.frames.last().map(|f| f.row_mark) else {
+            self.pending_type_params.push(name);
+            return;
+        };
+        self.type_params.push(name);
+        // The signature rows pushed since the frame opened (`T m<T>(...)`'s
+        // return type) never saw this parameter: a still-missing type use of
+        // the same name was the parameter all along, not an undefined class.
+        for row in &mut self.rows[mark..] {
+            if row.name == name
+                && matches!(row.shape, RowShape::TypeUse(TypeVerdict::Missing, false))
+            {
+                row.shape = RowShape::Value;
+            }
+        }
     }
 
     /// The name after the dot of a qualified type arrived: the prefix slot
@@ -932,6 +1162,10 @@ impl<'a> Engine<'a> {
             Receiver::This { container, .. } => (container, false),
             Receiver::Super { container, .. } => (container, true),
             Receiver::Typed { type_name, .. } => (type_name, false),
+            // A folded creation (`C().m(...)`): the instance face — the
+            // constructor-argument membership check walks the superclass
+            // chain like a declaration-typed receiver.
+            Receiver::Created { name, .. } => (name, false),
             Receiver::Container {
                 name: container, ..
             } => {
@@ -1307,6 +1541,7 @@ impl<'a> Engine<'a> {
         let Some(member) = self.rows.pop() else {
             return;
         };
+        let receiver_offset = self.rows.last().map(|r| r.range.offset);
         let recv = match self.rows.pop() {
             Some(popped) => match popped.shape {
                 RowShape::Bare(info) => Engine::receiver_of_bare(info),
@@ -1338,6 +1573,32 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+        // `super.named()` in a constructor-initializer list is a super
+        // *constructor* reference, never a member access: the named shape
+        // checks the superclass's constructor face
+        // (`undefined_constructor_in_initializer`), and the row folds —
+        // pass 2's `super.member` dispatch must never see it. The selector
+        // name is the report's second slot; the anchor spans the
+        // `super.named()` shape the oracle reports.
+        if self.initializer_depth > 0
+            && let Receiver::Super { container, .. } = recv
+        {
+            let span = SourceRange {
+                offset: receiver_offset.unwrap_or(member.range.offset),
+                length: member.range.end() - receiver_offset.unwrap_or(member.range.offset),
+            };
+            self.check_super_constructor(container, &member, span);
+            self.push_row(Row {
+                name: member.name,
+                range: member.range,
+                qualified: true,
+                shape: RowShape::Value,
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::UNKNOWN,
+            });
+            return;
+        }
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -1347,6 +1608,42 @@ impl<'a> Engine<'a> {
             write_op: member.write_op,
             ty: Ty::UNKNOWN,
         });
+    }
+
+    /// The super-constructor selector in an initializer list
+    /// (`error_verifier.dart`, the `SuperConstructorInvocation` resolution):
+    /// the direct superclass's named constructor set decides. An
+    /// unresolvable superclass (external, `on`-constraint chain) suppresses.
+    fn check_super_constructor(&mut self, container: StringId, member: &Row, span: SourceRange) {
+        let Some(superclass) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .and_then(|c| c.superclass)
+        else {
+            return;
+        };
+        let Some((super_container, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            superclass,
+        ) else {
+            return;
+        };
+        if super_container.constructors.contains(&member.name) {
+            return;
+        }
+        let class_text = self.strings.resolve(superclass).to_string();
+        let name_text = self.strings.resolve(member.name).to_string();
+        self.emit(
+            SemanticCode::UndefinedConstructorInInitializer,
+            span,
+            &class_text,
+            &name_text,
+        );
     }
 
     /// Opens an argument group: the top row is its callee — unless the group
@@ -1480,7 +1777,7 @@ impl<'a> Engine<'a> {
             let Some(formal) = formal else {
                 continue;
             };
-            if formal.ty.assignable_from(*ty) == Some(false) {
+            if self.assignable(*ty, formal.ty) == Some(false) {
                 mismatches.push((*ty, formal.ty, *range));
             }
         }
@@ -1495,6 +1792,13 @@ impl<'a> Engine<'a> {
     /// read stays a read (`foo;` vs `foo()`). An explicit type-argument group
     /// on the callee checks its arity (`_element`, or `_extension` for an
     /// extension override).
+    ///
+    /// A container-name callee (`E('x')` the explicit extension application,
+    /// `C()` the implicit creation) folds into a receiver row carrying the
+    /// container: the argument rows belong to the send (truncated away), and
+    /// a following `.member` / operator merge must resolve against the
+    /// container's face, not the last argument's row. Member callees
+    /// (`C.named()`, methods) are not folds — their own rows stand.
     fn consume_send(&mut self) {
         let Some(callee) = self.pending_send.take() else {
             return;
@@ -1511,6 +1815,25 @@ impl<'a> Engine<'a> {
         {
             let (_, count, range) = self.deferred_args.remove(pos);
             self.check_invocation_arity(callee, count, range);
+        }
+        if matches!(
+            self.rows.get(callee).map(|r| r.shape.clone()),
+            Some(RowShape::Bare(BareInfo::Container { .. }))
+        ) {
+            self.rows.truncate(callee + 1);
+            if let Some(row) = self.rows.get_mut(callee)
+                && let RowShape::Bare(BareInfo::Container { name, kind }) = row.shape
+            {
+                *row = Row {
+                    name,
+                    range: row.range,
+                    qualified: false,
+                    shape: RowShape::Receiver(Receiver::Created { name, kind }),
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::UNKNOWN,
+                };
+            }
         }
     }
 
@@ -1529,7 +1852,15 @@ impl<'a> Engine<'a> {
         let Some(head) = self.rows.get(row) else {
             return;
         };
-        if matches!(head.shape, RowShape::Bare(BareInfo::Plain { .. })) {
+        // A plain function head (`g<int>(...)`) — the oracle rewrites the
+        // shape to a plain invocation (`ast_rewrite.dart`) — and a member
+        // head reached through the creation syntax (`C.sm<int, String>(...)`,
+        // the `id.id<...>(` form) both check as the `_element` invocation.
+        // Class and extension heads checked at their type-argument group.
+        if matches!(
+            head.shape,
+            RowShape::Bare(BareInfo::Plain { .. }) | RowShape::Member { .. }
+        ) {
             self.check_invocation_arity(row, count, range);
         }
     }
@@ -1594,6 +1925,9 @@ impl<'a> Engine<'a> {
             Receiver::Typed {
                 type_name: container,
                 ..
+            }
+            | Receiver::Created {
+                name: container, ..
             }
             | Receiver::Container {
                 name: container, ..
@@ -1662,8 +1996,83 @@ impl<'a> Engine<'a> {
                     );
                 }
             }
+            RowShape::Member { recv } => {
+                // A property-access tear-off (`C.sm<int, String>;`): the
+                // oracle's `InvocationTargetFunctionTypedExpression` reports
+                // `_function` leading with the function type — rendered from
+                // the captured signature. A method tear-off is the only
+                // function-typed shape the model can render: getters, fields,
+                // and unknown receivers suppress. A name that is no member at
+                // all is the constructor-reference shape `C<...>.named` — the
+                // base type-argument code against the container.
+                let container = match *recv {
+                    Receiver::This { container, .. }
+                    | Receiver::Super { container, .. }
+                    | Receiver::Typed {
+                        type_name: container,
+                        ..
+                    }
+                    | Receiver::Container {
+                        name: container, ..
+                    } => Some(container),
+                    _ => None,
+                };
+                let Some(container) = container else {
+                    return;
+                };
+                match self.walk_members(container, row.name) {
+                    Walk::Found(entry) if entry.kind == MemberKind::Method => {
+                        if entry.type_params != count {
+                            let display = self.function_type_display(entry);
+                            self.emit3(
+                                SemanticCode::WrongNumberOfTypeArgumentsFunction,
+                                range,
+                                &display,
+                                &entry.type_params.to_string(),
+                                &count.to_string(),
+                            );
+                        }
+                    }
+                    // Non-method finds (getter/field tear-offs) render to
+                    // oracle shapes the model cannot name; a broken chain is
+                    // opaque — both suppress.
+                    Walk::Found(_) | Walk::ChainBroken => {}
+                    Walk::Missing => self.check_annotation_arity(container, count, range),
+                }
+            }
             _ => {}
         }
+    }
+
+    /// The `_function` message's function-type display from a captured
+    /// method signature: `{return} Function<{type params}>({formal types})`
+    /// — `T m<T>(T x)` renders `T Function<T>(T)`, the oracle's rendering of
+    /// the generic instantiation's uninstantiated type.
+    fn function_type_display(&self, entry: &crate::model::MemberEntry) -> String {
+        let ret = self.ty_display(entry.return_ty);
+        let params = entry
+            .type_param_names
+            .iter()
+            .map(|p| self.strings.resolve(*p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let formals = entry
+            .formals
+            .as_ref()
+            .map(|f| {
+                f.positional
+                    .iter()
+                    .map(|formal| self.ty_display(formal.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let group = if params.is_empty() {
+            String::new()
+        } else {
+            format!("<{params}>")
+        };
+        format!("{ret} Function{group}({formals})")
     }
 
     /// The `_element` emit: kind word, executable name, declared vs given.
@@ -2044,7 +2453,7 @@ impl<'a> Engine<'a> {
         }
         let (from, range) = (rhs_row.ty, rhs_row.range);
         let to = self.assignment_target_ty(&self.rows[target]);
-        if to.assignable_from(from) == Some(false) {
+        if self.assignable(from, to) == Some(false) {
             let (a0, a1) = (self.ty_display(from), self.ty_display(to));
             self.emit3(SemanticCode::InvalidAssignment, range, &a0, &a1, "");
         }
@@ -2064,7 +2473,7 @@ impl<'a> Engine<'a> {
             return;
         }
         let row = &self.rows[mark];
-        if to.assignable_from(row.ty) == Some(false) {
+        if self.assignable(row.ty, to) == Some(false) {
             let (a0, a1) = (self.ty_display(row.ty), self.ty_display(to));
             self.emit3(SemanticCode::InvalidAssignment, row.range, &a0, &a1, "");
         }
@@ -2093,7 +2502,7 @@ impl<'a> Engine<'a> {
             _ => match from {
                 Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
                 Ty::Dynamic => Some(true),
-                _ => to.assignable_from(from),
+                _ => self.assignable(from, to),
             },
         };
         if verdict == Some(false) {
@@ -2289,6 +2698,120 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The M1 assignability decision ([`Ty::assignable_from`] plus the
+    /// final-primitive table): a value typed by one final primitive never
+    /// fits another — the types cannot be extended, implemented, or mixed
+    /// in, so no subclass relation can close the gap, whatever declaration
+    /// the names resolve to. `int`/`double` fit `num` (the one supertype
+    /// edge); `int` → `double` stays undecided (an int *literal* in a
+    /// double context converts, an int *value* does not — the literal/variable
+    /// distinction is below the M1 facts). `None` suppresses (under-report).
+    fn assignable(&self, from: Ty, to: Ty) -> Option<bool> {
+        if let Some(verdict) = to.assignable_from(from) {
+            return Some(verdict);
+        }
+        let (
+            Ty::Named {
+                name: from_name,
+                nullable: false,
+            },
+            Ty::Named {
+                name: to_name,
+                nullable: false,
+            },
+        ) = (from, to)
+        else {
+            return None;
+        };
+        if from_name == to_name
+            || !self.primitive_ids.contains(&from_name)
+            || !self.primitive_ids.contains(&to_name)
+        {
+            return None;
+        }
+        let (int, double, num) = (
+            self.primitive_ids[0],
+            self.primitive_ids[1],
+            self.primitive_ids[2],
+        );
+        if (from_name == int || from_name == double) && to_name == num {
+            return Some(true);
+        }
+        if from_name == int && to_name == double {
+            // `double d = 1;` converts the int literal; `double d = intVar;`
+            // does not — the literal/variable distinction is below the M1
+            // facts, so the pair stays undecided (under-report).
+            return None;
+        }
+        Some(false)
+    }
+
+    /// The enum-constant constructor selector (`c.other()` in the
+    /// element's own position): the enclosing enum's constructor face
+    /// decides (`parseEnumElement`, the `ConstructorReferenceContinuation`
+    /// resolution). Unresolvable enum containers suppress.
+    fn check_enum_constructor_selector(&mut self, name: StringId, range: SourceRange) {
+        let Some((enum_name, _)) = self.container_context() else {
+            return;
+        };
+        let Some((container, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            enum_name,
+        ) else {
+            return;
+        };
+        if container.constructors.contains(&name) {
+            return;
+        }
+        let name_text = self.strings.resolve(name).to_string();
+        self.emit(
+            SemanticCode::UndefinedEnumConstructor,
+            range,
+            &name_text,
+            "",
+        );
+    }
+
+    /// A simple annotation name (`@foo`): the oracle's annotation resolution
+    /// needs a class (or a `foo.name` constant face); a fully missing name is
+    /// `undefined_annotation` anchored over the `@` (3.13.1 caliber — the
+    /// diagnostic was removed upstream in 3.14, `m1_codes.txt` freezes the
+    /// measured form). Defined names stay silent: the class/constructor
+    /// second-part checks sit outside the M1 model (under-report).
+    fn check_annotation(&mut self, name: StringId, range: SourceRange) {
+        let missing = matches!(self.resolve_bare(name), BareInfo::Missing { .. });
+        let at = self.annotation_at.take();
+        if missing && !self.guard.ignore(None, name) {
+            let span = SourceRange {
+                offset: at.map_or(range.offset, |at| at.offset),
+                length: range.end() - at.map_or(range.offset, |at| at.offset),
+            };
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(SemanticCode::UndefinedAnnotation, span, &name_text, "");
+        }
+        if missing {
+            self.record_miss(name, range, false, NameUse::Annotation);
+        }
+    }
+
+    /// A literal whose type is a final primitive (`push_value_row` plus the
+    /// type the static-nullability checks decide on).
+    fn push_primitive_row(&mut self, token: Token, primitive: usize) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::named(self.primitive_ids[primitive]),
+        });
+    }
+
     /// The named argument membership test against the active callee
     /// (`type_analyzer.dart:5820`): a resolved callee whose formal table
     /// lacks the label reports `undefined_named_parameter` at the label; an
@@ -2401,6 +2924,33 @@ impl<'a> Engine<'a> {
                         &type_text,
                     );
                 }
+            }
+            // A folded creation/extension-override receiver (`C() + 1`,
+            // `E(1) * 2`): the operator resolves against the container's
+            // member face — extensions report their dedicated operator row.
+            Receiver::Created { name, kind } => {
+                let Intent::Operator(_, op_range) = row.intent else {
+                    return;
+                };
+                let mut missing: Vec<String> = Vec::new();
+                for spelling in [read, write].into_iter().flatten() {
+                    if matches!(self.walk_members(name, spelling), Walk::Missing) {
+                        missing.push(self.strings.resolve(spelling).to_string());
+                    }
+                }
+                if missing.is_empty() {
+                    return;
+                }
+                let host_text = self.strings.resolve(name).to_string();
+                for text in missing {
+                    let code = if kind == ContainerKind::Extension {
+                        SemanticCode::UndefinedExtensionOperator
+                    } else {
+                        SemanticCode::UndefinedOperator
+                    };
+                    self.emit(code, op_range, &text, &host_text);
+                }
+                self.record_miss(name, op_range, true, NameUse::Read);
             }
             _ => {}
         }
@@ -2550,6 +3100,26 @@ impl<'a> Engine<'a> {
             Receiver::Container { name, kind } => {
                 self.check_container_member(row, name, kind);
             }
+            // A folded creation: class-shaped results resolve on the
+            // instance face (superclass walk, `Object` members); an
+            // extension override resolves against the extension's members —
+            // its `on` type's `Object` face is the under-report.
+            Receiver::Created { name, kind } => {
+                if kind == ContainerKind::Extension {
+                    if self.object_members.contains(&row.name) || row.name == self.intern("==") {
+                        return;
+                    }
+                    self.check_container_member(row, name, kind);
+                } else {
+                    self.check_instance_member(
+                        row,
+                        Receiver::Typed {
+                            type_name: name,
+                            ty: Ty::UNKNOWN,
+                        },
+                    );
+                }
+            }
             Receiver::This { .. } | Receiver::Typed { .. } => {
                 self.check_instance_member(row, recv);
             }
@@ -2676,6 +3246,10 @@ impl<'a> Engine<'a> {
             return;
         }
         if matches!(self.walk_members(container, row.name), Walk::ChainBroken) {
+            // A chain broken at the root type (`int x; x.noSuchGetter`) is
+            // the external-primitive face: the core member table decides.
+            // A broken superclass hop suppresses as before.
+            self.check_core_type_member(container, row);
             return;
         }
         let Some(kind) = self.container_kind_of(container) else {
@@ -2794,6 +3368,83 @@ impl<'a> Engine<'a> {
             name_text,
             &type_text,
         );
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// The external-primitive member face (`int x; x.noSuchGetter`): the
+    /// receiver type is a dart:core primitive when the name is one of the
+    /// [`CORE_TYPE_MEMBERS`] keys and resolves to no indexed container.
+    /// Extension members still apply implicitly, so the pool gates first; a
+    /// table hit is defined, a miss reports the access-intent trio.
+    fn check_core_type_member(&mut self, container: StringId, row: &Row) {
+        let container_text = self.strings.resolve(container);
+        let Some((_, members)) = CORE_TYPE_MEMBERS
+            .iter()
+            .find(|(name, _)| container_text == *name)
+        else {
+            return; // not a known primitive: suppress as before
+        };
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .is_some()
+        {
+            return; // locally declared: the regular walk already decided
+        }
+        if self
+            .index
+            .get(self.file)
+            .is_some_and(|f| f.extension_member(row.name).is_some())
+        {
+            return;
+        }
+        let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        let name_text = self.strings.resolve(row.name);
+        if members.contains(&name_text)
+            || (write && members.contains(&self.strings.resolve(self.setter_spelling(row.name))))
+        {
+            return;
+        }
+        if row.name == self.intern("==") || self.object_members.contains(&row.name) {
+            return;
+        }
+        let type_text = container_text.to_string();
+        match row.intent {
+            Intent::Invoke => self.emit(
+                SemanticCode::UndefinedMethod,
+                row.range,
+                name_text,
+                &type_text,
+            ),
+            Intent::Write | Intent::ReadWrite => {
+                if row.intent == Intent::ReadWrite {
+                    self.emit(
+                        SemanticCode::UndefinedGetter,
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                }
+                self.emit(
+                    SemanticCode::UndefinedSetter,
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            Intent::Read => self.emit(
+                SemanticCode::UndefinedGetter,
+                row.range,
+                name_text,
+                &type_text,
+            ),
+            Intent::Operator(..) => {}
+        }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
@@ -3459,6 +4110,22 @@ impl ParserListener for DiagnoseListener<'_> {
                 // `_enum` code). `handle_enum_element` closes it.
                 engine.enter_enum_element();
             }
+            C::ConstructorReferenceContinuationAfterTypeArguments
+                if engine.in_enum_element.is_some() && engine.ctor_pos == 0 =>
+            {
+                // The enum constant's constructor selector (`c.other()`):
+                // outside argument expressions (ctor_pos 0), the name must
+                // be a constructor the enclosing enum declares
+                // (`undefined_enum_constructor`).
+                if let Some(name) = name {
+                    engine.check_enum_constructor_selector(name, token.range);
+                }
+            }
+            C::MetadataReference => {
+                if let Some(name) = name {
+                    engine.check_annotation(name, token.range);
+                }
+            }
             C::TopLevelFunctionDeclaration => {
                 if let Some(name) = name {
                     engine.latch_return_type(ExecKind::Function, name);
@@ -3509,6 +4176,22 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
         self.engine.borrow_mut().armed_ty = Some(Ty::Void);
+    }
+
+    fn begin_initializers(&mut self, _token: Token) {
+        self.engine.borrow_mut().initializer_depth += 1;
+    }
+
+    fn end_initializers(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.engine.borrow_mut().initializer_depth -= 1;
+    }
+
+    fn begin_metadata(&mut self, token: Token) {
+        self.engine.borrow_mut().annotation_at = Some(token.range);
+    }
+
+    fn end_metadata(&mut self, _begin: Token, _period_before_name: Option<Token>, _end: Token) {
+        self.engine.borrow_mut().annotation_at = None;
     }
 
     // —— receivers and selectors ——————————————————————————————————————
@@ -4046,19 +4729,19 @@ impl ParserListener for DiagnoseListener<'_> {
     // already did.
 
     fn handle_literal_int(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().push_primitive_row(token, 0);
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().push_primitive_row(token, 0);
     }
 
     fn handle_literal_double(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().push_primitive_row(token, 1);
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
-        self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().push_primitive_row(token, 1);
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
@@ -4067,7 +4750,7 @@ impl ParserListener for DiagnoseListener<'_> {
             let is_true = engine.text_of(token) == Some("true");
             engine.pending_const = Some(Restriction::BoolValue(is_true));
         }
-        engine.push_value_row(token);
+        engine.push_primitive_row(token, 3);
     }
 
     fn handle_literal_null(&mut self, token: Token) {
@@ -4079,7 +4762,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_literal_string(&mut self, _interpolation_count: usize, end: Token) {
-        self.engine.borrow_mut().push_value_row(end);
+        self.engine.borrow_mut().push_primitive_row(end, 4);
     }
 
     fn end_literal_symbol(&mut self, hash: Token, _identifier_count: usize) {
@@ -4633,6 +5316,243 @@ mod tests {
     /// A bare undefined read reports `undefined_identifier` with the oracle's
     /// verbatim text; the miss also lands in the §8 names table.
     ///
+    /// The static-nullability trio with primitive literal types (#350): a
+    /// String literal into an int parameter / variable / return host reports
+    /// each verbatim text; the same-name and int-literal-in-double-context
+    /// shapes stay silent (the oracle's literal conversion).
+    ///
+    /// Hand-trace: `f('s')` — the argument flush attributes the single
+    /// String-typed row; the formal's declared `int` answers
+    /// [`Ty::assignable_from`] `None` (distinct named types), the final-
+    /// primitive table decides `false`. The declaration initializer and the
+    /// return check read the same table.
+    #[test]
+    fn primitive_literals_drive_the_assignability_trio() {
+        let report = report(
+            "class int {} class double {} \
+             void f(int x) {} int g() { return 's'; } \
+             void main() { f('s'); int y = 's'; double d = 1; int ok = 1; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+                "invalid_assignment",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'String' can't be returned from the function 'g' because it has a return type of 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The argument type 'String' can't be assigned to the parameter type 'int'. "
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "A value of type 'String' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// A fully missing annotation name reports `undefined_annotation` over
+    /// the `@` (#350; the 3.13.1 caliber — the diagnostic was removed
+    /// upstream in 3.14). A defined class annotation stays silent.
+    ///
+    /// Hand-trace: `@gone` — `begin_metadata` latches the `@`; the
+    /// MetadataReference identifier resolves `Missing` (the annotation name
+    /// is no declaration) -> the emit spans `@gone`.
+    #[test]
+    fn missing_annotation_reports_over_the_at_sign() {
+        let report = report("class A {} @gone void f() {} @A void g() {}");
+        assert_eq!(code_names(&report), ["undefined_annotation"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(d.message, "Undefined name 'gone' used as an annotation.");
+        assert_eq!(u32::try_from("class A {}@".len()).unwrap(), d.range.offset);
+        assert_eq!(u32::try_from("@gone".len()).unwrap(), d.range.length);
+    }
+
+    /// `super.named()` in a constructor-initializer list is a super
+    /// *constructor* reference: the named shape reports
+    /// `undefined_constructor_in_initializer` against the superclass, and
+    /// the member pass never mis-reports `undefined_super_member` (#350).
+    /// A declared selector stays silent.
+    ///
+    /// Hand-trace: the initializer bracket raises the depth; `super.named()`
+    /// merges at the dot with a `Super` receiver — the merge emits from the
+    /// superclass constructor face and folds the row, so pass 2 sees only a
+    /// value.
+    #[test]
+    fn super_initializer_selector_reports_the_class_constructor() {
+        let report = report(
+            "class A { A.named(); } \
+             class B extends A { B.bad() : super.missing(); B.good() : super.named(); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_constructor_in_initializer"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The class 'A' doesn't have a constructor named 'missing'."
+        );
+    }
+
+    /// An enum constant's constructor selector names a constructor the enum
+    /// does not declare: `undefined_enum_constructor` (#350). A declared
+    /// selector stays silent.
+    ///
+    /// Hand-trace: `c.bad()` — the selector identifier fires inside the
+    /// enum-element window; the enum's constructor face is `{other}` (the
+    /// named selector) with no unnamed constructor; `bad` misses -> the
+    /// emit at the selector.
+    #[test]
+    fn enum_constant_selector_reports_the_enum_constructor() {
+        let report = report("enum E { c.bad(); const E.other(); }");
+        assert_eq!(code_names(&report), ["undefined_enum_constructor"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The enum doesn't have a constructor named 'bad'."
+        );
+    }
+
+    /// The explicit extension application resolves its members against the
+    /// extension's face — `E('x').h` reports the extension trio (#350),
+    /// including the operator shape at the operator token — and `Object`
+    /// members (the `on` type's face) stay silent.
+    ///
+    /// Hand-trace: `E(1)` folds at the send into a `Created` receiver; the
+    /// merged member resolves through the extension kind's
+    /// `check_container_member`; `toString` suppresses (the `on` type
+    /// carries it).
+    #[test]
+    fn extension_application_reports_the_extension_trio() {
+        let report = report(
+            "class int {} \
+             extension E on int { int get g => 1; void m() {} set s(int v) {} int operator +(int o) => 1; } \
+             void f() { E(1).h; E(1).n(); E(1).t = 1; E(1) * 2; E(1).toString; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_extension_getter",
+                "undefined_extension_method",
+                "undefined_extension_setter",
+                "undefined_extension_operator",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'h' isn't defined for the extension 'E'."
+        );
+        assert_eq!(
+            report.diagnostics[3].message,
+            "The operator '*' isn't defined for the extension 'E'."
+        );
+    }
+
+    /// The external-primitive member face (#350): a member access on a
+    /// dart:core primitive receiver reports the interface trio when the
+    /// primitive genuinely lacks the name, and stays silent on its real
+    /// surface (`isEven`, `toString`).
+    ///
+    /// Hand-trace: `int x` types the receiver `int` — unresolvable as a
+    /// container, the walk chain-breaks at the root and
+    /// [`CORE_TYPE_MEMBERS`] decides. Locally declared faces keep the
+    /// regular walk.
+    #[test]
+    fn primitive_receivers_report_the_member_trio() {
+        let report = report(
+            "void f() { int x = 1; x.noSuchGetter; x.noSuchMethodHere(); x.noSuchSetter = 2; x.isEven; x.toString; }",
+        );
+        // The receiver type `int` is undeclared in the harness: its type use
+        // carries the known `undefined_class` row ahead of the member trio.
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_class",
+                "undefined_getter",
+                "undefined_method",
+                "undefined_setter",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The getter 'noSuchGetter' isn't defined for the type 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The method 'noSuchMethodHere' isn't defined for the type 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[3].message,
+            "The setter 'noSuchSetter' isn't defined for the type 'int'."
+        );
+    }
+
+    /// A creation result used as an operator receiver reports
+    /// `undefined_operator` at the operator token (#350); the creation's own
+    /// instance face still resolves (`Object` members, superclass chains).
+    ///
+    /// Hand-trace: `B() + 1` — the send folds the class callee into a
+    /// `Created` receiver; the operator intent walks `B`'s member face and
+    /// misses `+`. `B().m()` resolves through the superclass edge;
+    /// `B().toString` suppresses (the Object member every class carries).
+    #[test]
+    fn creation_operator_reports_undefined_operator() {
+        let report = report(
+            "class A { void m() {} } class B extends A {} \
+             void f() { B() + 1; B().m(); B().toString; C() + 1; } class C { void nosuch() {} }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_operator", "undefined_operator"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The operator '+' isn't defined for the type 'B'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The operator '+' isn't defined for the type 'C'."
+        );
+    }
+
+    /// A member's own type parameters scope over its whole signature
+    /// (#350): the return-type row pushed before `<T>` parsed re-scopes, so
+    /// no `undefined_class` fires — and the invocation arity checks still
+    /// answer.
+    ///
+    /// Hand-trace: `T m<T>(T x)` — the Executable frame opens before the
+    /// return type; `begin_type_variable` joins the frame's `type_params`
+    /// and rewrites the still-missing `T` rows above the frame's row mark.
+    #[test]
+    fn member_type_parameters_scope_over_the_signature() {
+        let report = report(
+            "class D {} class C { T m<T>(T x) => x; static T sm<T>(T x) => x; } \
+             void g<T>(D x) {} \
+             void f() { var d = D(); g<D, D>(d); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["wrong_number_of_type_arguments_element"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The function 'g' is declared with 1 type parameters, but 2 type arguments are given."
+        );
+    }
+
     /// Hand-trace: `f` opens the Executable frame; `nose` resolves through
     /// locals → type parameters → container face (none) → extension pool →
     /// `lookup_scoped` → `NotFound` (`Missing`); the argless send never opens

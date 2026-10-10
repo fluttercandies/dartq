@@ -53,8 +53,9 @@ use crate::model::{
 
 /// The signature-composition version (PRD §5.6): bumped with any change to
 /// what [`FileElements::api_signature`] hashes. v1: the initial composition-F
-/// face (#282).
-pub const SIGNATURE_VERSION: u32 = 1;
+/// face (#282). v2: constructor selectors + the unnamed flag per container,
+/// and member type-parameter names (#350 — the constructor-undefined faces).
+pub const SIGNATURE_VERSION: u32 = 2;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -228,6 +229,9 @@ impl<'a> Face<'a> {
             "instance"
         });
         self.uint(u64::from(entry.type_params));
+        for param in &entry.type_param_names {
+            self.name(*param);
+        }
         self.ty(entry.var_ty);
         self.ty(entry.return_ty);
         match &entry.formals {
@@ -294,6 +298,8 @@ impl<'a> Face<'a> {
                 sealed,
                 interfaces,
                 enum_constants,
+                constructors,
+                has_unnamed_constructor,
             } = &elements.containers[&name];
             self.field("container");
             self.name(name);
@@ -318,6 +324,17 @@ impl<'a> Face<'a> {
             for constant in enum_constants {
                 self.name(*constant);
             }
+            // The constructor face: named selectors in stored order, then
+            // the unnamed flag.
+            self.usize(constructors.len());
+            for constructor in constructors {
+                self.name(*constructor);
+            }
+            self.field(if *has_unnamed_constructor {
+                "unnamed"
+            } else {
+                "no-unnamed"
+            });
             // Member names are a hash map: sort by text, then render each
             // member's full executable shape. The nested level sorts into the
             // second scratch so the container loop's iteration state survives.
@@ -466,7 +483,9 @@ mod tests {
         let v2 = elements.api_signature_with_version(&strings, 2);
         assert_ne!(v1, v2);
         assert_eq!(v1, elements.api_signature_with_version(&strings, 1));
-        assert_eq!(elements.api_signature(&strings), v1);
-        assert_eq!(ApiSignature::as_bytes(&v1).len(), 16);
+        // The live composition rides the current version constant.
+        let live = elements.api_signature_with_version(&strings, SIGNATURE_VERSION);
+        assert_eq!(elements.api_signature(&strings), live);
+        assert_eq!(ApiSignature::as_bytes(&live).len(), 16);
     }
 }

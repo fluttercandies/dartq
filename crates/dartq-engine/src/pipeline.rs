@@ -307,6 +307,47 @@ const DART_CORE_FACE: &[&str] = &[
     "print",
 ];
 
+/// The explicit-import SDK library faces beyond dart:core, verbatim from the
+/// reference SDK (`sdk/lib/<library>/*.dart` public top-level surface).
+/// `import 'dart:<name>'` directives the resolver classified
+/// [`ResolvedTarget::External`] join the matching synthetic node; a library
+/// absent from the table stays edgeless (the resolver's posture).
+const DART_SDK_FACES: &[(&str, &[&str])] = &[(
+    "math",
+    &[
+        "E",
+        "LN10",
+        "LN2",
+        "LOG10E",
+        "LOG2E",
+        "MutableRectangle",
+        "Point",
+        "Random",
+        "Rectangle",
+        "atan",
+        "atan2",
+        "acos",
+        "asin",
+        "cos",
+        "e",
+        "exp",
+        "ln10",
+        "ln2",
+        "log",
+        "log10e",
+        "log2e",
+        "max",
+        "min",
+        "pi",
+        "pow",
+        "sin",
+        "sqrt",
+        "sqrt1_2",
+        "sqrt2",
+        "tan",
+    ],
+)];
+
 fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     let mut builder = LibraryGraphBuilder::new(&state.strings);
     let mut graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId> = FxHashMap::default();
@@ -324,21 +365,33 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         }
     }
 
-    // The implicit `dart:core` import (the analyzer's synthesized core
-    // import): one synthetic graph node carrying dart:core's public face,
-    // imported unfiltered by every library. A hit answers "defined" without
-    // an element model — kind-unknown, so container and member questions
-    // about core faces suppress (the M1 under-report posture) — while a
-    // name outside the face still reports: the edge carries declarations,
-    // not suppressions, and the semantic engine's undefined guard reads
-    // broken (`target: None`) edges only. The node has no engine-library
-    // mapping: no directive resolves to it, and it contributes no
-    // dependency edges (cascade and CSR shapes are untouched).
+    // The synthetic SDK nodes: dart:core (the analyzer's synthesized implicit
+    // import) plus every `dart:<library>` face an explicit import names.
+    // A hit answers "defined" without an element model — kind-unknown, so
+    // container and member questions about core faces suppress (the M1
+    // under-report posture) — while a name outside the face still reports:
+    // the edge carries declarations, not suppressions, and the semantic
+    // engine's undefined guard reads broken (`target: None`) edges only.
+    // The nodes have no engine-library mapping: no directive resolves to
+    // them, and they contribute no dependency edges (cascade and CSR shapes
+    // are untouched).
     let core_file = state.files.intern(Path::new("<dart:core>"));
     let core = builder.intern("dart:core");
     for name in DART_CORE_FACE {
         builder.declare(core, state.strings.intern(name), core_file);
     }
+    let mut sdk_faces: FxHashMap<&str, dartq_resolution::LibraryId> = DART_SDK_FACES
+        .iter()
+        .map(|(uri, names)| {
+            let node = builder.intern(&format!("dart:{uri}"));
+            let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+            for name in *names {
+                builder.declare(node, state.strings.intern(name), file);
+            }
+            (*uri, node)
+        })
+        .collect();
+    sdk_faces.insert("core", core);
 
     for library in state.libraries.live() {
         let graph_id = graph_ids[&library];
@@ -354,15 +407,30 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         for file in member_files(state.libraries.info(library).expect("live library")) {
             for directive in &state.residency[&file].directives {
                 match directive.kind {
-                    DirectiveKind::Import => builder.import(
-                        graph_id,
-                        ImportEdge {
-                            target: graph_target(state, &graph_ids, directive.target),
-                            prefix: directive.prefix,
-                            deferred: directive.deferred,
-                            combinators: directive.combinators.clone(),
-                        },
-                    ),
+                    DirectiveKind::Import => {
+                        // An explicit `dart:` import that classified External
+                        // joins its synthetic face node; an unknown face
+                        // stays edgeless (the resolver's posture).
+                        let sdk_target = (directive.target == ResolvedTarget::External)
+                            .then(|| {
+                                directive
+                                    .uri
+                                    .as_ref()
+                                    .and_then(|uri| uri.strip_prefix("dart:"))
+                                    .and_then(|name| sdk_faces.get(name).copied())
+                            })
+                            .flatten();
+                        builder.import(
+                            graph_id,
+                            ImportEdge {
+                                target: sdk_target
+                                    .or_else(|| graph_target(state, &graph_ids, directive.target)),
+                                prefix: directive.prefix,
+                                deferred: directive.deferred,
+                                combinators: directive.combinators.clone(),
+                            },
+                        );
+                    }
                     DirectiveKind::Export => builder.export(
                         graph_id,
                         ExportEdge {

@@ -251,6 +251,9 @@ pub struct MemberEntry {
     pub is_static: bool,
     /// The member's own type parameters (`void m<T>()`); 0 when absent.
     pub type_params: u16,
+    /// The member's own type-parameter names, in declaration order (the
+    /// `wrong_number_of_type_arguments_function` display renders them).
+    pub type_param_names: Box<[StringId]>,
     /// Declared type of a field (getters/setters/methods: [`Ty::Unknown`]).
     pub var_ty: Ty,
     /// Declared return type of a method/getter/setter (fields:
@@ -284,6 +287,16 @@ pub struct Container {
     /// An enum's constants in declaration order (the exhaustiveness
     /// witness order follows it, `types/enum.dart`); empty elsewhere.
     pub enum_constants: Vec<StringId>,
+    /// The named constructor selectors the container declares (`A.named`
+    /// keeps `named`). Unnamed constructors and the implicit default are
+    /// [`Container::has_unnamed_constructor`]'s business.
+    pub constructors: Box<[StringId]>,
+    /// The container can be constructed without a selector: no explicit
+    /// constructor exists (the implicit default), or an unnamed one was
+    /// declared. A named-only declaration (`A.named();`) drops this to
+    /// `false` — the `undefined_constructor_in_initializer` /
+    /// `undefined_enum_constructor` unnamed-selector queries read it.
+    pub has_unnamed_constructor: bool,
 }
 
 /// One top-level declaration.

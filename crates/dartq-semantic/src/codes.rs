@@ -56,16 +56,17 @@
 //!
 //! Frozen gate rows this table deliberately does not carry (each
 //! under-reports, never false-positives; see the [`crate::diagnose`] module
-//! docs): `undefined_constructor_in_initializer` and
-//! `undefined_enum_constructor` (constructors are outside the M1 model),
-//! `undefined_referenced_parameter` (`@UseResult(unless:)`-specific check,
-//! `annotation_verifier.dart:519-541`), `undefined_hidden_name` /
+//! docs): `undefined_referenced_parameter` (`@UseResult(unless:)`-specific
+//! check, `annotation_verifier.dart:519-541`) and `undefined_hidden_name` /
 //! `undefined_shown_name` (`STATIC_WARNING` tier; the parser consumes
 //! directives diet-style and resolution's [`Combinators`] exposes no clause
-//! enumeration — both arrive with the directive milestone), and
-//! `wrong_number_of_type_arguments_function` (the row exists above but has
-//! no emit site: the M1 [`crate::model::Ty`] cannot render the function-type
-//! display the template leads with — under-report). Every other frozen gate
+//! enumeration — both arrive with the directive milestone). The
+//! constructor-selector rows (`undefined_constructor_in_initializer` /
+//! `undefined_enum_constructor`) joined in #350 with the constructor-name
+//! capture; the unnamed-selector message variants stay deferred
+//! (under-report). `wrong_number_of_type_arguments_function` carries the
+//! row and #350 added its emit site (the function-type display renders from
+//! the captured member signature). Every other frozen gate
 //! row is carried: the `wrong_number_of_type_arguments*` family (including
 //! `_element`, with emit sites in [`crate::diagnose`]) and
 //! `wrong_number_of_parameters_for_operator` are implemented above, and
@@ -90,6 +91,15 @@ pub enum SemanticCode {
     UndefinedAnnotation,
     /// `Undefined class '{0}'.`
     UndefinedClass,
+    /// `The class '{0}' doesn't have a constructor named '{1}'.` — a
+    /// `super.named()` initializer invokes a constructor the superclass does
+    /// not declare (`undefined_constructor_in_initializer`; the
+    /// unnamed-selector variant `..._default` stays deferred).
+    UndefinedConstructorInInitializer,
+    /// `The enum doesn't have a constructor named '{0}'.` — an enum
+    /// constant's constructor selector names a constructor the enum does
+    /// not declare (the unnamed variant `..._unnamed` stays deferred).
+    UndefinedEnumConstructor,
     /// `There's no constant named '{0}' in '{1}'.`
     UndefinedEnumConstant,
     /// `The getter '{0}' isn't defined for the extension '{1}'.`
@@ -227,6 +237,13 @@ impl SemanticCode {
             Self::DuplicateDefinition => ("duplicate_definition", "DUPLICATE_DEFINITION"),
             Self::UndefinedAnnotation => ("undefined_annotation", "UNDEFINED_ANNOTATION"),
             Self::UndefinedClass => ("undefined_class", "UNDEFINED_CLASS"),
+            Self::UndefinedConstructorInInitializer => (
+                "undefined_constructor_in_initializer",
+                "UNDEFINED_CONSTRUCTOR_IN_INITIALIZER",
+            ),
+            Self::UndefinedEnumConstructor => {
+                ("undefined_enum_constructor", "UNDEFINED_ENUM_CONSTRUCTOR")
+            }
             Self::UndefinedEnumConstant => ("undefined_enum_constant", "UNDEFINED_ENUM_CONSTANT"),
             Self::UndefinedExtensionGetter => {
                 ("undefined_extension_getter", "UNDEFINED_EXTENSION_GETTER")
@@ -345,6 +362,12 @@ impl SemanticCode {
                 format!("Undefined name '{a0}' used as an annotation.")
             }
             Self::UndefinedClass => format!("Undefined class '{a0}'."),
+            Self::UndefinedConstructorInInitializer => {
+                format!("The class '{a0}' doesn't have a constructor named '{a1}'.")
+            }
+            Self::UndefinedEnumConstructor => {
+                format!("The enum doesn't have a constructor named '{a0}'.")
+            }
             Self::UndefinedEnumConstant => {
                 format!("There's no constant named '{a0}' in '{a1}'.")
             }
@@ -527,6 +550,8 @@ mod tests {
             SemanticCode::DuplicateDefinition,
             SemanticCode::UndefinedAnnotation,
             SemanticCode::UndefinedClass,
+            SemanticCode::UndefinedConstructorInInitializer,
+            SemanticCode::UndefinedEnumConstructor,
             SemanticCode::UndefinedEnumConstant,
             SemanticCode::UndefinedExtensionGetter,
             SemanticCode::UndefinedExtensionMethod,
@@ -633,6 +658,14 @@ mod tests {
         assert_eq!(
             SemanticCode::UndefinedEnumConstant.message("x", "E"),
             "There's no constant named 'x' in 'E'."
+        );
+        assert_eq!(
+            SemanticCode::UndefinedConstructorInInitializer.message("A", "named"),
+            "The class 'A' doesn't have a constructor named 'named'."
+        );
+        assert_eq!(
+            SemanticCode::UndefinedEnumConstructor.message("other", ""),
+            "The enum doesn't have a constructor named 'other'."
         );
         assert_eq!(
             SemanticCode::WrongNumberOfParametersForOperator.message3("+", "1", "2"),

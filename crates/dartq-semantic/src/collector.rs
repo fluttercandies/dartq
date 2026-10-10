@@ -101,6 +101,18 @@ struct OpenContainer {
     interfaces: Vec<StringId>,
     /// The enum's constants in declaration order.
     enum_constants: Vec<StringId>,
+    /// The named constructor selectors declared so far, and whether an
+    /// unnamed constructor exists (explicit or the implicit default).
+    ctor_named: Vec<StringId>,
+    ctor_has_unnamed: bool,
+}
+
+/// The open constructor's capture: the named selectors it declares plus
+/// its unnamed flag (`A()` keeps the flag; `A.named()` records the selector
+/// and clears it).
+struct CtorCapture {
+    named: Vec<StringId>,
+    has_unnamed: bool,
 }
 
 /// A class member executable between `begin_method` and `end_method`.
@@ -110,6 +122,8 @@ struct PendingMember {
     shape: Option<(StringId, MemberKind, SourceRange)>,
     is_static: bool,
     type_params: u16,
+    /// The member's own type-parameter names, in declaration order.
+    type_param_names: Vec<StringId>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
 }
@@ -146,6 +160,10 @@ struct Builder<'src, 'tab> {
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTypedef>,
+    /// A constructor is open (`begin_constructor`..`end_constructor`): the
+    /// named selectors it declares plus its unnamed flag. `A()` records the
+    /// unnamed shape; `A.named()` records `named` only.
+    ctor_open: Option<CtorCapture>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
     positional_formals: Vec<Formal>,
@@ -196,6 +214,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_member: None,
             pending_top: None,
             pending_typedef: None,
+            ctor_open: None,
             formal_depth: 0,
             positional_formals: Vec::new(),
             named_formals: Vec::new(),
@@ -216,6 +235,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn capture_name(&self, token: Token) -> Option<(StringId, SourceRange)> {
         let range = token.range;
         self.name_of(token).map(|name| (name, range))
+    }
+
+    /// The named segment of an open constructor (`A.named` keeps `named`).
+    /// A qualified non-constructor name is invalid Dart — ignored.
+    fn note_constructor_continuation(&mut self, name: Option<StringId>) {
+        if let Some(capture) = &mut self.ctor_open
+            && let Some(name) = name
+        {
+            capture.has_unnamed = false;
+            capture.named.push(name);
+        }
     }
 
     /// Records a duplicate (second) declaration; the name maps keep the
@@ -293,6 +323,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             sealed: false,
             interfaces: Vec::new(),
             enum_constants: Vec::new(),
+            ctor_named: Vec::new(),
+            ctor_has_unnamed: true,
         });
         self.header_super_open = true;
         self.super_candidate = None;
@@ -331,6 +363,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 sealed: open.sealed,
                 interfaces: open.interfaces,
                 enum_constants: open.enum_constants,
+                constructors: open.ctor_named.into_boxed_slice(),
+                has_unnamed_constructor: open.ctor_has_unnamed,
             });
         } else {
             for (name, entry) in members {
@@ -490,6 +524,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         let count = self.type_param_count;
         if let Some(pending) = &mut self.pending_member {
             pending.type_params = count;
+            pending.type_param_names = std::mem::take(&mut self.type_var_group);
         } else if let Some(pending) = &mut self.pending_top {
             pending.type_params = count;
         } else if let Some(pending) = &mut self.pending_typedef {
@@ -768,6 +803,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     pending.return_ty = armed;
                 }
             }
+            IdentifierContext::MethodDeclarationContinuation => {
+                builder.note_constructor_continuation(name);
+            }
             IdentifierContext::TopLevelVariableDeclaration
             | IdentifierContext::FieldDeclaration => {
                 if let Some((name, range)) = name_with_range {
@@ -792,6 +830,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     kind: MemberKind::Field,
                                     is_static,
                                     type_params: 0,
+                                    type_param_names: Box::default(),
                                     var_ty: ty,
                                     return_ty: Ty::UNKNOWN,
                                     formals: None,
@@ -824,6 +863,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 kind: MemberKind::Field,
                                 is_static: true,
                                 type_params: 0,
+                                type_param_names: Box::default(),
                                 var_ty: Ty::UNKNOWN,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
@@ -967,6 +1007,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             shape,
             is_static: static_kw.is_some(),
             type_params: 0,
+            type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
         });
@@ -993,6 +1034,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     kind,
                     is_static: pending.is_static,
                     type_params: pending.type_params,
+                    type_param_names: pending.type_param_names.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
@@ -1083,6 +1125,53 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             name: None,
             type_params: 0,
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_constructor(
+        &mut self,
+        _kind: DeclarationKind,
+        _augment_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _get_or_set: Option<Token>,
+        _new_kw: Option<Token>,
+        _name: Token,
+        _enclosing_declaration_name: Option<&str>,
+    ) {
+        let mut builder = self.builder.borrow_mut();
+        // `A()` (or the head recovered): the unnamed shape until a
+        // `A.named` continuation says otherwise.
+        builder.ctor_open = Some(CtorCapture {
+            named: Vec::new(),
+            has_unnamed: true,
+        });
+    }
+
+    fn end_constructor(
+        &mut self,
+        _kind: DeclarationKind,
+        _begin: Token,
+        _new_kw: Option<Token>,
+        _begin_param: Token,
+        _begin_initializers: Option<Token>,
+        _end: Token,
+    ) {
+        let mut builder = self.builder.borrow_mut();
+        if let Some(capture) = builder.ctor_open.take()
+            && let Some(open) = builder.containers.last_mut()
+        {
+            for name in capture.named {
+                if !open.ctor_named.contains(&name) {
+                    open.ctor_named.push(name);
+                }
+            }
+            // Any unnamed constructor (this one, or the implicit default the
+            // container opened with) keeps the unnamed face.
+            open.ctor_has_unnamed &= capture.has_unnamed;
+        }
     }
 
     fn end_typedef(
