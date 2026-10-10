@@ -228,6 +228,7 @@ dependencies = [
  "dartq-scanner",
  "dartq-schema",
  "dartq-sdk",
+ "dartq-semantic",
  "dartq-source",
  "serde",
  "serde_json",

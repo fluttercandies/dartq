@@ -35,6 +35,7 @@ use dartq_diagnostics::CodeRegistry;
 use dartq_engine::state::persist::PersistedFacts;
 use dartq_engine::{Engine, LibraryId, UnitFacts};
 use dartq_index::TestGraph;
+use dartq_semantic::MicroKind;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
 use thiserror::Error;
 
@@ -214,18 +215,16 @@ fn library_surface(
 ) -> FileSnapshot {
     /// The library-face names of one unit's element model: every named
     /// container plus every non-type-parameter top-level declaration,
-    /// setters under their `name=` spelling — the capture filter's mirror.
-    /// The kind rides its derived Debug spelling because dartq-commands
-    /// does not depend on dartq-semantic (the engine owns the element
-    /// model); a rename that breaks the spelling fails the impact
-    /// equivalence test instead of leaking the name.
+    /// setters under their `name=` spelling — the capture filter's
+    /// mirror, applying the same `MicroKind::TypeParam` exclusion the
+    /// engine's library graph does.
     fn face_names(facts: &UnitFacts, names: &mut Vec<StringId>) {
         names.extend(facts.elements.containers().map(|(name, _)| name));
         names.extend(
             facts
                 .elements
                 .declarations()
-                .filter(|(_, decl)| format!("{:?}", decl.kind) != "TypeParam")
+                .filter(|(_, decl)| decl.kind != MicroKind::TypeParam)
                 .map(|(name, _)| name),
         );
     }

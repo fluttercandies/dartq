@@ -19,6 +19,7 @@ dartq-resolution = { path = "../dartq-resolution" }
 dartq-scanner = { path = "../dartq-scanner" }
 dartq-schema = { path = "../dartq-schema" }
 dartq-sdk = { path = "../dartq-sdk" }
+dartq-semantic = { path = "../dartq-semantic" }
 dartq-source = { path = "../dartq-source" }
 serde = { workspace = true }
 serde_json = { workspace = true }
