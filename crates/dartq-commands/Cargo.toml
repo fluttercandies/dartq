@@ -16,6 +16,7 @@ dartq-package = { path = "../dartq-package" }
 dartq-parser = { path = "../dartq-parser" }
 dartq-pub = { path = "../dartq-pub" }
 dartq-scanner = { path = "../dartq-scanner" }
+dartq-schema = { path = "../dartq-schema" }
 dartq-sdk = { path = "../dartq-sdk" }
 dartq-source = { path = "../dartq-source" }
 serde = { workspace = true }

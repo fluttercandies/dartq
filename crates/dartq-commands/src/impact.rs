@@ -127,11 +127,11 @@ pub fn impact_after_analysis(
 /// on a dead slot). The label is the defining file's path; the test graph
 /// reads the same string's directory and basename for the `*_test.dart`
 /// convention (dartq-index's sibling rule).
-type IdentTable = Vec<Option<String>>;
+pub(crate) type IdentTable = Vec<Option<String>>;
 
 /// The stable label of every live library, indexed by the engine library id
 /// (dead slots hold `None`).
-fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
+pub(crate) fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
     let mut idents: IdentTable = vec![None; libraries.len()];
     for (library, files) in libraries {
         let Some(path) = files

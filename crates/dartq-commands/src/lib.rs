@@ -16,6 +16,7 @@
 //!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
 //! * [`query`] — the symbol index query over the analyzed state.
+//! * [`explain`] — the §15.3 explain report.
 //! * [`impact`] — the §15.4 impact report.
 //! * [`compat`] — the §15.5 per-SDK compatibility matrix.
 //! * [`fix`] — the §15.6 anchored patch substrate.
@@ -27,6 +28,7 @@ pub mod check;
 pub mod compat;
 pub mod config;
 pub mod discover;
+pub mod explain;
 pub mod fix;
 pub mod impact;
 pub mod index;
