@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Persistent snapshot substrate for dartq's cold-start path: content-addressed analysis state on disk."
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 blake3 = { workspace = true }

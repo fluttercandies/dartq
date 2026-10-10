@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Per-command cores shared by the dartq CLI and daemon RPC faces: plain parameters in, typed results out."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "analyzer"]
+categories = ["development-tools"]
 
 [dependencies]
 dartq-ai = { path = "../dartq-ai" }

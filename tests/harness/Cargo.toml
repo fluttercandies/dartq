@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal differential-testing harness, not published to crates.io.
+publish = false
 
 [dependencies]
 serde = { workspace = true }

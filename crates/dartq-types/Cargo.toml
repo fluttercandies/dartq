@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "The Dart type system's analysis surface in dartq: the ten-shape type skeleton, nullability, and canonical interning."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "types"]
 
 [dependencies]
 rustc-hash = { workspace = true }

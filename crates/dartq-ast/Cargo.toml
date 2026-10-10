@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Compact arena-based Dart syntax tree; spans derive from token ranges at access time."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "ast", "syntax-tree"]
+categories = ["parser-implementations"]
 
 [dependencies]
 dartq-language = { path = "../dartq-language" }

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "The dartq command-line tool for fast Dart static analysis (dartq check, dartq analyze)."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "analyzer", "linter", "cli"]
+categories = ["development-tools"]
 
 # The published command faces are `dartq check` (M0 differential,
 # engine-api-spec §4.1) and `dartq analyze` (M1 engine); ship the binary

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Diagnostic data model and oracle-exact output writers for Dart analysis results."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "diagnostics"]
 
 [dependencies]
 dartq-source = { path = "../dartq-source" }

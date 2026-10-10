@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Dart lexical scanner: UTF-8 source to a linear token table with syntax diagnostics."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "lexer", "scanner", "tokenizer"]
+categories = ["parser-implementations"]
 
 [dependencies]
 # Frozen contract dependencies (see the "unified swap points" section in lib.rs):

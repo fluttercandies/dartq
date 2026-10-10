@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Dart flow analysis: type promotion and demotion, definite assignment, and reachability."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "flow-analysis"]
 
 [dependencies]
 dartq-parser = { path = "../dartq-parser" }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Readers for pub's resolution artifacts (package_config.json, pubspec.yaml, pubspec.lock) plus workspace discovery and freshness rules."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "pub"]
 
 [dependencies]
 dartq-language = { path = "../dartq-language" }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Symbol index over Dart code: declaration and reference surfaces for lookup, navigation, and impact queries."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart", "index"]
 
 [dependencies]
 dartq-parser = { path = "../dartq-parser" }

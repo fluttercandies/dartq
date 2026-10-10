@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "URI, import, export, part, and conditional import resolution with namespace computation for Dart."
+repository.workspace = true
+readme = "README.md"
+keywords = ["dart"]
 
 [dependencies]
 dartq-diagnostics = { path = "../dartq-diagnostics" }

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Layered analysis cache (L1, L2, L3) and eviction policies for dartq."
+repository.workspace = true
+readme = "README.md"
 
 [lints]
 workspace = true

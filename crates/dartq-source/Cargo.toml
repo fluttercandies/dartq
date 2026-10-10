@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Content-addressed source layer for Dart analysis: file tables, content hashing, and line indexes."
+repository.workspace = true
+readme = "README.md"
 
 [features]
 serde = ["dep:serde"]
