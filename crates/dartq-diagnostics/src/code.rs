@@ -355,6 +355,22 @@ mod tests {
         );
     }
 
+    /// [`DiagnosticType::severity`] maps each family to its oracle severity:
+    /// `SYNTACTIC_ERROR` / `COMPILE_TIME_ERROR` rows are oracle-ERROR,
+    /// `STATIC_WARNING` rows oracle-WARNING, `LINT` rows oracle-INFO, and
+    /// `Tool` — the dartq-own per-code fallback — stays ERROR.
+    #[test]
+    fn dtype_severity_maps_oracle_families() {
+        use crate::model::Severity;
+
+        assert_eq!(DiagnosticType::SyntacticError.severity(), Severity::Error);
+        assert_eq!(DiagnosticType::CompileTimeError.severity(), Severity::Error);
+        assert_eq!(DiagnosticType::StaticWarning.severity(), Severity::Warning);
+        assert_eq!(DiagnosticType::Lint.severity(), Severity::Info);
+        // dartq-own fallback: `dartq/` tool diagnostics are ERROR.
+        assert_eq!(DiagnosticType::Tool.severity(), Severity::Error);
+    }
+
     /// Message templates: placeholders are consecutive from `{0}` and never
     /// exceed the measured upper bound of 1 (2 arguments, e.g.
     /// `conflicting_modifiers`); literal braces must survive untouched.

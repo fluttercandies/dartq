@@ -96,13 +96,15 @@ impl fmt::Display for DiagnosticType {
 impl DiagnosticType {
     /// Oracle severity for a registry-true family (the
     /// `dtype_matches_oracle_severity` invariant: `COMPILE_TIME_ERROR` rows
-    /// are oracle-ERROR, `STATIC_WARNING` rows oracle-WARNING). The single
-    /// derivation of its mapping — dartq-semantic's per-code `severity`
-    /// folds onto this method (`dtype().severity()`).
+    /// are oracle-ERROR, `STATIC_WARNING` rows oracle-WARNING, `LINT` rows
+    /// oracle-INFO). The single derivation of its mapping — dartq-semantic's
+    /// per-code `severity` folds onto this method (`dtype().severity()`).
+    /// `Tool` is the dartq-own fallback and maps to ERROR.
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {
             Self::StaticWarning => Severity::Warning,
+            Self::Lint => Severity::Info,
             _ => Severity::Error,
         }
     }
