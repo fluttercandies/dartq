@@ -583,3 +583,843 @@ fn case_less_switch_expression_does_not_panic() {
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
 }
+
+// —— try/catch/finally combinations ——————————————————————————————————————
+// Event layouts mirror the recorder (record.rs): the try body runs before
+// `CatchClauseBegin`, each clause ends at `CatchClauseEnd` (the
+// `handle_catch_block` join), `FinallyBlock` separates the catch context
+// from the finally body, and `TryEnd { has_finally }` closes the frame.
+
+/// try + catch + finally, every part completing normally: `FinallyBlock`
+/// joins the try-catch exit with the conservative exception-entry state
+/// (official `tryFinallyStatement_finallyBegin`, flow_analysis.dart:8269)
+/// and `TryEnd` attaches the finally without killing the tail.
+#[test]
+fn try_catch_finally_completes_normally() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::TryBegin { span: span(1) },
+        Ev::ExprStmt { span: span(2) },
+        Ev::OtherExpr { span: span(3) },
+        Ev::CatchClauseBegin,
+        Ev::ExprStmt { span: span(4) },
+        Ev::OtherExpr { span: span(5) },
+        Ev::CatchClauseEnd,
+        Ev::FinallyBlock,
+        Ev::ExprStmt { span: span(6) },
+        Ev::OtherExpr { span: span(7) },
+        Ev::TryEnd { has_finally: true },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// try/finally with a return in the body: the finally completes normally,
+/// but `_attachFinally` (flow_analysis.dart:8419-8467) takes the exit
+/// reachability from the try exit (r1, unreachable) whenever the finally
+/// exit itself is reachable — the trailing statement is dead.
+#[test]
+fn try_finally_body_return_leaves_tail_dead() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::TryBegin { span: span(1) },
+        Ev::ReturnBegin { span: span(2) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::FinallyBlock,
+        Ev::ExprStmt { span: span(3) },
+        Ev::OtherExpr { span: span(4) },
+        Ev::TryEnd { has_finally: true },
+        Ev::ExprStmt { span: span(5) },
+        Ev::OtherExpr { span: span(6) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(interp.facts.len(), 1);
+    assert!(!interp.reachable());
+}
+
+/// A return in the finally itself: the finally exit is unreachable, so
+/// `_attachFinally` marks the try exit unreachable too — the trailing
+/// statement is dead (event-level twin of `finally_return_kills_exit`).
+#[test]
+fn try_finally_return_leaves_tail_dead() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::TryBegin { span: span(1) },
+        Ev::ExprStmt { span: span(2) },
+        Ev::OtherExpr { span: span(3) },
+        Ev::FinallyBlock,
+        Ev::ReturnBegin { span: span(4) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::TryEnd { has_finally: true },
+        Ev::ExprStmt { span: span(5) },
+        Ev::OtherExpr { span: span(6) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(interp.facts.len(), 1);
+    assert!(!interp.reachable());
+}
+
+/// Two catch clauses: the first returns, the second completes. Later
+/// catches resume from `beforeCatch`, not from the previous catch's exit
+/// (official `tryCatchStatement_catchBegin`, flow_analysis.dart:8182), so
+/// the second clause's completion keeps the statement exit alive.
+#[test]
+fn try_two_catches_first_returns_second_completes() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::TryBegin { span: span(1) },
+        Ev::ExprStmt { span: span(2) },
+        Ev::OtherExpr { span: span(3) },
+        Ev::CatchClauseBegin,
+        Ev::ReturnBegin { span: span(4) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::CatchClauseEnd,
+        Ev::CatchClauseBegin,
+        Ev::ExprStmt { span: span(5) },
+        Ev::OtherExpr { span: span(6) },
+        Ev::CatchClauseEnd,
+        Ev::TryEnd { has_finally: false },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// A `break` inside the finally block: the jump targets the enclosing loop
+/// (try frames are not break targets), so the exit state travels through
+/// the loop's break model and the code after the loop stays reachable.
+#[test]
+fn finally_break_exits_via_loop_exit_join() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::WhileBegin { span: span(1) },
+        Ev::WhileBodyBegin,
+        Ev::TryBegin { span: span(2) },
+        Ev::ExprStmt { span: span(3) },
+        Ev::OtherExpr { span: span(4) },
+        Ev::FinallyBlock,
+        Ev::Break {
+            label: None,
+            span: span(5),
+        },
+        Ev::TryEnd { has_finally: true },
+        Ev::WhileEnd,
+        Ev::ExprStmt { span: span(6) },
+        Ev::OtherExpr { span: span(7) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// A `continue` inside the finally block: the jump re-enters the enclosing
+/// loop through its continue model, and the loop's condition-false exit
+/// keeps the code after the loop reachable.
+#[test]
+fn finally_continue_exits_via_loop_exit_join() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::WhileBegin { span: span(1) },
+        Ev::WhileBodyBegin,
+        Ev::TryBegin { span: span(2) },
+        Ev::ExprStmt { span: span(3) },
+        Ev::OtherExpr { span: span(4) },
+        Ev::FinallyBlock,
+        Ev::Continue {
+            label: None,
+            span: span(5),
+        },
+        Ev::TryEnd { has_finally: true },
+        Ev::WhileEnd,
+        Ev::ExprStmt { span: span(6) },
+        Ev::OtherExpr { span: span(7) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// try + catch + finally where the CATCH returns but the try body
+/// completes: the body's normal exit is seeded into the after-accumulator
+/// (official `tryCatchStatement_bodyEnd`, flow_analysis.dart:8163) and
+/// survives the returning catch, so the finally keeps the tail alive.
+#[test]
+fn try_catch_finally_returning_catch_keeps_tail_alive() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::TryBegin { span: span(1) },
+        Ev::ExprStmt { span: span(2) },
+        Ev::OtherExpr { span: span(3) },
+        Ev::CatchClauseBegin,
+        Ev::ReturnBegin { span: span(4) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::CatchClauseEnd,
+        Ev::FinallyBlock,
+        Ev::ExprStmt { span: span(5) },
+        Ev::OtherExpr { span: span(6) },
+        Ev::TryEnd { has_finally: true },
+        Ev::ExprStmt { span: span(7) },
+        Ev::OtherExpr { span: span(8) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+// —— switch statements and switch expressions with cases —————————————————
+
+/// Switch expression with two alternatives (a guarded constant and a
+/// wildcard): each arm branches from the chained unmatched state, the
+/// guard events run between `SwitchExprCasePattern` and the arm value (the
+/// recorder's order), and the block end joins the arms' combined state.
+/// Invariant-level: stack drains, no facts, replay stays reachable
+/// (official `switch_beginAlternative`/`switch_endAlternative`,
+/// flow_analysis.dart:1680).
+#[test]
+fn switch_expression_cases_and_guard_replay() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::SwitchExprBegin { span: span(1) },
+        Ev::Ident {
+            name: 0,
+            token: span(2),
+            context: IdentifierContext::Expression,
+        },
+        Ev::SwitchExprBlockBegin,
+        // `1 when b => e` — pattern, separator, guard, then the value.
+        Ev::SwitchExprCaseBegin,
+        Ev::PatternBegin,
+        Ev::ConstantPatternBegin,
+        Ev::OtherExpr { span: span(3) },
+        Ev::ConstantPatternEnd,
+        Ev::PatternEnd,
+        Ev::SwitchExprCasePattern,
+        Ev::GuardBegin,
+        Ev::Bool { value: true },
+        Ev::GuardEnd,
+        Ev::OtherExpr { span: span(4) },
+        Ev::SwitchExprCaseEnd { has_guard: true },
+        // `_ => e`.
+        Ev::SwitchExprCaseBegin,
+        Ev::PatternBegin,
+        Ev::Wildcard { token: span(5) },
+        Ev::PatternEnd,
+        Ev::SwitchExprCasePattern,
+        Ev::OtherExpr { span: span(6) },
+        Ev::SwitchExprCaseEnd { has_guard: false },
+        Ev::SwitchExprBlockEnd,
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// Switch statement whose `case` and `default` both return: the default
+/// kills the unmatched chain (official `switch_endAlternatives`
+/// isExhaustive effect), so the joined exit is unreachable and the
+/// statement after the switch is dead (event-level twin of
+/// `switch_all_cases_exit`).
+#[test]
+fn switch_statement_default_exhaustive_tail_dead() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::SwitchBegin { span: span(1) },
+        Ev::Ident {
+            name: 0,
+            token: span(2),
+            context: IdentifierContext::Expression,
+        },
+        Ev::SwitchBlockBegin,
+        Ev::CaseBegin {
+            label_count: 0,
+            expression_count: 1,
+        },
+        Ev::CaseExprBegin,
+        Ev::OtherExpr { span: span(3) },
+        Ev::CaseExprEnd { has_guard: false },
+        Ev::ReturnBegin { span: span(4) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::CaseEnd { statement_count: 1 },
+        // `default:` — no case-expression events; the group opens at once.
+        Ev::CaseBegin {
+            label_count: 0,
+            expression_count: 0,
+        },
+        Ev::ReturnBegin { span: span(5) },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
+        Ev::CaseEnd { statement_count: 1 },
+        Ev::SwitchBlockEnd,
+        Ev::ExprStmt { span: span(6) },
+        Ev::OtherExpr { span: span(7) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(interp.facts.len(), 1);
+    assert!(!interp.reachable());
+}
+
+/// A switch expression used as a variable initializer must leave exactly
+/// one value for the enclosing `InitializerEnd` consumer: `var y =
+/// switch (x) { 1 => 2 }; y;` must not report `y` as definitely
+/// unassigned.
+///
+/// Suspected defect (do not weaken): `SwitchExprCaseEnd` (interp_stmt.rs)
+/// pops each arm's value and `SwitchExprBlockEnd` (interp_stmt.rs) never
+/// pushes a replacement, so the whole expression nets ZERO values; the
+/// `InitializerEnd` pairing then finds no right-hand side and `y` stays
+/// unwritten — a false-positive `UnassignedRead`. The same hole makes `x =
+/// switch (x) { 1 => 2 };` pop the assignment target as the right-hand
+/// side. Every other composite expression nets exactly one value for its
+/// consumer (see the `ListLitEnd`/`ExprBody` contracts in ev.rs).
+#[ignore = "defect: switch expression nets zero values (interp_stmt.rs SwitchExprCaseEnd pops, SwitchExprBlockEnd never pushes) — false-positive UnassignedRead on the initialized variable"]
+#[test]
+fn switch_expression_value_reaches_later_reads() {
+    let source = "void f(int x) { var y = switch (x) { 1 => 2 }; y; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+// —— assert statements ————————————————————————————————————————————————————
+
+/// `assert` with a condition and a message: the exit joins the pre-assert
+/// state with the condition-true branch only — the message's effects are
+/// dropped and both expression values are truncated off the stack
+/// (official `assert_end`, flow_analysis.dart:8218-8223).
+#[test]
+fn assert_join_with_message_invariants() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::AssertBegin { span: span(1) },
+        Ev::OtherExpr { span: span(2) },
+        Ev::Bool { value: true },
+        Ev::AssertEnd,
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.exprs.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// official definite_assignment/data/assert.dart `assertStatement`: the
+/// condition's assignment holds while the message runs (so the message
+/// read is clean) but the exit joins the pre-assert state, and the read
+/// after the statement is definitely unassigned.
+#[test]
+fn assert_condition_write_unassigned_after() {
+    let source = "void f() { late int v; assert((v = 0) >= 0, v); v; }";
+    assert_eq!(unassigned_snippets(source), ["v"]);
+}
+
+// —— pattern assignment and pattern declarations ——————————————————————————
+// The recorder models patterns by their leaves only (PatternBegin/End,
+// ConstantPatternBegin/End, DeclaredVarPattern, AssignedVarPattern,
+// Wildcard, GuardBegin/End): composite shapes (list/map/record/object
+// patterns) carry no events of their own and collapse to those leaves, so
+// only leaf-level shapes are representable in hand-built streams.
+
+/// Pattern assignment `(a, b) = (1, 2)`: the assigned-variable leaves
+/// queue writes and `PatternAssign` applies the right-hand side's state to
+/// every target (official `handlePatternAssignment`).
+#[test]
+fn pattern_assignment_writes_targets() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::NoInitializer,
+        Ev::VarDeclEnd,
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(2),
+        },
+        Ev::InitializedIdent { name: 1 },
+        Ev::NoInitializer,
+        Ev::VarDeclEnd,
+        Ev::PatternBegin,
+        Ev::AssignedVarPattern { name: 0 },
+        Ev::AssignedVarPattern { name: 1 },
+        Ev::PatternEnd,
+        Ev::OtherExpr { span: span(3) },
+        Ev::OtherExpr { span: span(4) },
+        Ev::RecordLitEnd { count: 2 },
+        Ev::PatternAssign,
+        Ev::Ident {
+            name: 0,
+            token: span(5),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(6) },
+        Ev::Ident {
+            name: 1,
+            token: span(7),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(8) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.current.model(0).assigned);
+    assert!(interp.current.model(1).assigned);
+    assert!(interp.reachable());
+}
+
+/// Pattern variable declaration `var (a, b) = (1, 2)`: the declared
+/// variables are assigned exactly when the pattern matched, and the
+/// statement-end marker fires after the right-hand side (the recorder's
+/// order).
+#[test]
+fn pattern_declaration_declares_assigned() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::PatternBegin,
+        Ev::DeclaredVarPattern {
+            name: 0,
+            is_final: false,
+        },
+        Ev::DeclaredVarPattern {
+            name: 1,
+            is_final: false,
+        },
+        Ev::PatternEnd,
+        Ev::OtherExpr { span: span(1) },
+        Ev::OtherExpr { span: span(2) },
+        Ev::RecordLitEnd { count: 2 },
+        Ev::PatternVarDeclStmt { span: span(3) },
+        Ev::Ident {
+            name: 0,
+            token: span(4),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(5) },
+        Ev::Ident {
+            name: 1,
+            token: span(6),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(7) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.current.model(0).assigned);
+    assert!(interp.current.model(1).assigned);
+    assert!(interp.reachable());
+}
+
+/// A pattern assignment writes every matched target: both `a` and `b`
+/// read assigned afterwards (official pattern-assignment definite
+/// assignment).
+#[test]
+fn pattern_assignment_assigns_both_targets() {
+    let source = "void f() { int a; int b; (a, b) = (1, 2); a; b; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A wildcard leaf binds no target: `b` stays definitely unassigned while
+/// `a` is written.
+#[test]
+fn pattern_assignment_wildcard_skips_target() {
+    let source = "void f() { int a; int b; (a, _) = (1, 2); b; }";
+    assert_eq!(unassigned_snippets(source), ["b"]);
+}
+
+// —— suspension demotion ——————————————————————————————————————————————————
+
+/// The demoting `suspension` path (official `suspension`,
+/// flow_analysis.dart:7912-7933): an await inside a local function whose
+/// reads intersect the anywhere-written set demotes those variables to the
+/// conservative join. Invariant-level: the demotion's only observable is
+/// the (restored) closure-internal state, so this pins no-crash, drained
+/// stack, and no facts for the non-empty demote set (the empty-set variant
+/// is `await_in_plain_async_method_demotes_nothing`).
+#[test]
+fn closure_await_demotes_captured_reads() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        // var x = ...;
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::InitializerBegin,
+        Ev::OtherExpr { span: span(2) },
+        Ev::InitializerEnd,
+        Ev::VarDeclEnd,
+        // () async { x; await g(); }
+        Ev::ExecBegin { is_closure: true },
+        Ev::AsyncModifier {
+            is_async: true,
+            is_generator: false,
+        },
+        Ev::Ident {
+            name: 0,
+            token: span(3),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(4) },
+        Ev::AwaitBegin,
+        Ev::Ident {
+            name: 1,
+            token: span(5),
+            context: IdentifierContext::Expression,
+        },
+        Ev::SendNoArgs,
+        Ev::AwaitEnd,
+        Ev::ExecEnd,
+        // x = 1; — the anywhere-write that arms the demotion.
+        Ev::Ident {
+            name: 0,
+            token: span(6),
+            context: IdentifierContext::Expression,
+        },
+        Ev::OtherExpr { span: span(7) },
+        Ev::Assign { plain: true },
+        Ev::ExprStmt { span: span(8) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// The demoting suspension shape at source level: an await inside a
+/// closure whose read target is written elsewhere in the function takes
+/// the demotion join without producing facts (official `suspension` reads
+/// ∩ anywhere-written − declared).
+#[test]
+fn closure_await_with_enclosing_write_no_facts() {
+    let source =
+        "void f(int? x, Future g()) async { var h = () async { await g(); x; }; x = 1; h(); }";
+    assert!(facts_of(source).is_empty());
+}
+
+// —— for-in statements ————————————————————————————————————————————————————
+// Event layout mirrors the recorder: the loop variable declaration and the
+// iterable expression precede `ForInParts` (the parser fires
+// `handle_for_in_loop_parts` after the iterable), the body sits between
+// `ForInBodyBegin`/`ForInBodyEnd`, and `ForInEnd` closes the loop.
+
+/// Statement for-in, real replay: the head pops the iterable, the body's
+/// writes are conservatively joined at the loop head, and the exit joins
+/// the zero-iteration state (official `forEach_bodyBegin`/
+/// `forEach_end`, flow_analysis.dart:6941). Invariant-level on facts; the
+/// zero-iteration dominance on the loop variable's assignment is asserted
+/// on the model.
+#[test]
+fn for_in_statement_replay_invariants() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        // for (var a in ...) — the loop variable, declared unassigned.
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::NoInitializer,
+        Ev::VarDeclEnd,
+        Ev::ForInExprBegin,
+        Ev::OtherExpr { span: span(2) },
+        Ev::ForInExprEnd,
+        Ev::ForInParts,
+        Ev::ForInBodyBegin,
+        // a = 1;
+        Ev::Ident {
+            name: 0,
+            token: span(3),
+            context: IdentifierContext::Expression,
+        },
+        Ev::OtherExpr { span: span(4) },
+        Ev::Assign { plain: true },
+        Ev::ExprStmt { span: span(5) },
+        Ev::ForInBodyEnd,
+        Ev::ForInEnd,
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.exprs.is_empty());
+    assert!(interp.facts.is_empty());
+    // The zero-iteration path dominates the exit: one body write does not
+    // make the loop variable definitely assigned after the loop.
+    assert!(!interp.current.model(0).assigned);
+    assert!(interp.reachable());
+}
+
+/// A `break` in a for-in body: the break's state joins the loop exit (the
+/// documented for-in divergence from `forEach_end`, sound and more
+/// precise), so the code after the loop stays reachable.
+#[test]
+fn for_in_break_joins_exit() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::NoInitializer,
+        Ev::VarDeclEnd,
+        Ev::ForInExprBegin,
+        Ev::OtherExpr { span: span(2) },
+        Ev::ForInExprEnd,
+        Ev::ForInParts,
+        Ev::ForInBodyBegin,
+        Ev::Break {
+            label: None,
+            span: span(3),
+        },
+        Ev::ForInBodyEnd,
+        Ev::ForInEnd,
+        Ev::ExprStmt { span: span(4) },
+        Ev::OtherExpr { span: span(5) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// A collection for-in element (`[for (var a in b) e]`): the head replays
+/// before the `ForInParts` marker, the marker opens the loop without a
+/// second head, and the element nets exactly one value for the literal's
+/// consumer. Event-level pin of the shape the parser-blocked source tests
+/// (`collection_for_in_*`) cannot reach yet.
+#[test]
+fn collection_for_in_element_nets_one_value() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::ForControlFlowBegin,
+        // Loop variable with its initializer.
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::InitializerBegin,
+        Ev::OtherExpr { span: span(2) },
+        Ev::InitializerEnd,
+        Ev::VarDeclEnd,
+        // The iterable.
+        Ev::OtherExpr { span: span(3) },
+        Ev::ForInParts,
+        // The element expression.
+        Ev::OtherExpr { span: span(4) },
+        Ev::ForControlFlowEnd { for_in: true },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(interp.exprs.len(), 1);
+    assert!(interp.facts.is_empty());
+}
+
+/// official definite_assignment/data/for_each.dart `forEach`: the iterable
+/// is evaluated (and its writes hold) even when the loop runs zero times,
+/// so only the body's write stays not-definite.
+#[test]
+fn for_each_zero_iteration_leaves_unassigned() {
+    let source =
+        "void f() { late Object v1, v2; for (var _ in (v1 = [0, 1, 2])) { v2 = 0; } v1; v2; }";
+    assert_eq!(unassigned_snippets(source), ["v2"]);
+}
+
+/// official definite_assignment/data/for_each.dart `forEach_continue`:
+/// continue paths re-enter the body, so neither the pre-continue write nor
+/// the post-continue write is definite at the exit.
+#[test]
+fn for_each_continue_paths_unassigned() {
+    let source = "void f(bool c) { late int v1, v2; for (var _ in [0, 1, 2]) { v1 = 0; if (c) continue; v2 = 0; } v1; v2; }";
+    assert_eq!(unassigned_snippets(source), ["v1", "v2"]);
+}
+
+/// Reading the for-in loop variable inside the body must produce no fact:
+/// the analyzer declares the loop variable initialized right before
+/// `forEach_bodyBegin` (analyzer for_resolver.dart,
+/// `declare(initialized: true)`; official corpus for_each.dart
+/// `forEach_assigns_to_declared_var`).
+///
+/// Suspected defect (do not weaken): the loop variable is declared
+/// uninitialized (`InitializedIdent`, interp_stmt.rs) and
+/// `for_in_parts_at` (interp.rs) never writes it, so the body read emits a
+/// false-positive `UnassignedRead`. The identifier-head form
+/// (`for (i in xs)`) misses the same write.
+#[ignore = "defect: for-in never writes its loop variable (interp.rs for_in_parts_at) — false-positive UnassignedRead on body reads (oracle: for_each.dart forEach_assigns_to_declared_var)"]
+#[test]
+fn for_each_loop_variable_assigned_in_body() {
+    let source = "void f(List<int> b) { for (var a in b) { a; } }";
+    assert!(unassigned_snippets(source).is_empty());
+}
