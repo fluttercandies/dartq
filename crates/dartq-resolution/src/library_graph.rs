@@ -76,7 +76,7 @@
 //! - The graph is sized entirely by its input (libraries × names × edges);
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
 
-use dartq_source::{FileId, StringId, StringTable};
+use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map;
 
@@ -120,9 +120,33 @@ pub enum CombinatorClause {
     Hide(Box<[StringId]>),
 }
 
+/// One written combinator token, captured at directive construction: the
+/// clause kind it was written under, its bare identifier, and the token's
+/// UTF-16 span as captured. The written sequence — duplicates preserved, in
+/// written order — is what [`LibraryGraph::undefined_combinator_names`]
+/// iterates, one report per written token (the oracle's
+/// `dead_code_verifier.dart:148-158` walks the AST name list as written).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrittenName {
+    name: StringId,
+    hidden: bool,
+    span: SourceRange,
+}
+
 /// The ordered combinator list of one directive; empty means unfiltered.
+///
+/// Alongside the deduplicated clause sets it carries the two derived faces
+/// the decision layers consume: the **written** token sequence
+/// ([`LibraryGraph::undefined_combinator_names`]'s iteration source) and the
+/// interned setter-spelling pairing (the undefined check's setter probe —
+/// derived where the constructor expands the spellings, so the query pays
+/// no string work).
 #[derive(Clone, Debug, Default)]
-pub struct Combinators(Box<[CombinatorClause]>);
+pub struct Combinators {
+    clauses: Box<[CombinatorClause]>,
+    written: Box<[WrittenName]>,
+    setters: Box<[(StringId, StringId)]>,
+}
 
 impl Combinators {
     /// Builds the combinator list from source-ordered clauses, expanding each
@@ -130,7 +154,83 @@ impl Combinators {
     /// `strings`) and sorting for binary-search membership. Clause names are
     /// bare identifiers (combinator grammar has no `=`); a written set is
     /// taken as given.
+    ///
+    /// The written sequence is synthesized from the clause input (order and
+    /// duplicates preserved); the spans are the zero-length range at offset 0
+    /// — this constructor receives no capture. The span-carrying constructor
+    /// is [`Self::with_spans`].
     pub fn new(clauses: impl IntoIterator<Item = CombinatorClause>, strings: &StringTable) -> Self {
+        let clauses: Vec<CombinatorClause> = clauses.into_iter().collect();
+        let written: Vec<WrittenName> = clauses
+            .iter()
+            .flat_map(|clause| {
+                let (names, hidden) = clause_names(clause);
+                names.iter().copied().map(move |name| WrittenName {
+                    name,
+                    hidden,
+                    span: SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
+                })
+            })
+            .collect();
+        Self::build(clauses, written, strings)
+    }
+
+    /// [`Self::new`] with the written tokens' captured spans: each clause
+    /// rides with a span list parallel to its names (built from the same
+    /// capture loop, so the pairing cannot desync). The spans land on the
+    /// yielded [`UndefinedCombinatorName`]s — the report anchors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a clause's span list is not exactly as long as its name
+    /// list — a caller capture bug, surfaced rather than misaligned silently.
+    pub fn with_spans(
+        clauses: impl IntoIterator<Item = (CombinatorClause, Box<[SourceRange]>)>,
+        strings: &StringTable,
+    ) -> Self {
+        let clauses: Vec<(CombinatorClause, Box<[SourceRange]>)> = clauses.into_iter().collect();
+        let written: Vec<WrittenName> = clauses
+            .iter()
+            .flat_map(|(clause, spans)| {
+                let (names, hidden) = clause_names(clause);
+                assert_eq!(
+                    names.len(),
+                    spans.len(),
+                    "combinator capture: span list must parallel the clause's names"
+                );
+                names
+                    .iter()
+                    .copied()
+                    .zip(spans.iter().copied())
+                    .map(move |(name, span)| WrittenName { name, hidden, span })
+            })
+            .collect();
+        let clauses = clauses.into_iter().map(|(clause, _)| clause).collect();
+        Self::build(clauses, written, strings)
+    }
+
+    /// The unfiltered list — the no-combinator common case.
+    #[must_use]
+    pub fn unfiltered() -> Self {
+        Self {
+            clauses: Box::new([]),
+            written: Box::new([]),
+            setters: Box::new([]),
+        }
+    }
+
+    /// Shared assembly: expand the clause sets for membership, and derive the
+    /// setter pairing from the written tokens (the intern of each spelling
+    /// hash-hits [`expand_names`]' work — the pairing just records it).
+    fn build(
+        clauses: Vec<CombinatorClause>,
+        written: impl IntoIterator<Item = WrittenName>,
+        strings: &StringTable,
+    ) -> Self {
+        let written: Box<[WrittenName]> = written.into_iter().collect();
         let clauses: Box<[CombinatorClause]> = clauses
             .into_iter()
             .map(|clause| match clause {
@@ -142,13 +242,19 @@ impl Combinators {
                 }
             })
             .collect();
-        Self(clauses)
-    }
-
-    /// The unfiltered list — the no-combinator common case.
-    #[must_use]
-    pub fn unfiltered() -> Self {
-        Self(Box::new([]))
+        let mut setters: Vec<(StringId, StringId)> = Vec::new();
+        for token in &written {
+            if setters.iter().any(|(bare, _)| *bare == token.name) {
+                continue;
+            }
+            let setter = strings.intern(&format!("{}=", strings.resolve(token.name)));
+            setters.push((token.name, setter));
+        }
+        Self {
+            clauses,
+            written,
+            setters: setters.into_boxed_slice(),
+        }
     }
 
     /// The clause list in source order. Clause name sets carry the
@@ -156,7 +262,18 @@ impl Combinators {
     /// persistence face round-trips through this view.
     #[must_use]
     pub fn clauses(&self) -> &[CombinatorClause] {
-        &self.0
+        &self.clauses
+    }
+
+    /// The interned `name=` spelling of the written bare identifier `name`,
+    /// derived at construction ([`Self::build`]) — the undefined check's
+    /// setter probe face, so the query pays no string work. `setters`
+    /// derives from the written tokens, so every written name is present.
+    pub(crate) fn setter_spelling(&self, name: StringId) -> Option<StringId> {
+        self.setters
+            .iter()
+            .find(|(bare, _)| *bare == name)
+            .map(|(_, setter)| *setter)
     }
 
     /// Whether `name` survives this directive's combinators, applied in
@@ -165,7 +282,7 @@ impl Combinators {
     /// clauses see what earlier clauses left).
     #[must_use]
     pub fn allows(&self, name: StringId) -> bool {
-        self.0.iter().all(|clause| match clause {
+        self.clauses.iter().all(|clause| match clause {
             CombinatorClause::Show(names) => names.binary_search(&name).is_ok(),
             CombinatorClause::Hide(names) => names.binary_search(&name).is_err(),
         })
@@ -175,7 +292,7 @@ impl Combinators {
     /// `showCombinators.isEmpty` test, `element.dart:8229`).
     #[must_use]
     pub fn has_show(&self) -> bool {
-        self.0
+        self.clauses
             .iter()
             .any(|clause| matches!(clause, CombinatorClause::Show(_)))
     }
@@ -188,9 +305,18 @@ impl Combinators {
     /// extra spellings are unreachable.
     #[must_use]
     pub fn shows(&self, name: StringId) -> bool {
-        self.0.iter().any(|clause| {
+        self.clauses.iter().any(|clause| {
             matches!(clause, CombinatorClause::Show(names) if names.binary_search(&name).is_ok())
         })
+    }
+}
+
+/// A clause's name list with its kind — the shared read of both variants
+/// (`false` for `show`, `true` for `hide`).
+fn clause_names(clause: &CombinatorClause) -> (&[StringId], bool) {
+    match clause {
+        CombinatorClause::Show(names) => (names, false),
+        CombinatorClause::Hide(names) => (names, true),
     }
 }
 
@@ -256,17 +382,23 @@ pub struct ExportEntry {
 }
 
 /// One undefined directive-combinator name ([`LibraryGraph::
-/// undefined_combinator_names`]): a written `show`/`hide` identifier neither
-/// spelling of which the directive target's export scope defines.
+/// undefined_combinator_names`]): one report per **written** `show`/`hide`
+/// token the directive target's export scope defines under neither spelling
+/// — the oracle iterates the AST name list as written and reports at each
+/// node (`dead_code_verifier.dart:148-158`), so a duplicated written name
+/// yields duplicated reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UndefinedCombinatorName {
-    /// The written (bare) identifier — the report anchor and the message's
-    /// `{1}` argument (`dead_code_verifier.dart:141-158` anchors at the name
-    /// token with `name.name.lexeme`).
+    /// The written (bare) identifier — the message's `{1}` argument.
     pub name: StringId,
     /// `true` for a `hide` clause (`undefined_hidden_name`), `false` for
     /// `show` (`undefined_shown_name`).
     pub hidden: bool,
+    /// The written token's captured UTF-16 span — the report anchor (the
+    /// oracle anchors `atNode(name)`, `dead_code_verifier.dart:153-158`).
+    /// Zero-length at offset 0 when the capture carried no spans
+    /// ([`Combinators::new`]).
+    pub span: SourceRange,
 }
 
 /// One spelling's slot in a library's locals layer.
@@ -566,7 +698,10 @@ impl<'t> LibraryGraphBuilder<'t> {
                 }
             })
             .collect();
-        LibraryGraph { nodes, declarations }
+        LibraryGraph {
+            nodes,
+            declarations,
+        }
     }
 }
 
@@ -726,30 +861,28 @@ impl LibraryGraph {
     }
 
     /// The directive-combinator findings for one resolved directive edge:
-    /// every written `show`/`hide` name the target's export scope does not
-    /// define — the `undefined_hidden_name`/`undefined_shown_name`
+    /// every **written** `show`/`hide` token the target's export scope does
+    /// not define — the `undefined_hidden_name`/`undefined_shown_name`
     /// `STATIC_WARNING` pair ([`crate::codes::UNDEFINED_HIDDEN_NAME`]/[
-    /// `crate::codes::UNDEFINED_SHOWN_NAME`]).
+    /// `crate::codes::UNDEFINED_SHOWN_NAME`]). One entry per written token,
+    /// in written order, each carrying its captured span: the oracle
+    /// iterates `combinator.shownNames`/`hiddenNames` as written and reports
+    /// at each node (`dead_code_verifier.dart:148-158`), so a duplicated
+    /// written name yields duplicated reports.
     ///
-    /// Decision order mirrors the oracle exactly. The namespace is the
+    /// Decision per token mirrors the oracle exactly. The namespace is the
     /// target library's export scope — `element_resolver.dart:407-432`
     /// `_resolveCombinators` resolves each written name against
     /// `library.exportNamespace` through both spellings (`get2(name)`,
     /// `get2('name=')`), and `dead_code_verifier.dart:141-158`
     /// `_checkCombinator` reports only when both faces come back null.
     /// dartq's export scope is that namespace with setters under their
-    /// `name=` spelling, so a name is defined iff either probe hits; the
-    /// getter probe first keeps the common hit case at one lookup. Every
-    /// clause is checked independently in source order — `show`/`hide`
-    /// interplay never couples the decisions (`show noSuch hide noSuch`
-    /// reports both codes), and an `as` prefix or `deferred` is not
-    /// consulted (`dead_code_verifier.dart:77-113` checks every import and
-    /// export directive's combinators alike). The clause sets carry
-    /// [`Combinators::new`]'s `name=` expansions; the written set is bare
-    /// identifiers (combinator grammar has no `=`), so the expanded
-    /// spellings are filtered out. Written duplicates collapse through the
-    /// constructor's dedupe where the oracle's token-list loop would report
-    /// twice — one under-report, never a false positive.
+    /// `name=` spelling, so the probe is `exported(target, name)` then —
+    /// through the construction-derived setter pairing, no string work —
+    /// `exported(target, setter)`. Each token decides independently; an
+    /// `as` prefix or `deferred` is not consulted
+    /// (`dead_code_verifier.dart:77-113` checks every import and export
+    /// directive's combinators alike).
     ///
     /// `target` is the directive's resolved target library, passed as the
     /// edge carries it: `None` (invalid URI, missing file, not a library)
@@ -768,32 +901,20 @@ impl LibraryGraph {
     /// not [`Self::uri`].
     pub fn undefined_combinator_names<'a>(
         &'a self,
-        strings: &'a StringTable,
         target: Option<LibraryId>,
         combinators: &'a Combinators,
     ) -> impl Iterator<Item = UndefinedCombinatorName> + 'a {
         target.into_iter().flat_map(move |target| {
-            combinators.clauses().iter().flat_map(move |clause| {
-                let (hidden, names) = match clause {
-                    CombinatorClause::Show(names) => (false, names),
-                    CombinatorClause::Hide(names) => (true, names),
-                };
-                names
-                    .iter()
-                    .copied()
-                    .filter(move |&name| {
-                        // A `name=` entry is the constructor's setter
-                        // expansion, never written (grammar has no `=`).
-                        !strings.resolve(name).ends_with('=')
-                            && self.exported(target, name).is_none()
-                            && self
-                                .exported(
-                                    target,
-                                    strings.intern(&format!("{}=", strings.resolve(name))),
-                                )
-                                .is_none()
-                    })
-                    .map(move |name| UndefinedCombinatorName { name, hidden })
+            combinators.written.iter().filter_map(move |token| {
+                let defined = self.exported(target, token.name).is_some()
+                    || combinators
+                        .setter_spelling(token.name)
+                        .is_some_and(|setter| self.exported(target, setter).is_some());
+                (!defined).then(|| UndefinedCombinatorName {
+                    name: token.name,
+                    hidden: token.hidden,
+                    span: token.span,
+                })
             })
         })
     }
@@ -842,7 +963,10 @@ impl LibraryGraph {
     /// query.
     #[must_use]
     pub fn declaring_libraries(&self, name: StringId) -> &[LibraryId] {
-        self.declarations.get(&name).map(Vec::as_slice).unwrap_or(&[])
+        self.declarations
+            .get(&name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -902,15 +1026,24 @@ mod tests {
     }
 
     /// One-clause combinator list over `names` — `hidden: true` builds
-    /// `hide`, else `show`.
+    /// `hide`, else `show`. Built through `with_spans` with synthetic
+    /// per-token spans (offset `4 * index`, length 2) so the capture path
+    /// — not just the span-less constructor — is what every decision pin
+    /// exercises.
     fn combinators(hidden: bool, names: &[&str], strings: &StringTable) -> Combinators {
-        let names: Box<[StringId]> = names.iter().map(|n| strings.intern(n)).collect();
+        let ids: Vec<StringId> = names.iter().map(|n| strings.intern(n)).collect();
+        let spans: Box<[SourceRange]> = (0..ids.len())
+            .map(|index| SourceRange {
+                offset: (4 * index) as u32,
+                length: 2,
+            })
+            .collect();
         let clause = if hidden {
-            CombinatorClause::Hide(names)
+            CombinatorClause::Hide(ids.into())
         } else {
-            CombinatorClause::Show(names)
+            CombinatorClause::Show(ids.into())
         };
-        Combinators::new([clause], strings)
+        Combinators::with_spans([(clause, spans)], strings)
     }
 
     /// The undefined-combinator findings as (name text, hidden) pairs.
@@ -921,7 +1054,7 @@ mod tests {
         combinators: &Combinators,
     ) -> Vec<(String, bool)> {
         graph
-            .undefined_combinator_names(strings, target, combinators)
+            .undefined_combinator_names(target, combinators)
             .map(|found| (strings.resolve(found.name).to_owned(), found.hidden))
             .collect()
     }
@@ -968,6 +1101,59 @@ mod tests {
             strings,
         );
         assert!(findings(&graph, strings, Some(math), &defined).is_empty());
+    }
+
+    /// Per-token reporting: the oracle iterates the written name list and
+    /// reports at each node (`dead_code_verifier.dart:148-158` — `for
+    /// (SimpleIdentifier name in names)` with `_diagnosticReporter.atNode(
+    /// name, ...)`), so `show noSuch, noSuch` on an undefined name is TWO
+    /// findings, in written order, each anchored at its own token's span.
+    #[test]
+    fn duplicate_written_names_report_per_token() {
+        let mut rig = Rig::new();
+        let math = rig.builder.intern("dart:math");
+        let face_file = rig.file("<dart:math>");
+        rig.declare(math, "max", face_file);
+        let strings = rig.strings;
+        let graph = rig.builder.finish();
+
+        let no_such = strings.intern("noSuch");
+        let spans = [
+            SourceRange {
+                offset: 18,
+                length: 6,
+            },
+            SourceRange {
+                offset: 26,
+                length: 6,
+            },
+        ];
+        let combinators = Combinators::with_spans(
+            [(
+                CombinatorClause::Show(Box::from([no_such, no_such])),
+                Box::from(spans.as_slice()),
+            )],
+            strings,
+        );
+        let found: Vec<UndefinedCombinatorName> = graph
+            .undefined_combinator_names(Some(math), &combinators)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                UndefinedCombinatorName {
+                    name: no_such,
+                    hidden: false,
+                    span: spans[0],
+                },
+                UndefinedCombinatorName {
+                    name: no_such,
+                    hidden: false,
+                    span: spans[1],
+                },
+            ],
+            "one finding per written token, written order, per-token spans"
+        );
     }
 
     /// The oracle checks export directives' combinators identically
@@ -1695,7 +1881,10 @@ mod tests {
             graph.local(a, rig.strings.intern("Shape")),
             LocalLookup::Found(_)
         ));
-        assert_eq!(graph.class_modifiers(a, rig.strings.intern("Shape")), Some(sealed));
+        assert_eq!(
+            graph.class_modifiers(a, rig.strings.intern("Shape")),
+            Some(sealed)
+        );
         assert_eq!(
             graph.class_modifiers(lib_b, rig.strings.intern("Shape")),
             Some(plain)
@@ -1705,6 +1894,10 @@ mod tests {
             graph.declaring_libraries(rig.strings.intern("Shape")),
             &[a, lib_b]
         );
-        assert!(graph.declaring_libraries(rig.strings.intern("Missing")).is_empty());
+        assert!(
+            graph
+                .declaring_libraries(rig.strings.intern("Missing"))
+                .is_empty()
+        );
     }
 }

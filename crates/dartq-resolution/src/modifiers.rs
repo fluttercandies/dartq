@@ -245,10 +245,18 @@ pub fn declaration_violations(modifiers: &ClassModifiers) -> Vec<DeclarationViol
             // parser_impl.dart:723-730 — report order base, final,
             // interface, sealed.
             if modifiers.is_base {
-                push(&mut violations, ModifierCode::BaseEnum, &[ModifierKeyword::Base]);
+                push(
+                    &mut violations,
+                    ModifierCode::BaseEnum,
+                    &[ModifierKeyword::Base],
+                );
             }
             if modifiers.is_final {
-                push(&mut violations, ModifierCode::FinalEnum, &[ModifierKeyword::Final]);
+                push(
+                    &mut violations,
+                    ModifierCode::FinalEnum,
+                    &[ModifierKeyword::Final],
+                );
             }
             if modifiers.is_interface {
                 push(
@@ -731,9 +739,7 @@ pub fn induced_modifier(
             return Some(InducedModifier::Interface); // :696-697
         }
     }
-    if interfaces
-        .iter()
-        .any(|i| i.base_face() || i.final_face())
+    if interfaces.iter().any(|i| i.base_face() || i.final_face())
         || mixins.iter().any(|m| m.base_face() || m.final_face())
     {
         return Some(InducedModifier::Base); // :700-706
@@ -1152,10 +1158,7 @@ mod tests {
         enumeration.is_interface = true;
         let violations = declaration_violations(&enumeration);
         assert_eq!(
-            violations
-                .iter()
-                .map(|v| v.code)
-                .collect::<Vec<_>>(),
+            violations.iter().map(|v| v.code).collect::<Vec<_>>(),
             vec![
                 ModifierCode::BaseEnum,
                 ModifierCode::FinalEnum,
@@ -1163,9 +1166,7 @@ mod tests {
                 ModifierCode::SealedEnum,
             ]
         );
-        assert!(violations[3]
-            .anchors
-            .contains(&ModifierKeyword::Sealed));
+        assert!(violations[3].anchors.contains(&ModifierKeyword::Sealed));
     }
 
     #[test]
@@ -1268,7 +1269,10 @@ mod tests {
         abstract_final_interface.is_base = false;
         let violations = declaration_violations(&abstract_final_interface);
         assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].code, ModifierCode::AbstractFinalInterfaceClass);
+        assert_eq!(
+            violations[0].code,
+            ModifierCode::AbstractFinalInterfaceClass
+        );
     }
 
     #[test]
@@ -1284,7 +1288,14 @@ mod tests {
         assert_eq!(sealed_supertype_violation(&local), None);
         // The official checks `ClassElement.isSealed` — non-sealed or
         // induced-only carriers do not fire.
-        assert_eq!(sealed_supertype_violation(&super_facts(class_mods(true, false, false, false), false, false)), None);
+        assert_eq!(
+            sealed_supertype_violation(&super_facts(
+                class_mods(true, false, false, false),
+                false,
+                false
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1456,10 +1467,42 @@ mod tests {
             mods: fixture.mods.clone(),
             supers: fixture.supers.clone(),
         };
-        sealed_fixture.mods.insert(D::Base, class_mods(true, false, false, true));
+        sealed_fixture
+            .mods
+            .insert(D::Base, class_mods(true, false, false, true));
         assert_eq!(
             nearest_explicit_base_or_final(&sealed_fixture, D::Mid),
             None
+        );
+    }
+
+    /// Cycle pin: a mutual-hierarchy cycle terminates and answers `None`
+    /// when nothing in it qualifies — the explicit visited set (the
+    /// cycle-safe adaptation noted on [`nearest_explicit_base_or_final`])
+    /// stops the revisit, so an adversarial or erroneous cyclic hierarchy
+    /// cannot hang the walk. A cycle member that does qualify is still
+    /// found: the guard stops revisits, not the search.
+    #[test]
+    fn cyclic_hierarchy_terminates_and_answers() {
+        let fixture = Fixture {
+            mods: FxHashMap::from_iter([
+                (D::Sub, class_mods(false, false, false, false)),
+                (D::Mid, class_mods(false, false, false, false)),
+            ]),
+            supers: FxHashMap::from_iter([(D::Sub, vec![D::Mid]), (D::Mid, vec![D::Sub])]),
+        };
+        assert_eq!(nearest_explicit_base_or_final(&fixture, D::Sub), None);
+
+        let mut qualifying = Fixture {
+            mods: fixture.mods.clone(),
+            supers: fixture.supers.clone(),
+        };
+        qualifying
+            .mods
+            .insert(D::Mid, class_mods(true, false, false, false));
+        assert_eq!(
+            nearest_explicit_base_or_final(&qualifying, D::Sub),
+            Some(D::Mid)
         );
     }
 
@@ -1534,7 +1577,8 @@ mod tests {
             library: SDK,
             same_library: false,
         };
-        let mut reportable_final = input(plain_element, final_super, Some(ancestor_final_sdk), false);
+        let mut reportable_final =
+            input(plain_element, final_super, Some(ancestor_final_sdk), false);
         reportable_final.super_library = PRE_MODIFIERS;
         assert_eq!(
             subtype_restriction_violation(&reportable_final),
@@ -1568,7 +1612,8 @@ mod tests {
             library: USER,
             same_library: false,
         };
-        let mut carve_out_user = input(plain_element, final_super, Some(ancestor_final_user), false);
+        let mut carve_out_user =
+            input(plain_element, final_super, Some(ancestor_final_user), false);
         carve_out_user.super_library = PRE_MODIFIERS;
         assert_eq!(subtype_restriction_violation(&carve_out_user), None);
         // Carve-out leg 3: the implements anchor stays silent
@@ -1735,7 +1780,12 @@ mod tests {
         ];
         for code in all {
             let info = code.info();
-            assert_eq!(info.name.to_uppercase(), info.machine, "{}", info.unique_name);
+            assert_eq!(
+                info.name.to_uppercase(),
+                info.machine,
+                "{}",
+                info.unique_name
+            );
             assert!(!info.message.is_empty(), "{}", info.unique_name);
             let use_site_or_subtype = matches!(
                 code,
@@ -1752,11 +1802,21 @@ mod tests {
                     | ModifierCode::MixinSubtypeOfFinalIsNotBase
             );
             if use_site_or_subtype {
-                assert_eq!(info.dtype, DiagnosticType::CompileTimeError, "{}", info.unique_name);
+                assert_eq!(
+                    info.dtype,
+                    DiagnosticType::CompileTimeError,
+                    "{}",
+                    info.unique_name
+                );
                 assert!(info.has_published, "{}", info.unique_name);
                 assert_eq!(info.correction, None, "{}", info.unique_name);
             } else {
-                assert_eq!(info.dtype, DiagnosticType::SyntacticError, "{}", info.unique_name);
+                assert_eq!(
+                    info.dtype,
+                    DiagnosticType::SyntacticError,
+                    "{}",
+                    info.unique_name
+                );
                 assert_eq!(
                     info.has_published,
                     code == ModifierCode::AbstractSealedClass,
@@ -1793,11 +1853,15 @@ mod tests {
         }
         // Spot-check two verbatim messages (registry :15536 and :15818).
         assert_eq!(
-            ModifierCode::SealedClassSubtypeOutsideOfLibrary.info().message,
+            ModifierCode::SealedClassSubtypeOutsideOfLibrary
+                .info()
+                .message,
             "The class '{0}' can't be extended, implemented, or mixed in outside of its library because it's a sealed class."
         );
         assert_eq!(
-            ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed.info().message,
+            ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed
+                .info()
+                .message,
             "The type '{0}' must be 'base', 'final' or 'sealed' because the supertype '{1}' is 'base'."
         );
     }

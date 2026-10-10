@@ -306,9 +306,9 @@ fn package_of<'p>(packages: &'p PackageTable, path: &Path) -> Option<(&'p str, S
 
 /// The canonical URI string of `path` (`pathToUri` face) against `memo` —
 /// the one implementation of the spelling, memoized per `FileTable`
-/// -normalized path. [`UriResolver::canonical_uri`] and [`container_base`]
-/// reach it through field-disjoint borrows (the base computation runs while
-/// `files` holds the container's interned path).
+/// -normalized path. [`container_base`] reaches it through field-disjoint
+/// borrows (the base computation runs while `files` holds the container's
+/// interned path).
 fn canonical_uri_memo(
     canonical: &mut FxHashMap<PathBuf, Box<str>>,
     packages: &PackageTable,
@@ -317,7 +317,16 @@ fn canonical_uri_memo(
     if let Some(known) = canonical.get(path) {
         return known.clone();
     }
-    let uri: Box<str> = if let Some((package, rel)) = package_of(packages, path) {
+    let uri = compose_canonical_uri(packages, path);
+    canonical.insert(path.to_path_buf(), uri.clone());
+    uri
+}
+
+/// The pure spelling computation behind [`canonical_uri_memo`] and
+/// [`UriResolver::canonical_uri`]: `package:` inside a package lib dir
+/// (deepest match wins), `file://` otherwise.
+fn compose_canonical_uri(packages: &PackageTable, path: &Path) -> Box<str> {
+    if let Some((package, rel)) = package_of(packages, path) {
         Box::from(format!("package:{package}/{}", encode_uri_path(&rel)))
     } else {
         let text = path.to_string_lossy();
@@ -328,9 +337,7 @@ fn canonical_uri_memo(
             format!("/{encoded}")
         };
         Box::from(format!("file://{with_slash}"))
-    };
-    canonical.insert(path.to_path_buf(), uri.clone());
-    uri
+    }
 }
 
 /// The canonical base URI space `path` composes relatives in, derived from
@@ -517,12 +524,19 @@ impl<'a> UriResolver<'a> {
     /// implementation of the spelling, so a change to it cannot desync the
     /// composition base ([`container_base`] derives from it). Memoized per
     /// `FileTable`-normalized path for this resolver's lifetime (the package
-    /// table cannot change under a live resolver); callers needing a longer
-    /// horizon cache the owned result — the engine's per-file canonical
-    /// table does exactly that.
+    /// table cannot change under a live resolver); the returned borrow shares
+    /// that lifetime, and callers needing a longer horizon cache the owned
+    /// result — the engine's per-file canonical table does exactly that.
     #[must_use]
-    pub fn canonical_uri(&mut self, path: &Path) -> Box<str> {
-        canonical_uri_memo(&mut self.canonical, self.packages, path)
+    pub fn canonical_uri(&mut self, path: &Path) -> &str {
+        if !self.canonical.contains_key(path) {
+            let uri = compose_canonical_uri(self.packages, path);
+            self.canonical.insert(path.to_path_buf(), uri);
+        }
+        self.canonical
+            .get(path)
+            .map(Box::as_ref)
+            .expect("memoized above")
     }
 
     /// Lands a composed absolute URI on a target: scheme dispatch, existence,
@@ -2145,11 +2159,11 @@ mod tests {
 
         assert_eq!(
             resolver.canonical_uri(&fixture.workspace.root.join("pkg_a/lib/sub/b.dart")),
-            Box::from("package:pkg_a/sub/b.dart")
+            "package:pkg_a/sub/b.dart"
         );
         assert_eq!(
             resolver.canonical_uri(&fixture.workspace.root.join("app/lib/main.dart")),
-            Box::from(format!(
+            format!(
                 "file://{}",
                 encode_uri_path(
                     &fixture
@@ -2158,7 +2172,7 @@ mod tests {
                         .join("app/lib/main.dart")
                         .to_string_lossy()
                 )
-            ))
+            )
         );
     }
 
