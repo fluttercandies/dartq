@@ -97,3 +97,49 @@ cargo run -p corpus-gen -- --out tests/corpus/mega/100k --scale 100k --seed 0
 ```
 
 `tests/corpus/mega/` is gitignored; regenerate locally as needed.
+
+## Consumption
+
+`scripts/mega-run.sh` is the wired consumer (S4 budget shape, PRD 19.2 S4 +
+19.3): per scale it regenerates the tree if absent (same pinned
+`--seed 0`), materializes the package config the generated tree lacks, and
+runs the harness bench faces `rss-100k` and `incremental-p95` with
+`--corpus-dir` pointed at the scale dir. No oracle differential by default
+(S4 is a dartq-side budget: RSS ceiling + latency, not a Jaccard row).
+
+```bash
+scripts/mega-run.sh --dry-run --scale 10k   # plan only, executes nothing
+scripts/mega-run.sh --scale 1k              # one scale (default)
+scripts/mega-run.sh --all                   # the 1k -> 10k -> 100k ladder
+scripts/mega-run.sh --all --label mega-r2   # report dir suffix
+```
+
+Facts the runner relies on:
+
+- **Seed contract:** same seed + scale = byte-identical tree and manifest
+  (`manifest.json` fingerprint). The runner always pins `--seed 0`; only
+  regenerate with a different seed if you intend to fork the corpus shape.
+- **Disk footprint** (measured on the seed-0 trees): 1k ~4 MB, 10k ~40 MB,
+  100k ~398 MB. `incremental-p95` additionally copies the scale dir per run
+  (edit fixture), so the 100k scale needs ~800 MB of headroom.
+- **Package config:** the generator emits `pubspec.yaml` files but no
+  `.dart_tool/`. `scripts/mega-run.sh` materializes a hand-written
+  `.dart_tool/package_config.json` per scale (app + every `packages/*`
+  entry, config-file-relative `rootUri`, `languageVersion 3.13` — the
+  harness corpus preflight's floor) before invoking the harness. It is
+  idempotent and skipped when present; delete it alongside the tree when
+  regenerating from scratch.
+- **Edit manifest:** `incremental-p95` needs `--manifest`; the runner
+  writes a five-step budget-smoke manifest (whole-file edits to
+  `lib/main.dart`, stable across scales) into the report dir. Replace it
+  there for a heavier acceptance sequence — the face's manifest schema is
+  documented in `tests/harness/src/bench.rs`.
+- **Timeout:** the runner exports
+  `DARTQ_HARNESS_ORACLE_TIMEOUT_MS=600000` unless already set — a
+  100k-file batch analysis exceeds the harness's 120 s default.
+- **Reports:** `docs/audits/mega/<label>/<scale>/{rss-100k,
+  incremental-p95}/report.json`; the runner's summary prints per-scale
+  wall time, files/LOC, peak RSS (+ per-100k normalization), and the
+  incremental p50/p95/p99. Budget thresholds are intentionally not asserted
+  yet (no baseline exists; exit 1 is reserved for the acceptance run).
+
