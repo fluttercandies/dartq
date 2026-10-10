@@ -197,7 +197,12 @@ fn locate(text: &str, edit: &Edit) -> Option<usize> {
         }
     }
     // Re-location: every position where the original slice survives with
-    // the anchor context flanking it.
+    // the anchor context flanking it. Line numbers come from a fresh
+    // [`LineIndex`] of the current text — the same index the anchor was
+    // born from in [`anchored_edit`], so both faces agree on what "the
+    // anchor line" means (the applier's text mutates per write, so an
+    // index shared across edits would read stale line starts).
+    let lines = LineIndex::new(text);
     let mut line_match: Option<usize> = None;
     let mut line_matches = 0;
     let mut any_match: Option<usize> = None;
@@ -211,8 +216,8 @@ fn locate(text: &str, edit: &Edit) -> Option<usize> {
         if any_match.is_none() {
             any_match = Some(start);
         }
-        let line = 1 + text[..start].bytes().filter(|&b| b == b'\n').count();
-        if u32::try_from(line) == Ok(edit.anchor.line) {
+        let (line, _) = lines.byte_to_line_col(u32::try_from(start).expect("offset exceeds u32"));
+        if line == edit.anchor.line {
             line_matches += 1;
             line_match = Some(start);
         }

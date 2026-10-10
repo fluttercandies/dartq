@@ -31,6 +31,7 @@
 use std::path::{Path, PathBuf};
 
 use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
+use dartq_diagnostics::CodeRegistry;
 use dartq_engine::state::persist::PersistedFacts;
 use dartq_engine::{Engine, LibraryId, UnitFacts};
 use dartq_index::TestGraph;
@@ -232,6 +233,11 @@ fn library_surface(
     let mut names: Vec<StringId> = Vec::new();
     let mut folded = Vec::with_capacity(members.len() * 32);
     let mut signatures = Vec::with_capacity(members.len());
+    // The builtin diagnostic-code registry, built once per load (the #428
+    // contract): `materialize` consults it per restored diagnostic, and a
+    // per-member rebuild would reconstruct the ~270-entry map for every
+    // snapshot hit.
+    let codes = CodeRegistry::builtin();
     for &file in members {
         let bytes = engine.content(file).expect("resident member");
         // The content identity rides the query contract's 32-byte blake3
@@ -244,7 +250,8 @@ fn library_surface(
             // The signature column off the payload bytes before the
             // materializing move (`materialize` consumes the payload).
             let signature = payload.api_signature;
-            let facts = payload.materialize(text, strings, &mut |path| restored.intern(path));
+            let facts =
+                payload.materialize(text, strings, &codes, &mut |path| restored.intern(path));
             face_names(&facts, &mut names);
             signature
         } else {

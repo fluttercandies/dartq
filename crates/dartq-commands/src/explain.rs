@@ -187,11 +187,16 @@ pub fn explain_after_analysis(
         &tests,
         &harvest.strings,
     );
-    let json = serde_json::to_string(&report).expect("explain report serializes");
+    // One serialization into the answer `Value`, then one serialization of
+    // that Value to the validator's &str face (`dartq-schema::validate` is
+    // string-typed) — the parsed-back round trip of the older shape is
+    // gone: the report is converted exactly twice, never re-parsed.
+    let value = serde_json::to_value(&report).expect("explain report serializes");
+    let json = serde_json::to_string(&value).expect("explain report serializes");
     dartq_schema::validate(&json, dartq_schema::Domain::Explain).unwrap_or_else(|violation| {
         panic!("explain report violates the published schema: {violation}")
     });
-    serde_json::from_str(&json).expect("validated JSON re-parses")
+    value
 }
 
 /// The commands [`Verbosity`] onto the assembler's: same three tiers, same

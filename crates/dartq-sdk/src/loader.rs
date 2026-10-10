@@ -4,7 +4,7 @@
 //! revision → `libraries.json` (with target resolution) →
 //! `allowed_experiments.json` → canonical id.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -340,25 +340,33 @@ pub(crate) fn parse_libraries_json(text: &str) -> Result<SdkLibraries, String> {
     for name in segments.keys() {
         let mut libraries = BTreeMap::new();
         let mut stack = Vec::new();
-        resolve_segment(&segments, name, &mut stack, &mut libraries)?;
+        let mut visited = BTreeSet::new();
+        resolve_segment(&segments, name, &mut stack, &mut visited, &mut libraries)?;
         targets.insert(name.clone(), TargetLibraries { libraries });
     }
     Ok(SdkLibraries { targets })
 }
 
 /// Depth-first segment resolution: inherited segments contribute first, own
-/// definitions overwrite (`include` merges, self wins); `stack` detects
-/// cycles and deduplicates diamonds.
+/// definitions overwrite (`include` merges, self wins). `stack` detects
+/// cycles; `visited` skips re-processing a segment already merged through
+/// another include path (a diamond contributes once — its entries are
+/// identical either way), one set per root target so each root still
+/// merges the full chain into its own `libraries`.
 fn resolve_segment(
     segments: &BTreeMap<String, RawSegment>,
     name: &str,
     stack: &mut Vec<String>,
+    visited: &mut BTreeSet<String>,
     libraries: &mut BTreeMap<String, SdkLibrary>,
 ) -> Result<(), String> {
     if stack.iter().any(|entry| entry == name) {
         let mut cycle = stack.clone();
         cycle.push(name.to_owned());
         return Err(format!("`include` cycle: {}", cycle.join(" -> ")));
+    }
+    if !visited.insert(name.to_owned()) {
+        return Ok(());
     }
     let Some(segment) = segments.get(name) else {
         return Err(format!(
@@ -368,7 +376,7 @@ fn resolve_segment(
     };
     stack.push(name.to_owned());
     for include in &segment.include {
-        resolve_segment(segments, &include.target, stack, libraries)?;
+        resolve_segment(segments, &include.target, stack, visited, libraries)?;
     }
     for (library_name, raw) in &segment.libraries {
         libraries.insert(library_name.clone(), convert_library(library_name, raw)?);
