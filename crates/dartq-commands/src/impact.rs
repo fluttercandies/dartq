@@ -10,8 +10,11 @@
 //!   defining-file basenames (dartq-index's derivation: imports primary,
 //!   the `*_test.dart` convention fallback);
 //! * the **file snapshot** folds the seed library's member files — blake3
-//!   over the member hashes, the library-face declaration names from the
-//!   dartq-index capture pass.
+//!   over the member hashes, the library-face declaration names. Per member
+//!   the persisted-facts hint decides the derivation: a snapshot hit is
+//!   `materialize`d through the #341 load faces and read off the restored
+//!   element model; a genuine miss re-derives the same two columns by
+//!   scan+capture (the dartq-index capture pass).
 //!
 //! One-shot posture: a CLI run holds no baseline, so the seed enters the
 //! query as a **hypothetical** API-level change ([`LibraryChange::hypothetical`])
@@ -23,12 +26,13 @@
 use std::path::{Path, PathBuf};
 
 use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
+use dartq_engine::state::persist::PersistedFacts;
 use dartq_engine::{Engine, LibraryId};
 use dartq_index::{TestGraph, capture};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, scan};
-use dartq_source::{FileId, StringId, StringTable};
+use dartq_source::{FileId, FileTable, StringId, StringTable};
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
@@ -70,7 +74,9 @@ pub fn impact(engine: &mut Engine, target: &Path) -> Result<query::ImpactReport,
 }
 
 /// The report over an already-analyzed engine — the daemon path, whose read
-/// task has just run the analysis pass.
+/// task has just run the analysis pass. Hint-less: every member seeds. A
+/// caller holding a snapshot generation threads it through
+/// [`impact_after_analysis_with_persisted_facts`].
 ///
 /// # Errors
 ///
@@ -79,8 +85,40 @@ pub fn impact_after_analysis(
     engine: &Engine,
     target: &Path,
 ) -> Result<query::ImpactReport, ImpactError> {
+    impact_after_analysis_with_persisted_facts(engine, target, &unpersisted)
+}
+
+/// The persisted-facts hint the query consults before seeding (the #341
+/// load faces): called once per member file with the file's resident
+/// source, it answers `Some` when the snapshot generation carries the
+/// file's facts under its current content key and `None` on a genuine miss
+/// — first run, generation mismatch, tables-stamp mismatch, eviction. The
+/// accelerator invariant: a miss is a recompute (the seed arm), never an
+/// error.
+pub type PersistedFactsHint<'a> = &'a dyn Fn(&str) -> Option<PersistedFacts>;
+
+/// The hint-less posture.
+fn unpersisted(_: &str) -> Option<PersistedFacts> {
+    None
+}
+
+/// [`impact_after_analysis`] over a persisted-facts hint: members the
+/// snapshot carries surface through [`PersistedFacts::materialize`], the
+/// rest seed exactly as before — the outputs are byte-identical either way
+/// for the same content (the impact equivalence test).
+///
+/// # Errors
+///
+/// [`ImpactError::Missing`] / [`ImpactError::NotAnalyzed`] on a bad target.
+pub fn impact_after_analysis_with_persisted_facts(
+    engine: &Engine,
+    target: &Path,
+    persisted: PersistedFactsHint<'_>,
+) -> Result<query::ImpactReport, ImpactError> {
     // The seed: the target file's owning library.
-    let canonical = target.canonicalize().map_err(|_| ImpactError::Missing(target.to_path_buf()))?;
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| ImpactError::Missing(target.to_path_buf()))?;
     let Some(seed_file) = engine.file_table().try_file_id(&canonical) else {
         return Err(ImpactError::NotAnalyzed(canonical));
     };
@@ -101,7 +139,8 @@ pub fn impact_after_analysis(
     let idents = library_identities(engine, &libraries);
 
     let strings = StringTable::new();
-    let current = seed_snapshot(engine, &members, &strings);
+    let mut restored = FileTable::new();
+    let current = library_surface(engine, &members, &strings, persisted, &mut restored);
 
     // The substrate over the engine's faces, then the query.
     let neighbors = |library: u32| -> &[u32] {
@@ -131,7 +170,10 @@ pub(crate) type IdentTable = Vec<Option<String>>;
 
 /// The stable label of every live library, indexed by the engine library id
 /// (dead slots hold `None`).
-pub(crate) fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
+pub(crate) fn library_identities(
+    engine: &Engine,
+    libraries: &[(LibraryId, Vec<FileId>)],
+) -> IdentTable {
     let mut idents: IdentTable = vec![None; libraries.len()];
     for (library, files) in libraries {
         let Some(path) = files
@@ -145,30 +187,75 @@ pub(crate) fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<F
     idents
 }
 
-/// The folded surface of one library: blake3 over the member hashes, the
-/// library-face declaration names from the capture pass (parse-surface
+/// The folded surface of one library over its member files: blake3 over the
+/// member content hashes, the library-face declaration names. Per member
+/// the persisted hint decides the derivation: a hit `materialize`s the
+/// payload through the #341 load faces and reads the two columns off the
+/// restored facts; a miss re-derives them by scan+capture (parse-surface
 /// capture proceeds through scan diagnostics — the under-report bias; this
 /// face produces no diagnostics of its own).
-fn seed_snapshot(engine: &Engine, members: &[FileId], strings: &StringTable) -> FileSnapshot {
+///
+/// The equivalence the fold stands on: both arms answer for the same
+/// resident bytes — the content identity is the same blake3 over the same
+/// bytes, and the restored element model's face set (every named container
+/// plus every non-type-parameter top-level declaration, setters under their
+/// `name=` spelling) is the capture pass's `is_library_face` set — so a
+/// generation whose entries match the workspace folds into the seed's
+/// exact snapshot. The `restored` table takes the payload's file
+/// references (directive targets, diagnostic files); the surface face
+/// reads none of them, but `materialize` mints ids through it by contract.
+fn library_surface(
+    engine: &Engine,
+    members: &[FileId],
+    strings: &StringTable,
+    persisted: PersistedFactsHint<'_>,
+    restored: &mut FileTable,
+) -> FileSnapshot {
     let mut names: Vec<StringId> = Vec::new();
     let mut folded = Vec::with_capacity(members.len() * 32);
     for &file in members {
         let bytes = engine.content(file).expect("resident member");
+        // The content identity rides the query contract's 32-byte blake3
+        // over the resident bytes — the same digest either arm answers for;
+        // the payload's 16-byte column is the entry key's domain, not the
+        // fold's.
         folded.extend_from_slice(&content_hash(bytes));
         let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-        let scanned = scan(text, SCAN_CONFIG, file);
-        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-            DEFAULT_LANGUAGE_VERSION,
-        ));
-        let captured = capture(file, text, &scanned.tokens, features, strings);
-        names.extend(
-            captured
-                .index
-                .decls()
-                .iter()
-                .filter(|row| row.is_library_face())
-                .map(|row| row.name),
-        );
+        match persisted(text) {
+            Some(payload) => {
+                let facts = payload.materialize(text, strings, &mut |path| restored.intern(path));
+                names.extend(facts.elements.containers().map(|(name, _)| name));
+                names.extend(
+                    facts
+                        .elements
+                        .declarations()
+                        // Type parameters are declaration-scoped, not
+                        // library faces — the capture filter's mirror. The
+                        // kind rides its derived Debug spelling because
+                        // dartq-commands does not depend on dartq-semantic
+                        // (the engine owns the element model); a rename
+                        // that breaks the spelling fails the impact
+                        // equivalence test instead of leaking the name.
+                        .filter(|(_, decl)| format!("{:?}", decl.kind) != "TypeParam")
+                        .map(|(name, _)| name),
+                );
+            }
+            None => {
+                let scanned = scan(text, SCAN_CONFIG, file);
+                let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+                    DEFAULT_LANGUAGE_VERSION,
+                ));
+                let captured = capture(file, text, &scanned.tokens, features, strings);
+                names.extend(
+                    captured
+                        .index
+                        .decls()
+                        .iter()
+                        .filter(|row| row.is_library_face())
+                        .map(|row| row.name),
+                );
+            }
+        }
     }
     names.sort_unstable();
     names.dedup();
@@ -182,6 +269,261 @@ fn seed_snapshot(engine: &Engine, members: &[FileId], strings: &StringTable) -> 
 mod tests {
     use super::*;
     use crate::workspace::{open_engine, test_fixture::workspace};
+    use dartq_index::DeclKind;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+
+    /// Projects one file's facts onto the persisted payload the saver
+    /// writes. The engine's resident facts are crate-private, so the
+    /// projection reuses the same capture pass the seed arm reads: every
+    /// library-face row becomes an element column entry (containers vs
+    /// top-level declarations, names on the per-entry string slice, kinds
+    /// in the persisted spellings) — the shape the load arm's derivation
+    /// consumes.
+    fn persisted_facts(text: &str, file: FileId, strings: &StringTable) -> PersistedFacts {
+        let scanned = scan(text, SCAN_CONFIG, file);
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            DEFAULT_LANGUAGE_VERSION,
+        ));
+        let captured = capture(file, text, &scanned.tokens, features, strings);
+        let mut slice: Vec<String> = Vec::new();
+        let mut slots: HashMap<String, u32> = HashMap::new();
+        let top_decl = |kind: &str| {
+            json!({
+                "kind": kind,
+                "type_params": 0,
+                "var_ty": "Unknown",
+                "return_ty": "Unknown",
+                "formals": null,
+            })
+        };
+        let container = |kind: &str| {
+            json!({
+                "kind": kind,
+                "superclass": null,
+                "members": [],
+                "type_params": 0,
+                "sealed": false,
+                "interfaces": [],
+                "enum_constants": [],
+                "constructors": [],
+                "has_unnamed_constructor": true,
+            })
+        };
+        let mut decls: Vec<serde_json::Value> = Vec::new();
+        let mut containers: Vec<serde_json::Value> = Vec::new();
+        let mut order: Vec<u32> = Vec::new();
+        for row in captured.index.decls() {
+            if !row.is_library_face() {
+                continue;
+            }
+            let name = strings.resolve(row.name).to_owned();
+            let at = match slots.get(&name) {
+                Some(&at) => at,
+                None => {
+                    slots.insert(name.clone(), slice.len() as u32);
+                    slice.push(name);
+                    (slice.len() - 1) as u32
+                }
+            };
+            match row.kind {
+                DeclKind::Class => {
+                    order.push(at);
+                    containers.push(json!([at, container("Class")]));
+                }
+                DeclKind::Enum => {
+                    order.push(at);
+                    containers.push(json!([at, container("Enum")]));
+                }
+                DeclKind::Mixin => {
+                    order.push(at);
+                    containers.push(json!([at, container("Mixin")]));
+                }
+                DeclKind::Extension => {
+                    order.push(at);
+                    containers.push(json!([at, container("Extension")]));
+                }
+                DeclKind::ExtensionType => {
+                    order.push(at);
+                    containers.push(json!([at, container("ExtensionType")]));
+                }
+                DeclKind::TypeAlias => decls.push(json!([at, top_decl("TypeAlias")])),
+                DeclKind::TopLevelFn => decls.push(json!([at, top_decl("TopLevelFn")])),
+                DeclKind::TopLevelVar => decls.push(json!([at, top_decl("TopLevelVar")])),
+                // Members and type parameters are never library faces; the
+                // filter above already skipped them.
+                _ => {}
+            }
+        }
+        serde_json::from_value(json!({
+            "api_signature": vec![0u8; 16],
+            "directives": [],
+            "elements": {
+                "strings": slice,
+                "decls": decls,
+                "containers": containers,
+                "container_order": order,
+                "extension_members": [],
+                "duplicates": [],
+                "arity_violations": [],
+            },
+            "diagnostics": [],
+            "files": [],
+        }))
+        .expect("saver-shape payload decodes")
+    }
+
+    /// The equivalence contract of the persisted surface: entries carried
+    /// by the snapshot answer for their files through `materialize`, and
+    /// the report over the loaded facts is byte-identical to the seeded
+    /// baseline for the same content. The fixture spans every face kind
+    /// plus a generic top-level function, whose type parameter must stay
+    /// out of both derivations, and a part file folded into the seed
+    /// library's surface.
+    #[test]
+    fn loaded_facts_reproduce_the_seeded_report() {
+        let root = workspace(
+            "impact_persisted",
+            &[
+                (
+                    "lib/main.dart",
+                    "part 'extra.dart';\n\n class Greeter { String hello() => 'hi'; }\n\
+                     enum Color { red, green }\n mixin Runner {}\n\
+                     extension GreeterRun on Greeter { void wave() {} }\n\
+                     extension type Meters(int value) {}\n typedef Name = String;\n\
+                     int counter = 0;\n String get greeting => 'hi';\n\
+                     set greeting(String value) {}\n void greet<T>(T thing) {}\n",
+                ),
+                (
+                    "lib/extra.dart",
+                    "part of 'main.dart';\n\n void helper(int x) {}\n double ratio = 1.0;\n",
+                ),
+                (
+                    "lib/other.dart",
+                    "import 'main.dart';\n\n void use() { Greeter().hello(); }\n",
+                ),
+                ("test/main_test.dart", "void main() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/main.dart");
+        let seeded = impact(&mut engine, &target).expect("seeded impact");
+
+        // The save side: one payload per workspace file, keyed by the exact
+        // content the store's entry key pins.
+        let strings = StringTable::new();
+        let mut persisted: HashMap<String, PersistedFacts> = HashMap::new();
+        for relative in [
+            "lib/main.dart",
+            "lib/extra.dart",
+            "lib/other.dart",
+            "test/main_test.dart",
+        ] {
+            let path = root.join(relative);
+            let text = fs::read_to_string(&path).expect("fixture file");
+            let file = engine.file_table().try_file_id(&path).expect("discovered");
+            persisted.insert(text.clone(), persisted_facts(&text, file, &strings));
+        }
+
+        let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
+            persisted.get(text).cloned()
+        })
+        .expect("loaded impact");
+
+        // The seed members (main.dart and its part) both hit; the report
+        // bytes are the seeded baseline's.
+        assert_eq!(
+            serde_json::to_string(&loaded).expect("serialize"),
+            serde_json::to_string(&seeded).expect("serialize"),
+            "the loaded report is the seeded report",
+        );
+        // The comparison is not vacuous: the hypothetical change lists the
+        // library's face names, and the type parameter is in neither
+        // derivation's set.
+        let names: Vec<&str> = loaded
+            .changed
+            .iter()
+            .map(|row| row.symbol.as_str())
+            .collect();
+        assert!(
+            names.iter().any(|row| row.ends_with("|Greeter")),
+            "face rows: {names:?}"
+        );
+        assert!(
+            names.iter().any(|row| row.ends_with("|greeting=")),
+            "the setter's lookup spelling rides: {names:?}"
+        );
+        assert!(
+            names.iter().any(|row| row.ends_with("|helper")),
+            "the part file folds into the surface: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|row| row.ends_with("|T")),
+            "the type parameter is not a library face: {names:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fallback tier: a member the snapshot does not carry seeds exactly
+    /// as before. With no hint at all — and with entries present for
+    /// non-member files only — the report stays byte-identical to the
+    /// seed: the per-entry decision consults the seed library's members
+    /// alone, and a miss is a recompute, never an error.
+    #[test]
+    fn absent_entries_fall_back_to_seeding_per_member() {
+        let root = workspace(
+            "impact_absent",
+            &[
+                (
+                    "lib/main.dart",
+                    "part 'extra.dart';\n\n class Greeter { String hello() => 'hi'; }\n\
+                     void greet<T>(T thing) {}\n",
+                ),
+                (
+                    "lib/extra.dart",
+                    "part of 'main.dart';\n\n void helper(int x) {}\n",
+                ),
+                (
+                    "lib/other.dart",
+                    "import 'main.dart';\n\n void use() { Greeter().hello(); }\n",
+                ),
+                ("test/main_test.dart", "void main() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/main.dart");
+        let seeded = impact(&mut engine, &target).expect("seeded impact");
+
+        let hintless = impact_after_analysis(&engine, &target).expect("hintless impact");
+        assert_eq!(
+            serde_json::to_string(&hintless).expect("serialize"),
+            serde_json::to_string(&seeded).expect("serialize"),
+            "the hint-less posture is the seed",
+        );
+
+        // Entries exist — but only for files outside the seed library.
+        let strings = StringTable::new();
+        let mut persisted: HashMap<String, PersistedFacts> = HashMap::new();
+        for relative in ["lib/other.dart", "test/main_test.dart"] {
+            let path = root.join(relative);
+            let text = fs::read_to_string(&path).expect("fixture file");
+            let file = engine.file_table().try_file_id(&path).expect("discovered");
+            persisted.insert(text.clone(), persisted_facts(&text, file, &strings));
+        }
+        let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
+            persisted.get(text).cloned()
+        })
+        .expect("partially loaded impact");
+        assert_eq!(
+            serde_json::to_string(&loaded).expect("serialize"),
+            serde_json::to_string(&seeded).expect("serialize"),
+            "missing seed members seed; foreign entries never perturb",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// The naming-fallback precision (ai-audit X1) end-to-end over the real
     /// engine: two same-basename `a.dart` in different directories plus a
