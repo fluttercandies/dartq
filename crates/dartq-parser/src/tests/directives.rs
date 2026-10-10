@@ -157,16 +157,14 @@ fn conditional_uri_payloads_in_source_order() {
     );
 }
 
-/// Missing candidate URI (official `ensureLiteralString` :5075): the error
-/// pair reports on the offending token and a synthetic empty string stands
-/// in as the candidate.
+/// Missing candidate URI (official `ensureLiteralString` :5075): `x` is a
+/// legal dotted-name condition, so the only failure is the missing
+/// candidate — expectedString on the `;`, which survives (the synthetic
+/// string is spliced before it) and terminates the import.
 #[test]
 fn conditional_uri_payloads_missing_candidate_uri() {
     let listener = ConditionalPayloads::of("import 'a.dart' if (x);");
-    assert_eq!(
-        listener.errors,
-        ["unexpected_token", "expected_string_literal"]
-    );
+    assert_eq!(listener.errors, ["expected_string_literal"]);
     assert_eq!(listener.clauses, vec![("x".to_owned(), vec![String::new()])]);
 }
 
@@ -428,15 +426,30 @@ fn import_at_eof_recovers_semicolon() {
 
 #[test]
 fn uri_must_be_string() {
-    // The 3.13 oracle surfaces the shared-code expectedString and an
-    // unexpectedToken on the offending token.
+    // The string recovery reports ONLY expectedString (official
+    // `ensureLiteralString` :5075; oracle: no `unexpectedToken` from the
+    // read). The synthetic string is spliced BEFORE the offender
+    // (`rewriteAndRecover` → `insertToken`, token_stream_rewriter
+    // .dart:85), so the offender survives to the next grammar position and
+    // takes its own report: the import recovery boundary
+    // (`skipUnexpectedTokenOpt` :5148 via `parseImportRecovery`
+    // :1022-1025) re-reports `5` before the `;`; `part`'s
+    // `ensureSemicolon` reports the missing `;` anchored at `part`
+    // (`findPreviousNonZeroLengthToken`), and the top-level continuation
+    // then takes `5;` — `expected_declaration` (the shared
+    // `EXPECTED_EXECUTABLE` code) on `5`, `unexpectedToken` on `;`.
     assert_eq!(
         error_codes("import 5;"),
-        ["unexpected_token", "expected_string_literal"]
+        ["expected_string_literal", "unexpected_token"]
     );
     assert_eq!(
         error_codes("part 5;"),
-        ["unexpected_token", "expected_string_literal"]
+        [
+            "expected_string_literal",
+            "expected_token",
+            "expected_executable",
+            "unexpected_token"
+        ]
     );
 }
 
@@ -449,13 +462,18 @@ fn combinator_missing_name() {
 fn conditional_uri_missing_paren() {
     // insertParens recovery (official :1136-1143): a synthetic
     // `( <empty-id> )` triple stands in for the paren pair; the offending
-    // token then fails the URI read.
+    // `x` then fails the URI read (expectedString only — the string
+    // recovery reports no unexpectedToken). The synthetic string is spliced
+    // BEFORE `x` (`insertToken`, token_stream_rewriter.dart:85), so `x`
+    // survives to the import recovery boundary and is re-reported there
+    // (`skipUnexpectedTokenOpt` :5148 via `parseImportRecovery`
+    // :1022-1025 — `x` precedes the `;`).
     assert_eq!(
         error_codes("import 'a.dart' if x;"),
         [
             "expected_token",
-            "unexpected_token",
-            "expected_string_literal"
+            "expected_string_literal",
+            "unexpected_token"
         ]
     );
 }

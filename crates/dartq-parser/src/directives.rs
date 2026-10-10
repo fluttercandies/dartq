@@ -592,22 +592,23 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     /// Official `ensureLiteralString` :5075: the next token must be a string
-    /// literal; otherwise report `expectedString` and parse a synthesized
-    /// empty string in its place (the offending token stays for the caller's
-    /// `;` recovery).
+    /// literal; otherwise report `expectedString` — the ONLY code this
+    /// recovery reports (oracle: `import 5;` carries no `unexpectedToken`
+    /// from the string read) — and splice a synthetic empty string in BEFORE
+    /// the offending token (`rewriteAndRecover` → `insertToken`,
+    /// token_stream_rewriter.dart:85 — the real token survives and belongs
+    /// to the next grammar position: a following `;` still terminates the
+    /// directive, a garbage token is the recovery boundary's or the
+    /// top-level continuation's own report), then parse the literal. The
+    /// queued synthetic is consumed by [`Self::parse_literal_string`] itself.
     pub(crate) fn ensure_literal_string(&mut self) -> TokenSpan {
         if self.peek_kind() != TokenKind::String {
             let at = self.peek_span();
             let lexeme = self.cursor.lexeme(at.id).to_owned();
-            // The 3.13 oracle surfaces both the shared-code expectedString
-            // and an unexpectedToken on the offending token.
-            self.report(msg::unexpected_token(&lexeme), at);
             self.report(msg::expected_string(&lexeme), at);
-            let id = self
+            let _ = self
                 .cursor
                 .insert_synthetic(TokenKind::String, at.range.offset);
-            self.cursor.advance();
-            let _ = id;
         }
         self.parse_literal_string()
     }
