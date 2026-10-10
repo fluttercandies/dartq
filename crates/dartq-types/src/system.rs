@@ -556,10 +556,13 @@ impl<'a> TypeSystem<'a> {
     }
 
     /// `asInstanceOf` over this-type and instantiated roots: the
-    /// instantiation of `from` viewed as an instance of `target`, walking
-    /// the supertype edges with live substitution — `None` when `target` is
-    /// not a supertype of `from`. Iterative with a visited set; claims a
-    /// pooled walk unit like [`TypeSystem::interface_subtype`].
+    /// instantiation of `from` viewed as an instance of `target` — the
+    /// receiver itself when the elements already match (the official
+    /// `asInstanceOf` answers with `this`, element.dart
+    /// `InterfaceTypeImpl.asInstanceOf`), else the walk over supertype
+    /// edges with live substitution — `None` when `target` is not a
+    /// supertype of `from`. Iterative with a visited set; claims a pooled
+    /// walk unit like [`TypeSystem::interface_subtype`].
     fn as_instance_of(&self, from: TypeId, target: TypeDeclId) -> Option<TypeId> {
         let TypeKind::Interface {
             decl: from_decl,
@@ -568,6 +571,9 @@ impl<'a> TypeSystem<'a> {
         else {
             return None;
         };
+        if from_decl == target {
+            return Some(from);
+        }
         let (mut visited, mut frontier) = match self.walk.try_borrow_mut() {
             Ok(mut scratch) => {
                 let mut unit = scratch.units.pop().unwrap_or_default();
@@ -1482,7 +1488,12 @@ mod can_be_subtype_tests {
     fn fixture() -> (TypeTable, TypeHierarchy) {
         let table = TypeTable::new();
         let (g, box_e) = (TypeParamId::from_raw(1), TypeParamId::from_raw(2));
-        let g_ty = table.intern(UninternedType::TypeParameter { parameter: g }, false);
+        // `class SubGA extends SealedG<int>`: a supertype edge may only
+        // reference its owner's own type parameters (hierarchy.rs
+        // `validate_edge`), so the concrete instantiation enters as the
+        // argument — the same shape the official `allSubtypes` scan collects
+        // (element.dart:183/:199).
+        let sub_g_a_edge = itf(&table, SEALED_G, &[itf(&table, INT, &[])]);
         let hierarchy = TypeHierarchy::builder(CoreDecls {
             object: OBJECT,
             future: FUTURE,
@@ -1511,7 +1522,7 @@ mod can_be_subtype_tests {
         .supertype(SUB_A, itf(&table, SEALED, &[]))
         .supertype(SUB_B, itf(&table, SEALED, &[]))
         .supertype(SEALED_G, itf(&table, OBJECT, &[]))
-        .supertype(SUB_G_A, itf(&table, SEALED_G, &[g_ty]))
+        .supertype(SUB_G_A, sub_g_a_edge)
         .supertype(ENUM, itf(&table, OBJECT, &[]))
         .supertype(OTHER, itf(&table, OBJECT, &[]))
         .supertype(BOX, itf(&table, OBJECT, &[]))
@@ -1695,10 +1706,12 @@ mod can_be_subtype_tests {
         assert!(sys.can_be_subtype_of(future_or_string, future_or_int));
     }
 
-    /// The load-bearing invariant: `isSubtypeOf(a, b) ⇒ canBeSubtypeOf(a, b)`
-    /// over every ordered pair of a corpus spanning all ten kinds. This is
-    /// what keeps "the cast/subtype check is unnecessary" and "the pattern
-    /// never matches" mutually exclusive.
+    /// The load-bearing invariant, over every ordered pair of a corpus
+    /// spanning all ten kinds: `isSubtypeOf(a, b) ⇒ canBeSubtypeOf(a, b)`
+    /// except in the official's own bottom/`Null` corner, pinned positively
+    /// below. This is what keeps "the cast/subtype check is unnecessary"
+    /// and "the pattern never matches" mutually exclusive on the pairs the
+    /// diagnostics see.
     #[test]
     fn mutual_exclusion_law_over_fixture_corpus() {
         let (table, hierarchy) = fixture();
@@ -1812,21 +1825,98 @@ mod can_be_subtype_tests {
             record,
             record_q,
         ];
+        // The official's own bottom/`Null` corner, pinned positively on
+        // both sides. Rule 3 Left Bottom (subtype.dart:299-301) answers
+        // `Never <: Null` with `true`, while canBeSubtypeOf's `Null` arm
+        // (type_system.dart:160-169) answers `leftIsNullable` =
+        // `isPotentiallyNullable(Never)` = `!isNonNullable(Never)` =
+        // `false` (type_system.dart:1260/:1883-1912 — `NeverTypeImpl`
+        // falls through every `isNonNullable` branch). The two relations
+        // legitimately disagree there and both WARNING codes co-fire; the
+        // sweep below carves exactly this shape out of the strict law.
+        let never = table.intern(UninternedType::Never, false);
+        let null = table.intern(UninternedType::Null, false);
+        assert!(sys.is_subtype(never, null));
+        assert!(!sys.can_be_subtype_of(never, null));
+
         for (i, &a) in corpus.iter().enumerate() {
             for &b in corpus.iter().skip(i) {
+                // `bottom(a) && null(b)` is the corner above — checked, not
+                // skipped: both of its official answers are pinned there.
+                let bottom_vs_null = |x: TypeId, y: TypeId| sys.is_bottom(x) && sys.is_null(y);
                 if sys.is_subtype(a, b) {
                     assert!(
-                        sys.can_be_subtype_of(a, b),
-                        "law violated: is_subtype({a:?}, {b:?}) but !can_be_subtype_of"
+                        bottom_vs_null(a, b) || sys.can_be_subtype_of(a, b),
+                        "law violated: is_subtype({}, {}) but !can_be_subtype_of (ids {a:?} / {b:?})",
+                        describe(&sys, a),
+                        describe(&sys, b)
                     );
                 }
                 if sys.is_subtype(b, a) {
                     assert!(
-                        sys.can_be_subtype_of(b, a),
-                        "law violated: is_subtype({b:?}, {a:?}) but !can_be_subtype_of"
+                        bottom_vs_null(b, a) || sys.can_be_subtype_of(b, a),
+                        "law violated: is_subtype({}, {}) but !can_be_subtype_of (ids {b:?} / {a:?})",
+                        describe(&sys, b),
+                        describe(&sys, a)
                     );
                 }
             }
+        }
+    }
+
+    /// Renders a corpus type for law-violation messages: fixture decl names
+    /// over the kind structure, with the `?` projection — so a failing pair
+    /// reads `FutureOr<int?>` instead of `TypeId(24)`.
+    fn describe(sys: &TypeSystem, id: TypeId) -> String {
+        let ty = sys.table().get(id);
+        let text = match ty.kind() {
+            TypeKind::Never => "Never".to_string(),
+            TypeKind::Null => "Null".to_string(),
+            TypeKind::Dynamic => "dynamic".to_string(),
+            TypeKind::Void => "void".to_string(),
+            TypeKind::Invalid => "Invalid".to_string(),
+            TypeKind::TypeParameter { .. } => "T".to_string(),
+            TypeKind::Function { .. } => "Fn".to_string(),
+            TypeKind::FutureOr { base } => format!("FutureOr<{}>", describe(sys, base)),
+            TypeKind::Record { shape } => {
+                format!(
+                    "Record(pos={})",
+                    sys.table().record_shape(shape).positional.len()
+                )
+            }
+            TypeKind::Interface { decl, args } => {
+                let name = match decl {
+                    OBJECT => "Object",
+                    FUTURE => "Future",
+                    FUNCTION => "Function",
+                    RECORD => "Record",
+                    NUM => "num",
+                    INT => "int",
+                    STRING => "String",
+                    SEALED => "Sealed",
+                    SUB_A => "SubA",
+                    SUB_B => "SubB",
+                    SEALED_G => "SealedG",
+                    SUB_G_A => "SubGA",
+                    ENUM => "Enum",
+                    OTHER => "Other",
+                    BOX => "Box",
+                    _ => "<decl>",
+                };
+                if args.is_empty() {
+                    name.to_string()
+                } else {
+                    let rendered: Vec<String> = (0..args.len())
+                        .map(|i| describe(sys, sys.table().arg(args.offset() + i)))
+                        .collect();
+                    format!("{name}<{}>", rendered.join(", "))
+                }
+            }
+        };
+        if ty.is_nullable() && !matches!(ty.kind(), TypeKind::Null) {
+            format!("{text}?")
+        } else {
+            text
         }
     }
 }
