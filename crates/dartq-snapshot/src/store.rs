@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_atime, set_file_mtime};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -20,7 +20,7 @@ pub const DEFAULT_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// How many saves may pass before the capacity scan runs regardless of the
 /// size estimate — the bound on how far the cheap estimate can drift from
-/// reality (and on how long stale entries survive between sweeps).
+/// reality.
 const ENFORCE_EVERY_SAVES: u32 = 32;
 
 /// The per-generation load-recency marker: one file touched once per load
@@ -60,14 +60,32 @@ pub enum SaveError {
     Json(#[from] serde_json::Error),
 }
 
-/// One loaded generation: the matched header, the remap slices, and every
-/// entry that survived integrity checks (corrupt entries are dropped, not
-/// reported).
+/// One loaded generation: the matched header, the remap slices, and the
+/// complete manifest-verified entry set. A missing, extra, or undecodable
+/// entry demotes the whole load to `None` — a returned `Snapshot` is
+/// always internally consistent, never a subset of a save.
 #[derive(Clone, Debug)]
 pub struct Snapshot<T> {
     pub header: GenerationHeader,
     pub tables: RemapTables,
     pub entries: Vec<Entry<T>>,
+}
+
+/// The write half of `tables.json`: the remap slices and the entry-id
+/// manifest in one atomic unit, so the pairing between a save's tables and
+/// its entry files cannot be torn apart by a crash — a manifest from one
+/// save never faces the entries of another.
+#[derive(Serialize)]
+struct TablesFile<'a> {
+    tables: &'a RemapTables,
+    entry_ids: &'a [[u8; 16]],
+}
+
+/// The read half of `tables.json`.
+#[derive(Deserialize)]
+struct StoredTables {
+    tables: RemapTables,
+    entry_ids: Vec<[u8; 16]>,
 }
 
 /// The persistent snapshot store under one cache root.
@@ -112,9 +130,13 @@ impl SnapshotStore {
         &self.root
     }
 
-    /// Loads the generation matching `expected`, or `None` on any mismatch
-    /// or damage to the header/remap tables. Entries that fail their
-    /// checksum or JSON decode are skipped individually.
+    /// Loads the generation matching `expected`, or `None` on any
+    /// mismatch, damage, or incompleteness: the header must equal
+    /// `expected`, `tables.json` must parse, the entries directory must
+    /// exist, and the set of entry files on disk must equal the entry-id
+    /// manifest inside `tables.json` exactly — a missing, extra, or
+    /// undecodable entry demotes the whole generation to a miss. There is
+    /// no partial `Some`.
     ///
     /// Entry order is deterministic (sorted by key id), and the load
     /// touches the generation's recency marker once, refreshing its access
@@ -126,48 +148,62 @@ impl SnapshotStore {
         if stored != *expected {
             return None;
         }
-        let tables: RemapTables = parse(&fs::read(generation.join("tables.json")).ok()?)?;
+        let stored_tables: StoredTables = parse(&fs::read(generation.join("tables.json")).ok()?)?;
+        let mut claimed = stored_tables.entry_ids;
+        claimed.sort_unstable();
 
-        let mut entries = Vec::new();
-        if let Ok(dir) = fs::read_dir(generation.join("entries")) {
-            for file in dir.flatten() {
-                let path = file.path();
-                if path.extension() != Some(std::ffi::OsStr::new("entry")) {
-                    continue;
-                }
-                let Ok(bytes) = fs::read(&path) else { continue };
-                let Some(decoded) = entry::decode::<T>(&bytes) else {
-                    continue;
-                };
-                entries.push(decoded);
-            }
+        // The entries directory must exist (a generation is its entries,
+        // even when the manifest is empty) and every decodable entry file
+        // must carry a claimed id.
+        let mut present: Vec<[u8; 16]> = Vec::with_capacity(claimed.len());
+        let mut entries = Vec::with_capacity(claimed.len());
+        for file in fs::read_dir(generation.join("entries")).ok()?.flatten() {
+            let Some(id) = entry_file_id(&file.path()) else {
+                continue;
+            };
+            let bytes = fs::read(file.path()).ok()?;
+            entries.push(entry::decode::<T>(&bytes)?);
+            present.push(id);
+        }
+        present.sort_unstable();
+        if present != claimed {
+            return None;
         }
         entries.sort_by_key(|entry| entry.key.id());
         touch_recency(&generation.join(RECENCY_MARKER));
         Some(Snapshot {
             header: stored,
-            tables,
+            tables: stored_tables.tables,
             entries,
         })
     }
 
-    /// Writes a generation: entries first, then remap tables, then the
-    /// header — a torn save leaves a headerless directory that loads as a
-    /// miss. Re-saving an existing generation overwrites files in place;
-    /// every file replacement is atomic.
+    /// Writes a generation: entries first, then the remap tables with the
+    /// entry-id manifest folded in (one atomic unit), then the header. The
+    /// manifest names exactly the entries passed to this call, so `load`
+    /// accepts the generation only when the directory holds precisely that
+    /// set — a torn or failed re-save leaves the previous manifest facing
+    /// extra files, which demotes the whole generation to a miss instead
+    /// of loading a mixture of two saves.
     ///
-    /// Capacity and staleness are throttled, not per-save: the bytes just
-    /// written accrue into a cheap estimate, and only when the estimate
-    /// crosses `capacity_bytes` or [`ENFORCE_EVERY_SAVES`] saves have
-    /// passed does the save pay for the full scan ([`Self::enforce_capacity`])
-    /// followed by sweeping this generation's stale entries (files of
-    /// content states no longer in the written set).
+    /// The save-shape contract (see the crate docs): a save claims the
+    /// *complete* entry set of the generation. Entry keys are a
+    /// deterministic function of their content, so re-saves whose entry
+    /// set only grows stay coherent; any other shape leaves the abandoned
+    /// files of earlier saves in place (there is no stale sweep — they die
+    /// with the generation under LRU) and the manifest gate demotes the
+    /// generation to a miss.
+    ///
+    /// Capacity is throttled, not per-save: the bytes just written accrue
+    /// into a cheap estimate, and only when the estimate crosses
+    /// `capacity_bytes` or [`ENFORCE_EVERY_SAVES`] saves have passed does
+    /// the save pay for the full scan ([`Self::enforce_capacity`]).
     ///
     /// # Errors
     ///
     /// A header claiming a foreign `format_version` (nothing is written),
-    /// or an IO/serialization failure (earlier files of the generation
-    /// remain valid).
+    /// or an IO/serialization failure: the generation then loads as the
+    /// last complete state, or as a miss — never as a mixture.
     pub fn save<T: Serialize>(
         &self,
         header: &GenerationHeader,
@@ -184,7 +220,7 @@ impl SnapshotStore {
         let entries_dir = generation.join("entries");
         fs::create_dir_all(&entries_dir)?;
         let mut written = 0u64;
-        let mut ids = Vec::with_capacity(entries.len());
+        let mut ids: Vec<[u8; 16]> = Vec::with_capacity(entries.len());
         for entry in entries {
             let id = entry.key.id();
             let framed = entry::encode(entry)?;
@@ -195,7 +231,9 @@ impl SnapshotStore {
             )?;
             ids.push(id);
         }
-        let encoded_tables = serde_json::to_vec(tables)?;
+        ids.sort_unstable();
+        ids.dedup();
+        let encoded_tables = serde_json::to_vec(&TablesFile { tables, entry_ids: &ids })?;
         written += encoded_tables.len() as u64;
         atomic_write(&generation.join("tables.json"), &encoded_tables)?;
         let encoded_header = serde_json::to_vec(header)?;
@@ -206,8 +244,6 @@ impl SnapshotStore {
         let saves = self.saves_since_enforce.fetch_add(1, Ordering::Relaxed) + 1;
         if estimate > self.capacity_bytes || saves >= ENFORCE_EVERY_SAVES {
             self.enforce_capacity();
-            ids.sort_unstable();
-            sweep_stale_entries(&entries_dir, &ids);
         }
         Ok(())
     }
@@ -263,6 +299,21 @@ fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     serde_json::from_slice(bytes).ok()
 }
 
+/// The entry id named by `path` — `<32 hex>.entry`, the exact shape `save`
+/// writes — or `None` for anything else. Unparseable names (a crashed
+/// writer's temp file, planted junk) are never entries and never fatal.
+#[must_use]
+fn entry_file_id(path: &Path) -> Option<[u8; 16]> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".entry")?;
+    if stem.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    hex::decode_to_slice(stem, &mut id).ok()?;
+    Some(id)
+}
+
 /// Creates (or reuses) the generation's recency marker and bumps its
 /// atime/mtime, so the LRU sweep sees the hit even on noatime mounts — one
 /// touched file per load, not two utimes per entry. Errors are irrelevant:
@@ -294,37 +345,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     written
-}
-
-/// Removes entry files whose ids are not in the sorted `ids` set — the
-/// stale content states earlier saves of this generation left behind. One
-/// `read_dir`, no per-name allocation (the hex id decodes into a stack
-/// array). Temp and junk names never parse as entries and are left to
-/// [`dir_stats`]'s temp sweep or untouched. Best-effort: a failed removal
-/// keeps a valid-but-unmatched entry, which loads skip anyway.
-fn sweep_stale_entries(entries_dir: &Path, ids: &[[u8; 16]]) {
-    let Ok(dir) = fs::read_dir(entries_dir) else {
-        return;
-    };
-    for file in dir.flatten() {
-        let file_name = file.file_name();
-        let Some(stem) = file_name.to_str() else {
-            continue;
-        };
-        let Some(stem) = stem.strip_suffix(".entry") else {
-            continue;
-        };
-        if stem.len() != 32 {
-            continue;
-        }
-        let mut id = [0u8; 16];
-        if hex::decode_to_slice(stem, &mut id).is_err() {
-            continue;
-        }
-        if ids.binary_search(&id).is_err() {
-            let _ = fs::remove_file(file.path());
-        }
-    }
 }
 
 /// `$XDG_CACHE_HOME/dartiq`, or `$HOME/.cache/dartiq` when unset, empty, or

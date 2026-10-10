@@ -9,7 +9,12 @@ use crate::blake3_128;
 /// breaking change to the container itself (e.g. a bincode switch); entry
 /// payload semantics live in [`GenerationHeader::semantic_version`], which
 /// the caller supplies.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// v2 folds the entry-id manifest into `tables.json` (one atomic unit
+/// with the remap slices). No on-disk back-compat is provided or needed:
+/// nothing consumes the format yet — the daemon's `save_generation` is
+/// unwired and the load-side wiring (#341) designs against this contract.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Identity of one snapshot generation (PRD §5.5, §5.6). A loaded
 /// generation is used only when every field equals what the caller

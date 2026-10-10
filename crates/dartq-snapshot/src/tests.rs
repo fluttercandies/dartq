@@ -113,6 +113,31 @@ fn save_one_entry(cache: &TempCache) -> GenerationHeader {
     header
 }
 
+/// `save_one_entry` plus a growing re-save: the generation claims both
+/// keys and stays coherent — an entry set that only grows across re-saves
+/// matches each new manifest exactly.
+fn save_two_entries(cache: &TempCache) -> GenerationHeader {
+    let header = save_one_entry(cache);
+    cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .save(
+            &header,
+            &tables(),
+            &[
+                Entry {
+                    key: key(1, 10),
+                    payload: payload("main"),
+                },
+                Entry {
+                    key: key(2, 10),
+                    payload: payload("other"),
+                },
+            ],
+        )
+        .expect("save sibling");
+    header
+}
+
 fn assert_generation_miss(mutate: fn(&mut GenerationHeader)) {
     let cache = TempCache::new("mismatch");
     save_one_entry(&cache);
@@ -232,22 +257,12 @@ fn generation_misses_on_package_graph_mismatch() {
     assert_generation_miss(|h| h.package_graph_fingerprint = [9; 16]);
 }
 
+/// A single corrupt entry demotes the whole generation: a manifest-named
+/// entry that fails its checksum is a mismatch, never a smaller `Some`.
 #[test]
-fn corrupt_entry_is_skipped_but_siblings_load() {
+fn corrupt_entry_demotes_the_generation() {
     let cache = TempCache::new("corrupt-entry");
-    let header = save_one_entry(&cache);
-    cache
-        .store(DEFAULT_CAPACITY_BYTES)
-        .save(
-            &header,
-            &tables(),
-            &[Entry {
-                key: key(2, 10),
-                payload: payload("other"),
-            }],
-        )
-        .expect("save sibling");
-
+    let header = save_two_entries(&cache);
     let victim =
         entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(1, 10).id())));
     let mut bytes = fs::read(&victim).expect("read entry");
@@ -255,41 +270,31 @@ fn corrupt_entry_is_skipped_but_siblings_load() {
     bytes[last] ^= 0xFF;
     fs::write(&victim, &bytes).expect("corrupt entry");
 
-    let snapshot = cache
-        .store(DEFAULT_CAPACITY_BYTES)
-        .load::<TestPayload>(&header)
-        .expect("generation");
-    assert_eq!(snapshot.entries.len(), 1);
-    assert_eq!(snapshot.entries[0].key, key(2, 10));
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none()
+    );
 }
 
+/// Truncation is corruption to the frame checksum: the same whole-generation
+/// demotion.
 #[test]
-fn truncated_entry_is_skipped_but_siblings_load() {
+fn truncated_entry_demotes_the_generation() {
     let cache = TempCache::new("truncated-entry");
-    let header = save_one_entry(&cache);
-    cache
-        .store(DEFAULT_CAPACITY_BYTES)
-        .save(
-            &header,
-            &tables(),
-            &[Entry {
-                key: key(2, 10),
-                payload: payload("other"),
-            }],
-        )
-        .expect("save sibling");
-
+    let header = save_two_entries(&cache);
     let victim =
         entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(1, 10).id())));
     let bytes = fs::read(&victim).expect("read entry");
     fs::write(&victim, &bytes[..bytes.len() / 2]).expect("truncate entry");
 
-    let snapshot = cache
-        .store(DEFAULT_CAPACITY_BYTES)
-        .load::<TestPayload>(&header)
-        .expect("generation");
-    assert_eq!(snapshot.entries.len(), 1);
-    assert_eq!(snapshot.entries[0].key, key(2, 10));
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none()
+    );
 }
 
 #[test]
@@ -493,73 +498,149 @@ fn symlink_cycle_terminates_the_capacity_scan() {
     );
 }
 
-/// The throttle: ordinary saves never scan — the stale entries a re-save
-/// orphans linger until the byte estimate crosses capacity (or the save
-/// counter forces) an enforce, at which point the sweep aligns the
-/// generation's entry files with the just-written set.
+/// The union-of-saves semantic is gone: entry files that exist outside the
+/// manifest — a torn re-save's new entry, or the residue of a re-save
+/// whose set changed — demote the generation to a strict miss, and nothing
+/// ever sweeps the residue away. Abandoned files die with the generation
+/// under LRU.
 #[test]
-fn save_throttles_the_stale_sweep_until_enforce() {
-    let cache = TempCache::new("throttle");
-    let header = test_header();
+fn partial_resave_is_a_strict_miss_never_a_union() {
+    let cache = TempCache::new("partial-resave");
+    let header = save_two_entries(&cache);
     let store = cache.store(DEFAULT_CAPACITY_BYTES);
-    store
-        .save(
-            &header,
-            &tables(),
-            &[
-                Entry {
-                    key: key(1, 10),
-                    payload: payload("a"),
-                },
-                Entry {
-                    key: key(2, 10),
-                    payload: payload("b"),
-                },
-            ],
-        )
-        .expect("save");
-    store
-        .save(
-            &header,
-            &tables(),
-            &[Entry {
-                key: key(3, 10),
-                payload: payload("c"),
-            }],
-        )
-        .expect("resave");
-
-    // Two saves, tiny estimate: below the throttle nothing scanned.
     let dir = entries_dir(&cache.path, &header);
     let entry_file = |k: u8| dir.join(format!("{}.entry", hex::encode(key(k, 10).id())));
+
+    // Torn re-save: v3's entry file lands, its manifest write never does.
+    let v3 = Entry {
+        key: key(3, 10),
+        payload: payload("v3"),
+    };
+    fs::write(
+        entry_file(3),
+        crate::entry::encode(&v3).expect("encode v3"),
+    )
+    .expect("plant torn entry");
     assert!(
-        entry_file(1).exists() && entry_file(2).exists(),
-        "no scan before the throttle fires"
+        store.load::<TestPayload>(&header).is_none(),
+        "an entry outside the manifest is a miss"
     );
 
-    // A store whose first save already sits over capacity enforces — and
-    // sweeps — immediately. The just-saved generation is the newest and is
-    // never evicted, so the sweep finds its entries dir in place.
-    let store = cache.store(1);
+    // Completed re-save with a changed set: the manifest claims {3} while
+    // the directory holds {1, 2, 3} — a miss, not a union.
     store
+        .save(&header, &tables(), &[v3])
+        .expect("subset re-save succeeds");
+    assert!(
+        store.load::<TestPayload>(&header).is_none(),
+        "residue files demote the changed-set re-save"
+    );
+    for k in [1u8, 2, 3] {
+        assert!(entry_file(k).exists(), "residue is never swept: {k}");
+    }
+}
+
+/// An entry file missing from the claimed set — the eviction-vs-loader
+/// race outcome — demotes the whole generation.
+#[test]
+fn missing_entry_demotes_the_generation() {
+    let cache = TempCache::new("missing-entry");
+    let header = save_two_entries(&cache);
+    let victim =
+        entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(2, 10).id())));
+    fs::remove_file(&victim).expect("remove entry");
+
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none()
+    );
+}
+
+/// The entries directory itself is part of the claim: even an empty
+/// manifest requires its (empty) directory, so an eviction that raced a
+/// saver cannot leave a valid-looking empty generation behind.
+#[test]
+fn missing_entries_directory_demotes_even_an_empty_generation() {
+    let cache = TempCache::new("no-entries-dir");
+    let header = test_header();
+    cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .save::<TestPayload>(&header, &tables(), &[])
+        .expect("save");
+    fs::remove_dir_all(entries_dir(&cache.path, &header)).expect("remove entries dir");
+
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none()
+    );
+}
+
+/// An eviction racing a loader used to yield a partial `Some`; under the
+/// manifest gate even a perfectly valid entry file outside the claimed
+/// set demotes the whole generation.
+#[test]
+fn extra_entry_demotes_the_generation() {
+    let cache = TempCache::new("extra-entry");
+    let header = save_one_entry(&cache);
+    let outsider = Entry {
+        key: key(9, 10),
+        payload: payload("planted"),
+    };
+    fs::write(
+        entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(9, 10).id()))),
+        crate::entry::encode(&outsider).expect("encode outsider"),
+    )
+    .expect("plant valid entry");
+
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none()
+    );
+}
+
+/// F1's plain-IO-error window: a re-save that fails at the tables write
+/// (its entries already replaced claimed files) leaves the previous
+/// coherent generation loadable — same manifest, same file set — never a
+/// mixture of unreadable halves.
+#[test]
+fn failed_tables_write_keeps_the_last_coherent_generation() {
+    let cache = TempCache::new("failed-tables");
+    let header = save_two_entries(&cache);
+    let generation = gen_dir(&cache.path, &header);
+
+    // Block the tables write: a directory where tables.json must go.
+    fs::remove_file(generation.join("tables.json")).expect("remove tables");
+    fs::create_dir(generation.join("tables.json")).expect("block tables path");
+
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let error = store
         .save(
             &header,
             &tables(),
             &[Entry {
-                key: key(4, 10),
-                payload: payload("d"),
+                key: key(1, 10),
+                payload: payload("v2"),
             }],
         )
-        .expect("save over capacity");
-    assert!(
-        !entry_file(1).exists() && !entry_file(2).exists(),
-        "stale swept"
-    );
-    assert!(
-        !entry_file(3).exists(),
-        "the sweep aligns entries with the written set, not with history"
-    );
-    assert!(entry_file(4).exists(), "the written entry survives");
+        .expect_err("tables write fails");
+    assert!(matches!(error, SaveError::Io(_)));
+
+    fs::remove_dir(generation.join("tables.json")).expect("unblock tables path");
+    let snapshot = store.load::<TestPayload>(&header).expect("coherent v1");
+    assert_eq!(snapshot.entries.len(), 2);
+    let main = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key(1, 10))
+        .expect("claimed entry");
+    assert_eq!(main.payload.unit, "v2", "the overwritten entry is the re-save's");
+    assert!(snapshot.entries.iter().any(|entry| entry.key == key(2, 10)));
 }
 
 /// Recency beats fitting: the newest generation is never evicted, even
@@ -604,13 +685,19 @@ fn enforce_never_evicts_the_newest_generation() {
     }
 
     // Capacity smaller than either generation alone: A goes whole, B stays
-    // even though the store remains over capacity.
+    // even though the store remains over capacity. The survivor is intact
+    // under the manifest gate — eviction never half-deletes a generation.
     cache.store(1).enforce_capacity();
     assert!(!gen_dir(&cache.path, &header_a).exists(), "older evicted");
     assert!(
         gen_dir(&cache.path, &header_b).exists(),
         "the newest generation survives over capacity"
     );
+    let survivor = cache
+        .store(1)
+        .load::<TestPayload>(&header_b)
+        .expect("survivor loads whole");
+    assert_eq!(survivor.entries.len(), 1);
 }
 
 /// The enforce walk sweeps leaked temp files anywhere under the cache —
