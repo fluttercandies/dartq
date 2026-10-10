@@ -95,6 +95,21 @@ const C8_PN1: &str = "part of p8;\nint g() => 3;\n";
 const C9_C: &str = "import 'b.dart';\nint h() => g();\n";
 const C9_A_RENAMED: &str = "int f2() => 1;\n";
 
+// C10/C11 — membership-change seeds (audit P0: part detach / claim
+// transfer). Both edit one file yet move a member BETWEEN libraries, so the
+// losing/gaining sides carry no signature of their own.
+const C10_M: &str = "import 'n.dart';\nint v = f() + g();\n";
+const C10_N: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
+const C10_P9: &str = "library p9;\npart 'pn.dart';\nint h() => 2;\n";
+const C10_PN0: &str = "part of p8;\nint g() => 1;\n";
+const C10_PN1: &str = "part of p9;\nint g() => 1;\n";
+
+const C11_M: &str = "import 'n2.dart';\nint v = h() + g();\n";
+const C11_N1_0: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
+const C11_N1_1: &str = "library p10;\npart 'pn.dart';\nint f() => 1;\n";
+const C11_N2: &str = "library p8;\npart 'pn.dart';\nint h() => 2;\n";
+const C11_PN: &str = "part of p8;\nint g() => 1;\n";
+
 /// One manifest batch entry: `Some(bytes)` = `set_content`, `None` =
 /// `remove_file` (incremental-oracle-cases §1.1).
 type Batch = &'static [(&'static str, Option<&'static str>)];
@@ -1116,6 +1131,80 @@ fn c9_signature_rename_cascades_through_clean_middles() {
     run_case(&CASE_C9);
 }
 
+/// C10 — part detach (audit P0 hole 1): pn edits its own `part of` from p8
+/// to p9, moving itself from n's library to p9's. pn is the only changed
+/// file, but the LOSING library n is identity-stale with identity-clean
+/// importers: m keeps its cached "g() defined" view of n's namespace while a
+/// full recompute reports `undefined_function` — the pre-fix silent
+/// divergence. The membership seeds (pre-reform owner capture in `apply` +
+/// the owner diff in `close`) must seed n so m recomputes.
+static CASE_C10: Case = Case {
+    id: "C10",
+    initial: &[
+        ("lib/m.dart", C10_M),
+        ("lib/n.dart", C10_N),
+        ("lib/p9.dart", C10_P9),
+        ("lib/pn.dart", C10_PN0),
+    ],
+    steps: &[Step {
+        batch: &[("lib/pn.dart", Some(C10_PN1))],
+        changed: &["lib/pn.dart"],
+        removed: &[],
+        invalidated: &["lib/m.dart", "lib/n.dart", "lib/p9.dart"],
+    }],
+    absolute: Absolute::Explicit(&[
+        // Baseline: m sees f() (n) and g() (pn through n) — clean.
+        &[],
+        // n's namespace drops g with pn; m's stale view must recompute.
+        &[("undefined_function", "lib/m.dart")],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+#[test]
+fn c10_part_detach_seeds_losing_library_importers() {
+    run_case(&CASE_C10);
+}
+
+/// C11 — claim transfer (audit P0 hole 2): n1 and n2 both declare `library
+/// p8;` with a `part 'pn.dart';` directive; pn's claim goes to n1 (smallest
+/// defining URI). Renaming n1's directive away hands pn to n2 — pn's bytes
+/// are unchanged (no signature) and n2's own files are unchanged, so the
+/// pre-fix seeds never reach n2 and its importer m keeps the pre-transfer
+/// `undefined_function` for pn's g(). The part-target identity flip in
+/// `close` is the only signal that seeds n2.
+static CASE_C11: Case = Case {
+    id: "C11",
+    initial: &[
+        ("lib/m.dart", C11_M),
+        ("lib/n1.dart", C11_N1_0),
+        ("lib/n2.dart", C11_N2),
+        ("lib/pn.dart", C11_PN),
+    ],
+    steps: &[Step {
+        batch: &[("lib/n1.dart", Some(C11_N1_1))],
+        changed: &["lib/n1.dart"],
+        removed: &[],
+        invalidated: &["lib/m.dart", "lib/n1.dart", "lib/n2.dart"],
+    }],
+    absolute: Absolute::Explicit(&[
+        // Baseline: pn belongs to n1, so m's g() (through n2) is undefined.
+        &[("undefined_function", "lib/m.dart")],
+        // The transfer heals m: n2's namespace now carries pn's g().
+        &[],
+    ]),
+    stable_bytes: &[],
+    mode_b: false,
+    order_pin: None,
+};
+
+#[test]
+fn c11_claim_transfer_seeds_gaining_library_importers() {
+    run_case(&CASE_C11);
+}
+
 /// `part 'b.dart';` whose target is a plain library: the target belongs to
 /// neither membership nor the dep set, so its residency flip is visible only
 /// through the part-target staleness identity. Removing it must dirty the
@@ -1192,5 +1281,54 @@ fn unclaimed_part_target_removal_matches_full_recompute() {
         machine_bytes(&engine, &diagnostics),
         full_arm_bytes(&fixture, &state),
         "A1 re-add step"
+    );
+}
+
+/// Adjacent-string URI concatenation (audit P1, coverage P3.7c): the
+/// directive URI is the concatenation of adjacent string literals —
+/// `import 'a' '.dart';` resolves `a.dart` — so the resolver must see the
+/// joined value, not the prefix. Unlike the dual-arm cases this defect is
+/// arm-symmetric (a full recompute mis-resolves identically), so the sharp
+/// assertion is direct: every concatenated form resolves against real files
+/// and the whole workspace is diagnostic-free. Covers all three `read_uri`
+/// consumers: `import` (main), `part` (host), `part of` URI-form (p).
+/// Pre-fix this fails with `uri_does_not_exist` on the prefixes (`'a'`,
+/// `'p'`, `'host'`) and m's `undefined_function` for the unclaimed part's
+/// `w()`.
+#[test]
+fn adjacent_string_uri_concatenates_before_resolution() {
+    const MAIN: &str = "import 'a' '.dart';\nint v = t();\n";
+    const HOST: &str = "part 'p' '.dart';\nint u() => 3;\n";
+    const P: &str = "part of 'host' '.dart';\nint w() => 4;\n";
+    const A: &str = "int t() => 1;\n";
+    const M: &str = "import 'host.dart';\nint x = u() + w();\n";
+    let initial = [
+        ("lib/a.dart", A),
+        ("lib/host.dart", HOST),
+        ("lib/m.dart", M),
+        ("lib/main.dart", MAIN),
+        ("lib/p.dart", P),
+    ];
+    let fixture = Fixture::new(&initial);
+    let state: BTreeMap<String, String> = initial
+        .iter()
+        .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+        .collect();
+    let mut engine = fixture.engine();
+    for (path, source) in initial {
+        engine.set_content(&fixture.path(path), source.as_bytes());
+    }
+    engine.apply_pending(&mut |_| {});
+    let mut log = RawLog::default();
+    let diagnostics = analyze_all(&fixture, &mut engine, &state, &mut log);
+    assert!(
+        diagnostics.is_empty(),
+        "concatenated URIs resolve cleanly: {:?}",
+        absolute_set(&fixture, &engine, &diagnostics)
+    );
+    assert_eq!(
+        machine_bytes(&engine, &diagnostics),
+        full_arm_bytes(&fixture, &state),
+        "A1 adjacent-string baseline"
     );
 }

@@ -147,15 +147,25 @@ pub(crate) fn apply(
     // analyze unwraps every queued id's info.
     //
     // The closure is signature-gated (L2, PRD §11.3): seeds are the owners of
-    // signature-changed files and the (still live) former owners of removed
-    // files; everything else stays clean unless its own identity moved. The
-    // removed files' pre-reform owners are captured before reform rebuilds
-    // `library_of_file`.
+    // signature-changed files, the (still live) former owners of removed
+    // files, and both live owners of any changed file whose membership moved;
+    // everything else stays clean unless its own identity moved. The
+    // pre-reform owners are captured before reform rebuilds
+    // `library_of_file` — after the rebuild only the *new* owner of a changed
+    // file is reachable, which is the detach hole (a `part of` edit strands
+    // the losing library's importers on stale facts) and the transfer hole
+    // (a claimant renaming away hands its part to a competitor library that
+    // no seed reaches).
     let removed_owners: Vec<Option<LibraryId>> = removed
         .iter()
         .map(|file| state.library_of_file.get(file).copied())
         .collect();
-    let (invalidated, retired_any) = reform_and_close(state, &sig_changed, &removed_owners);
+    let changed_pre_owners: Vec<(FileId, Option<LibraryId>)> = changed
+        .iter()
+        .map(|(file, _, _)| (*file, state.library_of_file.get(file).copied()))
+        .collect();
+    let (invalidated, retired_any) =
+        reform_and_close(state, &sig_changed, &changed_pre_owners, &removed_owners);
     state.invalidated = invalidated.clone();
     // The resolution graph rebuilds only when its inputs moved: a
     // signature-bearing face (element or directive), a removal, or a library
@@ -791,10 +801,16 @@ fn walk_library(
     end
 }
 
-/// Reads the URI literal starting at `i`, handling the interpolation split
-/// (a `String` segment followed by an interpolation token carries no
-/// resolvable string). Returns the uri text, its UTF-16 span, and the index
-/// just past the literal region.
+/// Reads the URI literal starting at `i`. Adjacent string literals
+/// concatenate into one URI (`import 'li' 'b/a.dart';` resolves `lib/a.dart`).
+/// The oracle's assembly is the directive uri's `StringLiteral.stringValue`
+/// (file_state.dart:1017,1147): `AdjacentStringsImpl._appendStringValue`
+/// concatenates the per-segment values, each segment decoding its own
+/// raw/cooked body (ast.dart:195-200), and any interpolation segment makes
+/// the whole literal shapeless (`StringInterpolationImpl._appendStringValue`
+/// throws → `null`, ast.dart:51023). Returns the uri text, its UTF-16 span
+/// (the whole adjacent region; zero when shapeless), and the index just past
+/// the literal region.
 fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, SourceRange, usize) {
     let interpolated = |kind: Option<TokenKind>| {
         matches!(
@@ -814,10 +830,33 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
             i,
         );
     }
-    if interpolated(kind_at(tokens, i + 1)) {
+    // Concatenate the run of adjacent plain `String` segments. An
+    // undecodable segment (malformed escape) leaves the region shapeless —
+    // under-report, never a false positive.
+    let mut j = i;
+    let mut value = String::new();
+    let mut decodable = true;
+    let span_offset = tokens.get(i).expect("kind_at checked").utf16_offset;
+    // Always overwritten by the first iteration (segment `i` is a `String`).
+    let mut span_end = span_offset;
+    loop {
+        match kind_at(tokens, j) {
+            Some(TokenKind::String) => {
+                let lexeme = tokens.lexeme(text, j);
+                let token = tokens.get(j).expect("kind_at checked");
+                span_end = token.utf16_offset + utf16_len_of(lexeme);
+                match string_literal_value(lexeme) {
+                    Some(segment) => value.push_str(&segment),
+                    None => decodable = false,
+                }
+                j += 1;
+            }
+            _ => break,
+        }
+    }
+    if interpolated(kind_at(tokens, j)) {
         // Skip the whole segment chain: `String` pieces and `${ … }` groups
         // (group-aware, so a `;` inside the interpolation cannot mislead).
-        let mut j = i;
         loop {
             match kind_at(tokens, j) {
                 Some(TokenKind::String | TokenKind::StringInterpolationIdentifier) => j += 1,
@@ -836,13 +875,11 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
             j,
         );
     }
-    let token = tokens.get(i).expect("kind_at checked");
-    let lexeme = tokens.lexeme(text, i);
     let span = SourceRange {
-        offset: token.utf16_offset,
-        length: utf16_len_of(lexeme),
+        offset: span_offset,
+        length: span_end - span_offset,
     };
-    (string_literal_value(lexeme).map(Into::into), span, i + 1)
+    (decodable.then(|| value.into_boxed_str()), span, j)
 }
 
 /// `import`/`export`: uri, `[deferred] [as p]` (import shapes only in
@@ -1083,10 +1120,11 @@ fn unescape(body: &str) -> Option<String> {
 fn reform_and_close(
     state: &mut EngineState,
     sig_changed: &[FileId],
+    changed_pre_owners: &[(FileId, Option<LibraryId>)],
     removed_owners: &[Option<LibraryId>],
 ) -> (Vec<LibraryId>, bool) {
     let retired_any = reform_libraries(state);
-    let invalidated = close(state, sig_changed, removed_owners);
+    let invalidated = close(state, sig_changed, changed_pre_owners, removed_owners);
     (invalidated, retired_any)
 }
 
@@ -1338,8 +1376,11 @@ fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
 
 /// The post-closure dirty set (§3.2 step 5, L2-refined per PRD §11.3):
 /// libraries with no cached result or changed identity, plus the importer
-/// closure fanned out **only from the signature-gated seeds** — the owners
-/// of `sig_changed` files and the live former owners of removed files. From
+/// closure fanned out **only from the propagation seeds** — the owners of
+/// `sig_changed` files, both live owners of a changed file whose membership
+/// moved (the pre-reform owner is the losing side of a `part of` detach),
+/// libraries whose part-target identity moved (a claim flip between
+/// competitor libraries), and the live former owners of removed files. From
 /// a seed the closure passes unconditionally through every importer (the
 /// re-export chain D←L←M: M's face moves, L re-exports it unchanged, D must
 /// still recompute); a library that is only identity-stale (a body edit
@@ -1349,9 +1390,12 @@ fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
 fn close(
     state: &mut EngineState,
     sig_changed: &[FileId],
+    changed_pre_owners: &[(FileId, Option<LibraryId>)],
     removed_owners: &[Option<LibraryId>],
 ) -> Vec<LibraryId> {
     let mut dirty: FxHashSet<LibraryId> = FxHashSet::default();
+    let mut queued: FxHashSet<LibraryId> = FxHashSet::default();
+    let mut work: Vec<LibraryId> = Vec::new();
     for lib in state.libraries.live() {
         let info = state.libraries.info(lib).expect("live library has info");
         let stale = match state.results.get(&lib) {
@@ -1365,21 +1409,46 @@ fn close(
         if stale {
             dirty.insert(lib);
         }
+        // Membership-change seed (transfer shape): the part-target identity
+        // moves exactly when a resolved `part` target flipped claim state or
+        // residency. The gaining library's own files are unchanged and the
+        // moved member carries no signature, so no other seed reaches it —
+        // yet its namespace changed, and its identity-clean importers would
+        // keep stale facts.
+        if let Some(result) = state.results.get(&lib)
+            && result.part_targets != info.part_targets
+            && queued.insert(lib)
+        {
+            work.push(lib);
+        }
     }
-    // Signature-gated propagation seeds. Both categories are identity-stale
-    // by construction (a signature move implies a content move; a removed
-    // member implies a membership move), so the identity pass above already
+    // Signature-gated propagation seeds. All categories are identity-stale
+    // by construction (a signature move implies a content move; a membership
+    // move implies an identity move), so the identity pass above already
     // invalidated them — seeding only starts the fan-out, deduplicated by
     // `queued` so each library propagates once. Retired owners are skipped:
     // their importers went stale through the dropped dependency instead.
-    let mut queued: FxHashSet<LibraryId> = FxHashSet::default();
-    let mut work: Vec<LibraryId> = Vec::new();
     for file in sig_changed {
         if let Some(&lib) = state.library_of_file.get(file)
             && state.libraries.info(lib).is_some()
             && queued.insert(lib)
         {
             work.push(lib);
+        }
+    }
+    // Membership-change seed (detach shape): a changed file whose owner
+    // differs between the pre- and post-reform membership maps moved between
+    // libraries. The losing owner is identity-stale (it dropped a member)
+    // but identity-clean importers ride its seed; the winning owner is
+    // usually already seeded through its member's own signature move.
+    for (file, pre_owner) in changed_pre_owners {
+        let post_owner = state.library_of_file.get(file).copied();
+        if post_owner != *pre_owner {
+            for owner in [*pre_owner, post_owner].into_iter().flatten() {
+                if state.libraries.info(owner).is_some() && queued.insert(owner) {
+                    work.push(owner);
+                }
+            }
         }
     }
     for owner in removed_owners.iter().flatten().copied() {
