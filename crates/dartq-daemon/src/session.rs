@@ -1014,6 +1014,14 @@ impl Session {
             .get_or_insert_with(|| PluginHosts::launch(&self.workspace_root))
     }
 
+    /// Replaces the session's plugin set (test seam): lets a gate inject a
+    /// crafted set — e.g. an already-dead plugin — without going through
+    /// the launch path's real child processes. Call before the first drain.
+    #[cfg(test)]
+    fn inject_plugins(&mut self, set: PluginSet) {
+        self.plugins = set;
+    }
+
     /// The generation save (#309, #306): one
     /// [`dartq_snapshot::GenerationHeader`] plus per-file fact entries per
     /// context, through the engine's own flush face
@@ -1248,8 +1256,17 @@ impl Session {
                     .filter_map(|(diagnostic, converted)| {
                         converted.clone().map(|row| (diagnostic.file, row))
                     });
-            turn.publishes
-                .extend(self.plan_publishes(plugins::merge(engine_rows, plugin_findings)));
+            let merged = plugins::merge(engine_rows, plugin_findings);
+            // The crash row is one-shot: it rides this push but never the
+            // published-state baseline (no engine row carries the code, so
+            // the code constant is an exact marker), or every later clean
+            // cycle would republish the file to reconcile it away.
+            let retained: Vec<_> = merged
+                .iter()
+                .filter(|(_, row)| row.code != dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name)
+                .cloned()
+                .collect();
+            turn.publishes.extend(self.plan_publishes(merged, retained));
         }
         // dartq/analyze answers keep the CLI analyze face's printed order
         // (severity-first before writing; the shared key lives in
@@ -1574,11 +1591,30 @@ impl Session {
     /// set — engine rows plus the cycle's plugin findings, already merged
     /// and deduplicated ([`plugins::merge`]). Order is by URI, so the push
     /// sequence is deterministic.
-    fn plan_publishes(&mut self, merged: Vec<(FileId, lsp::Diagnostic)>) -> Vec<Publish> {
+    /// Plans the publish pushes for one base analysis: diffs the merged
+    /// rows against the published-state baseline and emits one push per
+    /// changed file (plus baseline files whose rows vanished entirely).
+    ///
+    /// `retained` is the state future cycles reproduce — recorded as the
+    /// new baseline. It differs from `merged` exactly on one-shot rows
+    /// (the plugin crash row): those ride the push but never the baseline,
+    /// so the next clean cycle diffs quiet against the retained state
+    /// instead of reconciling the one-shot row away (which would
+    /// republish the file forever after).
+    fn plan_publishes(
+        &mut self,
+        merged: Vec<(FileId, lsp::Diagnostic)>,
+        retained: Vec<(FileId, lsp::Diagnostic)>,
+    ) -> Vec<Publish> {
         let mut current: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>> =
             FxHashMap::default();
         for (file, diagnostic) in merged {
             current.entry(file).or_default().push(diagnostic);
+        }
+        let mut record: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>> =
+            FxHashMap::default();
+        for (file, diagnostic) in retained {
+            record.entry(file).or_default().push(diagnostic);
         }
         // Reconsider every diagnosed file plus every baseline file whose
         // diagnostics vanished entirely.
@@ -1609,7 +1645,11 @@ impl Session {
                 continue;
             };
             let path = path.to_path_buf();
-            self.published.insert(file, now.clone());
+            let baseline = match record.entry(file) {
+                Entry::Occupied(occupied) => occupied.remove(),
+                Entry::Vacant(_) => Vec::new(),
+            };
+            self.published.insert(file, baseline);
             publishes.push(Publish {
                 uri: uri::from_path(&path),
                 version: self.opened.get(&path).copied(),
@@ -3214,20 +3254,6 @@ mod tests {
         (workspace, session, pool, root)
     }
 
-    /// The rows of an analyze answer.
-    fn rows(answer: &Result<serde_json::Value, SessionError>) -> Vec<serde_json::Value> {
-        answer.as_ref().expect("analyze answers")["diagnostics"]
-            .as_array()
-            .expect("diagnostics array")
-            .clone()
-    }
-
-    /// Whether the rows mention `suffix` (a file's uri tail).
-    fn mentions(rows: &[serde_json::Value], suffix: &str) -> bool {
-        rows.iter()
-            .any(|row| row["uri"].as_str().is_some_and(|uri| uri.ends_with(suffix)))
-    }
-
     /// Requests route by `context` tag: the default context resolves the
     /// conditional import's heavy branch, the declared-variable fork
     /// resolves light — each answer comes from its own engine, over one
@@ -3396,29 +3422,23 @@ mod tests {
         assert_ne!(warm.route(Some("t")), warm.default_context);
     }
 
-    /// The plugin weave (#471 phase B): a plugin whose spawn fails (the
-    /// entrypoint does not exist) is recorded at assembly; the crash row
-    /// withholds until the session has an anchor (a published file), then
-    /// publishes once — merged after the engine rows — and never repeats.
+    /// The plugin weave (#471 phase B): a dead plugin is recorded at
+    /// assembly; the crash row withholds until the session has an anchor
+    /// (a published file), then publishes once — merged after the engine
+    /// rows — and never repeats. The dead set is injected rather than
+    /// reached through a manifest on disk: a missing-entrypoint manifest is
+    /// *skipped* at discovery (never spawn-failed), and a spawnable one
+    /// needs a real child process — both pinned by plugins.rs's own tests.
+    /// This gate pins the session side of the weave.
     #[test]
     fn a_failing_plugin_surfaces_its_crash_row_on_the_base_publish() {
-        let workspace = Workspace::new(BROKEN_MAIN);
-        // The broken manifest lands before assembly: launch discovers it,
-        // the spawn fails (no such entrypoint), and the set records the
-        // crash for the first anchored cycle.
-        let dir = workspace.path("plugins/dead");
-        fs::create_dir_all(&dir).expect("plugin dir");
-        fs::write(
-            dir.join("dartq_plugin.json"),
-            r#"{"name": "dead", "version": "0.1.0", "entrypoint": "missing.dart"}"#,
-        )
-        .expect("manifest");
-        let store = SnapshotStore::open(SnapshotConfig {
-            root: Some(store_root("plugin-crash-unit")),
-            capacity_bytes: DEFAULT_CAPACITY_BYTES,
-        })
-        .expect("store opens on a temp root");
-        let mut session = Session::with_store(workspace.engine_config(), store).expect("session");
+        let (_workspace, mut session) = fixture("plugin-crash-unit");
+        // The broken plugin lands before the first drain: its spawn failure
+        // is already recorded, awaiting the first anchored cycle.
+        session.inject_plugins(PluginSet::with_dead_plugin(
+            "dead",
+            "restart budget of 3 exhausted",
+        ));
 
         session.sweep().expect("sweep");
         let turn = session.service();

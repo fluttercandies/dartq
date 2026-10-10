@@ -716,7 +716,12 @@ mod tests {
     /// saves without any further frame (#347): the bounded receive pays off.
     /// The deadline save also leaves the sink clean, so the session-end
     /// flush is a no-op.
+    ///
+    /// Serial phase like the other real-time gates: the window is wall-clock
+    /// and the flush tally is process-global, so a parallel test flushing
+    /// its own session inside the window would pollute the count.
     #[test]
+    #[ignore = "serial phase: real-time debounce window over a process-global probe"]
     fn idle_server_flushes_at_the_deadline_without_frames() {
         let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
         let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));

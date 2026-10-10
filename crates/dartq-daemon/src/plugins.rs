@@ -134,6 +134,30 @@ impl PluginSet {
         self.plugins.is_empty()
     }
 
+    /// A set carrying one already-dead plugin: `runtime: None` with a
+    /// recorded failure awaiting an anchor, exactly what `launch` produces
+    /// when a spawn fails. Test seam for the session-side weave — reaching
+    /// the same state through the launch path needs a real child process
+    /// (and a manifest whose entrypoint exists; missing-entrypoint
+    /// manifests are *skipped*, never spawned-failed, so a session gate
+    /// cannot conjure a crash from them deterministically). The crash-row
+    /// generation itself is pinned by this module's tests; the session's
+    /// gate pins the weave: anchor resolution, convert-once inclusion,
+    /// merge order, once-per-session suppression.
+    #[cfg(test)]
+    pub(crate) fn with_dead_plugin(name: &str, reason: &str) -> Self {
+        Self {
+            plugins: vec![PluginSlot {
+                name: name.to_owned(),
+                runtime: None,
+                pending_crash: Some(Box::new(RuntimeError::Crashed {
+                    reason: reason.to_owned(),
+                })),
+                crash_emitted: false,
+            }],
+        }
+    }
+
     /// One analyze cycle against the plugins: feeds the engine's merged
     /// diagnostic set (the lints included by the caller), waits
     /// [`DRAIN_BUDGET`] per live plugin for findings, and returns both.

@@ -111,20 +111,32 @@ pub use watch::WatchOptions;
 pub(crate) mod probe {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-
-    /// Diagnostic conversions this process performed (one per diagnostic
-    /// per read task — a second call site would double it).
-    static CONVERSIONS: AtomicUsize = AtomicUsize::new(0);
-    /// Snapshot-sink saves attempted (the idle deadline wake shows up here).
-    static FLUSHES: AtomicUsize = AtomicUsize::new(0);
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     thread_local! {
+        /// Diagnostic conversions this thread performed (one per diagnostic
+        /// per read task — a second call site would double it). Thread-local
+        /// on purpose: every test drives its session synchronously on its
+        /// own harness thread, so a process-global tally would be inflated
+        /// by concurrent tests converting between a reset and its assert.
+        static CONVERSIONS: Cell<usize> = const { Cell::new(0) };
+        /// One-shot panic trigger for the containment test (a real engine
+        /// panic cannot be conjured deterministically from RPC input).
+        /// Thread-local so a parallel test's read group cannot steal an
+        /// armed trigger between `arm` and the owner's own turn.
+        static READ_PANIC: Cell<bool> = const { Cell::new(false) };
         /// Only the measuring test's thread counts, so concurrent tests on
         /// other threads (parallel harnesses) never pollute the numbers.
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static BULK_BYTES: Cell<usize> = const { Cell::new(0) };
     }
+
+    /// Snapshot-sink saves attempted (the idle deadline wake shows up here).
+    /// Deliberately process-global: the idle-flush test reads it from its
+    /// harness thread while its server thread performs the saves, so a
+    /// thread-local tally would be invisible. That test is a serial-phase
+    /// gate (real-time window), where no concurrent test can pollute it.
+    static FLUSHES: AtomicUsize = AtomicUsize::new(0);
 
     /// Allocations at or above this size are bulk (whole-file texts);
     /// diagnostic- and JSON-sized traffic stays orders of magnitude below.
@@ -167,7 +179,7 @@ pub(crate) mod probe {
     static ALLOCATOR: ProbeAllocator = ProbeAllocator;
 
     pub(crate) fn count_conversion() {
-        CONVERSIONS.fetch_add(1, Relaxed);
+        CONVERSIONS.with(|count| count.set(count.get() + 1));
     }
 
     pub(crate) fn count_flush() {
@@ -187,26 +199,23 @@ pub(crate) mod probe {
         BULK_BYTES.with(Cell::take)
     }
 
-    /// The counters since the last reset, for the measuring test's window.
+    /// The counters since the last reset, for the measuring test's window:
+    /// conversions counted on the calling thread, flushes process-wide.
     pub(crate) fn counters() -> (usize, usize) {
-        (CONVERSIONS.load(Relaxed), FLUSHES.load(Relaxed))
+        (CONVERSIONS.with(Cell::get), FLUSHES.load(Relaxed))
     }
 
     pub(crate) fn reset_counters() {
-        CONVERSIONS.store(0, Relaxed);
+        CONVERSIONS.with(|count| count.set(0));
         FLUSHES.store(0, Relaxed);
     }
 
-    /// One-shot panic trigger for the containment test (a real engine panic
-    /// cannot be conjured deterministically from RPC input).
-    static READ_PANIC: AtomicBool = AtomicBool::new(false);
-
     /// Arms the next read group's execution to panic once.
     pub(crate) fn arm_read_panic() {
-        READ_PANIC.store(true, Relaxed);
+        READ_PANIC.with(|armed| armed.set(true));
     }
 
     pub(crate) fn take_read_panic() -> bool {
-        READ_PANIC.swap(false, Relaxed)
+        READ_PANIC.with(|armed| armed.replace(false))
     }
 }
