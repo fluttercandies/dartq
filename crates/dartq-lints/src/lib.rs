@@ -30,7 +30,7 @@
 //! `pkg/linter/lib/src/rules/` and its message template in
 //! `pkg/linter/lib/src/diagnostic.g.dart`.
 //!
-//! Implemented (68):
+//! Implemented (72):
 //! - wave 1 (18): `avoid_empty_else`, `camel_case_extensions`,
 //!   `camel_case_types`, `curly_braces_in_flow_control_structures`,
 //!   `empty_catches`, `prefer_typing_uninitialized_variables` (core);
@@ -99,9 +99,21 @@
 //!   equality for the initializing-formal conversion, and a syntax shadow
 //!   index for the `this.` scope question. Each rule module spells out its
 //!   over/under-report faces.
+//! - release-gate seam tranche (4, #435): `secure_pubspec_urls` (core);
+//!   `package_names`, `implementation_imports`, `exhaustive_cases`
+//!   (recommended). Each official verdict leans on facts the [`Unit`]
+//!   substrate does not carry — pubspec data, the analyzing library's
+//!   package identity, element-model constant values — so the body is
+//!   ported as a pure function over an explicit input face (the
+//!   documented seam), and the engine wiring belongs to the mounting
+//!   ticket #434: the pubspec pair share the `rules::pubspec` data seam,
+//!   `implementation_imports` takes (own package name, resolved import
+//!   URI), and `exhaustive_cases` takes the enum-like candidate plus the
+//!   switch members. Registry rows keep name/group/count alignment with
+//!   `kinds: &[]`; the traversal never dispatches them.
 //!
 //! With this tranche every `package:lints` member has a terminal state:
-//! implemented (68), or documented-blocked with the exact resolution fact it
+//! implemented (72), or documented-blocked with the exact resolution fact it
 //! waits for (below).
 //!
 //! # Documented-blocked members, with the blocker
@@ -129,19 +141,17 @@
 //!   renamed-parameter overrides unreported), `overridden_fields`,
 //!   `avoid_renaming_method_parameters`,
 //!   `use_super_parameters` (super-constructor parameter correspondence).
-//! - **Scope resolution beyond the file**: `implementation_imports` needs
-//!   the analyzed file's own package identity (`package_config`) — the
-//!   import URI's `package:*/src/` face is visible, the same-package
-//!   comparison is not.
-//! - **Non-Dart artifacts**: `depend_on_referenced_packages` and
-//!   `secure_pubspec_urls` / `package_names` read the pubspec and the
-//!   package graph.
+//! - **Scope resolution beyond the file**: `package_config` package
+//!   identity remains the one scope face the [`Unit`] lacks;
+//!   `implementation_imports` (the only rule waiting on it) ships its
+//!   predicate over the seam above.
+//! - **Non-Dart artifacts**: `depend_on_referenced_packages` reads the
+//!   pubspec and the package graph (the pubspec value face itself is the
+//!   `rules::pubspec` seam, shared with the mounted `secure_pubspec_urls` /
+//!   `package_names`).
 //! - **Flow analysis (#278)**: `prefer_final_fields` (mutation analysis
 //!   across member bodies; a per-unit write scan over-reports on fields
 //!   mutated in a sibling part file).
-//! - **Enum + constant evaluation**: `exhaustive_cases` (enum value
-//!   enumeration for switch exhaustiveness; the scrutinee's static type
-//!   picks the enum, which a same-file-only approximation cannot).
 //!
 //! (The pre-#353 notes naming `unnecessary_getters_setters` and
 //! `unnecessary_const` were re-audited and ported in that tranche;

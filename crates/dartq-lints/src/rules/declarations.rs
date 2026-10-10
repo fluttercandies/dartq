@@ -1222,9 +1222,11 @@ pub(crate) mod prefer_initializing_formals {
         if let Some(initializers) = initializers {
             ref_roots.push(initializers);
         }
-        if let Some(body) = kids.iter().copied().find(|&kid| {
-            matches!(c.kind(kid), NodeKind::Block | NodeKind::BlockBody)
-        }) {
+        if let Some(body) = kids
+            .iter()
+            .copied()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::Block | NodeKind::BlockBody))
+        {
             ref_roots.push(body);
             face_body(c, body, &mut candidates);
         }
@@ -1417,12 +1419,10 @@ pub(crate) mod prefer_initializing_formals {
             if field_name.starts_with('_') {
                 continue; // private_named_parameters is off
             }
-            let Some(&(_, param_type)) = params.iter().find(|(name, _)| *name == param_name)
-            else {
+            let Some(&(_, param_type)) = params.iter().find(|(name, _)| *name == param_name) else {
                 continue;
             };
-            let Some(&(_, field_type)) = fields.iter().find(|(name, _)| *name == field_name)
-            else {
+            let Some(&(_, field_type)) = fields.iter().find(|(name, _)| *name == field_name) else {
                 continue;
             };
             let (Some(param_type), Some(field_type)) = (param_type, field_type) else {

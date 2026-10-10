@@ -165,12 +165,12 @@ fn registry_fits_the_enable_set_word_count() {
 }
 
 /// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3,
-/// 12 #353-completion and 4 #315-wave-3 rules make 68 registered — every
-/// `package:lints` member is either here or documented-blocked in the crate
-/// docs.
+/// 12 #353-completion, 4 #315-wave-3 and 4 #435-release-gate-seam rules make
+/// 72 registered — every `package:lints` member is either here or
+/// documented-blocked in the crate docs.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 68);
+    assert_eq!(RULES.len(), 72);
 }
 
 #[test]

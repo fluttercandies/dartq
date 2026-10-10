@@ -513,6 +513,168 @@ pub(crate) mod provide_deprecation_message {
     }
 }
 
+pub(crate) mod implementation_imports {
+    //! Official: `pkg/linter/lib/src/rules/implementation_imports.dart` —
+    //! an import whose resolved URI is a `package:<other>/src/…`
+    //! implementation path (`Uri.isImplementation`,
+    //! `pkg/analyzer/lib/utilities/extensions/uri.dart:8-11`) of a package
+    //! other than the analyzing library's own (`isSamePackageAs`,
+    //! uri.dart:15-21) reports at the import's URI node (:44-56).
+    //!
+    //! Seam posture (documented): the verdict needs the analyzing library's
+    //! own package identity — the official `context.libraryElement?.uri`
+    //! (:30-34), resolved through the package config. [`Unit`][crate::Unit]
+    //! carries the file path only, so a mounted AST dispatch could not tell
+    //! the legal same-package `src/` imports from foreign ones (over-reports
+    //! valid code). The body below is the pure predicate over (own package
+    //! name, resolved import URI); the registry row keeps name/group
+    //! alignment with `kinds: &[]`, and #434 mounts it with the
+    //! package-identity face.
+    //!
+    //! The seam body is dead until #434 wires it (`kinds: &[]` keeps the
+    //! traversal from dispatching) — the allow below is the seam, not debt.
+    #![allow(dead_code)]
+
+    use super::{Group, RuleSpec};
+    use crate::rules::not_dispatched;
+
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "implementation_imports",
+        group: Group::Recommended,
+        problem: "Import of a library in the 'lib/src' directory of another package.",
+        correction: "Try importing a public library that exports this library, or removing the import.",
+        kinds: &[],
+        check: not_dispatched,
+    };
+
+    /// The official `visitImportDirective` verdict (:44-56) over one
+    /// import: `true` reports at the URI node. `own_package` is the first
+    /// path segment of the analyzing library's `package:` URI (its package
+    /// name); `uri` is the import's resolved URI (the official
+    /// `importedLibrary.source.uri` — a `package:` or `file:` form, not
+    /// the written string).
+    #[must_use]
+    pub fn check_import(own_package: &str, uri: &str) -> bool {
+        uri_is_implementation(uri) && !uri_is_same_package_as(own_package, uri)
+    }
+
+    /// `Uri.isImplementation` (uri.dart:8-11):
+    /// `(isScheme('package') || !hasAbsolutePath) && >2 path segments &&
+    /// segments[1] == 'src'`.
+    #[must_use]
+    pub fn uri_is_implementation(uri: &str) -> bool {
+        let (scheme, path) = scheme_and_path(uri);
+        if !scheme.eq_ignore_ascii_case("package") && path.starts_with('/') {
+            return false;
+        }
+        let segments: Vec<&str> = path.split('/').collect();
+        segments.len() > 2 && segments[1] == "src"
+    }
+
+    /// `Uri.isSamePackageAs` (uri.dart:15-21) with the source URI reduced
+    /// to its package name: both sides `package:` URIs with a non-empty
+    /// segment list and equal first segments.
+    #[must_use]
+    pub fn uri_is_same_package_as(own_package: &str, uri: &str) -> bool {
+        let (scheme, path) = scheme_and_path(uri);
+        scheme.eq_ignore_ascii_case("package")
+            // `pathSegments.isNotEmpty`: a `package:` URI always yields at
+            // least one segment (the empty path's `[""]`).
+            && path.split('/').next() == Some(own_package)
+    }
+
+    /// The scheme and path of a URI string (the `Uri.tryParse` +
+    /// `.scheme`/`.path` face): the RFC 3986 scheme prefix (empty when
+    /// absent; returned as written — the call sites compare
+    /// ASCII-case-insensitively, covering Dart's lowercase scheme
+    /// normalization), and the remainder with any `?query`/`#fragment`
+    /// stripped. Segmenting mirrors `pathSegments`: `'/'`-split, leading
+    /// empty segment on absolute paths, trailing empty on a trailing
+    /// slash.
+    fn scheme_and_path(uri: &str) -> (&str, &str) {
+        let b = uri.as_bytes();
+        let mut scheme_end = 0;
+        if !b.is_empty() && b[0].is_ascii_alphabetic() {
+            let mut i = 1;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'+' | b'-' | b'.'))
+            {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b':' {
+                scheme_end = i;
+            }
+        }
+        let rest = &uri[scheme_end..];
+        let rest = rest.strip_prefix(':').unwrap_or(rest);
+        // `Uri.path` excludes the query and fragment.
+        let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
+        let scheme = if scheme_end > 0 {
+            &uri[..scheme_end]
+        } else {
+            ""
+        };
+        (scheme, &rest[..path_end])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The official `test_differentPackage_src`.
+        #[test]
+        fn other_package_src_reports() {
+            assert!(check_import("test", "package:foo/src/foo.dart"));
+        }
+
+        /// `test_samePackage_src` — own-package `src/` imports are legal.
+        #[test]
+        fn own_package_src_is_silent() {
+            assert!(!check_import("foo", "package:foo/src/foo.dart"));
+        }
+
+        /// `test_differentPackage_lib` — public libraries never report.
+        #[test]
+        fn public_library_is_silent() {
+            assert!(!check_import("test", "package:foo/foo.dart"));
+        }
+
+        /// A resolved `file:` URI has an absolute path — the
+        /// `!hasAbsolutePath` arm of `isImplementation` fails.
+        #[test]
+        fn resolved_file_uris_are_silent() {
+            assert!(!check_import("test", "file:///pkg/lib/src/foo.dart"));
+        }
+
+        /// `isImplementation` needs more than two path segments.
+        #[test]
+        fn segment_count_gates() {
+            assert!(!check_import("test", "package:foo/src"));
+            // A trailing slash yields a final empty segment
+            // (`Uri.pathSegments`, uri.dart:4700-4715), so the gate holds —
+            // such a URI stays silent only because it never resolves to a
+            // source (the official `DirectiveUriWithSource` guard is the
+            // mounter's premise, not the predicate's).
+            assert!(check_import("test", "package:foo/src/"));
+            assert!(check_import("test", "package:foo/src/a.dart"));
+        }
+
+        /// The `Uri.path` face strips query and fragment before
+        /// segmentation.
+        #[test]
+        fn query_and_fragment_strip() {
+            assert!(check_import("test", "package:foo/src/a.dart?x=1#f"));
+        }
+
+        #[test]
+        fn same_package_predicate_needs_the_package_scheme() {
+            assert!(uri_is_same_package_as("foo", "package:foo/src/a.dart"));
+            assert!(!uri_is_same_package_as("foo", "package:bar/src/a.dart"));
+            assert!(!uri_is_same_package_as("foo", "file:///x/lib/src/a.dart"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::engine::Features;

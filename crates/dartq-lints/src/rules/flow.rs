@@ -558,6 +558,355 @@ pub(crate) mod type_literal_in_constant_pattern {
     }
 }
 
+pub(crate) mod exhaustive_cases {
+    //! Official: `pkg/linter/lib/src/rules/exhaustive_cases.dart` +
+    //! `asEnumLikeType` (`pkg/linter/lib/src/extensions.dart:604-647`) — a
+    //! switch over an enum-like type (a concrete, unsubclassed class or an
+    //! extension type, with only private generative constructors and at
+    //! least two `static const` fields of the type) must cover every
+    //! constant value or carry a `default`. Each case head whose constant
+    //! resolves to a value removes it (:49-74); a `default` member ends the
+    //! whole check silent (:75-77); every remaining value then reports once
+    //! — at the statement head through the scrutinee's `)` — spelled with
+    //! the group's preferred (first non-deprecated) name (:80-93). Real
+    //! enums never enter (the element walk's default arm — the analyzer's
+    //! own exhaustiveness errors cover them).
+    //!
+    //! Seam posture (documented): the scrutinee's static type and the
+    //! constants' computed values are element-model facts
+    //! [`Unit`][crate::Unit] does not carry, so the body runs over the
+    //! declarative face below — the enum-like gate is ported inside, and
+    //! the mounter (the wiring ticket, #434) supplies the facts. The
+    //! registry row keeps name/group alignment with `kinds: &[]`.
+    //!
+    //! The seam body is dead until #434 wires it (`kinds: &[]` keeps the
+    //! traversal from dispatching) — the allow below is the seam, not debt.
+    #![allow(dead_code)]
+
+    use super::{Group, RuleSpec};
+    use crate::rules::not_dispatched;
+
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "exhaustive_cases",
+        group: Group::Recommended,
+        problem: "Missing case clauses for some constants in '{0}'.",
+        correction: "Try adding case clauses for the missing constants.",
+        kinds: &[],
+        check: not_dispatched,
+    };
+
+    /// One `static const` field of the candidate type (the official field
+    /// walk, extensions.dart:627-642).
+    pub struct ConstantField<'a> {
+        pub name: &'a str,
+        /// `field.isConst && field.isStatic`.
+        pub is_static_const: bool,
+        /// The field's type is the enclosing type (the
+        /// `field.type != thisType` skip).
+        pub of_this_type: bool,
+        /// `metadata.hasDeprecated` — aliases are reported last.
+        pub deprecated: bool,
+        /// The computed constant-value identity; aliasing fields
+        /// (`static const b = a`) share the id, `None` when the value is
+        /// not computable (the `fieldValue == null` skip).
+        pub value: Option<u32>,
+    }
+
+    /// The candidate type face — `asEnumLikeType`'s inputs
+    /// (extensions.dart:604-647).
+    pub struct EnumLikeCandidate<'a> {
+        /// An extension type (`ExtensionTypeElement`) is always
+        /// enum-like-eligible; a class must additionally pass the two
+        /// class-only gates below.
+        pub is_extension_type: bool,
+        /// Class only: `element.isAbstract`.
+        pub is_abstract: bool,
+        /// Class only: a subclass exists in the defining compilation unit
+        /// (`_hasSubclassInDefiningCompilationUnit`).
+        pub has_subclass_in_defining_unit: bool,
+        /// Every constructor as `(is_private, is_generative)` — all must
+        /// hold (:620).
+        pub constructors: &'a [(bool, bool)],
+        /// The type's fields, declaration order (:627); the enumeration
+        /// applies the official `isOriginGetterSetter` skip (getter/setter
+        /// pseudo-fields are not fields and never enter the face).
+        pub constants: &'a [ConstantField<'a>],
+    }
+
+    /// One switch member's face (the official member walk,
+    /// exhaustive_cases.dart:49-77).
+    pub struct SwitchMember {
+        /// `default:` — ends the whole check silent (:75-77).
+        pub is_default: bool,
+        /// The constant value the head covers: a constant-pattern /
+        /// legacy-case head whose expression resolves to one of the type's
+        /// constant values (the `Identifier` / `PropertyAccess` /
+        /// `DotShorthandPropertyAccess` faces all resolve through
+        /// `computeConstantValue`). `None` — other patterns, foreign
+        /// constants, unresolved heads — covers nothing.
+        pub covers: Option<u32>,
+    }
+
+    /// The official verdict: the missing values' preferred names, in field
+    /// declaration order — the mounter renders each into the template at
+    /// the statement span (statement head through the scrutinee's `)`,
+    /// :80-93). Empty when the type is not enum-like or a `default` is
+    /// present.
+    #[must_use]
+    pub fn check_switch<'a>(
+        candidate: &'a EnumLikeCandidate<'a>,
+        members: &[SwitchMember],
+    ) -> Vec<&'a str> {
+        if !candidate.is_extension_type
+            && (candidate.is_abstract || candidate.has_subclass_in_defining_unit)
+        {
+            return Vec::new();
+        }
+        if !candidate
+            .constructors
+            .iter()
+            .all(|&(is_private, is_generative)| is_private && is_generative)
+        {
+            return Vec::new();
+        }
+        // The constant groups in declaration order, keyed by value id
+        // (extensions.dart:626-642). Constant counts are tiny — linear
+        // grouping beats a map.
+        let mut groups: Vec<(u32, Vec<&'a ConstantField<'a>>)> = Vec::new();
+        let mut value_count = 0;
+        for field in candidate.constants {
+            if !field.is_static_const || !field.of_this_type {
+                continue;
+            }
+            let Some(value) = field.value else {
+                continue;
+            };
+            value_count += 1;
+            match groups.iter_mut().find(|(id, _)| *id == value) {
+                Some((_, group)) => group.push(field),
+                None => groups.push((value, vec![field])),
+            }
+        }
+        // The two-constant minimum counts fields, not values (:640) — a
+        // `static const b = a` pair is enum-like with one group.
+        if value_count < 2 {
+            return Vec::new();
+        }
+        let mut covered: Vec<u32> = Vec::new();
+        for member in members {
+            if member.is_default {
+                return Vec::new();
+            }
+            if let Some(value) = member.covers.filter(|value| !covered.contains(value)) {
+                covered.push(value);
+            }
+        }
+        groups
+            .iter()
+            .filter(|(value, _)| !covered.contains(value))
+            .map(|(_, group)| preferred_name(group))
+            .collect()
+    }
+
+    /// The group's reporting name (:84-88): the first non-deprecated
+    /// member, else the first.
+    fn preferred_name<'a>(group: &[&'a ConstantField<'a>]) -> &'a str {
+        group
+            .iter()
+            .find(|field| !field.deprecated)
+            .unwrap_or(&group[0])
+            .name
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const PRIVATE_GENERATIVE: (bool, bool) = (true, true);
+
+        fn candidate<'a>(
+            constructors: &'a [(bool, bool)],
+            constants: &'a [ConstantField<'a>],
+        ) -> EnumLikeCandidate<'a> {
+            EnumLikeCandidate {
+                is_extension_type: false,
+                is_abstract: false,
+                has_subclass_in_defining_unit: false,
+                constructors,
+                constants,
+            }
+        }
+
+        fn const_field(name: &str, value: Option<u32>) -> ConstantField<'_> {
+            ConstantField {
+                name,
+                is_static_const: true,
+                of_this_type: true,
+                deprecated: false,
+                value,
+            }
+        }
+
+        fn member(covers: Option<u32>) -> SwitchMember {
+            SwitchMember {
+                is_default: false,
+                covers,
+            }
+        }
+
+        /// The official `test_class_enumLike_allCases` face — every value
+        /// covered, silent.
+        #[test]
+        fn fully_covered_switch_is_silent() {
+            let ctors = [PRIVATE_GENERATIVE];
+            let fields = [
+                const_field("e", Some(0)),
+                const_field("f", Some(1)),
+                const_field("g", Some(2)),
+            ];
+            let members = [member(Some(0)), member(Some(1)), member(Some(2))];
+            assert!(check_switch(&candidate(&ctors, &fields), &members).is_empty());
+        }
+
+        /// The official `test_class_enumLike_missingCase` — the uncovered
+        /// value reports with its name.
+        #[test]
+        fn missing_value_reports_the_name() {
+            let ctors = [PRIVATE_GENERATIVE];
+            let fields = [
+                const_field("e", Some(0)),
+                const_field("f", Some(1)),
+                const_field("g", Some(2)),
+            ];
+            let members = [member(Some(0)), member(Some(1))];
+            assert_eq!(check_switch(&candidate(&ctors, &fields), &members), ["g"]);
+        }
+
+        /// The official `test_class_enumLike_withDefault` — a `default`
+        /// silences the whole check even with values missing (:75-77).
+        #[test]
+        fn default_silences() {
+            let ctors = [PRIVATE_GENERATIVE];
+            let fields = [
+                const_field("e", Some(0)),
+                const_field("f", Some(1)),
+                const_field("g", Some(2)),
+            ];
+            let members = [
+                member(Some(0)),
+                SwitchMember {
+                    is_default: true,
+                    covers: None,
+                },
+            ];
+            assert!(check_switch(&candidate(&ctors, &fields), &members).is_empty());
+        }
+
+        /// A non-constant / foreign / unresolved head covers nothing (the
+        /// official `enumConstants.remove` misses) — missing values report
+        /// in declaration order.
+        #[test]
+        fn foreign_head_covers_nothing() {
+            let ctors = [PRIVATE_GENERATIVE];
+            let fields = [
+                const_field("e", Some(0)),
+                const_field("f", Some(1)),
+                const_field("g", Some(2)),
+            ];
+            let members = [member(Some(0)), member(None)];
+            assert_eq!(
+                check_switch(&candidate(&ctors, &fields), &members),
+                ["f", "g"]
+            );
+        }
+
+        /// The official `test_class_enumLike_deprecatedAliases` — aliases
+        /// share a value id; covering either alias covers the value, and a
+        /// missing alias group reports the first non-deprecated name.
+        #[test]
+        fn alias_group_prefers_the_live_name() {
+            let ctors = [PRIVATE_GENERATIVE];
+            let fields = [
+                const_field("newFoo", Some(0)),
+                ConstantField {
+                    deprecated: true,
+                    ..const_field("oldFoo", Some(0))
+                },
+                const_field("bar", Some(1)),
+                const_field("baz", Some(2)),
+            ];
+            // newFoo + bar + baz covers everything (the deprecated alias
+            // never reports).
+            let all = [member(Some(0)), member(Some(1)), member(Some(2))];
+            assert!(check_switch(&candidate(&ctors, &fields), &all).is_empty());
+            // bar + baz leaves the alias group; the live name reports.
+            let partial = [member(Some(1)), member(Some(2))];
+            assert_eq!(
+                check_switch(&candidate(&ctors, &fields), &partial),
+                ["newFoo"]
+            );
+        }
+
+        /// The enum-like gate (extensions.dart:604-647): public or
+        /// non-generative constructors, an abstract class, a subclass in
+        /// the defining unit, or fewer than two value-carrying
+        /// `static const` fields of the type all stay silent.
+        #[test]
+        fn gate_rejections() {
+            let fields = [const_field("e", Some(0)), const_field("f", Some(1))];
+            let members = [member(Some(0))];
+            // A public constructor.
+            let public = [(false, true)];
+            assert!(check_switch(&candidate(&public, &fields), &members).is_empty());
+            // A non-generative constructor (a factory).
+            let factory = [(true, false)];
+            assert!(check_switch(&candidate(&factory, &fields), &members).is_empty());
+            // Abstract, or subclassed in the defining unit.
+            let mut abstract_candidate = candidate(&[PRIVATE_GENERATIVE], &fields);
+            abstract_candidate.is_abstract = true;
+            assert!(check_switch(&abstract_candidate, &members).is_empty());
+            let mut subclassed = candidate(&[PRIVATE_GENERATIVE], &fields);
+            subclassed.has_subclass_in_defining_unit = true;
+            assert!(check_switch(&subclassed, &members).is_empty());
+            // One constant only (the official
+            // `test_class_notEnumLike_singleConstant`).
+            let single = [const_field("e", Some(0))];
+            assert!(check_switch(&candidate(&[PRIVATE_GENERATIVE], &single), &members).is_empty());
+            // Non-const / foreign-typed / non-computable fields do not
+            // count toward the minimum.
+            let uncounted = [
+                ConstantField {
+                    is_static_const: false,
+                    ..const_field("e", Some(0))
+                },
+                ConstantField {
+                    of_this_type: false,
+                    ..const_field("f", Some(1))
+                },
+                const_field("g", None),
+            ];
+            let two = [member(Some(0)), member(Some(1))];
+            assert!(check_switch(&candidate(&[PRIVATE_GENERATIVE], &uncounted), &two).is_empty());
+        }
+
+        /// Extension types skip the class-only gates (the official
+        /// `test_extensionType_*` family); duplicate values count fields,
+        /// not groups, toward the minimum (:640).
+        #[test]
+        fn extension_types_and_aliased_pairs() {
+            let fields = [const_field("a", Some(0)), const_field("b", Some(0))];
+            let mut ext = candidate(&[PRIVATE_GENERATIVE], &fields);
+            ext.is_extension_type = true;
+            assert_eq!(check_switch(&ext, &[]), ["a"]);
+            // As a class, the same shape passes the gates too (two fields).
+            assert_eq!(
+                check_switch(&candidate(&[PRIVATE_GENERATIVE], &fields), &[]),
+                ["a"]
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;

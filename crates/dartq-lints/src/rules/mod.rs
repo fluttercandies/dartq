@@ -17,12 +17,22 @@ pub(crate) mod empty;
 pub(crate) mod expressions;
 pub(crate) mod flow;
 pub(crate) mod names;
+pub(crate) mod pubspec;
 pub(crate) mod strings;
 pub(crate) mod types;
 
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
+
+/// The check of a seam-mounted rule: its body is the official verdict as a
+/// pure function over facts [`Unit`] does not carry (pubspec data, package
+/// identity, element-model constant values), so the traversal never
+/// dispatches it — the [`RuleSpec`] sits in [`crate::RULES`] for
+/// name/group/count alignment with `kinds: &[]`, and the mounting ticket
+/// (#434) owns the wiring. See `rules::pubspec` and the per-rule
+/// seam-posture notes.
+pub(crate) fn not_dispatched(_check: &mut Check<'_>) {}
 
 /// First direct child of `id`, if any. A child's subtree occupies
 /// `[children(child).start, child]` (a childless child's subtree is the

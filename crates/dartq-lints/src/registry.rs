@@ -69,9 +69,9 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the #315 wave-3 tranche. Order is registry order
-/// ([`RuleId`] assignment), grouped core-first then alphabetically within
-/// each group — keep the pin test in `tests/registry_pin.rs` in sync.
+/// All rules through the #435 release-gate seam tranche. Order is registry
+/// order ([`RuleId`] assignment), grouped core-first then alphabetically
+/// within each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
@@ -94,6 +94,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::collections::prefer_iterable_where_type::SPEC,
     &crate::rules::declarations::prefer_typing_uninitialized_variables::SPEC,
     &crate::rules::directives::provide_deprecation_message::SPEC,
+    &crate::rules::pubspec::secure_pubspec_urls::SPEC,
     &crate::rules::flow::type_literal_in_constant_pattern::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
@@ -107,11 +108,14 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::flow::control_flow_in_finally::SPEC,
     &crate::rules::empty::empty_constructor_bodies::SPEC,
     &crate::rules::empty::empty_statements::SPEC,
+    &crate::rules::flow::exhaustive_cases::SPEC,
+    &crate::rules::directives::implementation_imports::SPEC,
     &crate::rules::directives::library_prefixes::SPEC,
     &crate::rules::types::library_private_types_in_public_api::SPEC,
     &crate::rules::directives::no_leading_underscores_for_library_prefixes::SPEC,
     &crate::rules::names::no_leading_underscores_for_local_identifiers::SPEC,
     &crate::rules::expressions::null_closures::SPEC,
+    &crate::rules::pubspec::package_names::SPEC,
     &crate::rules::expressions::prefer_adjacent_string_concatenation::SPEC,
     &crate::rules::collections::prefer_collection_literals::SPEC,
     &crate::rules::expressions::prefer_conditional_assignment::SPEC,

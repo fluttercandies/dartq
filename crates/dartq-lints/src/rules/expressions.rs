@@ -1229,16 +1229,13 @@ pub(crate) mod null_closures {
         let slots: Option<Slots> = if chain.len() == 1 {
             CONSTRUCTORS
                 .iter()
-                .find(|entry| entry.0 .0 == member_name && entry.0 .1.is_none())
+                .find(|entry| entry.0.0 == member_name && entry.0.1.is_none())
                 .map(|entry| entry.1)
         } else {
             let class_name = chain[chain.len() - 2];
             let constructor = CONSTRUCTORS
                 .iter()
-                .find(|entry| {
-                    entry.0 .0 == class_name
-                        && entry.0 .1 == Some(member_name)
-                })
+                .find(|entry| entry.0.0 == class_name && entry.0.1 == Some(member_name))
                 .map(|entry| entry.1);
             let function = STATICS
                 .iter()
@@ -1413,11 +1410,9 @@ pub(crate) mod unnecessary_this {
                 NodeKind::LocalFunctionDeclaration => {
                     // The function name binds from its declaration on; the
                     // parameters scope the whole body.
-                    let names_decl = crate::rules::member_name(c, ancestor)
-                        .is_some_and(|decl| {
-                            c.lexeme(c.head_token(decl)) == name
-                                && c.byte_span(decl).start < use_start
-                        });
+                    let names_decl = crate::rules::member_name(c, ancestor).is_some_and(|decl| {
+                        c.lexeme(c.head_token(decl)) == name && c.byte_span(decl).start < use_start
+                    });
                     if names_decl || collect_member_parameters(c, ancestor).contains(&name) {
                         return true;
                     }
@@ -1430,12 +1425,7 @@ pub(crate) mod unnecessary_this {
 
     /// Local declarations of a block that precede the use: variables
     /// (`VariablesDeclaration`) and pattern bindings.
-    fn block_declares_before(
-        c: &Check<'_>,
-        block: u32,
-        use_start: usize,
-        name: &str,
-    ) -> bool {
+    fn block_declares_before(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> bool {
         for decl in c.collect_direct(block) {
             match c.kind(decl) {
                 NodeKind::VariablesDeclaration => {
@@ -1514,10 +1504,12 @@ pub(crate) mod unnecessary_this {
         let Some(&owner) = member_index.checked_sub(1).and_then(|i| c.path.get(i)) else {
             return false;
         };
-        c.collect_direct(owner).into_iter().any(|member| {
-            match c.kind(member) {
+        c.collect_direct(owner)
+            .into_iter()
+            .any(|member| match c.kind(member) {
                 NodeKind::Fields => {
-                    c.payload(member).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                    c.payload(member).first()
+                        == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
                         && field_names(c, member).contains(&name)
                 }
                 NodeKind::Method => {
@@ -1530,13 +1522,10 @@ pub(crate) mod unnecessary_this {
                     );
                     instance
                         && crate::rules::member_name(c, member)
-                            .is_some_and(|member_node| {
-                                c.lexeme(c.head_token(member_node)) == name
-                            })
+                            .is_some_and(|member_node| c.lexeme(c.head_token(member_node)) == name)
                 }
                 _ => false,
-            }
-        })
+            })
     }
 
     /// The field names of one `Fields` member.
