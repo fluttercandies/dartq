@@ -208,10 +208,12 @@ pub(crate) mod prefer_generic_function_type_aliases {
     /// vs the `GenericTypeAlias` that carries `=`) reports at its name with the
     /// generic-function-type rewrite spelled in the message. The replacement
     /// is assembled from source slices in the official order
-    /// (`returnType + ' ' + 'Function' + typeParameters + parameters`);
-    /// slices instead of `toSource()` differ only when a comment sits inside
-    /// the typedef tail (message-text blind spot, no report-position
-    /// impact). A synthetic semicolon (recovery) skips (:48-49). Message:
+    /// (`returnType + ' ' + 'Function' + typeParameters + parameters`); the
+    /// slices carry the written tail verbatim — a comment inside the tail
+    /// (between tokens of a sliced part) rides along in the message, where
+    /// the official `toSource()` re-render drops it (the golden pin holds
+    /// this written-tail face; the report position is unaffected). A
+    /// synthetic semicolon (recovery) skips (:48-49). Message:
     /// `diagnostic.g.dart` `preferGenericFunctionTypeAliases`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_generic_function_type_aliases",
@@ -617,18 +619,27 @@ pub(crate) mod avoid_init_to_null {
 }
 
 pub(crate) mod prefer_function_declarations_over_variables {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, Group, NodeKind, RuleSpec, member_name};
     use crate::rules::{NONE_TOKEN, first_child};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
     /// — a variable initialized with a function literal reports. Fields and
     /// top-level variables only when final (:42-49); locals unless the
-    /// variable is mutated in scope (:50-55).
+    /// variable is potentially mutated in its scope (:50-55).
     ///
-    /// Approximation (documented): `isPotentiallyMutatedInScope`
-    /// (`prefer_function_declarations_over_variables.dart:53`) needs
-    /// usage analysis and is dropped — locals always report, so a later
-    /// reassignment (`var f = () {}; f = ...;`) over-reports. Message:
+    /// The mutation face (`isPotentiallyMutatedInScope`, :53) is the
+    /// in-rule write scan: any unqualified write to the name after the
+    /// declaration, anywhere in the enclosing function body (nested
+    /// closures included) — an assignment target (`=`, `??=`, compound) —
+    /// keeps the variable a variable and passes. Loop-part rebinding
+    /// (`for (f in ...)`) is a declaration, not a write, and never
+    /// suppresses, mirroring the official's declaration face. Residual
+    /// (documented): a write that element resolution would bind to a
+    /// shadowing redeclaration between the write and this declaration
+    /// still counts (the erroneous / user-shadowed family under-reports);
+    /// `++`/`--` operands and pattern-assignment writes (`(f, _) = ...`)
+    /// are not scanned, so a variable mutated only through those
+    /// over-reports. Message:
     /// `diagnostic.g.dart` `preferFunctionDeclarationsOverVariables`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_function_declarations_over_variables",
@@ -660,9 +671,10 @@ pub(crate) mod prefer_function_declarations_over_variables {
         if c.kind(declaration) != NodeKind::VariablesDeclaration {
             return;
         }
-        if c.ancestor(2).is_some_and(|owner| {
+        let is_member = c.ancestor(2).is_some_and(|owner| {
             matches!(c.kind(owner), NodeKind::Fields | NodeKind::TopLevelFields)
-        }) {
+        });
+        if is_member {
             let keyword = c
                 .payload(declaration)
                 .first()
@@ -671,9 +683,62 @@ pub(crate) mod prefer_function_declarations_over_variables {
             if keyword == NONE_TOKEN || c.lexeme(keyword) != "final" {
                 return;
             }
+        } else if is_potentially_mutated(c) {
+            // `isPotentiallyMutatedInScope` (:53) — a later write to the
+            // name in the enclosing function body keeps it a variable.
+            return;
         }
         let range = c.utf16_span(c.node());
         c.report(range, &[]);
+    }
+
+    /// Whether any unqualified write to this declaration's name sits at or
+    /// after the declaration inside the enclosing function body (the
+    /// nearest `BlockBody` ancestor — the official's `FunctionBody` scope).
+    fn is_potentially_mutated(c: &Check<'_>) -> bool {
+        let Some(name) = member_name(c, c.node()) else {
+            return false;
+        };
+        let name = c.lexeme(c.head_token(name));
+        let after = c.byte_span(c.node()).end;
+        let Some(body) = c
+            .path
+            .iter()
+            .rev()
+            .copied()
+            .find(|&ancestor| c.kind(ancestor) == NodeKind::BlockBody)
+        else {
+            return false;
+        };
+        is_mutated_after(c, body, name, after)
+    }
+
+    /// The write scan over `root`'s subtree: an assignment whose target is
+    /// the bare name, positioned at or after `after` (byte offset — the
+    /// declaration's own initializer is before it). Subtrees that end
+    /// before `after` prune.
+    fn is_mutated_after(c: &Check<'_>, root: u32, name: &str, after: usize) -> bool {
+        for kid in c.collect_direct(root) {
+            if c.byte_span(kid).end <= after {
+                continue;
+            }
+            if c.byte_span(kid).start >= after && writes_name(c, kid, name) {
+                return true;
+            }
+            if is_mutated_after(c, kid, name, after) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The write faces: an assignment whose first operand is the bare name
+    /// (the op payload word may be any of `=` / `??=` / compound).
+    fn writes_name(c: &Check<'_>, node: u32, name: &str) -> bool {
+        c.kind(node) == NodeKind::Assignment
+            && c.collect_direct(node).first().is_some_and(|&lhs| {
+                c.kind(lhs) == NodeKind::Identifier && c.lexeme(c.head_token(lhs)) == name
+            })
     }
 }
 
@@ -724,19 +789,21 @@ pub(crate) mod type_init_formals {
 }
 
 pub(crate) mod recursive_getters {
-    use super::{Check, Group, NodeKind, RuleSpec, get_set_token};
+    use super::{Check, Group, NodeKind, RuleSpec, get_set_token, path_shadowed};
 
     /// Official: `pkg/linter/lib/src/rules/recursive_getters.dart:31-95` — a
     /// getter (no parameter list) whose body references itself reports at
-    /// the reference.
-    ///
-    /// Approximation (documented): the element identity (`node.element !=
-    /// element`, :57-60) is taken as the same-lexeme read inside the
-    /// nearest enclosing getter, so a local or nested function of the same
-    /// name shadowing the getter over-reports (the user-shadowed family;
-    /// the official `isSelfReference` element check excludes it). The
-    /// const-literal subtree skip (:61-70) covers erroneous code only and
-    /// is dropped. Message: `diagnostic.g.dart` `recursiveGetters`.
+    /// the reference. The element identity (`node.element != element`,
+    /// :57-60) is the in-rule shadow walk (`path_shadowed`): a
+    /// same-lexeme read captured between the read and the getter — by a
+    /// local (`var x`), a parameter or catch parameter, a for-loop
+    /// variable, a switch-case pattern variable, or a nested function of
+    /// that name — resolves to that binder, not the getter, and passes.
+    /// Residual (documented): pattern variables bound by an if-case
+    /// condition (`if (v case var x)`) are not walked, so a read inside the
+    /// then-branch of that name over-reports; the const-literal subtree
+    /// skip (:61-70) covers erroneous code only and is dropped. Message:
+    /// `diagnostic.g.dart` `recursiveGetters`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "recursive_getters",
         group: Group::Recommended,
@@ -776,15 +843,15 @@ pub(crate) mod recursive_getters {
         }
         // The nearest enclosing getter with no parameter list
         // (:78-85: `parameters != null` bails).
-        let getter = c.path.iter().rev().copied().find(|&ancestor| {
+        let Some(getter_index) = c.path.iter().rposition(|&ancestor| {
             matches!(
                 c.kind(ancestor),
                 NodeKind::Method | NodeKind::TopLevelMethod
             )
-        });
-        let Some(getter) = getter else {
+        }) else {
             return;
         };
+        let getter = c.path[getter_index];
         if get_set_token(c, getter) != Some("get") {
             return;
         }
@@ -816,13 +883,18 @@ pub(crate) mod recursive_getters {
         if !body_span.contains(&c.byte_span(node).start) {
             return;
         }
+        // The shadow walk — the `isSelfReference` element identity (:57-60):
+        // a same-lexeme binder between the read and the getter captures it.
+        if path_shadowed(c, getter_index, name) {
+            return;
+        }
         let range = c.utf16_span(node);
         c.report(range, &[name]);
     }
 }
 
 pub(crate) mod unnecessary_getters_setters {
-    use super::{Check, Group, NodeKind, RuleSpec, get_set_token};
+    use super::{Check, Group, NodeKind, RuleSpec, get_set_token, parameter_name, parameters_bind};
     use crate::rules::first_child;
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_getters_setters.dart:41-97`
@@ -834,9 +906,17 @@ pub(crate) mod unnecessary_getters_setters {
     /// Approximation (documented): the field identity (`staticElement
     /// isGetterElement` + same enclosing class, ast.dart
     /// `_checkForSimpleGetter`) is taken as a same-lexeme private field
-    /// declared in the same class body, so a same-named local shadowing the
-    /// field inside a trivial body over-reports (the user-shadowed family).
-    /// Message: `diagnostic.g.dart` `unnecessaryGettersSetters`.
+    /// declared in the same class body, with the shared shadow walk: the
+    /// setter's assignment target resolves through its body scope, so a
+    /// same-lexeme parameter captures it and the pair passes (the
+    /// `_checkForSimpleSetter` `writeElement` face — a parameter write is
+    /// not the field's implicit setter). The trivial-body shapes cannot
+    /// carry a same-named local (the sole-statement extraction), so no
+    /// further shadow face exists there. The setter's type-agreement guard
+    /// (`expression.writeType != rightHandSide.staticType`, ast.dart) is
+    /// resolution-bound and stays dropped: a wrap whose written types
+    /// disagree over-reports. Message: `diagnostic.g.dart`
+    /// `unnecessaryGettersSetters`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_getters_setters",
         group: Group::Recommended,
@@ -992,15 +1072,13 @@ pub(crate) mod unnecessary_getters_setters {
             return false;
         }
         let (lhs, rhs) = (operands[0], operands[1]);
-        if !simple_field_read(c, lhs, fields) {
-            return false;
-        }
-        // `rightElement == parameters.first` (:92-96 in ast.dart).
-        let params = kids
+        // `rightElement == parameters.first` (:92-96 in ast.dart); the same
+        // list is the body scope of the target-shadow face below.
+        let Some(params) = kids
             .iter()
-            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters)
-            .copied();
-        let Some(params) = params else {
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
             return false;
         };
         let param_list = c.collect_direct(params);
@@ -1010,7 +1088,15 @@ pub(crate) mod unnecessary_getters_setters {
         let Some(param_name) = parameter_name(c, param_list[0]) else {
             return false;
         };
-        c.kind(rhs) == NodeKind::Identifier && c.lexeme(c.head_token(rhs)) == param_name
+        // The assignment target resolves through the body scope: a
+        // parameter of the same name captures it (the `writeElement` face —
+        // a parameter write is not the field's implicit setter).
+        let target_shadowed = c.kind(lhs) == NodeKind::Identifier
+            && parameters_bind(c, params, c.lexeme(c.head_token(lhs)));
+        !target_shadowed
+            && simple_field_read(c, lhs, fields)
+            && c.kind(rhs) == NodeKind::Identifier
+            && c.lexeme(c.head_token(rhs)) == param_name
     }
 
     /// A bare identifier naming a private field of this class.
@@ -1018,22 +1104,6 @@ pub(crate) mod unnecessary_getters_setters {
         c.kind(expression) == NodeKind::Identifier && {
             let lexeme = c.lexeme(c.head_token(expression));
             lexeme.starts_with('_') && fields.contains(&lexeme)
-        }
-    }
-
-    /// A formal parameter's name (`FormalParameter` word 1, or the
-    /// function-typed form's identifier child).
-    fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
-        match c.kind(parameter) {
-            NodeKind::FormalParameter => {
-                let name = c.payload(parameter).get(1).copied()?;
-                (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
-            }
-            NodeKind::FunctionTypedFormalParameter => {
-                let name = crate::rules::member_name(c, parameter)?;
-                Some(c.lexeme(c.head_token(name)))
-            }
-            _ => None,
         }
     }
 }
@@ -1470,6 +1540,165 @@ pub(crate) mod prefer_initializing_formals {
 }
 
 // —— shared helpers ———————————————————————————————————————————————————————
+
+// —— shadow-check face ——————————————————————————————————————————————————
+//
+// Shared by `recursive_getters` (read-vs-getter identity) and
+// `unnecessary_getters_setters` (assignment-target-vs-field identity): the
+// official checks are element identities, so a same-lexeme read or target
+// captured by a nearer binding is a different element and must not report.
+// The binders the walk honors: local variables, local/named functions (name
+// and parameters), catch parameters, for-loop variables, switch-case
+// pattern variables, and the enclosing member's own parameters.
+
+/// Whether `stmt` declares a binding of `name` at its own level (a block
+/// sibling, or the initializer of a `for` parts list).
+fn statement_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
+    match c.kind(stmt) {
+        NodeKind::VariablesDeclaration => c.collect_direct(stmt).into_iter().any(|decl| {
+            c.kind(decl) == NodeKind::InitializedIdentifier
+                && super::member_name(c, decl).is_some_and(|n| c.lexeme(c.head_token(n)) == name)
+        }),
+        NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression => {
+            function_name_binds(c, stmt, name)
+        }
+        NodeKind::PatternVarDeclStatement => pattern_binds(c, stmt, name),
+        NodeKind::LabeledStatement => c
+            .collect_direct(stmt)
+            .into_iter()
+            .any(|kid| c.kind(kid) != NodeKind::Label && statement_binds(c, kid, name)),
+        _ => false,
+    }
+}
+
+/// The name a local/named function binds (`FunctionName` child).
+fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
+    c.collect_direct(node)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::FunctionName)
+        .is_some_and(|wrapper| {
+            super::member_name(c, wrapper).is_some_and(|n| c.lexeme(c.head_token(n)) == name)
+        })
+}
+
+/// Whether a pattern subtree declares `name` (`DeclaredVariablePattern`
+/// payload word 0 carries the variable token, collapse map §3.7).
+fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
+    c.children(pattern).any(|descendant| {
+        c.kind(descendant) == NodeKind::DeclaredVariablePattern
+            && c.payload(descendant)
+                .first()
+                .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+    })
+}
+
+/// Whether a formal-parameter list declares `name` (plain and
+/// function-typed formals, through the shared [`parameter_name`]).
+fn parameters_bind(c: &Check<'_>, params: u32, name: &str) -> bool {
+    c.collect_direct(params)
+        .into_iter()
+        .any(|param| parameter_name(c, param) == Some(name))
+}
+
+/// The for-in loop variable binds inside the loop: the bare form is an
+/// `Identifier` child completing before the parts' `in` token, the `var x`
+/// form a `DeclaredVariablePattern` child (the parts node is childless —
+/// collapse map §3.4 `ForInLoopPartsHandle`).
+fn for_in_binds(c: &Check<'_>, scope: u32, name: &str) -> bool {
+    let kids = c.collect_direct(scope);
+    let Some(in_token) = kids
+        .iter()
+        .copied()
+        .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
+        .and_then(|parts| c.payload(parts).get(3).copied())
+        .filter(|&token| token != NONE_TOKEN)
+    else {
+        return false;
+    };
+    kids.into_iter().any(|kid| match c.kind(kid) {
+        NodeKind::DeclaredVariablePattern => c
+            .payload(kid)
+            .first()
+            .is_some_and(|&v| v < in_token && c.lexeme(v) == name),
+        NodeKind::Identifier => {
+            c.unit.ast.token_range(kid).end <= in_token && c.lexeme(c.head_token(kid)) == name
+        }
+        _ => false,
+    })
+}
+
+/// The read-to-member shadow walk over the ancestor path: at every scope
+/// level between `read_index` (exclusive) and the read, a same-lexeme
+/// binder on the path captures it. Block siblings bind from their
+/// declaration; parameters, catch parameters, for-loop variables, and
+/// switch-case pattern variables bind through their scope node; a nested
+/// function's own name binds inside its body.
+fn path_shadowed(c: &Check<'_>, top_index: usize, name: &str) -> bool {
+    let mut child = *c.path.last().expect("read node");
+    for &scope in &c.path[top_index + 1..c.path.len() - 1] {
+        let binds = match c.kind(scope) {
+            NodeKind::Block => c
+                .collect_direct(scope)
+                .into_iter()
+                .any(|stmt| stmt != child && statement_binds(c, stmt, name)),
+            NodeKind::CatchClause | NodeKind::FunctionExpression => c
+                .collect_direct(scope)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                .is_some_and(|params| parameters_bind(c, params, name)),
+            NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression => {
+                function_name_binds(c, scope, name)
+                    || c.collect_direct(scope)
+                        .into_iter()
+                        .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                        .is_some_and(|params| parameters_bind(c, params, name))
+            }
+            NodeKind::ForIn | NodeKind::ForControlFlow => for_in_binds(c, scope, name),
+            NodeKind::ForStatement => c
+                .collect_direct(scope)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::ForParts)
+                .is_some_and(|parts| {
+                    c.collect_direct(parts)
+                        .into_iter()
+                        .any(|stmt| statement_binds(c, stmt, name))
+                }),
+            NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
+                c.collect_direct(scope).into_iter().any(|kid| {
+                    // Case patterns complete as flat direct children
+                    // (collapse map §4), so the variable is the child's
+                    // own payload token.
+                    c.kind(kid) == NodeKind::DeclaredVariablePattern
+                        && c.payload(kid)
+                            .first()
+                            .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                })
+            }
+            _ => false,
+        };
+        if binds {
+            return true;
+        }
+        child = scope;
+    }
+    false
+}
+
+/// A formal parameter's name (`FormalParameter` word 1, or the
+/// function-typed form's identifier child).
+fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
+    match c.kind(parameter) {
+        NodeKind::FormalParameter => {
+            let name = c.payload(parameter).get(1).copied()?;
+            (name != NONE_TOKEN).then(|| c.lexeme(name))
+        }
+        NodeKind::FunctionTypedFormalParameter => {
+            let name = member_name(c, parameter)?;
+            Some(c.lexeme(c.head_token(name)))
+        }
+        _ => None,
+    }
+}
 
 /// The `get`/`set` keyword token of a member declaration, by lexeme.
 /// `Method` payload word 1 and `TopLevelMethod` payload word 0 are the
@@ -3433,5 +3662,501 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("prefer_initializing_formals")).is_empty());
+    }
+
+    // —— batch A2 divergence pins (#466) ———————————————————————————————————
+
+    /// An identifier with a declaration context (the local/parameter name
+    /// faces; the read gate keys on the expression context).
+    fn declared_identifier(
+        b: &mut dartq_ast::AstBuilder,
+        context: dartq_parser::IdentifierContext,
+        first: u32,
+        end: u32,
+    ) {
+        b.begin(NodeKind::Identifier, first);
+        b.patch(0, context as u32);
+        b.end(NodeKind::Identifier, end);
+    }
+
+    /// `int get x { var x = 1; return x; }` — the body local captures the
+    /// read, so it is not the getter reference (`isSelfReference`'s element
+    /// identity, recursive_getters.dart:57-60).
+    #[test]
+    fn recursive_getter_shadowed_local_passes() {
+        let source = "int get x { var x = 1; return x; }";
+        // int0 get1 x2 {3 var4 x5 =6 17 ;8 return9 x10 ;11 }12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "get", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::BlockBody, 3);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 3);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                declared_identifier(
+                    b,
+                    dartq_parser::IdentifierContext::LocalVariableDeclaration,
+                    5,
+                    6,
+                );
+                b.begin(NodeKind::VariableInitializer, 6);
+                b.leaf(NodeKind::LiteralInt, 7);
+                b.end(NodeKind::VariableInitializer, 8);
+                b.end(NodeKind::InitializedIdentifier, 8);
+                b.end(NodeKind::VariablesDeclaration, 9);
+                b.begin(NodeKind::ReturnStatement, 9);
+                identifier(b, 10, 11);
+                b.end(NodeKind::ReturnStatement, 12);
+                b.end(NodeKind::Block, 13);
+                b.end(NodeKind::BlockBody, 13);
+                b.end(NodeKind::TopLevelMethod, 13);
+            }),
+        );
+        assert!(f.run(&one_rule("recursive_getters")).is_empty());
+    }
+
+    /// `int get x { var h = (x) { return x; }; return 1; }` — the closure
+    /// parameter captures the read inside the closure body.
+    #[test]
+    fn recursive_getter_shadowed_parameter_passes() {
+        let source = "int get x { var h = (x) { return x; }; return 1; }";
+        // int0 get1 x2 {3 var4 h5 =6 (7 x8 )9 {10 return11 x12 ;13 }14 ;15 return16 117 ;18 }19
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, tok(source, t, "get", 0));
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::BlockBody, 3);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 3);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                declared_identifier(
+                    b,
+                    dartq_parser::IdentifierContext::LocalVariableDeclaration,
+                    5,
+                    6,
+                );
+                b.begin(NodeKind::VariableInitializer, 6);
+                b.begin(NodeKind::FunctionExpression, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::FormalParameter, 7);
+                b.patch(0, NONE);
+                b.patch(1, tok(source, t, "x", 1));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                declared_identifier(
+                    b,
+                    dartq_parser::IdentifierContext::FormalParameterDeclaration,
+                    8,
+                    9,
+                );
+                b.end(NodeKind::FormalParameter, 10);
+                b.end(NodeKind::FormalParameters, 10);
+                b.begin(NodeKind::BlockBody, 10);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 10);
+                b.begin(NodeKind::ReturnStatement, 11);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ReturnStatement, 14);
+                b.end(NodeKind::Block, 15);
+                b.end(NodeKind::BlockBody, 15);
+                b.end(NodeKind::FunctionExpression, 15);
+                b.end(NodeKind::VariableInitializer, 15);
+                b.end(NodeKind::InitializedIdentifier, 15);
+                b.end(NodeKind::VariablesDeclaration, 16);
+                b.begin(NodeKind::ReturnStatement, 16);
+                b.leaf(NodeKind::LiteralInt, 17);
+                b.end(NodeKind::ReturnStatement, 19);
+                b.end(NodeKind::Block, 20);
+                b.end(NodeKind::BlockBody, 20);
+                b.end(NodeKind::TopLevelMethod, 20);
+            }),
+        );
+        assert!(f.run(&one_rule("recursive_getters")).is_empty());
+    }
+
+    /// `set x(int _x) { _x = _x; }` — the assignment target resolves to the
+    /// setter's parameter, not the field (`_checkForSimpleSetter`'s
+    /// `writeElement` face), so the pair passes.
+    #[test]
+    fn getter_setter_parameter_shadow_passes() {
+        let source = "class C { int _x = 0; int get x => _x; set x(int _x) { _x = _x; } }";
+        // class0 C1 {2 int3 _x4 =5 06 ;7 int8 get9 x10 =>11 _x12 ;13 set14 x15 (16 int17 _x18 )19 {20 _x21 =22 _x23 ;24 }25 }26
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 3);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Method, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 8, 9);
+                identifier(b, 10, 11);
+                b.begin(NodeKind::ExpressionBody, 11);
+                b.patch(0, 11);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                identifier(b, 12, 13);
+                b.end(NodeKind::ExpressionBody, 14);
+                b.end(NodeKind::Method, 14);
+                b.begin(NodeKind::Method, 14);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "set", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::NoType, 14);
+                identifier(b, 15, 16);
+                b.begin(NodeKind::FormalParameters, 16);
+                b.begin(NodeKind::FormalParameter, 16);
+                b.patch(0, NONE);
+                b.patch(1, tok(source, t, "_x", 1));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 17, 18);
+                identifier(b, 18, 19);
+                b.end(NodeKind::FormalParameter, 20);
+                b.end(NodeKind::FormalParameters, 20);
+                b.begin(NodeKind::BlockBody, 20);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 20);
+                b.begin(NodeKind::ExpressionStatement, 20);
+                b.begin(NodeKind::Assignment, 21);
+                b.patch(0, tok(source, t, "=", 1));
+                identifier(b, 21, 22);
+                identifier(b, 23, 24);
+                b.end(NodeKind::Assignment, 24);
+                b.end(NodeKind::ExpressionStatement, 25);
+                b.end(NodeKind::Block, 26);
+                b.end(NodeKind::BlockBody, 26);
+                b.end(NodeKind::Method, 26);
+                b.end(NodeKind::DeclarationBody, 26);
+                b.end(NodeKind::ClassDeclaration, 27);
+                b.end(NodeKind::TopLevelDeclaration, 27);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_getters_setters")).is_empty());
+    }
+
+    /// A getter whose body declares a local named exactly like the (absent)
+    /// field never wraps a field — no report.
+    #[test]
+    fn getter_setter_body_local_passes() {
+        let source = "class C { int get x { var x = 1; return x; } set x(int v) { x = v; } }";
+        // class0 C1 {2 int3 get4 x5 {6 var7 x8 =9 110 ;11 return12 x13 ;14 }15 set16 x17 (18 int19 v20 )21 {22 x23 =24 v25 ;26 }27 }28
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "get", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::BlockBody, 6);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 6);
+                b.begin(NodeKind::VariablesDeclaration, 6);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 7);
+                declared_identifier(
+                    b,
+                    dartq_parser::IdentifierContext::LocalVariableDeclaration,
+                    8,
+                    9,
+                );
+                b.begin(NodeKind::VariableInitializer, 9);
+                b.leaf(NodeKind::LiteralInt, 10);
+                b.end(NodeKind::VariableInitializer, 11);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 12);
+                b.begin(NodeKind::ReturnStatement, 12);
+                identifier(b, 13, 14);
+                b.end(NodeKind::ReturnStatement, 15);
+                b.end(NodeKind::Block, 16);
+                b.end(NodeKind::BlockBody, 16);
+                b.end(NodeKind::Method, 16);
+                b.begin(NodeKind::Method, 16);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, tok(source, t, "set", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::NoType, 16);
+                identifier(b, 17, 18);
+                b.begin(NodeKind::FormalParameters, 18);
+                b.begin(NodeKind::FormalParameter, 18);
+                b.patch(0, NONE);
+                b.patch(1, tok(source, t, "v", 0));
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 19, 20);
+                identifier(b, 20, 21);
+                b.end(NodeKind::FormalParameter, 22);
+                b.end(NodeKind::FormalParameters, 22);
+                b.begin(NodeKind::BlockBody, 22);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 22);
+                b.begin(NodeKind::ExpressionStatement, 22);
+                b.begin(NodeKind::Assignment, 23);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 23, 24);
+                identifier(b, 25, 26);
+                b.end(NodeKind::Assignment, 27);
+                b.end(NodeKind::ExpressionStatement, 27);
+                b.end(NodeKind::Block, 28);
+                b.end(NodeKind::BlockBody, 28);
+                b.end(NodeKind::Method, 28);
+                b.end(NodeKind::DeclarationBody, 28);
+                b.end(NodeKind::ClassDeclaration, 29);
+                b.end(NodeKind::TopLevelDeclaration, 29);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_getters_setters")).is_empty());
+    }
+
+    /// The correction spells the written tail verbatim — a comment inside
+    /// the tail rides along in the message text.
+    #[test]
+    fn generic_function_alias_correction_keeps_comments() {
+        let source = "typedef void F(/* hi */ int);";
+        // typedef0 void1 F2 (3 int4 )5 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Typedef, 0);
+                b.patch(0, tok(source, t, "typedef", 0));
+                b.patch(1, NONE); // old form: no `=`
+                b.leaf_span(NodeKind::Type, 1, 2);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.end(NodeKind::FormalParameters, 6);
+                b.end(NodeKind::Typedef, 7);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_generic_function_type_aliases"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].correction,
+            Some(
+                "Try using the generic function type syntax ('void Function(/* hi */ int)')."
+                    .to_owned()
+            )
+        );
+    }
+
+    /// `f = null;` after the declaration is a later write — the variable is
+    /// potentially mutated in scope and passes (:53).
+    #[test]
+    fn function_variable_mutated_later_passes() {
+        let source = "void m() { var f = () {}; f = null; }";
+        // void0 m1 (2 )3 {4 var5 f6 =7 (8 )9 {10 }11 ;12 f13 =14 null15 ;16 }17
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::BlockBody, 4);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::VariablesDeclaration, 4);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 6);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::VariableInitializer, 7);
+                b.begin(NodeKind::FunctionExpression, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.end(NodeKind::FormalParameters, 10);
+                b.begin(NodeKind::Block, 10);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::FunctionExpression, 12);
+                b.end(NodeKind::VariableInitializer, 12);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Assignment, 13);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 13, 14);
+                b.leaf(NodeKind::LiteralNull, 15);
+                b.end(NodeKind::Assignment, 16);
+                b.end(NodeKind::ExpressionStatement, 17);
+                b.end(NodeKind::Block, 18);
+                b.end(NodeKind::BlockBody, 18);
+                b.end(NodeKind::TopLevelMethod, 18);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_function_declarations_over_variables"))
+                .is_empty()
+        );
+    }
+
+    /// A write inside a nested closure is a potential mutation too.
+    #[test]
+    fn function_variable_mutated_in_nested_closure_passes() {
+        let source = "void m() { var f = () {}; g(() { f = 1; }); }";
+        // void0 m1 (2 )3 {4 var5 f6 =7 (8 )9 {10 }11 ;12 g13 (14 (15 )16 {17 f18 =19 120 ;21 }22 )23 ;24 }25
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::BlockBody, 4);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::VariablesDeclaration, 4);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 6);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::VariableInitializer, 7);
+                b.begin(NodeKind::FunctionExpression, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.end(NodeKind::FormalParameters, 10);
+                b.begin(NodeKind::Block, 10);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::FunctionExpression, 12);
+                b.end(NodeKind::VariableInitializer, 12);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Send, 13);
+                identifier(b, 13, 14);
+                b.begin(NodeKind::Arguments, 14);
+                b.begin(NodeKind::FunctionExpression, 14);
+                b.begin(NodeKind::FormalParameters, 14);
+                b.end(NodeKind::FormalParameters, 17);
+                b.begin(NodeKind::BlockBody, 17);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 17);
+                b.begin(NodeKind::ExpressionStatement, 17);
+                b.begin(NodeKind::Assignment, 18);
+                b.patch(0, tok(source, t, "=", 0));
+                identifier(b, 18, 19);
+                b.leaf(NodeKind::LiteralInt, 20);
+                b.end(NodeKind::Assignment, 21);
+                b.end(NodeKind::ExpressionStatement, 22);
+                b.end(NodeKind::Block, 23);
+                b.end(NodeKind::BlockBody, 23);
+                b.end(NodeKind::FunctionExpression, 23);
+                b.end(NodeKind::Arguments, 24);
+                b.end(NodeKind::Send, 24);
+                b.end(NodeKind::ExpressionStatement, 25);
+                b.end(NodeKind::Block, 26);
+                b.end(NodeKind::BlockBody, 26);
+                b.end(NodeKind::TopLevelMethod, 26);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_function_declarations_over_variables"))
+                .is_empty()
+        );
+    }
+
+    /// Never reassigned — the local still reports (preserved face).
+    #[test]
+    fn function_variable_unmutated_local_reports() {
+        let source = "void m() { var f = () {}; g(f); }";
+        // void0 m1 (2 )3 {4 var5 f6 =7 (8 )9 {10 }11 ;12 g13 (14 f15 )16 ;17 }18
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::BlockBody, 4);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::VariablesDeclaration, 4);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 6);
+                identifier(b, 6, 7);
+                b.begin(NodeKind::VariableInitializer, 7);
+                b.begin(NodeKind::FunctionExpression, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.end(NodeKind::FormalParameters, 10);
+                b.begin(NodeKind::Block, 10);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::FunctionExpression, 12);
+                b.end(NodeKind::VariableInitializer, 12);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Send, 13);
+                identifier(b, 13, 14);
+                b.begin(NodeKind::Arguments, 14);
+                identifier(b, 15, 16);
+                b.end(NodeKind::Arguments, 17);
+                b.end(NodeKind::Send, 17);
+                b.end(NodeKind::ExpressionStatement, 18);
+                b.end(NodeKind::Block, 19);
+                b.end(NodeKind::BlockBody, 19);
+                b.end(NodeKind::TopLevelMethod, 19);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_function_declarations_over_variables"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
     }
 }
