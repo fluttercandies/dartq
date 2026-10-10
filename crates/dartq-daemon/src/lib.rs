@@ -20,8 +20,8 @@
 //!   exit without shutdown exits 1, per LSP). Requests before `initialize`
 //!   answer `ServerNotInitialized`.
 //! * Overlay (PRD §16.3, M1 whole-file replacement): `textDocument/didOpen`
-//!   and `textDocument/didChange` stage a write task on the session's root
-//!   [`Runtime`] context; `textDocument/didClose` stages the on-disk bytes
+//!   and `textDocument/didChange` stage a write task that fans out to the
+//!   session's contexts; `textDocument/didClose` stages the on-disk bytes
 //!   back (or a removal for an overlay-only buffer). None of this touches
 //!   the workspace files on disk.
 //! * Scheduling (PRD §16.5, §16.6): each turn batches every already-queued
@@ -36,27 +36,31 @@
 //!   CLI commands): `dartq/analyze` (the merged diagnostic set, LSP URIs),
 //!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/explain`,
 //!   `dartq/fix`, and `dartq/compat` (CLI-mirror faces with canonical path
-//!   labels), plus the per-agent overlay faces `dartq/overlay.set` and
-//!   `dartq/overlay.clear` (PRD §16.3). All are announced under
+//!   labels), plus the per-agent overlay faces `dartq/overlay.set`,
+//!   `dartq/overlay.commit` (the PRD §16.3 merge: the agent's staged
+//!   buffers write back to the worktree and merge into the base view), and
+//!   `dartq/overlay.clear`. All are announced under
 //!   `capabilities.experimental`; all answers carry `schema_version` and
 //!   honor an optional `verbosity` (the canonical tiers in dartq-schema's
-//!   crate docs); the engine-view faces additionally accept `agentId` (the
-//!   analyzed overlay view) and `since` (delta mode), with the per-face
-//!   visibility contract documented in the `commands` module.
+//!   crate docs); the engine-view faces additionally accept `context` (the
+//!   multi-root routing tag, PRD §16.2), `agentId` (the analyzed overlay
+//!   view), and `since` (delta mode), with the per-face visibility contract
+//!   documented in the `commands` module.
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
 //!   notifications are ignored (both per LSP).
 //!
 //! # Snapshot persistence (#306, #309)
 //!
-//! After overlay applies settle, the debounced sink saves one snapshot
-//! generation: 500 ms after the last apply, checked at turn boundaries, plus
-//! an unconditional flush at session end. While the sink is dirty the main
-//! loop's receive is bounded by the window's remaining time, so an *idle*
-//! daemon wakes at the deadline to save instead of blocking forever — still
-//! no timer thread. Saves are accelerator semantics: failures log and
-//! continue. The generation payload itself waits on engine faces still
-//! missing (see the `session` module docs); until they land each flush logs
-//! the gap and writes nothing.
+//! After overlay applies settle, the debounced sink saves every context's
+//! facts generation through the engine's flush face: 500 ms after the last
+//! apply, checked at turn boundaries, plus an unconditional flush at
+//! session end. The header's context salt separates forked contexts'
+//! generation directories (#482), so N contexts coexist collision-free in
+//! one store; session construction warm-starts each context from its
+//! matching generation. While the sink is dirty the main loop's receive is
+//! bounded by the window's remaining time, so an *idle* daemon wakes at the
+//! deadline to save instead of blocking forever — still no timer thread.
+//! Saves are accelerator semantics: failures log and continue.
 //!
 //! # File watch (`--watch`, PRD §16.7 mode 3)
 //!

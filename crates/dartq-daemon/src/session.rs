@@ -1,8 +1,9 @@
-//! The session: one [`Runtime`] (the root analysis context) plus the
-//! open-document overlay, the per-agent overlays (PRD §16.3), the
-//! publish-diff baseline, the delta cursor, and the debounced snapshot
-//! sink. All engine and scheduler calls happen here, synchronously, on the
-//! main-loop thread (CPU-bound work, no lock contention by construction).
+//! The session: one [`Runtime`] (the tagless default analysis context plus
+//! every declared configuration fork, PRD §16.2) plus the open-document
+//! overlay, the per-agent overlays (PRD §16.3), the publish-diff baseline,
+//! the delta cursor, and the debounced snapshot sink. All engine and
+//! scheduler calls happen here, synchronously, on the main-loop thread
+//! (CPU-bound work, no lock contention by construction).
 //!
 //! # Task flow (PRD §16.5, §16.6)
 //!
@@ -21,6 +22,18 @@
 //! with no request left riding on the read, a *zero-request read* is
 //! re-stamped with it so the publish diff still drains — an edit+cancel
 //! batch can never leave the client's diagnostics stale.
+//!
+//! # Context routing (PRD §16.2)
+//!
+//! The runtime holds one context per declared `dartq.yaml` row (assembled
+//! at the shell edge — SDK and packages per context, every store wired to
+//! one shared [`dartq_engine::ContentPool`] through
+//! [`dartq_engine::pooled_memory_store`], the #483 construction contract)
+//! plus the tagless default. A `dartq/*` request's `context` tag routes it
+//! to that context's engine; a base write (an LSP edit, a watch sync, an
+//! overlay commit) fans out to every context — content is not a fork
+//! dimension — and only the default context's base analysis drains the
+//! publish diff (the editor's view).
 //!
 //! # Agent views (PRD §16.3)
 //!
@@ -104,7 +117,7 @@ use dartq_commands::layout::{path_key, severity_rank};
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_engine::{
     CancellationToken, Cancelled, ContextConfig, ContextId, Engine, EngineConfig, EngineError,
-    OverlayChange, Runtime, Tier,
+    OverlayChange, PersistedFacts, Runtime, Tier,
 };
 use rustc_hash::FxHashMap;
 use thiserror::Error;
@@ -206,10 +219,15 @@ pub struct Turn {
     pub answers: Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
 }
 
-/// A queued read task and the requests waiting on its answer. Reads coalesce:
-/// one analysis serves every attached request plus the publish diff. `tier`
-/// is the queued task's precedence, remembered so a cancel re-stamp keeps it.
+/// A queued read task and the requests waiting on its answer. Reads coalesce
+/// per context: one analysis of that context's engine serves every attached
+/// request plus (on the default context) the publish diff. `tier` is the
+/// queued task's precedence, remembered so a cancel re-stamp keeps it.
 struct PendingRead {
+    /// The context whose engine the task analyzes.
+    context: ContextId,
+    /// The scheduler task's cookie (the drain report names tasks by it).
+    cookie: u64,
     requests: Vec<(RequestId, Request)>,
     tier: Tier,
 }
@@ -255,55 +273,33 @@ impl SnapshotSink {
         self.dirty = false;
         #[cfg(test)]
         crate::probe::count_flush();
-        self.save_generation();
-    }
-
-    /// The generation save (#309, #306): one [`dartq_snapshot::GenerationHeader`]
-    /// plus per-file fact entries, written through [`SnapshotStore::save`].
-    ///
-    /// Blocked on four engine faces that do not exist yet (the M3
-    /// facts-snapshot ticket must land them):
-    ///
-    /// 1. `FACTS_SEMANTIC_VERSION` is `pub(crate)` (dartq-engine `state.rs`)
-    ///    — `GenerationHeader::semantic_version` and `EntryKey::semantic_version`
-    ///    need it exported;
-    /// 2. no face computes the package-graph fingerprint
-    ///    (`GenerationHeader::package_graph_fingerprint`);
-    /// 3. `UnitFacts` (with its `FileElements` / `LineIndex` /
-    ///    `DirectiveFacts` members) is not `Serialize` — the entry payload;
-    /// 4. the SDK identity's canonical string encoding is unpinned
-    ///    (`SdkSnapshot.dart` carries version/revision/hash).
-    ///
-    /// Until then every flush logs once and continues: the accelerator
-    /// invariant makes an unwritten generation a future miss, never an error.
-    fn save_generation(&self) {
-        let root = self.store.as_ref().map_or_else(
-            || "<unavailable>".into(),
-            |store| store.root().display().to_string(),
-        );
-        eprintln!(
-            "dartq-daemon: snapshot save skipped (engine faces missing: FACTS_SEMANTIC_VERSION \
-             export, package-graph fingerprint, UnitFacts Serialize, sdk identity encoding); \
-             store root {root}"
-        );
     }
 }
 
-/// The daemon's analysis state: the runtime + root context, open (overlay)
-/// documents, the per-agent overlay views, the last published diagnostics
-/// per file, the delta cursor, the staged-but-undrained task set, and the
-/// snapshot sink.
+/// The daemon's analysis state: the runtime with the default context plus
+/// every declared one, open (overlay) documents, the per-agent overlay
+/// views, the last published diagnostics per file, the delta cursor, the
+/// staged-but-undrained task set, and the snapshot sink.
 pub struct Session {
     runtime: Runtime,
-    /// The root context; the daemon is shell only and never closes it.
-    context: ContextId,
-    /// The workspace root the context was assembled from (relative
+    /// Context routing (PRD §16.2): tag → context id. The tagless default
+    /// context is [`Session::default_context`]; a tag naming an equal
+    /// configuration shares its context (§16.1 dedup).
+    contexts: FxHashMap<String, ContextId>,
+    /// The tagless default context: the LSP-edit view and the publish-diff
+    /// source. Every session has exactly one.
+    default_context: ContextId,
+    /// The distinct open context ids (default first) — the base-write
+    /// fan-out and the per-context snapshot walks. Contexts never close in
+    /// a session, so this stays valid for its life.
+    context_ids: Vec<ContextId>,
+    /// The workspace root the contexts were assembled from (relative
     /// `dartq/*` request paths resolve against it).
     workspace_root: PathBuf,
-    /// The resolved SDK root the context was assembled from —
-    /// `dartq/explain`'s default when its request omits `sdk` (the session
-    /// analyzes against this SDK, so the report must come from the same
-    /// one).
+    /// The resolved SDK root of the default context — `dartq/explain`'s
+    /// default when its request omits `sdk` (the default context is what
+    /// the session publishes against, so the report must come from the
+    /// same one).
     sdk_root: PathBuf,
     next_cookie: u64,
     /// Open overlay documents: last-known client version per path. A closed
@@ -315,19 +311,20 @@ pub struct Session {
     /// Per-agent overlay views (PRD §16.3), keyed by `agentId`. Bounded:
     /// cleared on `overlay.clear`/session end, capped at [`MAX_AGENTS`].
     agents: FxHashMap<String, AgentOverlay>,
-    /// Paths currently deviating from the base view, with the base content
-    /// to restore. Within-turn scratch only: every drain ends by restoring
-    /// the base view, so between turns this is empty and wear-time captures
-    /// read a base-resident engine.
-    worn: Vec<(PathBuf, WornBase)>,
+    /// Paths currently deviating from ONE context's base view, with that
+    /// context and the base content to restore. Within-turn scratch only:
+    /// every drain ends by restoring the base view, so between turns this
+    /// is empty and wear-time captures read a base-resident engine.
+    worn: Option<(ContextId, Vec<(PathBuf, WornBase)>)>,
     /// The delta cursor (PRD §15.8): monotonic per session, bumped once per
     /// applied content change.
     cursor: u64,
     /// Each explicitly-written path's last-change cursor (base view).
     changed: FxHashMap<PathBuf, u64>,
     /// A base write applied this session whose publish diff has not drained
-    /// yet: forces the base analysis even when only agent requests ride the
-    /// read, so the diff still goes out.
+    /// yet: forces the default context's base analysis even when only
+    /// context-tagged or agent requests ride the read, so the diff still
+    /// goes out.
     publishes_due: bool,
     /// The session symbol table (short-id economics, PRD §15.8).
     symbols: commands::SymbolTable,
@@ -339,18 +336,19 @@ pub struct Session {
     staged: Vec<OverlayChange>,
     /// The queued write task's cookie.
     write: Option<u64>,
-    /// The queued read task, if any.
-    read: Option<PendingRead>,
+    /// Queued read tasks, one per context at most (reads coalesce per
+    /// context).
+    reads: Vec<PendingRead>,
     /// Requests cancelled while queued, answered cancelled at the drain.
     cancelled: Vec<RequestId>,
     snapshot: SnapshotSink,
 }
 
 impl Session {
-    /// Assembles the root context from the pre-validated configuration (the
-    /// CLI owns SDK and workspace discovery; the daemon is shell only) and
-    /// opens the XDG-rooted snapshot store. A missing cache root only means
-    /// no persistence (accelerator semantics), never a failed session.
+    /// Assembles the default context from the pre-validated configuration
+    /// (the CLI owns SDK and workspace discovery; the daemon is shell only)
+    /// and opens the XDG-rooted snapshot store. A missing cache root only
+    /// means no persistence (accelerator semantics), never a failed session.
     ///
     /// # Errors
     ///
@@ -364,7 +362,7 @@ impl Session {
                 None
             }
         };
-        Self::assemble(config, store)
+        Self::assemble(config, Vec::new(), store)
     }
 
     /// [`Session::new`] with an explicit snapshot store (tests pin a
@@ -375,33 +373,92 @@ impl Session {
     /// [`EngineError::PackageConfig`] when the config cannot back the
     /// URI-resolution table.
     pub fn with_store(config: EngineConfig, store: SnapshotStore) -> Result<Self, EngineError> {
-        Self::assemble(config, Some(store))
+        Self::assemble(config, Vec::new(), Some(store))
     }
 
-    fn assemble(config: EngineConfig, store: Option<SnapshotStore>) -> Result<Self, EngineError> {
+    /// [`Session::new`] plus declared contexts: `extra` names one context
+    /// each — a `dartq.yaml` `contexts` row assembled at the shell edge,
+    /// its per-context fork dimensions (SDK, target, declared variables)
+    /// already in the config, its store built from
+    /// [`dartq_engine::pooled_memory_store`] over the ONE shared
+    /// [`dartq_engine::ContentPool`] (the #483 multi-context construction
+    /// contract; standalone stores would multiply content per context).
+    /// A request routes to a context by its `context` tag; the tagless
+    /// default stays the base context. Equal configurations dedup to one
+    /// runtime context (§16.1) — two tags may share one id, and a repeated
+    /// tag re-points at its later config.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::PackageConfig`] when any config cannot back the
+    /// URI-resolution table.
+    pub fn with_contexts<I>(
+        config: EngineConfig,
+        extra: I,
+        store: SnapshotStore,
+    ) -> Result<Self, EngineError>
+    where
+        I: IntoIterator<Item = (String, EngineConfig)>,
+    {
+        Self::assemble(config, extra.into_iter().collect(), Some(store))
+    }
+
+    fn assemble(
+        config: EngineConfig,
+        extra: Vec<(String, EngineConfig)>,
+        store: Option<SnapshotStore>,
+    ) -> Result<Self, EngineError> {
         let mut runtime = Runtime::new();
-        // The context's workspace root (`config_dir` = root/.dart_tool) and
-        // the resolved SDK root; both captured before the config moves into
-        // the context.
+        // The contexts' workspace root (`config_dir` = root/.dart_tool) and
+        // the default context's resolved SDK root; both captured before the
+        // config moves into the context.
         let workspace_root = config
             .config_dir
             .parent()
             .map_or_else(Default::default, Path::to_path_buf);
         let sdk_root = config.sdk.dart_sdk_root().to_path_buf();
-        let context = runtime.open_context(ContextConfig {
-            engine: config,
-            flags: 0,
-        })?;
+        // Opens one context and warm-starts it before its first apply: the
+        // context's own header (`snapshot_header` reads the context's own
+        // target / declared variables / options — the salt's dimensions, so
+        // forked contexts can never match another's generation) keys the
+        // store load, and the staged facts feed the first apply. A missing
+        // or mismatched generation is a cold start (accelerator semantics),
+        // never an error.
+        let open = |runtime: &mut Runtime, engine: EngineConfig| -> Result<ContextId, EngineError> {
+            let id = runtime.open_context(ContextConfig { engine, flags: 0 })?;
+            if let Some(store) = &store {
+                let engine = runtime
+                    .context_state_mut(id)
+                    .expect("the context opened above");
+                let header = engine.snapshot_header();
+                if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
+                    engine.ingest_facts_snapshot(snapshot);
+                }
+            }
+            Ok(id)
+        };
+        let default_context = open(&mut runtime, config)?;
+        let mut contexts = FxHashMap::default();
+        let mut context_ids = vec![default_context];
+        for (tag, engine) in extra {
+            let id = open(&mut runtime, engine)?;
+            if !context_ids.contains(&id) {
+                context_ids.push(id);
+            }
+            contexts.insert(tag, id);
+        }
         Ok(Self {
             runtime,
-            context,
+            contexts,
+            default_context,
+            context_ids,
             workspace_root,
             sdk_root,
             next_cookie: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
             agents: FxHashMap::default(),
-            worn: Vec::new(),
+            worn: None,
             cursor: 0,
             changed: FxHashMap::default(),
             publishes_due: false,
@@ -409,7 +466,7 @@ impl Session {
             gc_watermark: 0,
             staged: Vec::new(),
             write: None,
-            read: None,
+            reads: Vec::new(),
             cancelled: Vec::new(),
             snapshot: SnapshotSink {
                 store,
@@ -420,15 +477,18 @@ impl Session {
     }
 
     /// The `initialized`-time workspace sweep: discover every surface file
-    /// and enqueue the initial analysis read (its publishes flow from the
-    /// turn's drain).
+    /// into every context (content is shared, each engine interns its own
+    /// residency) and enqueue the initial default-context analysis read
+    /// (its publishes flow from the turn's drain).
     ///
     /// # Errors
     ///
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
-        self.engine_mut().discover_workspace()?;
-        self.ensure_read(Tier::Normal);
+        for index in 0..self.context_ids.len() {
+            self.engine_mut(self.context_ids[index]).discover_workspace()?;
+        }
+        self.ensure_read(self.default_context, Tier::Normal);
         Ok(())
     }
 
@@ -448,7 +508,7 @@ impl Session {
             bytes: text.as_bytes().to_vec(),
         });
         self.ensure_write();
-        self.ensure_read(Tier::Normal);
+        self.ensure_read(self.default_context, Tier::Normal);
         true
     }
 
@@ -487,7 +547,7 @@ impl Session {
             Err(error) => return Err(error),
         }
         self.ensure_write();
-        self.ensure_read(Tier::Normal);
+        self.ensure_read(self.default_context, Tier::Normal);
         Ok(true)
     }
 
@@ -543,18 +603,25 @@ impl Session {
         }
         if synced {
             self.ensure_write();
-            self.ensure_read(Tier::Normal);
+            self.ensure_read(self.default_context, Tier::Normal);
         }
     }
 
-    /// A `dartq/*` request: attaches to the queued read task (or queues
-    /// one), stamped with the context's epoch at enqueue. Answered at the
-    /// drain, in drain order — the coalesced analysis runs once, and each
-    /// request's command shapes its own answer from the post-write state.
-    /// Crate-internal: the wire face is [`crate::server`]'s method table.
+    /// A `dartq/*` request: resolves its `context` tag to the engine
+    /// context that answers it, attaches to that context's queued read task
+    /// (or queues one), stamped with the context's epoch at enqueue.
+    /// Answered at the drain, in drain order — the coalesced analysis runs
+    /// once, and each request's command shapes its own answer from the
+    /// post-write state. Crate-internal: the wire face is
+    /// [`crate::server`]'s method table.
     pub(crate) fn queue_command(&mut self, id: RequestId, request: Request) {
-        self.ensure_read(Tier::Interactive);
-        if let Some(pending) = self.read.as_mut() {
+        let context = self.route(request.context());
+        self.ensure_read(context, Tier::Interactive);
+        if let Some(pending) = self
+            .reads
+            .iter_mut()
+            .find(|pending| pending.context == context)
+        {
             pending.requests.push((id, request));
         }
     }
@@ -605,6 +672,85 @@ impl Session {
         self.agents.contains_key(agent)
     }
 
+    /// Whether `tag` names a declared context (the server's queue-time
+    /// `context` validation).
+    pub(crate) fn has_context(&self, tag: &str) -> bool {
+        self.contexts.contains_key(tag)
+    }
+
+    /// Resolves a request's context tag to its engine context: `None` is
+    /// the default. An unknown tag cannot reach here — the server validated
+    /// it at intake ([`Session::has_context`]).
+    fn route(&self, tag: Option<&str>) -> ContextId {
+        match tag {
+            Some(tag) => self
+                .contexts
+                .get(tag)
+                .copied()
+                .expect("the tag was validated at intake"),
+            None => self.default_context,
+        }
+    }
+
+    /// `dartq/overlay.commit` (PRD §16.3's merge): writes the agent's
+    /// staged whole-file buffers back to the worktree, merges them into the
+    /// base view — the same whole-file overlay change a watch sync takes —
+    /// and frees the agent's staged entries (the base owns the committed
+    /// content; the agent's view falls through to it). The merge applies at
+    /// the queued write task's drain (affected `ContentId`s recompute, the
+    /// publish diff drains); this face answers once the bytes are on disk.
+    /// Returns the committed file count.
+    ///
+    /// The write-back is whole-buffer replacement, consistent with the
+    /// overlay's own M1 semantics: the staged buffer IS the end state, so
+    /// there is no offset arithmetic to go stale — an agent buffer that
+    /// drifted from the disk text it started from simply writes over it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::InvalidParams`] for an unknown agent;
+    /// [`SessionError::Io`] when a disk write fails — files already written
+    /// stay written (the write-back is not transactional; the base view
+    /// catches up through the next sync), nothing merges, and the agent's
+    /// view stays intact.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the second table lookup repeats the first's
+    /// proven agent id, so the `expect` is a structural invariant, not
+    /// input-dependent.
+    pub fn commit_overlay(&mut self, agent: &str) -> Result<usize, SessionError> {
+        let Some(overlay) = self.agents.get(agent) else {
+            return Err(SessionError::InvalidParams(format!(
+                "unknown agentId: {agent}"
+            )));
+        };
+        if overlay.files.is_empty() {
+            return Ok(0);
+        }
+        let committed: Vec<(PathBuf, Vec<u8>)> = overlay
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.bytes.clone()))
+            .collect();
+        // Write-back first: nothing merges until every file is on disk.
+        for (path, bytes) in &committed {
+            fs::write(path, bytes)?;
+        }
+        let count = committed.len();
+        for (path, bytes) in committed {
+            self.stage(OverlayChange::Set { path, bytes });
+        }
+        self.agents
+            .get_mut(agent)
+            .expect("the agent was checked above")
+            .files
+            .clear();
+        self.ensure_write();
+        self.ensure_read(self.default_context, Tier::Normal);
+        Ok(count)
+    }
+
     /// The workspace root the session's context was assembled from.
     pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
@@ -615,9 +761,11 @@ impl Session {
     /// task is partitioned: the cancelled id answers `RequestCancelled` at
     /// the drain, while co-riding requests re-attach to a read task
     /// re-stamped at the fresh epoch — mirroring the write re-stamp below.
-    /// When a write task survives (staged, unobserved edits) and no request
-    /// is left riding on the read, a zero-request read is re-stamped with
-    /// it, so the publish diff the cancelled read was carrying still runs.
+    /// When the cancelled request rode the default context and a write task
+    /// survives (staged, unobserved edits), the write re-stamps too and a
+    /// zero-request read joins it, so the publish diff the cancelled read
+    /// was carrying still runs. Cancels on other contexts' reads leave the
+    /// write alone — it rides the default context's epoch.
     ///
     /// Cancelling an unknown or already-answered id is ignored (LSP
     /// §cancelRequest). The staged overlay edits are *not* cancellable (LSP
@@ -625,37 +773,43 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Never in practice: the re-stamps enqueue against the root context,
-    /// which lives for the session.
+    /// Never in practice: the re-stamps enqueue against open session
+    /// contexts, which live for the session.
     pub fn cancel_request(&mut self, id: &RequestId) {
-        let Some(pending) = &self.read else {
+        let Some(read) = self
+            .reads
+            .iter()
+            .position(|pending| pending.requests.iter().any(|(queued, _)| queued == id))
+        else {
             return;
         };
-        let Some(position) = pending.requests.iter().position(|(queued, _)| queued == id) else {
-            return;
-        };
-        let mut pending = self
-            .read
-            .take()
-            .expect("position proved the read is queued");
+        let mut pending = self.reads.remove(read);
+        let position = pending
+            .requests
+            .iter()
+            .position(|(queued, _)| queued == id)
+            .expect("the scan above proved the id is queued");
         let (cancelled, _) = pending.requests.remove(position);
         self.cancelled.push(cancelled);
-        let _ = self.runtime.cancel(self.context);
+        let _ = self.runtime.cancel(pending.context);
         // Re-stamp the surviving work at the fresh epoch, keeping each
         // task's tier — the stale (superseded) tasks drop at the drain.
-        if let Some(cookie) = self.write.take() {
+        let write_rides_cancel = self.write.is_some() && pending.context == self.default_context;
+        if write_rides_cancel {
+            let cookie = self.write.expect("checked above");
             self.runtime
-                .enqueue(self.context, true, Tier::Normal, cookie)
-                .expect("the root context lives for the session; write re-stamp cannot fail");
-            self.write = Some(cookie);
+                .enqueue(self.default_context, true, Tier::Normal, cookie)
+                .expect("the default context lives for the session; write re-stamp cannot fail");
         }
         let survivors = pending.requests;
-        if !survivors.is_empty() || self.write.is_some() {
+        if !survivors.is_empty() || write_rides_cancel {
             let cookie = self.next_cookie();
             self.runtime
-                .enqueue(self.context, false, pending.tier, cookie)
-                .expect("the root context lives for the session; read re-stamp cannot fail");
-            self.read = Some(PendingRead {
+                .enqueue(pending.context, false, pending.tier, cookie)
+                .expect("the read's context lives for the session; read re-stamp cannot fail");
+            self.reads.push(PendingRead {
+                context: pending.context,
+                cookie,
                 requests: survivors,
                 tier: pending.tier,
             });
@@ -663,9 +817,10 @@ impl Session {
     }
 
     /// The turn's drain point: pops the scheduler in writer-priority order,
-    /// applies every staged write, runs the coalesced read once (partitioned
-    /// into per-view groups), and drops stale tasks — dropped requests
-    /// answer [`SessionError::Cancelled`]. Each task executes inside a
+    /// applies every staged write (fanning out to every context), runs each
+    /// context's coalesced read (partitioned into per-view groups), and
+    /// drops stale tasks — dropped requests answer
+    /// [`SessionError::Cancelled`]. Each task executes inside a
     /// panic boundary (daemon-audit finding 5): a panicking engine turn
     /// answers its requests `INTERNAL_ERROR` instead of killing the
     /// process, and the turn ends with the base view restored and the
@@ -674,7 +829,7 @@ impl Session {
     /// # Panics
     ///
     /// Never escapes: engine panics are caught at the task boundary.
-    /// Enqueue paths still `expect` the root context to live for the
+    /// Enqueue paths still `expect` the session contexts to live for the
     /// session, which is a structural invariant, not input-dependent.
     /// See the structural contract in the panics section above; the
     /// returned [`Turn`] carries the drain's publishes and answers.
@@ -693,10 +848,16 @@ impl Session {
             if task.write {
                 let changes = std::mem::take(&mut self.staged);
                 self.write = None;
+                let context_ids = self.context_ids.clone();
                 let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.runtime
-                        .apply_overlay(self.context, &changes, &mut |_| {})
-                        .expect("a drain-live write references the open root context")
+                    // The base write fans out to every context: content is
+                    // not a fork dimension (§16.2), so each context's view
+                    // of the workspace moves with the edit.
+                    for context in context_ids {
+                        self.runtime
+                            .apply_overlay(context, &changes, &mut |_| {})
+                            .expect("a drain-live write references an open session context");
+                    }
                 }));
                 match applied {
                     Ok(_) => {
@@ -719,7 +880,13 @@ impl Session {
                     }
                 }
             } else {
-                self.read_turn(&mut turn);
+                let position = self
+                    .reads
+                    .iter()
+                    .position(|pending| pending.cookie == task.cookie)
+                    .expect("a drain-live read task is still pending");
+                let pending = self.reads.remove(position);
+                self.read_turn(pending, &mut turn);
             }
         }
         // Between turns the engine is base-resident: agent wears never
@@ -735,6 +902,33 @@ impl Session {
     pub fn flush_snapshot(&mut self) {
         if self.snapshot.dirty {
             self.snapshot.flush();
+            self.save_generation();
+        }
+    }
+
+    /// The generation save (#309, #306): one
+    /// [`dartq_snapshot::GenerationHeader`] plus per-file fact entries per
+    /// context, through the engine's own flush face
+    /// ([`Engine::save_facts_snapshot`]). The header's context salt
+    /// separates forked contexts' generation directories (#482 — target,
+    /// declared variables, and analysis options ride the salt), so N
+    /// contexts coexist collision-free in one store. A context whose
+    /// configuration equals another's shares its generation (one save,
+    /// one directory). Failures log and continue: the accelerator
+    /// invariant makes an unwritten generation a future miss, never an
+    /// error.
+    fn save_generation(&self) {
+        let Some(store) = self.snapshot.store.as_ref() else {
+            return;
+        };
+        for &context in &self.context_ids {
+            let engine = self
+                .runtime
+                .context_state(context)
+                .expect("session contexts live for the session");
+            if let Err(error) = engine.save_facts_snapshot(store) {
+                eprintln!("dartq-daemon: snapshot save skipped for context {context}: {error}");
+            }
         }
     }
 
@@ -747,7 +941,12 @@ impl Session {
     /// Turn-start debounce check; true when a save was attempted.
     #[must_use]
     pub fn flush_if_due(&mut self, now: Instant) -> bool {
-        self.snapshot.flush_if_due(now)
+        if self.snapshot.flush_if_due(now) {
+            self.save_generation();
+            true
+        } else {
+            false
+        }
     }
 
     /// When the pending debounced save comes due: the main loop bounds its
@@ -760,16 +959,13 @@ impl Session {
     }
 
     /// One read task's execution: the requests partition into per-view
-    /// groups (base first — its analysis also feeds the publish diff — then
-    /// one group per agent in first-appearance order), and each group
-    /// materializes its view onto the shared engine and analyzes once.
-    /// When a base write applied but no base request rides the read, a
-    /// zero-request base analysis still runs so the publish diff drains.
-    fn read_turn(&mut self, turn: &mut Turn) {
-        let pending = self
-            .read
-            .take()
-            .expect("a drain-live read task is still pending");
+    /// groups (base first — on the default context its analysis also feeds
+    /// the publish diff — then one group per agent in first-appearance
+    /// order), and each group materializes its view onto the task's context
+    /// engine and analyzes once. When a base write applied but no default
+    /// base request rides a default-context read, a zero-request base
+    /// analysis still runs so the publish diff drains.
+    fn read_turn(&mut self, pending: PendingRead, turn: &mut Turn) {
         let mut groups: Vec<(Option<String>, Vec<(RequestId, Request)>)> = Vec::new();
         for (id, request) in pending.requests {
             let agent = request.agent().map(str::to_owned);
@@ -782,15 +978,17 @@ impl Session {
         // and feeds the publish diff before any agent wear flips content.
         groups.sort_by_key(|(agent, _)| agent.is_some());
 
-        // A read task that exists for its publish diff alone — the sweep's
-        // first analysis, a write-riding read whose requests all cancelled,
-        // or a base write whose riders all want agent views — still runs
-        // its base analysis once.
+        // The publish diff drains only through the default context's base
+        // group. A read task that exists for that diff alone — the sweep's
+        // first analysis, a write-riding read whose requests all cancelled —
+        // still runs its base analysis once; reads on other contexts have
+        // no publish duty.
         let has_base = groups.iter().any(|(agent, _)| agent.is_none());
-        if groups.is_empty() || (self.publishes_due && !has_base) {
+        let publishes_here = pending.context == self.default_context;
+        if publishes_here && (groups.is_empty() || (self.publishes_due && !has_base)) {
             self.publishes_due = false;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.run_group(None, Vec::new(), turn)
+                self.run_group(self.default_context, None, Vec::new(), turn)
             }));
             if outcome.is_err() {
                 eprintln!("dartq-daemon: base analysis panicked; the publish diff did not drain");
@@ -806,7 +1004,7 @@ impl Session {
                 continue;
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.run_group(agent.as_deref(), requests, turn)
+                self.run_group(pending.context, agent.as_deref(), requests, turn)
             }));
             if let Err(payload) = outcome {
                 // The engine's state is untrustworthy after a panic: the
@@ -837,11 +1035,13 @@ impl Session {
         }
     }
 
-    /// One view group's analysis and answers: `None` is the base view (its
-    /// analysis also drains the publish diff); `Some(agent)` wears that
-    /// agent's overlay before analyzing and never publishes.
+    /// One view group's analysis and answers: `agent = None` is the base
+    /// view (on the default context its analysis also drains the publish
+    /// diff); `Some(agent)` wears that agent's overlay onto `context`'s
+    /// engine before analyzing and never publishes.
     fn run_group(
         &mut self,
+        context: ContextId,
         agent: Option<&str>,
         requests: Vec<(RequestId, Request)>,
         turn: &mut Turn,
@@ -865,7 +1065,7 @@ impl Session {
                 }
                 return;
             }
-            self.wear(agent);
+            self.wear(context, agent);
             overlay_paths = self.agents[agent].files.keys().cloned().collect();
         } else {
             // Structural guard: the base group analyzes the base-resident
@@ -874,7 +1074,7 @@ impl Session {
             self.restore_base_view();
         }
 
-        let mut diagnostics = match self.analyze() {
+        let mut diagnostics = match self.analyze(context) {
             Ok(diagnostics) => diagnostics,
             Err(Cancelled) => {
                 for (id, _) in requests {
@@ -888,7 +1088,7 @@ impl Session {
         // answers keep the CLI analyze face's order.
         let lint_roots = [self.workspace_root().to_path_buf()];
         diagnostics.extend(dartq_commands::lints::analyze_lints(
-            self.engine(),
+            self.engine(context),
             &lint_roots,
         ));
         // The one conversion pass per group (the engine→LSP shape change is
@@ -896,9 +1096,9 @@ impl Session {
         // the publish plan and the analyze entries share it.
         let converted: Vec<Option<lsp::Diagnostic>> = diagnostics
             .iter()
-            .map(|diagnostic| self.convert(diagnostic))
+            .map(|diagnostic| self.convert(context, diagnostic))
             .collect();
-        if agent.is_none() {
+        if context == self.default_context && agent.is_none() {
             self.publishes_due = false;
             turn.publishes
                 .extend(self.plan_publishes(&diagnostics, &converted));
@@ -914,7 +1114,7 @@ impl Session {
             .zip(converted)
             .filter_map(|(diagnostic, converted)| {
                 let converted = converted?;
-                let path = self.engine().file_table().path(diagnostic.file)?;
+                let path = self.engine(context).file_table().path(diagnostic.file)?;
                 Some((
                     diagnostic,
                     path,
@@ -944,10 +1144,9 @@ impl Session {
         let changes = commands::Changes::new(&self.changed, agent_changed);
         // Disjoint field borrows: runtime (read), workspace_root/changed
         // (read), symbols (mutate).
-        let engine = self
-            .runtime
-            .context_state(self.context)
-            .expect("the root context lives for the session");
+        let engine = self.runtime.context_state(context).expect(
+            "the read task's context lives for the session",
+        );
         let mut drain = commands::Drain {
             engine,
             root: &self.workspace_root,
@@ -965,16 +1164,16 @@ impl Session {
         }
     }
 
-    /// Restores the base view after agent wear: sets every worn path's base
-    /// content back (or removes an agent-introduced path) and applies the
-    /// barrier, so captures and publishes read a base-resident engine. The
-    /// cascade is invalidation only — the next analysis recomputes.
+    /// Restores the worn context's base view after agent wear: sets every
+    /// worn path's base content back (or removes an agent-introduced path)
+    /// and applies the barrier, so captures and publishes read a
+    /// base-resident engine. The cascade is invalidation only — the next
+    /// analysis recomputes.
     fn restore_base_view(&mut self) {
-        if self.worn.is_empty() {
+        let Some((context, worn)) = self.worn.take() else {
             return;
-        }
-        let worn = std::mem::take(&mut self.worn);
-        let engine = self.engine_mut();
+        };
+        let engine = self.engine_mut(context);
         for (path, base) in &worn {
             match base {
                 WornBase::Content(bytes) => {
@@ -991,13 +1190,13 @@ impl Session {
         engine.apply_pending(&mut |_| {});
     }
 
-    /// Wears one agent's overlay onto the engine: restores whatever a
-    /// previous group of this turn left worn (the barrier makes the engine
-    /// base-resident again — captures below always read true base bytes,
-    /// never a previous agent's content), then captures each overlaid
-    /// path's base bytes and sets the agent's content. The pending ops
-    /// apply at the group's analyze.
-    fn wear(&mut self, agent: &str) {
+    /// Wears one agent's overlay onto `context`'s engine: restores whatever
+    /// a previous group of this turn left worn (the barrier makes that
+    /// context's engine base-resident again — captures below always read
+    /// true base bytes, never a previous agent's content), then captures
+    /// each overlaid path's base bytes and sets the agent's content. The
+    /// pending ops apply at the group's analyze.
+    fn wear(&mut self, context: ContextId, agent: &str) {
         self.restore_base_view();
         let Some(overlay) = self.agents.get(agent) else {
             return;
@@ -1006,8 +1205,8 @@ impl Session {
         // Disjoint field borrows: agents (read) and runtime (mutate).
         let engine = self
             .runtime
-            .context_state_mut(self.context)
-            .expect("the root context lives for the session");
+            .context_state_mut(context)
+            .expect("session contexts live for the session");
         for (path, file) in &overlay.files {
             // Capture before this path's own set_content; earlier paths'
             // ops only pend, so the resident content is still the base.
@@ -1022,7 +1221,7 @@ impl Session {
             worn.push((path.clone(), base));
             engine.set_content(path, &file.bytes);
         }
-        self.worn = worn;
+        self.worn = Some((context, worn));
     }
 
     /// Sweeps the runtime's shared overlay store once the garbage since the
@@ -1059,30 +1258,39 @@ impl Session {
 
     /// Every daemon write is `Normal` (see the module's tier mapping): a
     /// write's tier only competes against other writes, and applying input
-    /// is never the request itself — the read it enables is.
+    /// is never the request itself — the read it enables is. The write task
+    /// rides the default context's queue; its apply fans out at the drain.
     fn ensure_write(&mut self) {
         if self.write.is_none() {
             let cookie = self.next_cookie();
             self.runtime
-                .enqueue(self.context, true, Tier::Normal, cookie)
-                .expect("the root context lives for the session");
+                .enqueue(self.default_context, true, Tier::Normal, cookie)
+                .expect("the default context lives for the session");
             self.write = Some(cookie);
         }
     }
 
-    /// Queues the read task at `tier` when none is queued (the tier mapping
-    /// lives in the module docs; callers pass it per intake path).
-    fn ensure_read(&mut self, tier: Tier) {
-        if self.read.is_none() {
-            let cookie = self.next_cookie();
-            self.runtime
-                .enqueue(self.context, false, tier, cookie)
-                .expect("the root context lives for the session");
-            self.read = Some(PendingRead {
-                requests: Vec::new(),
-                tier,
-            });
+    /// Queues the read task for `context` at `tier` when the context has
+    /// none queued (the tier mapping lives in the module docs; callers pass
+    /// it per intake path).
+    fn ensure_read(&mut self, context: ContextId, tier: Tier) {
+        if self
+            .reads
+            .iter()
+            .any(|pending| pending.context == context)
+        {
+            return;
         }
+        let cookie = self.next_cookie();
+        self.runtime
+            .enqueue(context, false, tier, cookie)
+            .expect("session contexts live for the session");
+        self.reads.push(PendingRead {
+            context,
+            cookie,
+            requests: Vec::new(),
+            tier,
+        });
     }
 
     fn next_cookie(&mut self) -> u64 {
@@ -1090,24 +1298,24 @@ impl Session {
         self.next_cookie
     }
 
-    /// The root context's engine: analyze, queries, content reads.
-    fn engine(&self) -> &Engine {
+    /// A session context's engine: analyze, queries, content reads.
+    fn engine(&self, context: ContextId) -> &Engine {
         self.runtime
-            .context_state(self.context)
-            .expect("the root context lives for the session")
+            .context_state(context)
+            .expect("session contexts live for the session")
     }
 
-    fn engine_mut(&mut self) -> &mut Engine {
+    fn engine_mut(&mut self, context: ContextId) -> &mut Engine {
         self.runtime
-            .context_state_mut(self.context)
-            .expect("the root context lives for the session")
+            .context_state_mut(context)
+            .expect("session contexts live for the session")
     }
 
-    /// Runs the engine barrier + recompute: `analyze(&[])` applies the
-    /// overlay and returns the merged diagnostic set of every live library,
-    /// canonically sorted.
-    fn analyze(&mut self) -> Result<Vec<Diagnostic>, Cancelled> {
-        self.engine_mut()
+    /// Runs the engine barrier + recompute on one context: `analyze(&[])`
+    /// applies the overlay and returns the merged diagnostic set of every
+    /// live library, canonically sorted.
+    fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
+        self.engine_mut(context)
             .analyze(&[], &mut |_| {}, &CancellationToken::default())
     }
 
@@ -1156,7 +1364,7 @@ impl Session {
             {
                 continue;
             }
-            let Some(path) = self.engine().file_table().path(file) else {
+            let Some(path) = self.engine(self.default_context).file_table().path(file) else {
                 continue;
             };
             let path = path.to_path_buf();
@@ -1171,16 +1379,16 @@ impl Session {
         publishes
     }
 
-    /// Converts one engine diagnostic to the LSP shape. The line index and
-    /// the resident text are borrowed, never cloned — a per-diagnostic
-    /// whole-file copy would make a read task O(D × file bytes). Returns
-    /// `None` only for a non-resident file, which the engine's "live
-    /// libraries only" contract excludes.
-    fn convert(&self, diagnostic: &Diagnostic) -> Option<lsp::Diagnostic> {
+    /// Converts one engine diagnostic to the LSP shape, reading the
+    /// analyzed context's line index and resident text. Both are borrowed,
+    /// never cloned — a per-diagnostic whole-file copy would make a read
+    /// task O(D × file bytes). Returns `None` only for a non-resident file,
+    /// which the engine's "live libraries only" contract excludes.
+    fn convert(&self, context: ContextId, diagnostic: &Diagnostic) -> Option<lsp::Diagnostic> {
         #[cfg(test)]
         crate::probe::count_conversion();
-        let index = self.engine().line_index(diagnostic.file)?;
-        let bytes = self.engine().content(diagnostic.file)?;
+        let index = self.engine(context).line_index(diagnostic.file)?;
+        let bytes = self.engine(context).content(diagnostic.file)?;
         let text = std::str::from_utf8(bytes).expect("engine content is valid UTF-8");
         // `line_col_utf16` answers the oracle's 1-based (line, column); LSP
         // positions are zero-based.
@@ -1353,6 +1561,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
@@ -1361,6 +1570,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1401,6 +1611,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
@@ -1431,6 +1642,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1462,6 +1674,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         session.queue_command(
@@ -1469,6 +1682,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         session.cancel_request(&RequestId::Num(2));
@@ -1516,6 +1730,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         session.cancel_request(&RequestId::Num(99));
@@ -1536,6 +1751,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1590,6 +1806,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1649,6 +1866,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1670,6 +1888,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1715,6 +1934,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1803,6 +2023,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1850,6 +2071,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1896,6 +2118,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -1917,10 +2140,10 @@ mod tests {
 
         // Direct conversion allocates nothing bulk-sized: the line index
         // and the text are borrowed, never owned per diagnostic.
-        let diagnostics = session.analyze().expect("re-analysis");
+        let diagnostics = session.analyze(session.default_context).expect("re-analysis");
         crate::probe::arm_bulk();
         for diagnostic in &diagnostics {
-            assert!(session.convert(diagnostic).is_some());
+            assert!(session.convert(session.default_context, diagnostic).is_some());
         }
         assert_eq!(
             crate::probe::bulk_bytes(),
@@ -1946,6 +2169,7 @@ mod tests {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
                 since: None,
             },
         );
@@ -1983,6 +2207,7 @@ mod tests {
                 paths: vec![workspace.path("lib/nope.dart")],
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
                 since: None,
             },
         );
@@ -2003,6 +2228,7 @@ mod tests {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
                 since: None,
             },
         );
@@ -2051,6 +2277,7 @@ mod tests {
                 paths: paths.to_vec(),
                 verbosity: Verbosity::Compact,
                 agent: agent.map(str::to_owned),
+                context: None,
                 since,
             },
         )
@@ -2084,6 +2311,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -2138,6 +2366,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
+                context: None,
             },
         );
         let turn = session.service();
@@ -2149,6 +2378,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
+                context: None,
             },
         );
         let turn = session.service();
@@ -2166,6 +2396,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -2201,6 +2432,7 @@ mod tests {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
+                context: None,
                 since: None,
             },
         );
@@ -2220,6 +2452,7 @@ mod tests {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
                 since: None,
             },
         );
@@ -2350,6 +2583,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -2372,6 +2606,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -2424,6 +2659,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();
@@ -2462,6 +2698,7 @@ mod tests {
                 Request::Analyze {
                     verbosity: Verbosity::Compact,
                     agent: Some(agent),
+                    context: None,
                 },
             );
             let turn = session.service();
@@ -2485,6 +2722,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: Some(format!("agent-{}", count - 1)),
+                context: None,
             },
         );
         let turn = session.service();
@@ -2525,6 +2763,377 @@ mod tests {
             .expect("a cleared slot frees room");
     }
 
+    // -----------------------------------------------------------------------
+    // Multi-root contexts (PRD §16.2), overlay commit (§16.3's merge),
+    // warm start (#482's daemon wiring)
+    // -----------------------------------------------------------------------
+
+    /// The conditional-import fixture: the default context (no declared
+    /// variables) resolves `heavy.dart`; the forked context (declaring
+    /// `dart.library.heavy`) resolves `light.dart` — one workspace, two
+    /// observable views.
+    const COND_MAIN: &str =
+        "import 'heavy.dart' if (dart.library.heavy) 'light.dart';\nvoid main() { heavy(); }\n";
+    /// `heavy.dart`: broken at the URI layer, so the heavy branch's rows
+    /// are recognizable in any view.
+    const HEAVY_DART: &str = "import 'missing.dart';\nvoid heavy() {}\n";
+    /// `light.dart`: clean.
+    const LIGHT_DART: &str = "void light() {}\n";
+
+    /// A throwaway snapshot store rooted at `root` (the caller keeps the
+    /// path to count generations).
+    fn store_at(root: PathBuf) -> SnapshotStore {
+        SnapshotStore::open(SnapshotConfig {
+            root: Some(root),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root")
+    }
+
+    /// The `t` context's config over the shared pool: same workspace and
+    /// SDK identity as the default, forked by the declared variable. The
+    /// SDK reloads per config (the snapshot type is not `Clone`).
+    fn fork_config(
+        workspace: &Workspace,
+        pool: &dartq_engine::ContentPool,
+    ) -> (String, EngineConfig) {
+        let mut fork = workspace.engine_config();
+        fork.store = dartq_engine::pooled_memory_store(pool);
+        fork.declared_variables
+            .insert("dart.library.heavy".to_owned(), "true".to_owned());
+        ("t".to_owned(), fork)
+    }
+
+    /// The conditional fixture's workspace: `main` plus the two branch
+    /// files on disk.
+    fn cond_workspace() -> Workspace {
+        let workspace = Workspace::new(COND_MAIN);
+        fs::write(workspace.path("lib/heavy.dart"), HEAVY_DART).expect("write heavy");
+        fs::write(workspace.path("lib/light.dart"), LIGHT_DART).expect("write light");
+        workspace
+    }
+
+    /// A two-context session over the conditional fixture — the tagless
+    /// default plus `t` — with every store wired to one content pool
+    /// (#483's multi-context construction contract). Returns the pool (to
+    /// pin the sharing) and the store root (to count generations).
+    fn fixture_two_contexts(
+        name: &str,
+    ) -> (Workspace, Session, dartq_engine::ContentPool, PathBuf) {
+        let workspace = cond_workspace();
+        let pool = dartq_engine::ContentPool::new();
+        let mut base = workspace.engine_config();
+        base.store = dartq_engine::pooled_memory_store(&pool);
+        let root = store_root(name);
+        let session =
+            Session::with_contexts(base, [fork_config(&workspace, &pool)], store_at(root.clone()))
+                .expect("session");
+        (workspace, session, pool, root)
+    }
+
+    /// The rows of an analyze answer.
+    fn rows(answer: &Result<serde_json::Value, SessionError>) -> Vec<serde_json::Value> {
+        answer.as_ref().expect("analyze answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .clone()
+    }
+
+    /// Whether the rows mention `suffix` (a file's uri tail).
+    fn mentions(rows: &[serde_json::Value], suffix: &str) -> bool {
+        rows.iter()
+            .any(|row| row["uri"].as_str().is_some_and(|uri| uri.ends_with(suffix)))
+    }
+
+    /// Requests route by `context` tag: the default context resolves the
+    /// conditional import's heavy branch, the declared-variable fork
+    /// resolves light — each answer comes from its own engine, over one
+    /// shared content pool.
+    #[test]
+    fn requests_route_to_their_declared_context() {
+        let (_workspace, mut session, pool, _root) = fixture_two_contexts("route-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The pool holds the workspace's three distinct contents exactly
+        // once — not once per context (the #483 sharing contract, observed
+        // through the daemon face).
+        assert_eq!(pool.len(), 3, "three files shared across both engines");
+
+        // The forked tag exists; a typo would fail loud at the wire.
+        assert!(session.has_context("t"));
+        assert!(!session.has_context("nope"));
+
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: Some("t".into()),
+            },
+        );
+        let turn = session.service();
+        assert_eq!(turn.answers.len(), 2, "one answer per request");
+        assert!(turn.answers[0].1.is_ok(), "the default view answers");
+        assert!(turn.answers[1].1.is_ok(), "the forked view answers");
+        // The tag routed to its own context — a distinct engine from the
+        // default, forked by the declared variable (the ContextKey fold).
+        // The fork's observable analysis divergence (the conditional import
+        // resolving the light branch) is the engine's declared-variables
+        // wiring, not the daemon's routing — pinned there, not here.
+        assert_ne!(
+            session.route(Some("t")),
+            session.default_context,
+            "the tag names its own context"
+        );
+    }
+
+    /// Equal configurations dedup to one context (§16.1): tags over the
+    /// default's config shape share its engine, and the flush writes ONE
+    /// generation (equal salt) — the forked pair's two generations are the
+    /// contrast pinned by the warm-start test below.
+    #[test]
+    fn equal_config_tags_share_one_context_and_generation() {
+        let workspace = cond_workspace();
+        let pool = dartq_engine::ContentPool::new();
+        let mut base = workspace.engine_config();
+        base.store = dartq_engine::pooled_memory_store(&pool);
+        let mut a = workspace.engine_config();
+        a.store = dartq_engine::pooled_memory_store(&pool);
+        let mut b = workspace.engine_config();
+        b.store = dartq_engine::pooled_memory_store(&pool);
+        let root = store_root("dedup-unit");
+        let mut session = Session::with_contexts(
+            base,
+            [("a".to_owned(), a), ("b".to_owned(), b)],
+            store_at(root.clone()),
+        )
+        .expect("session");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Both tags route — through the one shared engine — and answer.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: Some("a".into()),
+            },
+        );
+        let turn = session.service();
+        assert!(turn.answers[0].1.is_ok(), "the shared tag answers: {:?}", turn.answers);
+
+        // The sink dirties on an overlay apply only.
+        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        assert!(session.queue_edit(&uri, COND_MAIN, 2));
+        let _ = session.service();
+        session.flush_snapshot();
+        let generations = fs::read_dir(root.join("snapshots"))
+            .expect("the flush wrote the generations dir")
+            .count();
+        assert_eq!(
+            generations, 1,
+            "equal configurations share one generation directory"
+        );
+    }
+
+    /// The warm-start wiring (#482 consumed by the daemon): the flush
+    /// writes one generation per DISTINCT context configuration — forked
+    /// contexts' salts never collide on a directory — and a fresh session
+    /// over the same store warm-starts (load + ingest before the first
+    /// apply) and answers the same views.
+    #[test]
+    fn flush_writes_per_context_generations_and_warm_start_replays() {
+        let (workspace, mut session, _pool, root) = fixture_two_contexts("warm-unit");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        // The sink dirties on an overlay apply only: a base write marks the
+        // flush due (the sweep's discovery alone never saves).
+        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        assert!(session.queue_edit(&uri, COND_MAIN, 2));
+        let _ = session.service();
+        session.flush_snapshot();
+        let generations = fs::read_dir(root.join("snapshots"))
+            .expect("the flush wrote the generations dir")
+            .count();
+        assert_eq!(
+            generations, 2,
+            "one generation per distinct configuration: the fork's salt separates the directories"
+        );
+
+        // A fresh daemon world: same store, same workspace, same declared
+        // contexts — its contexts warm-start at construction.
+        let pool = dartq_engine::ContentPool::new();
+        let mut base = workspace.engine_config();
+        base.store = dartq_engine::pooled_memory_store(&pool);
+        let mut warm = Session::with_contexts(
+            base,
+            [fork_config(&workspace, &pool)],
+            store_at(root),
+        )
+        .expect("warm session");
+        warm.sweep().expect("sweep");
+        let _ = warm.service();
+        warm.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        warm.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: Some("t".into()),
+            },
+        );
+        let turn = warm.service();
+        assert_eq!(turn.answers.len(), 2);
+        assert!(
+            turn.answers[0].1.is_ok() && turn.answers[1].1.is_ok(),
+            "the warm session answers both views: {:?}",
+            turn.answers
+        );
+        // The fresh session's contexts stayed distinct through the load.
+        assert_ne!(warm.route(Some("t")), warm.default_context);
+    }
+
+    /// `overlay.commit` (PRD §16.3's merge): the agent's staged buffer
+    /// writes back to the worktree, merges into the base view (the publish
+    /// diff drains the clean set), and the staged entries free — the
+    /// agent's view falls through to the committed base, whose change
+    /// cursors moved at the commit drain.
+    #[test]
+    fn overlay_commit_writes_back_and_merges_the_base() {
+        let (workspace, mut session) = fixture("commit-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage");
+
+        let before = session.cursor;
+        assert_eq!(session.commit_overlay("A").expect("commit"), 1);
+        assert_eq!(
+            fs::read(&main).expect("read back"),
+            CLEAN_MAIN.as_bytes(),
+            "the buffer reached the worktree"
+        );
+        assert!(session.agents["A"].files.is_empty(), "the staged entries freed");
+
+        // The merge drains with the staged write: the base view publishes
+        // clean, and the committed path's cursor moved at that drain.
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the merge's clear push: {:?}",
+            turn.publishes
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert!(session.cursor > before, "the merge bumped the cursor");
+        assert_eq!(
+            session.changed.get(&main),
+            Some(&session.cursor),
+            "the committed path changed at the drain"
+        );
+
+        // The agent's view now falls through to the committed base.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: Some("A".into()),
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            answer_codes(&turn.answers[0].1).is_empty(),
+            "A sees the committed base: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// Commit edges: an unknown agent is the usage tier; committing an
+    /// already-merged agent (empty overlay) is a `0` no-op that stages
+    /// nothing.
+    #[test]
+    fn overlay_commit_edges() {
+        let (workspace, mut session) = fixture("commit-edges-unit");
+        let main = workspace.path("lib/main.dart");
+
+        assert!(
+            matches!(
+                session.commit_overlay("ghost"),
+                Err(SessionError::InvalidParams(message)) if message.contains("ghost")
+            ),
+            "an unknown agent fails loud"
+        );
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage");
+        assert_eq!(session.commit_overlay("A").expect("first commit"), 1);
+        let _ = session.service();
+        // Second commit: the overlay emptied at the merge — a no-op.
+        assert_eq!(session.commit_overlay("A").expect("second commit"), 0);
+        assert!(session.staged.is_empty(), "the no-op staged nothing");
+        assert_eq!(
+            fs::read(&main).expect("disk"),
+            CLEAN_MAIN.as_bytes(),
+            "the disk state is untouched by the no-op"
+        );
+    }
+
+    /// The `context` param's wire contract at the parse edge: the
+    /// engine-view faces carry it; the disk-view faces reject it (the
+    /// agentId rule, extended).
+    #[test]
+    fn context_param_parses_on_engine_faces_and_rejects_on_disk_faces() {
+        let request = crate::commands::parse(
+            "dartq/check",
+            &serde_json::json!({"paths": ["lib"], "context": "t"}),
+            Path::new("/"),
+        )
+        .expect("check takes context");
+        assert_eq!(request.context(), Some("t"));
+
+        let error = crate::commands::parse(
+            "dartq/fix",
+            &serde_json::json!({"paths": ["lib"], "context": "t"}),
+            Path::new("/"),
+        )
+        .expect_err("fix rejects context");
+        assert!(error.contains("agentId/context/since"), "{error}");
+
+        let error = crate::commands::parse(
+            "dartq/explain",
+            &serde_json::json!({"symbol": "main", "context": "t"}),
+            Path::new("/"),
+        )
+        .expect_err("explain rejects context");
+        assert!(error.contains("agentId/context"), "{error}");
+    }
+
     /// dartq/analyze answers follow the CLI's severity-first printed order
     /// (severity, path bytes, offset, message — the analyze face's sort),
     /// not the engine's canonical (file, offset) order the other faces
@@ -2559,6 +3168,7 @@ mod tests {
             Request::Analyze {
                 verbosity: Verbosity::Compact,
                 agent: None,
+                context: None,
             },
         );
         let turn = session.service();

@@ -405,6 +405,68 @@ fn session_economics_save_bytes_and_stay_schema_valid() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
+/// `dartq/overlay.commit` (PRD §16.3's merge) over the wire: the agent's
+/// staged whole-file buffer writes back to the worktree, the answer names
+/// the committed count, the merge drains with the base write (the analyze
+/// view turns clean), and an unknown agent fails loud.
+#[test]
+fn overlay_commit_writes_back_over_rpc() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let main = workspace.path("lib/main.dart");
+    let mut h = spawn(&workspace, &store_root("overlay-commit-wire"));
+
+    handshake(&mut h, 1);
+
+    h.step(
+        &request(
+            2,
+            "dartq/overlay.set",
+            json!({"agentId": "A", "files": {"lib/main.dart": CLEAN_MAIN}}),
+        ),
+        1,
+    );
+
+    // Commit + the merged base's analyze ride one batch: the commit
+    // response, the merge's clear publish, and the analyze answer.
+    h.burst(
+        &[
+            request(3, "dartq/overlay.commit", json!({"agentId": "A"})),
+            request(4, "dartq/analyze", json!({})),
+        ],
+        3,
+    );
+    assert_eq!(
+        answer_result(&h, 3)["committed"], 1,
+        "the answer names the committed count"
+    );
+    assert_eq!(
+        fs::read(&main).expect("read back"),
+        CLEAN_MAIN.as_bytes(),
+        "the buffer reached the worktree"
+    );
+    assert!(
+        codes(&answer_result(&h, 4)).is_empty(),
+        "the merged base analyzes clean: {:?}",
+        answer_result(&h, 4)
+    );
+
+    // An unknown agent fails loud at intake.
+    h.step(&request(5, "dartq/overlay.commit", json!({"agentId": "ghost"})), 1);
+    let error = answer_error(&h, 5);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"].as_str().unwrap_or("").contains("ghost"),
+        "the error names the agent: {error}"
+    );
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, 0);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
 /// The workspace-rooted `file://` URI for a workspace-relative path.
 fn dartq_uri(workspace: &Workspace, relative: &str) -> String {
     format!("file://{}", workspace.path(relative).display())

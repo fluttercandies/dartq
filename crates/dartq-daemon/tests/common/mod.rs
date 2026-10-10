@@ -226,13 +226,39 @@ pub struct Harness {
 /// `store_root`.
 #[must_use]
 pub fn spawn(workspace: &Workspace, store_root: &Path) -> Harness {
-    let (client, receiver) = mpsc::channel();
     let store = SnapshotStore::open(SnapshotConfig {
         root: Some(store_root.to_path_buf()),
         capacity_bytes: DEFAULT_CAPACITY_BYTES,
     })
     .expect("store opens on a temp root");
-    let session = Session::with_store(workspace.engine_config(), store).expect("session");
+    start(Session::with_store(workspace.engine_config(), store).expect("session"))
+}
+
+/// [`spawn`] plus one declared context: the `t` tag forks the default by
+/// the declared variable `dart.library.heavy` (the conditional-import
+/// selector), and both contexts' stores share one content pool — the #483
+/// multi-context construction contract, exercised through the wire.
+#[must_use]
+pub fn spawn_with_heavy_context(workspace: &Workspace, store_root: &Path) -> Harness {
+    let pool = dartq_engine::ContentPool::new();
+    let mut base = workspace.engine_config();
+    base.store = dartq_engine::pooled_memory_store(&pool);
+    let mut fork = workspace.engine_config();
+    fork.store = dartq_engine::pooled_memory_store(&pool);
+    fork.declared_variables
+        .insert("dart.library.heavy".to_owned(), "true".to_owned());
+    let store = SnapshotStore::open(SnapshotConfig {
+        root: Some(store_root.to_path_buf()),
+        capacity_bytes: DEFAULT_CAPACITY_BYTES,
+    })
+    .expect("store opens on a temp root");
+    start(Session::with_contexts(base, [("t".to_owned(), fork)], store).expect("session"))
+}
+
+/// Runs the server loop over `session` on its own thread (the shared
+/// harness shape).
+fn start(session: Session) -> Harness {
+    let (client, receiver) = mpsc::channel();
     let output = SharedOutput::default();
     let reader = ChannelReader {
         receiver,

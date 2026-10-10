@@ -31,6 +31,11 @@
 //!
 //! | face            | view                                            |
 //! |-----------------|--------------------------------------------------|
+//! | `dartq/index`   | requested view — the analyzed view's resident    |
+//! |                 | index tallied (files/libraries/symbols/referenc  |
+//! |                 | es); the read task has just analyzed, so the     |
+//! |                 | tallies read the maintained state with no scan,  |
+//! |                 | no parse, no second capture                      |
 //! | `dartq/analyze` | requested view (base, or the agent's overlay)    |
 //! | `dartq/check`   | base: the M0 disk pipeline (scan+parse over the  |
 //! |                 | discovered file set). `agentId`: the requested   |
@@ -124,7 +129,8 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// (the server intercepts them before the scheduler queue — disk and
 /// plugin-process work, no engine analysis to schedule); the rest ride the
 /// session's read task.
-pub(crate) const METHODS: [&str; 11] = [
+pub(crate) const METHODS: [&str; 12] = [
+    "dartq/index",
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
@@ -142,6 +148,15 @@ pub(crate) const METHODS: [&str; 11] = [
 /// identity `$/cancelRequest` keys on — stays on the session side.
 #[derive(Debug, Clone)]
 pub(crate) enum Request {
+    /// The analyzed view's resident index tallied (the §15.1 `index`
+    /// face). An engine-view face (the tally reads the view's engine), so
+    /// `agentId`/`context` select the view; `since` is rejected — the
+    /// aggregate has no rows for a delta cursor to filter.
+    Index {
+        verbosity: Verbosity,
+        agent: Option<String>,
+        context: Option<String>,
+    },
     Analyze {
         verbosity: Verbosity,
         agent: Option<String>,
@@ -195,7 +210,8 @@ impl Request {
     /// of silently answering the base view).
     pub(crate) fn agent(&self) -> Option<&str> {
         match self {
-            Self::Analyze { agent, .. }
+            Self::Index { agent, .. }
+            | Self::Analyze { agent, .. }
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
@@ -207,7 +223,8 @@ impl Request {
     /// selector; validated at intake like `agentId`).
     pub(crate) fn context(&self) -> Option<&str> {
         match self {
-            Self::Analyze { context, .. }
+            Self::Index { context, .. }
+            | Self::Analyze { context, .. }
             | Self::Check { context, .. }
             | Self::Query { context, .. }
             | Self::Impact { context, .. } => context.as_deref(),
@@ -272,6 +289,27 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
 
     let invalid = |error: serde_json::Error| error.to_string();
     match method {
+        "dartq/index" => {
+            // An engine-view tally, so the view selectors apply — but a
+            // delta cursor has no rows to filter here: the answer is four
+            // verdict counts over the whole view.
+            let (agent, since) = session_fields(params)?;
+            if since.is_some() {
+                return Err(
+                    "dartq/index tallies the whole analyzed view; since applies to the \
+                     row-shaped faces (check/query/impact/explain)"
+                        .into(),
+                );
+            }
+            let context = context_field(params)?;
+            let decoded =
+                serde_json::from_value::<VerbosityParams>(params.clone()).map_err(invalid)?;
+            Ok(Request::Index {
+                verbosity: decoded.verbosity,
+                agent,
+                context,
+            })
+        }
         "dartq/analyze" => {
             let (agent, _) = session_fields(params)?;
             let context = context_field(params)?;
@@ -688,6 +726,7 @@ pub(crate) struct Drain<'a> {
 /// table's economics; everything else reads.
 pub(crate) fn answer(drain: &mut Drain<'_>, request: &Request) -> Result<Value, SessionError> {
     match request {
+        Request::Index { verbosity, .. } => Ok(index_answer(drain, *verbosity)),
         Request::Analyze { verbosity, .. } => Ok(analyze_answer(drain, *verbosity)),
         Request::Check {
             paths,
@@ -762,6 +801,50 @@ fn delta_row(
         None => true,
         Some(since) => changes.changed_since(&files.file_path(file), since),
     }
+}
+
+// ---------------------------------------------------------------------------
+// dartq/index — the §15.1 index-build face (resident tallies, CLI path labels)
+// ---------------------------------------------------------------------------
+
+/// The analyzed view's resident index tallied through the engine's read
+/// hooks — the same totals the CLI's fresh-build face reports, with no scan,
+/// no parse, no second capture (the read task has just run the view's
+/// analysis pass, so the maintained captures and library surfaces are
+/// current). The answer is the shared [`dartq_commands::index::IndexRun`]
+/// shaper verbatim, and it is tier-invariant: every field is a verdict
+/// count, nothing to trim (the impact posture).
+///
+/// A live library member without a capture is an engine-contract violation:
+/// the tally panics on it like the CLI face does, contained by the read
+/// task's panic boundary.
+fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
+    let mut files = 0;
+    let mut symbols = 0;
+    for (_, members) in drain.engine.libraries() {
+        files += members.len();
+        for &file in &members {
+            symbols += drain
+                .engine
+                .file_capture(file)
+                .expect("analyzed member")
+                .index
+                .len();
+        }
+    }
+    let mut libraries = 0;
+    let mut references = 0;
+    for (_, surface) in drain.engine.library_surfaces() {
+        libraries += 1;
+        references += surface.reference_count();
+    }
+    dartq_commands::index::IndexRun {
+        files,
+        libraries,
+        symbols,
+        references,
+    }
+    .to_json()
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,12 +1203,13 @@ pub(crate) fn fix_answer(
     verbosity: Verbosity,
     hosts: &mut fix::PluginHosts,
 ) -> Result<Value, SessionError> {
-    let per_file: Vec<FileFixSet> = fix::collect_set(paths, hosts).map_err(|error| match error {
-        DiscoverError::Missing(path) => {
-            SessionError::InvalidParams(format!("Directory or file doesn't exist: {path}"))
-        }
-        DiscoverError::Io(io) => SessionError::Io(io),
-    })?;
+    let per_file: Vec<FileFixSet> =
+        fix::collect_set(paths, hosts).map_err(|error| match error {
+            DiscoverError::Missing(path) => {
+                SessionError::InvalidParams(format!("Directory or file doesn't exist: {path}"))
+            }
+            DiscoverError::Io(io) => SessionError::Io(io),
+        })?;
     let files: Vec<Value> = per_file
         .iter()
         // Plugin-only rows are still a patch document (provenance-tagged).
@@ -1138,10 +1222,12 @@ pub(crate) fn fix_answer(
     let mut answer = json!({ "schema_version": SCHEMA_VERSION, "files": files });
     let errors = hosts.take_errors();
     if !errors.is_empty() {
-        answer["errors"] = json!(errors
-            .iter()
-            .map(|error| json!({ "plugin": error.plugin, "message": error.message }))
-            .collect::<Vec<_>>());
+        answer["errors"] = json!(
+            errors
+                .iter()
+                .map(|error| json!({ "plugin": error.plugin, "message": error.message }))
+                .collect::<Vec<_>>()
+        );
     }
     Ok(answer)
 }

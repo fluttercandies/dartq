@@ -32,7 +32,7 @@ use crate::commands;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::lsp::{self, PublishDiagnosticsParams};
 use crate::session::{Publish, Session, SessionError};
-use crate::watch::{WatchOptions, Watcher};
+use crate::watch::{WatchOptions, Watcher, is_config_input};
 
 /// Exit code for a clean session end: `shutdown` + `exit`, or the client
 /// simply closed the stream.
@@ -161,7 +161,7 @@ where
                     }
                 }
                 Incoming::Message(Message::Response(_)) => {} // clients never send these
-                Incoming::Watch { touched } => session.queue_disk_changes(&touched),
+                Incoming::Watch { touched } => handle_watch(&mut session, touched),
                 Incoming::Unparsable { code, message } => {
                     write_message(
                         &mut output,
@@ -393,7 +393,12 @@ fn handle_request(
         // request that needs it; the session end shuts it down.
         (Lifecycle::Ready, "dartq/fix") => {
             let params = request.params.unwrap_or(Value::Null);
-            Some(fix_response(fix_hosts, &params, session.workspace_root(), id))
+            Some(fix_response(
+                fix_hosts,
+                &params,
+                session.workspace_root(),
+                id,
+            ))
         }
         (Lifecycle::Ready, "dartq/assists") => {
             let params = request.params.unwrap_or(Value::Null);
@@ -467,6 +472,30 @@ fn overlay_ack() -> Value {
     json!({ "schema_version": commands::SCHEMA_VERSION })
 }
 
+/// One watch batch's intake: the paths split by input kind. `.dart` paths
+/// sync their bytes (the didChange-equivalent); a context input (pubspec /
+/// package config / analysis options) refreshes the contexts instead —
+/// re-discovery re-reads the `.dart` set and re-analysis republishes — while
+/// the config bytes themselves never stage as analysis content.
+fn handle_watch(session: &mut Session, touched: Vec<PathBuf>) {
+    let root = session.workspace_root().to_path_buf();
+    let mut sources = Vec::new();
+    let mut refreshed = false;
+    for path in touched {
+        if is_config_input(&path, &root) {
+            refreshed = true;
+        } else {
+            sources.push(path);
+        }
+    }
+    if refreshed && let Err(error) = session.sweep() {
+        failed("watch refresh", &error);
+    }
+    if !sources.is_empty() {
+        session.queue_disk_changes(&sources);
+    }
+}
+
 /// Relative request paths resolve against the session workspace root.
 fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
@@ -492,7 +521,8 @@ fn fix_response(
         #[serde(default)]
         verbosity: Verbosity,
     }
-    let invalid = |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
+    let invalid =
+        |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
     if let Err(message) = commands::reject_disk_view_only(params, "dartq/fix") {
         return invalid(message);
     }
@@ -534,7 +564,8 @@ fn assists_response(
         #[serde(default)]
         verbosity: Verbosity,
     }
-    let invalid = |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
+    let invalid =
+        |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
     if let Err(message) = commands::reject_disk_view_only(params, "dartq/assists") {
         return invalid(message);
     }
@@ -548,14 +579,12 @@ fn assists_response(
     let hosts = fix_hosts.get_or_launch();
     match fix::assists(&decoded.path, decoded.offset, decoded.length, hosts) {
         Ok(answer) => Response::ok(id, fix::assists_json(&answer, decoded.verbosity)),
-        Err(dartq_commands::discover::DiscoverError::Missing(path)) => invalid(format!(
-            "Directory or file doesn't exist: {path}"
-        )),
-        Err(dartq_commands::discover::DiscoverError::Io(io)) => Response::error(
-            Some(id),
-            codes::INTERNAL_ERROR,
-            io.to_string(),
-        ),
+        Err(dartq_commands::discover::DiscoverError::Missing(path)) => {
+            invalid(format!("Directory or file doesn't exist: {path}"))
+        }
+        Err(dartq_commands::discover::DiscoverError::Io(io)) => {
+            Response::error(Some(id), codes::INTERNAL_ERROR, io.to_string())
+        }
     }
 }
 

@@ -124,8 +124,9 @@ fn full_session_overlay_and_diagnostics() {
 }
 
 /// An overlay RPC change reflects in the subsequent diagnostics while the
-/// workspace file on disk — and the snapshot cache — stay untouched (PRD
-/// §16.3: writes never leave the overlay).
+/// workspace file on disk stays untouched (PRD §16.3: writes never leave
+/// the overlay — the accelerator's snapshot store, not the worktree,
+/// absorbs the edit).
 #[test]
 fn overlay_change_reflects_in_diagnostics_and_never_touches_disk() {
     let workspace = Workspace::new(BROKEN_MAIN);
@@ -165,9 +166,11 @@ fn overlay_change_reflects_in_diagnostics_and_never_touches_disk() {
         fs::read_to_string(&main_dart).expect("disk read"),
         BROKEN_MAIN
     );
-    // The accelerator wrote nothing: no snapshot generation exists (the
-    // debounced save is blocked on engine faces; see Session docs).
-    assert!(!root.join("snapshots").exists(), "no generation is written");
+    // The accelerator persisted the overlay-fed facts: the flush wrote a
+    // generation per context under the store root (PRD §16 warm start).
+    let generations =
+        fs::read_dir(root.join("snapshots")).expect("snapshots dir").count();
+    assert!(generations >= 1, "a generation is written");
 }
 
 #[test]

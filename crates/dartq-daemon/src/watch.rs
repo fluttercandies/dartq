@@ -8,11 +8,15 @@
 //! **bounded-interval directory poll**, documented as such: one thread
 //! re-walks the workspace every [`POLL_INTERVAL`] (reusing
 //! `dartq_commands::discover` for exact walk-rule parity with the CLI's
-//! discovery), fingerprints each `.dart` file by `(mtime, len)`, and diffs
+//! discovery), fingerprints each `.dart` file by `(mtime, len)` — plus the
+//! three non-`.dart` context inputs ([`CONFIG_INPUTS`], the files a context
+//! assembly consumes) — and diffs
 //! the walk against the previous tick — the tick's walk *is* the on-disk
 //! set, so the diff reports content changes, files that appeared, and files
 //! that vanished (re-discovery: what the session's `queue_disk_changes`
-//! turns into the same set the sweep's discovery takes, or a removal).
+//! turns into the same set the sweep's discovery takes, or a removal; a
+//! context input instead refreshes the contexts at intake — their bytes
+//! never stage as analysis content).
 //! A burst coalesces through the [`Debounce`]
 //! state machine until a changeless tick (the quiet period is one poll
 //! interval) or the max-hold deadline, then one batch of touched paths goes
@@ -30,7 +34,7 @@
 //! analysis's content check is authoritative (§16.7).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -46,6 +50,29 @@ use crate::server::Incoming;
 /// The poll cadence: one workspace walk per interval. Polling is the
 /// documented cost of the convenience layer (§16.7 watch is optional).
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The non-`.dart` context inputs tracked beside the `.dart` walk: the
+/// files a context assembly consumes (the package manifest, the resolved
+/// package graph, the analysis options — PRD §16.7's reload surface). They
+/// are fingerprinted like `.dart` files so a change (or appearance, or
+/// deletion) surfaces in the tick diff, but they never stage as analysis
+/// content — [`is_config_input`] routes them to the context refresh at
+/// intake.
+const CONFIG_INPUTS: [&str; 3] = [
+    "pubspec.yaml",
+    ".dart_tool/package_config.json",
+    "analysis_options.yaml",
+];
+
+/// Whether `path` is one of the watched non-`.dart` context inputs under
+/// `root`: its change routes to the context refresh (re-discovery +
+/// re-analysis), never to the content sync — a pubspec's bytes are not Dart
+/// source, and staging them would intern a phantom analysis file.
+pub(crate) fn is_config_input(path: &Path, root: &Path) -> bool {
+    CONFIG_INPUTS
+        .iter()
+        .any(|relative| path == root.join(relative))
+}
 
 /// A change burst may hold the batch at most this long before it flushes
 /// mid-burst — a writer that never quiets (a build tool, a formatter loop)
@@ -131,6 +158,14 @@ fn scan(root: &std::path::Path) -> Option<FxHashMap<PathBuf, Fingerprint>> {
                 let meta = fs::metadata(&path).ok()?;
                 Some((path, (meta.modified().ok()?, meta.len())))
             })
+            // The context inputs ride the same fingerprint map: present
+            // files are tracked, absent ones are not, so a later creation
+            // or deletion diffs as a touch like any file event.
+            .chain(CONFIG_INPUTS.iter().filter_map(|relative| {
+                let path = root.join(relative);
+                let meta = fs::metadata(&path).ok()?;
+                Some((path, (meta.modified().ok()?, meta.len())))
+            }))
             .collect(),
     )
 }
@@ -414,6 +449,96 @@ mod tests {
         );
 
         drop(watcher);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The non-`.dart` context inputs ride the same fingerprint map as the
+    /// `.dart` walk: each of the three triggers the diff on creation,
+    /// rewrite, and deletion — the watch trigger set PRD §16.7's reload
+    /// surface needs.
+    #[test]
+    fn scan_and_diff_track_each_config_input() {
+        let (root, _main) = workspace("config-inputs");
+        // The fixture seeds none of the three: the baseline map is the
+        // `.dart` set alone.
+        let baseline = scan(&root).expect("baseline");
+        assert_eq!(baseline.len(), 1, "the seeded file only");
+        assert!(
+            !baseline.keys().any(|path| is_config_input(path, &root)),
+            "no config input is tracked before it exists"
+        );
+
+        let pubspec = root.join("pubspec.yaml");
+        let options = root.join("analysis_options.yaml");
+        let config = root.join(".dart_tool/package_config.json");
+        fs::create_dir_all(config.parent().expect("parent")).expect("dir");
+
+        // Creation of the package manifest: one touch.
+        fs::write(&pubspec, "name: w\n").expect("write pubspec");
+        let after_pubspec = scan(&root).expect("scan");
+        assert_eq!(
+            diff(&baseline, &after_pubspec),
+            vec![pubspec.clone()],
+            "the manifest's creation is the batch"
+        );
+
+        // Creation of the analysis options: one touch (the manifest's
+        // unchanged fingerprint stays out of the diff).
+        fs::write(
+            &options,
+            "analyzer:\n  errors:\n    unused_import: ignore\n",
+        )
+        .expect("write options");
+        let after_options = scan(&root).expect("scan");
+        assert_eq!(
+            diff(&after_pubspec, &after_options),
+            vec![options.clone()],
+            "the options file's creation is the batch"
+        );
+
+        // Rewrite of the package config: one touch (a differing length
+        // moves the fingerprint even under mtime granularity ties).
+        fs::write(&config, r#"{"configVersion": 2, "packages": []}"#).expect("write config");
+        let after_config = scan(&root).expect("scan");
+        assert_eq!(
+            diff(&after_options, &after_config),
+            vec![config.clone()],
+            "the package config's rewrite is the batch"
+        );
+
+        // Deletion is a touch too (the vanished half of the diff).
+        fs::remove_file(&options).expect("remove options");
+        let after_removal = scan(&root).expect("scan");
+        let touched = diff(&after_config, &after_removal);
+        assert!(
+            touched.contains(&options),
+            "the deletion is the batch: {touched:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The intake classifier: exactly the watched set under the root routes
+    /// to the context refresh — a same-named file elsewhere is ordinary
+    /// (never-staged) territory, and `.dart` paths never classify as config.
+    #[test]
+    fn config_input_classifier_matches_only_the_watched_set() {
+        let (root, main) = workspace("config-classifier");
+        assert!(is_config_input(&root.join("pubspec.yaml"), &root));
+        assert!(is_config_input(&root.join("analysis_options.yaml"), &root));
+        assert!(is_config_input(
+            &root.join(".dart_tool/package_config.json"),
+            &root
+        ));
+        assert!(!is_config_input(&main, &root), "dart content syncs");
+        assert!(
+            !is_config_input(&root.join("tool/pubspec.yaml"), &root),
+            "same name outside the watched set is not a context input"
+        );
+        assert!(!is_config_input(
+            &root.join("lib/analysis_options.yaml"),
+            &root
+        ));
         fs::remove_dir_all(&root).ok();
     }
 
