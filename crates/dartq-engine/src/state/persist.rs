@@ -30,8 +30,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
@@ -41,7 +41,7 @@ use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
 use dartq_source::{FileId, FileTable, LineIndex, StringId, StringTable, content_hash};
 
-use crate::state::{DirectiveFacts, DirectiveKind, SDK_TARGET, UnitFacts};
+use crate::state::{DirectiveFacts, DirectiveKind, UnitFacts};
 
 /// blake3 truncated to 128 bits — the house digest width (§10.5).
 fn blake3_128(bytes: &[u8]) -> [u8; 16] {
@@ -96,15 +96,16 @@ fn field(bytes: &mut Vec<u8>, value: &[u8]) {
 /// fixed field order, space-separated, one-way. Every component changes
 /// what `dart:` resolution and the feature set resolve to, so the header
 /// equality gate (any mismatch is a whole-generation miss) keys on exactly
-/// these.
+/// these. `target` is the context's own segment (`EngineState::target`):
+/// two contexts resolving against different panels never share a header.
 #[must_use]
-pub fn sdk_identity(sdk: &SdkSnapshot) -> String {
+pub fn sdk_identity(sdk: &SdkSnapshot, target: &str) -> String {
     format!(
         "dart-sdk {} revision {} libraries {} target {}",
         sdk.dart.version,
         sdk.dart.revision.as_deref().unwrap_or("-"),
         sdk.dart.libraries_json_hash,
-        SDK_TARGET,
+        target,
     )
 }
 
@@ -803,34 +804,42 @@ mod tests {
 
     /// The SDK identity half of the miss gate: identical snapshots produce
     /// equal identities, and every folded component (version, revision,
-    /// libraries.json content hash) moves it.
+    /// libraries.json content hash, target segment) moves it.
     #[test]
     fn sdk_identity_is_stable_and_component_sensitive() {
-        let base = sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES));
+        let base = sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES), "vm");
         assert!(
             base.contains("dart-sdk 3.13.1 revision - "),
             "an absent revision spells `-`: {base}"
         );
         assert_eq!(
             base,
-            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES)),
+            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES), "vm"),
             "identical snapshots produce equal identities"
         );
 
-        let revised = sdk_identity(&sdk_snapshot("3.13.1\n", Some("abc123\n"), SDK_LIBRARIES));
+        let revised = sdk_identity(
+            &sdk_snapshot("3.13.1\n", Some("abc123\n"), SDK_LIBRARIES),
+            "vm",
+        );
         assert!(
             revised.contains("revision abc123 ") && revised != base,
             "the revision component moves the identity: {revised}"
         );
         assert_ne!(
             base,
-            sdk_identity(&sdk_snapshot("3.14.0\n", None, SDK_LIBRARIES)),
+            sdk_identity(&sdk_snapshot("3.14.0\n", None, SDK_LIBRARIES), "vm"),
             "the version component moves the identity"
         );
         assert_ne!(
             base,
-            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES_MUTATED)),
+            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES_MUTATED), "vm"),
             "the libraries.json hash component moves the identity"
+        );
+        assert_ne!(
+            base,
+            sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES), "js"),
+            "the target segment moves the identity"
         );
     }
 
@@ -892,11 +901,7 @@ mod tests {
 
         let options = salt_config_dir("options", Some("linter:\n  rules:\n    - avoid_print\n"));
         let with_options = context_salt("vm", &FxHashMap::default(), &roots(&options));
-        assert_ne!(
-            base,
-            with_options,
-            "located options content moves the salt"
-        );
+        assert_ne!(base, with_options, "located options content moves the salt");
         // The *content* (not the root path) is the folded dimension:
         // rewriting the same file in place moves the digest.
         std::fs::write(
@@ -940,6 +945,8 @@ mod tests {
                 pub_config: Arc::clone(&pub_config),
                 config_dir: config_dir.clone(),
                 semdiag: None,
+                target: "vm".to_owned(),
+                declared_variables: FxHashMap::default(),
             })
             .expect("engine")
         };

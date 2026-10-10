@@ -58,28 +58,50 @@ use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
 use dartq_snapshot::{
-    Entry, EntryKey, GenerationHeader, RemapTables, SaveError, Snapshot, SnapshotStore,
-    SNAPSHOT_FORMAT_VERSION,
+    Entry, EntryKey, GenerationHeader, RemapTables, SNAPSHOT_FORMAT_VERSION, SaveError, Snapshot,
+    SnapshotStore,
 };
-use dartq_source::{FileId, FileTable, LineIndex, MemorySourceStore, SourceStore, StringTable};
+use dartq_source::{
+    FileId, FileTable, LineIndex, MemorySourceStore, PooledSourceStore, SourceStore, StringTable,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 pub use cancel::{CancellationToken, Cancelled};
 pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
+pub use dartq_source::ContentPool;
 pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
 pub use scheduler::{DrainReport, Task, Tier};
 pub use state::persist::PersistedFacts;
 pub use state::{DirectiveFacts, DirectiveKind, LibraryId, ScannedFace, UnitFacts};
 
+/// The default SDK target segment (`libraries.json` panel) `dart:` URI
+/// resolution dispatches against — the `dart analyze` posture. Every
+/// [`EngineConfig`] constructor spells it unless the context selects
+/// otherwise; the constant is the single source of the default.
+pub const DEFAULT_TARGET: &str = "vm";
+
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
 /// of PRD §5.4's six context fields — store, SDK, packages — plus the pub
-/// config + config directory the URI-resolution table derives from.
+/// config + config directory the URI-resolution table derives from. The
+/// fork dimensions the context salt pins (#482) — target segment, declared
+/// variables — are first-class fields (#483) and ride the config into the
+/// context key.
+//
+// The declared-variables map is the face (its FxHasher is part of the
+// engine's identity, not a generalization axis).
+#[allow(clippy::implicit_hasher)]
 pub struct EngineConfig {
-    /// Content-addressed byte storage. The engine takes ownership: M1 is
-    /// single-Engine-per-process (§5 risk 4), so the drafted `Arc` sharing
-    /// returns with M3 multi-context. `MemorySourceStore` is the default.
+    /// Content-addressed byte storage. The engine takes ownership of the
+    /// store handle; byte-level sharing across engines/contexts is opt-in
+    /// through one [`ContentPool`] ([`pooled_memory_store`]): stores wired
+    /// to the same pool hold every distinct content exactly once between
+    /// them — the multi-context store face (§16.1's shared content store,
+    /// the M3 note this field's doc drafted). The handle itself stays
+    /// per-engine, so reads keep the zero-copy `get` contract and each
+    /// engine's own amortized GC path. [`memory_store`] is the standalone
+    /// default.
     pub store: Box<dyn SourceStore + Send + Sync>,
     /// SDK snapshot (PRD §7); loading hard-errors on a crippled SDK before
     /// construction (dartq-sdk doc).
@@ -96,6 +118,17 @@ pub struct EngineConfig {
     /// The semantic diagnostics plug point (#120/#121); `None` keeps the
     /// engine's syntax + URI-layer set (under-reporting contract).
     pub semdiag: Option<Arc<dyn SemanticDiagnoser>>,
+    /// The SDK target segment `dart:` URI resolution dispatches against
+    /// (the `libraries.json` panel — `vm`, `js`, …). [`DEFAULT_TARGET`]
+    /// (`vm`) preserves the `dart analyze` posture; the per-context value
+    /// forks both the context key and the snapshot generation salt.
+    pub target: String,
+    /// Declared variables (`-D name=value`) the conditional-import
+    /// (configurable URI) directives evaluate against. Empty by default —
+    /// the no-`-D` oracle context under which every configurable directive
+    /// resolves its primary URI; the per-context value forks both the
+    /// context key and the snapshot generation salt.
+    pub declared_variables: FxHashMap<String, String>,
 }
 
 /// Engine construction and explicit-API failures.
@@ -126,8 +159,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Binds the context. `dart:` URIs resolve against the SDK's `vm`
-    /// segment (target selection is an M2 context field).
+    /// Binds the context. `dart:` URIs resolve against the config's target
+    /// segment ([`EngineConfig::target`], [`DEFAULT_TARGET`] when unset) and
+    /// conditional directives against [`EngineConfig::declared_variables`].
     ///
     /// # Errors
     ///
@@ -141,6 +175,8 @@ impl Engine {
             &config.config_dir,
             config.sdk,
             config.store,
+            config.target,
+            config.declared_variables,
         )?;
         Ok(Self {
             state,
@@ -527,12 +563,12 @@ impl Engine {
         GenerationHeader {
             format_version: SNAPSHOT_FORMAT_VERSION,
             semantic_version: state::FACTS_SEMANTIC_VERSION,
-            sdk_identity: state::persist::sdk_identity(&self.state.sdk),
+            sdk_identity: state::persist::sdk_identity(&self.state.sdk, &self.state.target),
             package_graph_fingerprint: state::persist::package_graph_fingerprint(
                 &self.state.packages,
             ),
             context_salt: state::persist::context_salt(
-                state::SDK_TARGET,
+                &self.state.target,
                 &self.state.declared_variables,
                 &roots,
             ),
@@ -568,7 +604,12 @@ impl Engine {
         let mut claimed: FxHashSet<EntryKey> = FxHashSet::default();
         for file in files {
             let facts = &self.state.residency[&file];
-            let key = l1::facts_key(&self.state.packages, &self.state.files, file, facts.content());
+            let key = l1::facts_key(
+                &self.state.packages,
+                &self.state.files,
+                file,
+                facts.content(),
+            );
             let key = EntryKey {
                 content_hash: *key.content.as_bytes(),
                 feature_fingerprint: key.feature_fingerprint,
@@ -720,6 +761,22 @@ pub trait SemanticDiagnoser: Send + Sync {
 #[must_use]
 pub fn memory_store() -> Box<dyn SourceStore + Send + Sync> {
     Box::new(MemorySourceStore::new())
+}
+
+/// A store wired to `pool`: every distinct content the engine puts lands in
+/// the pool's shared storage, so N contexts constructed over one pool hold
+/// each content exactly once between them (§16.1's shared content store —
+/// the multi-context RSS face). Reads stay zero-copy through the context's
+/// own view; each context's GC drops only its own handles, and the pool
+/// reclaims storage no context references anymore (reference-counted
+/// sweep, amortized on fresh insertions).
+///
+/// The daemon passes one [`ContentPool`] to every context's
+/// [`EngineConfig::store`] this way; standalone engines keep
+/// [`memory_store`].
+#[must_use]
+pub fn pooled_memory_store(pool: &ContentPool) -> Box<dyn SourceStore + Send + Sync> {
+    Box::new(PooledSourceStore::new(pool))
 }
 
 /// Drops exactly one leading UTF-8 BOM (`EF BB BF`, U+FEFF) — oracle

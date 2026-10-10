@@ -16,10 +16,13 @@
 //!   [`ContentId`]s are content addresses valid across contexts, and
 //!   identical overlay bytes occupy one slot in the runtime's own
 //!   content-addressed overlay store (§16.3's path → `ContentId` map).
-//!   Physical byte sharing of *engine* stores awaits the drafted
-//!   `Arc`-sharing store face (the M3 note on `EngineConfig::store`);
-//!   per-context stores keep the zero-copy `get` contract and each
-//!   context's own GC path intact.
+//!   Physical byte sharing of *engine* stores is opt-in per store handle:
+//!   contexts constructed over one
+//!   [`ContentPool`](crate::ContentPool)
+//!   ([`pooled_memory_store`](crate::pooled_memory_store)) hold every
+//!   distinct content exactly once between them, while reads keep the
+//!   zero-copy `get` contract and each context's own GC path intact (the
+//!   pool reclaims what no context references anymore).
 //! * An overlay edit flows through the existing apply-path discipline —
 //!   `set_content` enqueue → `apply_pending` barrier — so overlay bytes make
 //!   a file resident without touching disk, with the same batch +
@@ -64,7 +67,8 @@ impl fmt::Display for ContextId {
 }
 
 /// blake3-128 over the canonical context configuration tuple: the SDK
-/// identity, the package graph rows, the merged-options file fingerprint,
+/// identity and its target segment, the conditional-import declared
+/// variables, the package graph rows, the merged-options file fingerprint,
 /// and the reserved flag word. Two opens with equal keys are the same
 /// context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,15 +83,21 @@ impl ContextKey {
 }
 
 /// One context's configuration: everything [`EngineConfig`] already carries
-/// (the fork dimensions of PRD §5.4's context slice) plus the reserved flag
-/// word for fork dimensions not yet materialized (target/conditional-env,
-/// the flutter panel — §16.2). Consumed by [`Runtime::open_context`].
+/// (the fork dimensions of PRD §5.4's context slice — SDK identity, target
+/// segment, declared variables, package graph, merged options) plus the
+/// reserved flag word for fork dimensions not yet materialized (the flutter
+/// panel — §16.2). Consumed by [`Runtime::open_context`].
 pub struct ContextConfig {
     /// The per-context analysis configuration, passed through to
     /// [`Engine::new`] verbatim (including the context's own content store).
+    /// Byte sharing across contexts is opt-in through one
+    /// [`ContentPool`](crate::ContentPool): construct every context's store
+    /// with [`pooled_memory_store`](crate::pooled_memory_store) over the
+    /// same pool and each distinct content is stored exactly once between
+    /// them; standalone stores keep full isolation.
     pub engine: EngineConfig,
     /// Reserved fork word, hashed into the key verbatim. Zero by default;
-    /// callers bit-encode panel/target toggles here until they grow into
+    /// callers bit-encode panel toggles here until they grow into
     /// real config fields.
     pub flags: u64,
 }
@@ -402,10 +412,15 @@ fn fold_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 }
 
 /// blake3-128 over the canonical configuration tuple (§16.2): SDK identity,
-/// the SDK's language metadata, the config directory, every package-graph
-/// row (name, root, language version — the version table §16.2 derives from
-/// the graph), the merged-options fingerprint per root, and the flag word.
-/// Rows and roots sort before folding so table layout cannot move the key.
+/// the SDK's language metadata and target segment, the conditional-import
+/// declared variables, the config directory, every package-graph row (name,
+/// root, language version — the version table §16.2 derives from the graph),
+/// the merged-options fingerprint per root, and the flag word. Rows, roots,
+/// and declared-variable names sort before folding so table layout cannot
+/// move the key. The target and variable columns mirror the context salt's
+/// dimensions (state/persist.rs `context_salt`) with the same encoding
+/// discipline — sorted keys, length-prefixed fields — so a context fork
+/// that moves the salt moves the key too.
 fn context_key(config: &ContextConfig) -> ContextKey {
     let engine = &config.engine;
     let mut hasher = blake3::Hasher::new();
@@ -414,6 +429,17 @@ fn context_key(config: &ContextConfig) -> ContextKey {
         &mut hasher,
         engine.sdk.language_metadata.to_string().as_bytes(),
     );
+    fold_field(&mut hasher, engine.target.as_bytes());
+    let mut variables: Vec<(&str, &str)> = engine
+        .declared_variables
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    variables.sort_unstable();
+    for (name, value) in &variables {
+        fold_field(&mut hasher, name.as_bytes());
+        fold_field(&mut hasher, value.as_bytes());
+    }
     fold_field(&mut hasher, engine.config_dir.to_string_lossy().as_bytes());
 
     let mut packages: Vec<(String, String, String)> = engine
@@ -472,4 +498,228 @@ fn context_key(config: &ContextConfig) -> ContextKey {
     let mut key = [0u8; 16];
     key.copy_from_slice(&digest.as_bytes()[..16]);
     ContextKey(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ContentPool, EngineEvent, pooled_memory_store};
+    use dartq_package::PackageTable;
+    use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
+    use dartq_sdk::SdkSnapshot;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A minimal one-package workspace fixture (root package `t` + a
+    /// synthetic SDK) — the context key and open/dedup test bed. The SDK
+    /// must be loaded fresh per config ([`SdkSnapshot`] is not `Clone`).
+    fn fixture(tag: &str) -> (PathBuf, Arc<PackageConfig>, PackageTable) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-context-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["lib", ".dart_tool", "sdk/lib/_internal"] {
+            std::fs::create_dir_all(root.join(dir)).expect("fixture dirs");
+        }
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
+        std::fs::write(
+            root.join("pubspec.lock"),
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        )
+        .expect("lock");
+        let config_text = r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#;
+        std::fs::write(root.join(".dart_tool/package_config.json"), config_text).expect("config");
+        std::fs::write(root.join("sdk/version"), "3.13.1\n").expect("version");
+        std::fs::write(
+            root.join("sdk/lib/libraries.json"),
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        )
+        .expect("libraries");
+        std::fs::write(
+            root.join("sdk/lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("experiments");
+        // Canonicalize before the pub faces resolve it (the #287 spelling
+        // universe — macOS /var vs /private/var).
+        let root = root.canonicalize().expect("fixture root resolves");
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(PackageConfig::parse(config_text).expect("valid config"));
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &pubspec,
+            &BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        let packages = PackageTable::build(&config, &graph, &config_dir).expect("table");
+        (root, config, packages)
+    }
+
+    fn sdk(root: &Path) -> SdkSnapshot {
+        SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads")
+    }
+
+    /// An engine config over `store`, everything else at the fixture
+    /// defaults (the `vm` target, no declared variables).
+    fn engine_config(
+        root: &Path,
+        config: &Arc<PackageConfig>,
+        packages: &PackageTable,
+        store: Box<dyn SourceStore + Send + Sync>,
+    ) -> EngineConfig {
+        EngineConfig {
+            store,
+            sdk: sdk(root),
+            packages: packages.clone(),
+            pub_config: Arc::clone(config),
+            config_dir: root.join(".dart_tool"),
+            semdiag: None,
+            target: crate::DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+        }
+    }
+
+    /// The two new fork columns move the key (#483): equal configurations
+    /// digest equally, and a different target segment or declared-variable
+    /// set forks it — the salt's dimension set with its canonicalization.
+    #[test]
+    fn context_key_moves_with_target_and_declared_variables() {
+        let (root, config, packages) = fixture("key");
+        let base = context_key(&ContextConfig {
+            engine: engine_config(&root, &config, &packages, crate::memory_store()),
+            flags: 0,
+        });
+        let again = context_key(&ContextConfig {
+            engine: engine_config(&root, &config, &packages, crate::memory_store()),
+            flags: 0,
+        });
+        assert_eq!(base, again, "equal configurations digest equally");
+
+        let mut forked = ContextConfig {
+            engine: engine_config(&root, &config, &packages, crate::memory_store()),
+            flags: 0,
+        };
+        forked.engine.target = "js".to_owned();
+        assert_ne!(
+            base,
+            context_key(&forked),
+            "the target segment forks the key"
+        );
+
+        let mut defined = ContextConfig {
+            engine: engine_config(&root, &config, &packages, crate::memory_store()),
+            flags: 0,
+        };
+        defined
+            .engine
+            .declared_variables
+            .insert("x".to_owned(), "1".to_owned());
+        defined
+            .engine
+            .declared_variables
+            .insert("y".to_owned(), "2".to_owned());
+        assert_ne!(
+            base,
+            context_key(&defined),
+            "a declared variable forks the key"
+        );
+        // Canonicalization: insertion order into the variable map cannot
+        // move the digest.
+        let mut reordered = ContextConfig {
+            engine: engine_config(&root, &config, &packages, crate::memory_store()),
+            flags: 0,
+        };
+        reordered
+            .engine
+            .declared_variables
+            .insert("y".to_owned(), "2".to_owned());
+        reordered
+            .engine
+            .declared_variables
+            .insert("x".to_owned(), "1".to_owned());
+        assert_eq!(
+            context_key(&defined),
+            context_key(&reordered),
+            "variable order is canonicalized away"
+        );
+    }
+
+    /// Same configuration dedups to one context; a forked target segment
+    /// opens a distinct context (the per-context SDK panel selection).
+    #[test]
+    fn open_context_dedups_equal_configs_and_forks_on_target() {
+        let (root, config, packages) = fixture("runtime");
+        let mut runtime = Runtime::new();
+        let open = |runtime: &mut Runtime, target: &str| {
+            let mut engine = engine_config(&root, &config, &packages, crate::memory_store());
+            engine.target = target.to_owned();
+            runtime.open_context(ContextConfig { engine, flags: 0 })
+        };
+        let base = open(&mut runtime, "vm").expect("open");
+        assert_eq!(
+            open(&mut runtime, "vm").expect("open"),
+            base,
+            "equal configurations are the same context"
+        );
+        let js = open(&mut runtime, "js").expect("open");
+        assert_ne!(js, base, "the target segment forks the context");
+        assert_eq!(runtime.len_contexts(), 2);
+    }
+
+    /// Contexts constructed over one pool hold shared content exactly once:
+    /// both engines put the same bytes, the pool's footprint stays one
+    /// entry, and each engine's own view reads it back (the multi-context
+    /// store face).
+    #[test]
+    fn pooled_contexts_store_shared_content_once() {
+        let (root, config, packages) = fixture("pool");
+        let pool = ContentPool::new();
+        let mut a = Engine::new(engine_config(
+            &root,
+            &config,
+            &packages,
+            pooled_memory_store(&pool),
+        ))
+        .expect("engine");
+        let mut b = Engine::new(engine_config(
+            &root,
+            &config,
+            &packages,
+            pooled_memory_store(&pool),
+        ))
+        .expect("engine");
+        let path = root.join("lib/main.dart");
+        let source = b"void main() {}\n";
+        let main_a = a.set_content(&path, source);
+        let main_b = b.set_content(&path, source);
+        let mut on_event = |_event: EngineEvent| {};
+        a.apply_pending(&mut on_event);
+        b.apply_pending(&mut on_event);
+
+        assert_eq!(pool.len(), 1, "one distinct content across both stores");
+        assert_eq!(
+            pool.len_bytes(),
+            u64::try_from(source.len()).expect("fixture fits u64"),
+            "counted once, not once per context"
+        );
+        assert_eq!(a.stored_contents(), 1);
+        assert_eq!(b.stored_contents(), 1);
+        assert_eq!(a.content(main_a), Some(&source[..]));
+        assert_eq!(b.content(main_b), Some(&source[..]));
+    }
 }

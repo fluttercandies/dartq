@@ -118,6 +118,8 @@ pub fn engine_config(
             // The semantic families are part of the analyze contract (#236):
             // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
             semdiag: Some(semdiag::diagnoser()),
+            target: dartq_engine::DEFAULT_TARGET.to_owned(),
+            declared_variables: rustc_hash::FxHashMap::default(),
         },
         dir,
     ))

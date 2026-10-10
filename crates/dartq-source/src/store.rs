@@ -1,5 +1,7 @@
 //! Content-addressed storage of source bytes (PRD §5.2).
 
+use std::sync::Mutex;
+
 use rustc_hash::FxHashMap;
 
 use crate::content_id::{ContentId, content_hash};
@@ -163,10 +165,278 @@ impl SourceStore for MemorySourceStore {
     }
 }
 
+/// Byte-level content dedup across stores: every store constructed over one
+/// pool holds each distinct content exactly once between them — the
+/// multi-context store face (one base, N context views). The pool is the
+/// shared instance (`Arc` inside, [`Clone`] is a handle); each store keeps
+/// its own `ContentId` → slot map, so reads stay lock-free zero-copy and
+/// each store's reclamation path stays its own.
+///
+/// Pool reclamation is reference-count-driven: a slot held by no store is
+/// dead (content addressing reproduces it byte-identically if the content
+/// is ever stored again), and the pool amortizes its sweep the way the
+/// engine's own stores amortize theirs — after [`POOL_GC_THRESHOLD`] fresh
+/// insertions. A store's `Drop` alone never reclaims: the next pool sweep
+/// does, so a closed context's bytes keep serving its live siblings.
+#[derive(Clone, Debug, Default)]
+pub struct ContentPool {
+    inner: std::sync::Arc<Mutex<PoolInner>>,
+}
+
+#[derive(Debug, Default)]
+struct PoolInner {
+    entries: FxHashMap<ContentId, std::sync::Arc<[u8]>>,
+    /// Fresh insertions since the last sweep — the amortization tally.
+    new_since_sweep: usize,
+    total_bytes: u64,
+}
+
+/// Fresh pool insertions that trigger one reference-count sweep.
+const POOL_GC_THRESHOLD: usize = 1024;
+
+impl ContentPool {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Distinct contents the pool holds — the deduplicated entry count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pool's mutex is poisoned (a store update panicked
+    /// while holding it) — the same posture as the intern table's lock.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("ContentPool mutex poisoned")
+            .entries
+            .len()
+    }
+
+    /// Whether the pool holds no content.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total bytes the pool holds — the deduplicated footprint: each
+    /// distinct content counted once, unlike a member store's view total.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pool's mutex is poisoned (a store update panicked
+    /// while holding it) — the same posture as the intern table's lock.
+    #[must_use]
+    pub fn len_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("ContentPool mutex poisoned")
+            .total_bytes
+    }
+
+    /// The slot for `id`, inserting `bytes` under it when the pool has not
+    /// seen the content yet. The caller guarantees `id == content_hash(bytes)`.
+    fn get_or_insert(&self, id: ContentId, bytes: &[u8]) -> std::sync::Arc<[u8]> {
+        let mut inner = self.inner.lock().expect("ContentPool mutex poisoned");
+        if inner.new_since_sweep >= POOL_GC_THRESHOLD {
+            // A slot held by no store is dead. Sweeping before the new
+            // insertion lands keeps the just-stored content out of this
+            // sweep's way entirely.
+            let mut reclaimed = 0u64;
+            inner.entries.retain(|_, slot| {
+                if std::sync::Arc::strong_count(slot) > 1 {
+                    true
+                } else {
+                    reclaimed += slot.len() as u64;
+                    false
+                }
+            });
+            inner.total_bytes -= reclaimed;
+            inner.new_since_sweep = 0;
+        }
+        if !inner.entries.contains_key(&id) {
+            let slot: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+            inner.total_bytes += bytes.len() as u64;
+            inner.new_since_sweep += 1;
+            inner.entries.insert(id, std::sync::Arc::clone(&slot));
+        }
+        std::sync::Arc::clone(&inner.entries[&id])
+    }
+}
+
+/// A [`SourceStore`] wired to a [`ContentPool`]: fresh contents dedup
+/// through the pool, everything else behaves exactly like
+/// [`MemorySourceStore`] — the per-store map is exclusively owned, so `get`
+/// stays zero-copy and [`collect_garbage`](SourceStore::collect_garbage)
+/// only ever drops this store's own handles.
+#[derive(Debug)]
+pub struct PooledSourceStore {
+    pool: ContentPool,
+    entries: FxHashMap<ContentId, std::sync::Arc<[u8]>>,
+    total_bytes: u64,
+}
+
+impl PooledSourceStore {
+    /// A store whose fresh contents dedup through `pool`.
+    #[must_use]
+    pub fn new(pool: &ContentPool) -> Self {
+        Self {
+            pool: pool.clone(),
+            entries: FxHashMap::default(),
+            total_bytes: 0,
+        }
+    }
+}
+
+impl SourceStore for PooledSourceStore {
+    fn put(&mut self, bytes: &[u8]) -> ContentId {
+        let id = content_hash(bytes);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.entries.entry(id) {
+            self.total_bytes += bytes.len() as u64;
+            entry.insert(self.pool.get_or_insert(id, bytes));
+        }
+        id
+    }
+
+    fn put_owned(&mut self, bytes: Vec<u8>) -> ContentId {
+        let id = content_hash(&bytes);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.entries.entry(id) {
+            self.total_bytes += bytes.len() as u64;
+            let slot: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+            let pooled = self.pool.get_or_insert(id, &slot);
+            entry.insert(pooled);
+        }
+        id
+    }
+
+    fn get(&self, id: ContentId) -> Option<&[u8]> {
+        self.entries.get(&id).map(std::sync::Arc::as_ref)
+    }
+
+    fn remove(&mut self, id: ContentId) -> bool {
+        match self.entries.remove(&id) {
+            Some(slot) => {
+                self.total_bytes -= slot.len() as u64;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn collect_garbage(&mut self, is_live: &dyn Fn(ContentId) -> bool) -> usize {
+        let before = self.entries.len();
+        let mut reclaimed = 0u64;
+        self.entries.retain(|id, slot| {
+            if is_live(*id) {
+                true
+            } else {
+                reclaimed += slot.len() as u64;
+                false
+            }
+        });
+        self.total_bytes -= reclaimed;
+        before - self.entries.len()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn len_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::content_id::content_hash;
+
+    /// Two stores over one pool hold each distinct content exactly once:
+    /// identical puts land on the same slot, the pool's footprint counts it
+    /// once, and each store's own view totals behave like a standalone
+    /// store's.
+    #[test]
+    fn pooled_stores_share_byte_storage() {
+        let pool = ContentPool::new();
+        let mut a = PooledSourceStore::new(&pool);
+        let mut b = PooledSourceStore::new(&pool);
+        let id = a.put(b"void main() {}");
+        assert_eq!(b.put(b"void main() {}"), id, "content addressing is global");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.len_bytes(), 14);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            a.len_bytes() + b.len_bytes(),
+            28,
+            "view totals are per-store"
+        );
+        assert_eq!(a.get(id), Some(&b"void main() {}"[..]));
+        assert_eq!(b.get(id), Some(&b"void main() {}"[..]));
+
+        // Fresh content inserts through the pool; `put_owned` moves. Views
+        // stay per-store: only a store that put content itself reads it.
+        let owned = b"void main() {}".to_vec();
+        assert_eq!(a.put_owned(owned), id, "owned insert keeps the slot");
+        let fresh = b"// fresh";
+        let fresh_id = a.put_owned(fresh.to_vec());
+        assert_eq!(pool.len(), 2);
+        assert_eq!(a.get(fresh_id), Some(&fresh[..]));
+        assert_eq!(b.get(fresh_id), None, "views are per-store");
+    }
+
+    /// A store's reclamation drops only its own handles: a sibling keeps
+    /// reading shared bytes after this store collected them as dead, and
+    /// the pool entry survives for exactly as long as some store holds it.
+    #[test]
+    fn pooled_gc_is_per_store_and_bytes_outlive_dropped_handles() {
+        let pool = ContentPool::new();
+        let mut a = PooledSourceStore::new(&pool);
+        let mut b = PooledSourceStore::new(&pool);
+        let id = a.put(b"shared bytes");
+        assert_eq!(b.put(b"shared bytes"), id);
+
+        assert_eq!(
+            a.collect_garbage(&|_: ContentId| false),
+            1,
+            "this store's handle is dropped"
+        );
+        assert_eq!(a.get(id), None);
+        assert_eq!(
+            b.get(id),
+            Some(&b"shared bytes"[..]),
+            "the sibling's view is untouched"
+        );
+        assert_eq!(pool.len(), 1, "the pool entry serves the live sibling");
+
+        // Once no store holds the slot, the entry is dead by refcount; the
+        // threshold-crossing fresh insert sweeps it, and a re-put
+        // reproduces the id byte-identically.
+        drop(b);
+        let mut churn = PooledSourceStore::new(&pool);
+        for i in 0..(POOL_GC_THRESHOLD as u64) {
+            churn.put(format!("churn {i}").as_bytes());
+        }
+        assert_eq!(
+            churn.get(id),
+            None,
+            "no store put it, so this store's view is empty"
+        );
+        assert_eq!(
+            churn.put(b"shared bytes"),
+            id,
+            "content addressing restores it"
+        );
+        assert_eq!(
+            pool.len(),
+            churn.len(),
+            "the dead entry was swept; the pool holds churn's live view"
+        );
+        assert_eq!(pool.len_bytes(), churn.len_bytes());
+    }
 
     #[test]
     fn put_dedups_identical_content() {

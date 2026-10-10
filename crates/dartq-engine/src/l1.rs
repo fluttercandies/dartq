@@ -20,7 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::event::{EngineEvent, RevalidateGate};
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, LibraryId,
-    LibraryInfo, PendingChange, SDK_TARGET, ScannedFace, UnitFacts,
+    LibraryInfo, PendingChange, ScannedFace, UnitFacts,
 };
 
 /// The outcome of one apply (engine-api-spec §1.2 `AffectedReport` payload).
@@ -327,7 +327,10 @@ fn recompute_facts(
             } else {
                 (payload, None)
             };
-            warmed.push((first, materialize_warm(first_payload, state, sources[first], &codes)));
+            warmed.push((
+                first,
+                materialize_warm(first_payload, state, sources[first], &codes),
+            ));
             if let Some(template) = rest {
                 for index in slots {
                     warmed.push((
@@ -353,7 +356,7 @@ fn recompute_facts(
     let mut resolver = UriResolver::new(
         &state.uri_packages,
         &state.sdk,
-        SDK_TARGET,
+        &state.target,
         &state.declared_variables,
         &mut state.files,
         &resident,
@@ -407,7 +410,9 @@ fn recompute_facts(
             .iter()
             .filter(|directive| directive.code.is_some())
             .count();
-        facts.diagnostics.truncate(facts.diagnostics.len() - uri_tail);
+        facts
+            .diagnostics
+            .truncate(facts.diagnostics.len() - uri_tail);
         resolve_unit(&mut facts, changed[index].0, &mut resolver);
         slots[index] = Some((Arc::new(facts), true));
     }
@@ -1775,6 +1780,8 @@ mod tests {
                 &self.config_dir,
                 SdkSnapshot::load(&self.root.join("sdk"), None).expect("synthetic SDK loads"),
                 crate::memory_store(),
+                "vm".to_owned(),
+                FxHashMap::default(),
             )
             .expect("engine state")
         }

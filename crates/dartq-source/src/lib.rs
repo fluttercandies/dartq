@@ -33,5 +33,5 @@ pub use locator::Locator;
 pub use source_range::{
     LineIndex, SourceRange, byte_offset_to_utf16, utf16_len_of, utf16_offset_to_byte,
 };
-pub use store::{MemorySourceStore, SourceStore};
+pub use store::{ContentPool, MemorySourceStore, PooledSourceStore, SourceStore};
 pub use string_table::{StringId, StringTable};

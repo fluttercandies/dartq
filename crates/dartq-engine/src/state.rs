@@ -58,11 +58,6 @@ const FACTS_SHAPE_VERSION: u32 = 5;
 pub const FACTS_SEMANTIC_VERSION: u32 =
     (FACTS_SHAPE_VERSION << 16) | (dartq_semantic::SIGNATURE_VERSION & 0xffff);
 
-/// The SDK target segment M1 resolves `dart:` URIs against. Context-level
-/// target selection is an M2 milestone (engine-api-spec §1.1); M1 pins the
-/// VM the way `dart analyze` defaults do.
-pub(crate) const SDK_TARGET: &str = "vm";
-
 /// Facts-cache capacity in entries. Steady-state residency is bounded by the
 /// live file set; this cache only memoizes *previous* contents so a
 /// change-back (git branch flip, undo) reparses for free. The entry cap
@@ -426,13 +421,19 @@ pub(crate) struct EngineState {
     /// URI-resolution face built from the same pub config (engine-api-spec
     /// §0, dartq-resolution `PackageTable`).
     pub uri_packages: UriPackageTable,
-    /// SDK snapshot; `dart:` targets resolve against [`SDK_TARGET`].
+    /// SDK snapshot; `dart:` targets resolve against [`Self::target`].
     pub sdk: SdkSnapshot,
+    /// The SDK target segment (the `libraries.json` panel — `vm`, `js`, …)
+    /// `dart:` URI resolution dispatches against. A context dimension
+    /// (#483): `EngineConfig::target` carries it, `"vm"` by default (the
+    /// `dart analyze` posture).
+    pub target: String,
     /// Declared variables (`DeclaredVariables`) of the conditional-import
     /// evaluation: the `-D name=value` pairs configurable directives test
-    /// against. Empty today — the no-`-D` oracle context
+    /// against. Empty by default — the no-`-D` oracle context
     /// (`driver.dart:583-593`), under which every configurable directive
-    /// resolves its primary URI; the CLI define surface populates this.
+    /// resolves its primary URI. A context dimension (#483):
+    /// `EngineConfig::declared_variables` carries it.
     pub declared_variables: FxHashMap<String, String>,
     /// Content-addressed byte storage, engine-owned (`Send + Sync` so the
     /// fan-out can hold `&EngineState`; jobs never touch the store —
@@ -542,6 +543,8 @@ impl EngineState {
         config_dir: &Path,
         sdk: SdkSnapshot,
         store: Box<dyn SourceStore + Send + Sync>,
+        target: String,
+        declared_variables: FxHashMap<String, String>,
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
         // Options are a context field: the include chains merge once here,
@@ -558,7 +561,8 @@ impl EngineState {
             packages,
             uri_packages,
             sdk,
-            declared_variables: FxHashMap::default(),
+            target,
+            declared_variables,
             store,
             files: FileTable::new(),
             strings: StringTable::new(),
@@ -678,7 +682,7 @@ impl EngineState {
     }
 
     /// A URI resolver over the engine's package table, SDK snapshot, and file
-    /// table; `dart:` URIs dispatch against [`SDK_TARGET`], conditional
+    /// table; `dart:` URIs dispatch against [`Self::target`], conditional
     /// directives evaluate against [`Self::declared_variables`]. Resolution
     /// interns directive targets into [`Self::files`], hence the exclusive
     /// borrow. `resident` is the file-state existence face — which interned
@@ -693,7 +697,7 @@ impl EngineState {
         UriResolver::new(
             &self.uri_packages,
             &self.sdk,
-            SDK_TARGET,
+            &self.target,
             &self.declared_variables,
             &mut self.files,
             resident,

@@ -118,6 +118,8 @@ impl Fixture {
             pub_config: Arc::clone(&self.config),
             config_dir: self.config_dir.clone(),
             semdiag: None,
+            target: dartq_engine::DEFAULT_TARGET.to_owned(),
+            declared_variables: rustc_hash::FxHashMap::default(),
         })
         .expect("engine")
     }
@@ -133,6 +135,8 @@ impl Fixture {
             pub_config: Arc::clone(&self.config),
             config_dir: self.config_dir.clone(),
             semdiag: Some(dartq_engine::semdiag::diagnoser()),
+            target: dartq_engine::DEFAULT_TARGET.to_owned(),
+            declared_variables: rustc_hash::FxHashMap::default(),
         })
         .expect("engine")
     }

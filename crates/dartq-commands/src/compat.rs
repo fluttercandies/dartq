@@ -154,6 +154,8 @@ fn analyze_axis(
         // the SDK-difference signal (`undefined_*` and friends) rides the
         // default diagnoser.
         semdiag: Some(semdiag::diagnoser()),
+        target: dartq_engine::DEFAULT_TARGET.to_owned(),
+        declared_variables: rustc_hash::FxHashMap::default(),
     })
     .map_err(|error| CompatError::Usage(format!("engine context unusable: {error}")))?;
 
