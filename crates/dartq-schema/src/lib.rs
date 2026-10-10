@@ -137,6 +137,20 @@
 //! | `matrix[].first_failure` |         | ● (when errors)     | ●    |
 //! | `matrix[].error`         |         | ● (on load failure) | ●    |
 //!
+//! Explain report rows (§15.3; the declaration's locators are the red
+//! line — `kind` is the row's semantic code. `minimal` drops the section
+//! arrays for the `counts` object, so the AI still sees which sections
+//! exist and are empty; `full` equals `compact` today):
+//!
+//! | field                    | minimal | compact | full |
+//! |--------------------------|---------|---------|------|
+//! | `symbol`                 | ●       | ●       | ●    |
+//! | `declaration`            | ●       | ●       | ●    |
+//! | `declaration.container`  |         | ●       | ●    |
+//! | section arrays (7)       | counts  | ●       | ●    |
+//! | `references[].qualified` | (count) | ●       | ●    |
+//! | `counts`                 | ●       |         |      |
+//!
 //! Tier-invariant faces: the impact report (every field is a locator or a
 //! verdict — nothing prose-like to trim; `since` is its token lever) and
 //! the run-metrics sidecar (a benchmark artifact, emitted complete or not
@@ -171,6 +185,9 @@
 //!   ([`diagnostics_schema`]; the `version` alias above).
 //! * [`Domain::FixPatch`] — the §15.6 patch document ([`fix_patch_schema`]).
 //! * [`Domain::Query`] — the §15.2 query answer ([`query_schema`]).
+//! * [`Domain::Explain`] — the §15.3 explain report
+//!   ([`explain_schema`]; `SCHEMA_VERSION_EXPLAIN` mirrors `dartq-ai`'s
+//!   authoritative constant).
 //! * [`Domain::Compat`] — the §15.5 compatibility report
 //!   ([`compat_schema`]; `SCHEMA_VERSION_COMPAT` mirrors `dartq-ai`'s
 //!   authoritative constant).
@@ -204,6 +221,7 @@ use serde_json::Value;
 
 mod compat;
 mod diagnostics;
+mod explain;
 mod fix_patch;
 mod impact;
 mod query;
@@ -212,6 +230,7 @@ mod support;
 
 pub use compat::{ERROR_KINDS, SCHEMA_VERSION_COMPAT, compat_schema};
 pub use diagnostics::{SCHEMA_VERSION_DIAGNOSTICS, diagnostics_schema};
+pub use explain::{SCHEMA_VERSION_EXPLAIN, explain_schema};
 pub use fix_patch::{SCHEMA_VERSION_FIX_PATCH, fix_patch_schema};
 pub use impact::{SCHEMA_VERSION_IMPACT, impact_schema};
 pub use query::{DECL_KINDS, REF_KINDS, SCHEMA_VERSION_QUERY, query_schema};
@@ -228,6 +247,8 @@ pub enum Domain {
     FixPatch,
     /// The §15.2 query answer (`dartq query --format=json`).
     Query,
+    /// The §15.3 explain report (`dartq-ai`'s `explain` query output).
+    Explain,
     /// The §15.5 compatibility report (`dartq compat`).
     Compat,
     /// The `--metrics-json` run summary (`dartq check` / `dartq analyze`).
@@ -283,6 +304,7 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::Diagnostics => diagnostics::validate_diagnostics(&value),
         Domain::FixPatch => fix_patch::validate_fix_patch(&value),
         Domain::Query => query::validate_query(&value),
+        Domain::Explain => explain::validate_explain(&value),
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
     }

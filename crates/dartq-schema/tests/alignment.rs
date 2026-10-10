@@ -6,13 +6,17 @@
 //! provenance live in `tests/output_faces.rs`.
 
 use dartq_ai::compatibility::{COMPAT_SCHEMA_VERSION, CompatReport};
+use dartq_ai::explain::{
+    DependencyRow, DeclarationRow, EXPLAIN_SCHEMA_VERSION, ExplainReport, MemberRow,
+    ReferenceRow, SectionCounts, SuperTypeRow,
+};
 use dartq_ai::impact::{
     AffectedTarget, AffectedTest, ChangedSymbol, EnvironmentImpact, IMPACT_SCHEMA_VERSION,
     ImpactLevel, ImpactReport,
 };
 use dartq_schema::{
-    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_DIAGNOSTICS, SCHEMA_VERSION_IMPACT,
-    SchemaViolation,
+    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_DIAGNOSTICS, SCHEMA_VERSION_EXPLAIN,
+    SCHEMA_VERSION_IMPACT, SchemaViolation,
 };
 
 /// Pin: dartq-ai owns the authoritative impact contract version; the schema
@@ -315,6 +319,115 @@ fn schema_documents_carry_the_version_constants() {
         diagnostics["properties"]["version"]["const"],
         SCHEMA_VERSION_DIAGNOSTICS
     );
+}
+
+/// Pin: dartq-ai owns the authoritative explain contract version; the
+/// schema crate's mirror must never drift.
+#[test]
+fn explain_version_constant_matches_dartq_ai() {
+    assert_eq!(SCHEMA_VERSION_EXPLAIN, EXPLAIN_SCHEMA_VERSION);
+}
+
+/// The compact explain report a real assembler emits passes validation.
+#[test]
+fn real_explain_report_passes_validation() {
+    let report = ExplainReport {
+        schema_version: EXPLAIN_SCHEMA_VERSION,
+        symbol: "Foo".to_owned(),
+        declaration: Some(DeclarationRow {
+            file: "a.dart".to_owned(),
+            name: "Foo".to_owned(),
+            kind: "class".to_owned(),
+            container: None,
+            range: [40, 43],
+        }),
+        inheritance: Some(vec![SuperTypeRow {
+            name: "Bar".to_owned(),
+            file: Some("a.dart".to_owned()),
+        }]),
+        interfaces: Some(Vec::new()),
+        constructors: Some(Vec::new()),
+        methods: Some(vec![MemberRow {
+            name: "area".to_owned(),
+            kind: "method".to_owned(),
+            range: [90, 93],
+        }]),
+        references: Some(vec![ReferenceRow {
+            file: "b.dart".to_owned(),
+            kind: "invoked".to_owned(),
+            range: [10, 13],
+            qualified: false,
+        }]),
+        dependencies: Some(vec![DependencyRow {
+            path: "package:t/b.dart".to_owned(),
+        }]),
+        affected_tests: Some(vec![AffectedTest {
+            path: "package:t/a_test.dart".to_owned(),
+        }]),
+        counts: None,
+    };
+    let payload = serde_json::to_string(&report).expect("serialize");
+    validate_ok(&payload, Domain::Explain);
+}
+
+/// The minimal explain report — declaration plus counts, no arrays —
+/// passes validation too.
+#[test]
+fn minimal_explain_report_passes_validation() {
+    let report = ExplainReport {
+        schema_version: EXPLAIN_SCHEMA_VERSION,
+        symbol: "Foo".to_owned(),
+        declaration: Some(DeclarationRow {
+            file: "a.dart".to_owned(),
+            name: "Foo".to_owned(),
+            kind: "class".to_owned(),
+            container: None,
+            range: [40, 43],
+        }),
+        inheritance: None,
+        interfaces: None,
+        constructors: None,
+        methods: None,
+        references: None,
+        dependencies: None,
+        affected_tests: None,
+        counts: Some(SectionCounts {
+            inheritance: 1,
+            interfaces: 0,
+            constructors: 0,
+            methods: 1,
+            references: 1,
+            dependencies: 1,
+            affected_tests: 1,
+        }),
+    };
+    let payload = serde_json::to_string(&report).expect("serialize");
+    validate_ok(&payload, Domain::Explain);
+}
+
+#[test]
+fn misspelled_explain_member_kind_is_named() {
+    let value = serde_json::to_value(ExplainReport {
+        schema_version: EXPLAIN_SCHEMA_VERSION,
+        symbol: "Foo".to_owned(),
+        declaration: None,
+        inheritance: Some(Vec::new()),
+        interfaces: Some(Vec::new()),
+        constructors: Some(Vec::new()),
+        methods: Some(vec![MemberRow {
+            name: "area".to_owned(),
+            kind: "constructor".to_owned(),
+            range: [90, 93],
+        }]),
+        references: Some(Vec::new()),
+        dependencies: Some(Vec::new()),
+        affected_tests: Some(Vec::new()),
+        counts: None,
+    })
+    .expect("value");
+    let violation = violation_of(&value.to_string(), Domain::Explain);
+    assert_eq!(violation.path, "methods[0].kind");
+    assert_eq!(violation.found, "\"constructor\"");
 }
 
 fn validate_ok(payload: &str, domain: Domain) {

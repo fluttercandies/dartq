@@ -107,6 +107,22 @@ pub(crate) fn non_negative_or_null(value: &Value, path: &str) -> Result<(), Sche
     non_negative(value, path).map(|_| ())
 }
 
+/// A §15.8.5 `[startOffset, endOffset)` range pair — the range spelling
+/// faces designed under the token-economics rule adopt (older faces keep
+/// their pinned `offset`+`length` columns).
+pub(crate) fn range_pair(value: &Value, path: &str) -> Result<(), SchemaViolation> {
+    let pair = array(value, path)?;
+    if pair.len() != 2 {
+        return Err(violation(
+            path,
+            "a two-element [start, end) array",
+            describe(value),
+        ));
+    }
+    non_negative(&pair[0], &join(path, "start"))?;
+    non_negative(&pair[1], &join(path, "end")).map(|_| ())
+}
+
 pub(crate) fn field<'v>(
     obj: &'v Map<String, Value>,
     key: &str,
