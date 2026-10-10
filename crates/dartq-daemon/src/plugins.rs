@@ -231,14 +231,23 @@ impl PluginSet {
     /// The graceful session-end teardown: `shutdown` per live runtime (the
     /// graceful handshake; `Drop` alone is kill-only). Errors are logged,
     /// never propagated — teardown quality does not affect the session's
-    /// outcome.
+    /// outcome. Each live plugin emits one structured §14.3 stats line (the
+    /// evidence round's per-plugin numbers); the snapshot is read before the
+    /// handshake consumes the runtime, and a dead slot's counters died with
+    /// its dropped runtime — its crash row already recorded the death.
     pub fn shutdown(self) {
         for slot in self.plugins {
             if let Some(runtime) = slot.runtime {
                 let name = &slot.name;
+                let stats = runtime.stats();
                 if let Err(error) = runtime.shutdown() {
                     eprintln!("dartq-daemon: plugin `{name}` shutdown failed: {error}");
                 }
+                eprintln!(
+                    "dartq-daemon: plugin stats `{name}`: peak_rss_bytes={} restarts={} \
+                     frames_in={} frames_out={}",
+                    stats.peak_rss_bytes, stats.restarts, stats.frames_in, stats.frames_out,
+                );
             }
         }
     }

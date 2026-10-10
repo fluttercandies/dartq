@@ -168,8 +168,9 @@ fn overlay_change_reflects_in_diagnostics_and_never_touches_disk() {
     );
     // The accelerator persisted the overlay-fed facts: the flush wrote a
     // generation per context under the store root (PRD §16 warm start).
-    let generations =
-        fs::read_dir(root.join("snapshots")).expect("snapshots dir").count();
+    let generations = fs::read_dir(root.join("snapshots"))
+        .expect("snapshots dir")
+        .count();
     assert!(generations >= 1, "a generation is written");
 }
 

@@ -125,6 +125,9 @@ pub(crate) mod probe {
         /// Thread-local so a parallel test's read group cannot steal an
         /// armed trigger between `arm` and the owner's own turn.
         static READ_PANIC: Cell<bool> = const { Cell::new(false) };
+        /// Same seam for the write-task arm (the apply path's containment
+        /// pin): one-shot, thread-local.
+        static WRITE_PANIC: Cell<bool> = const { Cell::new(false) };
         /// Only the measuring test's thread counts, so concurrent tests on
         /// other threads (parallel harnesses) never pollute the numbers.
         static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -217,5 +220,15 @@ pub(crate) mod probe {
 
     pub(crate) fn take_read_panic() -> bool {
         READ_PANIC.with(|armed| armed.replace(false))
+    }
+
+    /// Arms the next write task's apply to panic once (the write path's
+    /// containment pin).
+    pub(crate) fn arm_write_panic() {
+        WRITE_PANIC.with(|armed| armed.set(true));
+    }
+
+    pub(crate) fn take_write_panic() -> bool {
+        WRITE_PANIC.with(|armed| armed.replace(false))
     }
 }

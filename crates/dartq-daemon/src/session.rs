@@ -939,6 +939,10 @@ impl Session {
                 self.write = None;
                 let context_ids = self.context_ids.clone();
                 let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if crate::probe::take_write_panic() {
+                        panic!("test-armed write panic");
+                    }
                     // The base write fans out to every context: content is
                     // not a fork dimension (§16.2), so each context's view
                     // of the workspace moves with the edit.
@@ -963,9 +967,20 @@ impl Session {
                     }
                     Err(payload) => {
                         eprintln!(
-                            "dartq-daemon: overlay apply panicked ({}); the write did not land",
+                            "dartq-daemon: overlay apply panicked ({}); the write did not land; \
+                             the edits are restaged for the next write task",
                             panic_message(&payload)
                         );
+                        // Re-stage the taken changes (last-wins merge with
+                        // anything a new edit stages) WITHOUT re-enqueueing
+                        // the write task: the next real intake re-queues via
+                        // ensure_write and applies the merged latest bytes.
+                        // Re-enqueueing here would retry the same panicked
+                        // apply every drain — a deterministic panic must not
+                        // become a self-driven loop.
+                        for change in changes {
+                            self.stage(change);
+                        }
                     }
                 }
             } else {
@@ -1258,12 +1273,14 @@ impl Session {
                     });
             let merged = plugins::merge(engine_rows, plugin_findings);
             // The crash row is one-shot: it rides this push but never the
-            // published-state baseline (no engine row carries the code, so
-            // the code constant is an exact marker), or every later clean
-            // cycle would republish the file to reconcile it away.
+            // published-state baseline, or every later clean cycle would
+            // republish the file to reconcile it away. The marker is
+            // code+source — plugin codes are free-form, so a plugin emitting
+            // the crash code under its own source keeps its rows and its
+            // baseline.
             let retained: Vec<_> = merged
                 .iter()
-                .filter(|(_, row)| row.code != dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name)
+                .filter(|(_, row)| !Self::is_engine_crash_row(row))
                 .cloned()
                 .collect();
             turn.publishes.extend(self.plan_publishes(merged, retained));
@@ -1583,6 +1600,15 @@ impl Session {
     fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
         self.engine_mut(context)
             .analyze(&[], &mut |_| {}, &CancellationToken::default())
+    }
+
+    /// The one-shot plugin crash row's exact marker: the crash CODE under the
+    /// engine's own `source` tag (the convert pass stamps every engine row
+    /// `dartq`). Code alone is not exact — plugin codes are free-form, so a
+    /// plugin emitting the crash code under its own source must keep its rows
+    /// in the retained baseline.
+    fn is_engine_crash_row(row: &lsp::Diagnostic) -> bool {
+        row.code == dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name && row.source == "dartq"
     }
 
     /// Diffs the fresh row set against the published baseline and returns
@@ -3046,6 +3072,117 @@ mod tests {
             "the session survives the panic: {:?}",
             turn.answers[0]
         );
+    }
+
+    /// The write path's containment: a panicking apply does not lose the
+    /// client's staged edits — they are restaged (last-wins) and the next
+    /// real intake's write task applies them. Re-enqueueing immediately
+    /// would retry the same panicked apply every drain, so the restage
+    /// deliberately waits for new intake instead.
+    #[test]
+    fn a_panicking_write_restages_the_edits_for_the_next_apply() {
+        let (workspace, mut session) = fixture("write-panic-unit");
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The apply panics; the engine keeps its old view and the edits come
+        // back staged.
+        assert!(session.queue_edit(&uri, "var client = 1;\n", 2));
+        crate::probe::arm_write_panic();
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the write did not land, so nothing changed: {:?}",
+            turn.publishes
+        );
+        assert!(
+            !session.staged.is_empty(),
+            "the edits are restaged, not dropped"
+        );
+        let main_path = workspace.path("lib/main.dart");
+        let main_file = session
+            .engine(session.default_context)
+            .file_table()
+            .try_file_id(main_path.as_path())
+            .expect("the swept file is resident");
+        assert_eq!(
+            session
+                .engine(session.default_context)
+                .content(main_file)
+                .expect("resident content"),
+            BROKEN_MAIN.as_bytes(),
+            "the panicked apply did not land"
+        );
+
+        // The next real intake applies the restaged edit alongside the new
+        // one — the client's first word is not lost.
+        let second = crate::uri::from_path(&workspace.path("lib/second.dart"));
+        assert!(session.queue_edit(&second, "var second = 2;\n", 1));
+        let turn = session.service();
+        assert!(
+            !turn.publishes.is_empty(),
+            "the reconciled push drains: {:?}",
+            turn.publishes
+        );
+        let engine = session.engine(session.default_context);
+        let main_file = engine
+            .file_table()
+            .try_file_id(main_path.as_path())
+            .expect("the swept file is resident");
+        assert_eq!(
+            engine.content(main_file).expect("resident content"),
+            "var client = 1;\n".as_bytes(),
+            "the restaged edit applied with the next write task"
+        );
+        let second_file = engine
+            .file_table()
+            .try_file_id(workspace.path("lib/second.dart").as_path())
+            .expect("the overlay-only file is interned by its apply");
+        assert_eq!(
+            engine.content(second_file).expect("overlay content"),
+            "var second = 2;\n".as_bytes()
+        );
+    }
+
+    /// The retained-baseline marker is code+source, not code alone: a
+    /// plugin emitting the crash code under its own source keeps its rows
+    /// (its baseline must stabilize); only the engine's own row is one-shot.
+    #[test]
+    fn crash_row_marker_matches_code_and_source() {
+        let engine_row = lsp::Diagnostic {
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp::Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            severity: 1,
+            code: dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name.to_owned(),
+            source: "dartq".into(),
+            message: "plugin `echo` crashed".into(),
+        };
+        assert!(Session::is_engine_crash_row(&engine_row));
+
+        let colliding = lsp::Diagnostic {
+            source: "echo".into(),
+            ..engine_row.clone()
+        };
+        assert!(
+            !Session::is_engine_crash_row(&colliding),
+            "a plugin's own code collision is not a one-shot row"
+        );
+
+        let ordinary = lsp::Diagnostic {
+            code: "uri_does_not_exist".into(),
+            ..engine_row
+        };
+        assert!(!Session::is_engine_crash_row(&ordinary));
     }
 
     /// The shared overlay store is swept at the turn boundary (daemon-audit
