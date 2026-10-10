@@ -416,6 +416,7 @@ mod tests {
         .decl(INT, Vec::new())
         .decl(ITERABLE, vec![iterable_e])
         .supertype(NUM, itf(&table, OBJECT, &[]))
+        .supertype(INT, itf(&table, NUM, &[]))
         .supertype(ITERABLE, itf(&table, OBJECT, &[]))
         .build(&table)
         .expect("fixture hierarchy is valid");
@@ -447,7 +448,9 @@ mod tests {
         );
         // meet = index | index (shared_type.dart:129-134).
         assert_eq!(Variance::Covariant.meet(Variance::Contravariant), Variance::Invariant);
-        assert_eq!(Variance::Unrelated.meet(Variance::Invariant), Variance::Unrelated);
+        // `Unrelated` is the lattice top: its encoding 0 ORs away, so the
+        // meet of top with anything is that thing.
+        assert_eq!(Variance::Unrelated.meet(Variance::Invariant), Variance::Invariant);
         assert_eq!(Variance::Covariant.meet(Variance::Invariant), Variance::Invariant);
         // greaterThanOrEqual (shared_type.dart:109-127).
         assert!(Variance::Unrelated.greater_or_equal(Variance::Invariant));

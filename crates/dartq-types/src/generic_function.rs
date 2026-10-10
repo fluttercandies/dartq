@@ -432,8 +432,31 @@ mod tests {
             instantiate_function(&table, int, &[int]),
             Err(TypeError::NotFunctionType { .. })
         ));
-        // The empty short-circuit (type.dart:316-318).
-        assert!(matches!(instantiate_function(&table, identity, &[]), Ok(ty) if ty == identity));
+        // The arity check precedes the empty short-circuit
+        // (type.dart:311-318): zero arguments against one type parameter
+        // is the ArgumentError.
+        assert!(matches!(
+            instantiate_function(&table, identity, &[]),
+            Err(TypeError::FunctionInstantiationArity { expected: 1, actual: 0 })
+        ));
+        // The empty short-circuit (type.dart:316-318) fires only for
+        // non-generic functions: the receiver returns itself.
+        let non_generic = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: int,
+                    type_parameters: Vec::new(),
+                    positional: vec![int],
+                    named: Vec::new(),
+                    required_positional: 1,
+                },
+                false,
+            )
+            .expect("signature is well-formed");
+        assert!(matches!(
+            instantiate_function(&table, non_generic, &[]),
+            Ok(ty) if ty == non_generic
+        ));
     }
 
     /// The replacement walk (replace_top_bottom_visitor.dart:20-61): tops

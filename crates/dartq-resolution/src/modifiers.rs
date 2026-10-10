@@ -1524,52 +1524,58 @@ mod tests {
             Some(ModifierCode::MixinSubtypeOfBaseIsNotBase)
         );
 
-        // Final family (:259-294) with the carve-out (:262-279).
-        let ancestor_final = ExplicitBaseFinal {
+        // Final family (:259-294). The reportable cross-library shape
+        // (:262-279): the super library predates class modifiers, the
+        // ancestor library is the SDK, and the check is not
+        // implements-anchored — only then does the carve-out stay silent
+        // and the error report.
+        let ancestor_final_sdk = ExplicitBaseFinal {
             modifiers: final_super,
             library: SDK,
             same_library: false,
+        };
+        let mut reportable_final = input(plain_element, final_super, Some(ancestor_final_sdk), false);
+        reportable_final.super_library = PRE_MODIFIERS;
+        assert_eq!(
+            subtype_restriction_violation(&reportable_final),
+            Some(ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed)
+        );
+        // A same-library ancestor skips the carve-out guard entirely
+        // (:263 — the guard sits inside `ancestor.library != element.library`).
+        let ancestor_final_local = ExplicitBaseFinal {
+            modifiers: final_super,
+            library: USER,
+            same_library: true,
         };
         assert_eq!(
             subtype_restriction_violation(&input(
                 plain_element,
                 final_super,
-                Some(ancestor_final),
+                Some(ancestor_final_local),
                 false
             )),
             Some(ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed)
         );
-        // Carve-out: cross-library ancestor under a modifiers-enabled
-        // super library stays silent.
-        let enabled_super_library = ExplicitBaseFinal {
-            modifiers: final_super,
-            library: SDK,
-            same_library: false,
-        };
-        let mut carve_out = input(plain_element, final_super, Some(enabled_super_library), false);
-        carve_out.super_library.has_class_modifiers = true;
+        // Carve-out leg 1: cross-library ancestor under a
+        // modifiers-enabled super library stays silent.
+        let mut carve_out = input(plain_element, final_super, Some(ancestor_final_sdk), false);
+        carve_out.super_library = USER;
         assert_eq!(subtype_restriction_violation(&carve_out), None);
-        // Carve-out lifted when the ancestor library is not the SDK.
-        let mut user_ancestor = input(plain_element, final_super, Some(ancestor_base), false);
-        user_ancestor.explicit_base_or_final = Some(ExplicitBaseFinal {
+        // Carve-out leg 2: a non-SDK ancestor library stays silent
+        // (the `!baseOrFinalSuperElement.library.isInSdk` disjunct).
+        let ancestor_final_user = ExplicitBaseFinal {
             modifiers: final_super,
             library: USER,
             same_library: false,
-        });
-        assert_eq!(
-            subtype_restriction_violation(&user_ancestor),
-            Some(ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed)
-        );
-        // Carve-out bypassed via the implements anchor.
-        assert_eq!(
-            subtype_restriction_violation(&input(
-                plain_element,
-                final_super,
-                Some(ancestor_final),
-                true
-            )),
-            None
-        );
+        };
+        let mut carve_out_user = input(plain_element, final_super, Some(ancestor_final_user), false);
+        carve_out_user.super_library = PRE_MODIFIERS;
+        assert_eq!(subtype_restriction_violation(&carve_out_user), None);
+        // Carve-out leg 3: the implements anchor stays silent
+        // (the `implementsNamedType != null` disjunct).
+        let mut carve_out_impl = input(plain_element, final_super, Some(ancestor_final_sdk), true);
+        carve_out_impl.super_library = PRE_MODIFIERS;
+        assert_eq!(subtype_restriction_violation(&carve_out_impl), None);
 
         // An element that is already base/final/sealed never reports
         // (:258).
@@ -1583,25 +1589,52 @@ mod tests {
             None
         );
 
-        // The implements-anchored base branch (:240-256): sealed super,
-        // cross-library base ancestor.
-        let sealed_super = class_mods(false, false, false, true);
+        // The implements-anchored base branch (:240-256): the super
+        // element is sealed *and* carries the induced base flag — sealed
+        // classes inherit `isBase` from a base supertype
+        // (instance_member_inferrer.dart:679-680) — so the trigger
+        // (:189-202) fires and the cross-library base ancestor reports.
+        let sealed_base_super = class_mods(true, false, false, true);
         assert_eq!(
             subtype_restriction_violation(&input(
                 plain_element,
-                sealed_super,
+                sealed_base_super,
                 Some(ancestor_base),
                 true
             )),
             Some(ModifierCode::BaseClassImplementedOutsideOfLibrary)
         );
+        // Without the induced base flag the trigger never fires — that
+        // shape is the direct error_verifier walk's (:3712-3752), not
+        // this verifier's.
+        assert_eq!(
+            subtype_restriction_violation(&input(
+                plain_element,
+                class_mods(false, false, false, true),
+                Some(ancestor_base),
+                true
+            )),
+            None
+        );
 
-        // The platform exemption measured against the ancestor's library
-        // (:208-210): SDK use site under an SDK ancestor is exempt.
-        let sdk_element = input(plain_element, base_super, Some(ancestor_base), false);
-        let mut sdk_use = sdk_element;
+        // The platform exemption is measured against the ANCESTOR's
+        // library (:164-166, :208-210): an SDK use site under an SDK
+        // ancestor is exempt; a user-library ancestor never exempts.
+        let ancestor_base_sdk = ExplicitBaseFinal {
+            modifiers: base_super,
+            library: SDK,
+            same_library: false,
+        };
+        let mut sdk_use = input(plain_element, base_super, Some(ancestor_base_sdk), false);
         sdk_use.element_library = SDK;
         assert_eq!(subtype_restriction_violation(&sdk_use), None);
+        let mut user_ancestor_sdk_use =
+            input(plain_element, base_super, Some(ancestor_base), false);
+        user_ancestor_sdk_use.element_library = SDK;
+        assert_eq!(
+            subtype_restriction_violation(&user_ancestor_sdk_use),
+            Some(ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed)
+        );
     }
 
     #[test]
@@ -1615,13 +1648,18 @@ mod tests {
 
         // Non-sealed elements never carry induced flags (:651-653).
         assert_eq!(induced_modifier(&plain, Some(&base), &[], &[]), None);
-        // Final mixin face first (:655-659).
+        // `mixins.any(isFinal)` (:655-659) is unreachable from the element
+        // model: visitMixinDeclaration records only `isBase` on mixin
+        // fragments (element_builder.dart:1973-1980), and the verifier's
+        // own kind gate agrees (base_or_final_type_verifier.dart:331-340).
+        // The Mixin-kind value below carries an unrepresentable flag; the
+        // gate ignores it and the walk falls to the base-supertype branch.
         let mut final_mixin = plain;
         final_mixin.kind = DeclKind::Mixin;
         final_mixin.is_final = true;
         assert_eq!(
             induced_modifier(&sealed, Some(&base), &[], &[final_mixin]),
-            Some(InducedModifier::Final)
+            Some(InducedModifier::Base)
         );
         // Final supertype (:661-666).
         assert_eq!(
