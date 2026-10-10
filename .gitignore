@@ -8,6 +8,8 @@
 /.dart_tool/
 # pub-get artifacts inside test corpora (machine-specific absolute paths)
 tests/corpus/*/.dart_tool/
+# generated mega-corpus output (corpus-gen serial phase)
+tests/corpus/mega/
 build/
 *.iml
 

@@ -1,0 +1,21 @@
+[package]
+name = "corpus-gen"
+description = "Deterministic synthetic Dart corpus generator for scale and differential testing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "corpus_gen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "corpus-gen"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
