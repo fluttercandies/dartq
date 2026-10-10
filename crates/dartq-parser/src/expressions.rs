@@ -599,10 +599,31 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     ) -> (TokenSpan, TypeParamOrArg) {
         let is_bang =
             self.peek_kind() == TokenKind::Bang && self.cursor.look_kind(1) == TokenKind::Lt;
-        let type_arg = self.compute_type_param_or_arg_at(1, false);
+        // The official probe is `bangToken.next` (`computeMethodTypeArguments`,
+        // `type_info.dart:485`): one past the `!` when one is present,
+        // otherwise the `<` is the peek itself (`g<A, A>;`, `c.m<D>(...)`).
+        let lt_offset = usize::from(is_bang);
+        let type_arg = self.compute_type_param_or_arg_at(lt_offset, false);
         if matches!(type_arg, TypeParamOrArg::None) {
             // No group: the official `token` is left unchanged.
             return (current, type_arg);
+        }
+        // `_mayFollowTypeArgs` (`type_info.dart:521`, testable enumeration
+        // :565-574): the split successor of the group's closer decides type
+        // arguments vs relational operators (`f(a<b,c>(d))` vs
+        // `f(a<b,c>-d)`). A raw compound closer's split remainder `>` is
+        // never an allowed follower.
+        let before_group = if is_bang {
+            self.peek_id()
+        } else {
+            self.cursor
+                .last_consumed_id()
+                .expect("the block only runs after a parsed operand")
+        };
+        if type_arg.ends_on_raw_compound()
+            || !self.may_follow_type_args_at(type_arg.skip(before_group))
+        {
+            return (current, TypeParamOrArg::None);
         }
         if is_bang {
             let bang = self.peek_span();
@@ -617,6 +638,26 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return (end, TypeParamOrArg::None);
         }
         (end, type_arg)
+    }
+
+    /// `_mayFollowTypeArgs`'s allowed follower set (the `TokenType` names
+    /// behind the 256-entry table, `type_info.dart:565-574`) read at the id
+    /// after `closer`.
+    fn may_follow_type_args_at(&self, closer: crate::token_id::TokenId) -> bool {
+        matches!(
+            self.kind_at(self.offset_of(closer) + 1),
+            TokenKind::OpenParen
+                | TokenKind::Period
+                | TokenKind::EqEq
+                | TokenKind::BangEq
+                | TokenKind::CloseParen
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::Semicolon
+                | TokenKind::Colon
+                | TokenKind::Comma
+                | TokenKind::Eof
+        )
     }
 
     /// `rewriteSquareBrackets` (:4743) for the linear cursor: consume the

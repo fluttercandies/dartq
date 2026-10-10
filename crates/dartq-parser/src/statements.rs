@@ -541,8 +541,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         // `parseExpressionStatementOrDeclarationAfterModifiers`, gated on
         // `beforeType == start`): with no modifiers and a nullable
         // could-be-expression type, decide between `X? y;` and `a ? b : ...`.
-        // The official `=`-arm speculation needs the #20 cascade engine, so
-        // that arm keeps the type.
         if no_modifiers && !for_parts && matches!(type_info, TypeInfo::SimpleNullable) {
             if !self.peek_is_identifier() {
                 let next = self.peek_span();
@@ -554,11 +552,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 let _ = id;
             }
             let after_identifier = self.cursor.look_kind(1);
-            if !matches!(
+            let mut drop_type = !matches!(
                 after_identifier,
                 TokenKind::Semicolon | TokenKind::Comma | TokenKind::CloseParen | TokenKind::Eof
-            ) && !matches!(after_identifier, TokenKind::Keyword(_))
-            {
+            ) && !matches!(after_identifier, TokenKind::Keyword(_));
+            if after_identifier == TokenKind::Eq {
+                // Official `=`-arm speculation (parser_impl.dart:9980-9999):
+                // parse past the initializer expression (no cascades, with
+                // the listener and rewriter swapped out) — only a following
+                // `:` makes this a conditional expression, so `int? y = null;`
+                // keeps the declaration.
+                let lands_on_colon = {
+                    let mut spec = self.fork_for_speculation();
+                    spec.cursor.advance(); // `=`
+                    let _ = spec.parse_expression_without_cascade();
+                    spec.peek_kind() == TokenKind::Colon
+                };
+                drop_type = lands_on_colon;
+            }
+            if drop_type {
                 // Looks like part of a conditional expression: drop the type
                 // and parse the statement from its start.
                 self.cursor.reset(before_type);

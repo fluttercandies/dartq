@@ -540,6 +540,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             let mut complex = self.complex_from_here(type_param);
             complex.compute_prefixed_type(self, required);
+            // computePrefixedType's optional-shape veto (type_info_impl.dart
+            // :1081-1084): in a non-required position `id.id<...>` stays an
+            // expression head unless a declaration name follows the type end
+            // (`c.m<D>(x);` vs `p.F<int> v;`).
+            let follower_nameish =
+                !complex.end_raw_compound && self.looks_like_name_at_id(complex.end + 1);
+            if !required && complex.gft_has_return_type.is_none() && !follower_nameish {
+                return TypeInfo::NoType;
+            }
             return TypeInfo::Complex(complex);
         }
         // `id.` non-identifier.

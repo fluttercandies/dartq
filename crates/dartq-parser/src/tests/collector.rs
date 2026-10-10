@@ -116,6 +116,30 @@ impl ParserListener for Collector {
     fn end_type_arguments(&mut self, _: usize, _: TokenSpan, _: TokenSpan) {
         self.log.push(("end", "type_arguments"));
     }
+    fn handle_send(&mut self, _: TokenSpan, _: TokenSpan) {
+        self.log.push(("handle", "send"));
+    }
+    fn handle_type_argument_application(&mut self, _: TokenSpan) {
+        self.log.push(("handle", "type_argument_application"));
+    }
+    fn begin_function_typed_formal_parameter(&mut self, _: TokenSpan) {
+        self.log.push(("begin", "function_typed_formal"));
+    }
+    fn end_function_typed_formal_parameter(&mut self, _: TokenSpan, _: Option<TokenSpan>) {
+        self.log.push(("end", "function_typed_formal"));
+    }
+    fn begin_optional_formal_parameters(&mut self, _: TokenSpan) {
+        self.log.push(("begin", "optional_formal_parameters"));
+    }
+    fn end_optional_formal_parameters(
+        &mut self,
+        _count: usize,
+        _: TokenSpan,
+        _: TokenSpan,
+        _: crate::listener::MemberKind,
+    ) {
+        self.log.push(("end", "optional_formal_parameters"));
+    }
     fn begin_record_type(&mut self, _: TokenSpan) {
         self.log.push(("begin", "record_type"));
     }
