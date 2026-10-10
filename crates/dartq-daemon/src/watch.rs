@@ -1,4 +1,4 @@
-//! File-watch for `dartiq daemon --watch` (PRD §16.7, mode 3 — the optional
+//! File-watch for `dartq daemon --watch` (PRD §16.7, mode 3 — the optional
 //! convenience layer; explicit push and ContentId verification stay the
 //! truth).
 //!
