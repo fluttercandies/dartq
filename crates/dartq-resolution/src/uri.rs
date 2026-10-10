@@ -18,7 +18,7 @@
 //! `../x.dart` from `package:p/a/b.dart` selects `package:p/x.dart`, i.e.
 //! `lib/x.dart`, not `root/x.dart`.
 
-use std::collections::hash_map::Entry;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use dartq_pub::{PackageConfig, PubError, normalize};
@@ -70,10 +70,16 @@ pub enum UnresolvedKind {
     /// as `uri_has_not_been_generated` (the URI layer carries this in
     /// [`UriResolution::code`] while keeping the [`ResolvedUri::Package`]/[
     /// `ResolvedUri::File`] shape, so this variant is for upper layers).
+    /// Upper-layer-only contract: never constructed in this crate until the
+    /// file-role boundary lands (#119 lineage) — the gap is deliberate, not
+    /// an oversight.
     Generated,
     /// The target file exists but is a part file — decided by the
     /// library-graph layer, which alone knows file roles; reported as
-    /// `import_of_non_library` / `export_of_non_library`.
+    /// `import_of_non_library` / `export_of_non_library`. Upper-layer-only
+    /// contract: never constructed in this crate until the file-role
+    /// boundary lands (#119 lineage) — the gap is deliberate, not an
+    /// oversight.
     NotLibrary,
     /// The selected URI is `dart-ext:`; reported as
     /// `use_of_native_extension` (additive to the spec draft, which has no
@@ -137,17 +143,23 @@ pub enum DirectiveKind {
 /// the two tables can never diverge.
 #[derive(Debug)]
 pub struct PackageTable {
-    lib_dirs: FxHashMap<Box<str>, PathBuf>,
-    /// Directory holding `.dart_tool/` — the base of the generated-file
-    /// fallback.
-    workspace_root: PathBuf,
-    /// Package lib dirs sorted by component depth, deepest first —
+    /// Package lib dirs with their names, sorted by component depth (deepest
+    /// first) — the single owned copy in the table. It serves both faces:
     /// [`package_of`]'s scan index (the dartq-package `containing` shape:
     /// depths are computed once, a nested root always has strictly more
     /// components than any root it is contained by, and two distinct roots
     /// of equal depth can never both be a component prefix of one path, so
-    /// the first hit is the deepest).
-    by_depth: Vec<(PathBuf, Box<str>)>,
+    /// the first hit is the deepest) and, positioned by `indices`,
+    /// [`Self::lib_dir`].
+    lib_dirs: Vec<(PathBuf, Box<str>)>,
+    /// Package name → position in `lib_dirs` — the per-directive hot path's
+    /// O(1) `lib_dir` face without a second copy of any lib dir. Names are
+    /// unique (duplicate names are a hard error in the shared dartq-pub
+    /// face), so one name owns one position.
+    indices: FxHashMap<Box<str>, usize>,
+    /// Directory holding `.dart_tool/` — the base of the generated-file
+    /// fallback.
+    workspace_root: PathBuf,
 }
 
 /// A lib dir in the spelling universe the identity layer keys files under:
@@ -176,32 +188,34 @@ impl PackageTable {
     /// grammar, or a `packageUri` escaping its root; a broken config,
     /// reported loudly.
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
-        let mut lib_dirs: FxHashMap<Box<str>, PathBuf> = FxHashMap::default();
+        let mut lib_dirs: Vec<(PathBuf, Box<str>)> = Vec::new();
         for resolved in config.resolve(config_dir)? {
-            lib_dirs.insert(
-                Box::from(resolved.name.as_str()),
+            lib_dirs.push((
                 canonical_dir(&resolved.lib_dir),
-            );
+                Box::from(resolved.name.as_str()),
+            ));
         }
-        let mut by_depth: Vec<_> = lib_dirs
+        lib_dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.components().count()));
+        let indices: FxHashMap<Box<str>, usize> = lib_dirs
             .iter()
-            .map(|(name, dir)| (dir.clone(), name.clone()))
+            .enumerate()
+            .map(|(index, (_, name))| (name.clone(), index))
             .collect();
-        by_depth.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.components().count()));
         let workspace_root = config_dir
             .parent()
             .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
         Ok(Self {
             lib_dirs,
+            indices,
             workspace_root,
-            by_depth,
         })
     }
 
     /// The lib dir of package `name`, or `None` for an unknown package.
     #[must_use]
     pub fn lib_dir(&self, name: &str) -> Option<&Path> {
-        self.lib_dirs.get(name).map(PathBuf::as_path)
+        let index = *self.indices.get(name)?;
+        Some(self.lib_dirs[index].0.as_path())
     }
 }
 
@@ -228,6 +242,16 @@ pub struct UriResolver<'a> {
     /// outside residency.
     resident: &'a dyn Fn(FileId) -> bool,
     bases: FxHashMap<FileId, BaseUri>,
+    /// Canonical URIs memoized per `FileTable`-normalized path for this
+    /// resolver's lifetime — the package table cannot change under a live
+    /// resolver, so [`Self::canonical_uri`] pays its package scan once per
+    /// path instead of once per call.
+    canonical: FxHashMap<PathBuf, Box<str>>,
+    /// Existence answers memoized per normalized path for this resolver's
+    /// lifetime — the analyzed world is frozen while one resolver runs, so
+    /// [`Self::exists`] pays its stat once per target instead of once per
+    /// directive naming it.
+    existence: FxHashMap<PathBuf, bool>,
 }
 
 /// The canonical URI space a containing file resolves relatives against.
@@ -239,38 +263,27 @@ enum BaseUri {
     File(Box<str>),
 }
 
-/// An absolute URI after composition, ready to be landed on a target.
+/// An absolute URI after composition, ready to be landed on a target. The
+/// parsed parts move structurally — nothing is re-joined and re-split.
 enum Composed {
     Package {
         package: Box<str>,
         rel: Box<str>,
     },
     File(Box<str>),
-    Dart(Box<str>),
+    /// A `dart:` URI: the library name split once from the parsed path (its
+    /// first segment; an authority form leaves it empty, and no SDK table
+    /// lists an empty library), plus the canonical `dart:` spelling the SDK
+    /// face parses back — the one string the [`SdkSnapshot`] interface
+    /// demands.
+    Dart {
+        library: Box<str>,
+        uri: Box<str>,
+    },
     DartExt,
     /// Any other absolute scheme (`data:`, `http:`, …): parses, resolves to
     /// nothing.
     Other,
-}
-
-/// The canonical base URI space `path` composes relatives in:
-/// `package:<pkg>/<rel>` under a package lib dir (deepest match wins),
-/// `file://` otherwise.
-fn canonical_base(packages: &PackageTable, path: &Path) -> BaseUri {
-    if let Some((package, rel)) = package_of(packages, path) {
-        return BaseUri::Package {
-            package: Box::from(package),
-            path: Box::from(encode_uri_path(&rel)),
-        };
-    }
-    let text = path.to_string_lossy();
-    let encoded = encode_uri_path(&text);
-    let with_slash = if encoded.starts_with('/') {
-        encoded
-    } else {
-        format!("/{encoded}")
-    };
-    BaseUri::File(Box::from(with_slash))
 }
 
 /// The package whose lib dir (deepest match) contains `path`, with the
@@ -278,7 +291,7 @@ fn canonical_base(packages: &PackageTable, path: &Path) -> BaseUri {
 /// first component-boundary prefix hit (`Path::strip_prefix` semantics:
 /// `/projx/lib/a.dart` does not match a `/proj` package).
 fn package_of<'p>(packages: &'p PackageTable, path: &Path) -> Option<(&'p str, String)> {
-    for (dir, package) in &packages.by_depth {
+    for (dir, package) in &packages.lib_dirs {
         if let Ok(rest) = path.strip_prefix(dir) {
             if rest.as_os_str().is_empty() {
                 continue; // the lib dir itself is not a file inside it
@@ -287,6 +300,61 @@ fn package_of<'p>(packages: &'p PackageTable, path: &Path) -> Option<(&'p str, S
         }
     }
     None
+}
+
+/// The canonical URI string of `path` (`pathToUri` face) against `memo` —
+/// the one implementation of the spelling, memoized per `FileTable`
+/// -normalized path. [`UriResolver::canonical_uri`] and [`container_base`]
+/// reach it through field-disjoint borrows (the base computation runs while
+/// `files` holds the container's interned path).
+fn canonical_uri_memo(
+    canonical: &mut FxHashMap<PathBuf, Box<str>>,
+    packages: &PackageTable,
+    path: &Path,
+) -> Box<str> {
+    if let Some(known) = canonical.get(path) {
+        return known.clone();
+    }
+    let uri: Box<str> = if let Some((package, rel)) = package_of(packages, path) {
+        Box::from(format!("package:{package}/{}", encode_uri_path(&rel)))
+    } else {
+        let text = path.to_string_lossy();
+        let encoded = encode_uri_path(&text);
+        let with_slash = if encoded.starts_with('/') {
+            encoded
+        } else {
+            format!("/{encoded}")
+        };
+        Box::from(format!("file://{with_slash}"))
+    };
+    canonical.insert(path.to_path_buf(), uri.clone());
+    uri
+}
+
+/// The canonical base URI space `path` composes relatives in, derived from
+/// [`canonical_uri_memo`] (the single spelling implementation): the
+/// `package:` form splits at the first `/` — package names never carry one,
+/// and [`package_of`] guarantees a non-empty lib-relative path — while the
+/// `file://` form keeps its slash-anchored path.
+fn container_base(
+    canonical: &mut FxHashMap<PathBuf, Box<str>>,
+    packages: &PackageTable,
+    path: &Path,
+) -> BaseUri {
+    let uri = canonical_uri_memo(canonical, packages, path);
+    if let Some(rest) = uri.strip_prefix("package:") {
+        let (package, rel) = rest
+            .split_once('/')
+            .expect("package canonical URIs carry a lib-relative path");
+        return BaseUri::Package {
+            package: Box::from(package),
+            path: Box::from(rel),
+        };
+    }
+    BaseUri::File(Box::from(
+        uri.strip_prefix("file://")
+            .expect("canonical URIs are package: or file://"),
+    ))
 }
 
 impl<'a> UriResolver<'a> {
@@ -312,18 +380,31 @@ impl<'a> UriResolver<'a> {
             files,
             resident,
             bases: FxHashMap::default(),
+            canonical: FxHashMap::default(),
+            existence: FxHashMap::default(),
         }
     }
 
     /// Whether the analyzed world holds `path`: on disk, or resident in the
     /// engine (an id the owner of [`Self::resident`] declared content for —
-    /// a declared overlay the disk has never seen).
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
-            || match self.files.try_file_id(path) {
-                Some(id) => (self.resident)(id),
-                None => false,
-            }
+    /// a declared overlay the disk has never seen). Memoized per normalized
+    /// path for this resolver's lifetime: the analyzed world does not mutate
+    /// while one resolver runs, so a stat answered once is not paid again —
+    /// a cold 10⁵-file analysis otherwise pays one stat syscall per resolved
+    /// target. Callers pass `FileTable`-normalized paths (both in-crate
+    /// sites normalize before asking); drop the resolver to observe later
+    /// disk changes.
+    fn exists(&mut self, path: &Path) -> bool {
+        if let Some(&known) = self.existence.get(path) {
+            return known;
+        }
+        let found = path.exists()
+            || self
+                .files
+                .try_file_id(path)
+                .is_some_and(|id| (self.resident)(id));
+        self.existence.insert(path.to_path_buf(), found);
+        found
     }
 
     /// The [`FileTable`] targets were interned into.
@@ -410,40 +491,34 @@ impl<'a> UriResolver<'a> {
             };
         };
         if !raw.scheme.is_empty() {
-            return self.land(compose_absolute(&raw));
+            return self.land(compose_absolute(raw));
         }
-        // Field-disjoint borrows: read the memoized base while mutating
-        // `files` inside `land`.
-        let base = match self.bases.entry(container) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let path = self
-                    .files
-                    .path(container)
-                    .expect("container FileId interned in this resolver's FileTable");
-                entry.insert(canonical_base(self.packages, path))
-            }
-        };
-        let composed = compose_relative(base, &raw);
+        // Field-disjoint borrows: the memoized base is read out of `bases`
+        // before `land` mutates the other memos and `files`.
+        if !self.bases.contains_key(&container) {
+            let path = self
+                .files
+                .path(container)
+                .expect("container FileId interned in this resolver's FileTable");
+            let base = container_base(&mut self.canonical, self.packages, path);
+            self.bases.insert(container, base);
+        }
+        let composed = compose_relative(&self.bases[&container], &raw);
         self.land(composed)
     }
 
     /// The canonical URI of `path` (`pathToUri` face): `package:` inside a
     /// package lib dir (deepest match wins), `file://` otherwise. This is the
-    /// library-identity string the library-graph layer keys on.
+    /// library-identity string the library-graph layer keys on — and the one
+    /// implementation of the spelling, so a change to it cannot desync the
+    /// composition base ([`container_base`] derives from it). Memoized per
+    /// `FileTable`-normalized path for this resolver's lifetime (the package
+    /// table cannot change under a live resolver); callers needing a longer
+    /// horizon cache the owned result — the engine's per-file canonical
+    /// table does exactly that.
     #[must_use]
-    pub fn canonical_uri(&self, path: &Path) -> Box<str> {
-        if let Some((package, rel)) = package_of(self.packages, path) {
-            return Box::from(format!("package:{package}/{}", encode_uri_path(&rel)));
-        }
-        let text = path.to_string_lossy();
-        let encoded = encode_uri_path(&text);
-        let with_slash = if encoded.starts_with('/') {
-            encoded
-        } else {
-            format!("/{encoded}")
-        };
-        Box::from(format!("file://{with_slash}"))
+    pub fn canonical_uri(&mut self, path: &Path) -> Box<str> {
+        canonical_uri_memo(&mut self.canonical, self.packages, path)
     }
 
     /// Lands a composed absolute URI on a target: scheme dispatch, existence,
@@ -455,21 +530,12 @@ impl<'a> UriResolver<'a> {
                 target: ResolvedTarget::Missing,
                 code: Some(ResolutionCode::UseOfNativeExtension),
             },
-            Composed::Dart(dart_uri) => match self.sdk.uri_to_path(&self.target, &dart_uri) {
-                Ok(file) => {
-                    let library = dart_uri
-                        .strip_prefix("dart:")
-                        .and_then(|rest| rest.split('/').next())
-                        .unwrap_or_default();
-                    UriResolution {
-                        uri: ResolvedUri::Dart {
-                            library: Box::from(library),
-                            file,
-                        },
-                        target: ResolvedTarget::External,
-                        code: None,
-                    }
-                }
+            Composed::Dart { library, uri } => match self.sdk.uri_to_path(&self.target, &uri) {
+                Ok(file) => UriResolution {
+                    uri: ResolvedUri::Dart { library, file },
+                    target: ResolvedTarget::External,
+                    code: None,
+                },
                 // Unknown dart: library (or target): source is null —
                 // `uri_does_not_exist` per §4.2.
                 Err(_) => UriResolution {
@@ -491,7 +557,7 @@ impl<'a> UriResolver<'a> {
                         code: Some(ResolutionCode::UriDoesNotExist),
                     };
                 };
-                let path = normalize(Path::new(&text));
+                let path = normalize(Path::new(&*text));
                 let code = (!self.exists(&path)).then(|| missing_file_code(&path));
                 let id = self.files.intern(&path);
                 UriResolution {
@@ -538,7 +604,7 @@ impl<'a> UriResolver<'a> {
                 return UriResolution {
                     uri: ResolvedUri::Package {
                         package,
-                        rel: PathBuf::from(&decoded),
+                        rel: PathBuf::from(&*decoded),
                         file: built,
                     },
                     target: ResolvedTarget::Resolved(id),
@@ -550,7 +616,7 @@ impl<'a> UriResolver<'a> {
             return UriResolution {
                 uri: ResolvedUri::Package {
                     package,
-                    rel: PathBuf::from(&decoded),
+                    rel: PathBuf::from(&*decoded),
                     file,
                 },
                 target: ResolvedTarget::Resolved(id),
@@ -561,7 +627,7 @@ impl<'a> UriResolver<'a> {
         UriResolution {
             uri: ResolvedUri::Package {
                 package,
-                rel: PathBuf::from(&decoded),
+                rel: PathBuf::from(&*decoded),
                 file,
             },
             target: ResolvedTarget::Resolved(id),
@@ -956,16 +1022,27 @@ fn validate_authority(text: &str) -> Result<(), InvalidUriSyntax> {
     Ok(())
 }
 
-/// Classifies an absolute (scheme-carrying) [`RawUri`] for landing.
-fn compose_absolute(raw: &RawUri) -> Composed {
+/// Classifies an absolute (scheme-carrying) [`RawUri`] for landing, consuming
+/// the parse — the parts move structurally into [`Composed`], never re-joined
+/// and re-split.
+fn compose_absolute(raw: RawUri) -> Composed {
     match (raw.scheme.as_ref(), raw.authority.as_deref()) {
         ("dart-ext", _) => Composed::DartExt,
         ("dart", _) => {
-            let authority = raw.authority.as_deref().filter(|a| !a.is_empty());
-            Composed::Dart(Box::from(match authority {
+            // The library name is the path's first segment (`core` for both
+            // `dart:core` and `dart:core/bool.dart`); an authority form
+            // (`dart://x/core`) leaves it empty, which no SDK table lists.
+            // Split once here — `land` never re-parses the joined spelling,
+            // which survives only because the SDK face parses it.
+            let library = Box::from(match raw.path.split_once('/') {
+                Some((name, _)) => name,
+                None => raw.path.as_ref(),
+            });
+            let uri = Box::from(match raw.authority.as_deref().filter(|a| !a.is_empty()) {
                 Some(a) => format!("dart://{a}{}", raw.path),
                 None => format!("dart:{}", raw.path),
-            }))
+            });
+            Composed::Dart { library, uri }
         }
         ("package", _) => {
             // A leading `/` (any authority, or `package:///x`) or a missing
@@ -988,7 +1065,7 @@ fn compose_absolute(raw: &RawUri) -> Composed {
             // decodes the path — `file://host/x.dart` resolves to `/x.dart`.
             // Only a relative path has no filesystem meaning here.
             if raw.path.starts_with('/') {
-                Composed::File(raw.path.clone())
+                Composed::File(raw.path)
             } else {
                 Composed::Other
             }
@@ -1017,7 +1094,7 @@ fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
     // package resolver rejects (`slash < 1`).
     if let Some(authority) = &reference.authority {
         return match base {
-            BaseUri::File(_) => compose_absolute(&RawUri {
+            BaseUri::File(_) => compose_absolute(RawUri {
                 scheme: Box::from("file"),
                 authority: Some(authority.clone()),
                 path: reference.path.clone(),
@@ -1104,10 +1181,12 @@ fn remove_dot_segments(path: &str) -> String {
 }
 
 /// Percent-decodes a URI path into UTF-8 text, or `None` when an escape does
-/// not decode to valid UTF-8 (`fromUri` throws → resolver null).
-fn decode_uri_path(text: &str) -> Option<String> {
+/// not decode to valid UTF-8 (`fromUri` throws → resolver null). Borrowed on
+/// the escape-free path — the overwhelmingly common shape — so only a `%`
+/// forces the owned decode.
+fn decode_uri_path(text: &str) -> Option<Cow<'_, str>> {
     if !text.contains('%') {
-        return Some(text.to_owned());
+        return Some(Cow::Borrowed(text));
     }
     let bytes = text.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -1124,7 +1203,7 @@ fn decode_uri_path(text: &str) -> Option<String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).ok()
+    String::from_utf8(decoded).ok().map(Cow::Owned)
 }
 
 /// Percent-encodes a filesystem path into a URI path: everything outside the
@@ -1882,6 +1961,52 @@ mod tests {
         assert_eq!(code_of(&ext), ResolutionCode::UseOfNativeExtension);
     }
 
+    /// The `data:` acceptance boundary mirrors `UriData._parse`'s
+    /// `FormatException` faces (uri.dart:4254-4313) — bad MIME shapes, a
+    /// parameter section without `=`, a `base64` marker not immediately
+    /// before the comma, and the `base64.normalize` payload rules
+    /// (padding/length variants, a decoded `%`). Each lands as the crate's
+    /// typed `invalid_uri` face through the full resolver pipeline.
+    #[test]
+    fn data_uri_rejection_boundary() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let cases: [(&str, &str); 7] = [
+            ("non-empty MIME type without a `/`", "data:x"),
+            ("second `/` in the MIME type", "data:a/b/c,payload"),
+            ("parameter section without `=`", "data:a/b;;"),
+            (
+                "base64 marker not immediately before the comma",
+                "data:a/b;base64;x=1,QQ",
+            ),
+            (
+                "padded payload not closing a 4-multiple",
+                "data:a/b;base64,QQ=",
+            ),
+            ("unpadded payload length 1 mod 4", "data:a/b;base64,AAAAA"),
+            ("decoded `%` inside base64", "data:a/b;base64,%25"),
+        ];
+        for (why, uri) in cases {
+            let rejected = resolver(&fixture, &mut files).resolve(
+                container,
+                Some(uri),
+                DirectiveKind::ImportExport,
+            );
+            assert_eq!(
+                rejected.uri,
+                ResolvedUri::Unresolved(UnresolvedKind::BadUri),
+                "{why}: {uri}"
+            );
+            assert_eq!(
+                code_of(&rejected),
+                ResolutionCode::InvalidUri,
+                "{why}: {uri}"
+            );
+            assert_eq!(rejected.target, ResolvedTarget::Missing, "{why}: {uri}");
+        }
+    }
+
     #[test]
     fn no_string_and_bad_syntax_report_their_frozen_codes() {
         let fixture = Fixture::new();
@@ -1994,7 +2119,7 @@ mod tests {
     fn canonical_uri_prefers_package_space() {
         let fixture = Fixture::new();
         let mut files = FileTable::new();
-        let resolver = resolver(&fixture, &mut files);
+        let mut resolver = resolver(&fixture, &mut files);
 
         assert_eq!(
             resolver.canonical_uri(&fixture.workspace.root.join("pkg_a/lib/sub/b.dart")),

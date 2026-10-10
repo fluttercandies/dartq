@@ -571,18 +571,19 @@ fn apply_flow(
         .get(&name)
         .expect("flow source scope holds the name")
         .file;
-    let target = &mut scopes[flow.to.index() as usize];
-    if target.contains_key(&name) {
-        return false; // first-come-wins: locals and earlier flows stay
+    // First-come-wins insert (`export.dart:105-127`): the vacant branch is
+    // the hot path and pays a single probe — no `contains_key` + `insert`
+    // double lookup.
+    match scopes[flow.to.index() as usize].entry(name) {
+        hash_map::Entry::Vacant(slot) => {
+            slot.insert(ExportEntry {
+                file,
+                is_local: false,
+            });
+            true
+        }
+        hash_map::Entry::Occupied(_) => false, // locals and earlier flows stay
     }
-    target.insert(
-        name,
-        ExportEntry {
-            file,
-            is_local: false,
-        },
-    );
-    true
 }
 
 /// The frozen library graph: interned nodes with directive edges and computed
@@ -913,6 +914,45 @@ mod tests {
             .expect("present");
         assert!(entry.is_local);
         assert_eq!(entry.file, a_file);
+    }
+
+    /// Export-side combinator filtering (`apply_flow`'s `allows` gate — the
+    /// fixpoint's per-name filter, `summary2/export.dart:22-28`): an
+    /// `export 'x.dart' show Foo;`-shaped edge flows only the shown name
+    /// into the exporter's face — the hidden name never enters the scope —
+    /// and the shown one arrives as a re-export (`is_local: false`),
+    /// mirroring the import-side `import_combinators_filter_at_build`.
+    #[test]
+    fn export_combinators_filter_at_propagation() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let exporter = rig.builder.intern("package:e/e.dart");
+        let t_file = rig.file("t.dart");
+        rig.declare(target, "shown", t_file);
+        rig.declare(target, "hidden", t_file);
+        let strings = rig.strings;
+        let show_only = Combinators::new(
+            [CombinatorClause::Show(Box::from([strings.intern("shown")]))],
+            strings,
+        );
+        rig.builder.export(
+            exporter,
+            ExportEdge {
+                target: Some(target),
+                combinators: show_only,
+            },
+        );
+        let graph = rig.builder.finish();
+
+        assert!(
+            graph.exported(exporter, strings.intern("hidden")).is_none(),
+            "the hidden name never enters the exporter's scope"
+        );
+        let entry = graph
+            .exported(exporter, strings.intern("shown"))
+            .expect("the shown name flows through");
+        assert_eq!(entry.file, t_file);
+        assert!(!entry.is_local, "carried as a re-export");
     }
 
     /// Local declarations beat re-exports: they are seeded first and
