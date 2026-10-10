@@ -1,0 +1,6 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {"name": "pkg217", "rootUri": "..", "packageUri": "lib/", "languageVersion": "2.17"}
+  ]
+}
