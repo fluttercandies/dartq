@@ -25,7 +25,7 @@
 //! `pkg/linter/lib/src/rules/` and its message template in
 //! `pkg/linter/lib/src/diagnostic.g.dart`.
 //!
-//! Implemented (42):
+//! Implemented (52):
 //! - wave 1 (18): `avoid_empty_else`, `camel_case_extensions`,
 //!   `camel_case_types`, `curly_braces_in_flow_control_structures`,
 //!   `empty_catches`, `prefer_typing_uninitialized_variables` (core);
@@ -61,24 +61,31 @@
 //!   `LibraryName.has_name`, `PartOf.has_name`, and the `MetadataStar` /
 //!   annotated-sibling pair. The substrate grew two [`Features`] bits for
 //!   the gated rules (`enhanced_parts`, `unnamed_libraries`).
+//! - wave 3 (10): `no_duplicate_case_values` (core); `avoid_init_to_null`,
+//!   `avoid_returning_null_for_void`, `prefer_collection_literals`,
+//!   `prefer_contains`, `prefer_function_declarations_over_variables`,
+//!   `type_init_formals`, `unnecessary_null_aware_assignments`,
+//!   `unnecessary_to_list_in_spreads`, `use_rethrow_when_possible`
+//!   (recommended). These rules' resolution-bound facets (type and element
+//!   checks) are replaced by documented lexical approximations — each rule
+//!   module cites the official anchor and spells out the divergences
+//!   (over/under-report only on erroneous or user-shadowed code).
 //!
 //! Excluded for now, with the blocker:
 //! - **Needs the element model (resolution)**: `avoid_print` (dart:core
-//!   identity), `prefer_collection_literals`, `prefer_contains`,
-//!   `prefer_initializing_formals`, `unnecessary_getters_setters`,
-//!   `unnecessary_this`, `use_rethrow_when_possible` (canonical element
-//!   identity of the rethrown name), `type_init_formals` (field type
-//!   comparison), `avoid_init_to_null` (declared-type nullability,
-//!   `avoid_init_to_null.dart:59-67`). Within `library_annotations`, the
+//!   identity), `prefer_initializing_formals`, `unnecessary_getters_setters`,
+//!   `unnecessary_this`. Within `library_annotations`, the
 //!   `targetKinds` branch (an annotation declaration's `@Target` metadata,
 //!   library_annotations.dart:66-73) is likewise resolution-blocked and not
 //!   ported; the pragma branch is.
 //! - **Needs flow analysis (#278)**: `prefer_final_locals`,
-//!   `prefer_final_fields`, `prefer_function_declarations_over_variables`
-//!   (`isPotentiallyMutatedInScope`,
-//!   prefer_function_declarations_over_variables.dart:44-56).
+//!   `prefer_final_fields` (mutation analysis; wave 3's
+//!   `prefer_function_declarations_over_variables` ports the unmutated
+//!   subset with the mutated-local divergence documented).
 //! - **Needs constant evaluation**: `unnecessary_const` (const-context
-//!   computation), `no_duplicate_case_values`, `exhaustive_cases`.
+//!   computation), `exhaustive_cases` (wave 3's `no_duplicate_case_values`
+//!   ports the token-lexeme subset with the constant-value divergence
+//!   documented).
 //!
 //! Era note: behavior aligns to the Dart 3.15 main linter in
 //! `.third/dart-sdk` (the fact source per AGENTS.md), with rule lists from

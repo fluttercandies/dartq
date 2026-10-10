@@ -2,7 +2,8 @@
 //! `unnecessary_late`, `use_function_type_syntax_for_parameters`,
 //! `prefer_typing_uninitialized_variables`,
 //! `prefer_generic_function_type_aliases`, `unnecessary_constructor_name`,
-//! `hash_and_equals`.
+//! `hash_and_equals`, `avoid_init_to_null`,
+//! `prefer_function_declarations_over_variables`, `type_init_formals`.
 
 use dartq_ast::NodeKind;
 
@@ -524,6 +525,201 @@ pub(crate) mod hash_and_equals {
             .iter()
             .copied()
             .find(|&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::OperatorName))
+    }
+}
+
+pub(crate) mod avoid_init_to_null {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, first_child};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_init_to_null.dart:59-88` —
+    /// a variable whose initializer is the `null` literal reports at the
+    /// declaration; const/final declarations are exempt (`!node.isConst &&
+    /// !node.isFinal`, :62-63), as are the formal-parameter default-value
+    /// faces (:74-87).
+    ///
+    /// Approximation (documented): the official additionally requires the
+    /// declared type to be nullable (`typeSystem.isNullable`,
+    /// `avoid_init_to_null.dart:41/:65`) — a resolution question; the lexical
+    /// face reports regardless, so `int x = null;` (a compile error upstream)
+    /// over-reports. The super-formal sub-check
+    /// (`superConstructorParameter.defaultValueCode`, :78-84) is likewise
+    /// resolution-bound and treated like the regular form. The keyword gate
+    /// reads the declaration's `varFinalOrConst` token (collapse map §3.3
+    /// `VariablesDeclaration` `modifier` word; the parameter's init range is
+    /// its `init_start`/`init_end` words). Message: `diagnostic.g.dart`
+    /// `avoidInitToNull`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_init_to_null",
+        group: Group::Recommended,
+        problem: "Redundant initialization to 'null'.",
+        correction: "Try removing the initializer.",
+        kinds: &[NodeKind::InitializedIdentifier, NodeKind::FormalParameter],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::InitializedIdentifier => check_variable(c),
+            NodeKind::FormalParameter => check_parameter(c),
+            _ => {}
+        }
+    }
+
+    fn check_variable(c: &mut Check<'_>) {
+        // The initializer is the `VariableInitializer` child; its operand is
+        // the null literal.
+        let initializer = c
+            .collect_direct(c.node())
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer);
+        let Some(initializer) = initializer else {
+            return;
+        };
+        let Some(value) = first_child(c, initializer) else {
+            return;
+        };
+        if c.kind(value) != NodeKind::LiteralNull {
+            return;
+        }
+        // `!node.isConst && !node.isFinal` (:62-63): the declaration
+        // keyword is the VariablesDeclaration `modifier` word (collapse map
+        // §3.3); a written type (no keyword) initializes the same way.
+        if let Some(parent) = c.ancestor(1)
+            && c.kind(parent) == NodeKind::VariablesDeclaration
+            && let Some(&keyword) = c.payload(parent).first()
+            && keyword != NONE_TOKEN
+            && matches!(c.lexeme(keyword), "final" | "const")
+        {
+            return;
+        }
+        let range = c.utf16_span(c.node());
+        c.report(range, &[]);
+    }
+
+    fn check_parameter(c: &mut Check<'_>) {
+        // `{int x = null}` — the default value is delimited by the
+        // `init_start`/`init_end` payload words (collapse map §3.3/§3.9);
+        // exactly the `null` token qualifies under either end convention.
+        let payload = c.payload(c.node());
+        let Some(&start) = payload.get(2) else {
+            return;
+        };
+        if start == NONE_TOKEN {
+            return;
+        }
+        let end = payload.get(3).copied().unwrap_or(start);
+        if c.lexeme(start) == "null" && end.saturating_sub(start) <= 1 {
+            let range = c.utf16_span(c.node());
+            c.report(range, &[]);
+        }
+    }
+}
+
+pub(crate) mod prefer_function_declarations_over_variables {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, first_child};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
+    /// — a variable initialized with a function literal reports. Fields and
+    /// top-level variables only when final (:42-49); locals unless the
+    /// variable is mutated in scope (:50-55).
+    ///
+    /// Approximation (documented): `isPotentiallyMutatedInScope`
+    /// (`prefer_function_declarations_over_variables.dart:53`) needs
+    /// usage analysis and is dropped — locals always report, so a later
+    /// reassignment (`var f = () {}; f = ...;`) over-reports. Message:
+    /// `diagnostic.g.dart` `preferFunctionDeclarationsOverVariables`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_function_declarations_over_variables",
+        group: Group::Recommended,
+        problem: "Use a function declaration rather than a variable assignment to bind a function to a name.",
+        correction: "Try rewriting the closure assignment as a function declaration.",
+        kinds: &[NodeKind::InitializedIdentifier],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some(initializer) = c
+            .collect_direct(c.node())
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer)
+        else {
+            return;
+        };
+        let Some(value) = first_child(c, initializer) else {
+            return;
+        };
+        if c.kind(value) != NodeKind::FunctionExpression {
+            return;
+        }
+        // No enclosing function body ⟹ field/top-level: final only (:42-49).
+        let Some(declaration) = c.ancestor(1) else {
+            return;
+        };
+        if c.kind(declaration) != NodeKind::VariablesDeclaration {
+            return;
+        }
+        if c.ancestor(2).is_some_and(|owner| {
+            matches!(c.kind(owner), NodeKind::Fields | NodeKind::TopLevelFields)
+        }) {
+            let keyword = c
+                .payload(declaration)
+                .first()
+                .copied()
+                .unwrap_or(NONE_TOKEN);
+            if keyword == NONE_TOKEN || c.lexeme(keyword) != "final" {
+                return;
+            }
+        }
+        let range = c.utf16_span(c.node());
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod type_init_formals {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/type_init_formals.dart:37-64` — an
+    /// initializing formal (`this.x` / `super.x`) written with a type
+    /// annotation reports at the type (:37-48/:52-64).
+    ///
+    /// Approximation (documented): the official re-checks through the
+    /// element model — the field/super-parameter must exist and its type
+    /// must equal the written one (type_init_formals.dart:41-46/:56-62), so
+    /// only valid declarations lint. The lexical face reports any typed
+    /// receiver formal: a nonexistent field or a type mismatch (both compile
+    /// errors upstream) over-reports. `this.x`/`super.x` is the
+    /// `FormalParameter` `receiver` payload word (collapse map §3.3). Message:
+    /// `diagnostic.g.dart` `typeInitFormals`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "type_init_formals",
+        group: Group::Recommended,
+        problem: "Don't needlessly type annotate initializing formals.",
+        correction: "Try removing the type.",
+        kinds: &[NodeKind::FormalParameter],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `nodeType == null` bails (:38-39); `this.`/`super.` makes the
+        // parameter an initializing formal by grammar.
+        if c.payload(node).first().copied() == Some(crate::rules::NONE_TOKEN) {
+            return;
+        }
+        // The written type: the Type/FunctionType/RecordType child (a
+        // `NoType` child means unwritten, collapse map §3.8).
+        let Some(written) = c.collect_direct(node).into_iter().find(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+            )
+        }) else {
+            return;
+        };
+        let range = c.utf16_span(written);
+        c.report(range, &[]);
     }
 }
 
@@ -1434,5 +1630,473 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("hash_and_equals")).is_empty());
+    }
+
+    // —— avoid_init_to_null ———————————————————————————————————————————————
+
+    /// `test/rules/avoid_init_to_null_test.dart` `test_varInitializeNull` —
+    /// a `var x = null` local reports at the declaration.
+    #[test]
+    fn init_to_null_reports_a_local() {
+        let source = "var x = null;";
+        // var0 x1 =2 null3 ;4
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.leaf(NodeKind::LiteralNull, 3);
+                b.end(NodeKind::VariableInitializer, 5);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 5);
+                b.end(NodeKind::Block, 5);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_init_to_null"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Redundant initialization to 'null'.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing the initializer.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+    }
+
+    /// A typed variable reports; `final`/`const` declarations are exempt
+    /// (`!node.isConst && !node.isFinal`, :62-63).
+    #[test]
+    fn init_to_null_final_and_const_pass() {
+        let typed = "int? x = null;";
+        // int0 ?1 x2 =3 null4 ;5
+        let f = Fixture::build(
+            typed,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 0, 2);
+                b.begin(NodeKind::InitializedIdentifier, 2);
+                b.begin(NodeKind::VariableInitializer, 3);
+                b.leaf(NodeKind::LiteralNull, 4);
+                b.end(NodeKind::VariableInitializer, 6);
+                b.end(NodeKind::InitializedIdentifier, 6);
+                b.end(NodeKind::VariablesDeclaration, 6);
+                b.end(NodeKind::Block, 6);
+            }),
+        );
+        assert_eq!(f.run(&one_rule("avoid_init_to_null")).len(), 1);
+
+        for keyword in ["final", "const"] {
+            let source = format!("{keyword} x = null;");
+            // final0 x1 =2 null3 ;4
+            let f = Fixture::build(
+                &source,
+                unit_of(|b, t| {
+                    b.begin(NodeKind::Block, 0);
+                    b.begin(NodeKind::VariablesDeclaration, 0);
+                    b.patch(0, tok(&source, t, keyword, 0));
+                    b.begin(NodeKind::InitializedIdentifier, 1);
+                    b.begin(NodeKind::VariableInitializer, 2);
+                    b.leaf(NodeKind::LiteralNull, 3);
+                    b.end(NodeKind::VariableInitializer, 5);
+                    b.end(NodeKind::InitializedIdentifier, 5);
+                    b.end(NodeKind::VariablesDeclaration, 5);
+                    b.end(NodeKind::Block, 5);
+                }),
+            );
+            assert!(
+                f.run(&one_rule("avoid_init_to_null")).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// A field reports (`test_defaultNull` family).
+    #[test]
+    fn init_to_null_reports_a_field() {
+        let source = "class A { var x = null; }";
+        // class0 A1 {2 var3 x4 =5 null6 ;7 }8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralNull, 6);
+                b.end(NodeKind::VariableInitializer, 8);
+                b.end(NodeKind::InitializedIdentifier, 8);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.end(NodeKind::DeclarationBody, 9);
+                b.end(NodeKind::ClassDeclaration, 9);
+                b.end(NodeKind::TopLevelDeclaration, 9);
+            }),
+        );
+        assert_eq!(f.run(&one_rule("avoid_init_to_null")).len(), 1);
+    }
+
+    /// The parameter default-value face: `{int x = null}` reports, a
+    /// non-null default does not.
+    #[test]
+    fn init_to_null_parameter_default() {
+        let null_default = "f({int x = null}) {}";
+        // f0 (1 {2 int3 x4 =5 null6 }7 )8 {9 }10
+        let f = Fixture::build(
+            null_default,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::OptionalFormalParameters, 2);
+                b.begin(NodeKind::FormalParameter, 3);
+                b.patch(0, NONE);
+                b.patch(1, 4);
+                b.patch(2, 6);
+                b.patch(3, 7);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::OptionalFormalParameters, 8);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::Block, 9);
+                b.end(NodeKind::Block, 11);
+                b.end(NodeKind::TopLevelMethod, 11);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_init_to_null"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 3));
+
+        let int_default = "f({int x = 1}) {}";
+        // f0 (1 {2 int3 x4 =5 16 }7 )8 {9 }10
+        let f = Fixture::build(
+            int_default,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::OptionalFormalParameters, 2);
+                b.begin(NodeKind::FormalParameter, 3);
+                b.patch(0, NONE);
+                b.patch(1, 4);
+                b.patch(2, 6);
+                b.patch(3, 7);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.end(NodeKind::FormalParameter, 7);
+                b.end(NodeKind::OptionalFormalParameters, 8);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::Block, 9);
+                b.end(NodeKind::Block, 11);
+                b.end(NodeKind::TopLevelMethod, 11);
+            }),
+        );
+        assert!(f.run(&one_rule("avoid_init_to_null")).is_empty());
+    }
+
+    /// A non-null initializer never reports.
+    #[test]
+    fn init_to_non_null_passes() {
+        let source = "var x = 1;";
+        // var0 x1 =2 13 ;4
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "var", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.leaf(NodeKind::LiteralInt, 3);
+                b.end(NodeKind::VariableInitializer, 5);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 5);
+                b.end(NodeKind::Block, 5);
+            }),
+        );
+        assert!(f.run(&one_rule("avoid_init_to_null")).is_empty());
+    }
+
+    // —— prefer_function_declarations_over_variables ——————————————————————
+
+    /// `test/rules/prefer_function_declarations_over_variables_test.dart`
+    /// `test_local` — a final local initialized with a closure reports.
+    #[test]
+    fn function_variable_local_reports() {
+        let source = "final f = () {};";
+        // final0 f1 =2 (3 )4 {5 }6 ;7
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "final", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::FunctionExpression, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.end(NodeKind::FormalParameters, 5);
+                b.begin(NodeKind::Block, 5);
+                b.end(NodeKind::Block, 7);
+                b.end(NodeKind::FunctionExpression, 7);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Block, 8);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_function_declarations_over_variables"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use a function declaration rather than a variable assignment to bind a function to a name."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+    }
+
+    /// A non-closure initializer passes.
+    #[test]
+    fn function_variable_non_closure_passes() {
+        let source = "final f = 1;";
+        // final0 f1 =2 13 ;4
+        let f = Fixture::build(
+            source,
+            unit_of(|b, t| {
+                b.begin(NodeKind::Block, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(source, t, "final", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.leaf(NodeKind::LiteralInt, 3);
+                b.end(NodeKind::VariableInitializer, 5);
+                b.end(NodeKind::InitializedIdentifier, 5);
+                b.end(NodeKind::VariablesDeclaration, 5);
+                b.end(NodeKind::Block, 5);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("prefer_function_declarations_over_variables"))
+                .is_empty()
+        );
+    }
+
+    /// Fields and top-level variables report only when final (:42-49).
+    #[test]
+    fn function_variable_fields_require_final() {
+        let field = |keyword: &str| {
+            let source = format!("class A {{ {keyword} f = () {{}}; }}");
+            // class0 A1 {2 var3 f4 =5 (6 )7 {8 }9 ;10 }11
+            Fixture::build(
+                &source,
+                unit_of(|b, t| {
+                    b.begin(NodeKind::TopLevelDeclaration, 0);
+                    identifier(b, 1, 2);
+                    b.begin(NodeKind::ClassDeclaration, 0);
+                    b.patch(0, 0);
+                    b.patch(1, NONE);
+                    b.patch(2, NONE);
+                    b.patch(3, NONE);
+                    b.begin(NodeKind::DeclarationBody, 2);
+                    b.begin(NodeKind::Fields, 2);
+                    b.patch(0, MemberKind::NonStaticField as u32);
+                    b.begin(NodeKind::VariablesDeclaration, 3);
+                    b.patch(0, tok(&source, t, keyword, 0));
+                    b.begin(NodeKind::InitializedIdentifier, 4);
+                    b.begin(NodeKind::VariableInitializer, 5);
+                    b.begin(NodeKind::FunctionExpression, 6);
+                    b.begin(NodeKind::FormalParameters, 6);
+                    b.end(NodeKind::FormalParameters, 8);
+                    b.begin(NodeKind::Block, 8);
+                    b.end(NodeKind::Block, 10);
+                    b.end(NodeKind::FunctionExpression, 10);
+                    b.end(NodeKind::VariableInitializer, 10);
+                    b.end(NodeKind::InitializedIdentifier, 10);
+                    b.end(NodeKind::VariablesDeclaration, 11);
+                    b.end(NodeKind::Fields, 11);
+                    b.end(NodeKind::DeclarationBody, 12);
+                    b.end(NodeKind::ClassDeclaration, 12);
+                    b.end(NodeKind::TopLevelDeclaration, 12);
+                }),
+            )
+        };
+        assert_eq!(
+            field("final")
+                .run(&one_rule("prefer_function_declarations_over_variables"))
+                .len(),
+            1
+        );
+        assert!(
+            field("var")
+                .run(&one_rule("prefer_function_declarations_over_variables"))
+                .is_empty()
+        );
+
+        // Top-level: final reports.
+        let top = "final f = () {};";
+        // final0 f1 =2 (3 )4 {5 }6 ;7
+        let f = Fixture::build(
+            top,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelFields, 0);
+                b.begin(NodeKind::VariablesDeclaration, 0);
+                b.patch(0, tok(top, t, "final", 0));
+                b.begin(NodeKind::InitializedIdentifier, 1);
+                b.begin(NodeKind::VariableInitializer, 2);
+                b.begin(NodeKind::FunctionExpression, 3);
+                b.begin(NodeKind::FormalParameters, 3);
+                b.end(NodeKind::FormalParameters, 5);
+                b.begin(NodeKind::Block, 5);
+                b.end(NodeKind::Block, 7);
+                b.end(NodeKind::FunctionExpression, 7);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::TopLevelFields, 8);
+            }),
+        );
+        assert_eq!(
+            f.run(&one_rule("prefer_function_declarations_over_variables"))
+                .len(),
+            1
+        );
+    }
+
+    // —— type_init_formals —————————————————————————————————————————————————
+
+    /// `test/rules/type_init_formals_test.dart` `test_optionalParameters` —
+    /// a typed `this.x` formal reports at the type.
+    #[test]
+    fn typed_initializing_formal_reports() {
+        let source = "class C { C(int this.x); }";
+        // class0 C1 {2 C3 (4 int5 this6 .7 x8 )9 ;10 }11
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 4);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, 6); // the `this` receiver
+                b.patch(1, 8);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 5, 6);
+                b.end(NodeKind::FormalParameter, 9);
+                b.end(NodeKind::FormalParameters, 10);
+                b.end(NodeKind::Constructor, 11);
+                b.end(NodeKind::DeclarationBody, 12);
+                b.end(NodeKind::ClassDeclaration, 12);
+                b.end(NodeKind::TopLevelDeclaration, 12);
+            }),
+        );
+        let lints = f.run(&one_rule("type_init_formals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Don't needlessly type annotate initializing formals."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing the type.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// An untyped initializing formal and a typed plain formal pass
+    /// (`node.type == null` / not an initializing formal).
+    #[test]
+    fn untyped_and_plain_formals_pass() {
+        let untyped = "class C { C(this.x); }";
+        // class0 C1 {2 C3 (4 this5 .6 x7 )8 ;9 }10
+        let f = Fixture::build(
+            untyped,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Constructor, 3);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 4);
+                b.patch(3, NONE);
+                identifier(b, 3, 4);
+                b.begin(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, 5); // the `this` receiver
+                b.patch(1, 7);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 8);
+                b.end(NodeKind::FormalParameters, 9);
+                b.end(NodeKind::Constructor, 10);
+                b.end(NodeKind::DeclarationBody, 11);
+                b.end(NodeKind::ClassDeclaration, 11);
+                b.end(NodeKind::TopLevelDeclaration, 11);
+            }),
+        );
+        assert!(f.run(&one_rule("type_init_formals")).is_empty());
+
+        let plain = "f(int x) {}";
+        // f0 (1 int2 x3 )4 {5 }6
+        let f = Fixture::build(
+            plain,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::NoType, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::FormalParameters, 1);
+                b.begin(NodeKind::FormalParameter, 2);
+                b.patch(0, NONE);
+                b.patch(1, 3);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 2, 3);
+                b.end(NodeKind::FormalParameter, 4);
+                b.end(NodeKind::FormalParameters, 5);
+                b.begin(NodeKind::Block, 5);
+                b.end(NodeKind::Block, 7);
+                b.end(NodeKind::TopLevelMethod, 7);
+            }),
+        );
+        assert!(f.run(&one_rule("type_init_formals")).is_empty());
     }
 }

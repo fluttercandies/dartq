@@ -482,6 +482,246 @@ pub(crate) mod prefer_null_aware_operators {
     }
 }
 
+pub(crate) mod unnecessary_null_aware_assignments {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{first_child, last_child};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_null_aware_assignments.dart:42-49`
+    /// — `x ??= null` reports at the assignment; the write must not be a
+    /// setter (`node.writeElement is SetterElement` bails, :43), i.e.
+    /// property assignments (`a.b ??= null`) stay meaningful.
+    ///
+    /// Approximation (documented): the setter exclusion is taken from the
+    /// access shape — a [`NodeKind::DotAccess`] LHS or any assignment inside
+    /// a [`NodeKind::Cascade`] skips. Other exotic write elements (e.g.
+    /// `x[0] ??= null`, whose write element is not a setter upstream) report,
+    /// matching the official branch. Message: `diagnostic.g.dart`
+    /// `unnecessaryNullAwareAssignments`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_null_aware_assignments",
+        group: Group::Recommended,
+        problem: "Unnecessary assignment of 'null'.",
+        correction: "Try removing the assignment.",
+        kinds: &[NodeKind::Assignment],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.operator.type == QUESTION_QUESTION_EQ &&
+        // node.rightHandSide.isNullLiteral` (:45-46).
+        if c.lexeme(c.payload(node).first().copied().expect("assignment op")) != "??=" {
+            return;
+        }
+        let Some(rhs) = last_child(c, node) else {
+            return;
+        };
+        if c.kind(rhs) != NodeKind::LiteralNull {
+            return;
+        }
+        let Some(lhs) = first_child(c, node) else {
+            return;
+        };
+        if matches!(c.kind(lhs), NodeKind::DotAccess | NodeKind::CascadeAccess) {
+            return;
+        }
+        if c.path.iter().any(|&a| c.kind(a) == NodeKind::Cascade) {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod prefer_contains {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::first_child;
+
+    const USE_CONTAINS_PROBLEM: &str = "Unnecessary use of 'indexOf' to test for containment.";
+    const USE_CONTAINS_CORRECTION: &str = "Try using 'contains'.";
+    const ALWAYS_FALSE_PROBLEM: &str =
+        "Always 'false' because 'indexOf' is always greater than or equal to -1.";
+    const ALWAYS_TRUE_PROBLEM: &str =
+        "Always 'true' because 'indexOf' is always greater than or equal to -1.";
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_contains.dart:46-159` — an
+    /// `indexOf` compared against a small int literal with the containment
+    /// operators reports at the comparison. Three codes split by the matrix
+    /// (`_checkConstant`, :73-124): the rewrite (`==`/`!=`/`<=`/`>` at -1,
+    /// `>=`/`<` at 0), the always-false and always-true judgments.
+    ///
+    /// Approximations (documented): the receiver type check
+    /// (`implementsAnyInterface([Iterable, String])`, :145-149) is dropped —
+    /// any `indexOf` invocation on a target reports, so a user class with an
+    /// `indexOf` method over-reports; `getIntValue` reads int literals
+    /// (decimal/hex, separators, a negation prefix) only, so constant
+    /// expressions (`const k = -1`) under-report. Message: `diagnostic.g.dart`
+    /// `preferContainsUseContains`/`preferContainsAlwaysFalse`/`preferContainsAlwaysTrue`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_contains",
+        group: Group::Recommended,
+        problem: USE_CONTAINS_PROBLEM,
+        correction: USE_CONTAINS_CORRECTION,
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let op = c.lexeme(c.payload(node).first().copied().expect("binary op"));
+        if !matches!(op, "==" | "!=" | ">" | ">=" | "<" | "<=") {
+            return;
+        }
+        let operands = c.collect_direct(node);
+        if operands.len() < 2 {
+            return;
+        }
+        let (literal, effective_op) = {
+            let right = int_value(c, operands[1]);
+            if right.is_some_and(|v| v <= 0) && is_unassigned_index_of(c, node, operands[0]) {
+                (right.expect("checked Some"), op)
+            } else {
+                let left = int_value(c, operands[0]);
+                if left.is_some_and(|v| v <= 0) && is_unassigned_index_of(c, node, operands[1]) {
+                    (left.expect("checked Some"), invert(op))
+                } else {
+                    return;
+                }
+            }
+        };
+        let (problem, correction) = match literal {
+            -1 => match effective_op {
+                "==" | "!=" | "<=" | ">" => (USE_CONTAINS_PROBLEM, Some(USE_CONTAINS_CORRECTION)),
+                "<" => (ALWAYS_FALSE_PROBLEM, None),
+                ">=" => (ALWAYS_TRUE_PROBLEM, None),
+                _ => return,
+            },
+            0 => match effective_op {
+                ">=" | "<" => (USE_CONTAINS_PROBLEM, Some(USE_CONTAINS_CORRECTION)),
+                _ => return,
+            },
+            v if v < -1 => match effective_op {
+                "==" | "<=" | "<" => (ALWAYS_FALSE_PROBLEM, None),
+                "!=" | ">=" | ">" => (ALWAYS_TRUE_PROBLEM, None),
+                _ => return,
+            },
+            _ => return,
+        };
+        let range = c.utf16_span(node);
+        c.report_texts(range, problem, correction.unwrap_or_default(), &[]);
+    }
+
+    /// `TokenType.inverted` (the mirror-operand comparison, :67).
+    fn invert(op: &str) -> &'static str {
+        match op {
+            "==" => "!=",
+            "!=" => "==",
+            "<" => ">=",
+            ">=" => "<",
+            ">" => "<=",
+            _ => ">",
+        }
+    }
+
+    /// `getIntValue` restricted to int literals: decimal/hex with
+    /// separators, optionally negated by a prefix `-` (the source form of
+    /// `-1` in an expression).
+    fn int_value(c: &Check<'_>, node: u32) -> Option<i64> {
+        let (negative, literal) = if c.kind(node) == NodeKind::UnaryPrefix {
+            // `UnaryPrefix` is a width-0 kind; the operator is the span
+            // head (the `prefer_is_not_operator` precedent).
+            if c.lexeme(c.head_token(node)) != "-" {
+                return None;
+            }
+            (true, first_child(c, node)?)
+        } else {
+            (false, node)
+        };
+        if c.kind(literal) != NodeKind::LiteralInt {
+            return None;
+        }
+        let lexeme = c.lexeme(c.head_token(literal));
+        let digits = lexeme.trim_start_matches("0x").trim_start_matches("0X");
+        let digits: String = digits.chars().filter(|&ch| ch != '_').collect();
+        i64::from_str_radix(
+            &digits,
+            if lexeme.starts_with("0x") || lexeme.starts_with("0X") {
+                16
+            } else {
+                10
+            },
+        )
+        .ok()
+        .map(|v| if negative { -v } else { v })
+    }
+
+    /// `_isUnassignedIndexOf` (:128-159): an `indexOf` invocation on a
+    /// target, not the RHS of an assignment, with a zero start index.
+    fn is_unassigned_index_of(c: &Check<'_>, comparison: u32, expression: u32) -> bool {
+        is_unassigned_index_of_inner(c, comparison, expression).unwrap_or(false)
+    }
+
+    fn is_unassigned_index_of_inner(
+        c: &Check<'_>,
+        comparison: u32,
+        expression: u32,
+    ) -> Option<bool> {
+        // Unwrap parens and `as` expressions, tracking the invocation's
+        // parent (:148-152).
+        let mut current = expression;
+        let mut parent = comparison;
+        while matches!(
+            c.kind(current),
+            NodeKind::ParenthesizedExpression | NodeKind::AsExpression
+        ) {
+            parent = current;
+            current = first_child(c, current)?;
+        }
+        if c.kind(current) != NodeKind::Send {
+            return Some(false);
+        }
+        // `invocation.parent is AssignmentExpression` (:140).
+        if c.kind(parent) == NodeKind::Assignment {
+            return Some(false);
+        }
+        let kids = c.collect_direct(current);
+        let args_pos = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))?;
+        let callee = *kids.get(args_pos.checked_sub(1)?)?;
+        let args = c.collect_direct(kids[args_pos]);
+        // The method name is the callee's identifier (`x.indexOf` — a
+        // `DotAccess`; a bare `indexOf` has no target and the official
+        // `parentType == null` bails, :143-144).
+        let (name, target) = match c.kind(callee) {
+            NodeKind::DotAccess | NodeKind::Qualified => {
+                let access = c.collect_direct(callee);
+                let name = access.last().copied()?;
+                if c.kind(name) != NodeKind::Identifier {
+                    return Some(false);
+                }
+                (name, access.first().copied())
+            }
+            _ => return Some(false),
+        };
+        if c.lexeme(c.head_token(name)) != "indexOf" || target.is_none() {
+            return Some(false);
+        }
+        // A two-argument form must pass start index 0 (:152-155).
+        if args.len() == 2 {
+            let start = if c.kind(args[1]) == NodeKind::NamedArgument {
+                c.collect_direct(args[1]).get(1).copied()?
+            } else {
+                args[1]
+            };
+            if c.kind(start) != NodeKind::LiteralInt || c.lexeme(c.head_token(start)) != "0" {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1128,5 +1368,322 @@ mod tests {
         );
         let lints = f.run(&one_rule("prefer_null_aware_operators"));
         assert_eq!(lints.len(), 1);
+    }
+
+    // —— unnecessary_null_aware_assignments ———————————————————————————————
+
+    /// `test/rules/unnecessary_null_aware_assignments_test.dart` — `x ??=
+    /// null` reports at the assignment.
+    #[test]
+    fn null_aware_assignment_reports() {
+        let source = "x ??= null;";
+        // x0 ??=1 null2 ;3
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Assignment, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::Assignment, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_null_aware_assignments"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary assignment of 'null'.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing the assignment.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    }
+
+    /// A property target (`a.b ??= null`) and a non-null RHS pass.
+    #[test]
+    fn null_aware_property_and_non_null_pass() {
+        let property = "a.b ??= null;";
+        // a0 .1 b2 ??=3 null4 ;5
+        let f = Fixture::build(
+            property,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Assignment, 0);
+                b.patch(0, 3);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 4);
+                b.leaf(NodeKind::LiteralNull, 4);
+                b.end(NodeKind::Assignment, 6);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("unnecessary_null_aware_assignments"))
+                .is_empty()
+        );
+
+        let int_rhs = "x ??= 1;";
+        // x0 ??=1 12 ;3
+        let f = Fixture::build(
+            int_rhs,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Assignment, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                b.leaf(NodeKind::LiteralInt, 2);
+                b.end(NodeKind::Assignment, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("unnecessary_null_aware_assignments"))
+                .is_empty()
+        );
+    }
+
+    // —— prefer_contains ——————————————————————————————————————————————————
+
+    /// `test/rules/prefer_contains_test.dart` `test_contains` — `indexOf ==
+    /// -1` reports with the rewrite template.
+    #[test]
+    fn contains_reports_index_of_equals_minus_one() {
+        let source = "list.indexOf(e) == -1;";
+        // list0 .1 indexOf2 (3 e4 )5 ==6 -7 18 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 6);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 6);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.begin(NodeKind::UnaryPrefix, 7);
+                b.leaf(NodeKind::LiteralInt, 8);
+                b.end(NodeKind::UnaryPrefix, 10);
+                b.end(NodeKind::BinaryExpression, 10);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_contains"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of 'indexOf' to test for containment."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using 'contains'.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    }
+
+    /// The always-false/always-true judgments carry their own texts and no
+    /// correction; `>= 0` rewrites.
+    #[test]
+    fn contains_message_matrix() {
+        let build = |source: &str, literal: u32, negated: bool| {
+            Fixture::build(
+                source,
+                unit_of(|b, _t| {
+                    b.begin(NodeKind::ExpressionStatement, 0);
+                    b.begin(NodeKind::BinaryExpression, 0);
+                    b.patch(0, literal);
+                    b.begin(NodeKind::Send, 0);
+                    b.begin(NodeKind::DotAccess, 0);
+                    b.patch(0, 1);
+                    b.patch(1, 0);
+                    identifier(b, 0, 1);
+                    identifier(b, 2, 3);
+                    b.end(NodeKind::DotAccess, 6);
+                    b.begin(NodeKind::Arguments, 3);
+                    identifier(b, 4, 5);
+                    b.end(NodeKind::Arguments, 6);
+                    b.end(NodeKind::Send, 6);
+                    if negated {
+                        b.begin(NodeKind::UnaryPrefix, literal + 1);
+                        b.leaf(NodeKind::LiteralInt, literal + 2);
+                        b.end(NodeKind::UnaryPrefix, literal + 4);
+                    } else {
+                        b.leaf(NodeKind::LiteralInt, literal + 1);
+                    }
+                    // Negated: `-` literal+1, digit literal+2, `;` literal+3
+                    // (exclusive end literal+4); plain: digit literal+1,
+                    // `;` literal+2 (exclusive end literal+3).
+                    let end = if negated { literal + 4 } else { literal + 3 };
+                    b.end(NodeKind::BinaryExpression, end);
+                    b.end(NodeKind::ExpressionStatement, end);
+                }),
+            )
+        };
+        // list0 .1 indexOf2 (3 e4 )5 <6 -7 18 ;9
+        let always_false = build("list.indexOf(e) < -1;", 6, true);
+        let lints = always_false.run(&one_rule("prefer_contains"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Always 'false' because 'indexOf' is always greater than or equal to -1."
+        );
+        assert_eq!(lints[0].correction, None);
+
+        // list0 .1 indexOf2 (3 e4 )5 >=6 -7 18 ;9
+        let always_true = build("list.indexOf(e) >= -1;", 6, true);
+        let lints = always_true.run(&one_rule("prefer_contains"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Always 'true' because 'indexOf' is always greater than or equal to -1."
+        );
+
+        // list0 .1 indexOf2 (3 e4 )5 >=6 07 ;8
+        let rewrite = build("list.indexOf(e) >= 0;", 6, false);
+        let lints = rewrite.run(&one_rule("prefer_contains"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of 'indexOf' to test for containment."
+        );
+    }
+
+    /// A left-hand literal compares with the inverted operator.
+    #[test]
+    fn contains_left_literal_inverts_the_operator() {
+        let source = "-1 != list.indexOf(e);";
+        // -0 11 !=2 list3 .4 indexOf5 (6 e7 )8 ;9
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 2);
+                b.begin(NodeKind::UnaryPrefix, 0);
+                b.leaf(NodeKind::LiteralInt, 1);
+                b.end(NodeKind::UnaryPrefix, 3);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::DotAccess, 3);
+                b.patch(0, 4);
+                b.patch(1, 0);
+                identifier(b, 3, 4);
+                identifier(b, 5, 6);
+                b.end(NodeKind::DotAccess, 9);
+                b.begin(NodeKind::Arguments, 6);
+                identifier(b, 7, 8);
+                b.end(NodeKind::Arguments, 9);
+                b.end(NodeKind::Send, 9);
+                b.end(NodeKind::BinaryExpression, 10);
+                b.end(NodeKind::ExpressionStatement, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_contains"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of 'indexOf' to test for containment."
+        );
+    }
+
+    /// An assigned `indexOf`, a bare untargeted invocation, and a non-zero
+    /// start index pass (`_isUnassignedIndexOf`, :144-171).
+    #[test]
+    fn contains_assigned_and_bare_invocations_pass() {
+        let assigned = "(next = list.indexOf('{')) != -1;";
+        // (0 next1 =2 list3 .4 indexOf5 (6 '7 )8 )9 !=10 -11 112 ;13
+        let f = Fixture::build(
+            assigned,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 10);
+                b.begin(NodeKind::ParenthesizedExpression, 0);
+                b.begin(NodeKind::Assignment, 1);
+                b.patch(0, 2);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::Send, 3);
+                b.begin(NodeKind::DotAccess, 3);
+                b.patch(0, 4);
+                b.patch(1, 0);
+                identifier(b, 3, 4);
+                identifier(b, 5, 6);
+                b.end(NodeKind::DotAccess, 9);
+                b.begin(NodeKind::Arguments, 6);
+                b.leaf_span(NodeKind::StringLiteral, 7, 8);
+                b.end(NodeKind::Arguments, 9);
+                b.end(NodeKind::Send, 9);
+                b.end(NodeKind::Assignment, 9);
+                b.end(NodeKind::ParenthesizedExpression, 10);
+                b.begin(NodeKind::UnaryPrefix, 11);
+                b.leaf(NodeKind::LiteralInt, 12);
+                b.end(NodeKind::UnaryPrefix, 14);
+                b.end(NodeKind::BinaryExpression, 14);
+                b.end(NodeKind::ExpressionStatement, 14);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
+
+        let bare = "indexOf(e) == -1;";
+        // indexOf0 (1 e2 )3 ==4 -5 16 ;7
+        let f = Fixture::build(
+            bare,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 4);
+                b.begin(NodeKind::Send, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Arguments, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::Send, 4);
+                b.begin(NodeKind::UnaryPrefix, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::UnaryPrefix, 8);
+                b.end(NodeKind::BinaryExpression, 8);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
+
+        let started = "list.indexOf(e, 1) == -1;";
+        // list0 .1 indexOf2 (3 e4 ,5 16 )7 ==8 -9 110 ;11
+        let f = Fixture::build(
+            started,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::BinaryExpression, 0);
+                b.patch(0, 8);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 7);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::Send, 8);
+                b.begin(NodeKind::UnaryPrefix, 9);
+                b.leaf(NodeKind::LiteralInt, 10);
+                b.end(NodeKind::UnaryPrefix, 12);
+                b.end(NodeKind::BinaryExpression, 12);
+                b.end(NodeKind::ExpressionStatement, 12);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
     }
 }

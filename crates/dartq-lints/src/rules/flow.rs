@@ -1,5 +1,6 @@
-//! `curly_braces_in_flow_control_structures` and `control_flow_in_finally`
-//! — the flow-control family (one core, one recommended rule).
+//! The flow-control family: `curly_braces_in_flow_control_structures`,
+//! `control_flow_in_finally`, `no_duplicate_case_values`,
+//! `use_rethrow_when_possible`, `avoid_returning_null_for_void`.
 
 use dartq_ast::NodeKind;
 
@@ -228,6 +229,248 @@ pub(crate) mod control_flow_in_finally {
                 NodeKind::FunctionExpression | NodeKind::LocalFunctionDeclaration
             )
         })
+    }
+}
+
+pub(crate) mod no_duplicate_case_values {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::token_seq_equal;
+
+    /// Official: `pkg/linter/lib/src/rules/no_duplicate_case_values.dart:37-58`
+    /// — a `case` whose constant value equals an earlier `case` of the same
+    /// switch reports at the duplicate expression with both sources spelled
+    /// into `{0}`/`{1}`.
+    ///
+    /// Approximation (documented): the official keys the map by the
+    /// computed constant (`computeConstantValue`, :44); duplicate
+    /// detection here compares token-lexeme sequences, so only
+    /// syntactically identical expressions collide — `case 1 + 1:` vs
+    /// `case 2:` diverges (under-reports), and an identifier repeated
+    /// across two cases reports even when non-constant (the official skips
+    /// unknown values — over-reports on erroneous code only). Message:
+    /// `diagnostic.g.dart` `noDuplicateCaseValues`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_duplicate_case_values",
+        group: Group::Core,
+        problem: "The value of the case clause ('{0}') is equal to the value of an earlier case clause ('{1}').",
+        correction: "Try removing or changing the value.",
+        kinds: &[NodeKind::SwitchStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some(block) = c
+            .collect_direct(c.node())
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::SwitchBlock)
+        else {
+            return;
+        };
+        // Collect first: each case re-enters `direct_children` (the scratch
+        // RefCell forbids a live outer guard).
+        let cases: Vec<u32> = c
+            .direct_children(block)
+            .iter()
+            .copied()
+            .filter(|&kid| c.kind(kid) == NodeKind::SwitchCase)
+            .collect();
+        let mut seen: Vec<u32> = Vec::new();
+        for case in cases {
+            // Expressions follow the label prefix (`labelCount` pruned to
+            // the Label children, collapse map §3.4 SwitchCaseEnd); word 2
+            // counts them.
+            let count = c.payload(case).get(2).copied().unwrap_or(0) as usize;
+            if count == 0 {
+                continue;
+            }
+            let kids = c.collect_direct(case);
+            let expressions: Vec<u32> = kids
+                .into_iter()
+                .filter(|&kid| c.kind(kid) != NodeKind::Label)
+                .take(count)
+                .collect();
+            for expression in expressions {
+                if let Some(original) = seen
+                    .iter()
+                    .copied()
+                    .find(|&earlier| token_seq_equal(c, earlier, expression))
+                {
+                    let dup = source_slice(c, expression).to_owned();
+                    let orig = source_slice(c, original).to_owned();
+                    let range = c.utf16_span(expression);
+                    c.report(range, &[&dup, &orig]);
+                } else {
+                    seen.push(expression);
+                }
+            }
+        }
+    }
+
+    /// The source text of one expression (the official `toString()`
+    /// arguments).
+    fn source_slice<'a>(c: &'a Check<'_>, node: u32) -> &'a str {
+        let bytes = c.byte_span(node);
+        &c.unit.source[bytes]
+    }
+}
+
+pub(crate) mod use_rethrow_when_possible {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::first_child;
+
+    /// Official: `pkg/linter/lib/src/rules/use_rethrow_when_possible.dart:36-46`
+    /// — a `throw` of exactly the caught exception parameter, as a statement,
+    /// reports at the throw. The parameter identity
+    /// (`element == exceptionParameter`, :39-44) is
+    /// approximated lexically: the thrown identifier must name the nearest
+    /// enclosing catch's parameter (same lexeme). The documented divergence
+    /// is shadowing — a local named like the parameter inside the catch body
+    /// over-reports. Message: `diagnostic.g.dart` `useRethrowWhenPossible`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_rethrow_when_possible",
+        group: Group::Recommended,
+        problem: "Use 'rethrow' to rethrow a caught exception.",
+        correction: "Try replacing the 'throw' with a 'rethrow'.",
+        kinds: &[NodeKind::ThrowExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // `node.parent is! ExpressionStatement` bails (:37).
+        if c.ancestor(1)
+            .is_none_or(|parent| c.kind(parent) != NodeKind::ExpressionStatement)
+        {
+            return;
+        }
+        // The thrown expression is the throw's operand child (collapse map
+        // §3.5 ThrowExpressionHandle).
+        let Some(operand) = first_child(c, c.node()) else {
+            return;
+        };
+        if c.kind(operand) != NodeKind::Identifier {
+            return;
+        }
+        // `node.thisOrAncestorOfType<CatchClause>()` (:41).
+        let Some(catch_clause) = c
+            .path
+            .iter()
+            .rev()
+            .copied()
+            .find(|&n| c.kind(n) == NodeKind::CatchClause)
+        else {
+            return;
+        };
+        // The exception parameter is the catch's first formal (a stack-trace
+        // formal follows it; an `on`-only catch has none and never fires —
+        // `exceptionParameter` null, :42-43).
+        let Some(exception) = c
+            .collect_direct(catch_clause)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameter)
+        else {
+            return;
+        };
+        // The parameter name is payload word 1 (collapse map §3.3
+        // FormalParameterEnd).
+        let Some(&name) = c.payload(exception).get(1) else {
+            return;
+        };
+        if c.lexeme(c.head_token(operand)) == c.lexeme(name) {
+            let range = c.utf16_span(c.node());
+            c.report(range, &[]);
+        }
+    }
+}
+
+pub(crate) mod avoid_returning_null_for_void {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, first_child, last_child};
+
+    const PROBLEM: &str = "Don't return 'null' from a function with a return type of 'void'.";
+    const METHOD_PROBLEM: &str = "Don't return 'null' from a method with a return type of 'void'.";
+    const CORRECTION: &str = "Try removing the 'null'.";
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_returning_null_for_void.dart:41-81`
+    /// — `return null` (statement or arrow body) inside a sync function or
+    /// method whose declared return type is `void` reports at the return.
+    /// The two official message variants (from-function / from-method,
+    /// `diagnostic.g.dart:727/:739`) split on the enclosing declaration kind.
+    ///
+    /// Faces not ported (documented): the async `Future<void>` branch
+    /// (:77-80) needs the declared type resolved (`type.isDartAsyncFuture`),
+    /// and the closure face under-reports when the return type is inferred
+    /// from context (`void Function() f = () { return null; };`) — a
+    /// function expression has no written return type here. `async void`
+    /// functions never report (neither official branch takes them), so the
+    /// enclosing body's `async` token is read (collapse map §3.9:
+    /// `ExpressionBody` word 2, `BlockBody` word 0; a plain statement `Block`
+    /// body carries no async words).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_returning_null_for_void",
+        group: Group::Recommended,
+        problem: PROBLEM,
+        correction: CORRECTION,
+        kinds: &[NodeKind::ReturnStatement, NodeKind::ExpressionBody],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.expression case var expression?` (:47): a bare `return;`
+        // has no child.
+        let Some(expression) = first_child(c, node) else {
+            return;
+        };
+        if c.kind(expression) != NodeKind::LiteralNull {
+            return;
+        }
+        // The nearest enclosing function-like declaration decides the face
+        // (:55-57 — `thisOrAncestorMatching(FunctionExpression |
+        // MethodDeclaration)`).
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                // A closure has no written return type here — out of face.
+                NodeKind::FunctionExpression => return,
+                NodeKind::Method => {
+                    report_void(c, node, ancestor, METHOD_PROBLEM);
+                    return;
+                }
+                NodeKind::TopLevelMethod
+                | NodeKind::LocalFunctionDeclaration
+                | NodeKind::NamedFunctionExpression => {
+                    report_void(c, node, ancestor, PROBLEM);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `isAsync`/`type is VoidType` (:75), then the report at `node`.
+    fn report_void(c: &mut Check<'_>, node: u32, function: u32, problem: &str) {
+        let Some(body) = last_child(c, function) else {
+            return;
+        };
+        let async_kw = match c.kind(body) {
+            NodeKind::ExpressionBody => c.payload(body).get(2).copied(),
+            NodeKind::BlockBody => c.payload(body).first().copied(),
+            _ => Some(NONE_TOKEN),
+        };
+        if async_kw != Some(NONE_TOKEN) {
+            return;
+        }
+        // The written return type precedes the name; `void` is a
+        // [`NodeKind::VoidType`] child (collapse map §3.3/§3.8). An inferred
+        // or non-void written type never takes the official void branch.
+        let declares_void = c
+            .collect_direct(function)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::VoidType);
+        if !declares_void {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report_texts(range, problem, CORRECTION, &[]);
     }
 }
 
@@ -592,5 +835,434 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("control_flow_in_finally")).is_empty());
+    }
+
+    // —— no_duplicate_case_values —————————————————————————————————————————
+
+    /// `test/rules/no_duplicate_case_values_test.dart` `test_duplicateCase`
+    /// — the duplicate reports with both sources in the message.
+    #[test]
+    fn duplicate_case_value_reports() {
+        let source = "switch (x) { case 1: break; case 1: break; }";
+        // switch0 (1 x2 )3 {4 case5 16 :7 break8 ;9 case10 111 :12 break13 ;14 }15
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                for (case_head, int_tok, colon) in [(5, 6, 7), (10, 11, 12)] {
+                    b.begin(NodeKind::SwitchCase, case_head);
+                    b.patch(0, NONE);
+                    b.patch(1, colon);
+                    b.patch(2, 1); // one matched expression
+                    b.leaf(NodeKind::LiteralInt, int_tok);
+                    b.begin(NodeKind::Break, int_tok + 2);
+                    b.patch(0, 0);
+                    b.end(NodeKind::Break, int_tok + 4);
+                    b.end(NodeKind::SwitchCase, int_tok + 4);
+                }
+                b.end(NodeKind::SwitchBlock, 16);
+                b.end(NodeKind::SwitchStatement, 16);
+            }),
+        );
+        let lints = f.run(&one_rule("no_duplicate_case_values"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The value of the case clause ('1') is equal to the value of an earlier case clause ('1')."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing or changing the value.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 11));
+    }
+
+    /// Distinct values and a `default:` clause (no expressions) pass.
+    #[test]
+    fn distinct_and_default_cases_pass() {
+        let source = "switch (x) { case 1: break; case 2: break; default: break; }";
+        // switch0 (1 x2 )3 {4 case5 16 :7 break8 ;9 case10 211 :12 break13 ;14
+        // default15 :16 break17 ;18 }19
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                // case 1
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.begin(NodeKind::Break, 8);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 10);
+                b.end(NodeKind::SwitchCase, 10);
+                // case 2
+                b.begin(NodeKind::SwitchCase, 10);
+                b.patch(0, NONE);
+                b.patch(1, 12);
+                b.patch(2, 1);
+                b.leaf(NodeKind::LiteralInt, 11);
+                b.begin(NodeKind::Break, 13);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 15);
+                b.end(NodeKind::SwitchCase, 15);
+                // default (no expressions)
+                b.begin(NodeKind::SwitchCase, 15);
+                b.patch(0, 15);
+                b.patch(1, 16);
+                b.patch(2, 0);
+                b.begin(NodeKind::Break, 17);
+                b.patch(0, 0);
+                b.end(NodeKind::Break, 19);
+                b.end(NodeKind::SwitchCase, 19);
+                b.end(NodeKind::SwitchBlock, 20);
+                b.end(NodeKind::SwitchStatement, 20);
+            }),
+        );
+        assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
+    }
+
+    // —— use_rethrow_when_possible ————————————————————————————————————————
+
+    /// `test/rules/use_rethrow_when_possible_test.dart` `test_rethrow` — the
+    /// caught parameter rethrown as a statement reports at the throw.
+    #[test]
+    fn rethrow_of_the_exception_reports() {
+        let source = "try {} catch (e) { throw e; }";
+        // try0 {1 }2 catch3 (4 e5 )6 {7 throw8 e9 ;10 }11
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::ExpressionStatement, 8);
+                b.begin(NodeKind::ThrowExpression, 8);
+                identifier(b, 9, 10);
+                b.end(NodeKind::ThrowExpression, 11);
+                b.end(NodeKind::ExpressionStatement, 11);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::CatchClause, 12);
+                b.end(NodeKind::TryStatement, 12);
+            }),
+        );
+        let lints = f.run(&one_rule("use_rethrow_when_possible"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'rethrow' to rethrow a caught exception."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 8));
+    }
+
+    /// Throwing a different name and an `on`-only catch (no exception
+    /// parameter) pass.
+    #[test]
+    fn rethrow_other_name_and_on_form_pass() {
+        let other = "try {} catch (e) { throw x; }";
+        let f = Fixture::build(
+            other,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::ExpressionStatement, 8);
+                b.begin(NodeKind::ThrowExpression, 8);
+                identifier(b, 9, 10);
+                b.end(NodeKind::ThrowExpression, 11);
+                b.end(NodeKind::ExpressionStatement, 11);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::CatchClause, 12);
+                b.end(NodeKind::TryStatement, 12);
+            }),
+        );
+        assert!(f.run(&one_rule("use_rethrow_when_possible")).is_empty());
+
+        // try0 {1 }2 on3 E4 {5 throw6 e7 ;8 }9 — no exception parameter.
+        let on_form = "try {} on E { throw e; }";
+        let f = Fixture::build(
+            on_form,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.leaf_span(NodeKind::Type, 4, 5);
+                b.begin(NodeKind::Block, 5);
+                b.begin(NodeKind::ExpressionStatement, 6);
+                b.begin(NodeKind::ThrowExpression, 6);
+                identifier(b, 7, 8);
+                b.end(NodeKind::ThrowExpression, 9);
+                b.end(NodeKind::ExpressionStatement, 9);
+                b.end(NodeKind::Block, 10);
+                b.end(NodeKind::CatchClause, 10);
+                b.end(NodeKind::TryStatement, 10);
+            }),
+        );
+        assert!(f.run(&one_rule("use_rethrow_when_possible")).is_empty());
+    }
+
+    /// A throw inside an argument is not a statement throw (:37).
+    #[test]
+    fn rethrow_in_argument_position_passes() {
+        let source = "try {} catch (e) { g(throw e); }";
+        // try0 {1 }2 catch3 (4 e5 )6 {7 g8 (9 throw10 e11 )12 ;13 }14
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TryStatement, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Block, 1, 3);
+                b.begin(NodeKind::CatchClause, 3);
+                b.patch(0, 3);
+                b.patch(1, NONE);
+                b.begin(NodeKind::FormalParameter, 5);
+                b.patch(0, NONE);
+                b.patch(1, 5);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.end(NodeKind::FormalParameter, 6);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::ExpressionStatement, 8);
+                b.begin(NodeKind::Send, 8);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::Arguments, 9);
+                b.begin(NodeKind::ThrowExpression, 10);
+                identifier(b, 11, 12);
+                b.end(NodeKind::ThrowExpression, 13);
+                b.end(NodeKind::Arguments, 13);
+                b.end(NodeKind::Send, 13);
+                b.end(NodeKind::ExpressionStatement, 14);
+                b.end(NodeKind::Block, 15);
+                b.end(NodeKind::CatchClause, 15);
+                b.end(NodeKind::TryStatement, 15);
+            }),
+        );
+        assert!(f.run(&one_rule("use_rethrow_when_possible")).is_empty());
+    }
+
+    // —— avoid_returning_null_for_void ————————————————————————————————————
+
+    /// `test/rules/avoid_returning_null_for_void_test.dart` — a top-level
+    /// function carries the function text.
+    #[test]
+    fn returning_null_from_void_function_reports() {
+        let source = "void f() { return null; }";
+        // void0 f1 (2 )3 {4 return5 null6 ;7 }8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::VoidType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::ReturnStatement, 5);
+                b.leaf(NodeKind::LiteralNull, 6);
+                b.end(NodeKind::ReturnStatement, 8);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::TopLevelMethod, 9);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_returning_null_for_void"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Don't return 'null' from a function with a return type of 'void'."
+        );
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing the 'null'.".to_owned())
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    }
+
+    /// Inside a class the method variant reports.
+    #[test]
+    fn returning_null_from_void_method_reports() {
+        let source = "class A { void m() { return null; } }";
+        // class0 A1 {2 void3 m4 (5 )6 {7 return8 null9 ;10 }11 }12
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 3);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::VoidType, 3);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::FormalParameters, 5);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::ReturnStatement, 8);
+                b.leaf(NodeKind::LiteralNull, 9);
+                b.end(NodeKind::ReturnStatement, 11);
+                b.end(NodeKind::Block, 12);
+                b.end(NodeKind::Method, 12);
+                b.end(NodeKind::DeclarationBody, 13);
+                b.end(NodeKind::ClassDeclaration, 13);
+                b.end(NodeKind::TopLevelDeclaration, 13);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_returning_null_for_void"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Don't return 'null' from a method with a return type of 'void'."
+        );
+    }
+
+    /// A non-void declared type, a closure face, and `async void` pass.
+    #[test]
+    fn returning_null_non_void_and_async_pass() {
+        let typed = "int f() { return null; }";
+        // int0 f1 (2 )3 {4 return5 null6 ;7 }8
+        let f = Fixture::build(
+            typed,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 0, 1);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::ReturnStatement, 5);
+                b.leaf(NodeKind::LiteralNull, 6);
+                b.end(NodeKind::ReturnStatement, 8);
+                b.end(NodeKind::Block, 9);
+                b.end(NodeKind::TopLevelMethod, 9);
+            }),
+        );
+        assert!(f.run(&one_rule("avoid_returning_null_for_void")).is_empty());
+
+        // The closure is the nearest function — no written return type.
+        let closure = "void f() { g(() { return null; }); }";
+        // void0 f1 (2 )3 {4 g5 (6 (7 )8 {9 return10 null11 ;12 }13 )14 ;15 }16
+        let f = Fixture::build(
+            closure,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::VoidType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::Block, 4);
+                b.begin(NodeKind::ExpressionStatement, 5);
+                b.begin(NodeKind::Send, 5);
+                identifier(b, 5, 6);
+                b.begin(NodeKind::Arguments, 6);
+                b.begin(NodeKind::FunctionExpression, 7);
+                b.begin(NodeKind::FormalParameters, 7);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::Block, 9);
+                b.begin(NodeKind::ReturnStatement, 10);
+                b.leaf(NodeKind::LiteralNull, 11);
+                b.end(NodeKind::ReturnStatement, 13);
+                b.end(NodeKind::Block, 14);
+                b.end(NodeKind::FunctionExpression, 14);
+                b.end(NodeKind::Arguments, 15);
+                b.end(NodeKind::Send, 15);
+                b.end(NodeKind::ExpressionStatement, 16);
+                b.end(NodeKind::Block, 17);
+                b.end(NodeKind::TopLevelMethod, 17);
+            }),
+        );
+        assert!(f.run(&one_rule("avoid_returning_null_for_void")).is_empty());
+
+        // `void f() async { return null; }` — the async body skips both
+        // official branches (:75-80). The brace body is a `BlockBody`
+        // carrying the `async` token (collapse map §3.9).
+        let async_fn = "void f() async { return null; }";
+        // void0 f1 (2 )3 async4 {5 return6 null7 ;8 }9
+        let f = Fixture::build(
+            async_fn,
+            unit_of(|b, t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::VoidType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::BlockBody, 4);
+                b.patch(0, tok_at(async_fn, t, "async", 0));
+                b.patch(1, NONE);
+                b.begin(NodeKind::ReturnStatement, 6);
+                b.leaf(NodeKind::LiteralNull, 7);
+                b.end(NodeKind::ReturnStatement, 9);
+                b.end(NodeKind::BlockBody, 10);
+                b.end(NodeKind::TopLevelMethod, 10);
+            }),
+        );
+        assert!(f.run(&one_rule("avoid_returning_null_for_void")).is_empty());
+    }
+
+    /// The arrow-body face: `void f() => null;` reports.
+    #[test]
+    fn returning_null_from_arrow_body_reports() {
+        let source = "void f() => null;";
+        // void0 f1 (2 )3 =>4 null5 ;6
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelMethod, 0);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::VoidType, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::FormalParameters, 2);
+                b.end(NodeKind::FormalParameters, 4);
+                b.begin(NodeKind::ExpressionBody, 4);
+                b.patch(0, 4);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.leaf(NodeKind::LiteralNull, 5);
+                b.end(NodeKind::ExpressionBody, 7);
+                b.end(NodeKind::TopLevelMethod, 7);
+            }),
+        );
+        let lints = f.run(&one_rule("avoid_returning_null_for_void"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
     }
 }

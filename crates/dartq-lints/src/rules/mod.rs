@@ -1,11 +1,13 @@
-//! The wave-1 rules, grouped by theme. Each `SPEC` cites its official
+//! The rules, grouped by theme. Each `SPEC` cites its official
 //! implementation (`pkg/linter/lib/src/rules/<rule>.dart`, Dart 3.15 main)
 //! and the generated message template (`pkg/linter/lib/src/diagnostic.g.dart`).
 //!
-//! Selection criteria (wave 1): rules whose behavior is fully determined by
-//! the syntax-level substrate (arena AST + token table + comments) — no flow
-//! analysis (#278), no type inference, no element model. Rules needing those
-//! are listed in the crate docs with their blocker.
+//! Selection criteria: rules whose observable behavior is pinned by the
+//! syntax-level substrate (arena AST + token table + comments). A rule whose
+//! official form leans on the element model or flow analysis may still port
+//! when the lexical face matches on valid code — the approximation and its
+//! divergences are documented on the rule. Rules not portable at all are
+//! listed in the crate docs with their blocker.
 
 pub(crate) mod collections;
 pub(crate) mod declarations;

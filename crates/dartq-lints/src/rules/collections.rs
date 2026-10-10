@@ -1,5 +1,6 @@
 //! The collection-literal family: `prefer_inlined_adds`,
-//! `prefer_spread_collections`.
+//! `prefer_spread_collections`, `prefer_collection_literals`,
+//! `unnecessary_to_list_in_spreads`.
 //!
 //! Cascade shape (collapse map §3.5 CascadeEnd): a [`NodeKind::Cascade`]
 //! node's direct children are its sections; the target expression is the
@@ -170,6 +171,172 @@ pub(crate) mod prefer_spread_collections {
             return;
         }
         let range = c.utf16_span(method);
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod prefer_collection_literals {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    const PROBLEM: &str = "Unnecessary constructor invocation.";
+    const CORRECTION: &str = "Try using a collection literal.";
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_collection_literals.dart:41-95`
+    /// — no-arg `Map()`/`Set()` constructor invocations (the core types and
+    /// their `Linked*`/`Hash*` forms) report; `Set.from([…])`/`Set.of([…])`
+    /// with a single list literal reports; `listLiteral.toSet()` reports.
+    ///
+    /// Approximations (documented): the official pins the types through the
+    /// element model (`staticType.isDartCoreMap` etc., :99-105) and exempts
+    /// typedef constructors and matching context types (:44-46/:50-53); the
+    /// lexical face matches the constructor name, so a user-defined `Map`/`Set`
+    /// family class over-reports and the typedef/context exemptions are
+    /// dropped. Prefixed callees (`core.Map()`) and `new`/`const` wrappers
+    /// report at the inner invocation rather than the whole creation.
+    /// Message: `diagnostic.g.dart` `preferCollectionLiterals`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_collection_literals",
+        group: Group::Recommended,
+        problem: PROBLEM,
+        correction: CORRECTION,
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
+        else {
+            return;
+        };
+        let args = c.collect_direct(kids[args_pos]);
+        let Some(&callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return;
+        };
+        match c.kind(callee) {
+            // `Map()` / `Set()` — a plain type name with no arguments
+            // (:55-59/:68-74).
+            NodeKind::Identifier => {
+                let name = c.lexeme(c.head_token(callee));
+                if !is_collection_type(name) || !args.is_empty() {
+                    return;
+                }
+            }
+            // `Set.from([…])` / `Set.of([…])` — one list-literal argument
+            // (:75-81).
+            NodeKind::Qualified => {
+                let qualified = c.collect_direct(callee);
+                let (Some(type_name), Some(ctor)) =
+                    (qualified.first().copied(), qualified.last().copied())
+                else {
+                    return;
+                };
+                if c.kind(type_name) != NodeKind::Identifier
+                    || c.kind(ctor) != NodeKind::Identifier
+                    || !is_collection_type(c.lexeme(c.head_token(type_name)))
+                    || !matches!(c.lexeme(c.head_token(ctor)), "from" | "of")
+                {
+                    return;
+                }
+                if args.len() != 1 || c.kind(args[0]) != NodeKind::ListLiteral {
+                    return;
+                }
+            }
+            // `['a'].toSet()` (:87-95).
+            NodeKind::DotAccess => {
+                let access = c.collect_direct(callee);
+                let Some(name) = access.last().copied() else {
+                    return;
+                };
+                if c.kind(name) != NodeKind::Identifier || c.lexeme(c.head_token(name)) != "toSet" {
+                    return;
+                }
+                let Some(target) = access.first().copied() else {
+                    return;
+                };
+                if c.kind(target) != NodeKind::ListLiteral {
+                    return;
+                }
+            }
+            _ => return,
+        }
+        let range = c.utf16_span(node);
+        c.report_texts(range, PROBLEM, CORRECTION, &[]);
+    }
+
+    /// The `Map`/`Set` family names the official type checks accept
+    /// (`isDartCoreMap`/`isDartCoreSet` plus the `Linked*`/`Hash*` forms).
+    fn is_collection_type(name: &str) -> bool {
+        matches!(
+            name,
+            "Map" | "HashMap" | "LinkedHashMap" | "Set" | "HashSet" | "LinkedHashSet"
+        )
+    }
+}
+
+pub(crate) mod unnecessary_to_list_in_spreads {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_to_list_in_spreads.dart:37-47`
+    /// — a spread of `x.toList()` reports at the method name.
+    ///
+    /// Approximation (documented): the official requires the receiver to
+    /// implement `Iterable` (`implementsInterface('Iterable', 'dart.core')`,
+    /// :45) — a resolution fact; a spread expression's type is checked by
+    /// the compiler, so the lexical name check matches on all valid code and
+    /// a user `toList` on a non-Iterable (already a compile error in a
+    /// spread) over-reports. Message: `diagnostic.g.dart`
+    /// `unnecessaryToListInSpreads`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_to_list_in_spreads",
+        group: Group::Recommended,
+        problem: "Unnecessary use of 'toList' in a spread.",
+        correction: "Try removing the invocation of 'toList'.",
+        kinds: &[NodeKind::Spread],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // `node.expression` is the spread's operand child (collapse map
+        // §3.5 SpreadExpressionHandle).
+        let Some(expression) = c
+            .collect_direct(c.node())
+            .into_iter()
+            .next()
+            .filter(|&kid| c.kind(kid) == NodeKind::Send)
+        else {
+            return;
+        };
+        let kids = c.collect_direct(expression);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
+        else {
+            return;
+        };
+        let Some(&callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+            return;
+        };
+        // `expression.methodName.name == 'toList'` with a target
+        // (:43-45): the callee is `x.toList` — a `DotAccess` whose last
+        // child names the method.
+        if c.kind(callee) != NodeKind::DotAccess {
+            return;
+        }
+        let access = c.collect_direct(callee);
+        let Some(name) = access.last().copied() else {
+            return;
+        };
+        if c.kind(name) != NodeKind::Identifier
+            || c.lexeme(c.head_token(name)) != "toList"
+            || access.len() < 2
+        {
+            return;
+        }
+        let range = c.utf16_span(name);
         c.report(range, &[]);
     }
 }
@@ -399,5 +566,257 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("prefer_spread_collections")).is_empty());
+    }
+
+    // —— prefer_collection_literals ———————————————————————————————————————
+
+    /// `test/rules/prefer_collection_literals_test.dart` `test_map` — the
+    /// no-arg `Map()` invocation reports.
+    #[test]
+    fn collection_literals_reports_map_and_set() {
+        let map = "Map();";
+        // Map0 (1 )2 ;3
+        let f = Fixture::build(
+            map,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Arguments, 1);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::Send, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_collection_literals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary constructor invocation.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try using a collection literal.".to_owned())
+        );
+
+        let set = "Set();";
+        // Set0 (1 )2 ;3
+        let f = Fixture::build(
+            set,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Arguments, 1);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::Send, 4);
+                b.end(NodeKind::ExpressionStatement, 4);
+            }),
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+    }
+
+    /// `Set.from([1])` reports; a named constructor on the map family, a
+    /// non-list argument, and arguments on `Map()` pass.
+    #[test]
+    fn collection_literals_from_of_and_negatives() {
+        let from_list = "Set.from([1]);";
+        // Set0 .1 from2 (3 [4 15 ]6 )7 ;8
+        let f = Fixture::build(
+            from_list,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 4);
+                b.begin(NodeKind::Arguments, 3);
+                b.begin(NodeKind::ListLiteral, 4);
+                b.patch(0, NONE);
+                b.leaf(NodeKind::LiteralInt, 5);
+                b.end(NodeKind::ListLiteral, 7);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::Send, 8);
+                b.end(NodeKind::ExpressionStatement, 9);
+            }),
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        // `HashMap.identity()` — a named constructor on the map family
+        // (`constructorName != null`, :56).
+        let named_map = "HashMap.identity();";
+        // HashMap0 .1 identity2 (3 )4 ;5
+        let f = Fixture::build(
+            named_map,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 4);
+                b.begin(NodeKind::Arguments, 4);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+
+        // `Set.from(1)` — the argument is not a list literal (:76-78).
+        let from_int = "Set.from(1);";
+        // Set0 .1 from2 (3 14 )5 ;6
+        let f = Fixture::build(
+            from_int,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 4);
+                b.begin(NodeKind::Arguments, 3);
+                b.leaf(NodeKind::LiteralInt, 4);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+    }
+
+    /// `['a'].toSet()` reports; `x.toSet()` on a non-literal target passes
+    /// (:87-95).
+    #[test]
+    fn collection_literals_to_set_on_list_literal() {
+        let to_set = "['a'].toSet();";
+        // [0 'a'1 ]2 .3 toSet4 (5 )6 ;7
+        let f = Fixture::build(
+            to_set,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 3);
+                b.patch(1, 0);
+                b.begin(NodeKind::ListLiteral, 0);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::StringLiteral, 1, 2);
+                b.end(NodeKind::ListLiteral, 4);
+                identifier(b, 4, 5);
+                b.end(NodeKind::DotAccess, 7);
+                b.begin(NodeKind::Arguments, 5);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::Send, 8);
+                b.end(NodeKind::ExpressionStatement, 8);
+            }),
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let non_literal = "x.toSet();";
+        // x0 .1 toSet2 (3 )4 ;5
+        let f = Fixture::build(
+            non_literal,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, 0);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 5);
+                b.begin(NodeKind::Arguments, 3);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+    }
+
+    // —— unnecessary_to_list_in_spreads ————————————————————————————————————
+
+    /// `test/rules/unnecessary_to_list_in_spreads_test.dart` — `...x.toList()`
+    /// reports at the method name.
+    #[test]
+    fn to_list_spread_reports() {
+        let source = "[...list.toList()];";
+        // [0 ...1 list2 .3 toList4 (5 )6 ]7 ;8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::ListLiteral, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::Spread, 1);
+                b.begin(NodeKind::Send, 2);
+                b.begin(NodeKind::DotAccess, 2);
+                b.patch(0, 3);
+                b.patch(1, 0);
+                identifier(b, 2, 3);
+                identifier(b, 4, 5);
+                b.end(NodeKind::DotAccess, 7);
+                b.begin(NodeKind::Arguments, 5);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::Send, 8);
+                b.end(NodeKind::Spread, 8);
+                b.end(NodeKind::ListLiteral, 9);
+                b.end(NodeKind::ExpressionStatement, 9);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_to_list_in_spreads"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary use of 'toList' in a spread.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    /// A plain spread element and a bare `toList()` call pass.
+    #[test]
+    fn plain_spread_and_bare_to_list_pass() {
+        let plain = "[...list];";
+        // [0 ...1 list2 ]3 ;4
+        let f = Fixture::build(
+            plain,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::ListLiteral, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::Spread, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Spread, 4);
+                b.end(NodeKind::ListLiteral, 5);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("unnecessary_to_list_in_spreads"))
+                .is_empty()
+        );
+
+        let bare = "[...toList()];";
+        // [0 ...1 toList2 (3 )4 ]5 ;6
+        let f = Fixture::build(
+            bare,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::ListLiteral, 0);
+                b.patch(0, NONE);
+                b.begin(NodeKind::Spread, 1);
+                b.begin(NodeKind::Send, 2);
+                identifier(b, 2, 3);
+                b.begin(NodeKind::Arguments, 3);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.end(NodeKind::Spread, 6);
+                b.end(NodeKind::ListLiteral, 7);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("unnecessary_to_list_in_spreads"))
+                .is_empty()
+        );
     }
 }
