@@ -85,6 +85,12 @@ const FACTS_SHAPE_VERSION: u32 = 7;
 pub const FACTS_SEMANTIC_VERSION: u32 =
     (FACTS_SHAPE_VERSION << 16) | (dartq_semantic::SIGNATURE_VERSION & 0xffff);
 
+// The fold above is injective only while the signature fits its 16-bit lane:
+// a SIGNATURE_VERSION of 2^16 or more would wrap and alias an older
+// snapshot's key as current. Widening the key rides the next
+// FACTS_SHAPE_VERSION bump (a container-format change anyway).
+const _: () = assert!(dartq_semantic::SIGNATURE_VERSION <= u16::MAX as u32);
+
 /// Facts-cache capacity in entries. Steady-state residency is bounded by the
 /// live file set; this cache only memoizes *previous* contents so a
 /// change-back (git branch flip, undo) reparses for free. The entry cap

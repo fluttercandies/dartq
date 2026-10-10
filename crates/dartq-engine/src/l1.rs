@@ -1790,7 +1790,11 @@ fn maintain_and_close(
     // A file entering residency gains the reverse edges of every unchanged
     // source that already pointed at it (the sources' own events carried
     // nothing — their directive faces never moved). Changed and mover
-    // sources re-add their edges through their own events below.
+    // sources re-add their edges through their own events below. The movers'
+    // ids as a set: membership is asked per unchanged source, and a linear
+    // scan over the movers vector is quadratic on mass delete-recreate
+    // batches (a local — nothing lingers past this loop's scope).
+    let moved_set: FxHashSet<FileId> = movers.iter().map(|(moved, _, _)| *moved).collect();
     for (file, old, _) in &changed_faces {
         if old.is_some() {
             continue;
@@ -1801,21 +1805,38 @@ fn maintain_and_close(
             .map(|sources| sources.iter().copied().collect())
             .unwrap_or_default();
         for source in sources {
-            if changed_set.contains(&source) || movers.iter().any(|(moved, _, _)| moved == &source)
-            {
+            if changed_set.contains(&source) || moved_set.contains(&source) {
                 continue;
             }
             let Some(&owner) = state.library_of_file.get(&source) else {
                 continue;
             };
+            // The occurrence count reads the directives directly — the
+            // exact same multiset `UnitFace::of(facts).import_targets`
+            // carries for `file` (import/export resolved targets, source
+            // order, duplicates kept; order is irrelevant to a count)
+            // without materializing the face's two vectors per pair.
             let occurrences = state
                 .residency
                 .get(&source)
-                .map(|facts| UnitFace::of(facts).import_targets)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|target| target == file)
-                .count();
+                .map(|facts| {
+                    facts
+                        .directives
+                        .iter()
+                        .filter(|directive| {
+                            matches!(
+                                directive.kind,
+                                DirectiveKind::Import | DirectiveKind::Export
+                            )
+                        })
+                        .filter_map(|directive| match directive.target {
+                            ResolvedTarget::Resolved(target) => Some(target),
+                            _ => None,
+                        })
+                        .filter(|target| target == file)
+                        .count()
+                })
+                .unwrap_or(0);
             for _ in 0..occurrences {
                 add_edge(&mut state.importers, *file, owner);
             }

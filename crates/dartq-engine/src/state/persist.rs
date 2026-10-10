@@ -470,6 +470,47 @@ impl PersistedDirective {
                 )
             })
             .unzip();
+        let combinators = {
+            // Disk payload: a clause whose name and span columns disagree is
+            // a corrupt entry — serde-valid, so only the loader can see it.
+            // The whole directive's combinator face degrades to the empty
+            // one (the face a cold capture gives an import with no show/hide
+            // clauses) instead of tripping the constructor's capture-bug
+            // assert: under-report, never a crash, the same posture as the
+            // target index above. Zip-truncating was rejected — a truncated
+            // clause is a face no source spelling could have produced, while
+            // the empty face is the real no-combinator input. The live
+            // capture path keeps the assert: there a mismatch is an internal
+            // bug, not disk rot.
+            let clauses = self.combinators;
+            let desynced = clauses
+                .iter()
+                .any(|clause| clause.names.len() != clause.name_spans.len());
+            if desynced {
+                Combinators::unfiltered()
+            } else {
+                Combinators::with_spans(clauses.into_iter().map(|clause| {
+                    // Written order and duplicates ride verbatim; the
+                    // constructor re-expands the `name=` setter spellings
+                    // and re-sorts the clause sets exactly as the cold
+                    // capture did (l1.rs walk_import_export → the same
+                    // `with_spans` face).
+                    let names: Box<[StringId]> =
+                        clause.names.iter().map(|text| strings.intern(text)).collect();
+                    let spans: Box<[SourceRange]> = clause
+                        .name_spans
+                        .iter()
+                        .map(|span| span.source_range())
+                        .collect();
+                    let combinator = if clause.hide {
+                        CombinatorClause::Hide(names)
+                    } else {
+                        CombinatorClause::Show(names)
+                    };
+                    (combinator, spans)
+                }), strings)
+            }
+        };
         DirectiveFacts {
             kind: match self.kind {
                 PersistedDirectiveKind::Import => DirectiveKind::Import,
@@ -495,32 +536,7 @@ impl PersistedDirective {
             code: self.code.map(PersistedResolutionCode::resolve),
             prefix: self.prefix.as_deref().map(|text| strings.intern(text)),
             deferred: self.deferred,
-            combinators: Combinators::with_spans(
-                self.combinators.into_iter().map(|clause| {
-                    // Written order and duplicates ride verbatim; the
-                    // constructor re-expands the `name=` setter spellings
-                    // and re-sorts the clause sets exactly as the cold
-                    // capture did (l1.rs walk_import_export → the same
-                    // `with_spans` face).
-                    let names: Box<[StringId]> = clause
-                        .names
-                        .iter()
-                        .map(|text| strings.intern(text))
-                        .collect();
-                    let spans: Box<[SourceRange]> = clause
-                        .name_spans
-                        .iter()
-                        .map(|span| span.source_range())
-                        .collect();
-                    let combinator = if clause.hide {
-                        CombinatorClause::Hide(names)
-                    } else {
-                        CombinatorClause::Show(names)
-                    };
-                    (combinator, spans)
-                }),
-                strings,
-            ),
+            combinators,
             name: self.name.map(Box::from),
             configurations: configurations.into(),
             configuration_spans: configuration_spans.into(),
@@ -1547,6 +1563,81 @@ mod tests {
         assert!(!restored.directives[0].combinators.allows(restored_alpha));
         assert!(restored.directives[0].combinators.allows(restored_beta));
         assert!(restored.directives[0].combinators.has_show());
+    }
+
+    /// A disk payload whose combinator columns desync (JSON-valid, so only
+    /// the loader can see it) degrades to the empty combinator face instead
+    /// of tripping `Combinators::with_spans`' capture-bug assert (#554):
+    /// under-report, never a crash — the directive behaves as if it carried
+    /// no show/hide clauses at all.
+    #[test]
+    fn desynced_combinator_payload_degrades_instead_of_panicking() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let target = files.intern(Path::new("/w/lib/other.dart"));
+        let alpha = strings.intern("alpha");
+        let spans: Box<[SourceRange]> = Box::new([SourceRange {
+            offset: 40,
+            length: 5,
+        }]);
+        let combinators = Combinators::with_spans(
+            vec![(CombinatorClause::Hide(Box::new([alpha])), spans)],
+            &strings,
+        );
+        let directives = vec![DirectiveFacts {
+            kind: DirectiveKind::Import,
+            uri: Some("package:other/other.dart".into()),
+            uri_span: SourceRange {
+                offset: 7,
+                length: 26,
+            },
+            target: ResolvedTarget::Resolved(target),
+            code: None,
+            prefix: None,
+            deferred: false,
+            combinators,
+            name: None,
+            configurations: Box::default(),
+            configuration_spans: Box::default(),
+        }];
+        let source = "import 'package:other/other.dart' hide alpha;\n";
+        let facts = UnitFacts {
+            content: content_hash(source.as_bytes()),
+            api_signature: ApiSignature::from_bytes([5; 16]),
+            directives,
+            elements: Arc::new(dartq_semantic::FileElements::default()),
+            diagnostics: Vec::new(),
+            line_index: LineIndex::new(source),
+        };
+
+        let payload = PersistedFacts::of(&facts, &strings, &files);
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let mut decoded: PersistedFacts = serde_json::from_slice(&bytes).expect("deserialize");
+
+        // Corrupt the payload the way disk rot would: drop the span column
+        // under a non-empty name column. Serde accepts it; only the
+        // loader's length pairing can notice.
+        decoded.directives[0].combinators[0].name_spans.clear();
+
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
+            restored_files.intern(path)
+        });
+
+        let combinators = &restored.directives[0].combinators;
+        assert!(
+            !combinators.has_show(),
+            "degraded to the empty face: no clause data survives a desynced payload"
+        );
+        let hidden_before = restored_strings.intern("alpha");
+        let never_listed = restored_strings.intern("absent");
+        assert!(
+            combinators.allows(hidden_before) && combinators.allows(never_listed),
+            "the empty face filters nothing — the corrupt hide clause is dropped whole, \
+             not truncated into a face no source spelling could produce"
+        );
     }
 
     /// The version-bump contract (#539, the #512 precedent):
