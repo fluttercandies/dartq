@@ -983,8 +983,7 @@ pub(crate) mod tests {
             .references_of(file_d, strings.intern("gone"))
             .expect("both members' uses resolve");
         assert_eq!(gone.len(), 2);
-        let members: Vec<(FileId, RefKind)> =
-            gone.iter().map(|row| (row.file, row.kind)).collect();
+        let members: Vec<(FileId, RefKind)> = gone.iter().map(|row| (row.file, row.kind)).collect();
         assert_eq!(
             members,
             vec![(file_m, RefKind::Invoked), (file_p, RefKind::Invoked)],

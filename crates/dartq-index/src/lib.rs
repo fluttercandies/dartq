@@ -1,6 +1,6 @@
 //! The M1 symbol index (index-design-spec §8-§10; PRD §10.3, §20.3): the
-//! unlinked declaration surface, the per-library reference surface, the
-//! `query symbol` faces, and CSR-friendly graph exports.
+//! unlinked declaration surface, the per-library reference surface, and the
+//! `query symbol` faces.
 //!
 //! # Faces (spec §8 keep list)
 //!
@@ -18,9 +18,6 @@
 //! * **Query faces** ([`SymbolIndex`]): declarations by name across the
 //!   workspace and references of a declaration — the `query symbol` CLI
 //!   pair (#123).
-//! * **CSR exports** ([`csr`]): the import graph and the reference graph as
-//!   flat `&[u32]` offsets/edges arrays (the GPU posture directive — future
-//!   compute backends read views, never restructure the store).
 //! * **Test graph** ([`TestGraph`]): the inverted `test_of` edges from test
 //!   files to the libraries they test (PRD §15.4) — the AffectedTests join
 //!   of the impact query, in the same CSR posture over the caller's library
@@ -59,12 +56,10 @@ use dartq_resolution::LibraryId;
 use dartq_source::{FileId, StringId};
 
 mod capture;
-mod csr;
 mod library;
 mod test_graph;
 
 pub use capture::{DeclKind, DeclRow, FileCapture, FileIndex, SuperEdge, capture};
-pub use csr::{ImportCsr, ReferenceCsr};
 pub use library::{LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, TargetRef};
 pub use test_graph::TestGraph;
 
@@ -75,16 +70,6 @@ pub struct SymbolDecl<'a> {
     pub file: FileId,
     /// The declaration row (name, kind, span, container chain).
     pub decl: &'a DeclRow,
-}
-
-/// A `(file, name)` declaration key — the node id payload of the reference
-/// CSR export and the identity every row shares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DeclKey {
-    /// The declaring file.
-    pub file: FileId,
-    /// The declared (lookup-spelling) name.
-    pub name: StringId,
 }
 
 /// The workspace index: per-file declaration surfaces plus per-library

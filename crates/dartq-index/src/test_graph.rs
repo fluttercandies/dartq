@@ -1,6 +1,6 @@
 //! The test graph (PRD §15.4): `test_of` edges from test files to the
 //! libraries they test, stored in the index's dependency-subgraph posture
-//! (flat CSR arrays over the library id space, like [`crate::ImportCsr`]).
+//! (flat CSR arrays over the library id space).
 //!
 //! # Edge derivation
 //!
@@ -34,7 +34,7 @@
 //! # Identity and contracts
 //!
 //! Libraries are addressed in the caller's `u32` id space (`0..count`), the
-//! same convention [`crate::ImportCsr`]'s edge arrays use — the graph is
+//! same convention the workspace's CSR edge arrays use — the graph is
 //! built once over whatever interning the caller owns and never mints ids.
 //! `imports_of` must return targets below `count` (the CSR projection
 //! guarantees it; an out-of-range target is a caller bug and surfaces as
@@ -274,9 +274,11 @@ mod tests {
     #[test]
     fn sibling_wins_over_same_basename_elsewhere() {
         let identities = ["lib/a.dart", "test/a.dart", "test/a_test.dart"];
-        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
-            Some(identities[lib as usize])
-        });
+        let graph = TestGraph::build(
+            identities.len(),
+            |_| &[] as &[u32],
+            |lib| Some(identities[lib as usize]),
+        );
         assert_eq!(graph.tests_of(1), &[2], "the sibling resolves");
         assert_eq!(
             graph.tests_of(0),
@@ -291,9 +293,11 @@ mod tests {
     #[test]
     fn ambiguous_homonyms_gain_no_edge() {
         let identities = ["lib1/a.dart", "lib2/a.dart", "test/a_test.dart"];
-        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
-            Some(identities[lib as usize])
-        });
+        let graph = TestGraph::build(
+            identities.len(),
+            |_| &[] as &[u32],
+            |lib| Some(identities[lib as usize]),
+        );
         assert_eq!(graph.tests_of(0), &[] as &[u32]);
         assert_eq!(graph.tests_of(1), &[] as &[u32]);
     }
@@ -303,9 +307,11 @@ mod tests {
     #[test]
     fn unique_non_sibling_still_resolves() {
         let identities = ["lib/a.dart", "test/a_test.dart"];
-        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
-            Some(identities[lib as usize])
-        });
+        let graph = TestGraph::build(
+            identities.len(),
+            |_| &[] as &[u32],
+            |lib| Some(identities[lib as usize]),
+        );
         assert_eq!(graph.tests_of(0), &[1], "the unique candidate resolves");
     }
 

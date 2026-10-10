@@ -249,8 +249,10 @@ pub(crate) enum Family {
 /// The raw reference sites of one file: parallel columns in source order
 /// (offsets ascending — the property the in-place refinements binary
 /// search on). Promoted into [`crate::LibraryIndex`] tables at build time.
+/// Crate-internal: the only consumer is [`crate::LibraryBuilder`], and no
+/// external face names this type (#547 hygiene).
 #[derive(Debug, Default)]
-pub struct RawSites {
+pub(crate) struct RawSites {
     names: Vec<StringId>,
     kinds: Vec<u8>,
     families: Vec<u8>,
@@ -307,8 +309,9 @@ pub struct FileCapture {
     pub file: FileId,
     /// The unlinked declaration surface.
     pub index: FileIndex,
-    /// The raw reference sites.
-    pub sites: RawSites,
+    /// The raw reference sites. Crate-internal with [`RawSites`] (the
+    /// only consumer is [`crate::LibraryBuilder`]).
+    pub(crate) sites: RawSites,
 }
 
 /// The capture state shared between the listener and [`capture`].
