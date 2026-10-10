@@ -29,6 +29,7 @@ pub mod config;
 pub mod discover;
 pub mod fix;
 pub mod impact;
+pub mod index;
 pub mod layout;
 pub mod query;
 pub mod workspace;

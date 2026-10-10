@@ -122,3 +122,52 @@ pub fn load_workspace_faces(
     let pubspec = Pubspec::parse(&pubspec_text).map_err(|error| error.to_string())?;
     Ok((Arc::new(config), lock, pubspec))
 }
+
+#[cfg(test)]
+pub(crate) mod test_fixture {
+    //! The throwaway pub workspace + synthetic dart:core-only SDK the
+    //! engine-backed command tests analyze — the same assembly the CLI
+    //! tests' `analyze_fixture` pins and the dartq-engine integration
+    //! fixture (tests/common/mod.rs) shapes.
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Writes the workspace faces plus `libraries` (path relative to the
+    /// root, content) and returns the root. `tag` namespaces the temp dir.
+    pub(crate) fn workspace(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("dq_cmd_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(path, content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        for (relative, content) in libraries {
+            write(relative, content);
+        }
+        root
+    }
+}

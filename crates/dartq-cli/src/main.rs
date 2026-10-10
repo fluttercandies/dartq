@@ -1,6 +1,7 @@
 //! dartq CLI — `dartq check` (the M0 differential face), `dartq analyze`
-//! (the M1 engine face), `dartq query symbol` (the index face), and
-//! `dartq version`.
+//! (the M1 engine face), the `dartq query` index faces (`symbol` /
+//! `references` / `callers`, PRD §20.3 + §15.2), `dartq index` (the
+//! §15.1 index build), and `dartq version`.
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
 //! the daemon RPC faces share, PRD §15.1); this binary adds only argument
@@ -63,6 +64,7 @@ mod exit {
 mod compat;
 mod fix;
 mod impact;
+mod index;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -81,6 +83,8 @@ fn run(args: &[String]) -> u8 {
             command: Some(Command::Query(query_args)),
         }) => match query_args.face {
             QueryFace::Symbol(symbol_args) => query_symbol(&symbol_args),
+            QueryFace::References(symbol_args) => query_references(&symbol_args),
+            QueryFace::Callers(symbol_args) => query_callers(&symbol_args),
         },
         Ok(Cli {
             command: Some(Command::Impact(impact_args)),
@@ -94,6 +98,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Fix(fix_args)),
         }) => fix::run_entry(&fix_args),
+        Ok(Cli {
+            command: Some(Command::Index(index_args)),
+        }) => index::run_entry(&index_args),
         // Bare `dartq` and `dartq version` land here; `--version` short-
         // circuits in `try_parse_from` as a DisplayVersion error (routed to
         // stdout + exit 0 by the arm below).
@@ -135,6 +142,9 @@ enum Command {
     /// Emit or apply anchored fix patches (PRD §15.6); `--dry-run` only
     /// outputs them.
     Fix(fix::FixArgs),
+    /// Build the symbol index over the analyzed workspace and report what
+    /// it built (PRD §15.1).
+    Index(index::IndexArgs),
     /// Assess what a change to one file would affect (PRD §15.4).
     Impact(impact::ImpactArgs),
     /// Query the analyzed workspace's symbol index (PRD §20.3).
@@ -218,6 +228,12 @@ struct QueryArgs {
 enum QueryFace {
     /// Declarations of one symbol name and resolved references to them.
     Symbol(SymbolArgs),
+    /// All reference rows of one symbol name, kinded (the same rows the
+    /// symbol face serves today; the faces diverge as later semantics land).
+    References(SymbolArgs),
+    /// Invocation-shaped use sites of one symbol name (the references rows
+    /// with kind `invoked`).
+    Callers(SymbolArgs),
 }
 
 #[derive(Args)]
@@ -535,6 +551,84 @@ fn query_symbol(args: &SymbolArgs) -> u8 {
     }
 }
 
+/// `dartq query references` — the same rows the symbol face serves today
+/// (the index's reference surface is name-keyed and already kinded); a
+/// separate spelling per the PRD §15.2 family, diverging as later semantics
+/// land. Same tiers, same runner shape.
+fn query_references(args: &SymbolArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_references_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// The references face's runner: the symbol runner verbatim (the seam where
+/// the faces' rows diverge).
+fn query_references_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    query_symbol_run(args, out)
+}
+
+/// `dartq query callers` — crash tier like [`query_symbol`].
+fn query_callers(args: &SymbolArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_callers_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One callers run: the symbol query's runner with the invocation-shaped
+/// filter applied (`dartq_commands::query::callers`); exit 0 on success,
+/// zero results included.
+fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let run = match dartq_commands::query::callers(&mut engine, &args.name) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+
+    let written = write_query_out(out, &run, &args.name, args.format);
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing query results failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
+/// The query faces' shared output: machine rows or the one-line JSON
+/// envelope (`dartq_commands::query::to_json`, the frozen v1 contract).
+fn write_query_out(
+    out: &mut impl Write,
+    run: &dartq_commands::query::SymbolRun<'_>,
+    name: &str,
+    format: QueryFormat,
+) -> io::Result<()> {
+    match format {
+        QueryFormat::Machine => write_query_machine(out, &run.layout, &run.decls, &run.refs),
+        QueryFormat::Json => writeln!(out, "{}", dartq_commands::query::to_json(run, name)),
+    }
+}
+
 /// One query run: the analyze workspace assembly, one analyze pass (the
 /// read-after-write — the query reflects and never re-drives it), then the
 /// engine's symbol answer on `out`. Exit 0 on success, zero results
@@ -555,14 +649,7 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         }
     };
 
-    let written = match args.format {
-        QueryFormat::Machine => write_query_machine(out, &run.layout, &run.decls, &run.refs),
-        QueryFormat::Json => writeln!(
-            out,
-            "{}",
-            dartq_commands::query::to_json(&run, &args.name)
-        ),
-    };
+    let written = write_query_out(out, &run, &args.name, args.format);
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing query results failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -717,6 +804,8 @@ mod tests {
             &["check", "--metrics-json"][..],
             &["query"][..],
             &["query", "symbol"][..],
+            &["query", "references"][..],
+            &["query", "callers"][..],
             &["query", "bogus"][..],
         ] {
             assert!(parse_args_of(args).is_err(), "must reject {args:?}");
@@ -1218,8 +1307,9 @@ mod tests {
         let Command::Query(args) = parsed else {
             panic!("expected query command")
         };
-        // Single-variant face: an irrefutable destructure.
-        let QueryFace::Symbol(symbol) = args.face;
+        let QueryFace::Symbol(symbol) = args.face else {
+            panic!("expected symbol face")
+        };
         assert_eq!(symbol.name, "Foo");
         assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
         assert!(matches!(symbol.format, QueryFormat::Machine));
@@ -1239,11 +1329,42 @@ mod tests {
         let Command::Query(args) = parsed else {
             panic!("expected query command")
         };
-        let QueryFace::Symbol(symbol) = args.face;
+        let QueryFace::Symbol(symbol) = args.face else {
+            panic!("expected symbol face")
+        };
         assert!(matches!(symbol.format, QueryFormat::Json));
         assert_eq!(symbol.sdk, Some(PathBuf::from("/sdk")));
         assert_eq!(symbol.dir, PathBuf::from("/pkg"));
         assert_eq!(symbol.name, "Foo");
+    }
+
+    /// The references/callers faces share the symbol grammar (name
+    /// positional, dir, format, sdk).
+    #[test]
+    fn query_new_faces_parse() {
+        let parsed = parse_args_of(&["query", "references", "--format=json", "Foo", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::References(symbol) = args.face else {
+            panic!("expected references face")
+        };
+        assert_eq!(symbol.name, "Foo");
+        assert_eq!(symbol.dir, PathBuf::from("/pkg"));
+
+        let parsed = parse_args_of(&["query", "callers", "Foo"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::Callers(symbol) = args.face else {
+            panic!("expected callers face")
+        };
+        assert_eq!(symbol.name, "Foo");
+        assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
     }
 
     fn symbol_args(root: &Path, format: QueryFormat, name: &str) -> SymbolArgs {
@@ -1337,5 +1458,141 @@ mod tests {
         assert_eq!(query_symbol_run(&missing, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The references/callers faces end to end over the symbol test's
+    /// fixture: `references` serves the symbol answer's rows byte-for-byte;
+    /// `callers` keeps only the `invoked` rows (the `Foo()` constructor
+    /// site at UTF-16 offset 41, the `foo()` call at 50) while the
+    /// declaration rows stay for target identity; a declaration with no
+    /// invocations prints its DECL row and no REF rows; the JSON envelope is
+    /// the frozen v1 shape.
+    #[test]
+    fn query_references_and_callers_end_to_end() {
+        let root = analyze_fixture(
+            "refcall",
+            &[
+                (
+                    "lib/a.dart",
+                    "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n",
+                ),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  foo();\n}\n",
+                ),
+            ],
+        );
+        let a = root.canonicalize().expect("root").join("lib/a.dart");
+
+        // references == symbol rows (the index's reference surface is
+        // name-keyed and already kinded).
+        let mut symbol_out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut symbol_out),
+            exit::CLEAN
+        );
+        let mut references_out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_references_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut references_out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8(symbol_out).expect("UTF-8"),
+            String::from_utf8(references_out).expect("UTF-8"),
+            "the references spelling serves the symbol rows"
+        );
+
+        // callers Foo: the constructor site (the `var f` local carries no
+        // reference site).
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!(
+                "DECL|{}|-|class|Foo|1|7|3\nREF|{}|invoked|false|41|3\n",
+                a.display(),
+                a.display()
+            )
+        );
+
+        // callers foo: the one call site.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "foo"), &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!(
+                "DECL|{}|-|function|foo|4|6|3\nREF|{}|invoked|false|50|3\n",
+                a.display(),
+                a.display()
+            )
+        );
+
+        // callers meth: declared, never invoked — DECL row, no REF rows.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "meth"), &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!("DECL|{}|Foo|method|meth|2|8|4\n", a.display())
+        );
+
+        // callers JSON: the frozen v1 envelope with the filtered references.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            query_callers_run(&symbol_args(&root, QueryFormat::Json, "Foo"), &mut out),
+            exit::CLEAN
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["name"], "Foo");
+        assert_eq!(json["declarations"].as_array().expect("array").len(), 1);
+        let refs = json["references"].as_array().expect("array");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["kind"], "invoked");
+        assert_eq!(refs[0]["offset"], 41);
+        assert_eq!(refs[0]["target_file"], a.display().to_string());
+
+        // Usage tier: missing directory.
+        let missing = symbol_args(&root.join("nope"), QueryFormat::Machine, "Foo");
+        assert_eq!(query_callers_run(&missing, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // dartq index
+    // -----------------------------------------------------------------------
+
+    /// The index command face: dir defaults to the cwd, `--full` accepted.
+    #[test]
+    fn index_args_parse() {
+        let parsed = parse_args_of(&["index"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Index(args) = parsed else {
+            panic!("expected index command")
+        };
+        assert!(!args.full, "no rebuild flag by default");
+        assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
+        assert!(args.sdk.is_none());
+
+        let parsed = parse_args_of(&["index", "--full", "--sdk", "/sdk", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Index(args) = parsed else {
+            panic!("expected index command")
+        };
+        assert!(args.full);
+        assert_eq!(args.dir, PathBuf::from("/pkg"));
+        assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
     }
 }

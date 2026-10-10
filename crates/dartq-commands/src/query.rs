@@ -2,6 +2,13 @@
 //! (PRD §20.3). The queried name's declaration rows plus resolved reference
 //! rows, sorted by file path, then position — the printed contract.
 //!
+//! The PRD §15.2 query kinds over the current index: `references` serves
+//! the same rows as `symbol` (the index's reference surface is name-keyed
+//! and already kinded — reference/read/invoked/written/read-written, the
+//! frozen v1 enum); `callers` is its invocation-shaped subset. The faces
+//! diverge as the later semantics land (`implementations` waits on
+//! #281 mixin/override; `references` gains the override typing there).
+//!
 //! The JSON shaper [`to_json`] is the single implementation of the JSON
 //! output face: the CLI's `--format=json` writes it verbatim and the
 //! daemon's `dartq/query` compact verbosity returns it (plus
@@ -67,6 +74,43 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
             .then_with(|| a.range.offset.cmp(&b.range.offset))
     });
     SymbolRun { decls, refs, layout }
+}
+
+/// The `query callers` face (PRD §15.2): the invocation-shaped subset of the
+/// references answer. A callers row is a reference row whose kind is
+/// [`RefKind::Invoked`] — dartq-index's definition: "a call site,
+/// constructor reference, or tear-off-shaped use".
+///
+/// # Direction
+///
+/// The index records use→target edges only (dartq-index `RefRow`: the
+/// target's `(file, name)` plus the use site's span). A row therefore reads
+/// "the use site at `range` invokes the queried declaration at
+/// `target_file`" — the queried name is the callee and the use site is the
+/// caller side; the caller is identified by its site span, not by a caller
+/// declaration row (the index has no caller-declaration column).
+///
+/// The frozen v1 reference-row shape carries no use-file column — a gap
+/// shared with the `query symbol` REF rows: single-file libraries are
+/// unambiguous, while uses of one target from several member files leave
+/// the use file implicit in the row. Widening the row is an additive schema
+/// change owned by the schema/index lanes.
+///
+/// # Errors
+///
+/// [`AnalyzeError`] on discovery failure or cancellation.
+pub fn callers<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
+    let _ = prelude(engine)?;
+    Ok(callers_after_analysis(engine, name))
+}
+
+/// The callers answer over an already-analyzed engine — the daemon path
+/// (see [`symbol_after_analysis`]).
+#[must_use]
+pub fn callers_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
+    let mut run = symbol_after_analysis(engine, name);
+    run.refs.retain(|reference| reference.kind == RefKind::Invoked);
+    run
 }
 
 /// The JSON face: one object — `schema_version`, `name`, and the
@@ -143,5 +187,106 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
         RefKind::Invoked => "invoked",
         RefKind::Written => "written",
         RefKind::ReadWritten => "read-written",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::workspace::{open_engine, test_fixture::workspace};
+
+    /// Three libraries over one imported declaration surface: `Foo` is
+    /// constructed cross-file and `top` is called. The locals use `var` (no
+    /// type annotation) and no assignment statements appear: local
+    /// annotation and assignment-site kinds are the parser lane's in-flight
+    /// surface (the pinned symbol test's red), so these pins rest on the
+    /// observed-stable shapes only.
+    const A: &str = "class Foo {\n  void meth() {}\n}\nvoid top() {}\n";
+    const B: &str = "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  top();\n}\n";
+    const C: &str = "import 'a.dart';\nvoid other() {\n  var f2 = Foo();\n}\n";
+
+    fn fixture(tag: &str) -> PathBuf {
+        workspace(
+            tag,
+            &[("lib/a.dart", A), ("lib/b.dart", B), ("lib/c.dart", C)],
+        )
+    }
+
+    /// The `query callers` face: only the invocation-shaped rows survive —
+    /// non-invocation uses would filter out of the references answer — while
+    /// the declaration rows stay for target identity. UTF-16 offsets
+    /// hand-traced off the sources above.
+    #[test]
+    fn callers_are_the_invoked_subset() {
+        let root = fixture("callers");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let a = root.canonicalize().expect("root").join("lib/a.dart");
+
+        let run = callers(&mut engine, "Foo").expect("query");
+        assert_eq!(run.decls.len(), 1, "the declaration rows stay");
+        assert_eq!(run.decls[0].name, "Foo");
+        let refs: Vec<(RefKind, u32)> = run
+            .refs
+            .iter()
+            .map(|r| (r.kind, r.range.offset))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
+            "both constructor sites, one per use file"
+        );
+        for reference in &run.refs {
+            assert_eq!(
+                engine.file_table().path(reference.target_file),
+                Some(a.as_path()),
+                "rows target a.dart's Foo"
+            );
+        }
+
+        let run = callers(&mut engine, "top").expect("query");
+        assert_eq!(run.refs.len(), 1);
+        assert_eq!(run.refs[0].kind, RefKind::Invoked);
+        assert_eq!(run.refs[0].range.offset, 50);
+
+        // A declaration with no uses: empty callers, declaration still listed.
+        let run = callers(&mut engine, "meth").expect("query");
+        assert!(run.refs.is_empty(), "no invocation of meth");
+        assert_eq!(run.decls.len(), 1);
+
+        fs_remove(&root);
+    }
+
+    /// The references answer (the symbol face's rows): every resolved use,
+    /// kinded by the frozen enum — here the cross-file constructor sites and
+    /// the `top()` call, all `invoked`.
+    #[test]
+    fn references_answer_is_kinded() {
+        let root = fixture("references");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = symbol(&mut engine, "Foo").expect("query");
+        let refs: Vec<(RefKind, u32)> = run
+            .refs
+            .iter()
+            .map(|r| (r.kind, r.range.offset))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
+            "the constructor sites, offset order across the two use files"
+        );
+
+        let run = symbol(&mut engine, "top").expect("query");
+        assert_eq!(run.refs.len(), 1);
+        assert_eq!(run.refs[0].kind, RefKind::Invoked);
+        assert_eq!(run.refs[0].range.offset, 50);
+
+        fs_remove(&root);
+    }
+
+    fn fs_remove(root: &std::path::Path) {
+        std::fs::remove_dir_all(root).ok();
     }
 }

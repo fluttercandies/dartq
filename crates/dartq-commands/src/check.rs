@@ -179,8 +179,22 @@ fn analyze_file(source: &str, file: FileId) -> Vec<Diagnostic> {
 /// (official scanner: `_overrideVersion = null`); the scanner reports only
 /// the last header-window match, so the loop settles after at most one
 /// rescan.
+///
+/// The same settlement the engine's `l1::scan_unit` runs; this restatement
+/// is the M0 face's own (check has no engine involvement), and the index
+/// face seeds it with the owning package's version.
 fn scan_file(source: &str, file: FileId) -> (LanguageVersion, ScanResult, Vec<Diagnostic>) {
-    let mut version = DEFAULT_LANGUAGE_VERSION;
+    scan_file_at(source, DEFAULT_LANGUAGE_VERSION, file)
+}
+
+/// [`scan_file`] seeded with the file's package-derived language version
+/// (the engine capture's derivation) instead of the default.
+pub(crate) fn scan_file_at(
+    source: &str,
+    seed: LanguageVersion,
+    file: FileId,
+) -> (LanguageVersion, ScanResult, Vec<Diagnostic>) {
+    let mut version = seed;
     loop {
         let features = FeatureSet::for_language_version(version);
         let result = scan(
