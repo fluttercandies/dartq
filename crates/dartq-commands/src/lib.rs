@@ -12,6 +12,8 @@
 //! * [`workspace`] — the workspace/SDK assembly behind every engine-backed
 //!   face ([`EngineConfig`] plus the canonical package directory).
 //! * [`check`] — the M0 scan+parse pipeline.
+//! * [`config`] — the `dartiq.yaml` workspace config (PRD §15.9) plus the
+//!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
 //! * [`query`] — the symbol index query over the analyzed state.
 //! * [`impact`] — the §15.4 impact report.
@@ -23,6 +25,7 @@
 pub mod analyze;
 pub mod check;
 pub mod compat;
+pub mod config;
 pub mod discover;
 pub mod fix;
 pub mod impact;

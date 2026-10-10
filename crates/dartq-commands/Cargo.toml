@@ -20,6 +20,7 @@ dartq-sdk = { path = "../dartq-sdk" }
 dartq-source = { path = "../dartq-source" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

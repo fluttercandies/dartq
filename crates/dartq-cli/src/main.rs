@@ -743,6 +743,30 @@ mod tests {
         assert!(!error.use_stderr());
     }
 
+    /// The compat face's `--context` flag: repeatable labels, `--sdk-root`
+    /// unchanged alongside.
+    #[test]
+    fn compat_context_flag_parse() {
+        let parsed = parse_args_of(&[
+            "compat",
+            "--context",
+            "a",
+            "--context",
+            "b",
+            "--sdk-root",
+            "/s",
+            "f.dart",
+        ])
+        .expect("parse")
+        .expect("subcommand");
+        let Command::Compat(args) = parsed else {
+            panic!("expected compat command")
+        };
+        assert_eq!(args.contexts, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(args.sdk_roots, vec![PathBuf::from("/s")]);
+        assert_eq!(args.path, PathBuf::from("f.dart"));
+    }
+
     fn one_diag(severity: Severity) -> Diagnostic {
         let mut table = FileTable::new();
         let file = table.intern(Path::new("/c/lib/a.dart"));

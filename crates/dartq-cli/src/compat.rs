@@ -4,19 +4,21 @@
 //! The matrix mechanics (one axis = one SDK context, sequential axes over
 //! one package discovery, axis failure isolation) and the report assembly
 //! live in [`dartq_commands::compat`] — the one implementation the daemon's
-//! `dartq/compat` shares. This binary adds argument parsing, the
-//! `$DART_SDK` fallback for the axis roots, the tier mapping, and the JSON
-//! output.
+//! `dartq/compat` shares. This binary adds argument parsing, the axis-root
+//! resolution (explicit `--sdk-root` roots, then the `dartiq.yaml` contexts
+//! — all declared ones by default, the `--context` labels' subset when
+//! given — through [`dartq_commands::config::compat_axis_roots`], falling
+//! back to `$DART_SDK` when nothing declared any axis), the tier mapping,
+//! and the JSON output.
 //!
 //! Output is the §15.7 JSON contract (`schema_version: 1`): the queried
-//! file plus the matrix in `--sdk-root` order. The axis verdict rule and
-//! the `first_failure` ordering live in [`dartq_ai::compatibility`].
+//! file plus the matrix in axis order (CLI flags first, then contexts in
+//! file order). Contexts add rows, never row fields. The axis verdict rule
+//! and the `first_failure` ordering live in [`dartq_ai::compatibility`].
 //!
 //! Exit codes follow the query faces: 0 on a successful query —
 //! incompatible axes are the answer's data, not a failure — 64 usage, 4
-//! internal. `--context` labels and dartiq.yaml context-set declaration are
-//! follow-ups; this round takes explicit `--sdk-root` args (empty falls
-//! back to `$DART_SDK`, the single default axis).
+//! internal.
 
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -24,6 +26,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use dartq_commands::compat::{CompatError, compat as query_compat};
+use dartq_commands::config::{ConfigError, compat_axis_roots};
 
 use crate::exit;
 
@@ -40,6 +43,11 @@ pub(crate) struct CompatArgs {
     /// `$DART_SDK` (the single default axis).
     #[arg(long = "sdk-root")]
     pub(crate) sdk_roots: Vec<PathBuf>,
+    /// A dartiq.yaml context label, one matrix axis each; repeatable.
+    /// Empty selects every declared context; unknown labels are usage
+    /// errors. Needs a dartiq.yaml at the workspace root.
+    #[arg(long = "context")]
+    pub(crate) contexts: Vec<String>,
 }
 
 /// Crash tier like the other query faces: a panic aborts with exit 4 and
@@ -57,8 +65,24 @@ pub(crate) fn run_entry(args: &CompatArgs) -> u8 {
 }
 
 fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
-    let Some(roots) = sdk_roots(args) else {
-        return exit::USAGE;
+    let axes = match compat_axis_roots(&args.dir, &args.sdk_roots, &args.contexts) {
+        Ok(axes) => axes,
+        Err(ConfigError::Invalid(message)) => {
+            eprintln!("error: {message}");
+            return exit::USAGE;
+        }
+        Err(ConfigError::Io(error)) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let roots = if axes.is_empty() {
+        match dart_sdk_fallback() {
+            Some(roots) => roots,
+            None => return exit::USAGE,
+        }
+    } else {
+        axes
     };
     let report = match query_compat(&args.dir, &args.path, &roots) {
         Ok(report) => report,
@@ -87,13 +111,11 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
     exit::CLEAN
 }
 
-/// The axis roots: the explicit `--sdk-root` args, else `$DART_SDK` (the
-/// single default axis). `None` is the usage tier (the message is already
+/// The single default axis when neither the flags nor dartiq.yaml declared
+/// any: `$DART_SDK`, else the usage-tier error (the pre-config behavior,
+/// byte-identical). `None` is the usage tier (the message is already
 /// printed), mirroring the other engine faces' SDK resolution.
-fn sdk_roots(args: &CompatArgs) -> Option<Vec<PathBuf>> {
-    if !args.sdk_roots.is_empty() {
-        return Some(args.sdk_roots.clone());
-    }
+fn dart_sdk_fallback() -> Option<Vec<PathBuf>> {
     match std::env::var_os("DART_SDK") {
         Some(root) if !root.is_empty() => Some(vec![PathBuf::from(root)]),
         _ => {
@@ -171,6 +193,7 @@ mod tests {
         let args = CompatArgs {
             path: root.join("lib/a.dart"),
             dir: root.clone(),
+            contexts: vec![],
             sdk_roots: vec![
                 root.join("sdks/old"),
                 root.join("sdks/new"),
@@ -240,6 +263,7 @@ mod tests {
         let args = CompatArgs {
             path: root.join("lib/missing.dart"),
             dir: root.clone(),
+            contexts: vec![],
             sdk_roots: vec![root.join("sdks/new")],
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
@@ -255,6 +279,7 @@ mod tests {
         let args = CompatArgs {
             path: root.join("lib/a.dart"),
             dir: root.clone(),
+            contexts: vec![],
             sdk_roots: vec![root.join("sdks/new"), root.join("sdks/old")],
         };
         let mut out: Vec<u8> = Vec::new();
@@ -265,5 +290,104 @@ mod tests {
         assert_eq!(matrix[0]["sdk"], "3.13.1", "first axis answers first");
         assert_eq!(matrix[1]["sdk"], "3.5.0", "second axis answers second");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Writes the two-context config at the workspace root; `new` is
+    /// declared first on purpose — file order, not the sorted order.
+    fn write_context_config(root: &std::path::Path) {
+        fs::write(
+            root.join("dartiq.yaml"),
+            "version: 1\ncontexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
+        )
+        .expect("config");
+    }
+
+    /// The dartiq.yaml contract end to end: a config declaring two contexts
+    /// is the whole axis set — no `--sdk-root`, no `--context` — and the
+    /// matrix answers in file order with the frozen row shape.
+    #[test]
+    fn config_contexts_drive_the_matrix_without_sdk_root() {
+        let root = fixture("cfgmatrix");
+        write_context_config(&root);
+        let args = CompatArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            contexts: vec![],
+            sdk_roots: vec![],
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        let matrix = json["matrix"].as_array().expect("matrix");
+        assert_eq!(matrix.len(), 2, "one row per declared context");
+        assert_eq!(matrix[0]["sdk"], "3.13.1", "file order: `new` declared first");
+        assert_eq!(matrix[0]["compatible"], true);
+        assert_eq!(matrix[1]["sdk"], "3.5.0");
+        assert_eq!(matrix[1]["compatible"], false);
+        assert_eq!(matrix[1]["first_failure"]["code"], "uri_does_not_exist");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `--context` selects a subset (explicit `--sdk-root` roots keep their
+    /// CLI-order lead) and duplicate roots collapse into one row.
+    #[test]
+    fn context_flag_selects_subset_and_dedups() {
+        let root = fixture("cfgselect");
+        write_context_config(&root);
+
+        let mut out: Vec<u8> = Vec::new();
+        let args = CompatArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            contexts: vec!["old".to_owned()],
+            sdk_roots: vec![root.join("sdks/new")],
+        };
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        let matrix = json["matrix"].as_array().expect("matrix");
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(matrix[0]["sdk"], "3.13.1", "the explicit flag axis leads");
+        assert_eq!(matrix[1]["sdk"], "3.5.0", "the selected context follows");
+
+        let mut out: Vec<u8> = Vec::new();
+        let args = CompatArgs {
+            contexts: vec!["old".to_owned(), "old".to_owned()],
+            sdk_roots: vec![],
+            ..args
+        };
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        let matrix = json["matrix"].as_array().expect("matrix");
+        assert_eq!(matrix.len(), 1, "repeated labels resolve to one axis");
+        assert_eq!(matrix[0]["sdk"], "3.5.0");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Usage tier: an unknown label, and `--context` where no dartiq.yaml
+    /// declares contexts.
+    #[test]
+    fn context_errors_are_usage() {
+        let root = fixture("cfgerrors");
+        write_context_config(&root);
+        let unknown = CompatArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            contexts: vec!["nope".to_owned()],
+            sdk_roots: vec![],
+        };
+        assert_eq!(run(&unknown, &mut Vec::new()), exit::USAGE);
+
+        let bare = fixture("cfgbare");
+        let no_config = CompatArgs {
+            dir: bare.clone(),
+            contexts: vec!["old".to_owned()],
+            ..unknown
+        };
+        assert_eq!(run(&no_config, &mut Vec::new()), exit::USAGE);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&bare).ok();
     }
 }
