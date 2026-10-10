@@ -1,22 +1,17 @@
 //! Generated forwarding impl: every parser listener event reaches the
 //! [`Flow`] engine through the shared handle. Regenerate from
-//! `dartq-parser/src/listener.rs` when the trait grows. Exactly four
-//! events stay at their no-op trait defaults (`begin_block`/`end_block`/
-//! `begin_assert`/`end_assert`): their `BlockKind`/`AssertKind` parameter
-//! types are pub enums inside dartq-parser's private `listener` module
-//! and are not re-exported, so the method signatures cannot be written
-//! here. Forwarding them (recording the `Ev::Block`/`Ev::AssertBegin`
-//! pairs in `record.rs`; the interpreter side is already written) needs
-//! those two names added to dartq-parser's `pub use listener::{...}` list
-//! first.
+//! `dartq-parser/src/listener.rs` when the trait grows. The block/assert
+//! events forward their parser `BlockKind`/`AssertKind` (re-exported since
+//! the parser's re-export list gained them); `record.rs` narrows the block
+//! kind to the recorded subset.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use dartq_parser::TokenSpan as Token;
 use dartq_parser::{
-    ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind, ExperimentalFlag,
-    FormalParameterKind, IdentifierContext, MemberKind, Message, ParserListener,
+    AssertKind, BlockKind, ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind,
+    ExperimentalFlag, FormalParameterKind, IdentifierContext, MemberKind, Message, ParserListener,
 };
 
 use crate::record::Flow;
@@ -1631,6 +1626,14 @@ impl<'t> ParserListener for SharedFlow<'t> {
             .handle_no_primary_constructor(kind, token, const_keyword)
     }
 
+    fn begin_block(&mut self, token: Token, kind: BlockKind) {
+        self.0.borrow_mut().begin_block(token, kind)
+    }
+
+    fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
+        self.0.borrow_mut().end_block(count, begin, end, kind)
+    }
+
     fn begin_block_function_body(&mut self, token: Token) {
         self.0.borrow_mut().begin_block_function_body(token)
     }
@@ -1957,6 +1960,24 @@ impl<'t> ParserListener for SharedFlow<'t> {
 
     fn end_switch_statement(&mut self, token: Token, end: Token) {
         self.0.borrow_mut().end_switch_statement(token, end)
+    }
+
+    fn begin_assert(&mut self, token: Token, kind: AssertKind) {
+        self.0.borrow_mut().begin_assert(token, kind)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn end_assert(
+        &mut self,
+        begin: Token,
+        kind: AssertKind,
+        left_paren: Token,
+        comma: Option<Token>,
+        end: Token,
+    ) {
+        self.0
+            .borrow_mut()
+            .end_assert(begin, kind, left_paren, comma, end)
     }
 
     fn begin_switch_block(&mut self, token: Token) {

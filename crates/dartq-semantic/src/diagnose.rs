@@ -78,6 +78,22 @@
 //! (`void Function(int)`-form); the oracle's instantiated function types
 //! are a documented text divergence. Generic-method type-parameter
 //! compatibility and getter/setter cross-shape conflicts under-report.
+//!
+//! # The flow-analysis mount (#449)
+//!
+//! Every flow-relevant listener event double-dispatches to a per-unit
+//! [`dartq_flow::Flow`] recorder alongside the reference work — no second
+//! pass, no engine state: the recorder is constructed in [`diagnose`],
+//! lives only for the parse, and its [`dartq_flow::FlowFact`]s fold into
+//! the report at teardown. The first consumed family is
+//! [`SemanticCode::DeadCode`]: one static warning per statement entered
+//! while unreachable, at the statement's anchor. The fact layer reports
+//! per statement while the oracle folds each dead region into one
+//! diagnostic spanning to the region's end (`dead_code_verifier.dart`
+//! `_firstDead`) — a documented divergence, as are the declaration
+//! anchors (variable names, not the declaration head). The
+//! `UnassignedRead` facts are produced but not yet consumed (the
+//! `not_assigned_potentially_non_nullable_local_variable` milestone).
 
 //! # The frozen-family emit matrix (batch 1 #120, batch 2 #197)
 //!
@@ -221,9 +237,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dartq_diagnostics::{Diagnostic, Severity};
+use dartq_flow::{Flow, FlowFact};
 use dartq_parser::{
-    ConstructorReferenceContext, DeclarationKind, IdentifierContext, Parser, ParserFeatures,
-    ParserListener, TokenSpan as Token,
+    AssertKind, BlockKind, ConstructorReferenceContext, DeclarationKind, ExperimentalFlag,
+    FormalParameterKind, IdentifierContext, Message, Parser, ParserFeatures, ParserListener,
+    TokenSpan as Token,
 };
 use dartq_resolution::{ImportEdge, LibraryGraph, LibraryId, NamespaceEntry, Namespaces};
 use dartq_scanner::TokenTable;
@@ -4697,9 +4715,34 @@ fn bin_op_of(text: &str) -> BinOp {
 
 /// The reference-collecting [`ParserListener`] feeding a shared [`Engine`]:
 /// one parse over the same token table `collect` used, then pass 2 resolves
-/// the rows.
+/// the rows. Every flow-relevant event double-dispatches to the per-unit
+/// [`Flow`] recorder (the #449 fan-out), whose facts fold into the report
+/// after the parse.
 struct DiagnoseListener<'a> {
     engine: Rc<RefCell<Engine<'a>>>,
+    flow: Rc<RefCell<Flow<'a>>>,
+}
+
+/// Stably merges two source-ordered diagnostic lists by range offset
+/// (ties keep the base list's rows first).
+fn merge_source_ordered(base: Vec<Diagnostic>, extra: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut merged = Vec::with_capacity(base.len() + extra.len());
+    let mut base = base.into_iter().peekable();
+    let mut extra = extra.into_iter().peekable();
+    loop {
+        let take_base = match (base.peek(), extra.peek()) {
+            (Some(b), Some(e)) => b.range.offset <= e.range.offset,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_base {
+            merged.push(base.next().expect("peeked"));
+        } else {
+            merged.push(extra.next().expect("peeked"));
+        }
+    }
+    merged
 }
 
 /// Diagnoses one compilation unit against its library scope (#120, batch 1).
@@ -4729,12 +4772,14 @@ pub fn diagnose(
     let engine = Rc::new(RefCell::new(Engine::new(
         graph, namespaces, index, strings, source, tokens, file, lib,
     )));
+    let flow = Rc::new(RefCell::new(Flow::new(tokens, source)));
     let mut parser = Parser::new(
         source,
         tokens,
         features,
         DiagnoseListener {
             engine: Rc::clone(&engine),
+            flow: Rc::clone(&flow),
         },
     );
     parser.parse_unit();
@@ -4746,6 +4791,23 @@ pub fn diagnose(
         .into_inner();
     engine.resolve_rows();
     let mut report = std::mem::take(&mut engine.report);
+    // The flow layer's dead-code facts join the source-ordered tail of the
+    // report (both sides are offset-sorted; the merge keeps the invariant).
+    let mut flow_diagnostics = Vec::new();
+    for fact in flow.borrow_mut().take_facts() {
+        if let FlowFact::DeadCode { span } = fact {
+            let code = SemanticCode::DeadCode;
+            flow_diagnostics.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message("", ""),
+                file,
+                span.range,
+                code.correction_message(""),
+            ));
+        }
+    }
+    report.diagnostics = merge_source_ordered(report.diagnostics, flow_diagnostics);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
@@ -4963,6 +5025,18 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
+        self.flow.borrow_mut().begin_method(
+            _kind,
+            _augment_kw,
+            _external_kw,
+            static_kw,
+            _covariant_kw,
+            _var_final_or_const,
+            get_or_set,
+            name,
+            _enclosing_declaration_name,
+        );
+
         self.engine
             .borrow_mut()
             .push_executable_frame(static_kw.is_none());
@@ -4993,6 +5067,15 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
+        self.flow.borrow_mut().end_method(
+            _kind,
+            _get_or_set,
+            _begin,
+            _begin_param,
+            _begin_initializers,
+            _end,
+        );
+
         self.engine.borrow_mut().pop_frame();
     }
 
@@ -5002,10 +5085,18 @@ impl ParserListener for DiagnoseListener<'_> {
         _augment: Option<Token>,
         _external: Option<Token>,
     ) {
+        self.flow
+            .borrow_mut()
+            .begin_top_level_method(_last_consumed, _augment, _external);
+
         self.engine.borrow_mut().push_executable_frame(false);
     }
 
     fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, _end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_top_level_method(_begin, _get_or_set, _end);
+
         self.engine.borrow_mut().pop_frame();
     }
 
@@ -5022,6 +5113,19 @@ impl ParserListener for DiagnoseListener<'_> {
         _name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
+        self.flow.borrow_mut().begin_constructor(
+            _kind,
+            _augment_kw,
+            _external_kw,
+            _static_kw,
+            _covariant_kw,
+            var_final_or_const,
+            _get_or_set,
+            _new_kw,
+            _name,
+            _enclosing_declaration_name,
+        );
+
         let mut engine = self.engine.borrow_mut();
         // A `const` constructor makes its container a provable const-ctor
         // target (the #279 arg-check gate).
@@ -5040,6 +5144,15 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
+        self.flow.borrow_mut().end_constructor(
+            _kind,
+            _begin,
+            _new_kw,
+            _begin_param,
+            _begin_initializers,
+            _end,
+        );
+
         self.engine.borrow_mut().pop_frame();
     }
 
@@ -5051,6 +5164,14 @@ impl ParserListener for DiagnoseListener<'_> {
         _external_kw: Option<Token>,
         const_keyword: Option<Token>,
     ) {
+        self.flow.borrow_mut().begin_factory(
+            _kind,
+            _last_consumed,
+            _augment_kw,
+            _external_kw,
+            const_keyword,
+        );
+
         let mut engine = self.engine.borrow_mut();
         // A `const` factory is a const-constructor target.
         if const_keyword.is_some() {
@@ -5061,25 +5182,39 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_factory(_kind, _begin, _factory, _end);
+
         self.engine.borrow_mut().pop_frame();
     }
 
     fn begin_local_function_declaration(&mut self, _token: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_local_function_declaration(_token);
+
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
     fn end_local_function_declaration(&mut self, _end: Token) {
+        self.flow.borrow_mut().end_local_function_declaration(_end);
+
         self.engine.borrow_mut().pop_frame();
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_function_expression(_token);
+
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
     fn end_function_expression(&mut self, _begin: Token, end: Token) {
+        self.flow.borrow_mut().end_function_expression(_begin, end);
+
         let mut engine = self.engine.borrow_mut();
         engine.const_capture.end_opaque_group(end.range);
         engine.pop_frame();
@@ -5087,11 +5222,17 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_named_function_expression(&mut self, _token: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_named_function_expression(_token);
+
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
     fn end_named_function_expression(&mut self, end: Token) {
+        self.flow.borrow_mut().end_named_function_expression(end);
+
         let mut engine = self.engine.borrow_mut();
         engine.pop_frame();
         engine.push_value_row(end);
@@ -5114,6 +5255,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_catch_clause(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_catch_clause(_token);
+
         // The catch frame owns the catch parameters; the body block's own
         // events are not overridable from outside dartq-parser (BlockKind
         // is crate-private), so block scoping comes from the executable and
@@ -5122,14 +5265,20 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_catch_clause(&mut self, _token: Token) {
+        self.flow.borrow_mut().end_catch_clause(_token);
+
         self.engine.borrow_mut().pop_frame();
     }
 
     fn begin_for_statement(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_for_statement(_token);
+
         self.engine.borrow_mut().push_block_frame();
     }
 
     fn end_for_statement(&mut self, _end: Token) {
+        self.flow.borrow_mut().end_for_statement(_end);
+
         self.engine.borrow_mut().pop_frame();
     }
 
@@ -5141,10 +5290,20 @@ impl ParserListener for DiagnoseListener<'_> {
         _pattern_keyword: Option<Token>,
         _in_kw: Token,
     ) {
+        self.flow.borrow_mut().handle_for_in_loop_parts(
+            _await_kw,
+            _for_kw,
+            _left_paren,
+            _pattern_keyword,
+            _in_kw,
+        );
+
         self.engine.borrow_mut().push_block_frame();
     }
 
     fn end_for_in(&mut self, _end: Token) {
+        self.flow.borrow_mut().end_for_in(_end);
+
         self.engine.borrow_mut().pop_frame();
     }
 
@@ -5156,6 +5315,10 @@ impl ParserListener for DiagnoseListener<'_> {
         _late_kw: Option<Token>,
         var_final_or_const: Option<Token>,
     ) {
+        self.flow
+            .borrow_mut()
+            .begin_variables_declaration(_token, _late_kw, var_final_or_const);
+
         let mut engine = self.engine.borrow_mut();
         // The group's declared type arms here (one `parse_type` per group,
         // `handle_no_type` disarmed it for untyped groups); every name in
@@ -5167,6 +5330,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_variables_declaration(&mut self, _count: usize, _end: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .end_variables_declaration(_count, _end);
+
         let mut engine = self.engine.borrow_mut();
         engine.pending_decl_ty = None;
         engine.armed_ty = None;
@@ -5174,12 +5341,16 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_variable_initializer(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_variable_initializer(_token);
+
         let mut engine = self.engine.borrow_mut();
         engine.init_mark = Some(engine.rows.len());
         engine.open_const_initializer();
     }
 
     fn end_variable_initializer(&mut self, _token: Token) {
+        self.flow.borrow_mut().end_variable_initializer(_token);
+
         let mut engine = self.engine.borrow_mut();
         engine.close_const_initializer();
         engine.check_decl_initializer();
@@ -5201,6 +5372,8 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— identifiers ——————————————————————————————————————————————————
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
+        self.flow.borrow_mut().handle_identifier(token, context);
+
         use IdentifierContext as C;
         let mut engine = self.engine.borrow_mut();
         let name = engine.name_of(token);
@@ -5328,6 +5501,8 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— declared types ——————————————————————————————————————————————
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
+        self.flow.borrow_mut().handle_type(name, question);
+
         let mut engine = self.engine.borrow_mut();
         // The type completed without a group; its head slot is consumed.
         engine.pending_type_head = None;
@@ -5348,10 +5523,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
+        self.flow.borrow_mut().handle_no_type(_last_consumed);
+
         self.engine.borrow_mut().armed_ty = None;
     }
 
     fn handle_void_keyword(&mut self, _token: Token) {
+        self.flow.borrow_mut().handle_void_keyword(_token);
+
         self.engine.borrow_mut().armed_ty = Some(Ty::Void);
     }
 
@@ -5378,6 +5557,10 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— receivers and selectors ——————————————————————————————————————
 
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
+        self.flow
+            .borrow_mut()
+            .handle_this_expression(token, _context);
+
         self.engine.borrow_mut().push_keyword_receiver(token, false);
         self.engine
             .borrow_mut()
@@ -5386,6 +5569,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
+        self.flow
+            .borrow_mut()
+            .handle_super_expression(token, _context);
+
         self.engine.borrow_mut().push_keyword_receiver(token, true);
         self.engine
             .borrow_mut()
@@ -5394,6 +5581,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {
+        self.flow
+            .borrow_mut()
+            .handle_dot_access(token, end, is_null_aware);
+
         self.engine.borrow_mut().merge_member(is_null_aware);
         self.engine
             .borrow_mut()
@@ -5403,14 +5594,24 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
+        self.flow
+            .borrow_mut()
+            .handle_cascade_access(_operator, _end, is_null_aware);
+
         self.engine.borrow_mut().merge_member(is_null_aware);
     }
 
     fn handle_send(&mut self, _begin: Token, _end: Token) {
+        self.flow.borrow_mut().handle_send(_begin, _end);
+
         self.engine.borrow_mut().consume_send();
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_assignment_expression(operator, _end);
+
         let mut engine = self.engine.borrow_mut();
         engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
@@ -5418,6 +5619,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_binary_expression(&mut self, operator: Token) {
+        self.flow.borrow_mut().begin_binary_expression(operator);
+
         let mut engine = self.engine.borrow_mut();
         let Some(text) = engine.text_of(operator) else {
             return;
@@ -5432,10 +5635,16 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_binary_expression(&mut self, _operator: Token, end: Token) {
+        self.flow.borrow_mut().end_binary_expression(_operator, end);
+
         self.engine.borrow_mut().const_capture.end_binary(end.range);
     }
 
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_unary_prefix_expression(operator);
+
         let mut engine = self.engine.borrow_mut();
         let op = match engine.text_of(operator) {
             Some("-") => UnOp::Neg,
@@ -5454,14 +5663,24 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_conditional_expression(&mut self, _question: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_conditional_expression(_question);
+
         self.engine.borrow_mut().const_capture.begin_conditional();
     }
 
     fn handle_conditional_expression_colon(&mut self) {
+        self.flow.borrow_mut().handle_conditional_expression_colon();
+
         self.engine.borrow_mut().const_capture.conditional_colon();
     }
 
     fn end_conditional_expression(&mut self, _question: Token, _colon: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_conditional_expression(_question, _colon, end);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -5469,10 +5688,16 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_parenthesized_expression_or_record_literal(_token);
+
         self.engine.borrow_mut().const_capture.parenthesized_begin();
     }
 
     fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
+        self.flow.borrow_mut().handle_is_operator(is_operator, _not);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -5480,6 +5705,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_as_operator(&mut self, operator: Token) {
+        self.flow.borrow_mut().handle_as_operator(operator);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -5489,18 +5716,26 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— suppression brackets —————————————————————————————————————————
 
     fn begin_is_operator_type(&mut self, _operator: Token) {
+        self.flow.borrow_mut().begin_is_operator_type(_operator);
+
         self.engine.borrow_mut().enter_non_type_pos();
     }
 
     fn end_is_operator_type(&mut self, _operator: Token) {
+        self.flow.borrow_mut().end_is_operator_type(_operator);
+
         self.engine.borrow_mut().leave_non_type_pos();
     }
 
     fn begin_as_operator_type(&mut self, _operator: Token) {
+        self.flow.borrow_mut().begin_as_operator_type(_operator);
+
         self.engine.borrow_mut().enter_non_type_pos();
     }
 
     fn end_as_operator_type(&mut self, _operator: Token) {
+        self.flow.borrow_mut().end_as_operator_type(_operator);
+
         self.engine.borrow_mut().leave_non_type_pos();
     }
 
@@ -5541,11 +5776,15 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_arguments(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_arguments(_token);
+
         self.engine.borrow_mut().const_capture.begin_arguments();
         self.engine.borrow_mut().open_arguments();
     }
 
     fn end_arguments(&mut self, _count: usize, _begin: Token, end: Token) {
+        self.flow.borrow_mut().end_arguments(_count, _begin, end);
+
         let closed = self
             .engine
             .borrow_mut()
@@ -5602,6 +5841,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_named_argument(&mut self, _colon: Token) {
+        self.flow.borrow_mut().handle_named_argument(_colon);
+
         // The capture opens the named argument here (fires before the
         // value); the row engine opened it at the label's identifier event.
         self.engine.borrow_mut().const_capture.named_argument();
@@ -5613,6 +5854,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_return_statement(&mut self, has_expression: bool, _begin: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_return_statement(has_expression, _begin, end);
+
         let mut engine = self.engine.borrow_mut();
         let mark = engine.return_mark.take();
         if !has_expression {
@@ -5628,6 +5873,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .handle_expression_function_body(_arrow, _end);
+
         let mut engine = self.engine.borrow_mut();
         let Some(mark) = engine.body_mark.take() else {
             return;
@@ -5638,11 +5887,17 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .handle_async_modifier(_async_kw, _star);
+
         let mut engine = self.engine.borrow_mut();
         engine.body_mark = Some(engine.rows.len());
     }
 
     fn begin_cascade(&mut self, operator: Token) {
+        self.flow.borrow_mut().begin_cascade(operator);
+
         let mut engine = self.engine.borrow_mut();
         engine.in_cascade = true;
         engine.const_capture.begin_opaque_group();
@@ -5650,6 +5905,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_cascade(&mut self) {
+        self.flow.borrow_mut().end_cascade();
+
         let mut engine = self.engine.borrow_mut();
         engine.in_cascade = false;
         engine.const_capture.end_opaque_group(SourceRange {
@@ -5659,6 +5916,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_indexed_expression(question, open, close);
+
         let mut engine = self.engine.borrow_mut();
         // The oracle anchors index-access reports on the bracket pair
         // (`property_element_resolver.dart`, `_reportUnresolvedIndex`).
@@ -5705,6 +5966,8 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— patterns & switch exhaustiveness (M2 face) ——————————————————————
 
     fn begin_pattern(&mut self, _token: Token) {
+        self.flow.borrow_mut().begin_pattern(_token);
+
         let mut engine = self.engine.borrow_mut();
         engine.pattern_depth += 1;
         engine.pattern_stack.push(PatternFrame {
@@ -5715,6 +5978,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_pattern(&mut self, _token: Token) {
+        self.flow.borrow_mut().end_pattern(_token);
+
         let mut engine = self.engine.borrow_mut();
         engine.pattern_depth = engine.pattern_depth.saturating_sub(1);
         let Some(frame) = engine.pattern_stack.pop() else {
@@ -5806,10 +6071,16 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_constant_pattern(&mut self, _const_keyword: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .begin_constant_pattern(_const_keyword);
+
         self.engine.borrow_mut().pending_const = None;
     }
 
     fn end_constant_pattern(&mut self, _const_keyword: Option<Token>) {
+        self.flow.borrow_mut().end_constant_pattern(_const_keyword);
+
         let mut engine = self.engine.borrow_mut();
         let leaf = engine
             .pending_const
@@ -5870,6 +6141,12 @@ impl ParserListener for DiagnoseListener<'_> {
         variable: Token,
         _in_assignment_pattern: bool,
     ) {
+        self.flow.borrow_mut().handle_declared_variable_pattern(
+            _keyword,
+            variable,
+            _in_assignment_pattern,
+        );
+
         let mut engine = self.engine.borrow_mut();
         // The bound variable joins the enclosing scope (the flat M1 frame;
         // the oracle's pattern scoping is finer, and a wider binding can
@@ -5903,6 +6180,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_wildcard_pattern(&mut self, _keyword: Option<Token>, _wildcard: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_wildcard_pattern(_keyword, _wildcard);
+
         // A typed wildcard (`M _`) covers the declared type's space (the
         // official wildcard converts through its type); a bare `_` (or
         // `var _`) covers the context: no leaf.
@@ -5916,6 +6197,8 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— switch statements ————————————————————————————————————————————
 
     fn begin_switch_block(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_switch_block(token);
+
         let kw = self
             .engine
             .borrow_mut()
@@ -5928,10 +6211,16 @@ impl ParserListener for DiagnoseListener<'_> {
     /// Latches the `switch` keyword: the non-exhaustive anchor (the block
     /// event that follows only carries the `{`).
     fn begin_switch_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_switch_statement(token);
+
         self.engine.borrow_mut().switch_kw_latch = Some(token.range);
     }
 
     fn end_switch_block(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_switch_block(_count, _begin, _end);
+
         self.engine.borrow_mut().report_switch();
     }
 
@@ -5940,6 +6229,8 @@ impl ParserListener for DiagnoseListener<'_> {
     /// The case header's pattern window opens before its pattern parses;
     /// the root it produces is captured at [`Self::end_case_expression`].
     fn begin_case_expression(&mut self, _case_kw: Token) {
+        self.flow.borrow_mut().begin_case_expression(_case_kw);
+
         self.engine.borrow_mut().case_sink_open = true;
     }
 
@@ -5948,6 +6239,10 @@ impl ParserListener for DiagnoseListener<'_> {
     /// `caseNode.keyword`, constant_verifier.dart:1076-1085). Shared-body
     /// groups (`case A: case B:`) capture one case per header.
     fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, _colon: Token) {
+        self.flow
+            .borrow_mut()
+            .end_case_expression(case_kw, when, _colon);
+
         let mut engine = self.engine.borrow_mut();
         let root = engine.close_case_sink();
         let space = engine.substitute_root(root);
@@ -5970,6 +6265,16 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin: Token,
         _end: Token,
     ) {
+        self.flow.borrow_mut().end_switch_case(
+            _label_count,
+            _expression_count,
+            default_kw,
+            _colon_after_default,
+            _statement_count,
+            _begin,
+            _end,
+        );
+
         // The case headers already captured their spaces
         // ([`Self::end_case_expression`]); the body-level event only
         // latches `default` and closes any window a broken header left
@@ -5986,6 +6291,8 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— switch expressions ————————————————————————————————————————————
 
     fn begin_switch_expression_block(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_switch_expression_block(token);
+
         let kw = self
             .engine
             .borrow_mut()
@@ -5997,18 +6304,26 @@ impl ParserListener for DiagnoseListener<'_> {
 
     /// Latches the `switch` keyword of a switch expression.
     fn begin_switch_expression(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_switch_expression(token);
+
         self.engine.borrow_mut().switch_kw_latch = Some(token.range);
     }
 
     /// The expression-case header's pattern window opens before its
     /// pattern parses.
     fn begin_switch_expression_case(&mut self) {
+        self.flow.borrow_mut().begin_switch_expression_case();
+
         self.engine.borrow_mut().case_sink_open = true;
     }
 
     /// The expression case's pattern completed: its coverage latches now
     /// (the guard and the `=>` anchor only exist at the case's end).
     fn handle_switch_expression_case_pattern(&mut self, _token: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_switch_expression_case_pattern(_token);
+
         let mut engine = self.engine.borrow_mut();
         let root = engine.close_case_sink();
         let space = engine.substitute_root(root);
@@ -6024,6 +6339,10 @@ impl ParserListener for DiagnoseListener<'_> {
         arrow: Token,
         _end: Token,
     ) {
+        self.flow
+            .borrow_mut()
+            .end_switch_expression_case(_begin, when, arrow, _end);
+
         let mut engine = self.engine.borrow_mut();
         let space = engine
             .switches
@@ -6040,6 +6359,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_switch_expression_block(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_switch_expression_block(_count, _begin, _end);
+
         self.engine.borrow_mut().report_switch();
     }
 
@@ -6101,26 +6424,40 @@ impl ParserListener for DiagnoseListener<'_> {
     // already did.
 
     fn handle_literal_int(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_literal_int(token);
+
         self.engine.borrow_mut().push_primitive_row(token, 0);
         self.engine.borrow_mut().const_int_literal(token);
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_literal_int_with_separators(token);
+
         self.engine.borrow_mut().push_primitive_row(token, 0);
         self.engine.borrow_mut().const_int_literal(token);
     }
 
     fn handle_literal_double(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_literal_double(token);
+
         self.engine.borrow_mut().push_primitive_row(token, 1);
         self.engine.borrow_mut().const_double_literal(token);
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_literal_double_with_separators(token);
+
         self.engine.borrow_mut().push_primitive_row(token, 1);
         self.engine.borrow_mut().const_double_literal(token);
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_literal_bool(token);
+
         let mut engine = self.engine.borrow_mut();
         if engine.pattern_depth > 0 {
             let is_true = engine.text_of(token) == Some("true");
@@ -6131,6 +6468,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_null(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_literal_null(token);
+
         let mut engine = self.engine.borrow_mut();
         if engine.pattern_depth > 0 {
             engine.pending_const = Some(Restriction::Null);
@@ -6153,6 +6492,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_literal_string(&mut self, interpolation_count: usize, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_literal_string(interpolation_count, end);
+
         let mut engine = self.engine.borrow_mut();
         // The begin span arrives via the capture's own string marks (the
         // engine latched it at `begin_literal_string` — carried on the
@@ -6185,6 +6528,10 @@ impl ParserListener for DiagnoseListener<'_> {
         _const_keyword: Option<Token>,
         right: Token,
     ) {
+        self.flow
+            .borrow_mut()
+            .handle_literal_list(count, left, _const_keyword, right);
+
         let mut engine = self.engine.borrow_mut();
         if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
             // Implicit const literals in a const context check per element
@@ -6207,6 +6554,14 @@ impl ParserListener for DiagnoseListener<'_> {
         right: Token,
         has_set_entry: bool,
     ) {
+        self.flow.borrow_mut().handle_literal_set_or_map(
+            count,
+            left,
+            _const_keyword,
+            right,
+            has_set_entry,
+        );
+
         use crate::const_eval::{InstanceKind, SetOrMap};
         let mut engine = self.engine.borrow_mut();
         if let Some(shape) =
@@ -6240,6 +6595,10 @@ impl ParserListener for DiagnoseListener<'_> {
         _nk: Option<Token>,
         _nv: Option<Token>,
     ) {
+        self.flow
+            .borrow_mut()
+            .handle_literal_map_entry(colon, _end, _nk, _nv);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -6247,11 +6606,17 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_parenthesized_expression(&mut self, token: Token) {
+        self.flow.borrow_mut().end_parenthesized_expression(token);
+
         self.engine.borrow_mut().push_value_row(token);
         self.engine.borrow_mut().const_capture.parenthesized_end();
     }
 
     fn end_record_literal(&mut self, token: Token, count: usize, _const_keyword: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .end_record_literal(token, count, _const_keyword);
+
         let mut engine = self.engine.borrow_mut();
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
@@ -6355,11 +6720,15 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_await_expression(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_await_expression(token);
+
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let _ = token;
     }
 
     fn end_await_expression(&mut self, begin: Token, _end: Token) {
+        self.flow.borrow_mut().end_await_expression(begin, _end);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -6367,6 +6736,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_throw_expression(&mut self, throw: Token, _end: Token) {
+        self.flow.borrow_mut().handle_throw_expression(throw, _end);
+
         self.engine
             .borrow_mut()
             .const_capture
@@ -6374,10 +6745,412 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_non_null_assert_expression(&mut self, bang: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_non_null_assert_expression(bang);
+
         self.engine
             .borrow_mut()
             .const_capture
             .non_null_assert(bang.range);
+    }
+
+    // —— flow fan-out: events the diagnoser does not consume itself ———
+    // Forwarded verbatim to the per-unit flow recorder (see the module
+    // docs' flow section).
+
+    fn begin_assert(&mut self, token: Token, kind: AssertKind) {
+        self.flow.borrow_mut().begin_assert(token, kind);
+    }
+
+    fn begin_block(&mut self, token: Token, kind: BlockKind) {
+        self.flow.borrow_mut().begin_block(token, kind);
+    }
+
+    fn begin_block_function_body(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_block_function_body(token);
+    }
+
+    fn begin_do_while_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_do_while_statement(token);
+    }
+
+    fn begin_do_while_statement_body(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_do_while_statement_body(token);
+    }
+
+    fn begin_else_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_else_statement(token);
+    }
+
+    fn begin_for_control_flow(&mut self, await_kw: Option<Token>, for_kw: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_for_control_flow(await_kw, for_kw);
+    }
+
+    fn begin_for_in_body(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_for_in_body(token);
+    }
+
+    fn begin_for_in_expression(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_for_in_expression(token);
+    }
+
+    fn begin_for_statement_body(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_for_statement_body(token);
+    }
+
+    fn begin_if_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_if_control_flow(token);
+    }
+
+    fn begin_if_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_if_statement(token);
+    }
+
+    fn begin_initialized_identifier(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_initialized_identifier(token);
+    }
+
+    fn begin_labeled_statement(&mut self, token: Token, label_count: usize) {
+        self.flow
+            .borrow_mut()
+            .begin_labeled_statement(token, label_count);
+    }
+
+    fn begin_literal_symbol(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_literal_symbol(token);
+    }
+
+    fn begin_pattern_guard(&mut self, when: Token) {
+        self.flow.borrow_mut().begin_pattern_guard(when);
+    }
+
+    fn begin_rethrow_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_rethrow_statement(token);
+    }
+
+    fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, token: Token) {
+        self.flow
+            .borrow_mut()
+            .begin_switch_case(label_count, expression_count, token);
+    }
+
+    fn begin_then_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_then_statement(token);
+    }
+
+    fn begin_try_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_try_statement(token);
+    }
+
+    fn begin_while_statement(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_while_statement(token);
+    }
+
+    fn begin_while_statement_body(&mut self, token: Token) {
+        self.flow.borrow_mut().begin_while_statement_body(token);
+    }
+
+    fn end_assert(
+        &mut self,
+        begin: Token,
+        kind: AssertKind,
+        left_paren: Token,
+        comma: Option<Token>,
+        end: Token,
+    ) {
+        self.flow
+            .borrow_mut()
+            .end_assert(begin, kind, left_paren, comma, end);
+    }
+
+    fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
+        self.flow.borrow_mut().end_block(count, begin, end, kind);
+    }
+
+    fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_block_function_body(count, begin, end);
+    }
+
+    fn end_do_while_statement(&mut self, token: Token, while_kw: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_do_while_statement(token, while_kw, end);
+    }
+
+    fn end_do_while_statement_body(&mut self, end: Token) {
+        self.flow.borrow_mut().end_do_while_statement_body(end);
+    }
+
+    fn end_for_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().end_for_control_flow(token);
+    }
+
+    fn end_for_in_body(&mut self, end: Token) {
+        self.flow.borrow_mut().end_for_in_body(end);
+    }
+
+    fn end_for_in_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().end_for_in_control_flow(token);
+    }
+
+    fn end_for_in_expression(&mut self, end: Token) {
+        self.flow.borrow_mut().end_for_in_expression(end);
+    }
+
+    fn end_for_statement_body(&mut self, end: Token) {
+        self.flow.borrow_mut().end_for_statement_body(end);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn end_formal_parameter(
+        &mut self,
+        var_or_final: Option<Token>,
+        this_keyword: Option<Token>,
+        super_keyword: Option<Token>,
+        period_after_this_or_super: Option<Token>,
+        name: Token,
+        initializer_start: Option<Token>,
+        initializer_end: Option<Token>,
+        kind: FormalParameterKind,
+        member_kind: dartq_parser::MemberKind,
+    ) {
+        self.flow.borrow_mut().end_formal_parameter(
+            var_or_final,
+            this_keyword,
+            super_keyword,
+            period_after_this_or_super,
+            name,
+            initializer_start,
+            initializer_end,
+            kind,
+            member_kind,
+        );
+    }
+
+    fn end_function_type(&mut self, function: Token, question: Option<Token>) {
+        self.flow.borrow_mut().end_function_type(function, question);
+    }
+
+    fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
+        self.flow
+            .borrow_mut()
+            .end_function_typed_formal_parameter(token, question);
+    }
+
+    fn end_if_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().end_if_control_flow(token);
+    }
+
+    fn end_if_else_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().end_if_else_control_flow(token);
+    }
+
+    fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {
+        self.flow.borrow_mut().end_if_statement(token, else_kw, end);
+    }
+
+    fn end_initialized_identifier(&mut self, name: Token) {
+        self.flow.borrow_mut().end_initialized_identifier(name);
+    }
+
+    fn end_invalid_await_expression(&mut self, begin: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_invalid_await_expression(begin, end);
+    }
+
+    fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_invalid_yield_statement(begin, star, end);
+    }
+
+    fn end_labeled_statement(&mut self, label_count: usize) {
+        self.flow.borrow_mut().end_labeled_statement(label_count);
+    }
+
+    fn end_pattern_guard(&mut self, token: Token) {
+        self.flow.borrow_mut().end_pattern_guard(token);
+    }
+
+    fn end_rethrow_statement(&mut self, rethrow_kw: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .end_rethrow_statement(rethrow_kw, end);
+    }
+
+    fn end_switch_statement(&mut self, token: Token, end: Token) {
+        self.flow.borrow_mut().end_switch_statement(token, end);
+    }
+
+    fn end_try_statement(
+        &mut self,
+        count: usize,
+        begin: Token,
+        finally_kw: Option<Token>,
+        end: Token,
+    ) {
+        self.flow
+            .borrow_mut()
+            .end_try_statement(count, begin, finally_kw, end);
+    }
+
+    fn end_while_statement(&mut self, token: Token, end: Token) {
+        self.flow.borrow_mut().end_while_statement(token, end);
+    }
+
+    fn end_while_statement_body(&mut self, end: Token) {
+        self.flow.borrow_mut().end_while_statement_body(end);
+    }
+
+    fn end_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
+        self.flow.borrow_mut().end_yield_statement(begin, star, end);
+    }
+
+    fn handle_assigned_variable_pattern(&mut self, variable: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_assigned_variable_pattern(variable);
+    }
+
+    fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_break_statement(has_target, break_kw, end);
+    }
+
+    fn handle_catch_block(
+        &mut self,
+        on_kw: Option<Token>,
+        catch_kw: Option<Token>,
+        comma: Option<Token>,
+    ) {
+        self.flow
+            .borrow_mut()
+            .handle_catch_block(on_kw, catch_kw, comma);
+    }
+
+    fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_continue_statement(has_target, continue_kw, end);
+    }
+
+    fn handle_else_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_else_control_flow(token);
+    }
+
+    fn handle_empty_function_body(&mut self, semicolon: Token) {
+        self.flow.borrow_mut().handle_empty_function_body(semicolon);
+    }
+
+    fn handle_experiment_not_enabled(&mut self, flag: ExperimentalFlag, begin: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_experiment_not_enabled(flag, begin, end);
+    }
+
+    fn handle_expression_statement(&mut self, begin: Token, end: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_expression_statement(begin, end);
+    }
+
+    fn handle_finally_block(&mut self, finally_kw: Token) {
+        self.flow.borrow_mut().handle_finally_block(finally_kw);
+    }
+
+    fn handle_for_initializer_pattern_variable_assignment(
+        &mut self,
+        pattern_keyword: Token,
+        equals: Token,
+    ) {
+        self.flow
+            .borrow_mut()
+            .handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals);
+    }
+
+    fn handle_for_loop_parts(
+        &mut self,
+        for_kw: Token,
+        left_paren: Token,
+        left_separator: Token,
+        right_separator: Token,
+        expression_count: usize,
+    ) {
+        self.flow.borrow_mut().handle_for_loop_parts(
+            for_kw,
+            left_paren,
+            left_separator,
+            right_separator,
+            expression_count,
+        );
+    }
+
+    fn handle_invalid_function_body(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_invalid_function_body(token);
+    }
+
+    fn handle_invalid_statement(&mut self, begin: Token) {
+        self.flow.borrow_mut().handle_invalid_statement(begin);
+    }
+
+    fn handle_label(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_label(token);
+    }
+
+    fn handle_no_variable_initializer(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_no_variable_initializer(token);
+    }
+
+    fn handle_null_aware_element(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_null_aware_element(token);
+    }
+
+    fn handle_pattern_assignment(&mut self, equals: Token) {
+        self.flow.borrow_mut().handle_pattern_assignment(equals);
+    }
+
+    fn handle_pattern_variable_declaration_statement(
+        &mut self,
+        keyword: Token,
+        equals: Token,
+        semicolon: Token,
+    ) {
+        self.flow
+            .borrow_mut()
+            .handle_pattern_variable_declaration_statement(keyword, equals, semicolon);
+    }
+
+    fn handle_recoverable_error(&mut self, _p0: Message, _p1: Token, _p2: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_recoverable_error(_p0, _p1, _p2);
+    }
+
+    fn handle_send_without_arguments(&mut self, begin: Token, end: Token, next: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_send_without_arguments(begin, end, next);
+    }
+
+    fn handle_spread_expression(&mut self, operator: Token) {
+        self.flow.borrow_mut().handle_spread_expression(operator);
+    }
+
+    fn handle_switch_case_no_when_clause(&mut self, token: Token) {
+        self.flow
+            .borrow_mut()
+            .handle_switch_case_no_when_clause(token);
+    }
+
+    fn handle_then_control_flow(&mut self, token: Token) {
+        self.flow.borrow_mut().handle_then_control_flow(token);
     }
 }
 
@@ -9883,5 +10656,82 @@ mod tests {
             rep.diagnostics[0].message,
             "'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function()')."
         );
+    }
+
+    // —— #449: the flow-analysis mount (dead_code first milestone) ————————
+
+    /// UTF-16 offsets of the report's `dead_code` rows.
+    fn dead_code_offsets(report: &FileReport) -> Vec<u32> {
+        report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "dead_code")
+            .map(|d| d.range.offset)
+            .collect()
+    }
+
+    fn offset_of(source: &str, needle: &str) -> u32 {
+        source.find(needle).expect("needle present") as u32
+    }
+
+    /// A statement after `return` reports `dead_code` (a static warning) at
+    /// the dead statement's anchor, with the verbatim oracle texts.
+    #[test]
+    fn dead_code_after_return_emits() {
+        let source = "void f() { return; 1; }";
+        let report = report(source);
+        assert_eq!(code_names(&report), ["dead_code"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.message, "Dead code.");
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Try removing the code, or fixing the code before it so that it can be reached.")
+        );
+        assert_eq!(dead_code_offsets(&report), [offset_of(source, "1;")]);
+    }
+
+    /// Each statement entered while unreachable reports its own anchor: the
+    /// fact layer's per-statement contract (the oracle folds each dead
+    /// region into one diagnostic — see the module docs).
+    #[test]
+    fn dead_code_reports_per_statement() {
+        let source = "void f() { return; 1; 2; }";
+        let report = report(source);
+        assert_eq!(code_names(&report), ["dead_code", "dead_code"]);
+        assert_eq!(
+            dead_code_offsets(&report),
+            [offset_of(source, "1;"), offset_of(source, "2;")]
+        );
+    }
+
+    /// A dead local declaration reports at the declared name (the fact
+    /// layer's declaration anchor), not the declaration's head token.
+    #[test]
+    fn dead_local_declaration_emits_at_its_name() {
+        let source = "void f() { return; var x = 1; }";
+        let report = report(source);
+        assert_eq!(code_names(&report), ["dead_code"]);
+        assert_eq!(dead_code_offsets(&report), [offset_of(source, "x")]);
+    }
+
+    /// A closure body's own dead code reports inside the closure; the
+    /// enclosing function's tail stays reachable — the facts are
+    /// per-executable, so the closure's `return` cannot kill the outer
+    /// statements after it.
+    #[test]
+    fn closure_return_does_not_kill_the_enclosing_tail() {
+        let source = "void f() { var h = () { return; 1; }; 2; }";
+        let report = report(source);
+        assert_eq!(code_names(&report), ["dead_code"]);
+        assert_eq!(dead_code_offsets(&report), [offset_of(source, "1;")]);
+    }
+
+    /// Code after a `return` inside a branch stays live on the other path:
+    /// no over-report on partially dead control flow.
+    #[test]
+    fn partial_dead_branch_does_not_report() {
+        let report = report("void f(c) { if (c) { return; } 1; }");
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 }

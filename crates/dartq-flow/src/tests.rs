@@ -547,7 +547,9 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::WhileEnd,
         Ev::ExecEnd { is_expr: false },
         Ev::ReturnBegin { span: span(3) },
-        Ev::ReturnEnd { has_expression: false },
+        Ev::ReturnEnd {
+            has_expression: false,
+        },
         Ev::WhileEnd,
         Ev::ExprStmt { span: span(4) },
     ];
@@ -1016,12 +1018,9 @@ fn assert_join_with_message_invariants() {
 /// read is clean) but the exit joins the pre-assert state, and the read
 /// after the statement is definitely unassigned.
 ///
-/// Replayed at the buffer level because the source-level path cannot fire
-/// assert events yet: `begin_assert`/`end_assert` stay at their no-op
-/// listener defaults until dartq-parser re-exports `AssertKind` (see the
-/// forward.rs header), so the recorder cannot record the
-/// `AssertBegin`/`AssertEnd` pair. The stream below is exactly the buffer
-/// that forwarding will produce for the corpus source.
+/// Replayed at the buffer level to pin the exact event stream the
+/// recorder produces (the source-level twin below proves the
+/// `begin_assert`/`end_assert` forwarding reaches the interpreter).
 #[test]
 fn assert_condition_write_unassigned_after() {
     use crate::ev::{BinOp, Ev};
@@ -1080,7 +1079,9 @@ fn assert_condition_write_unassigned_after() {
         interp
             .facts
             .iter()
-            .filter(|fact| matches!(fact, FlowFact::UnassignedRead { span: s, .. } if *s == span(7)))
+            .filter(
+                |fact| matches!(fact, FlowFact::UnassignedRead { span: s, .. } if *s == span(7))
+            )
             .count(),
         1
     );
@@ -1482,5 +1483,52 @@ fn for_each_continue_paths_unassigned() {
 #[test]
 fn for_each_loop_variable_assigned_in_body() {
     let source = "void f(List<int> b) { for (var a in b) { a; } }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+// —— source-level assert and block forwarding —————————————————————————————
+// The recorder's `begin_assert`/`end_assert`/`begin_block`/`end_block`
+// arms, proven end to end through the parser (official
+// definite_assignment/data/assert.dart `assertStatement` and
+// reachability/data/early_exit.dart).
+
+/// The assert corpus shape at source level: the condition's assignment
+/// holds through the message but the exit joins the pre-assert state, so
+/// the read after the statement is definitely unassigned; the message's
+/// own read stays clean.
+#[test]
+fn assert_statement_forwarded_to_the_recorder() {
+    let source = "void f() { late int v; assert((v = 0) >= 0, v); v; }";
+    assert_eq!(unassigned_snippets(source), ["v"]);
+}
+
+/// A dead assert statement reports dead code: the assert events reach the
+/// interpreter's dead-code check (the `AssertBegin` span anchors).
+#[test]
+fn dead_assert_statement_reports_dead_code() {
+    let source = "void f() { return; assert(true); }";
+    assert_eq!(dead_snippets(source), ["assert"]);
+}
+
+/// A dead plain block reports at its `{`, and each statement entered
+/// inside it reports its own anchor (variable declarations anchor at the
+/// declared name, expression statements at their head): the fact layer
+/// reports per statement entered while unreachable. The oracle folds each
+/// dead region into one diagnostic spanning to the region's end
+/// (`dead_code_verifier.dart` `_firstDead`) — a documented consumer-side
+/// divergence.
+#[test]
+fn dead_statement_block_reports_per_statement() {
+    let source = "void f() { return; { var x = 1; x; } }";
+    assert_eq!(dead_snippets(source), ["{", "x", "x"]);
+}
+
+/// A live try/finally block produces no fact: its `begin_block` fires with
+/// the try kind, which scopes but never dead-checks (the `try` keyword's
+/// own dead check rides `TryBegin`).
+#[test]
+fn live_try_block_records_scope_only() {
+    let source = "void f() { try { var x = 1; x; } finally {} }";
+    assert!(dead_snippets(source).is_empty());
     assert!(unassigned_snippets(source).is_empty());
 }

@@ -263,6 +263,16 @@ pub enum SemanticCode {
     /// ('{4}').` — the same verdict for setters (`invalidOverrideSetter`,
     /// `diagnostic.g.dart:9616-9631`): one code name, dedicated text.
     InvalidOverrideSetter,
+    // —— #449: the flow-analysis family ————————————————————————————————————
+    /// `Dead code.` — a statement entered while the current control-flow
+    /// path is unreachable (`diagnostic.g.dart:3542-3552`, a
+    /// `STATIC_WARNING` at the dead statement's anchor; the flow facts
+    /// come from [`dartq_flow`]). The oracle folds each dead region into
+    /// one diagnostic spanning to the region's end
+    /// (`dead_code_verifier.dart` `_firstDead`) while the fact layer
+    /// reports per statement entered — a documented per-statement
+    /// divergence.
+    DeadCode,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -451,6 +461,7 @@ impl SemanticCode {
             Self::InvalidOverride | Self::InvalidOverrideSetter => {
                 ("invalid_override", "INVALID_OVERRIDE")
             }
+            Self::DeadCode => ("dead_code", "DEAD_CODE"),
         };
         let dtype = self.dtype();
         // The function variant is the one wrong-number template without a
@@ -471,7 +482,8 @@ impl SemanticCode {
             Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
-            | Self::UnreachableSwitchDefault => DiagnosticType::StaticWarning,
+            | Self::UnreachableSwitchDefault
+            | Self::DeadCode => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -626,6 +638,8 @@ impl SemanticCode {
             Self::UnreachableSwitchCase | Self::UnreachableSwitchDefault => {
                 self.message3("", "", "")
             }
+            // No-argument flow row (diagnostic.g.dart:3546).
+            Self::DeadCode => "Dead code.".to_string(),
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
@@ -742,6 +756,12 @@ impl SemanticCode {
             Self::NonExhaustiveSwitchExpression => Some(format!(
                 "Try adding a wildcard pattern or cases that match '{a2}'."
             )),
+            // The dead-code row's verbatim oracle correction
+            // (diagnostic.g.dart:3547-3549).
+            Self::DeadCode => Some(
+                "Try removing the code, or fixing the code before it so that it can be reached."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -849,6 +869,7 @@ mod tests {
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
+            SemanticCode::DeadCode,
         ];
         for code in codes {
             let info = code.code_info();
@@ -970,6 +991,7 @@ mod tests {
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
+            SemanticCode::DeadCode,
         ];
         for code in codes {
             assert_eq!(
@@ -993,6 +1015,7 @@ mod tests {
             SemanticCode::UnreachableSwitchDefault.severity(),
             Severity::Warning
         );
+        assert_eq!(SemanticCode::DeadCode.severity(), Severity::Warning);
         assert_eq!(
             SemanticCode::WrongNumberOfParametersForSetter.severity(),
             Severity::Error
@@ -1103,6 +1126,16 @@ mod tests {
         assert_eq!(
             SemanticCode::UnreachableSwitchDefault.message("", ""),
             "This default clause is covered by the previous cases."
+        );
+        // The #449 flow row: no-argument problem message, verbatim
+        // correction.
+        assert_eq!(SemanticCode::DeadCode.message("", ""), "Dead code.");
+        assert_eq!(
+            SemanticCode::DeadCode.correction_message(""),
+            Some(
+                "Try removing the code, or fixing the code before it so that it can be reached."
+                    .to_string()
+            )
         );
         // The #453 override templates: one code name, two message shapes.
         assert_eq!(

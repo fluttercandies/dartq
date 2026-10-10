@@ -280,6 +280,7 @@ dependencies = [
  "dartq-scanner",
  "dartq-sdk",
  "dartq-semantic",
+ "dartq-snapshot",
  "dartq-source",
  "rayon",
  "rustc-hash",
@@ -428,6 +429,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-diagnostics",
+ "dartq-flow",
  "dartq-language",
  "dartq-parser",
  "dartq-resolution",

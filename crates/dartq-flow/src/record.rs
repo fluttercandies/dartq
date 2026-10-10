@@ -4,8 +4,8 @@
 //! closure), and runs the replay pipeline when the executable ends.
 
 use dartq_parser::{
-    DeclarationKind, ExperimentalFlag, FormalParameterKind, IdentifierContext, MemberKind, Message,
-    ParserListener,
+    AssertKind, BlockKind, DeclarationKind, ExperimentalFlag, FormalParameterKind,
+    IdentifierContext, MemberKind, Message, ParserListener,
 };
 // The listener trait spells its token spans `Token` (the parser's own
 // alias of `TokenSpan`).
@@ -297,6 +297,46 @@ impl<'t> ParserListener for Flow<'t> {
             is_async: async_kw.is_some(),
             is_generator: star.is_some(),
         });
+    }
+
+    // —— blocks and asserts ——————————————————————————————————————————————
+
+    fn begin_block(&mut self, token: Token, kind: BlockKind) {
+        // Narrow to the recorded subset: only plain statement blocks carry
+        // the dead-code check; catch blocks still scope their locals; try,
+        // finally, and switch blocks (and function bodies, which frame
+        // through the dedicated body events) push scope only.
+        let kind = match kind {
+            BlockKind::Statement => crate::ev::BlockKind::Statement,
+            BlockKind::FunctionBody => crate::ev::BlockKind::FunctionBody,
+            BlockKind::CatchClause => crate::ev::BlockKind::CatchClause,
+            BlockKind::TryStatement | BlockKind::FinallyClause | BlockKind::SwitchStatement => {
+                crate::ev::BlockKind::Other
+            }
+        };
+        self.record(Ev::Block { kind, span: token });
+    }
+
+    fn end_block(&mut self, _count: usize, _begin: Token, _end: Token, _kind: BlockKind) {
+        self.record(Ev::EndBlock);
+    }
+
+    fn begin_assert(&mut self, token: Token, _kind: AssertKind) {
+        // The kind carries no flow weight: every assertion's condition is
+        // evaluated and its exit joins the pre-assert state, whatever the
+        // parse position.
+        self.record(Ev::AssertBegin { span: token });
+    }
+
+    fn end_assert(
+        &mut self,
+        _begin: Token,
+        _kind: AssertKind,
+        _left_paren: Token,
+        _comma: Option<Token>,
+        _end: Token,
+    ) {
+        self.record(Ev::AssertEnd);
     }
 
     // —— formal parameters ——————————————————————————————————————————————
