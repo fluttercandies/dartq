@@ -312,6 +312,15 @@ impl<'s, 't> TokenCursor<'s, 't> {
         }
     }
 
+    /// Takes the whole side table in insertion-id order — the end-of-parse
+    /// drain for [`TokenTable::append_inserted`]. Unlike [`Self::detach_queue`]
+    /// this keeps consumed entries too: every entry has a surviving id
+    /// (`table.len() + index`) that emitted events may reference.
+    pub(crate) fn take_inserted(&mut self) -> Vec<InsertedToken> {
+        self.head = QUEUE_EMPTY;
+        std::mem::take(&mut self.inserted)
+    }
+
     /// Matching close index for a real begin-group id (`TokenTable::matching_end`).
     pub(crate) fn table_matching_end(&self, id: TokenId) -> Option<TokenId> {
         let index = id as usize;
@@ -447,6 +456,66 @@ pub(crate) fn split_remainders(kind: TokenKind) -> &'static [(TokenKind, u32)] {
         TokenKind::GtGtGtEq => &[(TokenKind::GtGtEq, 1)],
         _ => &[],
     }
+}
+
+/// Materializes drained inserted tokens as scanner [`Token`]s — the payload
+/// for [`TokenTable::append_inserted`] — in insertion-id order. Split
+/// remainders carry their fixed ASCII lexeme length; recovery synthetics are
+/// zero-width (their lexeme is empty — the official synthetic shape, which
+/// also keeps `source[byte_range]` slicing valid at EOF-pinned offsets).
+#[must_use]
+pub(crate) fn materialize_inserted(source: &str, inserted: &[InsertedToken]) -> Vec<Token> {
+    let byte_offsets = byte_offsets(source, inserted);
+    inserted
+        .iter()
+        .zip(byte_offsets)
+        .map(|(t, byte_offset)| {
+            Token::inserted(
+                t.kind,
+                byte_offset,
+                if t.synthetic { 0 } else { t.utf16_len() },
+                t.utf16_offset,
+                t.synthetic,
+            )
+        })
+        .collect()
+}
+
+/// Byte offset of each inserted token, resolved from its UTF-16 offset.
+/// All-ASCII sources are identity (UTF-16 offsets are byte offsets);
+/// otherwise a single forward walk over the source resolves every offset —
+/// visited in sorted order because insertion-id order is not positional
+/// after a re-parse rewind. Offsets at or past the end clamp to source end
+/// (EOF-pinned synthetics).
+fn byte_offsets(source: &str, inserted: &[InsertedToken]) -> Vec<u32> {
+    if inserted.is_empty() {
+        return Vec::new();
+    }
+    if source.is_ascii() {
+        return inserted.iter().map(|t| t.utf16_offset).collect();
+    }
+    let mut order: Vec<(u32, usize)> = inserted
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.utf16_offset, i))
+        .collect();
+    order.sort_unstable_by_key(|&(offset, _)| offset);
+    let mut bytes = vec![0; inserted.len()];
+    let mut next = 0;
+    let (mut utf16, mut byte) = (0, 0);
+    for ch in source.chars() {
+        while next < order.len() && order[next].0 <= utf16 {
+            bytes[order[next].1] = byte;
+            next += 1;
+        }
+        utf16 += ch.len_utf16() as u32;
+        byte += ch.len_utf8() as u32;
+    }
+    while next < order.len() {
+        bytes[order[next].1] = byte;
+        next += 1;
+    }
+    bytes
 }
 
 /// UTF-16 length of a scanned token. Fixed-lexeme kinds are pure ASCII, so

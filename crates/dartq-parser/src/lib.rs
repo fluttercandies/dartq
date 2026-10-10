@@ -78,7 +78,7 @@
 //! token flow (`String` segments plus `${`/`}` begin-group pairs), so string
 //! literals need no special parser state.
 
-use dartq_scanner::TokenTable;
+use dartq_scanner::{Token, TokenTable};
 
 mod cursor;
 mod declarations;
@@ -123,5 +123,27 @@ pub use types::{TypeInfo, TypeParamOrArg};
 /// #18; until then nothing inside the unit is analyzed, so by design the
 /// parser produces no diagnostics here.
 pub fn parse_unit(source: &str, tokens: &TokenTable, features: ParserFeatures) {
-    Parser::new(source, tokens, features, NullListener).parse_unit();
+    parse_unit_with(source, tokens, features, NullListener);
+}
+
+/// Parses one compilation unit and returns the listener together with the
+/// parser-inserted tokens as scanner [`Token`]s, in insertion-id order (the
+/// id order of the parser's side table, `table.len() + i`).
+///
+/// Closer splits (`>>` → two `>`) and recovery synthetics live only in the
+/// parser's private side table: until they are folded in, their ids resolve
+/// nowhere and AST span derivation panics. The caller folds them with
+/// [`TokenTable::append_inserted`] — once, at parse end, before any AST span
+/// read (the unified-table sequencing contract).
+pub fn parse_unit_with<L: ParserListener>(
+    source: &str,
+    tokens: &TokenTable,
+    features: ParserFeatures,
+    listener: L,
+) -> (L, Vec<Token>) {
+    let mut parser = Parser::new(source, tokens, features, listener);
+    parser.parse_unit();
+    let inserted = parser.cursor.take_inserted();
+    let listener = parser.listener;
+    (listener, cursor::materialize_inserted(source, &inserted))
 }
