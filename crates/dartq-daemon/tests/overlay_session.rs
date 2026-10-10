@@ -94,12 +94,13 @@ fn two_agents_edit_and_delta_over_one_base() {
         0,
     );
 
-    // Base check = the M0 disk pipeline (module-doc visibility table): a
-    // missing import is a semantic error, invisible to scan+parse — empty.
+    // Base check = the disk pipeline: it reports missing relative-URI
+    // directive targets, and the fixture's import is one.
     h.step(&request(2, "dartq/check", json!({"paths": ["lib"]})), 1);
-    assert!(
-        codes(&answer_result(&h, 2)).is_empty(),
-        "base check is the disk pipeline: {:?}",
+    assert_eq!(
+        codes(&answer_result(&h, 2)),
+        ["uri_does_not_exist"],
+        "base check reports the missing import: {:?}",
         answer_result(&h, 2)
     );
     // Base analyze = the engine view: the URI error shows.
@@ -220,11 +221,13 @@ fn two_agents_edit_and_delta_over_one_base() {
         "delta before the overlay's cursor keeps the rows: {:?}",
         answer_result(&h, 11)
     );
-    // The base view changed at the didChange drain (4 > 3): rows included —
-    // and the disk pipeline now scans clean text, so the subset is empty.
-    assert!(
-        codes(&answer_result(&h, 12)).is_empty(),
-        "base delta on a now-clean file: {:?}",
+    // The base view changed at the didChange drain (4 > 3): rows included.
+    // didChange updates the engine text only — the disk still holds the
+    // fixture, and the disk pipeline reports its missing import.
+    assert_eq!(
+        codes(&answer_result(&h, 12)),
+        ["uri_does_not_exist"],
+        "base delta keeps the on-disk URI error: {:?}",
         answer_result(&h, 12)
     );
     assert_eq!(answer_result(&h, 12)["since"], 4);
