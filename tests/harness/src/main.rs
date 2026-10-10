@@ -84,7 +84,7 @@ fn print_usage() {
   harness run [--corpus-dir DIR]... [--oracle-dart PATH] [--oracle-format machine|json]
               [--dartq-cmd TEMPLATE] [--e2e-oracle] [--severity-filter LIST]
               [--type-filter LIST] [--codes-file PATH] [--threshold F] [--out DIR]
-              [--allow-vacuous]
+              [--allow-vacuous] [--persist-regressions DIR] [--list-known]
       Run oracle and dartq over the corpus, compare (code, file) entry sets.
       --corpus-dir is repeatable: each dir must be a corpus package; every dir
       is analyzed with one invocation per dir and the entry sets are merged
@@ -124,6 +124,18 @@ fn print_usage() {
       the corpus is auto-bisected to attribute the panicking files; the run
       still fails as a harness error (exit 2) and writes a dartq_panic_files
       attribution report under --out.
+      --persist-regressions DIR: materialize every post-filter diffing (code,
+      file) entry as a self-contained regression case under DIR —
+      <hash8>.json (both sides' verbatim rows, the Dart source inline, the
+      capturing run, and a replay_command argv) plus <hash8>.edits.jsonl (a
+      content-identical whole-file replay step). Same failure -> same file
+      (overwrite, no growth). Known divergences listed in tests/corpus/
+      regressions/known-diffs.json (code + corpus-relative file, optional
+      message_pattern substring) are suppressed; see --list-known.
+      --list-known: offline triage face — prints the exemption table with
+      ACTIVE / STALE / NO-EVIDENCE status derived from the persisted cases
+      (cases dir: the --persist-regressions value, default tests/corpus/
+      regressions/cases). Runs no analysis; needs no corpus.
       Raw outputs: every run persists both sides' complete machine outputs
       (all severities, unfiltered) to raw-outputs.json under --out, so
       post-hoc parity attribution (e.g. WARNING) works even when the gate
@@ -242,6 +254,13 @@ struct RunOptions {
     /// has no ERROR-tier entries post-filter (would otherwise pass at 1.0
     /// without judging anything).
     allow_vacuous: bool,
+    /// `--persist-regressions <dir>`: materialize every post-filter diffing
+    /// entry as a self-contained regression case under `dir` (PRD §19.1).
+    persist_regressions: Option<PathBuf>,
+    /// `--list-known`: offline face printing the exemption table
+    /// (tests/corpus/regressions/known-diffs.json) with stale entries marked;
+    /// runs no analysis.
+    list_known: bool,
 }
 
 impl RunOptions {
@@ -258,6 +277,8 @@ impl RunOptions {
             out: PathBuf::from(DEFAULT_OUT),
             e2e_oracle: false,
             allow_vacuous: false,
+            persist_regressions: None,
+            list_known: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -286,6 +307,10 @@ impl RunOptions {
                 "--out" => opts.out = value(args, &mut i)?.into(),
                 "--e2e-oracle" => opts.e2e_oracle = true,
                 "--allow-vacuous" => opts.allow_vacuous = true,
+                "--persist-regressions" => {
+                    opts.persist_regressions = Some(value(args, &mut i)?.into());
+                }
+                "--list-known" => opts.list_known = true,
                 other => return Err(unknown_flag(other, "run")),
             }
             i += 1;
@@ -303,7 +328,19 @@ impl RunOptions {
 }
 
 fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
-    let mut opts = RunOptions::parse(args)?;
+    let opts = RunOptions::parse(args)?;
+    // --list-known is an offline triage face: it reads the exemption table
+    // and the persisted cases, runs no analysis, and needs no corpus.
+    if opts.list_known {
+        let cases_dir = opts.persist_regressions.clone().unwrap_or_else(|| {
+            PathBuf::from(report::REGRESSIONS_ROOT).join(report::CASES_DIR)
+        });
+        let known_path =
+            PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
+        let summary = report::list_known(&known_path, &cases_dir).map_err(Outcome::Error)?;
+        return Ok((summary, true));
+    }
+    let mut opts = opts;
     if opts.corpus_dirs.is_empty() {
         opts.corpus_dirs.push(PathBuf::from(DEFAULT_TARGET));
     }
@@ -376,6 +413,45 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let (json_path, md_path) =
         report::write_reports(&cmp, &meta, verdict, &raw, &opts.out).map_err(Outcome::Error)?;
 
+    // Regression persistence (PRD §19.1): when asked, every post-filter
+    // diffing entry is materialized as a self-contained case under the
+    // persist dir — known divergences suppressed via the exemption table.
+    let persist_note = match &opts.persist_regressions {
+        Some(dir) => {
+            let known_path =
+                PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
+            let known = report::load_known_diffs(&known_path).map_err(Outcome::Error)?;
+            let captured_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let stats = report::persist_regressions(
+                &cmp,
+                &raw,
+                &report::PersistOptions {
+                    dir,
+                    known: &known,
+                    report_path: &json_path,
+                    dartq_cmd: &meta.dartq_cmd,
+                    oracle_cmd: &meta.oracle_cmd,
+                    captured_at,
+                },
+            )
+            .map_err(Outcome::Error)?;
+            format!(
+                "\nregressions: {} case(s) persisted to {} ({} file(s) fully exempt, \
+                 {} diff entr{} exempt, {} skipped)",
+                stats.files_persisted,
+                dir.display(),
+                stats.files_exempt,
+                stats.entries_exempt,
+                if stats.entries_exempt == 1 { "y" } else { "ies" },
+                stats.files_skipped,
+            )
+        }
+        None => String::new(),
+    };
+
     let stats: Vec<String> = cmp
         .severities
         .iter()
@@ -387,7 +463,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
          jaccard: {} (threshold {} on ERROR)\n\
          diffs: oracle-only {} entries, dartq-only {} entries\n\
          reports: {} {}\n\
-         result: {}",
+         result: {}{}",
         meta.corpus_dir,
         cmp.file_count,
         cmp.oracle_total,
@@ -399,6 +475,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         json_path.display(),
         md_path.display(),
         verdict.token(),
+        persist_note,
     );
     Ok((summary, verdict.exit_success()))
 }

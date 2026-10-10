@@ -9,9 +9,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::compare::{Comparison, Distribution, EntryKey};
+use crate::compare::{Comparison, DiffEntry, Distribution, EntryKey};
 use crate::machine::{EntryKeyBuilder, MachineDiag};
 
 pub(crate) struct RunMeta {
@@ -750,6 +750,410 @@ fn escape_md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
+// ---------------------------------------------------------------------------
+// Regression persistence (PRD §19.1: differential failures auto-persist as
+// regression cases)
+//
+// `--persist-regressions <dir>`: every post-filter diffing (code, file) entry
+// is materialized as one self-contained case file `<hash8>.json` (hash8 =
+// blake3 of the entry-key file path, first 8 hex) carrying both sides' raw
+// rows verbatim, the Dart source inline, the capturing run, and the argv
+// that reproduces it through `harness replay`. Deterministic: same failure
+// -> same file name (overwrite, never append). A known-diffs exemption
+// table suppresses re-persisting divergences already under triage;
+// `--list-known` prints the table with stale entries marked so triage can
+// prune. Writes are streaming per failing file — no case accumulation in
+// memory (a bad build can diff 10k+ files).
+// ---------------------------------------------------------------------------
+
+/// Repo-root-relative home of the exemption table and the default cases dir.
+pub(crate) const REGRESSIONS_ROOT: &str = "tests/corpus/regressions";
+pub(crate) const KNOWN_DIFFS_FILE: &str = "known-diffs.json";
+pub(crate) const CASES_DIR: &str = "cases";
+const CASE_SCHEMA: &str = "regression-case-v1";
+
+/// One exemption: a known divergence that must not re-persist. `file` is
+/// corpus-relative (label-free, so an entry generalizes across corpus dirs);
+/// `message_pattern` is an optional substring narrowed against the diffing
+/// entry's sample message (substring, not regex — the harness carries no
+/// regex dependency).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub(crate) struct KnownDiff {
+    pub(crate) code: String,
+    pub(crate) file: String,
+    #[serde(default)]
+    pub(crate) message_pattern: String,
+    #[serde(default)]
+    pub(crate) reason: String,
+}
+
+/// Loads the exemption table. A missing file is an empty table (first run);
+/// a malformed one is a hard error — a silently ignored table would
+/// re-persist everything.
+pub(crate) fn load_known_diffs(path: &Path) -> Result<Vec<KnownDiff>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let table: KnownDiffsFile = serde_json::from_str(&text)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    Ok(table.entries)
+}
+
+#[derive(Deserialize, Serialize)]
+struct KnownDiffsFile {
+    #[serde(default)]
+    entries: Vec<KnownDiff>,
+}
+
+/// One verbatim diagnostic row of a regression case (the machine-format
+/// quintuple; code in the lowercase entry-key form).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub(crate) struct CaseRow {
+    pub(crate) code: String,
+    pub(crate) line: u32,
+    pub(crate) column: u32,
+    pub(crate) length: u32,
+    pub(crate) message: String,
+}
+
+/// The persisted case: schema `regression-case-v1`, self-contained (source
+/// inline), reproducible through the recorded `replay_command`.
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+struct RegressionCase {
+    schema: String,
+    /// Corpus-relative file path (label-free); absolute when the divergence
+    /// is on a file outside every corpus root (both sides key those
+    /// canonically absolute — such cases carry no replay command).
+    file: String,
+    /// Merge label (multi-corpus) or the corpus dir string (single).
+    corpus: String,
+    oracle: Vec<CaseRow>,
+    dartq: Vec<CaseRow>,
+    /// The file's full Dart text (null when unreadable).
+    source: Option<String>,
+    captured_at: u64,
+    source_run: SourceRun,
+    replay_command: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+struct SourceRun {
+    report: String,
+    dartq_cmd: String,
+    oracle_cmd: String,
+}
+
+/// Inputs for one persist pass (all borrowed — nothing is buffered beyond
+/// what the run already holds).
+pub(crate) struct PersistOptions<'a> {
+    pub(crate) dir: &'a Path,
+    pub(crate) known: &'a [KnownDiff],
+    pub(crate) report_path: &'a Path,
+    pub(crate) dartq_cmd: &'a str,
+    pub(crate) oracle_cmd: &'a str,
+    /// Epoch seconds of the capture (injected so runs and tests stay
+    /// deterministic).
+    pub(crate) captured_at: u64,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PersistStats {
+    pub(crate) files_persisted: usize,
+    /// Files whose diffing entries are all exempt (nothing written).
+    pub(crate) files_exempt: usize,
+    /// Individual diff entries suppressed by the table (may span files that
+    /// were persisted anyway for a non-exempt sibling entry).
+    pub(crate) entries_exempt: usize,
+    /// Diffing files that could not be materialized (e.g. a merged
+    /// multi-corpus key whose file is outside every labeled corpus root).
+    pub(crate) files_skipped: usize,
+}
+
+/// `--persist-regressions` pass: groups the post-filter diff entries by file,
+/// exempts the known ones, and writes one case (+ its replay edits file) per
+/// remaining file, streaming — one `fs::write` per artifact, no accumulation.
+pub(crate) fn persist_regressions(
+    cmp: &Comparison,
+    raw: &RawSideOutputs<'_>,
+    opts: &PersistOptions<'_>,
+) -> Result<PersistStats, String> {
+    let mut by_file: BTreeMap<&str, Vec<&DiffEntry>> = BTreeMap::new();
+    for entry in cmp.oracle_only.iter().chain(&cmp.dartq_only) {
+        by_file.entry(entry.file.as_str()).or_default().push(entry);
+    }
+
+    let mut stats = PersistStats::default();
+    for (file_key, entries) in &by_file {
+        let Some((section, rel)) = locate_corpus(raw.corpora, file_key) else {
+            stats.files_skipped += 1;
+            continue;
+        };
+        let mut exempt = 0;
+        for entry in entries {
+            if entry_is_exempt(&entry.code, &rel, &entry.sample_message, opts.known) {
+                exempt += 1;
+            }
+        }
+        stats.entries_exempt += exempt;
+        if exempt == entries.len() {
+            stats.files_exempt += 1;
+            continue;
+        }
+
+        let dir = &raw.corpora[section].1;
+        let hash = hash8(file_key);
+        let oracle = side_case_rows(&raw.oracle[section], dir, &rel);
+        let dartq = side_case_rows(&raw.dartq[section], dir, &rel);
+        let source = read_case_source(dir, &rel);
+
+        // The replay repro: a content-identical whole-file replacement (the
+        // captured state re-analyzed through one replay step, so the
+        // divergence shows up in the step comparison). Only for in-corpus
+        // files with readable source — replay's edit schema requires
+        // corpus-relative paths.
+        let mut replay_command = Vec::new();
+        if let Some(text) = &source {
+            if !Path::new(&rel).is_absolute() {
+                write_edits_file(opts.dir, &hash, &rel, text)?;
+                replay_command = vec![
+                    "target/debug/harness".to_string(),
+                    "replay".to_string(),
+                    "--corpus-dir".to_string(),
+                    dir.display().to_string(),
+                    "--edits".to_string(),
+                    opts.dir.join(format!("{hash}.edits.jsonl")).display().to_string(),
+                    "--dartq-cmd".to_string(),
+                    opts.dartq_cmd.to_string(),
+                    "--daemon-cmd".to_string(),
+                    daemon_template(opts.dartq_cmd),
+                ];
+            }
+        }
+
+        let case = RegressionCase {
+            schema: CASE_SCHEMA.to_string(),
+            file: rel.to_string(),
+            corpus: raw.corpora[section]
+                .0
+                .clone()
+                .unwrap_or_else(|| dir.display().to_string()),
+            oracle,
+            dartq,
+            source,
+            captured_at: opts.captured_at,
+            source_run: SourceRun {
+                report: opts.report_path.display().to_string(),
+                dartq_cmd: opts.dartq_cmd.to_string(),
+                oracle_cmd: opts.oracle_cmd.to_string(),
+            },
+            replay_command,
+        };
+        let path = opts.dir.join(format!("{hash}.json"));
+        let text = serde_json::to_string_pretty(&case)
+            .map_err(|e| format!("serializing case {hash}: {e}"))?;
+        fs::create_dir_all(opts.dir)
+            .map_err(|e| format!("creating {}: {e}", opts.dir.display()))?;
+        fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        stats.files_persisted += 1;
+    }
+    Ok(stats)
+}
+
+/// Resolves an entry-key file to `(corpus section index, label-free path)`:
+/// labeled corpora claim their `label/…` keys; the unlabeled section claims
+/// everything else (single-corpus runs, and outside-corpus absolute keys).
+fn locate_corpus(corpora: &[(Option<String>, PathBuf)], file_key: &str) -> Option<(usize, String)> {
+    for (index, (label, _)) in corpora.iter().enumerate() {
+        match label {
+            Some(label) => {
+                if let Some(rest) = file_key.strip_prefix(&format!("{label}/")) {
+                    return Some((index, rest.to_string()));
+                }
+            }
+            None => return Some((index, file_key.to_string())),
+        }
+    }
+    None
+}
+
+/// One side's verbatim rows for `rel` within a corpus section (entry-key code
+/// form, sorted for a deterministic case body).
+fn side_case_rows(diags: &[MachineDiag], dir: &Path, rel: &str) -> Vec<CaseRow> {
+    let mut keys = EntryKeyBuilder::new(dir);
+    let mut rows: Vec<CaseRow> = diags
+        .iter()
+        .map(|d| {
+            let (code, file) = keys.key(d);
+            (code, file, d)
+        })
+        .filter(|(_, file, _)| file == rel)
+        .map(|(code, _, d)| CaseRow {
+            code,
+            line: d.line,
+            column: d.col,
+            length: d.length,
+            message: d.message.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (&a.code, a.line, a.column, a.length, &a.message).cmp(&(
+            &b.code,
+            b.line,
+            b.column,
+            b.length,
+            &b.message,
+        ))
+    });
+    rows
+}
+
+/// Reads the case's Dart source: corpus-relative against the corpus root,
+/// absolute keys (outside-corpus divergences) against the filesystem.
+fn read_case_source(dir: &Path, rel: &str) -> Option<String> {
+    let path = if Path::new(rel).is_absolute() {
+        PathBuf::from(rel)
+    } else {
+        dir.join(rel)
+    };
+    fs::read_to_string(path).ok()
+}
+
+fn entry_is_exempt(code: &str, rel_file: &str, sample_message: &str, known: &[KnownDiff]) -> bool {
+    known.iter().any(|k| {
+        k.code == code
+            && k.file == rel_file
+            && (k.message_pattern.is_empty() || sample_message.contains(&k.message_pattern))
+    })
+}
+
+/// blake3 of the file key, first 8 hex — the case file name stem. Same
+/// failure -> same name (overwrite semantics), ~2^32 collision space.
+fn hash8(file_key: &str) -> String {
+    dartq_source::content_hash(file_key.as_bytes())
+        .to_string()
+        .chars()
+        .take(8)
+        .collect()
+}
+
+/// The replay argv's `--daemon-cmd` template, derived from the run's dartq
+/// command: same program, `daemon` subcommand, non-analysis flags kept, the
+/// corpus dir as the literal `{dir}` placeholder the replay template
+/// contract substitutes. `./dartq analyze --format=machine --sdk X` ->
+/// `./dartq daemon --dir {dir} --sdk X`.
+fn daemon_template(dartq_cmd: &str) -> String {
+    let mut parts = dartq_cmd.split_whitespace();
+    let program = parts.next().unwrap_or_default().to_string();
+    let mut argv = vec![program, "daemon".to_string(), "--dir".to_string(), "{dir}".to_string()];
+    for arg in parts {
+        if matches!(arg, "analyze" | "check" | "--format=machine") {
+            continue;
+        }
+        argv.push(arg.to_string());
+    }
+    argv.join(" ")
+}
+
+/// Writes `<hash8>.edits.jsonl`: one replay step replacing the file with its
+/// captured content (a no-op edit that re-analyzes the captured state on
+/// both faces, surfacing the divergence in the step comparison).
+fn write_edits_file(dir: &Path, hash: &str, rel: &str, source: &str) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let step = serde_json::json!({
+        "file": rel,
+        "line": 1,
+        "column": 1,
+        "length": dartq_source::utf16_len_of(source),
+        "new_text": source,
+    });
+    let path = dir.join(format!("{hash}.edits.jsonl"));
+    fs::write(&path, format!("{step}\n"))
+        .map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// `--list-known`: the exemption table with liveness evidence from the
+/// persisted cases. ACTIVE = a persisted case currently carries a matching
+/// (code, file[, pattern]) divergence; STALE = cases exist but none matches
+/// (triage can prune); NO-EVIDENCE = no persisted cases at all (nothing may
+/// be claimed stale off zero data).
+pub(crate) fn list_known(known_path: &Path, cases_dir: &Path) -> Result<String, String> {
+    let known = load_known_diffs(known_path)?;
+    let mut cases = Vec::new();
+    match fs::read_dir(cases_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("reading {}: {e}", cases_dir.display()))?;
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    let text = fs::read_to_string(&path)
+                        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+                    let case: RegressionCase = serde_json::from_str(&text)
+                        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+                    cases.push(case);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("reading {}: {e}", cases_dir.display())),
+    }
+
+    let mut lines = Vec::new();
+    let mut active = 0;
+    let mut stale = 0;
+    let mut no_evidence = 0;
+    for k in &known {
+        let mut evidence = None;
+        for case in &cases {
+            let rows = case.oracle.iter().chain(&case.dartq);
+            if case.file == k.file
+                && rows.clone().any(|r| r.code == k.code)
+                && (k.message_pattern.is_empty()
+                    || rows
+                        .filter(|r| r.code == k.code)
+                        .any(|r| r.message.contains(&k.message_pattern)))
+            {
+                evidence = Some(case);
+                break;
+            }
+        }
+        let case_name = evidence.map(|c| format!("case {} rows", c.file));
+        match (&case_name, cases.is_empty()) {
+            (Some(_), _) => {
+                active += 1;
+                lines.push(format!(
+                    "ACTIVE       {} {}{}",
+                    k.code,
+                    k.file,
+                    case_name.map(|c| format!("  [{c}]")).unwrap_or_default(),
+                ));
+            }
+            (None, false) => {
+                stale += 1;
+                lines.push(format!("STALE        {} {}  (no persisted case matches; prunable)", k.code, k.file));
+            }
+            (None, true) => {
+                no_evidence += 1;
+                lines.push(format!("NO-EVIDENCE  {} {}  (no persisted cases yet)", k.code, k.file));
+            }
+        }
+    }
+    let mut summary = format!(
+        "known-diffs: {} entries ({} active, {} stale, {} no-evidence); cases dir: {}\n{}",
+        known.len(),
+        active,
+        stale,
+        no_evidence,
+        cases_dir.display(),
+        lines.join("\n"),
+    );
+    if known.is_empty() {
+        summary.push_str("\nknown-diffs table is empty");
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,6 +1642,285 @@ mod tests {
             length: 1,
             message: "m".into(),
         }
+    }
+
+    // -- regression persistence ----------------------------------------------
+
+    /// Fixture root with one dart file, plus the comparison where dartq misses
+    /// one of the oracle's two entries (a one-file diff).
+    fn persist_fixture() -> (PathBuf, Comparison, Vec<MachineDiag>, Vec<MachineDiag>) {
+        let root = std::env::temp_dir().join(format!("dq_persist_root_{}", std::process::id()));
+        let lib = root.join("lib");
+        fs::create_dir_all(&lib).expect("mkdir");
+        fs::write(lib.join("a.dart"), "int a = 1;\nint b = 2;\n").expect("fixture");
+        let root_canon = root.canonicalize().expect("canonicalize");
+        let diag = |code: &str, line: u32, message: &str| MachineDiag {
+            severity: Severity::Error,
+            dtype: "SYNTACTIC_ERROR".into(),
+            code: code.into(),
+            file: lib.join("a.dart"),
+            line,
+            col: 1,
+            length: 1,
+            message: message.into(),
+        };
+        let oracle = vec![diag("EXPECTED_TOKEN", 1, "Expected to find ';'."), diag("UNDEFINED_CLASS", 2, "Undefined class 'B'.")];
+        let dartq = vec![diag("expected_token", 1, "Expected to find ';'.")];
+        let cmp = compare(
+            &build_side_labeled(&oracle, &root_canon, None, |_| true),
+            &build_side_labeled(&dartq, &root_canon, None, |_| true),
+        );
+        (root_canon, cmp, oracle, dartq)
+    }
+
+    fn persist_opts<'a>(
+        dir: &'a Path,
+        known: &'a [KnownDiff],
+        report_path: &'a Path,
+        captured_at: u64,
+    ) -> PersistOptions<'a> {
+        PersistOptions {
+            dir,
+            known,
+            report_path,
+            dartq_cmd: "./target/debug/dartq analyze --format=machine --sdk /sdk",
+            oracle_cmd: "dart analyze --format=machine",
+            captured_at,
+        }
+    }
+
+    /// Determinism: the same failure persisted twice lands on ONE file pair
+    /// (json + edits), the second write overwriting the first — no append
+    /// growth, stable name.
+    #[test]
+    fn persist_is_deterministic_one_file_per_failure() {
+        let (root, cmp, oracle, dartq) = persist_fixture();
+        let out = std::env::temp_dir().join(format!("dq_persist_{}", std::process::id()));
+        let corpora = [(None, root.clone())];
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
+
+        for _ in 0..2 {
+            let opts = persist_opts(&out, &[], Path::new("docs/audits/x/report.json"), 1_700_000_000);
+            let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
+            assert_eq!(stats.files_persisted, 1);
+            assert_eq!((stats.files_exempt, stats.entries_exempt, stats.files_skipped), (0, 0, 0));
+        }
+
+        let mut names: Vec<String> = fs::read_dir(&out)
+            .expect("cases dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "exactly <hash>.json + <hash>.edits.jsonl: {names:?}");
+        assert!(
+            names.iter().all(|n| n.ends_with(".json") || n.ends_with(".edits.jsonl")),
+            "{names:?}"
+        );
+        let stem = names.iter().find(|n| n.ends_with(".json")).expect("case file");
+        assert_eq!(stem.len(), "abcdefgh.json".len(), "hash8 stem: {stem}");
+        // Byte-determinism at a fixed captured_at: re-reading and re-persisting
+        // produced identical case bytes.
+        let first = fs::read_to_string(out.join(stem)).expect("case text");
+        let parsed: RegressionCase = serde_json::from_str(&first).expect("case json");
+        assert_eq!(parsed.schema, "regression-case-v1");
+        assert_eq!(parsed.file, "lib/a.dart");
+
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Case schema shape: both sides' verbatim rows (dartq side empty for the
+    /// missing entry), inline source, run meta, and a replay_command whose
+    /// edits file parses through the replay edit schema.
+    #[test]
+    fn persisted_case_carries_schema_rows_source_and_replay_argv() {
+        let (root, cmp, oracle, dartq) = persist_fixture();
+        let out = std::env::temp_dir().join(format!("dq_persist_schema_{}", std::process::id()));
+        let corpora = [(None, root.clone())];
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
+        let opts = persist_opts(&out, &[], Path::new("docs/audits/x/report.json"), 42);
+        persist_regressions(&cmp, &raw, &opts).expect("persist");
+
+        let case_path = fs::read_dir(&out)
+            .expect("dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .expect("case file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&case_path).expect("text")).expect("json");
+        assert_eq!(parsed["schema"], "regression-case-v1");
+        assert_eq!(parsed["file"], "lib/a.dart");
+        assert_eq!(parsed["captured_at"], 42);
+        assert_eq!(parsed["source"], "int a = 1;\nint b = 2;\n");
+        assert_eq!(parsed["source_run"]["dartq_cmd"], "./target/debug/dartq analyze --format=machine --sdk /sdk");
+        assert_eq!(parsed["source_run"]["report"], "docs/audits/x/report.json");
+        // Oracle rows verbatim and sorted; dartq side empty (its only entry matched)
+        let oracle_rows = parsed["oracle"].as_array().expect("oracle rows");
+        assert_eq!(oracle_rows.len(), 2);
+        assert_eq!(oracle_rows[0]["code"], "expected_token");
+        assert_eq!(oracle_rows[0]["message"], "Expected to find ';'.");
+        assert_eq!(oracle_rows[1]["code"], "undefined_class");
+        assert_eq!(parsed["dartq"].as_array().expect("dartq rows").len(), 1);
+        // replay_command: argv-shaped, corpus + edits + dartq cmd, daemon derived
+        let argv: Vec<&str> = parsed["replay_command"]
+            .as_array()
+            .expect("argv")
+            .iter()
+            .map(|v| v.as_str().expect("string"))
+            .collect();
+        assert_eq!(argv[0], "target/debug/harness");
+        assert_eq!(argv[1], "replay");
+        assert!(argv.windows(2).any(|w| w[0] == "--corpus-dir" && w[1] == root.display().to_string()));
+        let edits_index = argv.iter().position(|a| *a == "--edits").expect("--edits present");
+        let edits_path = PathBuf::from(argv[edits_index + 1]);
+        let edits = crate::replay_edit::parse_edits(
+            &fs::read_to_string(&edits_path).expect("edits file"),
+        )
+        .expect("edits parse through the replay schema");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].file, "lib/a.dart");
+        assert_eq!(edits[0].new_text, "int a = 1;\nint b = 2;\n");
+        let daemon_index = argv.iter().position(|a| *a == "--daemon-cmd").expect("--daemon-cmd");
+        assert_eq!(
+            argv[daemon_index + 1],
+            "./target/debug/dartq daemon --dir {dir} --sdk /sdk",
+            "analyze/--format tokens dropped, corpus dir becomes the {{dir}} placeholder"
+        );
+
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Exemption table: a matching (code, file) entry suppresses the case;
+    /// a non-matching message_pattern does not.
+    #[test]
+    fn known_diffs_suppress_persistence() {
+        let (root, cmp, oracle, dartq) = persist_fixture();
+        let out = std::env::temp_dir().join(format!("dq_persist_known_{}", std::process::id()));
+        // Created up front: a fully exempt persist pass writes nothing and
+        // leaves the dir empty (create_dir_all only runs on the write path),
+        // so the artifact-count assertions below need the dir to exist.
+        fs::create_dir_all(&out).expect("persist dir");
+        let corpora = [(None, root.clone())];
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
+
+        // Exact code+file match: the only diffing entry is exempt -> no case.
+        let known = vec![KnownDiff {
+            code: "undefined_class".into(),
+            file: "lib/a.dart".into(),
+            message_pattern: String::new(),
+            reason: "triage in progress".into(),
+        }];
+        let opts = persist_opts(&out, &known, Path::new("r.json"), 1);
+        let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
+        assert_eq!(
+            (stats.files_persisted, stats.files_exempt, stats.entries_exempt),
+            (0, 1, 1),
+            "fully exempt file writes nothing"
+        );
+        assert_eq!(fs::read_dir(&out).expect("dir").count(), 0, "no artifacts");
+
+        // Pattern miss: the exemption does not fire, the case persists.
+        let known = vec![KnownDiff {
+            code: "undefined_class".into(),
+            file: "lib/a.dart".into(),
+            message_pattern: "no such message".into(),
+            reason: String::new(),
+        }];
+        let opts = persist_opts(&out, &known, Path::new("r.json"), 1);
+        let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
+        assert_eq!(stats.files_persisted, 1);
+        assert_eq!(stats.entries_exempt, 0);
+
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// --list-known status derivation: a matching persisted case is ACTIVE, a
+    /// table entry without one is STALE, and an empty cases dir yields
+    /// NO-EVIDENCE (never a false STALE off zero data).
+    #[test]
+    fn list_known_marks_active_stale_and_no_evidence() {
+        let dir = std::env::temp_dir().join(format!("dq_persist_list_{}", std::process::id()));
+        let known_path = dir.join("known-diffs.json");
+        let cases = dir.join("cases");
+        fs::create_dir_all(&cases).expect("cases dir");
+        let table = KnownDiffsFile {
+            entries: vec![
+                KnownDiff {
+                    code: "undefined_class".into(),
+                    file: "lib/a.dart".into(),
+                    message_pattern: String::new(),
+                    reason: String::new(),
+                },
+                KnownDiff {
+                    code: "expected_token".into(),
+                    file: "lib/gone.dart".into(),
+                    message_pattern: String::new(),
+                    reason: String::new(),
+                },
+            ],
+        };
+        fs::write(&known_path, serde_json::to_string_pretty(&table).expect("table"))
+            .expect("write table");
+
+        // No cases yet: NO-EVIDENCE for both.
+        let summary = list_known(&known_path, &cases).expect("list");
+        assert!(summary.contains("2 entries (0 active, 0 stale, 2 no-evidence)"), "{summary}");
+
+        // Persist a case carrying undefined_class on lib/a.dart: that entry
+        // turns ACTIVE, the other stays STALE (evidence exists, none matches).
+        let (root, cmp, oracle, dartq) = persist_fixture();
+        let corpora = [(None, root.clone())];
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
+        let opts = persist_opts(&cases, &[], Path::new("r.json"), 1);
+        persist_regressions(&cmp, &raw, &opts).expect("persist");
+        let summary = list_known(&known_path, &cases).expect("list");
+        assert!(summary.contains("2 entries (1 active, 1 stale, 0 no-evidence)"), "{summary}");
+        assert!(summary.contains("ACTIVE       undefined_class lib/a.dart"), "{summary}");
+        assert!(summary.contains("STALE        expected_token lib/gone.dart"), "{summary}");
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The exemption table file face: missing file = empty table, malformed
+    /// file = hard error (a silently ignored table would re-persist all).
+    #[test]
+    fn load_known_diffs_missing_is_empty_malformed_is_error() {
+        let missing = Path::new("/nonexistent/dq/known-diffs.json");
+        assert!(load_known_diffs(missing).expect("missing -> empty").is_empty());
+
+        let dir = std::env::temp_dir().join(format!("dq_persist_load_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let bad = dir.join("known-diffs.json");
+        fs::write(&bad, "{not json").expect("bad table");
+        assert!(load_known_diffs(&bad).is_err(), "malformed table must error");
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Position-delta channel over a single-corpus fixture, exercised the same
