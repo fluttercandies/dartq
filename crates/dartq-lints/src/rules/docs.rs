@@ -96,7 +96,7 @@ pub(crate) mod slash_for_doc_comments {
 }
 
 pub(crate) mod unintended_html_in_doc_comment {
-    use super::{Check, Group, NodeKind, RuleSpec, comment_lexeme, is_doc_form};
+    use super::{Check, Comment, Group, NodeKind, RuleSpec, comment_lexeme, is_doc_form};
 
     /// Official: `pkg/linter/lib/src/rules/unintended_html_in_doc_comment.dart:118-186`
     /// — doc-comment lines are scanned for angle-bracket text that Markdown
@@ -105,11 +105,15 @@ pub(crate) mod unintended_html_in_doc_comment {
     /// left-to-right pass with the same alternative order: escapes, code
     /// spans, autolinks, HTML comments/declarations/PIs/CDATA, `DartDoc`
     /// `[...]` links, whitelisted tags (`CommonMark` raw-HTML list, :17-125),
-    /// and finally the invalid `</?tag…>` shape — the report. Line-level
-    /// approximations (documented blind spots): markdown fenced code
-    /// blocks toggle on three-backtick fence lines (the analyzer's full
-    /// markdown `codeBlocks`
-    /// — indented blocks included — is out of reach), and the scan faces
+    /// and finally the invalid `</?tag…>` shape — the report. Lines inside a
+    /// markdown code region are skipped, mirroring the analyzer's
+    /// `codeBlocks` construction (`doc_comment_builder.dart`):
+    /// fenced regions toggle on ``` lines (a documented approximation —
+    /// no tick-count matching), and an indented code block opens after an
+    /// empty line when the content is indented by four or more characters,
+    /// lasting while it stays so. Remaining approximations: the official
+    /// models no other container blocks (lists, quotes) either —
+    /// `isPreviousLineEmpty` alone decides — and the scan faces
     /// declaration/directive doc groups (the official dispatch is the
     /// `Comment` AST node, i.e. documentation comments only). Message:
     /// `diagnostic.g.dart` `unintendedHtmlInDocComment`.
@@ -126,7 +130,7 @@ pub(crate) mod unintended_html_in_doc_comment {
         // The official face is per documentation comment
         // (`registry.addComment`, :135) — here, the run of consecutive
         // doc-form comments attached to one token. Each run scans exactly
-        // once, its fence state spanning every line of the run (the
+        // once, its code-region state spanning every line of the run (the
         // official computes `node.codeBlocks` over the whole comment).
         let comments = c.comments.all();
         let mut idx = 0;
@@ -150,28 +154,95 @@ pub(crate) mod unintended_html_in_doc_comment {
             if !run.iter().any(|cm| comment_lexeme(c, cm).contains('<')) {
                 continue;
             }
-            let mut fences = false;
-            for cm in run {
-                let lexeme = comment_lexeme(c, cm);
-                let comment_start = cm.range.start as usize;
-                let mut line_start = 0usize;
-                for line in lexeme.split('\n') {
+            scan_run(c, run);
+        }
+    }
+
+    /// Scans one doc-comment run, skipping lines inside a markdown code
+    /// region — the analyzer's `codeBlocks` construction
+    /// (`doc_comment_builder.dart:_parseDocComment`, :270-308): fenced
+    /// regions toggle on ``` lines (the documented approximation — no
+    /// tick-count matching), and an indented code block opens after an
+    /// empty line when the line content is indented by four or more
+    /// characters, lasting while it stays so; its terminating line is
+    /// re-dispatched as a normal line. The official models no other
+    /// container blocks (lists, quotes) either — `isPreviousLineEmpty`
+    /// alone decides — so a tightly indented list-item continuation is
+    /// prose while a blank-line-separated indented block is code.
+    fn scan_run(c: &mut Check<'_>, run: &[Comment]) {
+        let mut fenced = false;
+        let mut indented = false;
+        // `isPreviousLineEmpty` (:273) — true before the first line.
+        let mut prev_empty = true;
+        for cm in run {
+            let lexeme = comment_lexeme(c, cm);
+            let comment_start = cm.range.start as usize;
+            let block_form = matches!(cm.kind, crate::comments::CommentKind::Block);
+            let mut line_start = 0usize;
+            for (line_index, line) in lexeme.split('\n').enumerate() {
+                let content = line_content(line);
+                // Raw content emptiness; the builder counts a `/**` opening
+                // line as empty so an indented block can start on the next
+                // line (:298-302).
+                let empty = content.is_empty()
+                    || (block_form && line_index == 0 && content == "/**");
+                let indent =
+                    content.len() - content.trim_start_matches([' ', '\t']).len();
+                if fenced {
+                    // Every line of a fenced block is code, the closing
+                    // fence line included; the block leaves
+                    // `isPreviousLineEmpty` false (:287-289).
                     if is_fence_line(line) {
-                        fences = !fences;
-                    } else if !fences && line.contains('<') {
-                        for (start, end) in unintended_tags(line) {
-                            let from = c.unit.lines.byte_to_utf16(
-                                c.unit.source,
-                                (comment_start + line_start + start) as u32,
-                            );
-                            let to = from + utf16_len(&line[start..end]);
-                            c.report(from..to, &[]);
-                        }
+                        fenced = false;
                     }
-                    line_start += line.len() + 1; // +1 for the split `\n`
+                } else if indented && indent >= 4 {
+                    // Indented code block continuation (:560-563).
+                } else if prev_empty && indent >= 4 {
+                    // An indented code block opens after an empty line —
+                    // the official dispatch checks this before the fence
+                    // check (:279-285).
+                    indented = true;
+                } else {
+                    if indented {
+                        // The block's terminating line is re-dispatched as
+                        // a normal line (:564-574).
+                        indented = false;
+                    }
+                    if is_fence_line(line) {
+                        fenced = true;
+                        prev_empty = false;
+                    } else {
+                        if line.contains('<') {
+                            for (start, end) in unintended_tags(line) {
+                                let from = c.unit.lines.byte_to_utf16(
+                                    c.unit.source,
+                                    (comment_start + line_start + start) as u32,
+                                );
+                                let to = from + utf16_len(&line[start..end]);
+                                c.report(from..to, &[]);
+                            }
+                        }
+                        prev_empty = empty;
+                    }
                 }
+                line_start += line.len() + 1; // +1 for the split `\n`
             }
         }
+    }
+
+    /// The markdown line content: the line after the comment marker
+    /// (`///`, or leading whitespace plus `*` inside a block comment) and
+    /// one optional space, with a trailing `\r` stripped — the analyzer's
+    /// `_CharacterSequence` content
+    /// (`doc_comment_builder.dart:982-1087`).
+    fn line_content(line: &str) -> &str {
+        let content = line.trim_start_matches([' ', '\t']);
+        let content = content
+            .strip_prefix("///")
+            .or_else(|| content.strip_prefix('*'))
+            .unwrap_or(content);
+        let content = content.strip_prefix(' ').unwrap_or(content);
+        content.strip_suffix('\r').unwrap_or(content)
     }
 
     /// A Markdown fence toggle: the line's content after the comment marker
@@ -777,6 +848,85 @@ mod tests {
     #[test]
     fn html_fenced_block_passes() {
         let f = class_fixture("/// ```dart\n/// <T>\n/// ```\nclass A {}");
+        assert!(
+            f.run(&one_rule("unintended_html_in_doc_comment"))
+                .is_empty()
+        );
+    }
+
+    /// An indented code block after an empty line passes (official
+    /// `codeBlocks` indented type, `test_codeBlock_indented`): the line
+    /// content — marker and one space stripped — is indented by four.
+    #[test]
+    fn html_indented_block_passes() {
+        let f = class_fixture("/// Example:\n///\n///     var x = a <T> b;\nclass A {}");
+        assert!(
+            f.run(&one_rule("unintended_html_in_doc_comment"))
+                .is_empty()
+        );
+    }
+
+    /// `isPreviousLineEmpty` starts true, so an indented line at the very
+    /// start of a doc comment is code.
+    #[test]
+    fn html_indented_block_at_start_passes() {
+        let f = class_fixture("///     var x = a <T> b;\nclass A {}");
+        assert!(
+            f.run(&one_rule("unintended_html_in_doc_comment"))
+                .is_empty()
+        );
+    }
+
+    /// An indented line with no preceding blank line is a list item's
+    /// paragraph continuation, not code — the official models no list
+    /// containers and `_isPreviousLineEmpty` decides, so the tag reports.
+    #[test]
+    fn html_indented_list_continuation_reports() {
+        let f = class_fixture("/// - item:\n///     var x = a <T> b;\nclass A {}");
+        let lints = f.run(&one_rule("unintended_html_in_doc_comment"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range, 30..33);
+    }
+
+    /// A blank-line-separated indented block after a list item is code —
+    /// no report (the official `_parseIndentedCodeBlock` verdict).
+    #[test]
+    fn html_indented_after_blank_list_passes() {
+        let f = class_fixture("/// - item:\n///\n///     var x = a <T> b;\nclass A {}");
+        assert!(
+            f.run(&one_rule("unintended_html_in_doc_comment"))
+                .is_empty()
+        );
+    }
+
+    /// Prose scanning resumes once the indented block's terminator line
+    /// is re-dispatched (`_parseIndentedCodeBlock` returning the line).
+    #[test]
+    fn html_reports_after_indented_block_ends() {
+        let f = class_fixture("///     var x = 1;\n/// Uses a <T> here.\nclass A {}");
+        let lints = f.run(&one_rule("unintended_html_in_doc_comment"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range, 30..33);
+    }
+
+    /// A Java-style block doc comment's indented block passes (official
+    /// `test_unintendedHtml_javaDoc_multiline_indented`): ` *` counts as an
+    /// empty line and ` *     ` yields four content-space indentation.
+    #[test]
+    fn html_java_doc_indented_block_passes() {
+        let f = class_fixture("/**\n * Text\n *\n *     List<int>\n *\n * Text\n */\nclass A {}");
+        assert!(
+            f.run(&one_rule("unintended_html_in_doc_comment"))
+                .is_empty()
+        );
+    }
+
+    /// The `/**` opening line counts as empty, so an indented block may
+    /// start on the next line (official
+    /// `test_unintendedHtml_javaDoc_multiline_indented_atStart`).
+    #[test]
+    fn html_java_doc_indented_at_start_passes() {
+        let f = class_fixture("/**\n *     List<int>\n */\nclass A {}");
         assert!(
             f.run(&one_rule("unintended_html_in_doc_comment"))
                 .is_empty()
