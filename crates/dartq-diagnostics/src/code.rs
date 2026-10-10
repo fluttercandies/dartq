@@ -200,7 +200,7 @@ pub const DARTQ_MISSING_GENERATED_SOURCE: CodeInfo = CodeInfo::new(
 /// memory isolation; the restart budget's exhaustion is the terminal form).
 pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
     "dartiq/plugin_crashed",
-    "DARTQ/PLUGIN_CRASHED",
+    "DARTIQ/PLUGIN_CRASHED",
     DiagnosticType::Tool,
     false,
 );
@@ -209,7 +209,7 @@ pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
 /// (PRD §14.3 CPU and IPC rows).
 pub const DARTQ_PLUGIN_TIMEOUT: CodeInfo = CodeInfo::new(
     "dartiq/plugin_timeout",
-    "DARTQ/PLUGIN_TIMEOUT",
+    "DARTIQ/PLUGIN_TIMEOUT",
     DiagnosticType::Tool,
     false,
 );
