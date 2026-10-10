@@ -98,8 +98,7 @@ impl DiagnosticType {
     /// `dtype_matches_oracle_severity` invariant: `COMPILE_TIME_ERROR` rows
     /// are oracle-ERROR, `STATIC_WARNING` rows oracle-WARNING). The single
     /// derivation of its mapping — dartq-semantic's per-code `severity`
-    /// duplicates it and folds onto this method once that crate's current
-    /// lane (#350) lands.
+    /// folds onto this method (`dtype().severity()`).
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {

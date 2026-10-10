@@ -158,8 +158,9 @@
 //! * Assignability trio: literals carry their final-primitive types and
 //!   [`Engine::assignable`] extends [`Ty::assignable_from`] with the
 //!   final-primitive table (a value of one final primitive never fits
-//!   another; `int`/`double` fit `num`; `int`→`double` stays undecided —
-//!   the oracle's literal conversion is below the M1 facts).
+//!   another; `int`/`double` fit `num`; `int`→`double` is the oracle's
+//!   literal conversion — `analyzeIntLiteral`'s `convertToDouble`, decided
+//!   on the literal row, never on the value).
 //! * `undefined_annotation`: a fully missing `MetadataReference` name,
 //!   anchored over the `@` (the 3.13.1 caliber — removed upstream in 3.14).
 //! * `undefined_constructor_in_initializer`: `super.named()` inside a
@@ -189,9 +190,8 @@
 //! `annotation_verifier.dart:519-541`), `undefined_hidden_name` /
 //! `undefined_shown_name` (directives are consumed diet-style and the
 //! combinator model carries clause names without source spans — both arrive
-//! with the directive milestone), the unnamed-selector message variants of
-//! the two constructor rows, and the `int`→`double` assignability
-//! decision. `wrong_number_of_parameters_for_setter` is emitted here although
+//! with the directive milestone) and the unnamed-selector message variants of
+//! the two constructor rows. `wrong_number_of_parameters_for_setter` is emitted here although
 //! the oracle fires it from the parser: dartq's parser does not emit the code
 //! yet, and when it does, the collector-side emission must be removed or the
 //! code double-reports. Every deferral under-reports.
@@ -229,6 +229,14 @@ const ENUM_SYNTH_MEMBERS: [&str; 3] = ["values", "index", "name"];
 
 /// Builtin type names: always defined, independent of any import.
 const BUILTIN_TYPES: [&str; 1] = ["dynamic"];
+
+/// The dart:core top-level annotation names (`sdk/lib/core/annotations.dart`:
+/// `Deprecated` :63, `deprecated` :212, `override` :262, `pragma` :297) —
+/// dart:core is implicitly imported into every library, so an annotation of
+/// one of them is defined even where the SDK summary faces carry no
+/// top-level constants. The oracle resolves `@override` inside its own
+/// hosted sources (meta 1.19.0 `meta_meta.dart:202`) and reports nothing.
+const CORE_TOP_LEVEL_ANNOTATIONS: [&str; 4] = ["Deprecated", "deprecated", "override", "pragma"];
 
 /// The dart:core primitive types whose member face the engine answers
 /// directly: their declarations are external (the library graph carries
@@ -642,7 +650,10 @@ struct ExecReturn {
 /// events *before* the value, so the window from `mark` to the row count is
 /// the event-order-agnostic shape of one argument.
 struct ArgLevel {
-    args: Vec<(Option<StringId>, Ty, SourceRange)>,
+    /// `(name, type, primitive-literal flag, range)` per argument — the
+    /// flag feeds the int→double literal conversion
+    /// ([`Engine::assignable`]).
+    args: Vec<(Option<StringId>, Ty, bool, SourceRange)>,
     /// An argument is open between its `open_argument` and the next flush.
     arg_open: bool,
     /// The open argument's name (`None` = positional).
@@ -1712,7 +1723,8 @@ impl<'a> Engine<'a> {
             return;
         }
         if let Some(row) = self.rows.get(level.mark).filter(|_| hi == level.mark + 1) {
-            level.args.push((None, row.ty, row.range));
+            let literal = Self::primitive_literal(row, &self.primitive_ids);
+            level.args.push((None, row.ty, literal, row.range));
         }
         level.mark = hi;
     }
@@ -1734,10 +1746,14 @@ impl<'a> Engine<'a> {
         if hi == level.mark {
             return;
         }
-        let (ty, range) = match self.rows.get(level.mark) {
-            Some(row) if hi == level.mark + 1 => (row.ty, row.range),
+        let (ty, literal, range) = match self.rows.get(level.mark) {
+            Some(row) if hi == level.mark + 1 => {
+                let literal = Self::primitive_literal(row, &self.primitive_ids);
+                (row.ty, literal, row.range)
+            }
             _ => (
                 Ty::UNKNOWN,
+                false,
                 SourceRange {
                     offset: 0,
                     length: 0,
@@ -1745,7 +1761,7 @@ impl<'a> Engine<'a> {
             ),
         };
         level.mark = hi;
-        level.args.push((name, ty, range));
+        level.args.push((name, ty, literal, range));
     }
 
     /// Pairs the closed argument list against the callee's declared formals:
@@ -1773,7 +1789,7 @@ impl<'a> Engine<'a> {
         };
         let mut positional_index = 0usize;
         let mut mismatches: Vec<(Ty, Ty, SourceRange)> = Vec::new();
-        for (name, ty, range) in &level.args {
+        for (name, ty, literal, range) in &level.args {
             let formal = if let Some(n) = name {
                 formals.named_formal(*n)
             } else {
@@ -1784,7 +1800,7 @@ impl<'a> Engine<'a> {
             let Some(formal) = formal else {
                 continue;
             };
-            if self.assignable(*ty, formal.ty) == Some(false) {
+            if self.assignable(*ty, formal.ty, *literal) == Some(false) {
                 mismatches.push((*ty, formal.ty, *range));
             }
         }
@@ -2459,8 +2475,9 @@ impl<'a> Engine<'a> {
             return;
         }
         let (from, range) = (rhs_row.ty, rhs_row.range);
+        let literal = Self::primitive_literal(rhs_row, &self.primitive_ids);
         let to = self.assignment_target_ty(&self.rows[target]);
-        if self.assignable(from, to) == Some(false) {
+        if self.assignable(from, to, literal) == Some(false) {
             let (a0, a1) = (self.ty_display(from), self.ty_display(to));
             self.emit3(SemanticCode::InvalidAssignment, range, &a0, &a1, "");
         }
@@ -2480,7 +2497,8 @@ impl<'a> Engine<'a> {
             return;
         }
         let row = &self.rows[mark];
-        if self.assignable(row.ty, to) == Some(false) {
+        let literal = Self::primitive_literal(row, &self.primitive_ids);
+        if self.assignable(row.ty, to, literal) == Some(false) {
             let (a0, a1) = (self.ty_display(row.ty), self.ty_display(to));
             self.emit3(SemanticCode::InvalidAssignment, row.range, &a0, &a1, "");
         }
@@ -2490,8 +2508,10 @@ impl<'a> Engine<'a> {
     /// The return check (`rtv.dart:209-249` sync matrix): `void` hosts
     /// accept `void`/`dynamic`/`Null`; `void`/`dynamic` expressions only
     /// fit `void`/`dynamic` hosts; everything else defers to the
-    /// assignability decision. Bare `return;` is a `void` expression.
-    fn check_return(&mut self, from: Ty, range: SourceRange) {
+    /// assignability decision (the return expression is the literal's
+    /// context, so `from_literal` feeds the conversion — `double f() => 1;`
+    /// is clean). Bare `return;` is a `void` expression.
+    fn check_return(&mut self, from: Ty, range: SourceRange, from_literal: bool) {
         let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
             FrameKind::Executable { ret: Some(ret), .. } => Some((ret.ty, ret.host, ret.name)),
             _ => None,
@@ -2509,7 +2529,7 @@ impl<'a> Engine<'a> {
             _ => match from {
                 Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
                 Ty::Dynamic => Some(true),
-                _ => self.assignable(from, to),
+                _ => self.assignable(from, to, from_literal),
             },
         };
         if verdict == Some(false) {
@@ -2529,10 +2549,15 @@ impl<'a> Engine<'a> {
     }
 
     /// A single-row expression's type since `mark`, for the body/return
-    /// checks; `None` when the expression is compound.
-    fn single_row_since(&self, mark: usize) -> Option<(Ty, SourceRange)> {
+    /// checks, with the row's primitive-literal flag (the conversion's
+    /// source-side fact); `None` when the expression is compound.
+    fn single_row_since(&self, mark: usize) -> Option<(Ty, bool, SourceRange)> {
         let row = self.rows.get(mark)?;
-        (self.rows.len() == mark + 1).then_some((row.ty, row.range))
+        (self.rows.len() == mark + 1).then_some((
+            row.ty,
+            Self::primitive_literal(row, &self.primitive_ids),
+            row.range,
+        ))
     }
 
     /// Enters an enum constant: its constructor type arguments check against
@@ -2754,10 +2779,16 @@ impl<'a> Engine<'a> {
     /// fits another — the types cannot be extended, implemented, or mixed
     /// in, so no subclass relation can close the gap, whatever declaration
     /// the names resolve to. `int`/`double` fit `num` (the one supertype
-    /// edge); `int` → `double` stays undecided (an int *literal* in a
-    /// double context converts, an int *value* does not — the literal/variable
-    /// distinction is below the M1 facts). `None` suppresses (under-report).
-    fn assignable(&self, from: Ty, to: Ty) -> Option<bool> {
+    /// edge). `int` → `double` is the literal conversion
+    /// (`_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`,
+    /// `analyzeIntLiteral` → `convertToDouble`: an integer literal whose
+    /// context schema `int` does not satisfy but `double` does is typed
+    /// `double`), so `from_literal` — whether the source row is a
+    /// primitive literal — decides: `double d = 1;` is clean, `double d =
+    /// intVar;` reports (a non-literal expression keeps type `int`; the
+    /// conversion keys on the literal, never the value). `None` suppresses
+    /// (under-report).
+    fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
         if let Some(verdict) = to.assignable_from(from) {
             return Some(verdict);
         }
@@ -2789,12 +2820,27 @@ impl<'a> Engine<'a> {
             return Some(true);
         }
         if from_name == int && to_name == double {
-            // `double d = 1;` converts the int literal; `double d = intVar;`
-            // does not — the literal/variable distinction is below the M1
-            // facts, so the pair stays undecided (under-report).
-            return None;
+            // `analyzeIntLiteral`'s `convertToDouble`: the literal converts,
+            // the value does not.
+            return Some(from_literal);
         }
         Some(false)
+    }
+
+    /// A primitive-literal row: [`Engine::push_primitive_row`] is the only
+    /// `RowShape::Value` creator that carries a known final-primitive type
+    /// (every other `Value` push holds `Unknown` or `Null`), so the shape
+    /// plus a non-nullable final-primitive type identifies the int/double/
+    /// bool/String literal rows the conversion decides on.
+    fn primitive_literal(row: &Row, primitive_ids: &[StringId; 5]) -> bool {
+        let Ty::Named {
+            name,
+            nullable: false,
+        } = row.ty
+        else {
+            return false;
+        };
+        matches!(row.shape, RowShape::Value) && primitive_ids.contains(&name)
     }
 
     /// The enum-constant constructor selector (`c.other()` in the
@@ -2831,10 +2877,13 @@ impl<'a> Engine<'a> {
     /// needs a class (or a `foo.name` constant face); a fully missing name is
     /// `undefined_annotation` anchored over the `@` (3.13.1 caliber — the
     /// diagnostic was removed upstream in 3.14, `m1_codes.txt` freezes the
-    /// measured form). Defined names stay silent: the class/constructor
-    /// second-part checks sit outside the M1 model (under-report).
+    /// measured form). A [`CORE_TOP_LEVEL_ANNOTATIONS`] name is defined by
+    /// the implicit dart:core import, never missing. Defined names stay
+    /// silent: the class/constructor second-part checks sit outside the M1
+    /// model (under-report).
     fn check_annotation(&mut self, name: StringId, range: SourceRange) {
-        let missing = matches!(self.resolve_bare(name), BareInfo::Missing { .. });
+        let missing = matches!(self.resolve_bare(name), BareInfo::Missing { .. })
+            && !CORE_TOP_LEVEL_ANNOTATIONS.contains(&self.strings.resolve(name));
         let at = self.annotation_at.take();
         if missing && !self.guard.ignore(None, name) {
             let span = SourceRange {
@@ -4354,13 +4403,13 @@ impl ParserListener for DiagnoseListener<'_> {
         let mark = engine.return_mark.take();
         if !has_expression {
             // Bare `return;` is a `void` expression in the oracle's matrix.
-            engine.check_return(Ty::Void, end.range);
+            engine.check_return(Ty::Void, end.range, false);
             return;
         }
         if let Some(mark) = mark
-            && let Some((ty, range)) = engine.single_row_since(mark)
+            && let Some((ty, literal, range)) = engine.single_row_since(mark)
         {
-            engine.check_return(ty, range);
+            engine.check_return(ty, range, literal);
         }
     }
 
@@ -4369,8 +4418,8 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(mark) = engine.body_mark.take() else {
             return;
         };
-        if let Some((ty, range)) = engine.single_row_since(mark) {
-            engine.check_return(ty, range);
+        if let Some((ty, literal, range)) = engine.single_row_since(mark) {
+            engine.check_return(ty, range, literal);
         }
     }
 
@@ -5485,6 +5534,61 @@ mod tests {
         assert_eq!(
             report.diagnostics[2].message,
             "A value of type 'String' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// The int→double literal conversion (`analyzeIntLiteral`'s
+    /// `convertToDouble`): an int *literal* in a double context is clean on
+    /// every context site the M1 facts check (declaration initializer,
+    /// argument, return expression, assignment right-hand side), while an
+    /// int *value* (a variable read) reports on the same sites — the
+    /// conversion keys on the literal, never on the value.
+    ///
+    /// Hand-trace: `1` pushes a [`Engine::push_primitive_row`] row (a
+    /// `Value` row typed `int`, [`Engine::primitive_literal`] true); `i`'s
+    /// bare row carries the declared `int` in a non-literal shape. The
+    /// final-primitive table answers the literal flag for the int→double
+    /// pair, so the literal sites return `true` (silent) and the variable
+    /// sites `false` (the trio's codes, in source order).
+    #[test]
+    fn int_literal_converts_to_double_but_the_value_does_not() {
+        let report = report(
+            "class int {} class double {} \
+             void f(double x) {} double g() { return 1; } \
+             void main() { int i = 1; double a = 1; double b = i; f(1); f(i); double c; c = 1; c = i; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "invalid_assignment",
+                "argument_type_not_assignable",
+                "invalid_assignment",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'int' can't be assigned to a variable of type 'double'."
+        );
+    }
+
+    /// A dart:core top-level annotation name (`@override` — meta 1.19.0
+    /// `meta_meta.dart:202`, the M1 r2 gate's only non-#351 differential
+    /// row) is defined by the implicit dart:core import: no
+    /// `undefined_annotation` and no §8 miss. A genuinely missing name
+    /// still reports.
+    ///
+    /// Hand-trace: the `MetadataReference` identifier resolves `Missing` for
+    /// all three names; the [`CORE_TOP_LEVEL_ANNOTATIONS`] membership
+    /// clears `override`/`pragma`, leaving `gone` to report over the `@`.
+    #[test]
+    fn core_top_level_annotation_names_stay_silent() {
+        let report = report("@override @pragma('x') @gone void f() {}");
+        assert_eq!(code_names(&report), ["undefined_annotation"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Undefined name 'gone' used as an annotation."
         );
     }
 

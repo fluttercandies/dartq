@@ -81,8 +81,9 @@ use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
 pub enum SemanticCode {
     /// `The name '{0}' is already defined.`
     DuplicateDefinition,
-    /// `Undefined name '{0}' used as an annotation.` — no emit site fires:
-    /// dartq has no annotation resolution yet, and upstream removed the
+    /// `Undefined name '{0}' used as an annotation.` — the emit site is
+    /// [`crate::diagnose`]'s annotation check (a fully missing
+    /// `MetadataReference` name), and upstream removed the
     /// diagnostic in 3.14 (`removedIn: "3.14"` — absent from the pinned
     /// 3.15-main registry, only `messages.yaml` retains the text). The row
     /// stays for the 3.13.1 measurement oracle, which still emits it and
@@ -326,31 +327,37 @@ impl SemanticCode {
             ),
             Self::UnreachableSwitchCase => ("unreachable_switch_case", "UNREACHABLE_SWITCH_CASE"),
         };
-        // Tier: the setter row is a parser error in the oracle; the
-        // null-aware row is the frozen set's only static warning.
-        let dtype = match self {
-            Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
-            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => {
-                DiagnosticType::StaticWarning
-            }
-            _ => DiagnosticType::CompileTimeError,
-        };
+        let dtype = self.dtype();
         // The function variant is the one wrong-number template without a
         // `hasPublishedDocs` field (diagnostic.g.dart:18725-18744).
         let published = !matches!(self, Self::WrongNumberOfTypeArgumentsFunction);
         CodeInfo::new(name, machine, dtype, published)
     }
 
-    /// Oracle severity: every row is an error except the null-aware
-    /// static warning.
+    /// The oracle tier of the row — the single derivation of the family
+    /// split: the frozen set is compile-time errors except the setter row
+    /// (a *syntactic* error in the oracle, whose trigger lives in its
+    /// parser, `ast_builder.dart:6477,6510`) and the two static warnings
+    /// (`diagnostic.g.dart:17726`). Both [`SemanticCode::code_info`] and
+    /// [`SemanticCode::severity`] fold onto it.
+    #[must_use]
+    pub const fn dtype(self) -> DiagnosticType {
+        match self {
+            Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
+            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => {
+                DiagnosticType::StaticWarning
+            }
+            _ => DiagnosticType::CompileTimeError,
+        }
+    }
+
+    /// Oracle severity: folded onto the tier derivation
+    /// ([`DiagnosticType::severity`] — the single severity mapping, the
+    /// `dtype_matches_oracle_severity` invariant): every row is an error
+    /// except the two static warnings.
     #[must_use]
     pub const fn severity(self) -> Severity {
-        match self {
-            // `DiagnosticType.STATIC_WARNING` rows (diagnostic.g.dart
-            // :17726, unreachable_switch_case).
-            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => Severity::Warning,
-            _ => Severity::Error,
-        }
+        self.dtype().severity()
     }
 
     /// The verbatim oracle `problemMessage` with placeholders filled.
@@ -647,6 +654,79 @@ mod tests {
             SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function)
                 .code_info()
                 .has_published_docs
+        );
+    }
+
+    /// The severity derivation is the diagnostic layer's: every row's
+    /// severity equals its tier's ([`DiagnosticType::severity`], the
+    /// `dtype_matches_oracle_severity` invariant) — the pin against a
+    /// reintroduced hand-rolled mapping.
+    #[test]
+    fn severity_folds_onto_the_tier_derivation() {
+        let codes = [
+            SemanticCode::DuplicateDefinition,
+            SemanticCode::UndefinedAnnotation,
+            SemanticCode::UndefinedClass,
+            SemanticCode::UndefinedConstructorInInitializer,
+            SemanticCode::UndefinedEnumConstructor,
+            SemanticCode::UndefinedEnumConstant,
+            SemanticCode::UndefinedExtensionGetter,
+            SemanticCode::UndefinedExtensionMethod,
+            SemanticCode::UndefinedExtensionOperator,
+            SemanticCode::UndefinedExtensionSetter,
+            SemanticCode::UndefinedFunction,
+            SemanticCode::UndefinedGetter,
+            SemanticCode::UndefinedIdentifier,
+            SemanticCode::UndefinedIdentifierAwait,
+            SemanticCode::UndefinedMethod,
+            SemanticCode::UndefinedNamedParameter,
+            SemanticCode::UndefinedOperator,
+            SemanticCode::UndefinedPrefixedName,
+            SemanticCode::UndefinedSetter,
+            SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+            SemanticCode::UndefinedSuperMember(SuperShape::Method),
+            SemanticCode::UndefinedSuperMember(SuperShape::Operator),
+            SemanticCode::UndefinedSuperMember(SuperShape::Setter),
+            SemanticCode::WrongNumberOfParametersForOperator,
+            SemanticCode::WrongNumberOfParametersForOperatorMinus,
+            SemanticCode::WrongNumberOfParametersForSetter,
+            SemanticCode::WrongNumberOfTypeArguments,
+            SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+            SemanticCode::WrongNumberOfTypeArgumentsEnum,
+            SemanticCode::WrongNumberOfTypeArgumentsExtension,
+            SemanticCode::WrongNumberOfTypeArgumentsFunction,
+            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function),
+            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
+            SemanticCode::InvalidAssignment,
+            SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::ReturnOfInvalidType(ExecKind::Function),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Method),
+            SemanticCode::InvalidNullAwareOperator,
+            SemanticCode::NonExhaustiveSwitchStatement,
+            SemanticCode::NonExhaustiveSwitchExpression,
+            SemanticCode::UnreachableSwitchCase,
+        ];
+        for code in codes {
+            assert_eq!(
+                code.severity(),
+                code.dtype().severity(),
+                "{}",
+                code.code_info().name
+            );
+        }
+        // The two static warnings are the frozen set's only warnings; the
+        // syntactic setter row stays an error.
+        assert_eq!(
+            SemanticCode::InvalidNullAwareOperator.severity(),
+            Severity::Warning
+        );
+        assert_eq!(
+            SemanticCode::UnreachableSwitchCase.severity(),
+            Severity::Warning
+        );
+        assert_eq!(
+            SemanticCode::WrongNumberOfParametersForSetter.severity(),
+            Severity::Error
         );
     }
 
