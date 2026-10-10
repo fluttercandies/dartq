@@ -6,12 +6,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, Diagnostic, Severity};
+use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, Severity};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{CombinatorClause, Combinators, ResolvedTarget, UriResolution, UriResolver};
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
+use dartq_snapshot::EntryKey;
 use dartq_source::{ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -255,10 +256,19 @@ fn recompute_facts(
     // batch's files. Derivation is deferred to the resolution pass below —
     // it must re-run the per-file steps under the one sequential resolver.
     let mut hits: Vec<(usize, Arc<UnitFacts>)> = Vec::new();
+    // Warm-start slots (#482): identities the staged snapshot answers. The
+    // map lookup IS the content-hash verification — the key's hash column
+    // is the file's live ContentId. Checked before the sibling dedup
+    // deliberately: a snapshot payload is post-resolution, so unlike the
+    // facts cache it cannot serve as a derive template; every same-key
+    // slot materializes its own face.
+    let mut warm: Vec<(usize, FactsKey)> = Vec::new();
     for (index, (_, content, _)) in changed.iter().enumerate() {
         let key = facts_key(&state.packages, &state.files, changed[index].0, *content);
         if let Some(facts) = state.cached_facts(key) {
             hits.push((index, facts));
+        } else if state.warm_start.contains_key(&snapshot_key(key)) {
+            warm.push((index, key));
         } else if let Some(&template) = first_miss.get(&key) {
             siblings.entry(template).or_default().push(index);
         } else {
@@ -284,6 +294,51 @@ fn recompute_facts(
             (*index, *key, facts, face)
         })
         .collect();
+
+    // Warm-start materialization (#482): each matched payload comes off the
+    // staging map — the keyed removal is the content-hash verification —
+    // and materializes against the live tables. Grouped by key so a
+    // same-content batch (one payload, several consumers) removes it once;
+    // the extras clone the payload (identical bytes at two paths, rare and
+    // bounded by the batch). The staging map is single-shot: whatever no
+    // changed file claimed was stale against this batch and drops here —
+    // stale entries never survive an apply (bounded memory; the next
+    // ingest re-seeds). Grow-only: ingestion seeds recomputes, it never
+    // touches residency (#377).
+    let mut warmed: Vec<(usize, UnitFacts)> = Vec::with_capacity(warm.len());
+    if !warm.is_empty() {
+        // One registry per load: materialize runs per entry, and a
+        // per-entry `CodeRegistry::builtin()` would rebuild the ~270-entry
+        // map for every snapshot file (the #269 F2 anti-pattern).
+        let codes = CodeRegistry::builtin();
+        let mut by_key: FxHashMap<FactsKey, Vec<usize>> = FxHashMap::default();
+        for (index, key) in warm {
+            by_key.entry(key).or_default().push(index);
+        }
+        for (key, slots) in by_key {
+            let payload = state
+                .warm_start
+                .remove(&snapshot_key(key))
+                .expect("warm key checked at classification");
+            let mut slots = slots.into_iter();
+            let first = slots.next().expect("grouped slots are non-empty");
+            let (first_payload, rest) = if slots.len() > 0 {
+                (payload.clone(), Some(payload))
+            } else {
+                (payload, None)
+            };
+            warmed.push((first, materialize_warm(first_payload, state, sources[first], &codes)));
+            if let Some(template) = rest {
+                for index in slots {
+                    warmed.push((
+                        index,
+                        materialize_warm(template.clone(), state, sources[index], &codes),
+                    ));
+                }
+            }
+        }
+        state.warm_start.clear();
+    }
 
     // Sequential URI resolution over the shared FileTable: each template
     // resolves for its own file, then each sibling derives from the
@@ -335,6 +390,27 @@ fn recompute_facts(
         let derived = derive_facts(&facts, changed[index].0, &mut resolver);
         slots[index] = Some((Arc::new(derived), true));
     }
+    // Warm-start re-derivation (#482): the materialized face attributes and
+    // resolves against the snapshot's *saved* file; every baked diagnostic
+    // belongs to the unit, so re-attributing all of them to the consuming
+    // file is exact, and the URI diagnostic tail rebuilds one-for-one with
+    // the re-resolved coded directives (resolve_unit's construction
+    // invariant: exactly one pushed diagnostic per coded directive, after
+    // every other diagnostic) — a same-content file at another path
+    // re-resolves against its own directory.
+    for (index, mut facts) in warmed {
+        for diagnostic in &mut facts.diagnostics {
+            diagnostic.file = changed[index].0;
+        }
+        let uri_tail = facts
+            .directives
+            .iter()
+            .filter(|directive| directive.code.is_some())
+            .count();
+        facts.diagnostics.truncate(facts.diagnostics.len() - uri_tail);
+        resolve_unit(&mut facts, changed[index].0, &mut resolver);
+        slots[index] = Some((Arc::new(facts), true));
+    }
     drop(resolver);
     for (key, face) in scanned_to_cache {
         state.cache_scanned(key, face);
@@ -351,6 +427,34 @@ fn recompute_facts(
             (*file, facts, cache_hit)
         })
         .collect()
+}
+
+/// The snapshot entry identity of a facts key (#482): the same
+/// `(content, feature, semantic)` triple in the snapshot crate's wire
+/// form — the staging map's key.
+fn snapshot_key(key: FactsKey) -> EntryKey {
+    EntryKey {
+        content_hash: *key.content.as_bytes(),
+        feature_fingerprint: key.feature_fingerprint,
+        semantic_version: key.semantic_version,
+    }
+}
+
+/// Materializes one warm-start payload against the live tables (#482):
+/// re-interns the string slice into the engine's table, mints file ids
+/// through the engine's own file table, and rebuilds the line index from
+/// the batch source. The post-resolution directive targets and attributed
+/// diagnostics re-derive per consumer under the shared resolver (the
+/// re-derivation pass in [`recompute_facts`]).
+fn materialize_warm(
+    payload: crate::state::persist::PersistedFacts,
+    state: &mut EngineState,
+    source: &str,
+    codes: &CodeRegistry,
+) -> UnitFacts {
+    payload.materialize(source, &state.strings, codes, &mut |path| {
+        state.files.intern(path)
+    })
 }
 
 /// The per-file derivation over a pure (content, feature set) face, shared

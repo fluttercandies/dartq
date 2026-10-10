@@ -483,6 +483,15 @@ pub(crate) struct EngineState {
     /// globs, the lint face reads the rule names.
     pub options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
 
+    /// Warm-start staging (#482): a loaded facts snapshot's payloads, keyed
+    /// by the entry triple. `Engine::ingest_facts_snapshot` fills it; the
+    /// next apply consumes exact identity matches — the lookup IS the
+    /// content-hash verification, a hit serving only a file whose live
+    /// content id equals the key's hash — and drops everything left, so
+    /// stale entries never survive an apply. Ingestion is grow-only: it
+    /// seeds recomputes, it never removes residency (#377).
+    pub warm_start: FxHashMap<dartq_snapshot::EntryKey, persist::PersistedFacts>,
+
     /// Memoized pure per-file facts of previous contents — pre-resolution,
     /// so a cross-batch hit re-runs the per-file attribution and URI
     /// resolution at the hit site (l1 `derive_facts`; the [`FactsKey`] triple
@@ -564,6 +573,7 @@ impl EngineState {
             pending: FxHashMap::default(),
             pending_order: Vec::new(),
             options,
+            warm_start: FxHashMap::default(),
             facts_cache: FxHashMap::default(),
             facts_order: VecDeque::new(),
             scanned: FxHashMap::default(),

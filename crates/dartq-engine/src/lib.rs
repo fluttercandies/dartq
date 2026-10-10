@@ -57,8 +57,12 @@ use dartq_index::{FileCapture, LibraryIndex};
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
+use dartq_snapshot::{
+    Entry, EntryKey, GenerationHeader, RemapTables, SaveError, Snapshot, SnapshotStore,
+    SNAPSHOT_FORMAT_VERSION,
+};
 use dartq_source::{FileId, FileTable, LineIndex, MemorySourceStore, SourceStore, StringTable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 pub use cancel::{CancellationToken, Cancelled};
@@ -66,6 +70,7 @@ pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
 pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
 pub use scheduler::{DrainReport, Task, Tier};
+pub use state::persist::PersistedFacts;
 pub use state::{DirectiveFacts, DirectiveKind, LibraryId, ScannedFace, UnitFacts};
 
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
@@ -501,6 +506,106 @@ impl Engine {
     #[must_use]
     pub fn file_reference_graph(&self) -> CsrGraph {
         pipeline::file_reference_csr(&self.state)
+    }
+
+    /// The generation header facts snapshots key on (PRD §5.5/§5.6): the
+    /// container format version, the engine's `FACTS_SEMANTIC_VERSION`,
+    /// the SDK identity, the package-graph fingerprint, and the context
+    /// salt (the remaining fork dimensions — target, declared variables,
+    /// analysis options). The same header drives `SnapshotStore::load` at
+    /// warm start and `save` at flush; callers never derive it by hand.
+    #[must_use]
+    pub fn snapshot_header(&self) -> GenerationHeader {
+        let mut roots: Vec<PathBuf> = self
+            .state
+            .packages
+            .iter()
+            .map(|package| package.root.clone())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        GenerationHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            semantic_version: state::FACTS_SEMANTIC_VERSION,
+            sdk_identity: state::persist::sdk_identity(&self.state.sdk),
+            package_graph_fingerprint: state::persist::package_graph_fingerprint(
+                &self.state.packages,
+            ),
+            context_salt: state::persist::context_salt(
+                state::SDK_TARGET,
+                &self.state.declared_variables,
+                &roots,
+            ),
+        }
+    }
+
+    /// Writes the resident facts into `store` as one generation — the M3
+    /// flush face the daemon calls after analyze. One [`Entry`] per
+    /// distinct `(content, feature, semantic)` identity over residency,
+    /// under [`Self::snapshot_header`]. The entry key is path-free, so
+    /// same-content files share one payload (the path-smallest file's — a
+    /// deterministic pick, so an unchanged workspace's re-save leaves
+    /// entry frames, and their files, byte-identical). The remap slices
+    /// stay empty: the facts payload is self-contained (per-entry string
+    /// slices and file paths), so no generation-wide id space is needed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SaveError`] — a failed flush is a future miss (the
+    /// accelerator invariant), never a correctness loss.
+    pub fn save_facts_snapshot(&self, store: &SnapshotStore) -> Result<usize, SaveError> {
+        let mut files: Vec<FileId> = self.state.residency.keys().copied().collect();
+        files.sort_unstable_by(|a, b| {
+            let path = |file: FileId| {
+                self.state
+                    .files
+                    .path(file)
+                    .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+            };
+            path(*a).cmp(path(*b))
+        });
+        let mut entries: Vec<Entry<PersistedFacts>> = Vec::with_capacity(files.len());
+        let mut claimed: FxHashSet<EntryKey> = FxHashSet::default();
+        for file in files {
+            let facts = &self.state.residency[&file];
+            let key = l1::facts_key(&self.state.packages, &self.state.files, file, facts.content());
+            let key = EntryKey {
+                content_hash: *key.content.as_bytes(),
+                feature_fingerprint: key.feature_fingerprint,
+                semantic_version: key.semantic_version,
+            };
+            if !claimed.insert(key) {
+                continue;
+            }
+            entries.push(Entry {
+                key,
+                payload: PersistedFacts::of(facts, &self.state.strings, &self.state.files),
+            });
+        }
+        let saved = entries.len();
+        store.save(&self.snapshot_header(), &RemapTables::default(), &entries)?;
+        Ok(saved)
+    }
+
+    /// Warm start (the M3 load face): stages a loaded facts generation for
+    /// the next apply. Staging is keyed by the entry triple; the apply's
+    /// lookup IS the content-hash verification — an entry serves only a
+    /// file whose live content id equals the key's hash, and everything
+    /// stale drops at that first apply. Ingestion is grow-only: it seeds
+    /// recomputes, never touching residency (#377). The loaded header and
+    /// remap tables are the store's match gate — consumed by `load`, not
+    /// needed here.
+    ///
+    /// Returns the number of staged entries.
+    pub fn ingest_facts_snapshot(&mut self, snapshot: Snapshot<PersistedFacts>) -> usize {
+        let staged = snapshot.entries.len();
+        self.state.warm_start.extend(
+            snapshot
+                .entries
+                .into_iter()
+                .map(|entry| (entry.key, entry.payload)),
+        );
+        staged
     }
 }
 

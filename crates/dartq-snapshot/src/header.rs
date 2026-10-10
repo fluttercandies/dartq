@@ -21,10 +21,13 @@ use crate::blake3_128;
 /// hash, so an entry-set delta leaves the stamp (and every unchanged
 /// entry frame) byte-identical and `save` skips rewriting such files;
 /// `load` also rejects an entry whose payload key disagrees with its
-/// filename. No on-disk back-compat is provided or needed: nothing
-/// consumes the format yet — the load-side wiring (#344) designs against
-/// this contract.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+/// filename. v5 (#482): the header gained [`GenerationHeader::context_salt`]
+/// — the caller's remaining fork dimensions (target, declared variables,
+/// analysis options) hashed in, so forked contexts can never collide on
+/// one generation directory. No on-disk back-compat is provided or
+/// needed: an earlier generation simply mismatches its header and is
+/// rebuilt.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// Identity of one snapshot generation (PRD §5.5, §5.6). A loaded
 /// generation is used only when every field equals what the caller
@@ -45,6 +48,14 @@ pub struct GenerationHeader {
     pub sdk_identity: String,
     /// blake3-128 fingerprint of the package graph.
     pub package_graph_fingerprint: [u8; 16],
+    /// blake3-128 over the caller's remaining fork dimensions — the SDK
+    /// target segment, the conditional-import declared-variables map, and
+    /// the analysis-options content (#482). Opaque to this crate: the
+    /// caller derives it so two contexts differing on any of these
+    /// dimensions never share a generation directory, while the header
+    /// itself stays compact and value-hashed (dimensions folded in, whole
+    /// maps never embedded).
+    pub context_salt: [u8; 16],
 }
 
 impl GenerationHeader {

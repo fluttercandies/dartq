@@ -28,6 +28,13 @@ pub fn content_hash(bytes: &[u8]) -> ContentId {
 }
 
 impl ContentId {
+    /// The raw 16 digest bytes — the wire form snapshot entry keys carry
+    /// (`dartq_snapshot::EntryKey::content_hash` names the same blake3-128).
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
     /// Parses the lowercase or uppercase 32-character hex form produced by
     /// [`Display`](fmt::Display).
     ///

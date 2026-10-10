@@ -21,14 +21,17 @@
 //! Save shape: [`PersistedFacts::of`] projects resident facts, the caller
 //! wraps them in `dartq_snapshot::Entry` payloads keyed by
 //! `FACTS_SEMANTIC_VERSION` (state.rs); the header carries
-//! [`sdk_identity`] and [`package_graph_fingerprint`]. Load shape (#344
-//! seam): `Snapshot<PersistedFacts>` → [`PersistedFacts::materialize`]
-//! per entry.
+//! [`sdk_identity`], [`package_graph_fingerprint`], and the context salt
+//! ([`context_salt`]). Load shape (landed, #482): `Engine::
+//! ingest_facts_snapshot` stages a `Snapshot<PersistedFacts>` and the next
+//! apply materializes identity-matched entries through
+//! [`PersistedFacts::materialize`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use rustc_hash::FxHashMap;
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
@@ -103,6 +106,57 @@ pub fn sdk_identity(sdk: &SdkSnapshot) -> String {
         sdk.dart.libraries_json_hash,
         SDK_TARGET,
     )
+}
+
+/// The context-fork salt the generation header carries (#482): blake3-128
+/// over the fork dimensions [`sdk_identity`] and
+/// [`package_graph_fingerprint`] do not already pin — the SDK target
+/// segment, the conditional-import declared-variables map, and the
+/// analysis-options content. Sorted keys and length-prefixed fields make
+/// the digest a pure function of the dimension values (equal contexts
+/// digest equally across processes); any difference forks the header, so
+/// two contexts that would analyze differently can never collide on one
+/// generation directory. Options fold the *located options file's* path
+/// and raw bytes per root — the same content the merged options derive
+/// from, the `context_key` precedent — so exclude-glob and lint edits
+/// both move it, and an unreadable file contributes exactly what the
+/// engine's own loader analyzed (empty bytes).
+// The engine's declared-variables map is the face (its FxHasher is part
+// of the engine's identity, not a generalization axis).
+#[allow(clippy::implicit_hasher)]
+#[must_use]
+pub fn context_salt(
+    target: &str,
+    declared_variables: &FxHashMap<String, String>,
+    roots: &[PathBuf],
+) -> [u8; 16] {
+    let mut bytes = Vec::new();
+    field(&mut bytes, target.as_bytes());
+    let mut variables: Vec<(&str, &str)> = declared_variables
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    variables.sort_unstable();
+    for (name, value) in variables {
+        field(&mut bytes, name.as_bytes());
+        field(&mut bytes, value.as_bytes());
+    }
+    let mut roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    roots.sort_unstable();
+    roots.dedup();
+    for root in roots {
+        field(&mut bytes, root.as_os_str().as_encoded_bytes());
+        match crate::analysis_options::AnalysisOptions::find_for_dir(root) {
+            Some(file) => {
+                field(&mut bytes, &[1]);
+                field(&mut bytes, file.as_os_str().as_encoded_bytes());
+                let options = std::fs::read(&file).unwrap_or_default();
+                field(&mut bytes, &options);
+            }
+            None => field(&mut bytes, &[0]),
+        }
+    }
+    blake3_128(&bytes)
 }
 
 /// The snapshot payload of one file's [`UnitFacts`] (#341): the compact
@@ -533,7 +587,9 @@ fn written_names(names: &[StringId], strings: &StringTable) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::state::DirectiveKind;
+    use crate::{CancellationToken, Engine, EngineConfig, EngineEvent, memory_store};
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
+    use dartq_snapshot::{SnapshotConfig, SnapshotStore};
     use dartq_source::SourceRange;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -776,6 +832,206 @@ mod tests {
             sdk_identity(&sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES_MUTATED)),
             "the libraries.json hash component moves the identity"
         );
+    }
+
+    /// A bare config dir for the salt fixtures, with an optional
+    /// `analysis_options.yaml` (the file the options dimension folds).
+    fn salt_config_dir(tag: &str, options: Option<&str>) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dartq-engine-salt-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        if let Some(options) = options {
+            std::fs::write(dir.join("analysis_options.yaml"), options).expect("options file");
+        }
+        dir
+    }
+
+    /// A throwaway cache root for the snapshot round-trip.
+    fn snapshot_cache_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-snapshot-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// The context salt is a pure function of the fork dimensions and
+    /// sensitive to every one of them: equal dimensions digest equally;
+    /// the target, a declared variable, and the located options content
+    /// each move it.
+    #[test]
+    fn context_salt_is_stable_and_dimension_sensitive() {
+        let plain = salt_config_dir("plain", None);
+        let roots = |dir: &Path| vec![dir.to_path_buf()];
+        let base = context_salt("vm", &FxHashMap::default(), &roots(&plain));
+        assert_eq!(
+            base,
+            context_salt("vm", &FxHashMap::default(), &roots(&plain)),
+            "equal dimensions digest equally"
+        );
+        assert_ne!(
+            base,
+            context_salt("js", &FxHashMap::default(), &roots(&plain)),
+            "the target segment moves the salt"
+        );
+        let mut defined = FxHashMap::default();
+        defined.insert("dart.vm.profile".to_owned(), "true".to_owned());
+        assert_ne!(
+            base,
+            context_salt("vm", &defined, &roots(&plain)),
+            "a declared variable moves the salt"
+        );
+
+        let options = salt_config_dir("options", Some("linter:\n  rules:\n    - avoid_print\n"));
+        let with_options = context_salt("vm", &FxHashMap::default(), &roots(&options));
+        assert_ne!(
+            base,
+            with_options,
+            "located options content moves the salt"
+        );
+        // The *content* (not the root path) is the folded dimension:
+        // rewriting the same file in place moves the digest.
+        std::fs::write(
+            options.join("analysis_options.yaml"),
+            "linter:\n  rules:\n    - avoid_catches_without_threes\n",
+        )
+        .expect("rewrite options");
+        assert_ne!(
+            with_options,
+            context_salt("vm", &FxHashMap::default(), &roots(&options)),
+            "an options edit moves the salt"
+        );
+    }
+
+    /// The full warm-start seam (#482): save → fresh store load → ingest →
+    /// the next apply serves the materialized facts — the warm face equals
+    /// a from-scratch engine's on every observable column, and the
+    /// directive re-resolves against the consuming file's directory —
+    /// while an entry whose content moved since the save drops (its file
+    /// recomputes) and the staging map drains whole.
+    #[test]
+    fn warm_start_round_trips_and_drops_stale_entries() {
+        let config_dir = graph_config_dir();
+        let root = config_dir.parent().expect("fixture root").to_path_buf();
+        let main_path = root.join("lib/main.dart");
+        let other_path = root.join("lib/other.dart");
+        let main_src = "import 'other.dart';\nvoid main() { other(); }\n";
+        let other_src = "int other() => 1;\n";
+        // The stale variant renames the declaration — an API-face change,
+        // so the recomputed signature must differ from the saved one (a
+        // body-only edit would legitimately keep it stable, the L2 gate's
+        // own contract).
+        let stale_other_src = "int other2() => 1;\n";
+
+        let pub_config = Arc::new(PackageConfig::parse(GRAPH_CONFIG).expect("valid config"));
+        let build_engine = || {
+            Engine::new(EngineConfig {
+                store: memory_store(),
+                sdk: sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES),
+                packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
+                pub_config: Arc::clone(&pub_config),
+                config_dir: config_dir.clone(),
+                semdiag: None,
+            })
+            .expect("engine")
+        };
+        let mut saved_engine = build_engine();
+        let main_saved = saved_engine.set_content(&main_path, main_src.as_bytes());
+        let other_saved = saved_engine.set_content(&other_path, other_src.as_bytes());
+        let mut on_event = |_event: EngineEvent| {};
+        let cancel = CancellationToken::new();
+        saved_engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+        assert!(
+            saved_engine
+                .file_facts(main_saved)
+                .expect("resident")
+                .diagnostics
+                .is_empty(),
+            "the fixture analyzes clean"
+        );
+
+        let cache = snapshot_cache_dir();
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(cache.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        assert_eq!(
+            saved_engine.save_facts_snapshot(&store).expect("save"),
+            2,
+            "one entry per distinct content"
+        );
+        let header = saved_engine.snapshot_header();
+
+        // A fresh process's world: fresh engine, fresh load, ingest.
+        let mut warm_engine = build_engine();
+        let snapshot = store.load::<PersistedFacts>(&header).expect("generation");
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(warm_engine.ingest_facts_snapshot(snapshot), 2);
+        assert_eq!(warm_engine.state.warm_start.len(), 2, "staged");
+
+        // The same main content hits the snapshot; the mutated other is
+        // stale — its entry's hash no longer names the live content.
+        let main_warm = warm_engine.set_content(&main_path, main_src.as_bytes());
+        let other_warm = warm_engine.set_content(&other_path, stale_other_src.as_bytes());
+        warm_engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+
+        assert!(
+            warm_engine.state.warm_start.is_empty(),
+            "single-shot staging: matched entries consumed, stale ones dropped"
+        );
+
+        // The warm face equals the from-scratch engine on every observable.
+        let reference = saved_engine.file_facts(main_saved).expect("resident");
+        let warm = warm_engine.file_facts(main_warm).expect("resident");
+        assert_eq!(
+            reference.api_signature(),
+            warm.api_signature(),
+            "the warm signature equals a fresh compute"
+        );
+        assert_eq!(reference.diagnostics.len(), warm.diagnostics.len());
+        assert!(warm.diagnostics.is_empty());
+        assert_eq!(
+            reference.line_index.line_count(),
+            warm.line_index.line_count()
+        );
+        let ResolvedTarget::Resolved(warm_target) = warm.directives[0].target else {
+            panic!("the warm import resolved");
+        };
+        let ResolvedTarget::Resolved(reference_target) = reference.directives[0].target else {
+            panic!("the reference import resolved");
+        };
+        assert_eq!(
+            warm_engine.file_table().path(warm_target),
+            saved_engine.file_table().path(reference_target),
+            "the warm directive re-resolves exactly as a fresh compute does"
+        );
+
+        // The stale file recomputed: its facts name the live content, not
+        // the saved generation's.
+        let stale = warm_engine.file_facts(other_warm).expect("resident");
+        assert_eq!(stale.content(), content_hash(stale_other_src.as_bytes()));
+        assert_ne!(
+            stale.api_signature(),
+            saved_engine
+                .file_facts(other_saved)
+                .expect("resident")
+                .api_signature(),
+        );
+
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     /// A directive with show/hide combinators, a file target, a prefix, and

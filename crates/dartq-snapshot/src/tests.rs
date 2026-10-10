@@ -22,6 +22,7 @@ fn test_header() -> GenerationHeader {
         semantic_version: 3,
         sdk_identity: "dart-sdk 3.15.0 (vm)".to_string(),
         package_graph_fingerprint: [7; 16],
+        context_salt: [4; 16],
     }
 }
 
@@ -255,6 +256,23 @@ fn generation_misses_on_sdk_identity_mismatch() {
 #[test]
 fn generation_misses_on_package_graph_mismatch() {
     assert_generation_miss(|h| h.package_graph_fingerprint = [9; 16]);
+}
+
+#[test]
+fn generation_misses_on_context_salt_mismatch() {
+    assert_generation_miss(|h| h.context_salt = [9; 16]);
+}
+
+/// The context salt is a first-class directory fork (#482): two contexts
+/// differing on any fork dimension (the salt summarizes them) cannot name
+/// one generation directory, while equal headers keep sharing theirs.
+#[test]
+fn context_salt_splits_generation_directories() {
+    let base = test_header();
+    let mut salted = test_header();
+    salted.context_salt = [5; 16];
+    assert_ne!(base.dir_id(), salted.dir_id(), "a salt change forks the dir");
+    assert_eq!(base.dir_id(), test_header().dir_id(), "equal headers share the dir");
 }
 
 /// A single corrupt entry demotes the whole generation: a manifest-named
