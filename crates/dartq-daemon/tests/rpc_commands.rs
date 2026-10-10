@@ -11,7 +11,10 @@ mod common;
 use std::fs;
 use std::sync::Mutex;
 
-use common::{BROKEN_MAIN, CLEAN_MAIN, Workspace, notification, request, spawn, store_root};
+use common::{
+    BROKEN_MAIN, CLEAN_MAIN, Workspace, notification, request, spawn, spawn_with_heavy_context,
+    store_root,
+};
 use dartq_commands::discover::discover;
 use serde_json::{Value, json};
 
@@ -604,8 +607,8 @@ fn dartq_compat_matches_the_cli_matrix() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// dartq/fix: the row source is not wired yet (the parser→AST bridge is
-/// another ticket), so the schema-shaped document reports zero patches; a
+/// dartq/fix answers at intake with real patch documents (the #355 bridge
+/// feeds the built-in lint rows; the provenance tag rides every edit). A
 /// missing target answers the usage tier over RPC.
 #[test]
 fn dartq_fix_reports_the_schema_shaped_empty_document() {
@@ -775,4 +778,278 @@ fn dartq_invalid_verbosity_answers_invalid_params() {
     h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// Multi-root context routing (PRD §16.2) over the wire: a `context` tag
+/// routes the request to that declared context's engine — the
+/// conditional-import fixture resolves the heavy branch in the default
+/// context and the light branch in the `t` fork (which declares
+/// `dart.library.heavy`) — and an unknown tag is an `INVALID_PARAMS`
+/// answer, as is `context` on a disk-view face.
+#[test]
+fn dartq_context_routes_and_unknown_tag_fails_loud() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(
+        "import 'heavy.dart' if (dart.library.heavy) 'light.dart';\nvoid main() { heavy(); }\n",
+    );
+    fs::write(
+        workspace.path("lib/heavy.dart"),
+        "import 'missing.dart';\nvoid heavy() {}\n",
+    )
+    .expect("write heavy");
+    fs::write(workspace.path("lib/light.dart"), "void light() {}\n").expect("write light");
+    let mut h = spawn_with_heavy_context(&workspace, &store_root("rpc-context"));
+    handshake(&mut h, 1);
+
+    h.burst(
+        &[
+            request(2, "dartq/analyze", json!({})),
+            request(3, "dartq/analyze", json!({"context": "t"})),
+        ],
+        2,
+    );
+    let rows = |id: i64| -> Vec<String> {
+        answer_result(&h, id)["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|row| row["uri"].as_str().expect("uri").to_owned())
+            .collect()
+    };
+    let default_rows = rows(2);
+    let forked_rows = rows(3);
+    assert!(
+        default_rows.iter().any(|uri| uri.ends_with("heavy.dart")),
+        "the default context resolves the heavy branch: {default_rows:?}"
+    );
+    assert!(
+        !forked_rows.iter().any(|uri| uri.ends_with("heavy.dart")),
+        "the fork resolves light — heavy leaves the import closure: {forked_rows:?}"
+    );
+
+    // An unknown tag fails loud at intake.
+    h.step(
+        &request(4, "dartq/analyze", json!({"context": "nope"})),
+        1,
+    );
+    let error = answer_error(&h, 4);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"].as_str().unwrap_or("").contains("nope"),
+        "the error names the tag: {error}"
+    );
+
+    // The disk-view faces reject the selector (the agentId rule).
+    h.step(
+        &request(
+            5,
+            "dartq/fix",
+            json!({"paths": [workspace.path("lib")], "context": "t"}),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 5);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("agentId/context/since"),
+        "the rejection names the selector set: {error}"
+    );
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// dartq/fix emits real patch rows at intake: a file carrying an
+/// `unnecessary_new` hit materializes an anchored edit through the #355
+/// bridge, provenance-tagged `builtin-lint`, and an `agentId` selector is
+/// rejected (the disk-view rule).
+#[test]
+fn dartq_fix_emits_real_builtin_rows_with_provenance() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(CLEAN_MAIN);
+    let fixable = workspace.root.join("fixable.dart");
+    fs::write(&fixable, "void f() { var a = new B(); }\n").expect("write fixable");
+    let mut h = spawn(&workspace, &store_root("rpc-fix-rows"));
+    handshake(&mut h, 0);
+
+    h.step(
+        &request(2, "dartq/fix", json!({ "paths": [fixable.display().to_string()] })),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["schema_version"], 1);
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "the fixable file enters the document set");
+    let edits = files[0]["edits"].as_array().expect("edits array");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0]["source"], "builtin-lint");
+    assert_eq!(edits[0]["offset"], 19);
+    assert_eq!(edits[0]["length"], 4, "keyword plus trailing space");
+    assert_eq!(edits[0]["anchor"]["line"], 1);
+
+    h.step(
+        &request(
+            3,
+            "dartq/fix",
+            json!({ "paths": [fixable.display().to_string()], "agentId": "a" }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 3);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"].as_str().unwrap_or("").contains("agentId"),
+        "the disk-view rejection names the selector: {error}"
+    );
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// dartq/assists answers at intake: with no plugins discovered the assist
+/// list is empty and schema-stamped; a missing target is the usage tier;
+/// an `agentId` selector is rejected.
+#[test]
+fn dartq_assists_answers_schema_stamped_without_plugins() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(CLEAN_MAIN);
+    let mut h = spawn(&workspace, &store_root("rpc-assists"));
+    handshake(&mut h, 0);
+
+    h.step(
+        &request(
+            2,
+            "dartq/assists",
+            json!({ "path": workspace.path("lib/main.dart"), "offset": 0, "length": 0 }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(
+        result,
+        json!({ "file": workspace.path("lib/main.dart"), "schema_version": 1, "assists": [] }),
+        "no plugins, no assists, schema-stamped"
+    );
+
+    h.step(
+        &request(
+            3,
+            "dartq/assists",
+            json!({ "path": workspace.path("nope.dart") }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 3);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("Directory or file doesn't exist"),
+        "the usage tier message body: {error}"
+    );
+
+    h.step(
+        &request(
+            4,
+            "dartq/assists",
+            json!({ "path": workspace.path("lib/main.dart"), "agentId": "a" }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 4);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// Serial phase: spawns a real `dart` plugin process (the host package's
+/// fixer fixture) and drives the discovery → handshake → dispatch chain
+/// through both plugin faces: `dartq/assists` carries the fixture's change
+/// with its manifest-name provenance, and `dartq/fix` flattens it into the
+/// patch document beside the built-in rows.
+#[test]
+#[ignore = "serial phase: spawns a real dart plugin process"]
+fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
+    let dart_ok = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    assert!(dart_ok, "dart is not on PATH");
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../dartq-plugin-host/bin/fix_plugin.dart");
+    let workspace = Workspace::new(CLEAN_MAIN);
+    let target = workspace.root.join("a.dart");
+    fs::write(&target, "void f() { var a = new B(); }\n").expect("write target");
+    let plugin_dir = workspace.root.join("plugins").join("fixer");
+    fs::create_dir_all(&plugin_dir).expect("plugin dir");
+    let manifest = format!(
+        r#"{{"name": "fixer", "version": "0.1.0", "entrypoint": "{}",
+            "capabilities": ["lint", "fix"],
+            "timeouts": {{"callback_ms": 30000, "request_ms": 120000, "request_retries": 3}}}}"#,
+        script.display(),
+    );
+    fs::write(plugin_dir.join("dartq_plugin.json"), manifest).expect("manifest");
+
+    let mut h = spawn(&workspace, &store_root("rpc-assists-live"));
+    handshake(&mut h, 0);
+
+    h.step(
+        &request(
+            2,
+            "dartq/assists",
+            json!({ "path": target.display().to_string(), "offset": 19, "length": 4 }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["file"], target.display().to_string());
+    let assists = result["assists"].as_array().expect("assists array");
+    assert_eq!(assists.len(), 1, "the fixer's reply: {result}");
+    assert_eq!(assists[0]["source"], "fixer", "the manifest name is the provenance");
+    assert_eq!(assists[0]["message"], "insert const");
+    assert_eq!(assists[0]["priority"], 1);
+    assert_eq!(assists[0]["edits"][0]["offset"], 19, "the requested range echoes back");
+    assert_eq!(assists[0]["edits"][0]["replacement"], "const ");
+    assert_eq!(assists[0]["edits"][0]["anchor"]["line"], 1);
+
+    h.step(
+        &request(3, "dartq/fix", json!({ "paths": [target.display().to_string()] })),
+        1,
+    );
+    let result = answer_result(&h, 3);
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    let edits = files[0]["edits"].as_array().expect("edits array");
+    let sources: Vec<&str> = edits
+        .iter()
+        .map(|edit| edit["source"].as_str().expect("source"))
+        .collect();
+    assert_eq!(
+        sources,
+        ["builtin-lint", "fixer"],
+        "built-in rows first, then the plugin change flattened: {edits:?}"
+    );
+    assert_eq!(edits[1]["offset"], 19);
+    assert_eq!(edits[1]["replacement"], "const ");
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+
+    fs::remove_dir_all(&workspace.root).ok();
 }

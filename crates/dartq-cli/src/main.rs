@@ -111,6 +111,9 @@ fn run(args: &[String]) -> u8 {
             command: Some(Command::Fix(fix_args)),
         }) => fix::run_entry(&fix_args),
         Ok(Cli {
+            command: Some(Command::Assists(assists_args)),
+        }) => fix::run_assists_entry(&assists_args),
+        Ok(Cli {
             command: Some(Command::Index(index_args)),
         }) => index::run_entry(&index_args),
         Ok(Cli {
@@ -160,6 +163,9 @@ enum Command {
     /// Emit or apply anchored fix patches (PRD §15.6); `--dry-run` only
     /// outputs them.
     Fix(fix::FixArgs),
+    /// Query the plugin hosts' assists for one file location (PRD §14);
+    /// report-only.
+    Assists(fix::AssistsArgs),
     /// Build the symbol index over the analyzed workspace and report what
     /// it built (PRD §15.1).
     Index(index::IndexArgs),

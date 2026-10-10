@@ -11,8 +11,16 @@
 //!   this module implements exactly those tables and nothing else;
 //! * every engine-view request rides the session's read task, so
 //!   `$/cancelRequest` cancels it through the epoch machinery like any
-//!   other read. The two `dartq/overlay.*` faces answer at intake instead
-//!   (they mutate session bookkeeping, never analyze).
+//!   other read. The three `dartq/overlay.*` faces answer at intake instead
+//!   (they mutate session bookkeeping or the worktree, never analyze).
+//!
+//! # Context routing (PRD §16.2, multi-root)
+//!
+//! The engine-view faces accept an optional `context` tag naming a declared
+//! context (a `dartq.yaml` row assembled at the shell edge); the request
+//! analyzes that context's engine. Without one they analyze the default
+//! context. The disk-view faces take neither `context` nor `agentId` —
+//! they never touch a session engine view.
 //!
 //! # Analyzed view per face (PRD §16.3 multi-agent overlays)
 //!
@@ -93,7 +101,7 @@ use dartq_commands::analyze::AnalyzeError;
 use dartq_commands::compat::CompatError;
 use dartq_commands::discover::{self, DiscoverError};
 use dartq_commands::explain::{ExplainError, explain as explain_core};
-use dartq_commands::fix::{FileFixes, SCHEMA_VERSION as FIX_SCHEMA_VERSION};
+use dartq_commands::fix::FileFixSet;
 use dartq_commands::layout::EngineLayout;
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
 use dartq_commands::{Verbosity, check, compat as compat_core, fix, impact as impact_core, query};
@@ -111,18 +119,22 @@ use crate::session::SessionError;
 pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 
 /// The `dartq/*` method names, announced under `capabilities.experimental`
-/// in `initialize`'s answer. The two `dartq/overlay.*` faces answer at
-/// intake (the server intercepts them before the scheduler queue); the rest
-/// ride the session's read task.
-pub(crate) const METHODS: [&str; 9] = [
+/// in `initialize`'s answer. The `dartq/overlay.*` faces and the two
+/// plugin-dispatch faces (`dartq/fix`, `dartq/assists`) answer at intake
+/// (the server intercepts them before the scheduler queue — disk and
+/// plugin-process work, no engine analysis to schedule); the rest ride the
+/// session's read task.
+pub(crate) const METHODS: [&str; 11] = [
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
     "dartq/impact",
     "dartq/fix",
+    "dartq/assists",
     "dartq/compat",
     "dartq/explain",
     "dartq/overlay.set",
+    "dartq/overlay.commit",
     "dartq/overlay.clear",
 ];
 
@@ -133,29 +145,33 @@ pub(crate) enum Request {
     Analyze {
         verbosity: Verbosity,
         agent: Option<String>,
+        context: Option<String>,
     },
     Check {
         paths: Vec<PathBuf>,
         verbosity: Verbosity,
         agent: Option<String>,
+        context: Option<String>,
         since: Option<u64>,
     },
     Query {
         name: String,
         verbosity: Verbosity,
         agent: Option<String>,
+        context: Option<String>,
         since: Option<u64>,
     },
     Impact {
         target: PathBuf,
         verbosity: Verbosity,
         agent: Option<String>,
+        context: Option<String>,
         since: Option<u64>,
     },
     /// The §15.3 report over a per-query disk engine (the visibility
-    /// table's `dartq/explain` row): no `agent` field by construction, and
-    /// `sdk` — an explicit value is authoritative; absent defaults to the
-    /// session's resolved SDK root.
+    /// table's `dartq/explain` row): no `agent`/`context` field by
+    /// construction, and `sdk` — an explicit value is authoritative; absent
+    /// defaults to the session's resolved SDK root.
     Explain {
         symbol: String,
         verbosity: Verbosity,
@@ -183,6 +199,18 @@ impl Request {
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
+            Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
+        }
+    }
+
+    /// The request's `context` tag, if it named one (the multi-root routing
+    /// selector; validated at intake like `agentId`).
+    pub(crate) fn context(&self) -> Option<&str> {
+        match self {
+            Self::Analyze { context, .. }
+            | Self::Check { context, .. }
+            | Self::Query { context, .. }
+            | Self::Impact { context, .. } => context.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
     }
@@ -246,11 +274,13 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
     match method {
         "dartq/analyze" => {
             let (agent, _) = session_fields(params)?;
+            let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<VerbosityParams>(params.clone()).map_err(invalid)?;
             Ok(Request::Analyze {
                 verbosity: decoded.verbosity,
                 agent,
+                context,
             })
         }
         "dartq/check" | "dartq/fix" => {
@@ -265,10 +295,12 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 .collect();
             if method == "dartq/check" {
                 let (agent, since) = session_fields(params)?;
+                let context = context_field(params)?;
                 Ok(Request::Check {
                     paths,
                     verbosity: decoded.verbosity,
                     agent,
+                    context,
                     since,
                 })
             } else {
@@ -281,35 +313,40 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         }
         "dartq/query" => {
             let (agent, since) = session_fields(params)?;
+            let context = context_field(params)?;
             let decoded = serde_json::from_value::<QueryParams>(params.clone()).map_err(invalid)?;
             Ok(Request::Query {
                 name: decoded.name,
                 verbosity: decoded.verbosity,
                 agent,
+                context,
                 since,
             })
         }
         "dartq/impact" => {
             let (agent, since) = session_fields(params)?;
+            let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<TargetParams>(params.clone()).map_err(invalid)?;
             Ok(Request::Impact {
                 target: resolve(root, decoded.path),
                 verbosity: decoded.verbosity,
                 agent,
+                context,
                 since,
             })
         }
         "dartq/explain" => {
             // Delta economics without a view selector: `since` filters the
-            // report's rows (see `explain_answer`), but an `agentId` would
-            // silently answer a different view than the face's disk
-            // contract — the fix/compat rule, minus `since`.
+            // report's rows (see `explain_answer`), but an `agentId` or
+            // `context` would silently answer a different view than the
+            // face's disk contract — the fix/compat rule, minus `since`.
             let (agent, since) = session_fields(params)?;
-            if agent.is_some() {
+            let context = context_field(params)?;
+            if agent.is_some() || context.is_some() {
                 return Err(
-                    "dartq/explain answers the disk view; agentId applies to the engine-view \
-                     faces (analyze/check/query/impact)"
+                    "dartq/explain answers the disk view; agentId/context apply to the \
+                     engine-view faces (analyze/check/query/impact)"
                         .into(),
                 );
             }
@@ -369,14 +406,26 @@ fn session_fields(params: &Value) -> Result<(Option<String>, Option<u64>), Strin
     Ok((agent, since))
 }
 
-/// The disk-view faces take neither session field: an `agentId` or `since`
-/// there would silently answer a different view than the face's contract.
-fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), String> {
+/// The params' optional `context` tag (the multi-root routing selector,
+/// PRD §16.2). Absent and `null` are equivalent.
+fn context_field(params: &Value) -> Result<Option<String>, String> {
+    match params.get("context") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(tag)) if !tag.is_empty() => Ok(Some(tag.clone())),
+        Some(_) => Err("context must be a non-empty string".into()),
+    }
+}
+
+/// The disk-view faces take neither session field: an `agentId`, `context`,
+/// or `since` there would silently answer a different view than the face's
+/// contract.
+pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), String> {
     let (agent, since) = session_fields(params)?;
-    if agent.is_some() || since.is_some() {
+    let context = context_field(params)?;
+    if agent.is_some() || since.is_some() || context.is_some() {
         return Err(format!(
-            "{method} answers the disk view; agentId/since apply to the engine-view faces \
-             (analyze/check/query/impact)"
+            "{method} answers the disk view; agentId/context/since apply to the engine-view \
+             faces (analyze/check/query/impact)"
         ));
     }
     Ok(())
@@ -394,11 +443,7 @@ pub(crate) fn parse_overlay_set(
     params: &Value,
     root: &Path,
 ) -> Result<(String, Vec<(PathBuf, Vec<u8>)>), String> {
-    let agent = match params.get("agentId") {
-        Some(Value::String(agent)) if !agent.is_empty() => agent.clone(),
-        Some(_) => return Err("agentId must be a non-empty string".into()),
-        None => return Err("overlay.set requires an agentId".into()),
-    };
+    let agent = overlay_agent(params, "set")?;
     let files = match params.get("files") {
         Some(Value::Object(files)) => files,
         Some(_) => return Err("files must be an object mapping path to content".into()),
@@ -419,18 +464,33 @@ pub(crate) fn parse_overlay_set(
     Ok((agent, staged))
 }
 
-/// Decodes `dartq/overlay.clear` params: `{agentId}`. Clearing an unknown
-/// agent is answered ok by the caller (idempotent teardown).
+/// The `{agentId}`-shaped overlay faces' agent field: `overlay.clear`
+/// (idempotent teardown) and `overlay.commit` (the §16.3 merge) take
+/// exactly that.
 ///
 /// # Errors
 ///
 /// A missing or non-string `agentId`.
-pub(crate) fn parse_overlay_clear(params: &Value) -> Result<String, String> {
+fn overlay_agent(params: &Value, method: &str) -> Result<String, String> {
     match params.get("agentId") {
         Some(Value::String(agent)) if !agent.is_empty() => Ok(agent.clone()),
         Some(_) => Err("agentId must be a non-empty string".into()),
-        None => Err("overlay.clear requires an agentId".into()),
+        None => Err(format!("overlay.{method} requires an agentId")),
     }
+}
+
+/// Decodes `dartq/overlay.clear` params: `{agentId}`. Clearing an unknown
+/// agent is answered ok by the caller (idempotent teardown).
+pub(crate) fn parse_overlay_clear(params: &Value) -> Result<String, String> {
+    overlay_agent(params, "clear")
+}
+
+/// Decodes `dartq/overlay.commit` params: `{agentId}` — the merge writes
+/// the agent's staged whole-file buffers back to the worktree (PRD §16.3);
+/// there is no path subset (the overlay declares the end state, the merge
+/// commits it whole).
+pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
+    overlay_agent(params, "commit")
 }
 
 /// Relative request paths resolve against the session workspace root.
@@ -634,6 +694,7 @@ pub(crate) fn answer(drain: &mut Drain<'_>, request: &Request) -> Result<Value, 
             verbosity,
             agent,
             since,
+            ..
         } => match agent {
             Some(_) => check_engine_view(drain, paths, *verbosity, *since),
             None => check_disk_view(drain, paths, *verbosity, *since),
@@ -656,7 +717,12 @@ pub(crate) fn answer(drain: &mut Drain<'_>, request: &Request) -> Result<Value, 
             since,
             sdk,
         } => explain_answer(drain, symbol, *verbosity, *since, sdk.as_deref()),
-        Request::Fix { paths, verbosity } => fix_answer(paths, *verbosity),
+        Request::Fix { paths, verbosity } => {
+            // The scheduler arm has no host set (the intake dispatch owns
+            // the live one); the built-in rows alone answer here.
+            let mut hosts = fix::PluginHosts::empty();
+            fix_answer(paths, *verbosity, &mut hosts)
+        }
         Request::Compat {
             target,
             sdk_roots,
@@ -1044,8 +1110,17 @@ fn explain_answer(
 // dartq/fix — the §15.6 patch document (CLI path labels)
 // ---------------------------------------------------------------------------
 
-fn fix_answer(paths: &[PathBuf], verbosity: Verbosity) -> Result<Value, SessionError> {
-    let per_file: Vec<FileFixes> = fix::collect(paths).map_err(|error| match error {
+/// The fix answer over `hosts`: the §15.6 documents for the discovered
+/// files (built-in rows plus the plugin rows the hosts returned, every row
+/// provenance-tagged) and, when a host failed, the `errors` list. The
+/// intake dispatch (`server.rs`) passes its live host set; the scheduler
+/// arm has no host set and answers the built-in rows alone.
+pub(crate) fn fix_answer(
+    paths: &[PathBuf],
+    verbosity: Verbosity,
+    hosts: &mut fix::PluginHosts,
+) -> Result<Value, SessionError> {
+    let per_file: Vec<FileFixSet> = fix::collect_set(paths, hosts).map_err(|error| match error {
         DiscoverError::Missing(path) => {
             SessionError::InvalidParams(format!("Directory or file doesn't exist: {path}"))
         }
@@ -1053,46 +1128,22 @@ fn fix_answer(paths: &[PathBuf], verbosity: Verbosity) -> Result<Value, SessionE
     })?;
     let files: Vec<Value> = per_file
         .iter()
-        .filter(|fixes| !fixes.fixes.is_empty())
-        .map(|fixes| match verbosity {
-            // Minimal: file + offset/length/replacement — the red line; the
-            // anchor drops.
-            Verbosity::Minimal => {
-                let edits: Vec<Value> = fixes
-                    .fixes
-                    .iter()
-                    .map(|row| {
-                        json!({
-                            "offset": row.edit.offset,
-                            "length": row.edit.length,
-                            "replacement": row.edit.replacement,
-                        })
-                    })
-                    .collect();
-                json!({
-                    "file": fixes.path,
-                    "schema_version": FIX_SCHEMA_VERSION,
-                    "edits": edits,
-                })
-            }
-            // Compact is the §15.6 machine document verbatim.
-            Verbosity::Compact => fix::patch_json(fixes),
-            // Full adds the per-edit rule (cheaply available on the row;
-            // declared absent-tolerant in the canonical table).
-            Verbosity::Full => {
-                let mut document = fix::patch_json(fixes);
-                let edits = document["edits"]
-                    .as_array_mut()
-                    .expect("§15.6 document carries an edits array");
-                for (edit, row) in edits.iter_mut().zip(&fixes.fixes) {
-                    edit["rule"] = row.rule.into();
-                }
-                document
-            }
-        })
+        // Plugin-only rows are still a patch document (provenance-tagged).
+        .filter(|fixes| !fixes.fixes.is_empty() || !fixes.plugin.is_empty())
+        // The §15.6 document, all tiers canonical (the writer owns the
+        // anchor and provenance rows per tier).
+        .map(|fixes| fix::patch_json(fixes, verbosity))
         .collect();
     // The daemon face is dry by contract: it reports patches, never writes.
-    Ok(json!({ "schema_version": SCHEMA_VERSION, "files": files }))
+    let mut answer = json!({ "schema_version": SCHEMA_VERSION, "files": files });
+    let errors = hosts.take_errors();
+    if !errors.is_empty() {
+        answer["errors"] = json!(errors
+            .iter()
+            .map(|error| json!({ "plugin": error.plugin, "message": error.message }))
+            .collect::<Vec<_>>());
+    }
+    Ok(answer)
 }
 
 // ---------------------------------------------------------------------------

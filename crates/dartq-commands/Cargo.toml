@@ -14,6 +14,7 @@ dartq-language = { path = "../dartq-language" }
 dartq-lints = { path = "../dartq-lints" }
 dartq-package = { path = "../dartq-package" }
 dartq-parser = { path = "../dartq-parser" }
+dartq-plugin = { path = "../dartq-plugin" }
 dartq-pub = { path = "../dartq-pub" }
 dartq-resolution = { path = "../dartq-resolution" }
 dartq-scanner = { path = "../dartq-scanner" }

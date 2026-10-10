@@ -16,12 +16,16 @@
 //! daemon wakes at the deadline to save — still no timer thread.
 
 use std::io::{self, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+use dartq_commands::Verbosity;
+use dartq_commands::fix::{self, PluginHosts};
 
 use crate::codec::{self, FrameError};
 use crate::commands;
@@ -97,6 +101,9 @@ where
     let mut lifecycle = Lifecycle::Uninitialized;
     // Set only by `exit`; every other break falls through to `EXIT_CLEAN`.
     let mut exit_code: Option<u8> = None;
+    // The plugin-dispatch faces' host set: launched at the first
+    // `dartq/fix`/`dartq/assists` request, shut down when the session ends.
+    let mut fix_hosts = FixHosts::new(session.workspace_root());
 
     // Ends when the reader thread disconnects or a notification breaks out.
     loop {
@@ -138,7 +145,9 @@ where
         for incoming in batch {
             match incoming {
                 Incoming::Message(Message::Request(request)) => {
-                    if let Some(response) = handle_request(&mut lifecycle, &mut session, request) {
+                    if let Some(response) =
+                        handle_request(&mut lifecycle, &mut session, &mut fix_hosts, request)
+                    {
                         write_message(&mut output, &Message::Response(response))?;
                     }
                 }
@@ -195,6 +204,10 @@ where
 
     // #306: the clean-shutdown write, window or no window.
     session.flush_snapshot();
+
+    // The plugin hosts' graceful teardown: `shutdown` per live runtime
+    // (the handshake; `Drop` alone is kill-only). Errors log inside.
+    fix_hosts.shutdown();
 
     if reader.is_finished() {
         let _ = reader.join();
@@ -269,11 +282,46 @@ enum Lifecycle {
     ShutDown,
 }
 
+/// The plugin-dispatch faces' host set (PRD §14): lazily launched at the
+/// first `dartq/fix`/`dartq/assists` request — a session that never fixes
+/// never pays the plugins' spawn handshakes — and shut down when the
+/// session ends. Discovery runs under the session's workspace root (the
+/// `<root>/plugins/` convention).
+struct FixHosts {
+    root: PathBuf,
+    hosts: Option<PluginHosts>,
+}
+
+impl FixHosts {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            hosts: None,
+        }
+    }
+
+    /// The live host set, launching it on first use (the manifest budgets'
+    /// spawn + handshake cost lands on the first plugin-needing request).
+    fn get_or_launch(&mut self) -> &mut PluginHosts {
+        self.hosts
+            .get_or_insert_with(|| PluginHosts::launch(&self.root))
+    }
+
+    /// The graceful teardown; errors log inside (`shutdown` per live
+    /// runtime — `Drop` alone is kill-only).
+    fn shutdown(self) {
+        if let Some(hosts) = self.hosts {
+            hosts.shutdown();
+        }
+    }
+}
+
 /// Answers a request, or `None` when the request queued onto the session's
 /// scheduler and is answered by the turn's drain instead.
 fn handle_request(
     lifecycle: &mut Lifecycle,
     session: &mut Session,
+    fix_hosts: &mut FixHosts,
     request: Request,
 ) -> Option<Response> {
     let id = request.id;
@@ -294,8 +342,10 @@ fn handle_request(
             Some(Response::ok(id, Value::Null))
         }
         // The overlay faces answer at intake: they mutate session
-        // bookkeeping (staging or evicting an agent view), never analyze —
-        // no scheduler task, no cancel surface.
+        // bookkeeping or the worktree (staging, evicting, or merging an
+        // agent view), never analyze — no scheduler task, no cancel
+        // surface. `overlay.commit`'s merge analysis drains with the write
+        // task it stages; the RPC answer is the disk write-back.
         (Lifecycle::Ready, "dartq/overlay.set") => {
             let params = request.params.unwrap_or(Value::Null);
             match commands::parse_overlay_set(&params, session.workspace_root()) {
@@ -310,6 +360,22 @@ fn handle_request(
                 Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
             }
         }
+        (Lifecycle::Ready, "dartq/overlay.commit") => {
+            let params = request.params.unwrap_or(Value::Null);
+            match commands::parse_overlay_commit(&params) {
+                Ok(agent) => match session.commit_overlay(&agent) {
+                    Ok(committed) => Some(Response::ok(
+                        id,
+                        json!({
+                            "schema_version": commands::SCHEMA_VERSION,
+                            "committed": committed,
+                        }),
+                    )),
+                    Err(error) => Some(answer_error(id, &error)),
+                },
+                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
+            }
+        }
         (Lifecycle::Ready, "dartq/overlay.clear") => {
             let params = request.params.unwrap_or(Value::Null);
             match commands::parse_overlay_clear(&params) {
@@ -320,6 +386,24 @@ fn handle_request(
                 Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
             }
         }
+        // The plugin-dispatch faces answer at intake too: their work is
+        // disk reads plus plugin-process requests (`request/fixes` under
+        // the manifests' budgets), never engine analysis — no scheduler
+        // task, no cancel surface. The host set launches at the first
+        // request that needs it; the session end shuts it down.
+        (Lifecycle::Ready, "dartq/fix") => {
+            let params = request.params.unwrap_or(Value::Null);
+            Some(fix_response(fix_hosts, &params, session.workspace_root(), id))
+        }
+        (Lifecycle::Ready, "dartq/assists") => {
+            let params = request.params.unwrap_or(Value::Null);
+            Some(assists_response(
+                fix_hosts,
+                &params,
+                session.workspace_root(),
+                id,
+            ))
+        }
         (Lifecycle::Ready, method) if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
             // coalesced analysis runs once; the command answers from the
@@ -329,14 +413,24 @@ fn handle_request(
             let params = request.params.unwrap_or(Value::Null);
             match commands::parse(method, &params, session.workspace_root()) {
                 Ok(staged) => {
-                    // The agent view is validated at intake (fail loud on a
-                    // typo instead of silently answering the base view).
+                    // The agent view and the context tag are validated at
+                    // intake (fail loud on a typo instead of silently
+                    // answering the default view).
                     if let Some(agent) = staged.agent() {
                         if !session.has_agent(agent) {
                             return Some(Response::error(
                                 Some(id),
                                 codes::INVALID_PARAMS,
                                 format!("unknown agentId: {agent}"),
+                            ));
+                        }
+                    }
+                    if let Some(tag) = staged.context() {
+                        if !session.has_context(tag) {
+                            return Some(Response::error(
+                                Some(id),
+                                codes::INVALID_PARAMS,
+                                format!("unknown context: {tag}"),
                             ));
                         }
                     }
@@ -371,6 +465,98 @@ fn handle_request(
 /// it).
 fn overlay_ack() -> Value {
     json!({ "schema_version": commands::SCHEMA_VERSION })
+}
+
+/// Relative request paths resolve against the session workspace root.
+fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+/// The `dartq/fix` intake dispatch: the §15.6 documents over the requested
+/// paths — built-in lint rows plus the plugin hosts' proposals, every row
+/// provenance-tagged, and the hosts' failures in `errors` when any host
+/// died. Paths resolve against the session's workspace root.
+fn fix_response(
+    fix_hosts: &mut FixHosts,
+    params: &Value,
+    root: &Path,
+    id: jsonrpc::RequestId,
+) -> Response {
+    #[derive(Deserialize)]
+    struct FixParams {
+        paths: Vec<PathBuf>,
+        #[serde(default)]
+        verbosity: Verbosity,
+    }
+    let invalid = |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
+    if let Err(message) = commands::reject_disk_view_only(params, "dartq/fix") {
+        return invalid(message);
+    }
+    let decoded = match serde_json::from_value::<FixParams>(params.clone()) {
+        Ok(decoded) => decoded,
+        Err(error) => return invalid(error.to_string()),
+    };
+    if decoded.paths.is_empty() {
+        return invalid("paths must be a non-empty array".into());
+    }
+    let paths: Vec<PathBuf> = decoded
+        .paths
+        .into_iter()
+        .map(|path| resolve_path(root, path))
+        .collect();
+    let hosts = fix_hosts.get_or_launch();
+    match commands::fix_answer(&paths, decoded.verbosity, hosts) {
+        Ok(answer) => Response::ok(id, answer),
+        Err(error) => answer_error(id, &error),
+    }
+}
+
+/// The `dartq/assists` intake dispatch: the plugin hosts' location-directed
+/// proposals for one file (`request/fixes` at `[offset, offset + length)`),
+/// anchored against the file's on-disk text.
+fn assists_response(
+    fix_hosts: &mut FixHosts,
+    params: &Value,
+    root: &Path,
+    id: jsonrpc::RequestId,
+) -> Response {
+    #[derive(Deserialize)]
+    struct AssistsParams {
+        path: PathBuf,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default)]
+        length: u64,
+        #[serde(default)]
+        verbosity: Verbosity,
+    }
+    let invalid = |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
+    if let Err(message) = commands::reject_disk_view_only(params, "dartq/assists") {
+        return invalid(message);
+    }
+    let decoded = match serde_json::from_value::<AssistsParams>(params.clone()) {
+        Ok(mut decoded) => {
+            decoded.path = resolve_path(root, decoded.path);
+            decoded
+        }
+        Err(error) => return invalid(error.to_string()),
+    };
+    let hosts = fix_hosts.get_or_launch();
+    match fix::assists(&decoded.path, decoded.offset, decoded.length, hosts) {
+        Ok(answer) => Response::ok(id, fix::assists_json(&answer, decoded.verbosity)),
+        Err(dartq_commands::discover::DiscoverError::Missing(path)) => invalid(format!(
+            "Directory or file doesn't exist: {path}"
+        )),
+        Err(dartq_commands::discover::DiscoverError::Io(io)) => Response::error(
+            Some(id),
+            codes::INTERNAL_ERROR,
+            io.to_string(),
+        ),
+    }
 }
 
 /// Answers `initialize` with the negotiated capability set: the LSP surface
