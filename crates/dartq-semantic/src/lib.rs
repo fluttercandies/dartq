@@ -21,6 +21,9 @@
 //! * [`signature`] — the per-file API signature ([`ApiSignature`], #282):
 //!   the canonical blake3 hash of the element face the L2 strong-incremental
 //!   gate compares ([`FileElements::api_signature`], PRD §11.3).
+//! * [`persisted`] — the facts-snapshot payload projection of the model
+//!   (#341): plain-data mirrors with names on a per-entry string slice, the
+//!   compact columns the M3 cold-start load re-interns.
 //! * [`codes`] — the M1 semantic code table: the frozen families with tier
 //!   and verbatim oracle message.
 //! * [`diagnose`] — the M1 diagnosis engine (#120 batch 1 + #121 batch 2):
@@ -99,9 +102,11 @@
 
 pub mod codes;
 pub mod collector;
+pub mod const_eval;
 pub mod diagnose;
 pub mod library;
 pub mod model;
+pub mod persisted;
 pub mod signature;
 
 pub use collector::collect;

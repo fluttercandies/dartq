@@ -201,7 +201,8 @@ use std::rc::Rc;
 
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_parser::{
-    DeclarationKind, IdentifierContext, Parser, ParserFeatures, ParserListener, TokenSpan as Token,
+    ConstructorReferenceContext, DeclarationKind, IdentifierContext, Parser, ParserFeatures,
+    ParserListener, TokenSpan as Token,
 };
 use dartq_resolution::{ImportEdge, LibraryGraph, LibraryId, NamespaceEntry, Namespaces};
 use dartq_scanner::TokenTable;
@@ -209,7 +210,9 @@ use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
-use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
+use crate::const_eval::{
+    BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, IdentVerdict, UnOp, Verdict, eval,
+};use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
 use crate::model::{
     ArityViolation, Container, ContainerKind, FileElements, Formals, MemberEntry, MemberKind,
     MicroKind, TopDecl, Ty,
@@ -814,6 +817,67 @@ struct Engine<'a> {
     /// The `@` token of the open metadata entry (the
     /// `undefined_annotation` anchor spans `@` through the name).
     annotation_at: Option<SourceRange>,
+    /// The #279 constant-evaluation capture: expression folding while a
+    /// const context is open ([`crate::const_eval`]).
+    const_capture: ConstCapture,
+    /// Const-value scopes, innermost last; scope 0 is the file scope and
+    /// never pops. Const locals/fields bind their evaluated value here as
+    /// they close (file order).
+    const_scopes: Vec<FxHashMap<StringId, ConstBinding>>,
+    /// The open declaration group is `const` (locals or fields) — its
+    /// initializer expressions are const contexts.
+    const_group: bool,
+    /// The const group's declared names, in initializer order.
+    const_group_names: Vec<StringId>,
+    /// The next const-group name an initializer window consumes.
+    const_group_cursor: usize,
+    /// Top-level variables this pass saw declared *without* `const` (the
+    /// provable side of the identifier classification; use-before-decl
+    /// stays suppressed).
+    nonconst_top_level: FxHashSet<StringId>,
+    /// Static const field values captured this pass, keyed
+    /// `(container, member)` (file order: uses after the declaration).
+    const_field_values: FxHashMap<(StringId, StringId), ConstantValue>,
+    /// Containers of this file with a declared `const` constructor (the
+    /// arg-check gate for `const C(...)` / enum constants).
+    const_ctors: FxHashSet<StringId>,
+    /// The interned `identical` spelling (the one invocable const call).
+    identical_id: StringId,
+    /// Names of the const initializer windows currently open (innermost
+    /// last) — the binding key at close.
+    pending_init_names: Vec<StringId>,
+    /// The arg-check gate per open const-creation window (enum element /
+    /// explicit const ctor), innermost last.
+    arg_gates: Vec<bool>,
+    /// An enum-constant window is open (`handle_enum_element` doubles as
+    /// the previous element's close).
+    enum_element_open: bool,
+    /// Begin spans of open string literals (the `end_literal_string`
+    /// event carries only the end token).
+    const_string_begins: Vec<SourceRange>,
+}
+
+/// A const-environment binding.
+enum ConstBinding {
+    /// The evaluated value of a completed const variable.
+    Value(ConstantValue),
+    /// The initializer currently being evaluated — a self-reference is a
+    /// `recursive_compile_time_constant` cycle.
+    InProgress,
+}
+
+/// The callee classification a closed bare-identifier call resolves to
+/// (`evaluation.dart` `_invalidConstantForMethodInvocation`).
+enum CallClass {
+    /// An in-file container with a declared const constructor — the
+    /// implicit creation form checks its arguments.
+    ConstCtor,
+    /// A resolvable invocable name (top-level function/variable, local
+    /// callable): the invocation itself faults.
+    Invocable,
+    /// Unresolvable, or a container without a const constructor (the
+    /// `const_with_non_const*` family) — out of subset, defer.
+    Unknown,
 }
 
 impl<'a> Engine<'a> {
@@ -835,6 +899,7 @@ impl<'a> Engine<'a> {
         let enum_synth_members = ENUM_SYNTH_MEMBERS.map(|m| strings.intern(m));
         let builtin_types = BUILTIN_TYPES.map(|m| strings.intern(m));
         let primitive_ids = FINAL_PRIMITIVES.map(|m| strings.intern(m));
+        let identical_id = strings.intern("identical");
         Self {
             graph,
             namespaces,
@@ -881,6 +946,19 @@ impl<'a> Engine<'a> {
             primitive_ids,
             initializer_depth: 0,
             annotation_at: None,
+            const_capture: ConstCapture::new(identical_id),
+            const_scopes: vec![FxHashMap::default()],
+            const_group: false,
+            const_group_names: Vec::new(),
+            const_group_cursor: 0,
+            nonconst_top_level: FxHashSet::default(),
+            const_field_values: FxHashMap::default(),
+            const_ctors: FxHashSet::default(),
+            identical_id,
+            pending_init_names: Vec::new(),
+            arg_gates: Vec::new(),
+            enum_element_open: false,
+            const_string_begins: Vec::new(),
         }
     }
 
@@ -965,11 +1043,16 @@ impl<'a> Engine<'a> {
             type_mark,
             row_mark,
         });
+        self.const_scopes.push(FxHashMap::default());
     }
 
     fn pop_frame(&mut self) {
         if let Some(frame) = self.frames.pop() {
             self.type_params.truncate(frame.type_mark);
+        }
+        // Scope 0 is the file scope; it never pops.
+        if self.const_scopes.len() > 1 {
+            self.const_scopes.pop();
         }
     }
 
@@ -1405,7 +1488,22 @@ impl<'a> Engine<'a> {
             return;
         }
         let ty = match info {
-            BareInfo::Plain { ty } => ty,
+            BareInfo::Plain { ty } if ty != Ty::UNKNOWN => ty,
+            // #279 type folding: an in-file const top-level variable's
+            // declared type folds to its evaluated constant's type (the
+            // oracle infers the variable's type from the initializer). A
+            // shadowing local keeps its own (already-folded) type.
+            BareInfo::Plain { .. } => {
+                let from_local = self.frames.iter().any(|f| f.locals.contains(&name));
+                let is_top_var = self
+                    .top_level_decl(name)
+                    .is_some_and(|d| d.kind == MicroKind::TopLevelVar);
+                if !from_local && is_top_var {
+                    self.const_top_level_ty(name).unwrap_or(Ty::UNKNOWN)
+                } else {
+                    Ty::UNKNOWN
+                }
+            }
             _ => Ty::UNKNOWN,
         };
         self.push_row(Row {
@@ -3676,6 +3774,450 @@ impl<'a> Engine<'a> {
     }
 }
 
+// —— #279: the constant-evaluation face ——————————————————————————————————
+
+impl ConstLookup for Engine<'_> {
+    /// Bare-name classification for the const evaluator: const-environment
+    /// bindings first (a self-reference is the cycle fault), then
+    /// in-scope locals (provably non-const), then the model (containers
+    /// fold to type literals, top-level functions are constant tear-offs;
+    /// everything else defers — the rows report genuine misses).
+    fn ident(&self, name: StringId) -> IdentVerdict {
+        for scope in self.const_scopes.iter().rev() {
+            match scope.get(&name) {
+                Some(ConstBinding::Value(v)) => return IdentVerdict::Value(v.clone()),
+                Some(ConstBinding::InProgress) => return IdentVerdict::InProgress,
+                None => {}
+            }
+        }
+        if self.frames.iter().any(|f| f.locals.contains(&name)) {
+            return IdentVerdict::NotConstant;
+        }
+        match self.resolve_bare(name) {
+            BareInfo::Container { name, .. } => IdentVerdict::Value(ConstantValue::Type(name)),
+            BareInfo::Plain { .. } => match self.top_level_decl(name).map(|d| d.kind) {
+                Some(MicroKind::TopLevelFn) => IdentVerdict::Constant,
+                Some(MicroKind::TopLevelVar) => {
+                    if self.nonconst_top_level.contains(&name) {
+                        IdentVerdict::NotConstant
+                    } else {
+                        IdentVerdict::Constant
+                    }
+                }
+                _ => IdentVerdict::Constant,
+            },
+            _ => IdentVerdict::Constant,
+        }
+    }
+
+    /// `recv.name` where `recv` is a type literal: the in-file enum's
+    /// constants fold to enum values; this pass's captured static const
+    /// field values fold; everything else (synthesized enum members,
+    /// foreign/static faces) defers.
+    fn member(&self, recv: &ConstantValue, name: StringId) -> Verdict {
+        let ConstantValue::Type(container) = recv else {
+            return Verdict::Constant;
+        };
+        if let Some(c) = self.index.get(self.file).and_then(|f| f.container(*container))
+            && c.kind == ContainerKind::Enum
+            && c.enum_constants.contains(&name)
+        {
+            return Verdict::Value(ConstantValue::Enum {
+                container: *container,
+                name,
+            });
+        }
+        if let Some(v) = self.const_field_values.get(&(*container, name)) {
+            return Verdict::Value(v.clone());
+        }
+        Verdict::Constant
+    }
+
+    fn is_identical(&self, name: StringId) -> bool {
+        name == self.identical_id
+    }
+}
+
+impl<'a> Engine<'a> {
+    /// Arms a declaration group as a const context (the `const` keyword
+    /// seen on a local-variable or field group).
+    pub fn arm_const_group(&mut self) {
+        self.const_group = true;
+        self.const_group_names.clear();
+        self.const_group_cursor = 0;
+    }
+
+    /// A declaration-group name: const groups queue it for their
+    /// initializer windows; a non-const *top-level* variable joins the
+    /// provable non-const set (in-file, declaration order).
+    pub fn const_decl_name(&mut self, name: StringId, field_context: bool) {
+        if self.const_group {
+            self.const_group_names.push(name);
+        } else if field_context && self.frames.is_empty() {
+            self.nonconst_top_level.insert(name);
+        }
+    }
+
+    pub fn disarm_const_group(&mut self) {
+        self.const_group = false;
+        self.const_group_names.clear();
+        self.const_group_cursor = 0;
+    }
+
+    /// A const initializer window opens: the group's next name marks
+    /// in-progress (a self-reference inside is the cycle fault).
+    pub fn open_const_initializer(&mut self) {
+        if !self.const_group {
+            return;
+        }
+        let Some(name) = self.const_group_names.get(self.const_group_cursor).copied() else {
+            return;
+        };
+        self.const_group_cursor += 1;
+        if let Some(scope) = self.const_scopes.last_mut() {
+            scope.insert(name, ConstBinding::InProgress);
+        }
+        self.pending_init_names.push(name);
+        self.const_capture.open_initializer();
+    }
+
+    /// A const local-variable initializer closes: evaluate, report per
+    /// the official site mapping, bind the folded value and type.
+    pub fn close_const_initializer(&mut self) {
+        self.finish_const_initializer(true);
+    }
+
+    /// A const field initializer closes (class static consts and
+    /// top-level consts — const fields are implicitly static).
+    pub fn close_const_field_initializer(&mut self) {
+        self.finish_const_initializer(false);
+    }
+
+    fn finish_const_initializer(&mut self, local: bool) {
+        let Some(name) = self.pending_init_names.pop() else {
+            return;
+        };
+        if !self.const_capture.open() {
+            return;
+        }
+        let root = self.const_capture.close_initializer();
+        let verdict = root.as_ref().map_or(Verdict::Constant, |node| eval(node, self));
+        self.resolve_const_verdict(&verdict);
+        if let Verdict::Value(value) = &verdict {
+            let folded = self.folded_ty(value);
+            if local {
+                self.bind_var_type(name, folded);
+            } else if let Some((container, _)) = self.container_context() {
+                self.const_field_values
+                    .insert((container, name), value.clone());
+            }
+            // The value joins the const environment: locals in their
+            // frame scope, top-level consts in the file scope (later
+            // in-file initializers fold from it).
+            let scope = if local || !self.frames.is_empty() {
+                self.const_scopes.last_mut()
+            } else {
+                self.const_scopes.first_mut()
+            };
+            if let Some(scope) = scope {
+                scope.insert(name, ConstBinding::Value(value.clone()));
+            }
+        } else if let Some(scope) = self.const_scopes.last_mut() {
+            scope.remove(&name);
+        }
+    }
+
+    /// Reports one const verdict at its site mapping: a fault carries its
+    /// own `constEval*` code (the oracle's allow-list override), a
+    /// generic non-constancy takes the site default
+    /// (`const_initialized_with_non_constant_value`).
+    fn resolve_const_verdict(&mut self, verdict: &Verdict) {
+        match verdict {
+            Verdict::Value(_) | Verdict::Constant => {}
+            Verdict::NotConstant(span) => {
+                self.emit(
+                    SemanticCode::ConstInitializedWithNonConstantValue,
+                    *span,
+                    "",
+                    "",
+                );
+            }
+            Verdict::Fault(fault, span) => self.emit_const_fault(*fault, *span),
+        }
+    }
+
+    fn emit_const_fault(&mut self, fault: ConstFault, span: SourceRange) {
+        let code = match fault {
+            ConstFault::TypeBool => SemanticCode::ConstEvalTypeBool,
+            ConstFault::TypeBoolInt => SemanticCode::ConstEvalTypeBoolInt,
+            ConstFault::TypeBoolNumString => SemanticCode::ConstEvalTypeBoolNumString,
+            ConstFault::TypeInt => SemanticCode::ConstEvalTypeInt,
+            ConstFault::TypeNum => SemanticCode::ConstEvalTypeNum,
+            ConstFault::TypeNumString => SemanticCode::ConstEvalTypeNumString,
+            ConstFault::TypeString => SemanticCode::ConstEvalTypeString,
+            ConstFault::ThrowsException => SemanticCode::ConstEvalThrowsException,
+            ConstFault::ThrowsIdbze => SemanticCode::ConstEvalThrowsIdbze,
+            ConstFault::PrimitiveEquality => SemanticCode::ConstEvalPrimitiveEquality,
+            ConstFault::Recursive => SemanticCode::RecursiveCompileTimeConstant,
+        };
+        self.emit(code, span, "", "");
+    }
+
+    /// The declared type a constant value folds to (the oracle infers a
+    /// const variable's type from its constant initializer; only the
+    /// shapes [`Ty`] can carry fold).
+    fn folded_ty(&self, value: &ConstantValue) -> Ty {
+        match value {
+            ConstantValue::Int(_) => Ty::named(self.primitive_ids[0]),
+            ConstantValue::Double(_) => Ty::named(self.primitive_ids[1]),
+            ConstantValue::Bool(_) => Ty::named(self.primitive_ids[3]),
+            ConstantValue::Str(_) => Ty::named(self.primitive_ids[4]),
+            ConstantValue::Null => Ty::Null,
+            ConstantValue::Enum { container, .. } => Ty::named(*container),
+            // `const x = C();` has static type C (the const-creation
+            // container); collection shapes have no Ty face here.
+            ConstantValue::Created(container) => Ty::named(*container),
+            ConstantValue::Type(_) | ConstantValue::Instance(_) => Ty::UNKNOWN,
+        }
+    }
+
+    /// The folded declared type of an in-file const top-level variable
+    /// (the type-folding face of #279: `const x = 1;` folds `x` to
+    /// `int`).
+    pub fn const_top_level_ty(&self, name: StringId) -> Option<Ty> {
+        match self.const_scopes.first()?.get(&name)? {
+            ConstBinding::Value(v) => Some(self.folded_ty(v)),
+            ConstBinding::InProgress => None,
+        }
+    }
+
+    /// An enum constant's window opens (`handle_enum_element` doubles as
+    /// the previous element's close); its constructor arguments are the
+    /// const context. The arg gate needs the enum to resolve in this file
+    /// and carry a declared const constructor.
+    pub fn open_enum_const_element(&mut self) {
+        if self.enum_element_open {
+            self.close_enum_const_element();
+        }
+        // Every enum value creation is a const creation (the spec requires
+        // an enum's generative constructors to be const), so the gate arms
+        // on the in-file enum alone — enum constants precede their
+        // constructor declarations in source order.
+        let gate = self
+            .container_context()
+            .filter(|(_, kind)| *kind == ContainerKind::Enum)
+            .is_some_and(|(name, _)| {
+                self.index
+                    .get(self.file)
+                    .is_some_and(|f| f.container(name).is_some())
+            });
+        self.const_capture.open_enum_element();
+        self.arg_gates.push(gate);
+        self.enum_element_open = true;
+    }
+
+    pub fn close_enum_const_element(&mut self) {
+        if !self.enum_element_open {
+            return;
+        }
+        self.enum_element_open = false;
+        self.arg_gates.pop();
+        if self.const_capture.open() {
+            self.const_capture.close_enum_element();
+        }
+    }
+
+    /// An explicit `const C(...)` opened (`begin_const_expression`); the
+    /// gate arms once the target reference resolves.
+    pub fn open_const_ctor_invocation(&mut self) {
+        self.const_capture.open_ctor_invocation();
+        self.arg_gates.push(false);
+    }
+
+    /// `end_constructor_reference(..., Const)` inside a const-creation
+    /// window: the head token names the target; a const constructor this
+    /// file declared arms the argument check (foreign and non-const
+    /// targets defer — under-report).
+    pub fn arm_const_ctor_gate(&mut self, head: Token) {
+        let gate = self.name_of(head).is_some_and(|name| self.const_ctor_target(name));
+        if let Some(slot) = self.arg_gates.last_mut() {
+            // OR-in: an enum element's window pre-arms its gate (the
+            // constant's own ctor reference names the constant, never the
+            // enum's constructor) — a genuine `const C(...)` target only
+            // ever widens it.
+            *slot |= gate;
+        }
+    }
+
+    pub fn close_const_ctor_invocation(&mut self) {
+        self.arg_gates.pop();
+        if self.const_capture.open() {
+            self.const_capture.close_ctor_invocation();
+        }
+    }
+
+    /// A declared constructor or factory with the `const` modifier: its
+    /// container joins the provable const-constructor set.
+    pub fn note_const_ctor(&mut self) {
+        if let Some((name, _)) = self.container_context() {
+            self.const_ctors.insert(name);
+        }
+    }
+
+    fn const_ctor_target(&self, container: StringId) -> bool {
+        self.const_ctors.contains(&container)
+            && self
+                .index
+                .get(self.file)
+                .is_some_and(|f| f.container(container).is_some())
+    }
+
+    /// The callee classification a closed bare-identifier call resolves
+    /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`).
+    fn classify_call(&self, name: StringId) -> CallClass {
+        if self.const_ctor_target(name) {
+            return CallClass::ConstCtor;
+        }
+        if matches!(self.resolve_bare(name), BareInfo::Missing { .. }) {
+            return CallClass::Unknown;
+        }
+        if self.frames.iter().any(|f| f.locals.contains(&name))
+            || self.const_scopes.iter().any(|s| s.contains_key(&name))
+        {
+            return CallClass::Invocable;
+        }
+        match self.top_level_decl(name).map(|d| d.kind) {
+            Some(MicroKind::TopLevelFn) | Some(MicroKind::TopLevelVar) => CallClass::Invocable,
+            _ => CallClass::Unknown,
+        }
+    }
+
+    /// Arguments of a closed const creation: each evaluates against the
+    /// `const_with_non_constant_argument` default
+    /// (`constant_verifier.dart` `_validateConstantArguments`).
+    pub fn check_const_args(&mut self, gate: bool, args: &[crate::const_eval::Node]) {
+        if !gate {
+            return;
+        }
+        for arg in args {
+            let verdict = eval(arg, self);
+            match verdict {
+                Verdict::Value(_) | Verdict::Constant => {}
+                Verdict::NotConstant(span) => {
+                    self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                }
+                Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
+            }
+        }
+    }
+
+    /// Elements of a closed explicit const literal: each evaluates
+    /// against its `non_constant_*_element` default (the
+    /// `_ConstLiteralVerifier` site).
+    pub fn check_const_elements(&mut self, code: SemanticCode, parts: &[crate::const_eval::Node]) {
+        for part in parts {
+            match eval(part, self) {
+                Verdict::Value(_) | Verdict::Constant => {}
+                Verdict::NotConstant(span) => self.emit(code, span, "", ""),
+                Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
+            }
+        }
+    }
+
+    // —— capture event forwards (cheap no-ops with no window) ———
+
+    pub fn const_int_literal(&mut self, token: Token) {
+        let Some(text) = self.text_of(token) else {
+            return;
+        };
+        match parse_int_literal(text) {
+            Some(v) => self.const_capture.literal(token.range, ConstantValue::Int(v)),
+            // Beyond i64: a valid constant of unobservable value — defer.
+            None => self.const_capture.opaque_leaf(token.range),
+        }
+    }
+
+    pub fn const_double_literal(&mut self, token: Token) {
+        let Some(text) = self.text_of(token) else {
+            return;
+        };
+        let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+        match cleaned.parse::<f64>() {
+            Ok(v) => self.const_capture.literal(token.range, ConstantValue::Double(v)),
+            Err(_) => self.const_capture.opaque_leaf(token.range),
+        }
+    }
+
+    pub fn const_bool_literal(&mut self, token: Token) {
+        let value = self.text_of(token).is_some_and(|t| t == "true");
+        self.const_capture.literal(token.range, ConstantValue::Bool(value));
+    }
+
+    pub fn const_null_literal(&mut self, token: Token) {
+        self.const_capture.literal(token.range, ConstantValue::Null);
+    }
+
+    /// The raw interior of an interpolation-free string literal (the
+    /// begin token spans the whole literal, quotes included; escapes are
+    /// not decoded — no diagnostic observes the contents).
+    pub fn const_string_leaf(&mut self, begin: SourceRange, end: SourceRange) {
+        let text = self
+            .source
+            .get(begin.offset as usize + 1..begin.end().saturating_sub(1) as usize)
+            .unwrap_or("");
+        self.const_capture
+            .end_literal_string(0, begin, end, ConstantValue::Str(text.into()));
+    }
+
+    pub fn const_string_end(&mut self, count: usize, begin: SourceRange, end: SourceRange) {
+        self.const_capture
+            .end_literal_string(count, begin, end, ConstantValue::Str("".into()));
+    }
+}
+
+/// Parses an int literal body: decimal or `0x` hex, `_` separators
+/// stripped; `None` when the value exceeds `i64` (an unobservable edge —
+/// the literal defers to an opaque constant).
+fn parse_int_literal(text: &str) -> Option<i64> {
+    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+    let (radix, digits) =
+        if let Some(rest) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
+            (16, rest)
+        } else {
+            (10, cleaned.as_str())
+        };
+    i64::from_str_radix(digits, radix).ok()
+}
+
+/// The capture operator for a binary operator spelling (`??=` and
+/// friends never reach `begin_binary_expression` as plain binaries).
+fn bin_op_of(text: &str) -> BinOp {
+    match text {
+        "+" => BinOp::Add,
+        "-" => BinOp::Sub,
+        "*" => BinOp::Mul,
+        "/" => BinOp::Div,
+        "~/" => BinOp::IntDiv,
+        "%" => BinOp::Mod,
+        "&" => BinOp::BitAnd,
+        "|" => BinOp::BitOr,
+        "^" => BinOp::BitXor,
+        "<<" => BinOp::Shl,
+        ">>" => BinOp::Shr,
+        ">>>" => BinOp::Ushr,
+        "<" => BinOp::Lt,
+        ">" => BinOp::Gt,
+        "<=" => BinOp::Le,
+        ">=" => BinOp::Ge,
+        "==" => BinOp::Eq,
+        "!=" => BinOp::Ne,
+        "&&" => BinOp::And,
+        "||" => BinOp::Or,
+        "??" => BinOp::IfNull,
+        _ => BinOp::Add, // unreachable: the expression grammar's binary set
+    }
+}
+
 /// The reference-collecting [`ParserListener`] feeding a shared [`Engine`]:
 /// one parse over the same token table `collect` used, then pass 2 resolves
 /// the rows.
@@ -3981,13 +4523,19 @@ impl ParserListener for DiagnoseListener<'_> {
         _external_kw: Option<Token>,
         _static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
-        _var_final_or_const: Option<Token>,
+        var_final_or_const: Option<Token>,
         _get_or_set: Option<Token>,
         _new_kw: Option<Token>,
         _name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
-        self.engine.borrow_mut().push_executable_frame(true);
+        let mut engine = self.engine.borrow_mut();
+        // A `const` constructor makes its container a provable const-ctor
+        // target (the #279 arg-check gate).
+        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
+            engine.note_const_ctor();
+        }
+        engine.push_executable_frame(true);
     }
 
     fn end_constructor(
@@ -4008,10 +4556,15 @@ impl ParserListener for DiagnoseListener<'_> {
         _last_consumed: Token,
         _augment_kw: Option<Token>,
         _external_kw: Option<Token>,
-        _const_keyword: Option<Token>,
+        const_keyword: Option<Token>,
     ) {
+        let mut engine = self.engine.borrow_mut();
+        // A `const` factory is a const-constructor target.
+        if const_keyword.is_some() {
+            engine.note_const_ctor();
+        }
         // Factories have no `this`.
-        self.engine.borrow_mut().push_executable_frame(false);
+        engine.push_executable_frame(false);
     }
 
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
@@ -4028,12 +4581,17 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().push_executable_frame(instance);
     }
 
     fn end_function_expression(&mut self, _begin: Token, end: Token) {
         let mut engine = self.engine.borrow_mut();
+        engine.const_capture.end_opaque_group(end.range);
         engine.pop_frame();
         engine.push_value_row(end);
     }
@@ -4106,28 +4664,35 @@ impl ParserListener for DiagnoseListener<'_> {
         &mut self,
         _token: Token,
         _late_kw: Option<Token>,
-        _var_final_or_const: Option<Token>,
+        var_final_or_const: Option<Token>,
     ) {
         let mut engine = self.engine.borrow_mut();
         // The group's declared type arms here (one `parse_type` per group,
         // `handle_no_type` disarmed it for untyped groups); every name in
         // the group binds it.
         engine.pending_decl_ty = engine.armed_ty.take();
+        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
+            engine.arm_const_group();
+        }
     }
 
     fn end_variables_declaration(&mut self, _count: usize, _end: Option<Token>) {
         let mut engine = self.engine.borrow_mut();
         engine.pending_decl_ty = None;
         engine.armed_ty = None;
+        engine.disarm_const_group();
     }
 
     fn begin_variable_initializer(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
         engine.init_mark = Some(engine.rows.len());
+        engine.open_const_initializer();
     }
 
     fn end_variable_initializer(&mut self, _token: Token) {
-        self.engine.borrow_mut().check_decl_initializer();
+        let mut engine = self.engine.borrow_mut();
+        engine.close_const_initializer();
+        engine.check_decl_initializer();
     }
 
     fn begin_type_variable(&mut self, token: Token) {
@@ -4153,11 +4718,13 @@ impl ParserListener for DiagnoseListener<'_> {
             C::Expression => {
                 if let Some(name) = name {
                     engine.push_bare(name, token.range);
+                    engine.const_capture.identifier(name, token.range);
                 }
             }
             C::ExpressionContinuation => {
                 if let Some(name) = name {
                     engine.push_member(name, token.range);
+                    engine.const_capture.identifier(name, token.range);
                 }
             }
             C::TypeReference | C::TypeReferenceContinuation => {
@@ -4189,6 +4756,7 @@ impl ParserListener for DiagnoseListener<'_> {
             C::LocalVariableDeclaration => {
                 if let Some(name) = name {
                     engine.add_local(name);
+                    engine.const_decl_name(name, false);
                     engine.bind_declared_type(name);
                 }
             }
@@ -4207,8 +4775,10 @@ impl ParserListener for DiagnoseListener<'_> {
             C::EnumValueDeclaration => {
                 // The enum constant's window opens here: its type arguments
                 // check against the enclosing enum's declared count (the
-                // `_enum` code). `handle_enum_element` closes it.
+                // `_enum` code), and its constructor arguments capture as
+                // a const context (`handle_enum_element` closes it).
                 engine.enter_enum_element();
+                engine.open_enum_const_element();
             }
             C::ConstructorReferenceContinuationAfterTypeArguments
                 if engine.in_enum_element.is_some() && engine.ctor_pos == 0 =>
@@ -4234,6 +4804,15 @@ impl ParserListener for DiagnoseListener<'_> {
             C::MethodDeclaration => {
                 if let Some(name) = name {
                     engine.latch_return_type(ExecKind::Method, name);
+                }
+            }
+            // Field groups (class fields, enum body fields, top-level
+            // variables): const groups queue the names for their
+            // initializer windows; non-const top-level variables join the
+            // provable non-const set.
+            C::FieldDeclaration | C::TopLevelVariableDeclaration => {
+                if let Some(name) = name {
+                    engine.const_decl_name(name, true);
                 }
             }
             _ => {}
@@ -4298,14 +4877,27 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
         self.engine.borrow_mut().push_keyword_receiver(token, false);
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .this_or_super(token.range);
     }
 
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
         self.engine.borrow_mut().push_keyword_receiver(token, true);
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .this_or_super(token.range);
     }
 
-    fn handle_dot_access(&mut self, _token: Token, _end: Token, is_null_aware: bool) {
+    fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {
         self.engine.borrow_mut().merge_member(is_null_aware);
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .dot_access(is_null_aware, end.range);
+        let _ = token;
     }
 
     fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
@@ -4318,6 +4910,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
         let mut engine = self.engine.borrow_mut();
+        engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
         engine.check_assignment(operator);
     }
@@ -4327,10 +4920,75 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(operator) else {
             return;
         };
+        engine.const_capture.begin_binary(bin_op_of(text), operator.range);
         if USER_OPERATORS.contains(&text) {
             let op = engine.intern(text);
             engine.mark_operator(op, operator.range);
         }
+    }
+
+    fn end_binary_expression(&mut self, _operator: Token, end: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .end_binary(end.range);
+    }
+
+    fn handle_unary_prefix_expression(&mut self, operator: Token) {
+        let mut engine = self.engine.borrow_mut();
+        let op = match engine.text_of(operator) {
+            Some("-") => UnOp::Neg,
+            Some("!") => UnOp::Not,
+            Some("~") => UnOp::BitNot,
+            _ => UnOp::Inc, // `++`/`--` prefixes
+        };
+        engine.const_capture.unary_prefix(op);
+    }
+
+    fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .unary_postfix(operator.range);
+    }
+
+    fn begin_conditional_expression(&mut self, _question: Token) {
+        self.engine.borrow_mut().const_capture.begin_conditional();
+    }
+
+    fn handle_conditional_expression_colon(&mut self) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .conditional_colon();
+    }
+
+    fn end_conditional_expression(&mut self, _question: Token, _colon: Token, end: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .end_conditional(end.range);
+    }
+
+    fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .parenthesized_begin();
+    }
+
+    fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .not_constant(is_operator.range);
+    }
+
+    fn handle_as_operator(&mut self, operator: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .opaque_leaf(operator.range);
     }
 
     // —— suppression brackets —————————————————————————————————————————
@@ -4351,22 +5009,35 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.borrow_mut().leave_non_type_pos();
     }
 
-    fn begin_new_expression(&mut self, _token: Token) {
+    fn begin_new_expression(&mut self, token: Token) {
         self.engine.borrow_mut().enter_ctor_pos();
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .begin_opaque_group();
+        let _ = token;
     }
 
-    fn end_new_expression(&mut self, _token: Token) {
+    fn end_new_expression(&mut self, token: Token) {
         self.engine.borrow_mut().leave_ctor_pos();
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .end_opaque_group(token.range);
     }
 
-    fn begin_const_expression(&mut self, _const_keyword: Token) {
-        self.engine.borrow_mut().enter_ctor_pos();
+    fn begin_const_expression(&mut self, const_keyword: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.enter_ctor_pos();
+        engine.open_const_ctor_invocation();
+        let _ = const_keyword;
     }
 
     fn end_const_expression(&mut self, _token: Token) {
-        self.engine.borrow_mut().leave_ctor_pos();
+        let mut engine = self.engine.borrow_mut();
+        engine.close_const_ctor_invocation();
+        engine.leave_ctor_pos();
     }
-
     fn begin_implicit_creation_expression(&mut self, _token: Token) {
         self.engine.borrow_mut().enter_ctor_pos();
     }
@@ -4378,20 +5049,73 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_arguments(&mut self, _token: Token) {
+        self.engine.borrow_mut().const_capture.begin_arguments();
         self.engine.borrow_mut().open_arguments();
     }
 
-    fn end_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.engine.borrow_mut().close_arguments();
+    fn end_arguments(&mut self, _count: usize, _begin: Token, end: Token) {
+        let closed = self
+            .engine
+            .borrow_mut()
+            .const_capture
+            .end_arguments(end.range);
+        let mut engine = self.engine.borrow_mut();
+        if let Some(closed) = closed {
+            if closed.creation_owned {
+                // The creation's own list: each argument checks against
+                // `const_with_non_constant_argument`; the gate lives until
+                // the window closes (nested calls arm their own gates).
+                let gate = engine.arg_gates.last().copied().unwrap_or(false);
+                engine.check_const_args(gate, &closed.args);
+                if closed.ctor_invocation {
+                    // The creation's value joins the enclosing window —
+                    // typed by its container when this file declared the
+                    // const constructor (type folding), opaque otherwise.
+                    let ctor = closed
+                        .callee
+                        .is_some_and(|n| engine.const_ctor_target(n));
+                    let value = if ctor {
+                        ConstantValue::Created(closed.callee.expect("checked above"))
+                    } else {
+                        ConstantValue::Instance(crate::const_eval::InstanceKind::Object)
+                    };
+                    engine.const_capture.push_value(closed.span, value);
+                }
+            } else if let Some(name) = closed.callee {
+                // `name(...)` in a const context: the implicit const
+                // creation form checks per argument; any other resolvable
+                // callee is a method-invocation fault; unknown names defer
+                // (their own row reports).
+                match engine.classify_call(name) {
+                    CallClass::ConstCtor => {
+                        engine.check_const_args(true, &closed.args);
+                        engine
+                            .const_capture
+                            .push_value(closed.span, ConstantValue::Created(name));
+                    }
+                    CallClass::Invocable => {
+                        engine.emit(SemanticCode::ConstEvalMethodInvocation, closed.span, "", "");
+                        engine.const_capture.opaque_leaf(closed.span);
+                    }
+                    CallClass::Unknown => engine.const_capture.opaque_leaf(closed.span),
+                }
+            } else {
+                engine.const_capture.opaque_leaf(closed.span);
+            }
+        }
+        engine.close_arguments();
     }
 
     fn handle_positional_argument(&mut self, _token: Token) {
+        self.engine.borrow_mut().const_capture.positional_argument();
         self.engine.borrow_mut().open_argument(None);
     }
 
-    // `handle_named_argument` needs no override: the parser fires it before
-    // the value expression, so the named argument opened at its identifier
-    // event stays pending until the next argument boundary closes it.
+    fn handle_named_argument(&mut self, _colon: Token) {
+        // The capture opens the named argument here (fires before the
+        // value); the row engine opened it at the label's identifier event.
+        self.engine.borrow_mut().const_capture.named_argument();
+    }
 
     fn begin_return_statement(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
@@ -4428,12 +5152,22 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.body_mark = Some(engine.rows.len());
     }
 
-    fn begin_cascade(&mut self, _operator: Token) {
-        self.engine.borrow_mut().in_cascade = true;
+    fn begin_cascade(&mut self, operator: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.in_cascade = true;
+        engine.const_capture.begin_opaque_group();
+        let _ = operator;
     }
 
     fn end_cascade(&mut self) {
-        self.engine.borrow_mut().in_cascade = false;
+        let mut engine = self.engine.borrow_mut();
+        engine.in_cascade = false;
+        engine
+            .const_capture
+            .end_opaque_group(SourceRange {
+                offset: 0,
+                length: 0,
+            });
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
@@ -4444,6 +5178,9 @@ impl ParserListener for DiagnoseListener<'_> {
             offset: open.range.offset,
             length: close.range.end() - open.range.offset,
         };
+        // `#279: e1[e2]` is a spec constant the subset cannot value —
+        // both operands defer through an opaque leaf.
+        engine.const_capture.indexed(bracket);
         // The receiver: the closest row wholly before the `[`.
         let Some(pos) = engine
             .rows
@@ -4816,11 +5553,15 @@ impl ParserListener for DiagnoseListener<'_> {
         // The parser fires this after the constant's type arguments and
         // constructor arguments: the constant's window closed (it opened at
         // the EnumValueDeclaration identifier).
-        self.engine.borrow_mut().leave_enum_element();
+        let mut engine = self.engine.borrow_mut();
+        engine.close_enum_const_element();
+        engine.leave_enum_element();
     }
 
     fn handle_enum_elements(&mut self, _elements_end: Token, _count: usize) {
-        self.engine.borrow_mut().leave_enum_element();
+        let mut engine = self.engine.borrow_mut();
+        engine.close_enum_const_element();
+        engine.leave_enum_element();
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {
@@ -4850,18 +5591,22 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_literal_int(&mut self, token: Token) {
         self.engine.borrow_mut().push_primitive_row(token, 0);
+        self.engine.borrow_mut().const_int_literal(token);
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
         self.engine.borrow_mut().push_primitive_row(token, 0);
+        self.engine.borrow_mut().const_int_literal(token);
     }
 
     fn handle_literal_double(&mut self, token: Token) {
         self.engine.borrow_mut().push_primitive_row(token, 1);
+        self.engine.borrow_mut().const_double_literal(token);
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
         self.engine.borrow_mut().push_primitive_row(token, 1);
+        self.engine.borrow_mut().const_double_literal(token);
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
@@ -4871,6 +5616,7 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.pending_const = Some(Restriction::BoolValue(is_true));
         }
         engine.push_primitive_row(token, 3);
+        engine.const_bool_literal(token);
     }
 
     fn handle_literal_null(&mut self, token: Token) {
@@ -4879,47 +5625,242 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.pending_const = Some(Restriction::Null);
         }
         engine.push_null_row(token);
+        engine.const_null_literal(token);
     }
 
-    fn end_literal_string(&mut self, _interpolation_count: usize, end: Token) {
-        self.engine.borrow_mut().push_primitive_row(end, 4);
+    fn begin_literal_string(&mut self, begin: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.const_string_begins.push(begin.range);
+        engine.const_capture.begin_literal_string();
+    }
+
+    fn handle_interpolation_expression(&mut self, left: Token, _right: Option<Token>) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .interpolation_expression(left.range);
+    }
+
+    fn end_literal_string(&mut self, interpolation_count: usize, end: Token) {
+        let mut engine = self.engine.borrow_mut();
+        // The begin span arrives via the capture's own string marks (the
+        // engine latched it at `begin_literal_string` — carried on the
+        // event's `end` counterpart below).
+        let begin = engine.const_string_begins.pop().unwrap_or(end.range);
+        if interpolation_count == 0 {
+            engine.const_string_leaf(begin, end.range);
+        } else {
+            engine.const_string_end(interpolation_count, begin, end.range);
+        }
+        engine.push_primitive_row(end, 4);
     }
 
     fn end_literal_symbol(&mut self, hash: Token, _identifier_count: usize) {
         self.engine.borrow_mut().push_value_row(hash);
+        self.engine.borrow_mut().const_capture.symbol(hash.range);
+    }
+
+    fn handle_adjacent_string_literals(&mut self, start: Token, literal_count: usize) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .adjacent_strings(literal_count, start.range);
     }
 
     fn handle_literal_list(
         &mut self,
-        _count: usize,
-        _left: Token,
+        count: usize,
+        left: Token,
         _const_keyword: Option<Token>,
         right: Token,
     ) {
-        self.engine.borrow_mut().push_value_row(right);
+        let mut engine = self.engine.borrow_mut();
+        if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
+            // Implicit const literals in a const context check per element
+            // with the element code too (the oracle evaluates the literal
+            // at the enclosing site).
+            engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
+            engine.const_capture.push_value(
+                right.range,
+                ConstantValue::Instance(crate::const_eval::InstanceKind::List),
+            );
+        }
+        engine.push_value_row(right);
     }
 
     fn handle_literal_set_or_map(
         &mut self,
-        _count: usize,
-        _left: Token,
+        count: usize,
+        left: Token,
         _const_keyword: Option<Token>,
         right: Token,
-        _has_set_entry: bool,
+        has_set_entry: bool,
     ) {
-        self.engine.borrow_mut().push_value_row(right);
+        use crate::const_eval::{InstanceKind, SetOrMap};
+        let mut engine = self.engine.borrow_mut();
+        if let Some(shape) = engine
+            .const_capture
+            .literal_set_or_map(count, left.range, has_set_entry)
+        {
+            match shape {
+                SetOrMap::Map(entries) => {
+                    let flat: Vec<_> = entries
+                        .into_iter()
+                        .flat_map(|(k, v)| [k, v])
+                        .collect();
+                    engine.check_const_elements(SemanticCode::NonConstantMapElement, &flat);
+                    engine
+                        .const_capture
+                        .push_value(right.range, ConstantValue::Instance(InstanceKind::Map));
+                }
+                SetOrMap::Set(elements) => {
+                    engine.check_const_elements(SemanticCode::NonConstantSetElement, &elements);
+                    engine
+                        .const_capture
+                        .push_value(right.range, ConstantValue::Instance(InstanceKind::Set));
+                }
+            }
+        }
+        engine.push_value_row(right);
+    }
+
+    fn handle_literal_map_entry(&mut self, colon: Token, _end: Token, _nk: Option<Token>, _nv: Option<Token>) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .literal_map_entry(colon.range);
     }
 
     fn end_parenthesized_expression(&mut self, token: Token) {
         self.engine.borrow_mut().push_value_row(token);
+        self.engine.borrow_mut().const_capture.parenthesized_end();
     }
 
-    fn end_record_literal(&mut self, token: Token, _count: usize, _const_keyword: Option<Token>) {
-        self.engine.borrow_mut().push_value_row(token);
+    fn end_record_literal(&mut self, token: Token, count: usize, _const_keyword: Option<Token>) {
+        let mut engine = self.engine.borrow_mut();
+        if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
+            engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
+            engine.const_capture.push_value(
+                token.range,
+                ConstantValue::Instance(crate::const_eval::InstanceKind::Record),
+            );
+        }
+        engine.push_value_row(token);
     }
 
     fn end_const_literal(&mut self, end: Token) {
-        self.engine.borrow_mut().push_value_row(end);
+        let mut engine = self.engine.borrow_mut();
+        engine.const_capture.close_explicit_literal();
+        engine.push_value_row(end);
+    }
+
+    // —— #279: const contexts ————————————————————————————————————————
+
+    fn begin_fields(
+        &mut self,
+        _kind: DeclarationKind,
+        _augment_kw: Option<Token>,
+        _abstract_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+        _last_consumed: Token,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
+            engine.arm_const_group();
+        }
+    }
+
+    fn end_fields(
+        &mut self,
+        _kind: DeclarationKind,
+        _abstract_kw: Option<Token>,
+        _augment_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _count: usize,
+        _begin: Token,
+        _end: Token,
+    ) {
+        self.engine.borrow_mut().disarm_const_group();
+    }
+
+    fn end_top_level_fields(
+        &mut self,
+        _augment_kw: Option<Token>,
+        _abstract_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _count: usize,
+        _begin: Token,
+        _end: Token,
+    ) {
+        self.engine.borrow_mut().disarm_const_group();
+    }
+
+    fn begin_field_initializer(&mut self, _token: Token) {
+        self.engine.borrow_mut().open_const_initializer();
+    }
+
+    fn end_field_initializer(&mut self, _assignment: Token, _end: Token) {
+        self.engine.borrow_mut().close_const_field_initializer();
+    }
+
+    fn begin_const_literal(&mut self, _token: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .open_explicit_literal();
+    }
+
+    fn end_constructor_reference(
+        &mut self,
+        start: Token,
+        _period_before_name: Option<Token>,
+        _end: Token,
+        context: ConstructorReferenceContext,
+    ) {
+        if context == ConstructorReferenceContext::Const {
+            self.engine.borrow_mut().arm_const_ctor_gate(start);
+        }
+    }
+
+    fn begin_await_expression(&mut self, token: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .begin_opaque_group();
+        let _ = token;
+    }
+
+    fn end_await_expression(&mut self, begin: Token, _end: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .end_opaque_group(begin.range);
+    }
+
+    fn handle_throw_expression(&mut self, throw: Token, _end: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .throw_expression(throw.range);
+    }
+
+    fn handle_non_null_assert_expression(&mut self, bang: Token) {
+        self.engine
+            .borrow_mut()
+            .const_capture
+            .non_null_assert(bang.range);
     }
 }
 
@@ -7630,5 +8571,326 @@ mod tests {
     fn bare_wildcard_covers_the_context() {
         let report = report("class C {} void f(C c) { var x = switch (c) { _ => 1 }; }");
         assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    // —— #279: the constant-evaluation family ———————————————————————————
+    //
+    // Anchors: the reporting sites in
+    // `.third/dart-sdk/pkg/analyzer/lib/src/dart/constant/
+    // constant_verifier.dart` (`visitVariableDeclaration` :552, the
+    // `_reportError` allow-list :717+), the operator matrix in
+    // `.../constant/value.dart`, the invocation faults in
+    // `.../constant/evaluation.dart` (`_invalidConstantForMethodInvocation`
+    // :2197), the verbatim texts in
+    // `.../analyzer/lib/src/diagnostic/diagnostic.g.dart`, and the corpus
+    // `pkg/analyzer/test/src/dart/constant/evaluation_test.dart` /
+    // `tests/language/operator/integer_division_by_zero_test.dart`.
+
+    /// Clean const initializers over every subset shape: arithmetic,
+    /// adjacent strings, collections, records, const-ctor creations
+    /// (explicit and implicit), forward const references — no rows at all.
+    #[test]
+    fn const_initializer_subset_shapes_stay_clean() {
+        let rep = report(
+            "class int {} class C { const C(); } \
+             const a = 1 + 2; \
+             const b = 'x' 'y'; \
+             const c = [1, 2]; \
+             const d = {'k': 1}; \
+             const e = {}; \
+             const g = C(); \
+             const h = const C(); \
+             const fwd = base; const base = 1; \
+             const neg = -a; \
+             const shift = 1 << 2;",
+        );
+        assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
+    }
+
+    /// A provably non-const operand reports the site default
+    /// `const_initialized_with_non_constant_value` anchored at the
+    /// offending subexpression (constant_verifier.dart:552; the
+    /// `InvalidConstant` error entity).
+    #[test]
+    fn non_const_initializer_reports_the_site_default() {
+        let rep = report("class int {} int nc = 0; const x = 1 + nc;");
+        assert_eq!(
+            code_names(&rep),
+            ["const_initialized_with_non_constant_value"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // The local/formal shape proves non-constancy too.
+        let rep = report("void m() { var l = 1; const y = l; }");
+        assert_eq!(
+            code_names(&rep),
+            ["const_initialized_with_non_constant_value"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Unknown names defer: the M1 row reports, no const verdict fires
+    /// (under-report discipline — use-before-decl stays suppressed).
+    #[test]
+    fn unknown_names_defer_without_a_const_verdict() {
+        let rep = report("const x = gone;");
+        assert_eq!(
+            code_names(&rep),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A self-reference inside its own initializer is the cycle fault
+    /// (the allow-list's `recursive_compile_time_constant` override,
+    /// constant_verifier.dart:717+).
+    #[test]
+    fn self_referential_constant_reports_the_cycle() {
+        let rep = report("const a = a + 1;");
+        assert_eq!(
+            code_names(&rep),
+            ["recursive_compile_time_constant"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Const-creation arguments check per argument with
+    /// `const_with_non_constant_argument`
+    /// (`_validateConstantArguments`, constant_verifier.dart:843): the
+    /// explicit `const C(l)` and the implicit `C(l)` forms, and enum
+    /// constants with a declared const constructor.
+    #[test]
+    fn const_creation_arguments_check_per_argument() {
+        let rep = report(
+            "class int {} class C { const C(int v); } \
+             void m() { var l = 1; const a = C(l); const b = const C(l); }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_with_non_constant_argument",
+                "const_with_non_constant_argument",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+
+        let rep = report(
+            "class int {} int l = 0; enum E { a.named(l); const E.named(int v); final int v; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["const_with_non_constant_argument"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A const-creation target this file declared with a const
+    /// constructor keeps clean arguments silent, and the creation binds
+    /// its folded value (`const x = C();` has static type `C`). The
+    /// negative face (a foreign host type) defers: user-class pairs sit
+    /// outside the M1's final-primitive table, which is the engine's
+    /// documented under-report direction.
+    #[test]
+    fn const_creation_type_folds_to_its_container() {
+        let rep = report(
+            "class C { const C(); } \
+             const x = C(); \
+             const w = x; \
+             void m() { C ok = x; }",
+        );
+        assert!(
+            code_names(&rep).is_empty(),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A container without a const constructor and an unresolvable name
+    /// both defer (`const_with_non_const*` is outside the family) — no
+    /// const verdict either way.
+    #[test]
+    fn non_const_and_unknown_creation_targets_defer() {
+        let rep = report("class C { C(); } const x = C();");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+
+        let rep = report("const y = Gone();");
+        assert!(
+            code_names(&rep)
+                .iter()
+                .all(|c| !c.starts_with("const_") && !c.starts_with("non_constant_")),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// An invocable non-constructor callee faults with
+    /// `const_eval_method_invocation` at the invocation
+    /// (evaluation.dart:2197, diagnostic.g.dart:2846).
+    #[test]
+    fn invocable_callee_reports_method_invocation() {
+        let rep = report("void f() {} const x = f();");
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_method_invocation"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Methods can't be invoked in constant expressions."
+        );
+        // A local callable faults the same way.
+        let rep = report("void m() { var g = 1; const y = g(); }");
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_method_invocation"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Explicit const literals check per element with their
+    /// `non_constant_*_element` codes (the `_ConstLiteralVerifier` sites).
+    #[test]
+    fn const_literal_elements_check_per_element() {
+        let rep = report(
+            "void m() { var l = 1; \
+             const a = [l]; \
+             const b = {l}; \
+             const c = {l: 1}; \
+             const d = (l,); }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "non_constant_list_element",
+                "non_constant_set_element",
+                "non_constant_map_element",
+                "non_constant_record_field",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Clean elements stay silent, including the fault-deciding lazy
+        // shapes (`false && l` never evaluates its right operand).
+        let rep = report("void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }");
+        assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
+    }
+
+    /// The `constEval*` fault family overrides the site default, one code
+    /// per subfamily (the `_reportError` allow-list): division throws,
+    /// operand-type asserts, interpolation operand gate.
+    #[test]
+    fn const_eval_faults_match_the_official_codes() {
+        // `~/ 0` throws IntegerDivisionByZeroException
+        // (tests/language/operator/integer_division_by_zero_test.dart);
+        // `% 0` throws the generic exception
+        // (evaluation_test.dart:1765).
+        let rep = report("const a = 1 ~/ 0; const b = 1 % 0;");
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_throws_idbze", "const_eval_throws_exception"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Operand-type asserts, left operand first
+        // (evaluation_test.dart:1895 anchors the bool case).
+        let rep = report("const c = !1; const d = 1 + 'a'; const e = 1 & true; const f = 'a' + 1;");
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_eval_type_bool",
+                "const_eval_type_num",
+                "const_eval_type_bool_int",
+                "const_eval_throws_exception",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Interpolation operand gate (`isBoolNumStringOrNull`,
+        // value.dart:545): a constant operand of a non-convertible type
+        // faults; a NON-CONSTANT operand keeps the site default (the
+        // oracle fails its evaluation first).
+        let rep = report("const g = 'a${[1]}';");
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_type_bool_num_string"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let rep = report("void m() { var l = 1; const h = 'a${l}'; }");
+        assert_eq!(
+            code_names(&rep),
+            ["const_initialized_with_non_constant_value"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// `is` is not on the spec's constant-expression list (the site
+    /// default reports); `as` is, and its unknown result defers —
+    /// `(1 as int) + 1` stays clean.
+    #[test]
+    fn is_reports_and_as_defers() {
+        let rep = report("class int {} const x = 1 is int;");
+        assert_eq!(
+            code_names(&rep),
+            ["const_initialized_with_non_constant_value"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let rep = report("class int {} const y = 1 as int; const z = (1 as int) + 1;");
+        assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
+    }
+
+    /// A clean const variable's type folds from its initializer: `const
+    /// z = 1;` gives `z` static type `int` (the official inference), so a
+    /// String host rejects the read while an int host stays silent.
+    #[test]
+    fn const_variable_type_folds_per_the_official_rules() {
+        let rep = report(
+            "class int {} class String {} const z = 1; \
+             void m() { int ok = z; String bad = z; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_assignment"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "A value of type 'int' can't be assigned to a variable of type 'String'."
+        );
+        // Enum constants fold to their container too (the negative face
+        // against a user class defers — outside the final-primitive
+        // table).
+        let rep = report("enum E { a, b } void m() { E ok = E.a; }");
+        assert!(
+            code_names(&rep).is_empty(),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Deferral shapes never fabricate a verdict: interpolation text,
+    /// string repetition, index expressions, member invocations — all
+    /// silent here (documented under-report, see `const_eval` module
+    /// docs).
+    #[test]
+    fn deferred_shapes_stay_silent() {
+        let rep = report(
+            "class int {} const n = 3; const a = 'x${n}'; const b = 'ab' * 2; \
+             class C { const C(); } const c = C(); \
+             const d = 'a$b'; const w = c;",
+        );
+        // `d` interpolates an unknown constant (`b` folds deferred) —
+        // clean; `w` reads a deferred creation — clean.
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 }

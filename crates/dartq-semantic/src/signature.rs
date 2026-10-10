@@ -39,9 +39,9 @@
 //!
 //! [`SIGNATURE_VERSION`] rides the hash: any change to the rendering or the
 //! composition bumps it, invalidating every signature computed by a previous
-//! engine build (the PRD §5.6 semantic-version discipline — bump
-//! `FACTS_SEMANTIC_VERSION` in dartq-engine in the same change, since cached
-//! facts carry baked signatures).
+//! engine build (the PRD §5.6 semantic-version discipline — the engine's
+//! `FACTS_SEMANTIC_VERSION` folds `SIGNATURE_VERSION` into its low half, so
+//! cached facts invalidate automatically; no separate engine-side bump).
 
 use blake3::Hasher;
 use dartq_source::{StringId, StringTable};
@@ -67,6 +67,15 @@ impl ApiSignature {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
+    }
+
+    /// Restores the digest a persisted facts entry carries baked (#341):
+    /// the loaded signature must be byte-true, or the first post-load edit
+    /// would compare against a forged baseline and the L2 gate could
+    /// wrongly skip a cascade.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
     }
 
     /// The first 128 bits of a blake3 digest — the `ContentId` truncation.

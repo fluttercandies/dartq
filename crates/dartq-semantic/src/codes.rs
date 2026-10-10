@@ -191,6 +191,60 @@ pub enum SemanticCode {
     /// the `case` keyword of a statement case / the `=>` of an expression
     /// case, `constant_verifier.dart:1080-1088`).
     UnreachableSwitchCase,
+    // —— #279: the constant-evaluation family (all `COMPILE_TIME_ERROR`) ——
+    /// `Const variables must be initialized with a constant value.` — a
+    /// const variable/field initializer that is decidentally not constant
+    /// (the `visitVariableDeclaration` site default,
+    /// `constant_verifier.dart:550-556`).
+    ConstInitializedWithNonConstantValue,
+    /// `Arguments of a constant creation must be constant expressions.` —
+    /// an argument of a const creation / enum constant (the
+    /// `_validateConstantArguments` site default, `constant_verifier.dart:843`).
+    ConstWithNonConstantArgument,
+    /// `The values in a const list literal must be constants.`
+    NonConstantListElement,
+    /// `The values in a const set literal must be constants.`
+    NonConstantSetElement,
+    /// `The elements in a const map literal must be constant.`
+    NonConstantMapElement,
+    /// `The fields in a const record literal must be constants.`
+    NonConstantRecordField,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'bool'.`
+    ConstEvalTypeBool,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'bool' or 'int'.`
+    ConstEvalTypeBoolInt,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'bool', 'num', 'String' or 'null'.`
+    ConstEvalTypeBoolNumString,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'int'.`
+    ConstEvalTypeInt,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'num'.`
+    ConstEvalTypeNum,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'num' or 'String'.`
+    ConstEvalTypeNumString,
+    /// `In constant expressions, operands of this operator must be of type
+    /// 'String'.`
+    ConstEvalTypeString,
+    /// `Evaluation of this constant expression throws an exception.`
+    ConstEvalThrowsException,
+    /// `Evaluation of this constant expression throws an
+    /// IntegerDivisionByZeroException.`
+    ConstEvalThrowsIdbze,
+    /// `In constant expressions, operands of the equality operator must
+    /// have primitive equality.`
+    ConstEvalPrimitiveEquality,
+    /// `Methods can't be invoked in constant expressions.` — an invocation
+    /// of a non-constructor callee in a const context (the
+    /// `_invalidConstantForMethodInvocation` site,
+    /// `evaluation.dart:2197-2212`).
+    ConstEvalMethodInvocation,
+    /// `The compile-time constant expression depends on itself.`
+    RecursiveCompileTimeConstant,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -326,6 +380,50 @@ impl SemanticCode {
                 "NON_EXHAUSTIVE_SWITCH_EXPRESSION",
             ),
             Self::UnreachableSwitchCase => ("unreachable_switch_case", "UNREACHABLE_SWITCH_CASE"),
+            Self::ConstInitializedWithNonConstantValue => (
+                "const_initialized_with_non_constant_value",
+                "CONST_INITIALIZED_WITH_NON_CONSTANT_VALUE",
+            ),
+            Self::ConstWithNonConstantArgument => (
+                "const_with_non_constant_argument",
+                "CONST_WITH_NON_CONSTANT_ARGUMENT",
+            ),
+            Self::NonConstantListElement => {
+                ("non_constant_list_element", "NON_CONSTANT_LIST_ELEMENT")
+            }
+            Self::NonConstantSetElement => ("non_constant_set_element", "NON_CONSTANT_SET_ELEMENT"),
+            Self::NonConstantMapElement => ("non_constant_map_element", "NON_CONSTANT_MAP_ELEMENT"),
+            Self::NonConstantRecordField => {
+                ("non_constant_record_field", "NON_CONSTANT_RECORD_FIELD")
+            }
+            Self::ConstEvalTypeBool => ("const_eval_type_bool", "CONST_EVAL_TYPE_BOOL"),
+            Self::ConstEvalTypeBoolInt => ("const_eval_type_bool_int", "CONST_EVAL_TYPE_BOOL_INT"),
+            Self::ConstEvalTypeBoolNumString => (
+                "const_eval_type_bool_num_string",
+                "CONST_EVAL_TYPE_BOOL_NUM_STRING",
+            ),
+            Self::ConstEvalTypeInt => ("const_eval_type_int", "CONST_EVAL_TYPE_INT"),
+            Self::ConstEvalTypeNum => ("const_eval_type_num", "CONST_EVAL_TYPE_NUM"),
+            Self::ConstEvalTypeNumString => {
+                ("const_eval_type_num_string", "CONST_EVAL_TYPE_NUM_STRING")
+            }
+            Self::ConstEvalTypeString => ("const_eval_type_string", "CONST_EVAL_TYPE_STRING"),
+            Self::ConstEvalThrowsException => {
+                ("const_eval_throws_exception", "CONST_EVAL_THROWS_EXCEPTION")
+            }
+            Self::ConstEvalThrowsIdbze => ("const_eval_throws_idbze", "CONST_EVAL_THROWS_IDBZE"),
+            Self::ConstEvalPrimitiveEquality => (
+                "const_eval_primitive_equality",
+                "CONST_EVAL_PRIMITIVE_EQUALITY",
+            ),
+            Self::ConstEvalMethodInvocation => (
+                "const_eval_method_invocation",
+                "CONST_EVAL_METHOD_INVOCATION",
+            ),
+            Self::RecursiveCompileTimeConstant => (
+                "recursive_compile_time_constant",
+                "RECURSIVE_COMPILE_TIME_CONSTANT",
+            ),
         };
         let dtype = self.dtype();
         // The function variant is the one wrong-number template without a
@@ -430,6 +528,71 @@ impl SemanticCode {
             // No-argument rows: verbatim texts.
             Self::WrongNumberOfParametersForSetter => {
                 "Setters must declare exactly one required positional parameter.".to_string()
+            }
+            // The #279 constant-evaluation family: no-argument rows (the
+            // pinned registry `diagnostic.g.dart` texts).
+            Self::ConstInitializedWithNonConstantValue => {
+                "Const variables must be initialized with a constant value.".to_string()
+            }
+            Self::ConstWithNonConstantArgument => {
+                "Arguments of a constant creation must be constant expressions.".to_string()
+            }
+            Self::NonConstantListElement => {
+                "The values in a const list literal must be constants.".to_string()
+            }
+            Self::NonConstantSetElement => {
+                "The values in a const set literal must be constants.".to_string()
+            }
+            Self::NonConstantMapElement => {
+                "The elements in a const map literal must be constant.".to_string()
+            }
+            Self::NonConstantRecordField => {
+                "The fields in a const record literal must be constants.".to_string()
+            }
+            Self::ConstEvalTypeBool => {
+                "In constant expressions, operands of this operator must be of type 'bool'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeBoolInt => {
+                "In constant expressions, operands of this operator must be of type 'bool' or 'int'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeBoolNumString => {
+                "In constant expressions, operands of this operator must be of type 'bool', 'num', 'String' or 'null'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeInt => {
+                "In constant expressions, operands of this operator must be of type 'int'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeNum => {
+                "In constant expressions, operands of this operator must be of type 'num'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeNumString => {
+                "In constant expressions, operands of this operator must be of type 'num' or 'String'."
+                    .to_string()
+            }
+            Self::ConstEvalTypeString => {
+                "In constant expressions, operands of this operator must be of type 'String'."
+                    .to_string()
+            }
+            Self::ConstEvalThrowsException => {
+                "Evaluation of this constant expression throws an exception.".to_string()
+            }
+            Self::ConstEvalThrowsIdbze => {
+                "Evaluation of this constant expression throws an IntegerDivisionByZeroException."
+                    .to_string()
+            }
+            Self::ConstEvalPrimitiveEquality => {
+                "In constant expressions, operands of the equality operator must have primitive equality."
+                    .to_string()
+            }
+            Self::ConstEvalMethodInvocation => {
+                "Methods can't be invoked in constant expressions.".to_string()
+            }
+            Self::RecursiveCompileTimeConstant => {
+                "The compile-time constant expression depends on itself.".to_string()
             }
             // One- and two-argument rows reused through `message3`.
             Self::WrongNumberOfParametersForOperatorMinus => self.message3(a0, "", ""),
@@ -610,6 +773,24 @@ mod tests {
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
             SemanticCode::ReturnOfInvalidType(ExecKind::Method),
             SemanticCode::InvalidNullAwareOperator,
+            SemanticCode::ConstInitializedWithNonConstantValue,
+            SemanticCode::ConstWithNonConstantArgument,
+            SemanticCode::NonConstantListElement,
+            SemanticCode::NonConstantSetElement,
+            SemanticCode::NonConstantMapElement,
+            SemanticCode::NonConstantRecordField,
+            SemanticCode::ConstEvalTypeBool,
+            SemanticCode::ConstEvalTypeBoolInt,
+            SemanticCode::ConstEvalTypeBoolNumString,
+            SemanticCode::ConstEvalTypeInt,
+            SemanticCode::ConstEvalTypeNum,
+            SemanticCode::ConstEvalTypeNumString,
+            SemanticCode::ConstEvalTypeString,
+            SemanticCode::ConstEvalThrowsException,
+            SemanticCode::ConstEvalThrowsIdbze,
+            SemanticCode::ConstEvalPrimitiveEquality,
+            SemanticCode::ConstEvalMethodInvocation,
+            SemanticCode::RecursiveCompileTimeConstant,
         ];
         for code in codes {
             let info = code.code_info();
@@ -705,6 +886,24 @@ mod tests {
             SemanticCode::NonExhaustiveSwitchStatement,
             SemanticCode::NonExhaustiveSwitchExpression,
             SemanticCode::UnreachableSwitchCase,
+            SemanticCode::ConstInitializedWithNonConstantValue,
+            SemanticCode::ConstWithNonConstantArgument,
+            SemanticCode::NonConstantListElement,
+            SemanticCode::NonConstantSetElement,
+            SemanticCode::NonConstantMapElement,
+            SemanticCode::NonConstantRecordField,
+            SemanticCode::ConstEvalTypeBool,
+            SemanticCode::ConstEvalTypeBoolInt,
+            SemanticCode::ConstEvalTypeBoolNumString,
+            SemanticCode::ConstEvalTypeInt,
+            SemanticCode::ConstEvalTypeNum,
+            SemanticCode::ConstEvalTypeNumString,
+            SemanticCode::ConstEvalTypeString,
+            SemanticCode::ConstEvalThrowsException,
+            SemanticCode::ConstEvalThrowsIdbze,
+            SemanticCode::ConstEvalPrimitiveEquality,
+            SemanticCode::ConstEvalMethodInvocation,
+            SemanticCode::RecursiveCompileTimeConstant,
         ];
         for code in codes {
             assert_eq!(
