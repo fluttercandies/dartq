@@ -5,6 +5,7 @@
 //! UTF-16 offset (line/column are monotone in it), so no line-column
 //! computation is spent on sorting.
 
+use std::cmp::Ordering;
 use std::io;
 use std::time::Duration;
 
@@ -104,15 +105,7 @@ pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
     let prelude = prelude(engine)?;
     let layout = EngineLayout::over(engine, prelude.diagnostics.iter().map(|d| d.file));
     let mut diagnostics = prelude.diagnostics;
-    diagnostics.sort_by(|a, b| {
-        severity_rank(a.severity)
-            .cmp(&severity_rank(b.severity))
-            .then_with(|| {
-                path_key(layout.file_path(a.file)).cmp(path_key(layout.file_path(b.file)))
-            })
-            .then_with(|| a.range.offset.cmp(&b.range.offset))
-            .then_with(|| a.message.cmp(&b.message))
-    });
+    diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
         discovery: prelude.discovery,
@@ -123,4 +116,78 @@ pub fn run(engine: &mut Engine) -> Result<AnalyzeRun<'_>, AnalyzeError> {
         libraries_from_cache: prelude.libraries_from_cache,
         layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use dartq_diagnostics::{CodeInfo, DiagnosticType, FileId, Severity};
+    use dartq_engine::Engine;
+    use dartq_source::SourceRange;
+
+    use super::*;
+    use crate::workspace::{engine_config, test_fixture::workspace};
+
+    /// A hand-built diagnostic, identified by its message in the
+    /// assertions; the engine never analyzes it.
+    fn diagnostic(severity: Severity, file: FileId, offset: u32, message: &str) -> Diagnostic {
+        Diagnostic::new(
+            severity,
+            CodeInfo::new(
+                "undefined_function",
+                "UNDEFINED_FUNCTION",
+                DiagnosticType::CompileTimeError,
+                false,
+            ),
+            message,
+            file,
+            SourceRange { offset, length: 1 },
+            None,
+        )
+    }
+
+    /// The oracle-sort pin: severity, path bytes, offset, message, with a
+    /// crafted pair inverting under each adjacent key. The input arrives in
+    /// exact reverse of the expected output, so a dropped key leaves a
+    /// visible misorder: `omega` carries the smallest path and offset and
+    /// only its severity demotes it, `delta`'s smaller offset only path
+    /// bytes can outrank, `gamma`'s offset must overtake `beta`'s, and
+    /// `beta` must fall behind `alpha` on the message tiebreak.
+    #[test]
+    fn oracle_sort_pins_the_four_key_order() {
+        let root = workspace("analyze_sort", &[]);
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        // Paths interned directly (the daemon's set-content flow, applied
+        // so the layout can read text and line index) — the byte order of
+        // `lib/a.dart` vs `lib/b.dart` is the second sort key.
+        let a = engine.set_content(&root.join("lib/a.dart"), b"// a\n");
+        let b = engine.set_content(&root.join("lib/b.dart"), b"// b\n");
+        engine.apply_pending(&mut |_| {});
+        let layout = EngineLayout::over(&engine, [a, b]);
+
+        let mut diagnostics = vec![
+            diagnostic(Severity::Warning, a, 0, "omega"),
+            diagnostic(Severity::Error, b, 5, "delta"),
+            diagnostic(Severity::Error, a, 20, "gamma"),
+            diagnostic(Severity::Error, a, 10, "beta"),
+            diagnostic(Severity::Error, a, 10, "alpha"),
+        ];
+        diagnostics.sort_by(|left, right| oracle_cmp(left, right, &layout));
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, ["alpha", "beta", "gamma", "delta", "omega"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// One comparison of the oracle display order (DiagnosticWithPath.compareTo,
+/// dartdev analyze.dart:686-707): severity, file path, position, message.
+/// Position order is the UTF-16 offset (line/column are monotone in it), so
+/// no line-column computation is spent on sorting.
+fn oracle_cmp(a: &Diagnostic, b: &Diagnostic, layout: &EngineLayout<'_>) -> Ordering {
+    severity_rank(a.severity)
+        .cmp(&severity_rank(b.severity))
+        .then_with(|| path_key(layout.file_path(a.file)).cmp(path_key(layout.file_path(b.file))))
+        .then_with(|| a.range.offset.cmp(&b.range.offset))
+        .then_with(|| a.message.cmp(&b.message))
 }

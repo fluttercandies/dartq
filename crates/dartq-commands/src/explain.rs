@@ -29,6 +29,7 @@
 //! is born; a violation is a producer bug and stops the run (surfaced,
 //! never clamped).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -141,6 +142,21 @@ pub fn explain_after_analysis(
         })
         .collect();
 
+    // Per-file lookup maps for the closures below: one build each instead
+    // of an O(surfaces)/O(supers) linear find per reference row — the same
+    // build-once posture as the `file_labels` sort above. A file appears at
+    // most once per harvest vec (one library, one hit-file pass).
+    let surfaces_of: BTreeMap<FileId, &[DeclRow]> = harvest
+        .surfaces
+        .iter()
+        .map(|(_, file, surface)| (*file, surface.as_slice()))
+        .collect();
+    let supers_of: BTreeMap<FileId, &[TargetRef]> = harvest
+        .supers
+        .iter()
+        .map(|(file, targets)| (*file, targets.as_slice()))
+        .collect();
+
     let hits: Vec<SymbolDeclHit<'_>> = harvest
         .surfaces
         .iter()
@@ -160,20 +176,8 @@ pub fn explain_after_analysis(
         verbosity.into(),
         &hits,
         &harvest.refs,
-        |file| {
-            harvest
-                .surfaces
-                .iter()
-                .find(|(_, f, _)| *f == file)
-                .map_or(&[], |(_, _, surface)| surface.as_slice())
-        },
-        |file, _| {
-            harvest
-                .supers
-                .iter()
-                .find(|(f, _)| *f == file)
-                .map_or(&[], |(_, targets)| targets.as_slice())
-        },
+        |file| surfaces_of.get(&file).map_or(&[], |surface| *surface),
+        |file, _| supers_of.get(&file).map_or(&[], |targets| *targets),
         &importers,
         |library| idents[library as usize].as_deref().expect("live library"),
         |file| {
