@@ -6,7 +6,15 @@
 //! includes. Any malformed row fails the build with a `file:line` message;
 //! the emitted file is a pure function of the TSV, so builds are
 //! reproducible byte-for-byte.
+//!
+//! The table is also pinned against the oracle registry snapshot
+//! (`data/oracle-syntax-registry-3.13.1.txt`): every ParserErrorCode /
+//! ScannerErrorCode code the pinned 3.13.1 oracle can emit must exist in the
+//! TSV unless it is an exempted measured-dead code — a missing name fails the
+//! build, so the gate's acceptance set can never silently shrink below the
+//! oracle's emit domain.
 
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -65,6 +73,7 @@ fn main() {
         });
     }
     validate(&rows);
+    pin_to_oracle_registry(manifest_dir, &rows);
     emit(&rows);
 }
 
@@ -138,6 +147,68 @@ fn validate(rows: &[Row]) {
         dupes.is_empty(),
         "data/syntax-codes.tsv: duplicate code names {dupes:?}"
     );
+}
+
+/// Coverage pin against the pinned oracle registry: every ParserErrorCode /
+/// ScannerErrorCode code of analyzer-8.4.1 + _fe_analyzer_shared-91.0.0
+/// (`data/oracle-syntax-registry-3.13.1.txt`) must exist in the TSV unless it
+/// is an exempted measured-dead code. A missing name means the gate's
+/// acceptance set would silently drop every oracle diagnostic carrying it; a
+/// stale exemption means the snapshot was refreshed without re-deriving the
+/// prune rationale. Build-time on purpose: `cargo check` re-runs the pin.
+fn pin_to_oracle_registry(manifest_dir: &Path, rows: &[Row]) {
+    /// removedIn codes pruned from the TSV as measured-dead (TSV header,
+    /// docs/facts/syntax-codes.md section 9): present in the pinned registry,
+    /// never emitted by the pinned oracle, so they must not gate the pin.
+    const EXEMPTED_REGISTRY_CODES: [&str; 7] = [
+        "invalid_operator_for_super",
+        "missing_terminator_for_parameter_group",
+        "multiple_variables_in_for_each",
+        "non_user_definable_operator",
+        "unable_get_content",
+        "unexpected_terminator_for_parameter_group",
+        "wrong_terminator_for_parameter_group",
+    ];
+
+    let snapshot_path = manifest_dir.join("data/oracle-syntax-registry-3.13.1.txt");
+    println!("cargo:rerun-if-changed=data/oracle-syntax-registry-3.13.1.txt");
+    let snapshot = fs::read_to_string(&snapshot_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", snapshot_path.display()));
+
+    let tsv_names: HashSet<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+    let mut exempted: HashSet<&str> = EXEMPTED_REGISTRY_CODES.into_iter().collect();
+    for (no, line) in snapshot.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        assert!(
+            line.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "data/oracle-syntax-registry-3.13.1.txt:{}: expected a lowercase snake_case \
+             code name, got {line:?}",
+            no + 1
+        );
+        if !exempted.remove(line) && !tsv_names.contains(line) {
+            panic!(
+                "data/oracle-syntax-registry-3.13.1.txt:{}: oracle registry code `{line}` \
+                 is missing from data/syntax-codes.tsv — the gate's acceptance set would \
+                 silently drop every oracle diagnostic carrying it; add the row (with its \
+                 source class and captured template) or extend EXEMPTED_REGISTRY_CODES \
+                 with a recorded rationale",
+                no + 1
+            );
+        }
+    }
+    if !exempted.is_empty() {
+        let mut stale: Vec<&str> = exempted.into_iter().collect();
+        stale.sort_unstable();
+        panic!(
+            "data/oracle-syntax-registry-3.13.1.txt: EXEMPTED_REGISTRY_CODES entries no \
+             longer present in the registry snapshot: {stale:?} — the snapshot was \
+             refreshed; re-derive the exemption list (delete the retired names or \
+             re-record the prune rationale)"
+        );
+    }
 }
 
 /// Indices of `{N}` placeholders in a template, as `(index, byte offset)`.

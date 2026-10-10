@@ -218,6 +218,15 @@ struct JsonPositionDeltas {
     /// Total paired instances with a nonzero delta across all matched entries
     /// (the sample below is capped)
     nonzero_instances: usize,
+    /// Raw instances of matched keys on each side (all severities). Asymmetric
+    /// totals mean min-zip pairing left surplus instances unpaired — the
+    /// pairing covers only [`JsonPositionDeltas::paired_instances`] of them.
+    oracle_instances: usize,
+    dartq_instances: usize,
+    /// Instances actually paired: the min-zip length, summed over matched
+    /// entries. Surplus instances on the longer side stay unpaired and
+    /// contribute no delta rows.
+    paired_instances: usize,
     /// Nonzero-delta pairs in key-lexicographic order, then by oracle position,
     /// capped at [`POSITION_DELTA_SAMPLE_CAP`]. Zero-delta pairs stay silent.
     sample: Vec<JsonPositionDeltaRow>,
@@ -277,6 +286,9 @@ fn position_deltas(cmp: &Comparison, raw: &RawSideOutputs<'_>) -> JsonPositionDe
     let mut sample = Vec::new();
     let mut nonzero_entries = 0;
     let mut nonzero_instances = 0;
+    let mut oracle_instances = 0;
+    let mut dartq_instances = 0;
+    let mut paired_instances = 0;
     for key in &matched {
         let (Some(o_pos), Some(d_pos)) = (oracle.get(key), dartq.get(key)) else {
             // Unreachable by construction (a matched key survived the filters on
@@ -284,6 +296,9 @@ fn position_deltas(cmp: &Comparison, raw: &RawSideOutputs<'_>) -> JsonPositionDe
             // the channel informational either way.
             continue;
         };
+        oracle_instances += o_pos.len();
+        dartq_instances += d_pos.len();
+        paired_instances += o_pos.len().min(d_pos.len());
         let mut entry_nonzero = 0;
         for (&(o_line, o_col), &(d_line, d_col)) in o_pos.iter().zip(d_pos.iter()) {
             let delta_line = i64::from(d_line) - i64::from(o_line);
@@ -314,6 +329,9 @@ fn position_deltas(cmp: &Comparison, raw: &RawSideOutputs<'_>) -> JsonPositionDe
         matched_entries: matched.len(),
         entries_with_nonzero_delta: nonzero_entries,
         nonzero_instances,
+        oracle_instances,
+        dartq_instances,
+        paired_instances,
         sample,
     }
 }
@@ -685,11 +703,23 @@ fn markdown(
         meta.threshold,
         verdict.token()
     );
+    let asymmetry = if deltas.oracle_instances != deltas.dartq_instances {
+        format!(
+            "; instance totals differ: oracle {}, dartq {}, paired {} \
+             (surplus instances stay unpaired)",
+            deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances
+        )
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         md,
         "- position deltas (informational, not gated): {} matched entries, {} \
-         with nonzero line/col ({} instances; sample in report.json)",
-        deltas.matched_entries, deltas.entries_with_nonzero_delta, deltas.nonzero_instances
+         with nonzero line/col ({} instances; sample in report.json{})",
+        deltas.matched_entries,
+        deltas.entries_with_nonzero_delta,
+        deltas.nonzero_instances,
+        asymmetry
     );
     md
 }
@@ -1251,6 +1281,11 @@ mod tests {
         assert_eq!(deltas.matched_entries, 1);
         assert_eq!(deltas.entries_with_nonzero_delta, 1);
         assert_eq!(deltas.nonzero_instances, 3);
+        assert_eq!(
+            (deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances),
+            (3, 3, 3),
+            "equal totals: every instance paired"
+        );
         let rows: Vec<(u32, u32, u32, u32, i64, i64)> = deltas
             .sample
             .iter()
@@ -1283,6 +1318,11 @@ mod tests {
         assert_eq!(deltas.matched_entries, 1);
         assert_eq!(deltas.nonzero_instances, 1);
         assert_eq!(deltas.sample.len(), 1);
+        assert_eq!(
+            (deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances),
+            (2, 1, 1),
+            "asymmetric totals: min-zip pairs one row, the surplus oracle instance stays unpaired"
+        );
         assert_eq!(
             (deltas.sample[0].oracle_line, deltas.sample[0].dartq_line),
             (1, 2),
