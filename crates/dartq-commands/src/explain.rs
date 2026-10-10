@@ -105,9 +105,11 @@ fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value 
         for &file in members {
             let capture = engine.file_capture(file).expect("analyzed member");
             if let Some(rows) = capture.index.by_name(sym) {
-                hits.extend(
-                    rows.iter().map(|decl| SymbolDeclHit { library, file, decl }),
-                );
+                hits.extend(rows.iter().map(|decl| SymbolDeclHit {
+                    library,
+                    file,
+                    decl,
+                }));
                 hit_files.entry(library).or_default().push(file);
             }
         }
@@ -188,7 +190,11 @@ fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value 
                 .file_capture(file)
                 .map_or(&[][..], |capture| capture.index.decls())
         },
-        |file, _| supers.get(&file).map_or(&[][..], |targets| targets.as_slice()),
+        |file, _| {
+            supers
+                .get(&file)
+                .map_or(&[][..], |targets| targets.as_slice())
+        },
         &importers,
         |library| idents[library as usize].as_deref().expect("live library"),
         |file| {
