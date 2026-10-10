@@ -8,6 +8,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+mod curly_recovery;
 mod numbers;
 mod operators;
 mod strings;
@@ -68,6 +69,10 @@ pub(crate) struct Lexer<'s> {
     /// UTF-16 span of the comment lexeme behind `version_override` (set and
     /// cleared together with it; last match wins, same block).
     version_override_span: Option<SourceRange>,
+    /// Two-pass curly recovery (`None` on the first pass): byte offset of the
+    /// `{`/`${` the re-scan blames — see `curly_recovery`. Error-path-only
+    /// bookkeeping; never set on a clean file.
+    curly_recovery: Option<u32>,
 }
 
 impl<'s> Lexer<'s> {
@@ -87,12 +92,34 @@ impl<'s> Lexer<'s> {
             utf16_value: 0,
             version_override: None,
             version_override_span: None,
+            curly_recovery: None,
         };
         lex.next = lex.peek_char(0);
         lex
     }
 
     pub(crate) fn run(mut self) -> ScanResult {
+        let (result, curly_begin) = self.scan_once();
+        // Official scan/scanString (scanner.dart:90-108, 126-144): when the
+        // first pass errored while ending with exactly one unclosed `{`, a
+        // misaligned `{`/`${` is located in the token stream and the source
+        // is re-scanned once with that offset (the "user is typing" shape).
+        // Both gates are error-path-only: a clean file pays nothing beyond
+        // the O(1) empty-diagnostics check.
+        let recovery = curly_begin
+            .filter(|_| !result.diagnostics.is_empty())
+            .and_then(|begin| curly_recovery::recovery_offset(self.src, &result.tokens, begin));
+        match recovery {
+            None => result,
+            Some(offset) => {
+                let mut second = Lexer::new(self.src, self.config, self.file);
+                second.curly_recovery = Some(offset as u32);
+                second.scan_once().0
+            }
+        }
+    }
+
+    fn scan_once(&mut self) -> (ScanResult, Option<u32>) {
         let source_len = self.src.len();
         self.scan_header();
         loop {
@@ -110,18 +137,19 @@ impl<'s> Lexer<'s> {
                 Flow::Eof | Flow::CloseInterp => break,
             }
         }
-        self.close_unclosed_groups();
+        let curly_begin = self.close_unclosed_groups();
         self.emit(TokenKind::Eof, source_len, 0);
         let tokens = std::mem::take(&mut self.tokens);
         let end_of = std::mem::take(&mut self.end_of);
         let diags = std::mem::take(&mut self.diags);
-        ScanResult {
+        let result = ScanResult {
             tokens: TokenTable::new(tokens, end_of),
             diagnostics: crate::diag::finish(diags, self.src, self.file),
             language_version_override: self.version_override,
             language_version_override_span: self.version_override_span,
             line_index: LineIndex::new(self.src),
-        }
+        };
+        (result, curly_begin)
     }
 
     // --- basic advancement ---
@@ -782,6 +810,19 @@ impl<'s> Lexer<'s> {
     // --- group closing (official appendEndGroup/discardBeginGroupUntil) ---
 
     fn end_group(&mut self, close: TokenKind, start: usize) -> Flow {
+        // Two-pass recovery (official tokenizeCloseBrace :1139-1153): in the
+        // re-scan, a `}` whose stack head is the blamed `{` closes it with a
+        // synthetic closer + report (unmatchedBeginGroup), and then goes on
+        // to close the next begin down via the normal path below.
+        if close == TokenKind::CloseCurly
+            && let Some(offset) = self.curly_recovery
+            && let Some(&begin_idx) = self.groups.last()
+            && self.tokens[begin_idx as usize].kind == TokenKind::OpenCurly
+            && self.tokens[begin_idx as usize].byte_offset == offset
+        {
+            self.groups.pop();
+            self.report_unmatched_begin(begin_idx, start);
+        }
         // `<` never matches an end token (official discardBeginGroupUntil).
         self.discard_open_lt();
         let opens = close.matching_opens();
@@ -847,8 +888,16 @@ impl<'s> Lexer<'s> {
         );
     }
 
-    fn close_unclosed_groups(&mut self) {
+    /// Closes every still-open group at EOF. Returns the token index of the
+    /// single unclosed `{` when the stack was exactly one `{` (official
+    /// `appendEofToken`'s `openBraceWithMissingEndForPossibleRecovery`
+    /// condition, :532-537) — the two-pass recovery candidate.
+    fn close_unclosed_groups(&mut self) -> Option<u32> {
         self.discard_open_lt();
+        let curly_begin = match self.groups.as_slice() {
+            [idx] if self.tokens[*idx as usize].kind == TokenKind::OpenCurly => Some(*idx),
+            _ => None,
+        };
         let eof = self.src.len();
         while let Some(begin_idx) = self.groups.pop() {
             let begin_kind = self.tokens[begin_idx as usize].kind;
@@ -870,5 +919,6 @@ impl<'s> Lexer<'s> {
             let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
             self.diag(EXPECTED_TOKEN, || msg::expected_token(lexeme), eof, eof);
         }
+        curly_begin
     }
 }

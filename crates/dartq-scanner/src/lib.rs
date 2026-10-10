@@ -100,11 +100,12 @@
 //! `Identifier` token for recovery (the official `NonAsciiIdentifierToken`
 //! recovery shape).
 //!
-//! # Recovery strategy list (non-interrupting, single pass)
+//! # Recovery strategy list (single pass + one conditional re-scan)
 //!
 //! | Input | Behavior |
 //! |---|---|
 //! | Unclosed `{`/`(`/`[`/`${` (EOF) | Pop the stack one by one, inserting synthetic close tokens + `expected_token` diagnostics (official `unmatchedBeginGroup`) |
+//! | Exactly one unclosed `{` at EOF + a misaligned `{`/`${` in the stream | Two-pass recovery (official `scan`/`scanString` re-scan): the blamed brace's offset feeds a second full scan in which a `}` closing it is replaced by a synthetic closer + `expected_token` (`tokenizeCloseBrace`), and a blamed `${` is discarded with a synthetic `}` at the `$` while the string body resumes after the `{` (`tokenizeInterpolatedExpression`) — the "user is typing" shape recovers to the oracle's outline |
 //! | Extra/mismatched `}`/`)`/`]` | No scanner diagnostic, emitted as normal tokens (when official `discardBeginGroupUntil` finds no match it emits as-is; the parser reports the error) |
 //! | Close token matching deep in the stack | Silently pop the intermediate unclosed begins (official recovery semantics, `{[}` → `}` matches `{`) |
 //! | Unterminated string | Synthetic closing-quote STRING segment + `unterminated_string_literal` (range pinned to the last character, aligned with the analyzer's translation of `ErrorToken`) |

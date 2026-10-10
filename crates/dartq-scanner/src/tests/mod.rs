@@ -1,5 +1,6 @@
 //! Shared test helpers.
 
+mod curly_recovery;
 mod errors;
 mod escapes;
 mod inserted;

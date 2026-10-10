@@ -311,6 +311,22 @@ impl Lexer<'_> {
             let dollar_start = self.pos - 1; // `$` is a single byte
             self.bump(); // '{'
             self.begin_group(TokenKind::StringInterpolationExpression, dollar_start);
+            // Two-pass recovery (official tokenizeInterpolatedExpression
+            // :2260-2266): in the re-scan, the blamed `${` is discarded right
+            // after being opened — unmatchedBeginGroup pins a synthetic `}` at
+            // the `$` and reports it, and the string body resumes immediately
+            // after the `{` (official `return advance()`). The whole
+            // expression text stays string content: the next `"` in it closes
+            // the literal, which is what turns a typing-in-progress `${` into
+            // a plain unterminated/terminated string instead of cascading
+            // code-mode errors.
+            if self.curly_recovery == Some(dollar_start as u32) {
+                let begin_idx = self.groups.pop().expect("SII was just pushed");
+                self.report_unmatched_begin(begin_idx, dollar_start);
+                f.segment_start = self.pos;
+                f.escape_err = false;
+                return false;
+            }
             return true;
         }
         self.scan_interpolated_identifier();
