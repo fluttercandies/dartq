@@ -80,6 +80,10 @@ impl Workspace {
             r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
         );
         write("lib/main.dart", main_dart);
+        // The conventional package layout includes the test directory even
+        // when the seeded files don't touch it: fixtures that add test
+        // files write into it directly.
+        std::fs::create_dir_all(root.join("test")).expect("test dir");
 
         // macOS /var → /private/var: the engine's package table canonicalizes
         // its config dir, so every face and every test assertion must derive

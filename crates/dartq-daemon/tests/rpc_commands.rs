@@ -20,6 +20,16 @@ use serde_json::{Value, json};
 /// can never yank another test's workspace mid-session.
 static WORKSPACE: Mutex<()> = Mutex::new(());
 
+/// Poisoning is recovered deliberately: the guard protects no cross-test
+/// state (every test owns a unique workspace and store root), so a
+/// panicking holder has already failed loudly and the waiters only need
+/// the serialization.
+fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
+    WORKSPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// `initialize` + `initialized`: the sweep publishes `publishes` frames
 /// (one on a fixture with diagnostics, zero on a clean one).
 fn handshake(h: &mut common::Harness, publishes: usize) {
@@ -58,10 +68,7 @@ fn machine_face_rows(
     let mut machine = Vec::new();
     dartq_diagnostics::write_machine(
         &mut machine,
-        &dartq_diagnostics::AnalysisOutput {
-            diagnostics,
-            files,
-        },
+        &dartq_diagnostics::AnalysisOutput { diagnostics, files },
     )
     .expect("machine write");
     String::from_utf8(machine)
@@ -107,13 +114,17 @@ fn seeded_query_workspace() -> Workspace {
 /// under the frozen `schema_version` stamp.
 #[test]
 fn dartq_check_matches_the_cli_machine_face() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-check"));
     handshake(&mut h, 1);
 
     h.step(
-        &request(2, "dartq/check", json!({ "paths": [workspace.path("lib")] })),
+        &request(
+            2,
+            "dartq/check",
+            json!({ "paths": [workspace.path("lib")] }),
+        ),
         1,
     );
     let result = answer_result(&h, 2);
@@ -124,13 +135,19 @@ fn dartq_check_matches_the_cli_machine_face() {
     let run = dartq_commands::check::analyze_files(&files).expect("check core");
     let output = run.output();
     let expected = machine_face_rows(output.diagnostics, output.files);
-    assert!(!expected.is_empty(), "the broken fixture carries diagnostics");
+    assert!(
+        !expected.is_empty(),
+        "the broken fixture carries diagnostics"
+    );
     assert_eq!(
         result["diagnostics"],
         json!(expected),
         "the RPC rows equal the CLI machine rows"
     );
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -139,7 +156,7 @@ fn dartq_check_matches_the_cli_machine_face() {
 /// its URI the encoded file path and its diagnostic fields identical.
 #[test]
 fn dartq_analyze_matches_the_cli_machine_face() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-analyze"));
     handshake(&mut h, 1);
@@ -172,6 +189,9 @@ fn dartq_analyze_matches_the_cli_machine_face() {
         assert_eq!(entry["severity"], 1, "the fixture row is an error");
     }
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -181,7 +201,7 @@ fn dartq_analyze_matches_the_cli_machine_face() {
 /// CLI's own end-to-end test pins.
 #[test]
 fn dartq_query_equals_the_cli_json_face() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-query"));
@@ -211,6 +231,9 @@ fn dartq_query_equals_the_cli_json_face() {
     assert_eq!(references[1]["kind"], "invoked");
     assert_eq!(references[1]["offset"], 42);
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -220,7 +243,7 @@ fn dartq_query_equals_the_cli_json_face() {
 /// impact test makes.
 #[test]
 fn dartq_impact_matches_the_cli_report() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     // The test imports the lib through its package URI only: a clean
     // workspace keeps the sweep publish-free (a deterministic handshake).
@@ -234,7 +257,11 @@ fn dartq_impact_matches_the_cli_report() {
     handshake(&mut h, 0);
 
     h.step(
-        &request(2, "dartq/impact", json!({ "path": a.display().to_string() })),
+        &request(
+            2,
+            "dartq/impact",
+            json!({ "path": a.display().to_string() }),
+        ),
         1,
     );
     let result = answer_result(&h, 2);
@@ -248,7 +275,10 @@ fn dartq_impact_matches_the_cli_report() {
         .collect();
     assert_eq!(
         symbols,
-        vec![format!("{}|Foo", a.display()), format!("{}|foo", a.display())],
+        vec![
+            format!("{}|Foo", a.display()),
+            format!("{}|foo", a.display())
+        ],
         "every face name, ASCII-sorted"
     );
 
@@ -284,6 +314,9 @@ fn dartq_impact_matches_the_cli_report() {
         json!([{ "label": "default", "compatible": true }]),
     );
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -303,9 +336,11 @@ fn seeded_explain_workspace() -> Workspace {
         "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n",
     )
     .expect("write dog.dart");
-    fs::write(workspace.path("lib/main.dart"), "import 'dog.dart';\nvoid main() {\n  var d = Dog();\n  d.bark();\n}\n")
-        .expect("write main.dart");
-    fs::create_dir_all(workspace.path("test")).expect("test dir");
+    fs::write(
+        workspace.path("lib/main.dart"),
+        "import 'dog.dart';\nvoid main() {\n  var d = Dog();\n  d.bark();\n}\n",
+    )
+    .expect("write main.dart");
     fs::write(
         workspace.path("test/dog_test.dart"),
         "import 'package:fixture/dog.dart';\nvoid main() {\n  var d = Dog();\n}\n",
@@ -323,7 +358,7 @@ fn seeded_explain_workspace() -> Workspace {
 /// fan-out, which the session engine runs over recomputed libraries only).
 #[test]
 fn dartq_explain_answers_the_report() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = seeded_explain_workspace();
     let animal = workspace.path("lib/animal.dart");
     let dog = workspace.path("lib/dog.dart");
@@ -394,15 +429,17 @@ fn dartq_explain_answers_the_report() {
     let result = answer_result(&h, 3);
     assert_eq!(result["since"], 0, "the cursor echoes");
     assert_eq!(
-        result["declaration"]["name"],
-        "Dog",
+        result["declaration"]["name"], "Dog",
         "the red line stays in delta answers"
     );
     assert_eq!(result["inheritance"].as_array().expect("array").len(), 1);
     assert!(
         result["references"].as_array().expect("array").is_empty()
             && result["dependencies"].as_array().expect("array").is_empty()
-            && result["affected_tests"].as_array().expect("array").is_empty(),
+            && result["affected_tests"]
+                .as_array()
+                .expect("array")
+                .is_empty(),
         "no file changed since the cursor: {result}"
     );
 
@@ -455,7 +492,7 @@ fn dartq_explain_answers_the_report() {
 /// `INVALID_PARAMS` and the session stays healthy.
 #[test]
 fn dartq_explain_rejects_a_bad_symbol() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = seeded_explain_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-explain-usage"));
     handshake(&mut h, 0);
@@ -491,38 +528,38 @@ fn dartq_explain_rejects_a_bad_symbol() {
 /// fixture shape driven over RPC.
 #[test]
 fn dartq_compat_matches_the_cli_matrix() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     fs::write(
         workspace.path("lib/a.dart"),
         "import 'dart:async';\nclass Foo {}\n",
     )
     .expect("write a.dart");
+    // The SDK axes live under `sdks/`, which the base fixture doesn't
+    // create: each write establishes its parent directories.
+    let write = |relative: &str, content: &str| {
+        let path = workspace.path(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(path, content).expect("file");
+    };
     // The async-carrying axis.
-    fs::write(workspace.path("sdks/new/version"), "3.13.1\n").expect("version");
-    fs::write(
-        workspace.path("sdks/new/lib/libraries.json"),
+    write("sdks/new/version", "3.13.1\n");
+    write(
+        "sdks/new/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "async": {"uri": "async/async.dart"}}}}"#,
-    )
-    .expect("libraries.json");
-    fs::write(
-        workspace.path("sdks/new/lib/async/async.dart"),
-        "library dart.async;\n",
-    )
-    .expect("async.dart");
+    );
+    write("sdks/new/lib/async/async.dart", "library dart.async;\n");
     // The async-less axis.
-    fs::write(workspace.path("sdks/old/version"), "3.5.0\n").expect("version");
-    fs::write(
-        workspace.path("sdks/old/lib/libraries.json"),
+    write("sdks/old/version", "3.5.0\n");
+    write(
+        "sdks/old/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
-    )
-    .expect("libraries.json");
+    );
     for sdk in ["new", "old"] {
-        fs::write(
-            workspace.path(&format!("sdks/{sdk}/lib/_internal/allowed_experiments.json")),
+        write(
+            &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
             r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-        )
-        .expect("allowed_experiments.json");
+        );
     }
 
     let a = workspace.path("lib/a.dart");
@@ -557,6 +594,9 @@ fn dartq_compat_matches_the_cli_matrix() {
     assert_eq!(matrix[1]["compatible"], true);
     assert!(matrix[1].get("first_failure").is_none());
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -566,7 +606,7 @@ fn dartq_compat_matches_the_cli_matrix() {
 /// missing target answers the usage tier over RPC.
 #[test]
 fn dartq_fix_reports_the_schema_shaped_empty_document() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-fix"));
     handshake(&mut h, 0);
@@ -596,6 +636,9 @@ fn dartq_fix_reports_the_schema_shaped_empty_document() {
         "the CLI's usage message body: {error}"
     );
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -605,7 +648,7 @@ fn dartq_fix_reports_the_schema_shaped_empty_document() {
 /// the same machinery `dartq/analyze` rides.
 #[test]
 fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-cancel"));
     handshake(&mut h, 1);
@@ -626,9 +669,15 @@ fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
         .iter()
         .find(|frame| frame.get("id") == Some(&json!(2)))
         .expect("the cancelled request answers");
-    assert_eq!(answer["error"]["code"], -32800, "RequestCancelled: {answer}");
+    assert_eq!(
+        answer["error"]["code"], -32800,
+        "RequestCancelled: {answer}"
+    );
     assert!(answer.get("result").is_none(), "no result rides the cancel");
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -638,7 +687,7 @@ fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
 /// compact (the default) keeps the full rows.
 #[test]
 fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-verbosity"));
     handshake(&mut h, 1);
@@ -686,6 +735,9 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
     assert!(entry.get("severity").is_some(), "compact keeps severity");
     assert!(entry.get("message").is_some(), "compact keeps the message");
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
@@ -694,7 +746,7 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
 /// session stays healthy afterwards.
 #[test]
 fn dartq_invalid_verbosity_answers_invalid_params() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-invalid-verbosity"));
     handshake(&mut h, 0);
@@ -715,6 +767,9 @@ fn dartq_invalid_verbosity_answers_invalid_params() {
     let answer = answer_result(&h, 3);
     assert_eq!(answer["schema_version"], 1);
 
+    // Shutdown answers, then exit is the clean end (a bare `exit` is
+    // EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
