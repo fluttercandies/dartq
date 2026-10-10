@@ -133,10 +133,18 @@ impl SnapshotStore {
     /// Loads the generation matching `expected`, or `None` on any
     /// mismatch, damage, or incompleteness: the header must equal
     /// `expected`, `tables.json` must parse, the entries directory must
-    /// exist, and the set of entry files on disk must equal the entry-id
-    /// manifest inside `tables.json` exactly — a missing, extra, or
-    /// undecodable entry demotes the whole generation to a miss. There is
-    /// no partial `Some`.
+    /// exist, and the decodable entries whose tables stamp matches this
+    /// generation's `tables.json` must equal the entry-id manifest exactly
+    /// — a missing, extra, or undecodable entry demotes the whole
+    /// generation to a miss. There is no partial `Some`.
+    ///
+    /// The stamp check is the save-group pairing gate (#338): an entry file
+    /// only decodes under the tables it was saved with. A file whose stamp
+    /// mismatches — an earlier save's entry facing a newer tables, the
+    /// mixed middle of a torn re-save — is treated as *absent*, never
+    /// fatal; the manifest equality then decides. Stale files from an
+    /// interrupted sweep are therefore invisible residue, while a stamped
+    /// file outside the manifest still demotes the generation.
     ///
     /// Entry order is deterministic (sorted by key id), and the load
     /// touches the generation's recency marker once, refreshing its access
@@ -148,13 +156,15 @@ impl SnapshotStore {
         if stored != *expected {
             return None;
         }
-        let stored_tables: StoredTables = parse(&fs::read(generation.join("tables.json")).ok()?)?;
+        let tables_bytes = fs::read(generation.join("tables.json")).ok()?;
+        let stored_tables: StoredTables = parse(&tables_bytes)?;
+        let tables_stamp = crate::blake3_128(&tables_bytes);
         let mut claimed = stored_tables.entry_ids;
         claimed.sort_unstable();
 
         // The entries directory must exist (a generation is its entries,
-        // even when the manifest is empty) and every decodable entry file
-        // must carry a claimed id.
+        // even when the manifest is empty) and every decodable, stamped
+        // entry file must carry a claimed id.
         let mut present: Vec<[u8; 16]> = Vec::with_capacity(claimed.len());
         let mut entries = Vec::with_capacity(claimed.len());
         for file in fs::read_dir(generation.join("entries")).ok()?.flatten() {
@@ -162,7 +172,11 @@ impl SnapshotStore {
                 continue;
             };
             let bytes = fs::read(file.path()).ok()?;
-            entries.push(entry::decode::<T>(&bytes)?);
+            let (decoded, stamp) = entry::decode::<T>(&bytes)?;
+            if stamp != tables_stamp {
+                continue;
+            }
+            entries.push(decoded);
             present.push(id);
         }
         present.sort_unstable();
@@ -178,21 +192,22 @@ impl SnapshotStore {
         })
     }
 
-    /// Writes a generation: entries first, then the remap tables with the
-    /// entry-id manifest folded in (one atomic unit), then the header. The
-    /// manifest names exactly the entries passed to this call, so `load`
-    /// accepts the generation only when the directory holds precisely that
-    /// set — a torn or failed re-save leaves the previous manifest facing
-    /// extra files, which demotes the whole generation to a miss instead
-    /// of loading a mixture of two saves.
+    /// Writes a generation: the remap tables with the entry-id manifest
+    /// folded in first (one atomic unit — the stamp source every entry
+    /// frame embeds must exist before the entries do), then the stamped
+    /// entries, then the stale-entry sweep, then the header. `load` accepts
+    /// the generation only when the directory holds precisely the stamped,
+    /// claimed set — a torn save leaves old-stamped entries facing the new
+    /// tables and demotes to a miss instead of loading a mixture of two
+    /// saves (#338 save-group atomicity: the tables-stamp scheme, chosen
+    /// over flock for portability — no platform locking primitives, and a
+    /// concurrent-writer race degrades to a miss, never corruption).
     ///
     /// The save-shape contract (see the crate docs): a save claims the
-    /// *complete* entry set of the generation. Entry keys are a
-    /// deterministic function of their content, so re-saves whose entry
-    /// set only grows stay coherent; any other shape leaves the abandoned
-    /// files of earlier saves in place (there is no stale sweep — they die
-    /// with the generation under LRU) and the manifest gate demotes the
-    /// generation to a miss.
+    /// *complete* entry set of the generation. At save end the sweep removes
+    /// every on-disk entry outside the claim, so any set shape — growing,
+    /// shrinking, or changed — re-saves coherently, and a failed save
+    /// degrades to a miss, never a mixture.
     ///
     /// Capacity is throttled, not per-save: the bytes just written accrue
     /// into a cheap estimate, and only when the estimate crosses
@@ -219,23 +234,36 @@ impl SnapshotStore {
         let generation = self.generation_dir(header);
         let entries_dir = generation.join("entries");
         fs::create_dir_all(&entries_dir)?;
-        let mut written = 0u64;
-        let mut ids: Vec<[u8; 16]> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let id = entry.key.id();
-            let framed = entry::encode(entry)?;
-            written += framed.len() as u64;
-            atomic_write(
-                &entries_dir.join(format!("{}.entry", hex::encode(id))),
-                &framed,
-            )?;
-            ids.push(id);
-        }
+        let mut ids: Vec<[u8; 16]> = entries.iter().map(|entry| entry.key.id()).collect();
         ids.sort_unstable();
         ids.dedup();
-        let encoded_tables = serde_json::to_vec(&TablesFile { tables, entry_ids: &ids })?;
-        written += encoded_tables.len() as u64;
+        let encoded_tables = serde_json::to_vec(&TablesFile {
+            tables,
+            entry_ids: &ids,
+        })?;
+        // Tables first: the entry frames below embed the stamp of these
+        // exact bytes, pairing each entry with the save group that wrote it.
         atomic_write(&generation.join("tables.json"), &encoded_tables)?;
+        let tables_stamp = crate::blake3_128(&encoded_tables);
+        let mut written = encoded_tables.len() as u64;
+        for entry in entries {
+            let framed = entry::encode(entry, tables_stamp)?;
+            written += framed.len() as u64;
+            atomic_write(
+                &entries_dir.join(format!("{}.entry", hex::encode(entry.key.id()))),
+                &framed,
+            )?;
+        }
+        // Generational sweep: the manifest claims exactly `ids`, so entry
+        // files left by an earlier save with a different set are removed —
+        // the on-disk set equals the claim when this save returns.
+        if let Ok(present) = fs::read_dir(&entries_dir) {
+            for file in present.flatten() {
+                if entry_file_id(&file.path()).is_some_and(|id| ids.binary_search(&id).is_err()) {
+                    let _ = fs::remove_file(file.path());
+                }
+            }
+        }
         let encoded_header = serde_json::to_vec(header)?;
         written += encoded_header.len() as u64;
         atomic_write(&generation.join("header.json"), &encoded_header)?;

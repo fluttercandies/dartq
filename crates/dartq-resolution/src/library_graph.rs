@@ -146,6 +146,14 @@ impl Combinators {
         Self(Box::new([]))
     }
 
+    /// The clause list in source order. Clause name sets carry the
+    /// constructor-expanded spellings ([`Self::new`]); the facts-snapshot
+    /// persistence face round-trips through this view.
+    #[must_use]
+    pub fn clauses(&self) -> &[CombinatorClause] {
+        &self.0
+    }
+
     /// Whether `name` survives this directive's combinators, applied in
     /// source order (`summary2/combinator.dart` `allows`: a `show` the name
     /// is not in rejects it; a `hide` containing it rejects it; later

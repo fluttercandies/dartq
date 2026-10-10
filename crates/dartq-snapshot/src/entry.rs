@@ -1,4 +1,5 @@
-//! Snapshot entries: keys and the checksummed JSON payload frame.
+//! Snapshot entries: keys and the checksummed, tables-stamped JSON payload
+//! frame.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -33,8 +34,10 @@ impl EntryKey {
 }
 
 /// One stored entry. On disk: the blake3-128 hex checksum of the JSON
-/// bytes, a newline, then those bytes — so truncation and corruption are
-/// both caught by the checksum, and the payload is human-readable.
+/// bytes, a space, the blake3-128 hex stamp of the generation's
+/// `tables.json` bytes, a newline, then those bytes — so truncation and
+/// corruption are both caught by the checksum, and an entry is only ever
+/// decoded under the save group (the same tables) that wrote it (#338).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry<T> {
     pub key: EntryKey,
@@ -43,28 +46,38 @@ pub struct Entry<T> {
 
 /// Frames an entry for writing. Infallible except for payload
 /// serialization.
-pub(super) fn encode<T: Serialize>(entry: &Entry<T>) -> Result<Vec<u8>, serde_json::Error> {
+pub(super) fn encode<T: Serialize>(
+    entry: &Entry<T>,
+    tables_stamp: [u8; 16],
+) -> Result<Vec<u8>, serde_json::Error> {
     let payload = serde_json::to_vec(entry)?;
-    let mut framed = Vec::with_capacity(33 + payload.len());
+    let mut framed = Vec::with_capacity(66 + payload.len());
     framed.extend_from_slice(hex::encode(blake3_128(&payload)).as_bytes());
+    framed.push(b' ');
+    framed.extend_from_slice(hex::encode(tables_stamp).as_bytes());
     framed.push(b'\n');
     framed.extend_from_slice(&payload);
     Ok(framed)
 }
 
 /// Decodes a framed entry; `None` on any framing, checksum, or JSON
-/// failure (the accelerator invariant: corruption is a miss).
-pub(super) fn decode<T: DeserializeOwned>(framed: &[u8]) -> Option<Entry<T>> {
+/// failure (the accelerator invariant: corruption is a miss). The embedded
+/// tables stamp returns with the entry — the store compares it against the
+/// generation's current `tables.json` and treats a mismatch as *absent*
+/// (an entry from another save group), never as corrupt.
+pub(super) fn decode<T: DeserializeOwned>(framed: &[u8]) -> Option<(Entry<T>, [u8; 16])> {
     let newline = framed.iter().position(|&b| b == b'\n')?;
-    let (tag, payload) = (&framed[..newline], &framed[newline + 1..]);
-    if tag.len() != 32 {
+    let (tags, payload) = (&framed[..newline], &framed[newline + 1..]);
+    // Two 32-character hex tags separated by one space.
+    if tags.len() != 65 || tags[32] != b' ' {
         return None;
     }
-    let checksum: [u8; 16] = hex::decode(tag).ok()?.try_into().ok()?;
+    let checksum: [u8; 16] = hex::decode(&tags[..32]).ok()?.try_into().ok()?;
+    let stamp: [u8; 16] = hex::decode(&tags[33..]).ok()?.try_into().ok()?;
     if blake3_128(payload) != checksum {
         return None;
     }
-    serde_json::from_slice(payload).ok()
+    serde_json::from_slice(payload).ok().map(|entry| (entry, stamp))
 }
 
 #[cfg(test)]
@@ -82,8 +95,9 @@ mod tests {
             },
             payload: vec!["alpha".to_string(), "beta".to_string()],
         };
-        let framed = encode(&entry).expect("vec serializes");
-        assert_eq!(decode::<Vec<String>>(&framed), Some(entry));
+        let stamp = [7u8; 16];
+        let framed = encode(&entry, stamp).expect("vec serializes");
+        assert_eq!(decode::<Vec<String>>(&framed), Some((entry.clone(), stamp)));
 
         // Any single-byte payload flip trips the checksum.
         let mut corrupt = framed.clone();
@@ -94,5 +108,11 @@ mod tests {
         // Truncation before the newline and into the payload both miss.
         assert_eq!(decode::<Vec<String>>(&framed[..31]), None);
         assert_eq!(decode::<Vec<String>>(&framed[..framed.len() / 2]), None);
+
+        // The stamp round-trips distinctly.
+        assert_ne!(
+            decode::<Vec<String>>(&encode(&entry, [8u8; 16]).expect("encode")).expect("decoded"),
+            (entry.clone(), stamp)
+        );
     }
 }

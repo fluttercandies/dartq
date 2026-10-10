@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! <root>/snapshots/<generation id>/header.json    generation header (last write)
-//! <root>/snapshots/<generation id>/tables.json    remap slices + entry-id manifest (one atomic unit)
+//! <root>/snapshots/<generation id>/tables.json    remap slices + entry-id manifest (written first)
 //! <root>/snapshots/<generation id>/recency        load-recency marker (touched once per load)
 //! <root>/snapshots/<generation id>/entries/<entry id>.entry
 //! ```
@@ -23,33 +23,39 @@
 //! name is derived from the header itself, so a header mismatch is detected
 //! before any large read. Entries are per-file facts keyed by [`EntryKey`]
 //! (content hash + feature fingerprint + semantic version, PRD §5.6); each
-//! entry file is a blake3-128 checksum line followed by the payload JSON.
-//! `tables.json` carries the remap slices together with the entry-id
-//! manifest — the exact set of entry files the generation claims — and
-//! [`SnapshotStore::load`] accepts the generation only when the entries
-//! directory matches that set exactly, so a torn or raced save can never
-//! load as a mixture of two saves. Every file is written to a sibling
-//! temporary file and moved into place with [`std::fs::rename`], so a
-//! reader never observes a torn write.
+//! entry file is a blake3-128 checksum, the blake3-128 *stamp* of the
+//! generation's `tables.json` bytes, then the payload JSON. `tables.json`
+//! carries the remap slices together with the entry-id manifest — the exact
+//! set of entry files the generation claims. [`SnapshotStore::save`] writes
+//! the tables first (the stamp source must exist before the entries embed
+//! it), then the stamped entries, then sweeps every on-disk entry outside
+//! the claim, then the header; [`SnapshotStore::load`] accepts the
+//! generation only when the stamped, decodable entries equal that claim
+//! exactly, so a torn or raced save can never load as a mixture of two
+//! saves. Every file is written to a sibling temporary file and moved into
+//! place with [`std::fs::rename`], so a reader never observes a torn write.
 //!
 //! # The recovery contract
 //!
 //! What a crash (or a failed save) may leave on disk, and what happens:
 //!
 //! - **Guaranteed loadable**: the last generation whose `save` completed
-//!   every rename. Every returned entry passed its blake3-128 checksum and
-//!   JSON decode, and the entry files on disk are exactly the set the
-//!   manifest claims. A re-save that failed mid-way keeps the generation
-//!   loadable when its entry set is a subset of the current claim — the
-//!   rewritten entry files carry the new payloads (same key, same id) —
-//!   while a failed save whose set adds keys leaves extra files that demote
-//!   the generation to a miss.
+//!   every rename. Every returned entry passed its blake3-128 checksum,
+//!   its tables stamp matches the generation's `tables.json`, and the
+//!   stamped entry files on disk are exactly the set the manifest claims.
+//!   A re-save that failed mid-way keeps the generation loadable when the
+//!   interrupted save had not yet replaced the tables (the old stamped
+//!   entries still pair with them); once the new tables have landed, the
+//!   old-stamped entries are discarded and the generation is a miss until
+//!   the save is retried. Every such outcome is an availability loss (one
+//!   reanalysis), never a correctness one.
 //! - **Guaranteed lost**: any save whose renames did not all complete —
-//!   including the mixed middle of a torn re-save, which the manifest gate
-//!   demotes to a miss. There is no fsync anywhere; after power loss even
-//!   the last fully-renamed generation may vanish entirely (directory
-//!   entries are not durable). Every such outcome is a miss, never an
-//!   error: the accelerator invariant.
+//!   including the mixed middle of a torn re-save, which the stamp gate
+//!   (and the manifest gate behind it) demotes to a miss. There is no
+//!   fsync anywhere; after power loss even the last fully-renamed
+//!   generation may vanish entirely (directory entries are not durable).
+//!   Every such outcome is a miss, never an error: the accelerator
+//!   invariant.
 //! - **Never guaranteed**: that a re-save is atomic (it can tear; the torn
 //!   state is a miss, not a mixture), that the on-disk entry set is
 //!   complete (an incomplete set is a miss, not a smaller `Some`), or that
@@ -65,13 +71,14 @@
 //! # The save-shape contract
 //!
 //! Each `save` claims the *complete* entry set of the generation: the
-//! manifest written with the tables names exactly the entries passed in.
-//! Entry keys are a deterministic function of their content triple, so
-//! re-saves whose entry set only grows stay coherent, while a re-save with
-//! any other shape leaves the abandoned files of earlier saves in place
-//! (there is no stale sweep; they die with the generation under LRU) and
-//! the manifest gate then demotes the whole generation — an availability
-//! loss (one reanalysis), never a correctness one.
+//! manifest written with the tables names exactly the entries passed in,
+//! and the save-end sweep removes every on-disk entry outside the claim,
+//! so the generation is coherent in any set shape — growing, shrinking, or
+//! changed. The daemon flush obligation (#377) stands: flush writes the
+//! full current entry set, never a partial subset. A save that fails
+//! mid-way may leave residue (old-stamped entries, a partial sweep); the
+//! stamp and manifest gates demote that to a miss, never a mixture, and
+//! the next full-set save sweeps it away.
 //!
 //! # Format
 //!

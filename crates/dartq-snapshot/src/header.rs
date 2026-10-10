@@ -10,11 +10,15 @@ use crate::blake3_128;
 /// payload semantics live in [`GenerationHeader::semantic_version`], which
 /// the caller supplies.
 ///
-/// v2 folds the entry-id manifest into `tables.json` (one atomic unit
-/// with the remap slices). No on-disk back-compat is provided or needed:
-/// nothing consumes the format yet — the daemon's `save_generation` is
-/// unwired and the load-side wiring (#341) designs against this contract.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// v2 folded the entry-id manifest into `tables.json` (one atomic unit
+/// with the remap slices). v3 (#338 save-group atomicity, #341): the entry
+/// frame embeds a blake3-128 stamp of the generation's `tables.json`
+/// bytes — tables are written first, entries carry the stamp, and `load`
+/// discards entries whose stamp mismatches, so an entry can only ever
+/// decode under the save group that wrote it. No on-disk back-compat is
+/// provided or needed: nothing consumes the format yet — the load-side
+/// wiring (#344) designs against this contract.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// Identity of one snapshot generation (PRD §5.5, §5.6). A loaded
 /// generation is used only when every field equals what the caller

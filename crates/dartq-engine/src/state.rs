@@ -2,6 +2,8 @@
 //! pending overlay, the library arena with its reverse-import index, the
 //! per-library result cache, and the bounded per-file facts cache.
 
+pub mod persist;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,7 +38,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// [`UnitFacts::api_signature`], so any bump of
 /// `dartq_semantic::SIGNATURE_VERSION` (the element-face composition) must
 /// bump this too, or stale-signature comparisons survive a facts-cache hit.
-pub(crate) const FACTS_SEMANTIC_VERSION: u32 = 3;
+///
+/// Public since #341: the snapshot wiring keys every
+/// `dartq_snapshot::EntryKey` and the generation header's
+/// `semantic_version` on it.
+pub const FACTS_SEMANTIC_VERSION: u32 = 3;
 
 /// The SDK target segment M1 resolves `dart:` URIs against. Context-level
 /// target selection is an M2 milestone (engine-api-spec §1.1); M1 pins the
@@ -151,6 +157,14 @@ impl UnitFacts {
     #[must_use]
     pub const fn content(&self) -> ContentId {
         self.content
+    }
+
+    /// The file's baked API signature — the value the L2 strong-incremental
+    /// gate compares (PRD §11.3) and the facts snapshot persists (#341, the
+    /// #344 load seam's comparison input).
+    #[must_use]
+    pub const fn api_signature(&self) -> dartq_semantic::ApiSignature {
+        self.api_signature
     }
 
     /// The unit's `part of` directive, if the unit is a part file. When both

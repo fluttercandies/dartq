@@ -498,13 +498,14 @@ fn symlink_cycle_terminates_the_capacity_scan() {
     );
 }
 
-/// The union-of-saves semantic is gone: entry files that exist outside the
-/// manifest — a torn re-save's new entry, or the residue of a re-save
-/// whose set changed — demote the generation to a strict miss, and nothing
-/// ever sweeps the residue away. Abandoned files die with the generation
-/// under LRU.
+/// The union-of-saves semantic is gone in both directions. A torn re-save
+/// — the new entry file landed, its manifest write never did — is a strict
+/// miss: the entry is validly stamped but outside the manifest. A
+/// completed re-save with a changed set is coherent in every shape: the
+/// save-end sweep removes the entries the new claim drops, and the
+/// generation loads with exactly the new set.
 #[test]
-fn partial_resave_is_a_strict_miss_never_a_union() {
+fn shrinking_resave_sweeps_residue_and_loads() {
     let cache = TempCache::new("partial-resave");
     let header = save_two_entries(&cache);
     let store = cache.store(DEFAULT_CAPACITY_BYTES);
@@ -518,7 +519,7 @@ fn partial_resave_is_a_strict_miss_never_a_union() {
     };
     fs::write(
         entry_file(3),
-        crate::entry::encode(&v3).expect("encode v3"),
+        crate::entry::encode(&v3, tables_stamp(&cache, &header)).expect("encode v3"),
     )
     .expect("plant torn entry");
     assert!(
@@ -526,18 +527,76 @@ fn partial_resave_is_a_strict_miss_never_a_union() {
         "an entry outside the manifest is a miss"
     );
 
-    // Completed re-save with a changed set: the manifest claims {3} while
-    // the directory holds {1, 2, 3} — a miss, not a union.
+    // Completed shrinking re-save: the sweep removes {1, 2} and the
+    // generation loads with exactly {3}.
     store
         .save(&header, &tables(), &[v3])
-        .expect("subset re-save succeeds");
-    assert!(
-        store.load::<TestPayload>(&header).is_none(),
-        "residue files demote the changed-set re-save"
-    );
-    for k in [1u8, 2, 3] {
-        assert!(entry_file(k).exists(), "residue is never swept: {k}");
+        .expect("shrinking re-save succeeds");
+    let snapshot = store
+        .load::<TestPayload>(&header)
+        .expect("the swept generation loads whole");
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].key, key(3, 10));
+    for k in [1u8, 2] {
+        assert!(!entry_file(k).exists(), "stale entry swept: {k}");
     }
+    assert!(entry_file(3).exists(), "the claimed entry stays");
+}
+
+/// The stamp of the generation's current `tables.json` bytes — the value
+/// entry frames embed and load pairs against.
+fn tables_stamp(cache: &TempCache, header: &GenerationHeader) -> [u8; 16] {
+    crate::blake3_128(
+        &fs::read(gen_dir(&cache.path, header).join("tables.json")).expect("tables bytes"),
+    )
+}
+
+/// The save-group pairing gate (#338): entries only decode under the
+/// tables they were saved with. Rewriting `tables.json` — same manifest,
+/// different bytes — leaves every entry stale-stamped; they are discarded
+/// as absent and the claimed set can no longer be met: a miss, never a
+/// mixture of one save's tables with another's entries.
+#[test]
+fn rewritten_tables_discard_the_entries_saved_under_the_old_ones() {
+    let cache = TempCache::new("stamp-mismatch");
+    let header = save_one_entry(&cache);
+    let generation = gen_dir(&cache.path, &header);
+    let mut tables_bytes = fs::read(generation.join("tables.json")).expect("tables");
+    tables_bytes.push(b'\n');
+    fs::write(generation.join("tables.json"), &tables_bytes).expect("rewrite tables");
+
+    assert!(
+        cache
+            .store(DEFAULT_CAPACITY_BYTES)
+            .load::<TestPayload>(&header)
+            .is_none(),
+        "stale-stamped entries are discarded; the claim goes unmet"
+    );
+}
+
+/// A stale-stamped file whose id the manifest never claimed is invisible
+/// residue — an interrupted sweep's leftovers — not an extra: the
+/// generation still loads with exactly its claimed entries.
+#[test]
+fn stale_stamped_residue_does_not_block_a_matching_generation() {
+    let cache = TempCache::new("stale-residue");
+    let header = save_two_entries(&cache);
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let outsider = Entry {
+        key: key(9, 10),
+        payload: payload("residue"),
+    };
+    fs::write(
+        entries_dir(&cache.path, &header)
+            .join(format!("{}.entry", hex::encode(key(9, 10).id()))),
+        crate::entry::encode(&outsider, [0u8; 16]).expect("encode residue"),
+    )
+    .expect("plant stale residue");
+
+    let snapshot = store
+        .load::<TestPayload>(&header)
+        .expect("residue is discarded, not fatal");
+    assert_eq!(snapshot.entries.len(), 2);
 }
 
 /// An entry file missing from the claimed set — the eviction-vs-loader
@@ -580,8 +639,8 @@ fn missing_entries_directory_demotes_even_an_empty_generation() {
 }
 
 /// An eviction racing a loader used to yield a partial `Some`; under the
-/// manifest gate even a perfectly valid entry file outside the claimed
-/// set demotes the whole generation.
+/// manifest gate even a perfectly valid, correctly stamped entry file
+/// outside the claimed set demotes the whole generation.
 #[test]
 fn extra_entry_demotes_the_generation() {
     let cache = TempCache::new("extra-entry");
@@ -592,7 +651,8 @@ fn extra_entry_demotes_the_generation() {
     };
     fs::write(
         entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(9, 10).id()))),
-        crate::entry::encode(&outsider).expect("encode outsider"),
+        crate::entry::encode(&outsider, tables_stamp(&cache, &header))
+            .expect("encode outsider"),
     )
     .expect("plant valid entry");
 
@@ -604,15 +664,13 @@ fn extra_entry_demotes_the_generation() {
     );
 }
 
-/// F1's plain-IO-error window: a re-save that fails at the tables write
-/// (its entries already replaced claimed files) leaves the previous
-/// coherent generation loadable — same manifest, same file set — never a
-/// mixture of unreadable halves. The surgery fails the tables write
-/// without touching the previous `tables.json`: the generation directory
-/// is made read-only so the tables temp file cannot be created, while the
-/// entries directory stays writable and the claimed entry is replaced
-/// first — the save order (entries → tables → header) then leaves the old
-/// manifest facing exactly the claimed file set.
+/// F1's plain-IO-error window: a re-save that fails at its first write (the
+/// tables — the save order writes tables first, since the entry frames
+/// stamp them) leaves the previous coherent generation loadable — same
+/// stamped entries, same tables — never a mixture. The surgery fails the
+/// tables write without touching anything: the generation directory is
+/// made read-only so the tables temp file cannot be created, and the save
+/// aborts before any entry is replaced.
 #[cfg(unix)]
 #[test]
 fn failed_tables_write_keeps_the_last_coherent_generation() {
@@ -651,7 +709,10 @@ fn failed_tables_write_keeps_the_last_coherent_generation() {
         .iter()
         .find(|entry| entry.key == key(1, 10))
         .expect("claimed entry");
-    assert_eq!(main.payload.unit, "v2", "the overwritten entry is the re-save's");
+    assert_eq!(
+        main.payload.unit, "main",
+        "the failed save wrote nothing: the previous payload survives"
+    );
     assert!(snapshot.entries.iter().any(|entry| entry.key == key(2, 10)));
 }
 
