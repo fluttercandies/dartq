@@ -8,7 +8,7 @@
 //!
 //! Intake (a notification or request arrives) only *stages* work: overlay
 //! edits enqueue one write task plus the diagnostics read the publish push
-//! rides on, `dartq/analyze` attaches to (or enqueues) one read task,
+//! rides on, a `dartq/*` request attaches to (or enqueues) one read task,
 //! stamped with the context's epoch at enqueue. Execution
 //! happens at the single [`Session::service`] drain point, in the
 //! scheduler's writer-priority order — every staged write applies before any
@@ -34,7 +34,7 @@
 use std::collections::hash_map::Entry;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{Diagnostic, Severity};
@@ -47,6 +47,7 @@ use thiserror::Error;
 
 use dartq_snapshot::{SnapshotConfig, SnapshotStore};
 
+use crate::commands::{self, Request};
 use crate::jsonrpc::RequestId;
 use crate::lsp;
 use crate::uri;
@@ -67,6 +68,14 @@ pub enum SessionError {
     /// by a cancel); completed work stays cached, and nothing was produced.
     #[error("analysis cancelled")]
     Cancelled,
+    /// A `dartq/*` request's parameters name no valid target (the CLI's
+    /// usage tier, surfaced as `INVALID_PARAMS`).
+    #[error("{0}")]
+    InvalidParams(String),
+    /// A `dartq/*` command aborted after a usable request (the CLI's
+    /// internal tier, surfaced as `INTERNAL_ERROR`).
+    #[error("{0}")]
+    Internal(String),
 }
 
 impl From<Cancelled> for SessionError {
@@ -90,14 +99,15 @@ pub struct Turn {
     /// changed).
     pub publishes: Vec<Publish>,
     /// One entry per attached request; `Err` marks a request whose task was
-    /// stale at the drain (cancelled) and produced nothing.
-    pub answers: Vec<(RequestId, Result<Vec<lsp::AnalyzeEntry>, SessionError>)>,
+    /// stale at the drain (cancelled) or whose parameters named no valid
+    /// target, and produced nothing.
+    pub answers: Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
 }
 
 /// A queued read task and the requests waiting on its answer. Reads coalesce:
 /// one analysis serves every attached request plus the publish diff.
 struct PendingRead {
-    requests: Vec<RequestId>,
+    requests: Vec<(RequestId, Request)>,
 }
 
 /// Debounced snapshot persistence state: dirty since the last overlay apply,
@@ -182,6 +192,9 @@ pub struct Session {
     runtime: Runtime,
     /// The root context; the daemon is shell only and never closes it.
     context: ContextId,
+    /// The workspace root the context was assembled from (relative
+    /// `dartq/*` request paths resolve against it).
+    workspace_root: PathBuf,
     next_cookie: u64,
     /// Open overlay documents: last-known client version per path. A closed
     /// or never-opened file is absent — publishes then carry no version.
@@ -235,6 +248,12 @@ impl Session {
 
     fn assemble(config: EngineConfig, store: Option<SnapshotStore>) -> Result<Self, EngineError> {
         let mut runtime = Runtime::new();
+        // The context's workspace root (`config_dir` = root/.dart_tool);
+        // captured before the config moves into the context.
+        let workspace_root = config
+            .config_dir
+            .parent()
+            .map_or_else(Default::default, Path::to_path_buf);
         let context = runtime.open_context(ContextConfig {
             engine: config,
             flags: 0,
@@ -242,6 +261,7 @@ impl Session {
         Ok(Self {
             runtime,
             context,
+            workspace_root,
             next_cookie: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
@@ -329,14 +349,21 @@ impl Session {
         Ok(true)
     }
 
-    /// `dartq/analyze`: attaches the request to the queued read task (or
-    /// queues one), stamped with the context's epoch at enqueue. Answered at
-    /// the drain, in drain order.
-    pub fn queue_analyze(&mut self, id: RequestId) {
+    /// A `dartq/*` request: attaches to the queued read task (or queues
+    /// one), stamped with the context's epoch at enqueue. Answered at the
+    /// drain, in drain order — the coalesced analysis runs once, and each
+    /// request's command shapes its own answer from the post-write state.
+    /// Crate-internal: the wire face is [`crate::server`]'s method table.
+    pub(crate) fn queue_command(&mut self, id: RequestId, request: Request) {
         self.ensure_read();
         if let Some(pending) = self.read.as_mut() {
-            pending.requests.push(id);
+            pending.requests.push((id, request));
         }
+    }
+
+    /// The workspace root the session's context was assembled from.
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// `$/cancelRequest`: cancels one queued request by id, precisely
@@ -360,14 +387,18 @@ impl Session {
         let Some(pending) = &self.read else {
             return;
         };
-        let Some(position) = pending.requests.iter().position(|queued| queued == id) else {
+        let Some(position) = pending
+            .requests
+            .iter()
+            .position(|(queued, _)| queued == id)
+        else {
             return;
         };
         let mut pending = self
             .read
             .take()
             .expect("position proved the read is queued");
-        let cancelled = pending.requests.remove(position);
+        let (cancelled, _) = pending.requests.remove(position);
         self.cancelled.push(cancelled);
         let _ = self.runtime.cancel(self.context);
         // Re-stamp the surviving work at the fresh epoch — the stale
@@ -448,7 +479,9 @@ impl Session {
     }
 
     /// One read task's execution: a fresh full analysis — converted once,
-    /// then shared by the publish diff and every attached request's entries.
+    /// then shared by the publish diff, the `dartq/analyze` answers, and
+    /// every other attached `dartq/*` command (which run over the analyzed
+    /// state without re-driving the pass).
     fn read_turn(&mut self, turn: &mut Turn) {
         let pending = self
             .read
@@ -478,8 +511,14 @@ impl Session {
                         })
                     })
                     .collect();
-                for id in pending.requests {
-                    turn.answers.push((id, Ok(entries.clone())));
+                let drain = commands::Drain {
+                    engine: self.engine(),
+                    root: &self.workspace_root,
+                    entries: &entries,
+                };
+                for (id, request) in pending.requests {
+                    let answer = commands::answer(&drain, &request);
+                    turn.answers.push((id, answer));
                 }
             }
             // Known semantics until the M4 worker pool: in-flight
@@ -489,7 +528,7 @@ impl Session {
             // engine's contract (`analyze` can fail cancelled); stale work
             // never surfaces as a partial answer because it never starts.
             Err(Cancelled) => {
-                for id in pending.requests {
+                for (id, _) in pending.requests {
                     turn.answers.push((id, Err(SessionError::Cancelled)));
                 }
             }
@@ -749,6 +788,8 @@ mod tests {
     }
 
     use crate::test_fixtures::{BROKEN_MAIN, CLEAN_MAIN, Workspace, store_root};
+    use crate::commands::Request;
+    use dartq_commands::Verbosity;
     use dartq_snapshot::DEFAULT_CAPACITY_BYTES;
 
     /// A session over a throwaway workspace with a throwaway snapshot root.
@@ -786,9 +827,19 @@ mod tests {
         );
 
         // One batch: analyze, edit, analyze — one drain serves all three.
-        session.queue_analyze(RequestId::Num(2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
-        session.queue_analyze(RequestId::Num(3));
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         let turn = session.service();
 
         assert_eq!(turn.publishes.len(), 1, "the write's clear push");
@@ -799,7 +850,11 @@ mod tests {
             [&RequestId::Num(2), &RequestId::Num(3)]
         );
         for (_, answer) in &turn.answers {
-            let entries = answer.as_ref().expect("both requests answer");
+            let entries = answer
+                .as_ref()
+                .expect("both requests answer")["diagnostics"]
+                .as_array()
+                .expect("diagnostics array");
             assert!(entries.is_empty(), "post-write view: {entries:?}");
         }
     }
@@ -820,7 +875,12 @@ mod tests {
         let _ = session.service();
 
         // Request + edit + cancel in one batch, then silence.
-        session.queue_analyze(RequestId::Num(2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
         session.cancel_request(&RequestId::Num(2));
         let turn = session.service();
@@ -844,14 +904,24 @@ mod tests {
 
         // The publish baseline caught up in that turn: a follow-up analysis
         // (had the client not stayed silent) pushes nothing new.
-        session.queue_analyze(RequestId::Num(3));
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         let turn = session.service();
         assert!(
             turn.publishes.is_empty(),
             "no duplicate push: {:?}",
             turn.publishes
         );
-        let entries = turn.answers[0].1.as_ref().expect("post-write answer");
+        let entries = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("post-write answer")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
     }
 
@@ -867,8 +937,18 @@ mod tests {
 
         // Two analyses coalesce onto one read; cancelling one spares the
         // other.
-        session.queue_analyze(RequestId::Num(2));
-        session.queue_analyze(RequestId::Num(3));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         session.cancel_request(&RequestId::Num(2));
         let turn = session.service();
 
@@ -887,11 +967,16 @@ mod tests {
             "the cancelled id: {:?}",
             turn.answers[0]
         );
-        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok");
+        let entries = turn.answers[1]
+            .1
+            .as_ref()
+            .expect("survivor answers Ok")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.diagnostic.code == "uri_does_not_exist"),
+                .any(|entry| entry["code"] == "uri_does_not_exist"),
             "the survivor got the real analysis: {entries:?}"
         );
     }
@@ -907,7 +992,12 @@ mod tests {
 
         // Unknown id while a read is queued: the queued request still
         // answers normally.
-        session.queue_analyze(RequestId::Num(2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         session.cancel_request(&RequestId::Num(99));
         let turn = session.service();
         assert_eq!(
@@ -921,7 +1011,12 @@ mod tests {
         // An id that already answered: the read drained; the cancel is a
         // no-op and the next analysis still answers.
         session.cancel_request(&RequestId::Num(2));
-        session.queue_analyze(RequestId::Num(3));
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         let turn = session.service();
         assert_eq!(
             turn.answers.len(),
@@ -969,9 +1064,19 @@ mod tests {
 
         // The survivor is the LAST text: an earlier broken one winning
         // would surface syntax diagnostics here.
-        session.queue_analyze(RequestId::Num(2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("post-batch answer");
+        let entries = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("post-batch answer")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
         assert!(
             entries.is_empty(),
             "the last edit is the applied one: {entries:?}"
@@ -994,9 +1099,19 @@ mod tests {
         let _ = session.service();
 
         crate::probe::reset_counters();
-        session.queue_analyze(RequestId::Num(2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+            },
+        );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers");
+        let entries = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
         assert!(
             !entries.is_empty(),
             "the fixture must carry diagnostics for the probe"
@@ -1021,6 +1136,85 @@ mod tests {
             crate::probe::bulk_bytes(),
             0,
             "convert borrows the resident text; a whole-file clone would register"
+        );
+    }
+
+    /// A `dartq/check` request rides the same read task and epoch machinery
+    /// as `dartq/analyze`: a stale epoch aborts at the drain, before the
+    /// command executes — the request answers cancelled with no result
+    /// (PRD §15.1: every `dartq/*` face is cancellable).
+    #[test]
+    fn cancel_drops_a_queued_dartq_check_request() {
+        let (workspace, mut session) = fixture("cancel-command-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Check {
+                paths: vec![workspace.path("lib")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        session.cancel_request(&RequestId::Num(2));
+        let turn = session.service();
+
+        assert!(
+            turn.publishes.is_empty(),
+            "nothing changed since the sweep: {:?}",
+            turn.publishes
+        );
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one request, one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(2));
+        assert!(
+            matches!(answer, Err(SessionError::Cancelled)),
+            "the stale dartq/check answers cancelled: {answer:?}"
+        );
+    }
+
+    /// A `dartq/*` request whose parameters name no valid target answers
+    /// `InvalidParams` (the CLI's usage tier over RPC), and the session
+    /// stays healthy — a follow-up request answers normally.
+    #[test]
+    fn dartq_command_usage_failure_answers_invalid_params() {
+        let (workspace, mut session) = fixture("command-usage-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Check {
+                paths: vec![workspace.path("lib/nope.dart")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one request, one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(2));
+        assert!(
+            matches!(answer, Err(SessionError::InvalidParams(_))),
+            "a missing target is the usage tier: {answer:?}"
+        );
+
+        // The session is unharmed: the next command answers normally.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Check {
+                paths: vec![workspace.path("lib")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the session answers after a usage-tier failure: {:?}",
+            turn.answers
         );
     }
 }

@@ -23,6 +23,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::codec::{self, FrameError};
+use crate::commands;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::lsp::{self, PublishDiagnosticsParams};
 use crate::session::{Publish, Session, SessionError};
@@ -163,7 +164,7 @@ where
         }
         for (id, answer) in turn.answers {
             let response = match answer {
-                Ok(entries) => Response::ok(id, json!({ "diagnostics": entries })),
+                Ok(result) => Response::ok(id, result),
                 Err(error) => answer_error(id, &error),
             };
             write_message(&mut output, &Message::Response(response))?;
@@ -270,9 +271,20 @@ fn handle_request(
             *lifecycle = Lifecycle::ShutDown;
             Some(Response::ok(id, Value::Null))
         }
-        (Lifecycle::Ready, "dartq/analyze") => {
-            session.queue_analyze(id);
-            None
+        (Lifecycle::Ready, method) if commands::is_command(method) => {
+            // Every `dartq/*` face queues onto the session's read task (the
+            // coalesced analysis runs once; the command answers from the
+            // post-write state), so `$/cancelRequest` cancels it through
+            // the epoch machinery. Bad parameters answer `INVALID_PARAMS`
+            // without touching the session.
+            let params = request.params.unwrap_or(Value::Null);
+            match commands::parse(method, &params, session.workspace_root()) {
+                Ok(staged) => {
+                    session.queue_command(id, staged);
+                    None
+                }
+                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
+            }
         }
         (Lifecycle::Uninitialized, _) => Some(Response::error(
             Some(id),
@@ -294,19 +306,22 @@ fn handle_request(
     }
 }
 
-/// Answers `initialize` with the negotiated capability set.
+/// Answers `initialize` with the negotiated capability set: the LSP surface
+/// plus the stable `dartq/*` command family, announced as experimental so
+/// clients can opt in by name (PRD §15.1: the RPC faces 1:1 with the CLI
+/// commands).
 fn initialize_response(id: jsonrpc::RequestId) -> Response {
+    let dartq_capabilities = commands::METHODS
+        .iter()
+        .map(|method| ((*method).to_string(), json!({ "schemaVersion": commands::SCHEMA_VERSION })))
+        .collect::<serde_json::Map<String, Value>>();
     Response::ok(
         id,
         json!({
             "capabilities": {
                 "positionEncoding": "utf-16",
                 "textDocumentSync": 1,
-                // Non-LSP request surface: the raw-diagnose `dartq/analyze`.
-                // Announced as experimental so clients can opt in by name.
-                "experimental": {
-                    "dartq/analyze": {},
-                },
+                "experimental": dartq_capabilities,
             },
             "serverInfo": {
                 "name": "dartq",
@@ -392,7 +407,8 @@ fn handle_notification(
 }
 
 /// Maps a turn answer's failure to its response: a stale (cancelled) read
-/// answers LSP's `RequestCancelled`; anything else is surfaced as
+/// answers LSP's `RequestCancelled`; a request whose parameters named no
+/// valid target answers `InvalidParams`; anything else is surfaced as
 /// `InternalError`.
 fn answer_error(id: jsonrpc::RequestId, error: &SessionError) -> Response {
     match error {
@@ -401,7 +417,13 @@ fn answer_error(id: jsonrpc::RequestId, error: &SessionError) -> Response {
             codes::REQUEST_CANCELLED,
             "request cancelled before execution",
         ),
+        SessionError::InvalidParams(message) => {
+            Response::error(Some(id), codes::INVALID_PARAMS, message.clone())
+        }
         SessionError::Io(io) => Response::error(Some(id), codes::INTERNAL_ERROR, io.to_string()),
+        SessionError::Internal(message) => {
+            Response::error(Some(id), codes::INTERNAL_ERROR, message.clone())
+        }
     }
 }
 
@@ -448,12 +470,15 @@ mod tests {
         assert_eq!(id, Some(RequestId::Num(1)));
         assert_eq!(result["capabilities"]["textDocumentSync"], 1);
         assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
-        assert!(
-            result["capabilities"]["experimental"]
-                .get("dartq/analyze")
-                .is_some(),
-            "the experimental analyze request is announced"
-        );
+        // The stable `dartq/*` command family, announced as experimental:
+        // one entry per method, each carrying the response contract version.
+        for method in commands::METHODS {
+            assert_eq!(
+                result["capabilities"]["experimental"][method]["schemaVersion"],
+                commands::SCHEMA_VERSION,
+                "{method} is announced"
+            );
+        }
         assert_eq!(result["serverInfo"]["name"], "dartq");
     }
 

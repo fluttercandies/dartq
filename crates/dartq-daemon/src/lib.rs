@@ -28,12 +28,18 @@
 //!   frame and drains once — writes apply before any read analyzes, N edits
 //!   collapse into one apply + one analysis, and `textDocument/
 //!   publishDiagnostics` pushes go out for every file whose diagnostic set
-//!   changed (diff against the last publish). `dartq/analyze` queues a read
-//!   stamped with the context's enqueue epoch; `$/cancelRequest` bumps the
-//!   epoch, the stale task drops at the drain, and its requests answer
+//!   changed (diff against the last publish). A `dartq/*` request queues a
+//!   read stamped with the context's enqueue epoch; `$/cancelRequest` bumps
+//!   the epoch, the stale task drops at the drain, and its requests answer
 //!   `RequestCancelled` (-32800) with no result.
-//! * `dartq/analyze`: dartq's own pull face — the merged diagnostic set of
-//!   a fresh full analysis, one entry per diagnostic with its document URI.
+//! * The `dartq/*` command family (PRD §15.1 — the RPC faces 1:1 with the
+//!   CLI commands): `dartq/analyze` (the merged diagnostic set, LSP URIs),
+//!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/fix`, and
+//!   `dartq/compat` (CLI-mirror faces with canonical path labels). All are
+//!   announced under `capabilities.experimental`; all answers carry
+//!   `schema_version` and honor an optional `verbosity` (the canonical
+//!   tiers in dartq-schema's crate docs); all share their implementation
+//!   with the CLI through `dartq-commands`.
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
 //!   notifications are ignored (both per LSP).
 //!
@@ -57,6 +63,7 @@
 //! main loop writes, so the output side needs no lock.
 
 pub mod codec;
+pub(crate) mod commands;
 pub mod jsonrpc;
 pub mod lsp;
 pub mod session;

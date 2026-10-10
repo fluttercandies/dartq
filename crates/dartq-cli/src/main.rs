@@ -2,14 +2,18 @@
 //! (the M1 engine face), `dartq query symbol` (the index face), and
 //! `dartq version`.
 //!
+//! The per-command cores live in `dartq-commands` (the one implementation
+//! the daemon RPC faces share, PRD §15.1); this binary adds only argument
+//! parsing, output formatting, and the exit tiers.
+//!
 //! `check` drives the M0 pipeline (engine-api-spec §2.1): bytes → scan →
 //! `@dart` override rescan → parse, with all diagnostics written through
 //! `dartq-diagnostics`' oracle-exact writers. It stops there by design: no
 //! pub/package/SDK/engine involvement (the spec's M1 forbid-list).
 //!
 //! `analyze` drives the full engine over a real package directory:
-//! pub faces → [`Engine::new`] → [`Engine::discover_workspace`] →
-//! [`Engine::analyze`], printed through the same oracle-exact writers.
+//! pub faces → [`dartq_commands::workspace::open_engine`] → engine
+//! discovery → analysis, printed through the same oracle-exact writers.
 //!
 //! `query symbol` drives the same workspace assembly and answers from the
 //! symbol index over the analyzed state (PRD §20.3): the queried name's
@@ -28,37 +32,22 @@
 //!   the same tiers: 0 on success (zero results included), 64 usage, 4
 //!   internal.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::env;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
+use dartq_commands::discover::{DiscoverError, discover};
+use dartq_commands::query::{decl_kind_name, ref_kind_name};
+use dartq_commands::workspace::{engine_config, open_engine};
 use dartq_diagnostics::{
-    AnalysisOutput, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity, SourceRange,
-    write_json, write_machine,
+    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json, write_machine,
 };
-use dartq_engine::semdiag;
-use dartq_engine::{
-    CancellationToken, Cancelled, DeclHit, DeclKind, Engine, EngineConfig, EngineEvent, RefHit,
-    RefKind, SymbolAnswer, memory_store,
-};
-use dartq_language::{
-    DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
-};
-use dartq_package::PackageTable;
-use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
-use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
-use dartq_scanner::{ScanConfig, ScanResult, scan};
-use dartq_sdk::SdkSnapshot;
-use dartq_source::{FileTable, LineIndex};
+use dartq_engine::{DeclHit, RefHit};
 
 /// Process exit codes (engine-api-spec §4.2, pinned to analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210).
@@ -272,84 +261,6 @@ fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) 
         .unwrap_or(exit::CLEAN)
 }
 
-#[derive(Debug)]
-enum DiscoverError {
-    /// Path argument does not exist → usage error (64). The message body is
-    /// the oracle's `usageException` text (analyze.dart:191); the `error:`
-    /// prefix is dartq's and the oracle's trailing usage block is omitted
-    /// (`UsageException.toString` appends it, args usage_exception.dart:12)
-    /// — a deliberate divergence: stderr is outside the stdout-only
-    /// differential gate.
-    Missing(String),
-    /// Walk I/O failure → internal error (4).
-    Io(io::Error),
-}
-
-/// Canonical, sorted, deduplicated `.dart` file set under `paths`. A file
-/// argument is taken as-is (top-level `fs::metadata` follows links) and is
-/// unfiltered except for the `.dart` extension: the oracle yields explicit
-/// files without applying the walk rules (context_root.dart:71-72) but only
-/// `.dart` ones reach the driver (context_manager.dart:748-754 via
-/// file_paths.dart:75-78 `isDart`) — without the filter a non-Dart arg would
-/// parse as Dart and emit phantom diagnostics. A directory argument is
-/// walked recursively with the oracle's only built-in exclusion — the
-/// dot-basename rule, checked on every child path, directories and files
-/// alike (context_root.dart:116 + 146-149). `build`/`node_modules` are
-/// analysis_options concerns (excluded globs), not walk-level ones.
-///
-/// Symlinked directories are never descended into (cycle safety). This is a
-/// deliberate subset of the oracle's walk, which descends symlinked
-/// directories with canonical-path dedup (context_root.dart:119-129); the
-/// differential harness canonicalizes both sides, so the gate never sees the
-/// difference. Symlinked `.dart` files are included — the walk stats the
-/// link target and accepts regular files, matching the oracle's walk, which
-/// analyzes linked files too.
-fn discover(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>, DiscoverError> {
-    fn walk(dir: &Path, files: &mut BTreeSet<PathBuf>) -> io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let path = entry.path();
-            // Byte-prefix test: the dot rule is ASCII, and reading the raw
-            // name bytes avoids a per-entry lossy-name allocation.
-            if entry.file_name().as_encoded_bytes().starts_with(b".") {
-                continue;
-            }
-            if file_type.is_dir() {
-                walk(&path, files)?;
-            } else if path.extension().is_some_and(|ext| ext == "dart")
-                // `entry.file_type()` reports link-host facts (it does not
-                // follow symlinks): a symlinked `.dart` file is neither
-                // `is_dir` nor `is_file` there, yet the oracle analyzes it —
-                // stat the target (`fs::metadata` follows the link); a
-                // dangling link has no target and is skipped. Regular files
-                // take the cached-type path without a syscall.
-                && (file_type.is_file()
-                    || (file_type.is_symlink()
-                        && fs::metadata(&path).is_ok_and(|meta| meta.is_file())))
-            {
-                files.insert(path);
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = BTreeSet::new();
-    for path in paths {
-        let meta =
-            fs::metadata(path).map_err(|_| DiscoverError::Missing(path.display().to_string()))?;
-        if meta.is_file() {
-            // `.dart` only (oracle isDart parity — see the fn doc).
-            if path.extension().is_some_and(|ext| ext == "dart") {
-                files.insert(path.clone());
-            }
-        } else {
-            walk(path, &mut files).map_err(DiscoverError::Io)?;
-        }
-    }
-    Ok(files)
-}
-
 fn check(args: &CheckArgs) -> u8 {
     let started = Instant::now();
     let discovery_at = Instant::now();
@@ -372,30 +283,13 @@ fn check(args: &CheckArgs) -> u8 {
     // stdout kept empty — a partial diagnostic set must never masquerade as a
     // valid {0,1,2,3} result.
     let analyze_at = Instant::now();
-    let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut files_state = FileSet::default();
-        let mut diags = Vec::new();
-        for path in &files {
-            let (canonical, source) = read_source(path)?;
-            let file = files_state.push(&source, &canonical);
-            diags.extend(analyze_file(&source, file));
-        }
-        // Canonical order: file discovery order (sorted paths), then source
-        // position, then code/message — deterministic output at the engine-spec
-        // §1.3 canonical-sort granularity M0 has.
-        diags.sort_by(|a, b| {
-            a.file
-                .index()
-                .cmp(&b.file.index())
-                .then_with(|| a.range.offset.cmp(&b.range.offset))
-                .then_with(|| a.code.machine.cmp(b.code.machine))
-                .then_with(|| a.message.cmp(&b.message))
-        });
-        Ok::<_, io::Error>((files_state, diags))
-    }));
+    let analyzed =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dartq_commands::check::analyze_files(&files)
+        }));
     let analyze_ms = elapsed_ms(analyze_at.elapsed());
-    let (files_state, diags) = match analyzed {
-        Ok(Ok(analyzed)) => analyzed,
+    let run = match analyzed {
+        Ok(Ok(run)) => run,
         Ok(Err(error)) => {
             eprintln!("dartq: internal error: {error}");
             return exit::INTERNAL_ERROR;
@@ -410,13 +304,9 @@ fn check(args: &CheckArgs) -> u8 {
     // per line, and an unbuffered lock would flush per diagnostic line.
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let output = AnalysisOutput {
-        diagnostics: &diags,
-        files: &files_state,
-    };
     let written = match args.format {
-        CheckFormat::Machine => write_machine(&mut out, &output),
-        CheckFormat::Json => write_json(&mut out, &output),
+        CheckFormat::Machine => write_machine(&mut out, &run.output()),
+        CheckFormat::Json => write_json(&mut out, &run.output()),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
@@ -424,17 +314,10 @@ fn check(args: &CheckArgs) -> u8 {
     }
 
     if let Some(metrics_path) = &args.metrics_json {
-        // LOC counts newline bytes — the engine discovery convention, one
-        // pass, no line splitting.
-        let loc: u64 = files_state
-            .sources
-            .iter()
-            .map(|source| source.bytes().filter(|&b| b == b'\n').count() as u64)
-            .sum();
         let metrics = RunMetrics {
-            files: files.len(),
-            loc,
-            diagnostics: diags.len(),
+            files: run.file_count(),
+            loc: run.loc(),
+            diagnostics: run.diagnostics().len(),
             discovery_ms,
             analyze_ms,
             total_ms: elapsed_ms(started.elapsed()),
@@ -449,7 +332,7 @@ fn check(args: &CheckArgs) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     }
-    severity_exit(&diags, !args.no_fatal_warnings, args.fatal_infos)
+    severity_exit(run.diagnostics(), !args.no_fatal_warnings, args.fatal_infos)
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +359,7 @@ struct RunMetrics {
 impl RunMetrics {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
+            "schema_version": dartq_commands::SCHEMA_VERSION,
             "files": self.files,
             "loc": self.loc,
             "diagnostics": self.diagnostics,
@@ -505,162 +389,38 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
     }
 }
 
-/// The usage-tier workspace assembly shared by `analyze` and `query
-/// symbol`: SDK root resolution, canonicalized package directory (printed
-/// paths are symlink-resolved, the oracle convention), the three pub faces,
-/// package tables, SDK snapshot, and the engine context. Usage failures
-/// print on stderr and return the usage tier (64); stdout stays empty. The
-/// canonical directory comes back for the caller's discovery phase.
-fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), u8> {
-    let (config, dir) = engine_config(dir, sdk)?;
-    let engine = match Engine::new(config) {
-        Ok(engine) => engine,
-        Err(error) => {
-            eprintln!("error: engine context unusable: {error}");
-            return Err(exit::USAGE);
-        }
-    };
-    Ok((engine, dir))
-}
-
-/// The assembled [`EngineConfig`] behind [`open_engine`], plus the
-/// canonicalized package directory. The daemon face consumes the config
-/// directly (`Session::new` owns its engine lifetime, #328).
-fn engine_config(dir: &Path, sdk: Option<&Path>) -> Result<(EngineConfig, PathBuf), u8> {
-    let sdk_root = sdk
-        .map(Path::to_path_buf)
-        .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
-    let Some(sdk_root) = sdk_root else {
-        eprintln!("error: no Dart SDK root (pass --sdk PATH or set DART_SDK)");
-        return Err(exit::USAGE);
-    };
-    // Canonicalize up front so the printed paths are symlink-resolved (the
-    // oracle convention) and package roots derived from `config_dir` inherit
-    // the canonical form.
-    let dir = match dir.canonicalize() {
-        Ok(dir) => dir,
-        Err(_) => {
-            eprintln!("error: Directory or file doesn't exist: {}", dir.display());
-            return Err(exit::USAGE);
-        }
-    };
-    let config_dir = dir.join(".dart_tool");
-    let (config, lock, pubspec) = match load_workspace_faces(&dir, &config_dir) {
-        Ok(faces) => faces,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return Err(exit::USAGE);
-        }
-    };
-    let graph = match build_graph(
-        &config,
-        &lock,
-        &pubspec,
-        &BTreeMap::new(),
-        None,
-        &config_dir,
-    ) {
-        Ok(graph) => graph,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return Err(exit::USAGE);
-        }
-    };
-    let packages = match PackageTable::build(&config, &graph, &config_dir) {
-        Ok(packages) => packages,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return Err(exit::USAGE);
-        }
-    };
-    let sdk_snapshot = match SdkSnapshot::load(&sdk_root, None) {
-        Ok(sdk) => sdk,
-        Err(error) => {
-            eprintln!(
-                "error: Dart SDK at {} unusable: {error}",
-                sdk_root.display()
-            );
-            return Err(exit::USAGE);
-        }
-    };
-    Ok((
-        EngineConfig {
-            store: memory_store(),
-            sdk: sdk_snapshot,
-            packages,
-            pub_config: config,
-            config_dir,
-            // The semantic families are part of the analyze contract (#236):
-            // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
-            semdiag: Some(semdiag::diagnoser()),
-        },
-        dir,
-    ))
-}
-
 /// One analyze run over a real package directory: pub faces → engine →
-/// oracle-format output on `out`, metrics JSON at exit.
+/// oracle-format output on `out`, metrics JSON at exit. The workspace
+/// assembly and the engine pass live in `dartq-commands`; this shell adds
+/// the crash tier, the writers, and the exit tier.
 fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
-        Err(code) => return code,
-    };
-
-    let discovery_at = Instant::now();
-    let stats = match engine.discover_workspace() {
-        Ok(stats) => stats,
         Err(error) => {
-            eprintln!("dartq: internal error: discovery failed: {error}");
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let run = match dartq_commands::analyze::run(&mut engine) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
             return exit::INTERNAL_ERROR;
         }
     };
-    let discovery_ms = elapsed_ms(discovery_at.elapsed());
-
-    let mut analyzed = (0_usize, 0_usize);
-    let mut on_event = |event: EngineEvent| {
-        if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
-            if from_cache {
-                analyzed.1 += 1;
-            } else {
-                analyzed.0 += 1;
-            }
-        }
-    };
-    let analyze_at = Instant::now();
-    let mut diags = match engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
-        Ok(diags) => diags,
-        Err(Cancelled) => {
-            eprintln!("dartq: internal error: analysis cancelled");
-            return exit::INTERNAL_ERROR;
-        }
-    };
-    let analyze_ms = elapsed_ms(analyze_at.elapsed());
-
-    // Oracle display order (DiagnosticWithPath.compareTo, dartdev
-    // analyze.dart:686–707): severity, file path, position, message. Position
-    // order is the UTF-16 offset (line/column are monotone in it), so no
-    // line-column computation is spent on sorting.
-    let layout = EngineLayout::over(&engine, diags.iter().map(|d| d.file));
-    diags.sort_by(|a, b| {
-        severity_rank(a.severity)
-            .cmp(&severity_rank(b.severity))
-            .then_with(|| {
-                path_key(layout.file_path(a.file)).cmp(path_key(layout.file_path(b.file)))
-            })
-            .then_with(|| a.range.offset.cmp(&b.range.offset))
-            .then_with(|| a.message.cmp(&b.message))
-    });
+    let discovery_ms = elapsed_ms(run.discovery);
+    let analyze_ms = elapsed_ms(run.analysis);
 
     let written = match args.format {
         AnalyzeFormat::Machine => write_machine(
             out,
             &AnalysisOutput {
-                diagnostics: &diags,
-                files: &layout,
+                diagnostics: &run.diagnostics,
+                files: &run.layout,
             },
         ),
-        AnalyzeFormat::Human => write_human(out, &diags, &layout),
+        AnalyzeFormat::Human => write_human(out, &run.diagnostics, &run.layout),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
@@ -669,14 +429,14 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
 
     if let Some(metrics_path) = &args.metrics_json {
         let metrics = RunMetrics {
-            files: stats.file_count,
-            loc: stats.loc_total,
-            diagnostics: diags.len(),
+            files: run.file_count,
+            loc: run.loc,
+            diagnostics: run.diagnostics.len(),
             discovery_ms,
             analyze_ms,
             total_ms: elapsed_ms(started.elapsed()),
-            libraries_analyzed: analyzed.0,
-            libraries_from_cache: analyzed.1,
+            libraries_analyzed: run.libraries_analyzed,
+            libraries_from_cache: run.libraries_from_cache,
             max_rss_bytes: max_rss_bytes(),
         };
         if let Err(error) = write_metrics(metrics_path, &metrics) {
@@ -684,7 +444,7 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     }
-    severity_exit(&diags, !args.no_fatal_warnings, args.fatal_infos)
+    severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
 }
 
 /// The LSP daemon face: assemble the engine context, hand it to the daemon
@@ -695,7 +455,10 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
 fn daemon(args: &DaemonArgs) -> u8 {
     let (config, _dir) = match engine_config(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
-        Err(code) => return code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
     };
     let session = match dartq_daemon::Session::new(config) {
         Ok(session) => session,
@@ -716,83 +479,6 @@ fn daemon(args: &DaemonArgs) -> u8 {
             eprintln!("dartq: internal error: daemon transport failed: {error}");
             exit::INTERNAL_ERROR
         }
-    }
-}
-
-/// The three pub faces the engine's context derives from (the same assembly
-/// the engine integration fixture pins): `package_config.json`,
-/// `pubspec.lock`, `pubspec.yaml` — `dir` already canonicalized.
-fn load_workspace_faces(
-    dir: &Path,
-    config_dir: &Path,
-) -> Result<(Arc<PackageConfig>, LockFile, Pubspec), String> {
-    let config_text = fs::read_to_string(config_dir.join("package_config.json")).map_err(|_| {
-        format!(
-            "no .dart_tool/package_config.json under {} (run `dart pub get`)",
-            dir.display()
-        )
-    })?;
-    let config = PackageConfig::parse(&config_text).map_err(|error| error.to_string())?;
-    let lock_text = fs::read_to_string(dir.join("pubspec.lock")).map_err(|_| {
-        format!(
-            "no pubspec.lock under {} (run `dart pub get`)",
-            dir.display()
-        )
-    })?;
-    let lock = LockFile::parse(&lock_text).map_err(|error| error.to_string())?;
-    let pubspec_text = fs::read_to_string(dir.join("pubspec.yaml"))
-        .map_err(|_| format!("no pubspec.yaml under {}", dir.display()))?;
-    let pubspec = Pubspec::parse(&pubspec_text).map_err(|error| error.to_string())?;
-    Ok((Arc::new(config), lock, pubspec))
-}
-
-/// [`FileLayoutProvider`] over the engine's read faces: paths from the file
-/// table, positions from the resident line index, text borrowed straight
-/// from the content store — no per-diagnostic file reads or copies.
-///
-/// The (text, line index) pair is snapshotted once per distinct file in the
-/// output set: the writers call [`FileLayoutProvider::line_col`] up to twice
-/// per diagnostic (dartq-diagnostics writer.rs:128-129) and the content face
-/// re-validates UTF-8 on every call, so uncached resolution is O(D·N) on a
-/// diagnostic-heavy file. The check face's [`FileSet`] caches the same pair
-/// per file.
-struct EngineLayout<'a> {
-    engine: &'a Engine,
-    /// Exactly the FileIds the caller will query, each with its resident
-    /// text and line index.
-    cache: BTreeMap<FileId, (&'a str, &'a LineIndex)>,
-}
-
-impl<'a> EngineLayout<'a> {
-    /// Snapshots (text, index) once per distinct file in `files`.
-    fn over(engine: &'a Engine, files: impl IntoIterator<Item = FileId>) -> Self {
-        let mut cache = BTreeMap::new();
-        for file in files {
-            cache.entry(file).or_insert_with(|| {
-                // Engine content decoded as UTF-8 at set_content time
-                // (engine doc); validated exactly once per file here.
-                let text = std::str::from_utf8(engine.content(file).expect("analyzed FileId"))
-                    .expect("engine content is UTF-8");
-                (text, engine.line_index(file).expect("analyzed FileId"))
-            });
-        }
-        Self { engine, cache }
-    }
-}
-
-impl FileLayoutProvider for EngineLayout<'_> {
-    fn file_path(&self, file: FileId) -> &Path {
-        self.engine
-            .file_table()
-            .path(file)
-            .expect("analyzed FileId")
-    }
-
-    fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
-        let (text, index) = self.cache.get(&file).expect("output-set FileId");
-        // Diagnostic offsets are UTF-16; the fused conversion reports the
-        // official `LineInfo.getLocation` (line, UTF-16 column) directly.
-        index.line_col_utf16(text, utf16_offset)
     }
 }
 
@@ -856,48 +542,26 @@ fn query_symbol(args: &SymbolArgs) -> u8 {
 fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
-        Err(code) => return code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
     };
-    if let Err(error) = engine.discover_workspace() {
-        eprintln!("dartq: internal error: discovery failed: {error}");
-        return exit::INTERNAL_ERROR;
-    }
-    // The read-after-write: diagnostics are not part of this face, but the
-    // analyze pass is what builds the resolution stage the reference
-    // surface resolves through.
-    let mut on_event = |_: EngineEvent| {};
-    if let Err(Cancelled) = engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
-        eprintln!("dartq: internal error: analysis cancelled");
-        return exit::INTERNAL_ERROR;
-    }
-    let SymbolAnswer {
-        mut decls,
-        mut refs,
-    } = engine.query_symbols(&args.name);
-    let layout = EngineLayout::over(
-        &engine,
-        decls
-            .iter()
-            .map(|d| d.file)
-            .chain(refs.iter().map(|r| r.target_file)),
-    );
-
-    // Output determinism: file path byte order, then position. The engine
-    // returns id-ordered rows; path order is the printed contract.
-    decls.sort_by(|a, b| {
-        path_key(layout.file_path(a.file))
-            .cmp(path_key(layout.file_path(b.file)))
-            .then_with(|| a.range.offset.cmp(&b.range.offset))
-    });
-    refs.sort_by(|a, b| {
-        path_key(layout.file_path(a.target_file))
-            .cmp(path_key(layout.file_path(b.target_file)))
-            .then_with(|| a.range.offset.cmp(&b.range.offset))
-    });
+    let run = match dartq_commands::query::symbol(&mut engine, &args.name) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
 
     let written = match args.format {
-        QueryFormat::Machine => write_query_machine(out, &layout, &decls, &refs),
-        QueryFormat::Json => write_query_json(out, &layout, &args.name, &decls, &refs),
+        QueryFormat::Machine => write_query_machine(out, &run.layout, &run.decls, &run.refs),
+        QueryFormat::Json => writeln!(
+            out,
+            "{}",
+            dartq_commands::query::to_json(&run, &args.name)
+        ),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing query results failed: {error}");
@@ -948,106 +612,12 @@ fn write_query_machine(
     Ok(())
 }
 
-/// JSON format: one single-line object — `name` plus `declarations` and
-/// `references` arrays carrying the machine rows' fields (snake_case, the
-/// metrics-JSON convention). Zero results print empty arrays.
-fn write_query_json(
-    out: &mut impl Write,
-    layout: &dyn FileLayoutProvider,
-    name: &str,
-    decls: &[DeclHit<'_>],
-    refs: &[RefHit],
-) -> io::Result<()> {
-    let declarations: Vec<serde_json::Value> = decls
-        .iter()
-        .map(|decl| {
-            let (line, column) = layout.line_col(decl.file, decl.range.offset);
-            serde_json::json!({
-                "file": layout.file_path(decl.file).display().to_string(),
-                "container": decl.container,
-                "kind": decl_kind_name(decl.kind),
-                "name": decl.name,
-                "line": line,
-                "column": column,
-                "length": decl.range.length,
-            })
-        })
-        .collect();
-    let references: Vec<serde_json::Value> = refs
-        .iter()
-        .map(|reference| {
-            serde_json::json!({
-                "target_file": layout.file_path(reference.target_file).display().to_string(),
-                "kind": ref_kind_name(reference.kind),
-                "qualified": reference.qualified,
-                "offset": reference.range.offset,
-                "length": reference.range.length,
-            })
-        })
-        .collect();
-    writeln!(
-        out,
-        "{}",
-        serde_json::json!({
-            "name": name,
-            "declarations": declarations,
-            "references": references,
-        })
-    )
-}
-
-/// Stable machine spelling of a declaration family (the query face's own
-/// grammar — not a diagnostics code).
-fn decl_kind_name(kind: DeclKind) -> &'static str {
-    match kind {
-        DeclKind::Class => "class",
-        DeclKind::Enum => "enum",
-        DeclKind::Mixin => "mixin",
-        DeclKind::Extension => "extension",
-        DeclKind::ExtensionType => "extension-type",
-        DeclKind::TypeAlias => "type-alias",
-        DeclKind::TopLevelFn => "function",
-        DeclKind::TopLevelVar => "variable",
-        DeclKind::TypeParam => "type-param",
-        DeclKind::Method => "method",
-        DeclKind::Getter => "getter",
-        DeclKind::Setter => "setter",
-        DeclKind::Field => "field",
-    }
-}
-
-/// Stable machine spelling of a reference relation.
-fn ref_kind_name(kind: RefKind) -> &'static str {
-    match kind {
-        RefKind::Referenced => "reference",
-        RefKind::Read => "read",
-        RefKind::Invoked => "invoked",
-        RefKind::Written => "written",
-        RefKind::ReadWritten => "read-written",
-    }
-}
-
 /// One JSON object at exit (engine-api-spec §3, benchmark-harness-spec §2.4).
 /// A failed write is an internal error (4) at the call site, never silent —
 /// a run without its metrics file would corrupt benchmark data.
 fn write_metrics(path: &Path, metrics: &RunMetrics) -> io::Result<()> {
     let mut file = fs::File::create(path)?;
     writeln!(file, "{}", metrics.json())
-}
-
-/// Oracle severity priority (`DiagnosticWithPath._severityPriority`): Error
-/// first, then Warning, then Info.
-fn severity_rank(severity: Severity) -> u8 {
-    match severity {
-        Severity::Error => 0,
-        Severity::Warning => 1,
-        Severity::Info => 2,
-    }
-}
-
-/// Plain byte key of a path — the oracle's `filePath.compareTo` string order.
-fn path_key(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
 }
 
 fn elapsed_ms(duration: Duration) -> u64 {
@@ -1074,160 +644,13 @@ fn max_rss_bytes() -> Option<u64> {
     None
 }
 
-/// Canonical absolute path (the oracle prints symlink-resolved paths) plus
-/// strict UTF-8 source. A read/decode failure is an internal error (4), never
-/// a silently skipped file — lossy output would be format drift downstream.
-///
-/// Exactly one leading UTF-8 BOM is dropped (oracle read-layer parity: the
-/// analyzer read path strips it before scanning; spans are relative to the
-/// stripped text). A second BOM is content.
-fn read_source(path: &Path) -> io::Result<(PathBuf, String)> {
-    let canonical = path.canonicalize()?;
-    let mut source = fs::read_to_string(&canonical)?;
-    if source.starts_with('\u{FEFF}') {
-        source.drain(..'\u{FEFF}'.len_utf8());
-    }
-    Ok((canonical, source))
-}
-
-/// Per-file state behind [`FileLayoutProvider`]: canonical paths live in the
-/// [`FileTable`], positions resolve through the production [`LineIndex`] path
-/// (the same conversion the diagnostics goldens pin).
-#[derive(Default)]
-struct FileSet {
-    table: FileTable,
-    sources: Vec<String>,
-    indexes: Vec<LineIndex>,
-}
-
-impl FileSet {
-    /// Interns `path` (canonicalized by the caller) and registers its layout.
-    fn push(&mut self, source: &str, path: &Path) -> FileId {
-        let file = self.table.intern(path);
-        debug_assert_eq!(file.index() as usize, self.sources.len());
-        self.indexes.push(LineIndex::new(source));
-        self.sources.push(source.to_owned());
-        file
-    }
-}
-
-impl FileLayoutProvider for FileSet {
-    fn file_path(&self, file: FileId) -> &Path {
-        self.table.path(file).expect("interned FileId")
-    }
-
-    fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
-        let index = file.index() as usize;
-        // Diagnostic offsets are UTF-16; the fused conversion reports the
-        // official `LineInfo.getLocation` (line, UTF-16 column) directly.
-        self.indexes[index].line_col_utf16(&self.sources[index], utf16_offset)
-    }
-}
-
-/// Runs the M0 pipeline over one file: scan (+ override rescan), then parse
-/// through a diagnostics-collecting listener.
-fn analyze_file(source: &str, file: FileId) -> Vec<Diagnostic> {
-    let (version, scanned, mut diags) = scan_file(source, file);
-    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
-    // The parser owns its listener by value and exposes no accessor; a shared
-    // sink is the minimal way to collect events out. When #18 starts emitting
-    // `handle_recoverable_error`, these diagnostics flow without CLI changes.
-    let sink = Rc::new(RefCell::new(Vec::new()));
-    Parser::new(
-        source,
-        &scanned.tokens,
-        features,
-        DiagnosticListener {
-            file,
-            sink: Rc::clone(&sink),
-        },
-    )
-    .parse_unit();
-    diags.extend(std::mem::take(&mut *sink.borrow_mut()));
-    diags.extend(scanned.diagnostics);
-    diags
-}
-
-/// Scans `source`, honoring the `@dart` override consumer contract (scanner
-/// module docs; official `source_loader.dart:1194–1209` — the config is
-/// re-derived and the file rescanned before parsing). An override above the
-/// latest known version is dropped with the official `STATIC_WARNING`
-/// (official scanner: `_overrideVersion = null`); the scanner reports only
-/// the last header-window match, so the loop settles after at most one
-/// rescan.
-fn scan_file(source: &str, file: FileId) -> (LanguageVersion, ScanResult, Vec<Diagnostic>) {
-    let mut version = DEFAULT_LANGUAGE_VERSION;
-    loop {
-        let features = FeatureSet::for_language_version(version);
-        let result = scan(
-            source,
-            ScanConfig {
-                enable_triple_shift: triple_shift_enabled(version),
-                enable_augmentations: features.is_enabled(Feature::Augmentations),
-            },
-            file,
-        );
-        match result.language_version_override {
-            Some(override_version) if override_version.is_above_latest() => {
-                // The warning pins at the version comment — the whole
-                // `// @dart = x.y` lexeme, isomorphic to the official
-                // `LanguageVersionToken` (`analyzer scanner.dart:124`
-                // `.atOffset(versionToken.offset, versionToken.length)`; oracle
-                // `dart analyze --format=machine` on a line-1 comment:
-                // `1|1|15`).
-                let code = CodeRegistry::builtin()
-                    .get("invalid_language_version_override")
-                    .expect("official registry pins invalid_language_version_override");
-                let span = result
-                    .language_version_override_span
-                    .expect("scanner records the comment span with every override");
-                let warning = Diagnostic::new(
-                    Severity::Warning,
-                    code,
-                    format!(
-                        "The language version override can't specify a version greater than \
-                         the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
-                    ),
-                    file,
-                    span,
-                    None,
-                );
-                return (version, result, vec![warning]);
-            }
-            Some(override_version) if override_version != version => version = override_version,
-            _ => return (version, result, Vec::new()),
-        }
-    }
-}
-
-/// Collects parser recoverable errors into [`Diagnostic`]s. Per the parser's
-/// `message.rs` contract, the listener owns the translation into a
-/// `dartq_diagnostics::Diagnostic`, including file attribution; event spans
-/// arrive precomputed in the external UTF-16 convention ([`TokenSpan`]).
-struct DiagnosticListener {
-    file: FileId,
-    sink: Rc<RefCell<Vec<Diagnostic>>>,
-}
-
-impl ParserListener for DiagnosticListener {
-    fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {
-        let offset = start.range.offset;
-        let length = end.range.end() - offset;
-        self.sink.borrow_mut().push(Diagnostic::new(
-            Severity::Error,
-            message.code,
-            message.text,
-            self.file,
-            SourceRange { offset, length },
-            None,
-        ));
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
-    use dartq_diagnostics::EXPECTED_TOKEN;
+    use dartq_diagnostics::{EXPECTED_TOKEN, SourceRange};
+    use dartq_source::FileTable;
 
     /// Parses `args` (without the program name) into a subcommand; `None`
     /// means the bare-`dartq`/version fallback.
@@ -1376,94 +799,6 @@ mod tests {
         assert_eq!(severity_exit(&[error], false, true), exit::ERRORS);
     }
 
-    /// The F11 override contract: differing override rescans; above-latest
-    /// drops with the official warning; last header match wins.
-    #[test]
-    fn override_rescan_drop_and_last_wins() {
-        let mut table = FileTable::new();
-        let file = table.intern(Path::new("t.dart"));
-
-        let (version, _, warnings) = scan_file("// @dart = 2.12\nvar x = 1;\n", file);
-        assert_eq!(version, LanguageVersion::new(2, 12), "override adopted");
-        assert!(warnings.is_empty());
-
-        let (version, _, warnings) = scan_file("// @dart = 9.9\n", file);
-        assert_eq!(version, DEFAULT_LANGUAGE_VERSION, "above-latest dropped");
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code.name, "invalid_language_version_override");
-        assert_eq!(warnings[0].severity, Severity::Warning);
-        assert_eq!(warnings[0].range.offset, 0, "span at the comment");
-        assert_eq!(warnings[0].range.length, 14, "whole comment lexeme");
-
-        // Era anchors (oracle dart 3.13.1, facts version-skew §1.3 T2): 3.14
-        // is above the oracle's latest known version — warned and dropped;
-        // 3.13 is the latest and is accepted.
-        let (version, _, warnings) = scan_file("// @dart = 3.14\nvar x = 1;\n", file);
-        assert_eq!(
-            version, DEFAULT_LANGUAGE_VERSION,
-            "above-latest 3.14 dropped"
-        );
-        assert_eq!(warnings.len(), 1);
-
-        let (version, _, warnings) = scan_file("// @dart = 3.13\nvar x = 1;\n", file);
-        assert_eq!(
-            version,
-            LanguageVersion::new(3, 13),
-            "oracle latest accepted"
-        );
-        assert!(warnings.is_empty());
-
-        let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
-        assert_eq!(version, LanguageVersion::new(3, 1), "last match wins");
-
-        let (version, ..) = scan_file("var x = 1;\n", file);
-        assert_eq!(version, DEFAULT_LANGUAGE_VERSION);
-    }
-
-    /// The above-latest warning emits the oracle-matching machine line: the
-    /// span is the whole `@dart` comment lexeme (oracle Dart 3.13.1,
-    /// `dart analyze --format=machine` on `// @dart = 99.9`:
-    /// `WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|<file>|1|1|15|…`;
-    /// indented: `1|3|15`).
-    #[test]
-    fn override_warning_machine_span() {
-        fn machine_line(source: &str, path: &str) -> String {
-            let mut set = FileSet::default();
-            let file = set.push(source, Path::new(path));
-            let (_, _, diags) = scan_file(source, file);
-            assert_eq!(diags.len(), 1);
-            let mut out = Vec::new();
-            write_machine(
-                &mut out,
-                &AnalysisOutput {
-                    diagnostics: &diags,
-                    files: &set,
-                },
-            )
-            .expect("write");
-            String::from_utf8(out).unwrap()
-        }
-
-        let expected = format!(
-            "The language version override can't specify a version greater than \
-             the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
-        );
-        assert_eq!(
-            machine_line("// @dart = 99.9\nvar x = 1;\n", "/c/lib/a.dart"),
-            format!(
-                "WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|/c/lib/a.dart|\
-                 1|1|15|{expected}\n"
-            )
-        );
-        assert_eq!(
-            machine_line("  // @dart = 9.9\n", "/c/lib/b.dart"),
-            format!(
-                "WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|/c/lib/b.dart|\
-                 1|3|14|{expected}\n"
-            )
-        );
-    }
-
     /// Above-latest override alone → the warning tier (2), cleared by
     /// `--no-fatal-warnings`; no other check behavior changes.
     #[test]
@@ -1489,64 +824,6 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
-    }
-
-    /// The CLI read face strips exactly one leading BOM, matching the oracle
-    /// read layer: single BOM gone, second BOM kept as content, BOM-only
-    /// file reads back empty.
-    #[test]
-    fn read_source_strips_one_leading_bom() {
-        let root = std::env::temp_dir().join(format!("dq_cli_bom_{}", std::process::id()));
-        fs::create_dir_all(&root).expect("mkdir");
-        fs::write(root.join("single.dart"), "\u{FEFF}var x;").expect("write");
-        fs::write(root.join("double.dart"), "\u{FEFF}\u{FEFF}x").expect("write");
-        fs::write(root.join("only.dart"), "\u{FEFF}").expect("write");
-        fs::write(root.join("plain.dart"), "var x;").expect("write");
-
-        let (_, single) = read_source(&root.join("single.dart")).expect("read");
-        assert_eq!(single, "var x;");
-        let (_, double) = read_source(&root.join("double.dart")).expect("read");
-        assert_eq!(double, "\u{FEFF}x");
-        let (_, only) = read_source(&root.join("only.dart")).expect("read");
-        assert!(only.is_empty(), "BOM-only file strips to the empty string");
-        let (_, plain) = read_source(&root.join("plain.dart")).expect("read");
-        assert_eq!(plain, "var x;");
-
-        fs::remove_dir_all(&root).ok();
-    }
-
-    /// Byte-shape parity with the harness machine parser
-    /// (`tests/harness/src/machine.rs` `parse_machine`): 8 `|`-separated
-    /// fields, uppercase severity/type/code, 1-based line/col, UTF-16 length.
-    #[test]
-    fn machine_line_parity_with_harness() {
-        let mut set = FileSet::default();
-        let file = set.push("void f() { x }\n", Path::new("/c/lib/a.dart"));
-        // offset 11 (`x`), length 1 → line 1, column 12
-        let diag = Diagnostic::new(
-            Severity::Error,
-            EXPECTED_TOKEN,
-            "Expected to find ';'.",
-            file,
-            SourceRange {
-                offset: 11,
-                length: 1,
-            },
-            None,
-        );
-        let mut out = Vec::new();
-        write_machine(
-            &mut out,
-            &AnalysisOutput {
-                diagnostics: &[diag],
-                files: &set,
-            },
-        )
-        .expect("write");
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1|Expected to find ';'.\n"
-        );
     }
 
     /// End to end over a real temp tree: discovery, canonical paths, machine

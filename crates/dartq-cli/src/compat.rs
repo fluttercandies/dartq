@@ -1,20 +1,12 @@
 //! `dartq compat` — the PRD §15.5 compatibility face: the same workspace
 //! analyzed under several SDK roots, aggregated into a per-axis ✓/✗ matrix.
 //!
-//! One matrix **axis** is one SDK context (an [`SdkSnapshot`]; Dart+Flutter
-//! are fixed pairs, so one axis carries one label). The axes run
-//! **sequentially, one engine alive at a time** (bounded-memory doctrine:
-//! N concurrent semantic graphs would be the resource anti-pattern), over
-//! the same package discovery — pub faces and package graph are built once,
-//! the engine reassembled per axis from its own snapshot. The overlay stays
-//! empty; every axis sees the same on-disk base code.
-//!
-//! Per axis the run is the other engine faces' assembly + one analyze pass,
-//! filtered to ERROR-severity diagnostics (warnings/lints never flip an
-//! axis). An SDK root that fails to load is **isolated**, not fatal: the
-//! axis lands in the matrix as incompatible with the typed
-//! `sdk_unavailable` error row (`dartq-ai::compatibility`), and the
-//! remaining axes still answer.
+//! The matrix mechanics (one axis = one SDK context, sequential axes over
+//! one package discovery, axis failure isolation) and the report assembly
+//! live in [`dartq_commands::compat`] — the one implementation the daemon's
+//! `dartq/compat` shares. This binary adds argument parsing, the
+//! `$DART_SDK` fallback for the axis roots, the tier mapping, and the JSON
+//! output.
 //!
 //! Output is the §15.7 JSON contract (`schema_version: 1`): the queried
 //! file plus the matrix in `--sdk-root` order. The axis verdict rule and
@@ -27,22 +19,13 @@
 //! back to `$DART_SDK`, the single default axis).
 
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use clap::Args;
 
-use dartq_ai::compatibility as query;
-use dartq_ai::compatibility::{AxisAnalysis, AxisInput, Failure};
-use dartq_diagnostics::{FileLayoutProvider, Severity};
-use dartq_engine::{
-    CancellationToken, Cancelled, Engine, EngineConfig, EngineEvent, memory_store, semdiag,
-};
-use dartq_package::PackageTable;
-use dartq_pub::{PackageConfig, ResolvedPackageGraph, build_graph};
-use dartq_sdk::SdkSnapshot;
+use dartq_commands::compat::{CompatError, compat as query_compat};
 
-use crate::{EngineLayout, exit, load_workspace_faces};
+use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct CompatArgs {
@@ -73,82 +56,22 @@ pub(crate) fn run_entry(args: &CompatArgs) -> u8 {
     code
 }
 
-/// Why a compat run aborts without a matrix: workspace problems are the
-/// usage tier, engine failures the internal tier (the query faces' tiers;
-/// each carries its printed message body).
-enum Abort {
-    Usage(String),
-    Internal(String),
-}
-
-fn abort_code(abort: Abort) -> u8 {
-    match abort {
-        Abort::Usage(message) => {
-            eprintln!("error: {message}");
-            exit::USAGE
-        }
-        Abort::Internal(message) => {
-            eprintln!("dartq: internal error: {message}");
-            exit::INTERNAL_ERROR
-        }
-    }
-}
-
 fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
-    // Canonicalized up front so the printed paths are symlink-resolved (the
-    // oracle convention) and the target containment check compares like
-    // with like.
-    let Ok(dir) = args.dir.canonicalize() else {
-        eprintln!(
-            "error: Directory or file doesn't exist: {}",
-            args.dir.display()
-        );
-        return exit::USAGE;
-    };
-    let Ok(target) = args.path.canonicalize() else {
-        eprintln!(
-            "error: Directory or file doesn't exist: {}",
-            args.path.display()
-        );
-        return exit::USAGE;
-    };
-    if target.extension() != Some(std::ffi::OsStr::new("dart")) || !target.starts_with(&dir) {
-        eprintln!("error: not an analyzed .dart file: {}", target.display());
-        return exit::USAGE;
-    }
-
     let Some(roots) = sdk_roots(args) else {
         return exit::USAGE;
     };
-
-    // The pub faces and the package graph are axis-independent: built once,
-    // reused by every axis's engine assembly.
-    let config_dir = dir.join(".dart_tool");
-    let (config, lock, pubspec) = match load_workspace_faces(&dir, &config_dir) {
-        Ok(faces) => faces,
-        Err(message) => return abort_code(Abort::Usage(message)),
-    };
-    let graph = match build_graph(
-        &config,
-        &lock,
-        &pubspec,
-        &std::collections::BTreeMap::new(),
-        None,
-        &config_dir,
-    ) {
-        Ok(graph) => graph,
-        Err(error) => return abort_code(Abort::Usage(error.to_string())),
-    };
-
-    let mut matrix: Vec<AxisInput> = Vec::with_capacity(roots.len());
-    for root in &roots {
-        match analyze_axis(root, &config, &graph, &config_dir) {
-            Ok(axis) => matrix.push(axis),
-            Err(abort) => return abort_code(abort),
+    let report = match query_compat(&args.dir, &args.path, &roots) {
+        Ok(report) => report,
+        Err(CompatError::Usage(message)) => {
+            eprintln!("error: {message}");
+            return exit::USAGE;
         }
-    }
+        Err(CompatError::Internal(message)) => {
+            eprintln!("dartq: internal error: {message}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
 
-    let report = query::compatibility(&target.display().to_string(), &matrix);
     let written = out
         .write_all(
             serde_json::to_string(&report)
@@ -162,82 +85,6 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
         return exit::INTERNAL_ERROR;
     }
     exit::CLEAN
-}
-
-/// One matrix axis: assemble the engine under `root`'s snapshot over the
-/// shared package resolution, run the other faces' discover + analyze
-/// passes, and collect the axis's ERROR-severity diagnostics. An SDK root
-/// that fails to load is an `sdk_unavailable` axis, never an abort (axis
-/// failure isolation). The engine drops at function end — one semantic
-/// graph alive at a time (bounded-memory doctrine).
-fn analyze_axis(
-    root: &Path,
-    config: &Arc<PackageConfig>,
-    graph: &ResolvedPackageGraph,
-    config_dir: &Path,
-) -> Result<AxisInput, Abort> {
-    // A failed load has no version to label itself with: the axis keeps the
-    // root it was given.
-    let snapshot = match SdkSnapshot::load(root, None) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return Ok(AxisInput {
-                sdk: root.display().to_string(),
-                analysis: AxisAnalysis::SdkUnavailable(error.to_string()),
-            });
-        }
-    };
-    let sdk_label = snapshot.dart.version.clone();
-    // The identity table is engine-owned (not `Clone`); identical inputs
-    // rebuild it per axis.
-    let packages = PackageTable::build(config, graph, config_dir)
-        .map_err(|error| Abort::Usage(error.to_string()))?;
-    let mut engine = Engine::new(EngineConfig {
-        store: memory_store(),
-        sdk: snapshot,
-        packages,
-        pub_config: config.clone(),
-        config_dir: config_dir.to_path_buf(),
-        // The semantic families are part of the analyze contract (#236):
-        // the SDK-difference signal (`undefined_*` and friends) rides the
-        // default diagnoser.
-        semdiag: Some(semdiag::diagnoser()),
-    })
-    .map_err(|error| Abort::Usage(format!("engine context unusable: {error}")))?;
-
-    if let Err(error) = engine.discover_workspace() {
-        return Err(Abort::Internal(format!("discovery failed: {error}")));
-    }
-    // The read-after-write: the matrix reflects the analyzed state only.
-    let mut on_event = |_: EngineEvent| {};
-    let diags = engine
-        .analyze(&[], &mut on_event, &CancellationToken::default())
-        .map_err(|Cancelled| Abort::Internal("analysis cancelled".to_owned()))?;
-
-    // The verdict input: ERROR-severity diagnostics only, laid out through
-    // the engine's read faces.
-    let error_diags: Vec<_> = diags
-        .iter()
-        .filter(|diag| diag.severity == Severity::Error)
-        .collect();
-    let layout = EngineLayout::over(&engine, error_diags.iter().map(|diag| diag.file));
-    let errors = error_diags
-        .iter()
-        .map(|diag| {
-            let (line, col) = layout.line_col(diag.file, diag.range.offset);
-            Failure {
-                code: diag.code.name.to_owned(),
-                file: layout.file_path(diag.file).display().to_string(),
-                line,
-                col,
-                message: diag.message.clone(),
-            }
-        })
-        .collect();
-    Ok(AxisInput {
-        sdk: sdk_label,
-        analysis: AxisAnalysis::Analyzed(errors),
-    })
 }
 
 /// The axis roots: the explicit `--sdk-root` args, else `$DART_SDK` (the
@@ -396,6 +243,27 @@ mod tests {
             sdk_roots: vec![root.join("sdks/new")],
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The matrix preserves the caller's axis order even when a path is
+    /// relative (resolved against the process cwd by the OS, matching the
+    /// other faces' argument handling).
+    #[test]
+    fn relative_sdk_roots_keep_axis_order() {
+        let root = fixture("relative");
+        let args = CompatArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            sdk_roots: vec![root.join("sdks/new"), root.join("sdks/old")],
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        let matrix = json["matrix"].as_array().expect("matrix");
+        assert_eq!(matrix[0]["sdk"], "3.13.1", "first axis answers first");
+        assert_eq!(matrix[1]["sdk"], "3.5.0", "second axis answers second");
         fs::remove_dir_all(&root).ok();
     }
 }

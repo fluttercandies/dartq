@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+dartq-commands = { path = "../dartq-commands" }
 dartq-diagnostics = { path = "../dartq-diagnostics" }
 dartq-engine = { path = "../dartq-engine" }
 dartq-snapshot = { path = "../dartq-snapshot" }

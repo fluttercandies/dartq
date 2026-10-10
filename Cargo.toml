@@ -23,6 +23,7 @@ members = [
     "crates/dartq-cache",
     "crates/dartq-plugin",
     "crates/dartq-engine",
+    "crates/dartq-commands",
     "crates/dartq-daemon",
     "crates/dartq-ai",
     "crates/dartq-cli",

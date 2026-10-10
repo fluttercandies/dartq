@@ -1,25 +1,16 @@
 //! `dartq impact` — the PRD §15.4 impact face: what a change to one file
 //! would affect, over the analyzed workspace.
 //!
-//! The run drives the same workspace assembly as the other engine faces
-//! ([`crate::open_engine`], discovery, one analyze pass — the
-//! read-after-write the query faces share), then assembles the impact
-//! substrate from the engine's public graph faces and the dartq-index
-//! capture:
-//!
-//! * the **import closure** reads the engine's library import CSR (node =
-//!   engine [`dartq_engine::LibraryId`] index);
-//! * the **test graph** joins the CSR import edges with the
-//!   defining-file basenames (dartq-index's derivation: imports primary,
-//!   the `*_test.dart` convention fallback);
-//! * the **file snapshot** folds the seed library's member files — blake3
-//!   over the member hashes, the library-face declaration names from the
-//!   dartq-index capture pass.
+//! The substrate (import closure over the engine's CSR, the test graph, the
+//! folded file snapshot) and the report assembly live in
+//! [`dartq_commands::impact`] — the one implementation the daemon's
+//! `dartq/impact` shares. This binary adds argument parsing, the crash
+//! tier, the usage-tier mapping, and the JSON output.
 //!
 //! One-shot posture: a CLI run holds no baseline, so the seed enters the
-//! query as a **hypothetical** API-level change ([`LibraryChange::hypothetical`])
-//! — the report answers "what depends on this file's API surface". The
-//! daemon passes real before/after diffs through the same query.
+//! query as a **hypothetical** API-level change — the report answers "what
+//! depends on this file's API surface". The daemon passes real before/after
+//! diffs through the same query.
 //!
 //! Output is the §15.7 JSON contract (`schema_version: 1`, stable path
 //! labels; the v1 labels are the canonical file paths — package-form URIs
@@ -30,27 +21,10 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
-use dartq_engine::{CancellationToken, Cancelled, Engine, EngineEvent, LibraryId};
-use dartq_index::{TestGraph, capture};
-use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
-use dartq_parser::ParserFeatures;
-use dartq_scanner::{ScanConfig, scan};
-use dartq_source::{FileId, StringId, StringTable};
+use dartq_commands::impact::{ImpactError, impact as query_impact};
+use dartq_commands::workspace::open_engine;
 
-use crate::{exit, open_engine};
-
-/// The scan configuration of every non-version-gated capture face (the
-/// workspace default: triple shift and augmentations on).
-const SCAN_CONFIG: ScanConfig = ScanConfig {
-    enable_triple_shift: true,
-    enable_augmentations: true,
-};
-
-/// The stable label and the test-detection basename of one library, keyed
-/// by the engine library id (`None` on a dead slot).
-type Ident = (String, String);
-type IdentTable = Vec<Option<Ident>>;
+use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct ImpactArgs {
@@ -79,129 +53,27 @@ pub(crate) fn run_entry(args: &ImpactArgs) -> u8 {
     code
 }
 
-/// The stable label and the test-detection basename of every live library,
-/// indexed by the engine library id (dead slots hold `None`).
-fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
-    let mut idents: IdentTable = vec![None; libraries.len()];
-    for (library, files) in libraries {
-        let Some(path) = files
-            .first()
-            .and_then(|&file| engine.file_table().path(file))
-        else {
-            continue;
-        };
-        idents[library.index() as usize] = Some((
-            path.display().to_string(),
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        ));
-    }
-    idents
-}
-
-/// The folded surface of one library: blake3 over the member hashes, the
-/// library-face declaration names from the capture pass (parse-surface
-/// capture proceeds through scan diagnostics — the under-report bias; this
-/// face produces no diagnostics of its own).
-fn seed_snapshot(engine: &Engine, members: &[FileId], strings: &StringTable) -> FileSnapshot {
-    let mut names: Vec<StringId> = Vec::new();
-    let mut folded = Vec::with_capacity(members.len() * 32);
-    for &file in members {
-        let bytes = engine.content(file).expect("resident member");
-        folded.extend_from_slice(&content_hash(bytes));
-        let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-        let scanned = scan(text, SCAN_CONFIG, file);
-        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-            DEFAULT_LANGUAGE_VERSION,
-        ));
-        let captured = capture(file, text, &scanned.tokens, features, strings);
-        names.extend(
-            captured
-                .index
-                .decls()
-                .iter()
-                .filter(|row| row.is_library_face())
-                .map(|row| row.name),
-        );
-    }
-    names.sort_unstable();
-    names.dedup();
-    FileSnapshot {
-        content_hash: content_hash(&folded),
-        top_level_names: names.into_boxed_slice(),
-    }
-}
-
 fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
-        Err(code) => return code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
     };
-    if let Err(error) = engine.discover_workspace() {
-        eprintln!("dartq: internal error: discovery failed: {error}");
-        return exit::INTERNAL_ERROR;
-    }
-    // The read-after-write: the import graph and the library table reflect
-    // the analyzed state only after this pass.
-    let mut on_event = |_: EngineEvent| {};
-    if let Err(Cancelled) = engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
-        eprintln!("dartq: internal error: analysis cancelled");
-        return exit::INTERNAL_ERROR;
-    }
-
-    // The seed: the target file's owning library.
-    let Ok(target) = args.path.canonicalize() else {
-        eprintln!(
-            "error: Directory or file doesn't exist: {}",
-            args.path.display()
-        );
-        return exit::USAGE;
+    let report = match query_impact(&mut engine, &args.path) {
+        Ok(report) => report,
+        // Target problems are the usage tier (their Display bodies are the
+        // printed messages); prelude failures the internal tier.
+        Err(error @ (ImpactError::Missing(_) | ImpactError::NotAnalyzed(_))) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
     };
-    let Some(seed_file) = engine.file_table().try_file_id(&target) else {
-        eprintln!("error: not an analyzed .dart file: {}", target.display());
-        return exit::USAGE;
-    };
-    let Some(seed_library) = engine.library_of(seed_file) else {
-        eprintln!("error: not an analyzed .dart file: {}", target.display());
-        return exit::USAGE;
-    };
-
-    // Library identities and the seed's member list.
-    let csr = engine.library_import_graph();
-    let count = csr.nodes();
-    let libraries = engine.libraries();
-    let seed_library_index = seed_library.index() as usize;
-    let members = libraries
-        .iter()
-        .find(|(library, _)| library.index() as usize == seed_library_index)
-        .map(|(_, files)| files.clone())
-        .expect("live seed library");
-    let idents = library_identities(&engine, &libraries);
-
-    let strings = StringTable::new();
-    let current = seed_snapshot(&engine, &members, &strings);
-
-    // The substrate over the engine's faces, then the query.
-    let neighbors = |library: u32| -> &[u32] {
-        let start = csr.offsets()[library as usize] as usize;
-        let end = csr.offsets()[library as usize + 1] as usize;
-        &csr.edges()[start..end]
-    };
-    let tests = TestGraph::build(count, neighbors, |library| {
-        idents[library as usize]
-            .as_ref()
-            .map(|(_, basename)| basename.as_str())
-    });
-    let change = LibraryChange::hypothetical(seed_library.index(), current);
-    let report = query::impact(
-        count,
-        neighbors,
-        |library| -> &str { &idents[library as usize].as_ref().expect("live library").0 },
-        &tests,
-        &strings,
-        &[change],
-    );
 
     let written = out
         .write_all(
@@ -353,6 +225,34 @@ mod tests {
             path: root.join("lib/missing.dart"),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
+        };
+        assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The usage tier covers a target that does not exist at all: the
+    /// message names the path as given.
+    #[test]
+    fn missing_path_is_usage() {
+        let root = fixture("missing");
+        let args = ImpactArgs {
+            path: root.join("lib/nope.dart"),
+            dir: root.clone(),
+            sdk: Some(root.join("sdk")),
+        };
+        assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The engine assembly failure surfaces as the usage tier through the
+    /// shared [`dartq_commands::workspace::WorkspaceError`] message body.
+    #[test]
+    fn unusable_sdk_is_usage() {
+        let root = fixture("sdk");
+        let args = ImpactArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            sdk: Some(root.join("no-such-sdk")),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
