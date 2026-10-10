@@ -180,7 +180,11 @@ fn pattern_rhs_reserved_head() {
     );
     assert_codes(
         "var x = (if);\n",
-        &["expected_identifier_but_got_keyword"],
+        // Official ExpressionIdentifierContext.ensureIdentifier
+        // (identifier_context_impl.dart:411): a statement-start keyword is
+        // left for the statement parser — expectedIdentifier + synthetic —
+        // then ensureCloseParen reports the missing `)` (:1917).
+        &["expected_token", "missing_identifier"],
         "parenthesized reserved operand",
     );
 }
@@ -242,14 +246,17 @@ fn enum_header_reserved_head_skip_refusal() {
 fn typedef_old_style_no_name() {
     assert_codes(
         "typedef void = void Function();\n",
+        // The `void` head at the RHS name position is a statement-start
+        // keyword: the official expression-identifier template inserts a
+        // synthetic (expectedIdentifier) instead of eating the keyword.
         &[
             "expected_executable",
-            "expected_identifier_but_got_keyword",
             "expected_token",
             "expected_token",
             "missing_const_final_var_or_type",
             "missing_const_final_var_or_type",
             "missing_function_body",
+            "missing_identifier",
             "missing_identifier",
             "missing_identifier",
             "missing_identifier",

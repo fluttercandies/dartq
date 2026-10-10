@@ -485,11 +485,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.parse_selector_chain(end, context)
             }
             _ => {
-                // No primary here; report and stay (the caller's loop
-                // no-progress guards unwind).
-                let at = self.peek_span();
-                self.report(msg::expected_but_got("an expression"), at);
-                at
+                // Official parsePrimary's default arm routes every other
+                // head through parseSend — the name's ensureIdentifier
+                // recovery (expectedIdentifier family) reports and either
+                // consumes the keyword or makes way for a synthetic.
+                let end = self.parse_send(IdentifierContext::Expression);
+                self.parse_selector_chain(end, context)
             }
         }
     }
@@ -689,16 +690,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     ) -> TokenSpan {
         let start = self.peek_span();
         self.listener.begin_constructor_reference(start);
-        self.ensure_identifier(IdentifierContext::Expression);
-        let mut period_before_name = None;
-        if self.peek_kind() == TokenKind::Period {
-            let period = self.peek_span();
-            self.cursor.advance();
-            let second = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
-            let _ = second;
-            period_before_name = Some(period);
-        }
-        // Optional type arguments (must be followed by `(` at the use site).
+        // Official order (:6414-6446): identifier, qualified rest, type
+        // arguments, THEN the constructor name (`C<int>.new` — the `.name`
+        // comes after the type arguments).
+        self.ensure_identifier(IdentifierContext::ConstructorReference);
+        self.parse_qualified_rest_opt(IdentifierContext::ConstructorReferenceContinuation);
         if self.peek_kind() == TokenKind::Lt {
             let open = self.peek_span();
             let type_param = self.compute_type_param_or_arg_on_lt(false);
@@ -707,6 +703,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener
                     .handle_no_constructor_reference_continuation_after_type_arguments(open);
             }
+        }
+        let mut period_before_name = None;
+        if self.peek_kind() == TokenKind::Period {
+            let period = self.peek_span();
+            self.cursor.advance();
+            let second = self.ensure_identifier(
+                IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments,
+            );
+            let _ = second;
+            period_before_name = Some(period);
         }
         let end = self.peek_span();
         self.listener

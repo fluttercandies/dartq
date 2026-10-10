@@ -90,6 +90,23 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         context: crate::listener::IdentifierContext,
     ) -> TokenSpan {
         let peek = self.cursor.peek();
+        // `_tryRewriteNewToIdentifier` (parser_impl.dart:4101-4111): in
+        // continuation contexts `new` after `.` is rewritten to an
+        // identifier (the unnamed constructor) with no report
+        // (`allowsNewAsIdentifier => isContinuation`,
+        // identifier_context_impl.dart:200/391).
+        if peek.kind == TokenKind::Keyword(Keyword::New)
+            && matches!(
+                context,
+                crate::listener::IdentifierContext::ConstructorReferenceContinuation
+                    | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
+            )
+        {
+            let id = self.cursor.advance();
+            let span = self.span_of(id);
+            self.listener.handle_identifier(span, context);
+            return span;
+        }
         // Keyword names go through the context's official recovery template
         // first: class/mixin/extension names reject built-in identifiers
         // (`builtInIdentifierInDeclaration`), keyword-tolerant contexts
@@ -157,7 +174,11 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         let peek = self.cursor.peek();
         let is_continuation = context == crate::listener::IdentifierContext::ExpressionContinuation;
         let junk_kind = peek.kind;
-        if !self.looks_like_statement_start_at(1) {
+        // `looksLikeStatementStart(identifier)` (identifier_context_impl.dart
+        // :411): the candidate token itself is classified — a keyword that
+        // starts a statement is left for the statement parser, not eaten as
+        // a name. The cursor sits on the candidate.
+        if !self.looks_like_statement_start_at(0) {
             if is_keyword_or_identifier(junk_kind) {
                 let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
                 if is_continuation

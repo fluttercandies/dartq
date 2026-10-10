@@ -1478,6 +1478,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             None
         };
         if let Some(finally_kw) = finally_kw {
+            // Official `parseBlock(finallyToken, ...)` (:1502): the `finally`
+            // token itself is consumed before the block's ensureBlock.
+            self.cursor.advance();
             last_consumed = self.parse_block(
                 BlockKind::FinallyClause,
                 crate::message::BlockKind::FinallyClause,

@@ -262,7 +262,12 @@ impl ComplexType {
             parser.listener.handle_no_type(at);
             at
         } else if self.is_record_type || self.gft_return_type_has_record_type {
-            parser.parse_record_type(self.gft_return_type_has_record_type)
+            // `isQuestionPartOfType` (type_info_impl.dart:655): the trailing
+            // `?` belongs to the record type when compute captured it
+            // (`beforeQuestion != null`), otherwise it is the follower's.
+            parser.parse_record_type(
+                self.gft_return_type_has_record_type || self.before_question.is_some(),
+            )
         } else {
             parse_complex_plain_type(self, parser)
         };

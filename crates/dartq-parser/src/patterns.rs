@@ -346,7 +346,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
             }
             let type_param = self.compute_type_param_or_arg_on_lt(false);
-            if self.peek_kind() == TokenKind::OpenParen && !type_param.recovered() {
+            // Follower check mirrors the official
+            // `potentialTypeArg.skip(token).next!` (:11833-11835): the `(`
+            // is looked up AFTER the type-argument group, not at the cursor
+            // (which still sits on `<`).
+            let follower = self.type_arg_follower(&type_param, self.cursor.real_pos());
+            if follower == TokenKind::OpenParen && !type_param.recovered() {
                 type_param.parse_arguments(self);
                 let end = self.parse_object_pattern_rest(context);
                 self.listener
@@ -379,23 +384,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return end;
         }
 
-        // A reserved keyword cannot start a pattern element: official
-        // parsePrimary recovery reports the missing identifier and parses on
-        // with a synthetic name (CFE `case [if]` cascade).
-        if let TokenKind::Keyword(kw) = self.peek_kind()
-            && kw.style() == dartq_scanner::KeywordStyle::Reserved
-        {
-            let at = self.peek_span();
-            self.report(msg::missing_identifier(), at);
-            let synthetic = self.synthetic(TokenKind::Identifier, at.range.offset);
-            self.cursor.advance();
-            self.listener
-                .handle_identifier(synthetic, IdentifierContext::Expression);
-            self.is_last_pattern_allowed_inside_unary_pattern = true;
-            return synthetic;
-        }
-
-        // Constant pattern (implicit const).
+        // Constant pattern (implicit const). Reserved words land here too:
+        // official parsePrimaryPattern has no reserved-keyword arm —
+        // `true`/`false`/`null` parse as boolean/null literals through the
+        // expression engine (:11880-11897) and stay silent; any other
+        // reserved word takes parse_send's ensure-identifier recovery.
         self.listener.begin_constant_pattern(None);
         let end = self.parse_constant_expression(ConstantPatternContext::Implicit);
         self.listener.end_constant_pattern(None);
@@ -517,11 +510,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     fn parse_list_pattern_suffix(&mut self, context: PatternContext) -> TokenSpan {
         let begin = self.peek_span();
         if self.peek_kind() == TokenKind::Index {
-            // `[]` combined token: split into `[` + `]`.
-            self.cursor.advance();
+            // `[]` combined token: official `rewriteSquareBrackets` splits it
+            // into `[` + `]` and the suffix returns `token.next!` — the token
+            // AFTER the `]`. Both synthetics are drained so the cursor lands
+            // there (the caller reads the real `=>`/`:` follower).
+            self.cursor.advance(); // INDEX
             let open = self.synthetic(TokenKind::OpenSquare, begin.range.offset);
             let close = self.synthetic(TokenKind::CloseSquare, begin.range.offset + 1);
             self.listener.handle_list_pattern(0, open, close);
+            self.cursor.advance(); // synthetic `[`
+            self.cursor.advance(); // synthetic `]`
             return close;
         }
         self.cursor.advance(); // `[`

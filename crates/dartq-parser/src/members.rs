@@ -1762,7 +1762,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseQualifiedRestOpt`: `. identifier` suffix.
-    fn parse_qualified_rest_opt(&mut self, context: IdentifierContext) {
+    pub(crate) fn parse_qualified_rest_opt(&mut self, context: IdentifierContext) {
         if self.peek_kind() != TokenKind::Period {
             return;
         }

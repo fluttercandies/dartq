@@ -773,7 +773,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if matches!(type_param, TypeParamOrArg::None) {
             return None;
         }
-        let after_group = type_param.skip(self.real_id(name_pos + 1));
+        // `skip` expects the token BEFORE `<` (the name), matching the
+        // official `typeArg.skip(token)` pointer.
+        let after_group = type_param.skip(self.real_id(name_pos));
         let after_pos = self.offset_of(after_group) + 1;
         if self.kind_at(after_pos) != TokenKind::Period {
             return None;
@@ -2012,8 +2014,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         const_keyword: Option<TokenSpan>,
     ) -> TokenSpan {
         let type_param = self.compute_type_param_or_arg_on_lt(true);
-        let after = type_param.skip(self.peek_id());
-        if self.kind_at(self.offset_of(after) + 1) == TokenKind::OpenParen {
+        // The follower is read AFTER the group (official
+        // `typeArg.skip(token).next!`); the cursor still sits on `<`, so the
+        // follower is computed from the `<` offset, not peeked.
+        let follower = self.type_arg_follower(&type_param, self.cursor.real_pos());
+        if follower == TokenKind::OpenParen {
             if let Some(const_keyword) = const_keyword {
                 // `const <T>() {}` (:8334-8341).
                 let lexeme = self.cursor.lexeme(const_keyword.id).to_owned();
@@ -2043,18 +2048,25 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
     }
 
-    /// Official `parseLiteralFunctionSuffix` :8284: the body shape must
-    /// follow the already-parsed formal parameter list.
+    /// Official `parseLiteralFunctionSuffix` :8749: the body-shape check
+    /// reads the token after the formal parameter list
+    /// (`token.next!.endGroup!.next!`) — `=>` is the scanner's FUNCTION
+    /// token, so arrow bodies pass.
     fn parse_literal_function_suffix(&mut self) -> TokenSpan {
-        let after_body = matches!(
-            self.peek_kind(),
-            TokenKind::Function
-                | TokenKind::OpenCurly
-                | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
-        );
-        if !after_body {
-            let at = self.peek_span();
-            self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+        let open = self.peek_span();
+        if let Some(close) = self.cursor.table_matching_end(open.id) {
+            let after = self.offset_of(close) + 1;
+            let body = self.kind_at(after);
+            if !matches!(
+                body,
+                TokenKind::Function
+                    | TokenKind::OpenCurly
+                    | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
+            ) {
+                let id = self.real_id(after);
+                let at = self.span_of(id);
+                self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+            }
         }
         self.parse_function_expression()
     }
