@@ -1,7 +1,8 @@
 //! Wire frames and the newline-delimited JSON codec.
 //!
 //! One frame is one JSON object on one line, UTF-8 encoded, terminated by
-//! `'\n'`, and at most [`MAX_FRAME_SIZE`] bytes long:
+//! `'\n'`, with content plus terminator at most [`MAX_FRAME_SIZE`] bytes
+//! long:
 //!
 //! ```json
 //! {"schema_version": 1, "id": 7, "method": "initialize", "params": {}}
@@ -20,9 +21,16 @@ use serde_json::{Map, Value};
 /// fails with [`ProtocolError::SchemaVersion`] on any other version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Hard upper bound for one frame, enforced before buffering: the decoder
-/// never holds more than this many bytes, keeping host memory bounded when a
+/// Hard upper bound for one frame **on the wire** — the JSON content plus
+/// its `'\n'` terminator — enforced before buffering: the decoder never
+/// holds more than this many bytes, keeping host memory bounded when a
 /// plugin misbehaves (PRD §14.3 resource isolation).
+///
+/// The accounting is raw stream bytes, identical to the Dart host's gate
+/// (`dartq_plugin_host`, `host.dart`): a frame whose content is exactly
+/// [`MAX_FRAME_SIZE`] can never arrive, because with its terminator the
+/// buffered total is `MAX_FRAME_SIZE + 1` and trips the guard. The largest
+/// deliverable content is therefore `MAX_FRAME_SIZE - 1` bytes.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Core-to-plugin: the opening handshake request.
@@ -121,12 +129,16 @@ pub enum ProtocolError {
 ///
 /// Returns [`ProtocolError::Json`] if the params contain values that are not
 /// representable in JSON.
-pub fn encode_frame(frame: &Frame) -> Result<String, ProtocolError> {
-    serde_json::to_string(frame).map_err(|e| ProtocolError::Json(e.to_string()))
+pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
+    serde_json::to_vec(frame).map_err(|e| ProtocolError::Json(e.to_string()))
 }
 
 /// Decodes exactly one frame from one line's bytes (trailing `'\n'` already
 /// stripped).
+///
+/// The over-long check below guards the line's content; the wire's canonical
+/// bound (content **plus** terminator, enforced before buffering) lives in
+/// [`FrameDecoder`], which routes every decoded line through here.
 ///
 /// # Errors
 ///
@@ -208,6 +220,13 @@ impl FrameDecoder {
         self.buf.drain(..consumed);
         Ok(frames)
     }
+
+    /// Whether a partial frame is buffered. EOF with `true` here means the
+    /// stream ended mid-frame.
+    #[must_use]
+    pub fn has_partial(&self) -> bool {
+        !self.buf.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -235,8 +254,8 @@ mod tests {
     fn frame_round_trips_through_encode_and_decode() {
         for frame in [sample_request(), sample_notification()] {
             let line = encode_frame(&frame).expect("encode");
-            assert!(!line.contains('\n'));
-            let decoded = decode_line(line.as_bytes()).expect("decode");
+            assert!(!line.contains(&b'\n'));
+            let decoded = decode_line(&line).expect("decode");
             assert_eq!(decoded, frame);
         }
     }
@@ -294,10 +313,14 @@ mod tests {
     fn decoder_splits_chunks_into_frames_and_skips_blank_lines() {
         let a = encode_frame(&sample_request()).expect("encode");
         let b = encode_frame(&sample_notification()).expect("encode");
+        let mut stream = a;
+        stream.extend_from_slice(b"\n\n");
+        stream.extend_from_slice(&b);
+        stream.push(b'\n');
         let mut decoder = FrameDecoder::default();
         // Feed one byte at a time to prove partial frames buffer correctly.
         let mut frames = Vec::new();
-        for byte in format!("{a}\n\n{b}\n").into_bytes() {
+        for byte in stream {
             frames.extend(decoder.push(&[byte]).expect("push"));
         }
         assert_eq!(frames, vec![sample_request(), sample_notification()]);
@@ -308,6 +331,61 @@ mod tests {
     fn decoder_rejects_oversize_stream_and_drops_buffer() {
         let mut decoder = FrameDecoder::default();
         let err = decoder.push(&vec![b'x'; MAX_FRAME_SIZE + 1]).unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::TooLarge {
+                limit: MAX_FRAME_SIZE
+            }
+        );
+        assert!(decoder.buf.is_empty(), "buffer must be dropped on error");
+    }
+
+    /// A `notification/diagnostic` frame whose JSON content is exactly
+    /// `content_len` bytes (padded inside a string value); the caller pushes
+    /// the terminator separately.
+    fn terminated_diagnostic(content_len: usize) -> Vec<u8> {
+        let prefix =
+            br#"{"schema_version":1,"id":null,"method":"notification/diagnostic","params":{"pad":""#;
+        let suffix = br#""}}"#;
+        let pad = content_len - prefix.len() - suffix.len();
+        let mut line = Vec::with_capacity(content_len);
+        line.extend_from_slice(prefix);
+        line.resize(line.len() + pad, b'a');
+        line.extend_from_slice(suffix);
+        line
+    }
+
+    #[test]
+    fn frame_content_one_byte_under_the_bound_passes_with_its_newline() {
+        // The bound counts raw stream bytes (content + terminator), the same
+        // accounting as the Dart host's gate: content of `MAX - 1` plus its
+        // newline is exactly `MAX` buffered bytes, so it delivers. The frame
+        // is fed in two pushes to pin the incremental accounting too.
+        let mut decoder = FrameDecoder::default();
+        assert!(
+            decoder
+                .push(&terminated_diagnostic(MAX_FRAME_SIZE - 1))
+                .expect("content push")
+                .is_empty()
+        );
+        let frames = decoder.push(b"\n").expect("terminator push");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_notification());
+    }
+
+    #[test]
+    fn frame_content_exactly_at_the_bound_dies_at_its_terminator() {
+        // Content of exactly `MAX` can never arrive: with its newline the
+        // buffered total is `MAX + 1`, which trips the guard before any
+        // decode (the same pin the Dart host's host_loop_test makes).
+        let mut decoder = FrameDecoder::default();
+        assert!(
+            decoder
+                .push(&terminated_diagnostic(MAX_FRAME_SIZE))
+                .expect("content push")
+                .is_empty()
+        );
+        let err = decoder.push(b"\n").unwrap_err();
         assert_eq!(
             err,
             ProtocolError::TooLarge {

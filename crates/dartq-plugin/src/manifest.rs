@@ -25,11 +25,17 @@ pub const DEFAULT_MEMORY_BUDGET_MB: u32 = 512;
 /// analyze/fix callback, 10 s per IPC request, 3 retries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// Per-callback wall-clock timeout in milliseconds.
+    /// Per-callback wall-clock timeout in milliseconds; must be positive —
+    /// a zero budget fails at parse (it would insta-timeout every
+    /// interaction and kill the child on first use).
     pub callback_ms: u64,
-    /// Per-request IPC timeout in milliseconds.
+    /// Per-request IPC timeout in milliseconds; must be positive — a zero
+    /// budget fails at parse (it would insta-timeout every interaction and
+    /// kill the child on first use).
     pub request_ms: u64,
-    /// Retry budget per request.
+    /// Total process-restart budget over the runtime's whole lifetime, never
+    /// reset across generations: every crash/restart consumes one
+    /// (`stats.restarts`), and a spent budget turns the next crash terminal.
     pub request_retries: u32,
 }
 
@@ -109,8 +115,9 @@ impl Manifest {
     /// Typed [`ManifestError`] naming the offending field for every schema
     /// violation: required `name`/`version`/`entrypoint` must be non-empty
     /// strings, `capabilities` (optional) must be an array of wire names,
-    /// `timeouts` (optional) must hold non-negative integers, and
-    /// `memory_budget_mb` (optional) must be a positive integer.
+    /// `timeouts` (optional) must hold positive `callback_ms`/`request_ms`
+    /// and a non-negative `request_retries`, and `memory_budget_mb`
+    /// (optional) must be a positive integer.
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
         let value: Value =
             serde_json::from_str(text).map_err(|e| ManifestError::Json(e.to_string()))?;
@@ -177,10 +184,10 @@ fn parse_timeouts(value: &Value) -> Result<Timeouts, ManifestError> {
     })?;
     let mut timeouts = Timeouts::default();
     if let Some(v) = object.get("callback_ms") {
-        timeouts.callback_ms = as_non_negative(v, "timeouts.callback_ms")?;
+        timeouts.callback_ms = as_positive(v, "timeouts.callback_ms")?;
     }
     if let Some(v) = object.get("request_ms") {
-        timeouts.request_ms = as_non_negative(v, "timeouts.request_ms")?;
+        timeouts.request_ms = as_positive(v, "timeouts.request_ms")?;
     }
     if let Some(v) = object.get("request_retries") {
         timeouts.request_retries = u32::try_from(as_non_negative(v, "timeouts.request_retries")?)
@@ -198,6 +205,15 @@ fn as_non_negative(value: &Value, field: &'static str) -> Result<u64, ManifestEr
     value.as_u64().ok_or_else(|| {
         ManifestError::InvalidField(field, "must be a non-negative integer".to_owned())
     })
+}
+
+/// A wall-clock budget: a non-negative integer that must not be zero — every
+/// interaction would insta-timeout and kill the child.
+fn as_positive(value: &Value, field: &'static str) -> Result<u64, ManifestError> {
+    value
+        .as_u64()
+        .filter(|v| *v > 0)
+        .ok_or_else(|| ManifestError::InvalidField(field, "must be a positive integer".to_owned()))
 }
 
 #[cfg(test)]
@@ -287,6 +303,34 @@ mod tests {
                 .unwrap_err(),
             ManifestError::InvalidField("timeouts.callback_ms", _)
         ));
+    }
+
+    #[test]
+    fn zero_wall_clock_budgets_are_rejected_zero_retries_is_legal() {
+        // A zero callback/request budget insta-times-out every interaction
+        // and kills the child on first use — rejected at parse, not at
+        // runtime. Zero retries is a legitimate configuration: a runtime
+        // that never restarts.
+        for (text, field) in [
+            (
+                r#"{"name": "n", "version": "1.0.0", "entrypoint": "x", "timeouts": {"callback_ms": 0}}"#,
+                "timeouts.callback_ms",
+            ),
+            (
+                r#"{"name": "n", "version": "1.0.0", "entrypoint": "x", "timeouts": {"request_ms": 0}}"#,
+                "timeouts.request_ms",
+            ),
+        ] {
+            assert_eq!(
+                Manifest::parse(text).unwrap_err(),
+                ManifestError::InvalidField(field, "must be a positive integer".to_owned())
+            );
+        }
+        let manifest = Manifest::parse(
+            r#"{"name": "n", "version": "1.0.0", "entrypoint": "x", "timeouts": {"request_retries": 0}}"#,
+        )
+        .expect("parse");
+        assert_eq!(manifest.timeouts.request_retries, 0);
     }
 
     #[test]

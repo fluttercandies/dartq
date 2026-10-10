@@ -341,14 +341,17 @@ impl Session {
         }
     }
 
-    fn handle_notification(&mut self, frame: Frame) -> Result<Incoming, SessionError> {
+    fn handle_notification(&mut self, mut frame: Frame) -> Result<Incoming, SessionError> {
         let state = self.state.as_str();
         match method_kind(&frame.method) {
             MethodKind::Diagnostic => {
                 // Diagnostics are legal only once the handshake completed;
                 // they are rejected (never queued) in every other state.
                 match self.state {
-                    SessionState::Ready => Ok(Incoming::Diagnostic(parse_payload(&frame)?)),
+                    SessionState::Ready => Ok(Incoming::Diagnostic(parse_payload(
+                        &frame.method,
+                        std::mem::take(&mut frame.params),
+                    )?)),
                     _ => Err(SessionError::UnexpectedFrame {
                         method: frame.method,
                         state,
@@ -369,7 +372,7 @@ impl Session {
         }
     }
 
-    fn handle_reply(&mut self, frame: Frame, id: u64) -> Result<Incoming, SessionError> {
+    fn handle_reply(&mut self, mut frame: Frame, id: u64) -> Result<Incoming, SessionError> {
         let state = self.state.as_str();
         let kind = method_kind(&frame.method);
         match kind {
@@ -402,7 +405,8 @@ impl Session {
                 Ok(Incoming::Initialized(effective))
             }
             (MethodKind::Fixes, SessionState::Ready) => {
-                let reply: FixesReply = parse_payload(&frame)?;
+                let reply: FixesReply =
+                    parse_payload(&frame.method, std::mem::take(&mut frame.params))?;
                 self.outstanding.remove(pos);
                 Ok(Incoming::Fixes { id, reply })
             }
@@ -466,12 +470,15 @@ fn method_kind(name: &str) -> MethodKind {
     }
 }
 
-fn parse_payload<T: serde::de::DeserializeOwned>(frame: &Frame) -> Result<T, SessionError> {
-    serde_json::from_value(Value::Object(frame.params.clone())).map_err(|e| {
-        SessionError::InvalidPayload {
-            method: frame.method.clone(),
-            reason: e.to_string(),
-        }
+/// Parses a frame's `params` as `T`. The frame is consumed by the state
+/// machine, so the map is taken by value — no clone on the wire path.
+fn parse_payload<T: serde::de::DeserializeOwned>(
+    method: &str,
+    params: Map<String, Value>,
+) -> Result<T, SessionError> {
+    serde_json::from_value(Value::Object(params)).map_err(|e| SessionError::InvalidPayload {
+        method: method.to_owned(),
+        reason: e.to_string(),
     })
 }
 
@@ -638,8 +645,9 @@ mod tests {
         let request = session
             .send_fixes_request("lib/main.dart", 10, 2)
             .expect("send fixes request");
-        let wire = format!("{}\n", crate::encode_frame(&request).expect("encode"));
-        let decoded = decode_line(wire.as_bytes()).expect("decode");
+        let mut wire = crate::encode_frame(&request).expect("encode");
+        wire.push(b'\n');
+        let decoded = decode_line(&wire).expect("decode");
         assert_eq!(decoded, request);
 
         let mut fixes = Map::new();

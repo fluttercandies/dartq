@@ -10,8 +10,8 @@
 //! # Wire format (protocol v1)
 //!
 //! Frames are newline-delimited JSON over the plugin process's stdio: one
-//! UTF-8 JSON object per line, at most [`MAX_FRAME_SIZE`] (16 MiB) bytes.
-//! Every frame carries the same four fields:
+//! UTF-8 JSON object per line, at most [`MAX_FRAME_SIZE`] (16 MiB) bytes
+//! including the line terminator. Every frame carries the same four fields:
 //!
 //! ```json
 //! {"schema_version": 1, "id": 7, "method": "initialize", "params": {}}
@@ -63,8 +63,9 @@
 //! }).as_object().unwrap().clone());
 //!
 //! // One frame = one line; the caller writes it with a trailing '\n'.
-//! let line = encode_frame(&frame)?;
-//! let decoded = decode_line(format!("{line}\n").as_bytes())?;
+//! let mut line = encode_frame(&frame)?;
+//! line.push(b'\n');
+//! let decoded = decode_line(&line)?;
 //! assert_eq!(decoded, frame);
 //! # Ok::<(), dartq_plugin::ProtocolError>(())
 //! ```

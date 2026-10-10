@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -81,11 +81,10 @@ use dartq_diagnostics::{
     DARTQ_PLUGIN_CRASHED, DARTQ_PLUGIN_TIMEOUT, Diagnostic, Severity as EngineSeverity, SourceRange,
 };
 use dartq_source::{FileId, FileTable};
-use memchr::memchr;
 use thiserror::Error;
 
 use crate::capability::CapabilitySet;
-use crate::frame::{Frame, MAX_FRAME_SIZE, ProtocolError, decode_line, encode_frame};
+use crate::frame::{Frame, FrameDecoder, MAX_FRAME_SIZE, ProtocolError, encode_frame};
 use crate::manifest::Manifest;
 use crate::session::{
     FixesReply, Incoming, PluginDiagnostic, Session, SessionError, SessionState, Severity,
@@ -95,8 +94,12 @@ use crate::stats::{PluginStats, PluginStatsSnapshot};
 
 /// How often the isolation monitor samples the child's RSS.
 const RSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How often [`PluginRuntime::wait_diagnostics`] re-checks its buffer.
-const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Pending-diagnostics fuse: a plugin that queues more than this many
+/// un-drained diagnostics is torn down as a protocol violation instead of
+/// growing the buffer without bound — the same `10_000` fuse the parser's
+/// `MAX_DIAGNOSTICS` and the scanner's per-file cap enforce.
+const MAX_PENDING_DIAGNOSTICS: usize = 10_000;
 
 /// How a plugin process is launched and what budgets it runs under. The
 /// launch policy (the `dart` invocation) is the caller's; the runtime owns
@@ -229,6 +232,54 @@ enum WriterCommand {
     Close,
 }
 
+/// The per-generation diagnostic queue: the reader fills it, the handle
+/// drains it, and every push signals [`Self::wait_for_push`] so the handle
+/// parks instead of polling.
+#[derive(Debug, Default)]
+struct PendingDiagnostics {
+    queue: Mutex<Vec<PluginDiagnostic>>,
+    signal: Condvar,
+}
+
+impl PendingDiagnostics {
+    /// Queues one plugin diagnostic and wakes a parked waiter. Past
+    /// [`MAX_PENDING_DIAGNOSTICS`] the queue is a protocol violation — a
+    /// plugin flooding diagnostics is torn down like any other contract
+    /// break. `Err` carries the teardown reason.
+    fn push(&self, diagnostic: PluginDiagnostic) -> Result<(), String> {
+        let mut queue = self.queue.lock().expect("pending diagnostics lock");
+        if queue.len() >= MAX_PENDING_DIAGNOSTICS {
+            return Err(format!(
+                "plugin exceeded the {MAX_PENDING_DIAGNOSTICS}-diagnostic pending cap"
+            ));
+        }
+        queue.push(diagnostic);
+        self.signal.notify_all();
+        Ok(())
+    }
+
+    /// Takes every queued diagnostic (the handle-side drain).
+    fn take_all(&self) -> Vec<PluginDiagnostic> {
+        std::mem::take(&mut self.queue.lock().expect("pending diagnostics lock"))
+    }
+
+    /// Parks until a diagnostic arrives or `deadline` passes (`None`). The
+    /// deadline bounds the whole wait exactly; a push wakes the waiter
+    /// immediately — there is no poll tick.
+    fn wait_for_push(&self, deadline: Instant) -> Option<Vec<PluginDiagnostic>> {
+        let mut queue = self.queue.lock().expect("pending diagnostics lock");
+        while queue.is_empty() {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (woken, _) = self
+                .signal
+                .wait_timeout(queue, remaining)
+                .expect("pending diagnostics lock");
+            queue = woken;
+        }
+        Some(std::mem::take(&mut queue))
+    }
+}
+
 /// One live plugin: child process, session, isolation monitor, counters.
 ///
 /// Created by [`PluginRuntime::spawn`]; `&mut self` methods make the handle
@@ -248,7 +299,7 @@ pub struct PluginRuntime {
     acks: mpsc::Receiver<std::io::Result<()>>,
     child: Arc<Mutex<Option<Child>>>,
     events: mpsc::Receiver<ProtocolEvent>,
-    pending: Arc<Mutex<Vec<PluginDiagnostic>>>,
+    pending: Arc<PendingDiagnostics>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
@@ -294,7 +345,7 @@ impl PluginRuntime {
             acks: mpsc::channel().1,
             child: Arc::new(Mutex::new(None)),
             events,
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(PendingDiagnostics::default()),
             running: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             death: Arc::new(Mutex::new(None)),
@@ -352,14 +403,15 @@ impl PluginRuntime {
     /// thread panicked while holding it, a program bug, not a plugin failure.
     pub fn take_diagnostics(&mut self) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
         self.ensure_alive()?;
-        Ok(std::mem::take(
-            &mut self.pending.lock().expect("pending diagnostics lock"),
-        ))
+        Ok(self.pending.take_all())
     }
 
-    /// [`Self::take_diagnostics`] with a wait: polls until at least one
-    /// plugin diagnostic arrived or `timeout` elapsed (empty result). A child
-    /// death during the wait restarts it, within budget.
+    /// [`Self::take_diagnostics`] with a wait: parks on the reader's push
+    /// signal until at least one plugin diagnostic arrived or `timeout`
+    /// elapsed (empty result) — no poll tick, the deadline bounds the whole
+    /// wait. A child death during the wait restarts it, within budget: the
+    /// parked phase may run to the deadline on a dead child, and the final
+    /// alive gate performs the restart before the empty hand returns.
     ///
     /// # Errors
     ///
@@ -369,16 +421,17 @@ impl PluginRuntime {
         timeout: Duration,
     ) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
         let deadline = Instant::now() + timeout;
-        loop {
-            let drained = self.take_diagnostics()?;
-            if !drained.is_empty() {
-                return Ok(drained);
-            }
-            if Instant::now() >= deadline {
-                return Ok(Vec::new());
-            }
-            std::thread::sleep(DIAGNOSTICS_POLL_INTERVAL);
+        let drained = self.take_diagnostics()?;
+        if !drained.is_empty() {
+            return Ok(drained);
         }
+        if let Some(batch) = self.pending.wait_for_push(deadline) {
+            return Ok(batch);
+        }
+        // Deadline: one final alive-gated drain — a push racing the expiry is
+        // still honored, and a death during the wait gets its restart (or its
+        // error) here rather than at the next interaction.
+        self.take_diagnostics()
     }
 
     /// Sends `request/fixes` for `file` at the given UTF-16 range and awaits
@@ -593,7 +646,7 @@ impl PluginRuntime {
         self.session = Arc::new(Mutex::new(Session::new(CapabilitySet::all())));
         let (events_tx, events_rx) = mpsc::channel();
         self.events = events_rx;
-        self.pending = Arc::new(Mutex::new(Vec::new()));
+        self.pending = Arc::new(PendingDiagnostics::default());
         self.running = Arc::new(AtomicBool::new(true));
         self.alive = Arc::new(AtomicBool::new(true));
         self.death = Arc::new(Mutex::new(None));
@@ -740,7 +793,7 @@ impl PluginRuntime {
     /// Codec failures, [`RuntimeError::Crashed`] on a write deadline overrun
     /// or a dead writer, and transport I/O errors acked by the writer.
     fn write_frame(&mut self, frame: &Frame) -> Result<(), RuntimeError> {
-        let mut bytes = encode_frame(frame)?.into_bytes();
+        let mut bytes = encode_frame(frame)?;
         bytes.push(b'\n');
         let byte_len = bytes.len();
         let commands = self.commands.as_ref().expect("writer present while alive");
@@ -784,7 +837,7 @@ impl Drop for PluginRuntime {
 fn spawn_reader(
     stdout: ChildStdout,
     session: Arc<Mutex<Session>>,
-    pending: Arc<Mutex<Vec<PluginDiagnostic>>>,
+    pending: Arc<PendingDiagnostics>,
     events: Sender<ProtocolEvent>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
@@ -805,58 +858,42 @@ fn spawn_reader(
 
 /// Reads frames until the stream ends or the contract breaks. `Ok(())` only
 /// when the plugin answered `shutdown` (the clean exit).
+///
+/// Framing is delegated to [`FrameDecoder`] — the single codec authority,
+/// with the same raw-byte bound and terminator handling as the Dart host —
+/// so this loop only chunks bytes and drives the session.
 fn run_reader(
     mut stdout: impl BufRead,
     session: &Mutex<Session>,
-    pending: &Mutex<Vec<PluginDiagnostic>>,
+    pending: &PendingDiagnostics,
     events: &Sender<ProtocolEvent>,
     stats: &PluginStats,
 ) -> Result<(), String> {
-    let mut line = Vec::new();
+    let mut decoder = FrameDecoder::default();
     loop {
-        line.clear();
-        match read_bounded_line(&mut stdout, &mut line) {
-            Ok(LineRead::Eof) => {
-                let terminated =
-                    session.lock().expect("session lock").state() == SessionState::Terminated;
-                return if terminated {
-                    Ok(())
-                } else {
-                    Err("plugin process closed the connection".to_owned())
-                };
-            }
-            Ok(LineRead::Line) => {}
-            Ok(LineRead::Oversize) => {
-                stats.bytes_in(u64::try_from(line.len()).unwrap_or(u64::MAX));
-                stats.frame_dropped();
-                return Err(format!(
-                    "frame exceeds the {MAX_FRAME_SIZE}-byte frame limit"
-                ));
-            }
-            Ok(LineRead::Unterminated) => {
-                stats.bytes_in(u64::try_from(line.len()).unwrap_or(u64::MAX));
+        let chunk = match stdout.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        if chunk.is_empty() {
+            // EOF: a buffered partial frame means the stream died mid-frame;
+            // otherwise the clean end is a session that saw `shutdown`.
+            if decoder.has_partial() {
                 return Err("stream ended mid-frame".to_owned());
             }
-            Err(e) => return Err(e.to_string()),
+            let terminated =
+                session.lock().expect("session lock").state() == SessionState::Terminated;
+            return if terminated {
+                Ok(())
+            } else {
+                Err("plugin process closed the connection".to_owned())
+            };
         }
-        stats.bytes_in(u64::try_from(line.len()).unwrap_or(u64::MAX));
-        // Strip the terminator (`\n`, tolerating `\r\n`) before the empty
-        // check: `read_bounded_line` returns the line with its terminator,
-        // so this is where framing noise is normalized — a stray blank line
-        // is skipped, not decoded as a malformed frame. Same framing as
-        // `FrameDecoder::push` and the Dart host, so one blank line can
-        // never tear the session down.
-        if line.last() == Some(&b'\n') {
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let frame = match decode_line(&line) {
-            Ok(frame) => frame,
+        let chunk_len = chunk.len();
+        stats.bytes_in(u64::try_from(chunk_len).unwrap_or(u64::MAX));
+        let frames = match decoder.push(chunk) {
+            Ok(frames) => frames,
             Err(ProtocolError::TooLarge { .. }) => {
                 stats.frame_dropped();
                 return Err(format!(
@@ -865,26 +902,26 @@ fn run_reader(
             }
             Err(e) => return Err(e.to_string()),
         };
-        stats.frame_in();
-        let incoming = session.lock().expect("session lock").handle(frame);
-        match incoming {
-            Ok(Incoming::Initialized(caps)) => {
-                let _ = events.send(ProtocolEvent::Initialized(caps));
+        stdout.consume(chunk_len);
+        for frame in frames {
+            stats.frame_in();
+            let incoming = session.lock().expect("session lock").handle(frame);
+            match incoming {
+                Ok(Incoming::Initialized(caps)) => {
+                    let _ = events.send(ProtocolEvent::Initialized(caps));
+                }
+                Ok(Incoming::Diagnostic(diagnostic)) => {
+                    pending.push(diagnostic)?;
+                }
+                Ok(Incoming::ShutdownComplete) => {
+                    let _ = events.send(ProtocolEvent::ShutdownComplete);
+                    return Ok(());
+                }
+                Ok(Incoming::Fixes { id, reply }) => {
+                    let _ = events.send(ProtocolEvent::FixesReply { id, reply });
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Ok(Incoming::Diagnostic(diagnostic)) => {
-                pending
-                    .lock()
-                    .expect("pending diagnostics lock")
-                    .push(diagnostic);
-            }
-            Ok(Incoming::ShutdownComplete) => {
-                let _ = events.send(ProtocolEvent::ShutdownComplete);
-                return Ok(());
-            }
-            Ok(Incoming::Fixes { id, reply }) => {
-                let _ = events.send(ProtocolEvent::FixesReply { id, reply });
-            }
-            Err(e) => return Err(e.to_string()),
         }
     }
 }
@@ -1117,56 +1154,6 @@ pub fn crash_diagnostic(plugin: &str, error: &RuntimeError, anchor: FileId) -> D
     )
 }
 
-// --- bounded line reader ---
-
-/// Outcome of one bounded line read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LineRead {
-    /// EOF at a line boundary.
-    Eof,
-    /// One complete line (the caller trims the terminator).
-    Line,
-    /// [`MAX_FRAME_SIZE`] exceeded before a newline appeared.
-    Oversize,
-    /// EOF with a partial frame buffered.
-    Unterminated,
-}
-
-/// Reads up to and including the next `'\n'`, never buffering more than
-/// [`MAX_FRAME_SIZE`] + 1 bytes: the guard fires before allocation, keeping
-/// host memory bounded whatever the plugin writes.
-fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
-    buf.clear();
-    loop {
-        // The cap check leads: a buffer already at the limit is an oversize
-        // frame even when EOF arrives in the same breath.
-        let room = (MAX_FRAME_SIZE + 1) - buf.len();
-        if room == 0 {
-            return Ok(LineRead::Oversize);
-        }
-        let available = match reader.fill_buf() {
-            Ok(available) => available,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if available.is_empty() {
-            return Ok(if buf.is_empty() {
-                LineRead::Eof
-            } else {
-                LineRead::Unterminated
-            });
-        }
-        let take = available.len().min(room);
-        if let Some(pos) = memchr(b'\n', &available[..take]) {
-            buf.extend_from_slice(&available[..=pos]);
-            reader.consume(pos + 1);
-            return Ok(LineRead::Line);
-        }
-        buf.extend_from_slice(&available[..take]);
-        reader.consume(take);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,52 +1189,14 @@ mod tests {
         assert!(crashed.message.contains("closed the connection"));
     }
 
-    fn read_lines(input: &[u8]) -> Vec<(LineRead, String)> {
-        let mut reader = Cursor::new(input);
-        let mut buf = Vec::new();
-        let mut out = Vec::new();
-        loop {
-            buf.clear();
-            match read_bounded_line(&mut reader, &mut buf).expect("read") {
-                LineRead::Eof => break,
-                read => out.push((read, String::from_utf8(buf.clone()).expect("utf8"))),
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn bounded_reader_splits_lines_and_flags_broken_ends() {
-        let lines = read_lines(b"one\ntwo\r\n\nthree");
-        assert_eq!(
-            lines,
-            vec![
-                (LineRead::Line, "one\n".to_owned()),
-                (LineRead::Line, "two\r\n".to_owned()),
-                (LineRead::Line, "\n".to_owned()),
-                (LineRead::Unterminated, "three".to_owned()),
-            ]
-        );
-        assert_eq!(read_lines(b""), Vec::new());
-    }
-
-    #[test]
-    fn bounded_reader_flags_oversize_before_buffering() {
-        let long = vec![b'x'; MAX_FRAME_SIZE + 1];
-        let lines = read_lines(&long);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].0, LineRead::Oversize);
-        assert_eq!(lines[0].1.len(), MAX_FRAME_SIZE + 1);
-    }
-
     #[test]
     fn reader_skips_blank_lines_and_decodes_crlf_frames() {
         let init_reply = r#"{"schema_version":1,"id":1,"method":"initialize","params":{"protocol_version":1,"capabilities":["lint"]}}"#;
         let diagnostic = r#"{"schema_version":1,"id":null,"method":"notification/diagnostic","params":{"file":"lib/main.dart","severity":"warning","code":"p/lint","message":"framing","offset":1,"length":2}}"#;
         // One stray blank line between two valid frames, the second
-        // CRLF-terminated: framing noise both the pure decoder
-        // (`FrameDecoder::push`) and the Dart host tolerate — the reader
-        // must too, instead of tearing the session down over it.
+        // CRLF-terminated: framing noise the single codec authority
+        // (`FrameDecoder::push`, shared with the Dart host) normalizes — the
+        // reader must not tear the session down over it.
         let stream = format!("{init_reply}\n\n{diagnostic}\r\n");
 
         let session = Mutex::new({
@@ -1255,7 +1204,7 @@ mod tests {
             session.send_initialize().expect("arm the handshake");
             session
         });
-        let pending = Mutex::new(Vec::new());
+        let pending = PendingDiagnostics::default();
         let (events, rx) = mpsc::channel();
         let stats = PluginStats::default();
 
@@ -1278,9 +1227,102 @@ mod tests {
             matches!(rx.try_recv(), Ok(ProtocolEvent::Initialized(_))),
             "the handshake reply was processed across the blank line"
         );
-        let drained = pending.lock().expect("pending lock");
+        let drained = pending.queue.lock().expect("pending lock");
         assert_eq!(drained.len(), 1, "the CRLF-terminated frame decoded");
         assert_eq!(drained[0].code, "p/lint");
+    }
+
+    #[test]
+    fn pending_diagnostics_overflow_tears_the_session_down() {
+        // The reader-side fuse: the 10_001st un-drained diagnostic is a
+        // protocol violation (same 10_000 fuse as the parser's
+        // `MAX_DIAGNOSTICS`), not unbounded queue growth.
+        let init_reply = r#"{"schema_version":1,"id":1,"method":"initialize","params":{"protocol_version":1,"capabilities":["lint"]}}"#;
+        let diagnostic = r#"{"schema_version":1,"id":null,"method":"notification/diagnostic","params":{"file":"f","severity":"warning","code":"c","message":"m"}}"#;
+        let mut stream = format!("{init_reply}\n");
+        for _ in 0..=MAX_PENDING_DIAGNOSTICS {
+            stream.push_str(diagnostic);
+            stream.push('\n');
+        }
+
+        let session = Mutex::new({
+            let mut session = Session::new(CapabilitySet::all());
+            session.send_initialize().expect("arm the handshake");
+            session
+        });
+        let pending = PendingDiagnostics::default();
+        let (events, _rx) = mpsc::channel();
+        let stats = PluginStats::default();
+
+        let outcome = run_reader(
+            Cursor::new(stream.into_bytes()),
+            &session,
+            &pending,
+            &events,
+            &stats,
+        );
+
+        let reason = outcome.expect_err("overflow must be a protocol violation");
+        assert!(
+            reason.contains(&MAX_PENDING_DIAGNOSTICS.to_string()),
+            "the reason names the fuse: {reason}"
+        );
+        let drained = pending.queue.lock().expect("pending lock");
+        assert_eq!(
+            drained.len(),
+            MAX_PENDING_DIAGNOSTICS,
+            "the queue stopped exactly at the cap"
+        );
+    }
+
+    #[test]
+    fn wait_for_push_wakes_on_the_reader_signal_not_the_deadline() {
+        let pending = Arc::new(PendingDiagnostics::default());
+        let reader = {
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                // A "reader" pushes one diagnostic after a short delay. A
+                // missing signal would burn the whole 5 s deadline and blow
+                // the elapsed bound below.
+                std::thread::sleep(Duration::from_millis(50));
+                pending
+                    .push(PluginDiagnostic {
+                        file: "lib/main.dart".to_owned(),
+                        severity: Severity::Warning,
+                        code: "p/lint".to_owned(),
+                        message: "signaled".to_owned(),
+                        offset: 0,
+                        length: 0,
+                    })
+                    .expect("under the cap");
+            })
+        };
+        let start = Instant::now();
+        let batch = pending
+            .wait_for_push(start + Duration::from_secs(5))
+            .expect("the push woke the wait");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "woke on the push signal, long before the deadline"
+        );
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].code, "p/lint");
+        reader.join().expect("reader joins");
+    }
+
+    #[test]
+    fn wait_for_push_returns_none_at_the_deadline() {
+        let pending = PendingDiagnostics::default();
+        let start = Instant::now();
+        assert!(
+            pending
+                .wait_for_push(start + Duration::from_millis(50))
+                .is_none()
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "the deadline bounds the wait"
+        );
     }
 
     #[test]
