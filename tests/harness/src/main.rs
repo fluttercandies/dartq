@@ -13,6 +13,8 @@ mod corpus;
 mod dartq;
 mod machine;
 mod oracle;
+mod replay;
+mod replay_edit;
 mod report;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +62,7 @@ fn dispatch(args: &[String]) -> Result<(String, bool), Outcome> {
         Some("corpus") => run_corpus(&args[1..]).map(|s| (s, true)),
         Some("run") => run_compare(&args[1..]),
         Some("bench") => bench::bench_entry(&args[1..]),
+        Some("replay") => replay::replay_entry(&args[1..]),
         Some("--help" | "-h" | "help") | None => {
             print_usage();
             Ok((String::new(), true))
@@ -128,6 +131,17 @@ fn print_usage() {
       Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD})
       or the gate not in scope under --severity-filter (verdict SKIPPED,
       pure-report mode), 1 = below threshold, 2 = harness error.
+
+  harness replay --corpus-dir DIR --edits FILE.jsonl --dartq-cmd TEMPLATE
+                 --daemon-cmd TEMPLATE [--label NAME] [--out DIR]
+      PRD §19.4 oracle incremental consistency: drive one live `dartq
+      daemon` session with an edit sequence (overlay didChange + the
+      `dartq/analyze` pull = the incremental result) while the same edits
+      land on a materialized disk copy re-analyzed fresh per step (the
+      `--dartq-cmd` full-recompute result); per step both sides normalize
+      to one canonical shape and compare byte-wise. Report:
+      <out>/<label>/{{report.json,report.md}}. Exit codes: 0 all steps
+      equal, 1 any mismatch, 2 harness error.
 
   harness bench [--metric NAME]... [--corpus-dir DIR] [--out DIR]
                 [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
