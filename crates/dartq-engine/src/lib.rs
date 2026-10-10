@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dartq_diagnostics::Diagnostic;
+use dartq_index::{FileCapture, LibraryIndex};
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
@@ -413,6 +414,28 @@ impl Engine {
     #[must_use]
     pub fn file_facts(&self, file: FileId) -> Option<&state::UnitFacts> {
         self.state.residency.get(&file).map(Arc::as_ref)
+    }
+
+    /// The maintained capture of a resident file — the declaration surface
+    /// plus raw reference sites analyze recaptures per changed file
+    /// (index-design-spec §8) — or `None` before the file's first analyze
+    /// covers it. The raw-row read face the index-backed queries assemble
+    /// over: [`Engine::query_symbols`]'s substrate at row fidelity, the
+    /// rows' `StringId`s native to [`Engine::strings`].
+    #[must_use]
+    pub fn file_capture(&self, file: FileId) -> Option<&FileCapture> {
+        self.state.captures.get(&file).map(Arc::as_ref)
+    }
+
+    /// Every live library's maintained reference surface, ascending by
+    /// library id — rebuilt whole at each `LibraryAnalyzed` point and
+    /// dropped with the library at retirement, the fresh partition
+    /// [`Engine::query_symbols`] reads.
+    pub fn library_surfaces(&self) -> impl Iterator<Item = (LibraryId, &LibraryIndex)> + '_ {
+        self.state
+            .library_surfaces
+            .iter()
+            .map(|(library, surface)| (*library, surface))
     }
 
     /// The engine's intern table — the one table every resident fact's

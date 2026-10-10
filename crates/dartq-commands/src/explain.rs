@@ -1,28 +1,23 @@
 //! The explain face's core (PRD §15.3): the AI's one-stop symbol report —
 //! the commands wiring of the [`dartq_ai::explain`] assembler.
 //!
-//! The report joins index surfaces the engine keeps behind its `pub(crate)`
-//! index query (see [`crate::index`]'s module docs), so this face rides the
-//! same one public per-library window — the
-//! [`dartq_engine::SemanticDiagnoser`] hook — as the index face does. The
-//! [`ExplainCollector`] harvests exactly what the queried symbol needs
-//! while the analyze fan-out runs:
+//! The report answers from the engine's maintained index state after the
+//! one discover+analyze prelude — no second analysis pass runs. The
+//! declaration hits read the per-file captures
+//! ([`dartq_engine::Engine::file_capture`]), the reference and supertype
+//! rows the per-library reference surfaces
+//! ([`dartq_engine::Engine::library_surfaces`]) — the same maintained
+//! state `query_symbols` serves, at raw-row fidelity so the assembler's
+//! container anchors resolve in place. The rows' `StringId`s are native
+//! to the engine's intern table, which the answer resolves through. The
+//! transient per-answer maps (hit grouping, supertype projection) are
+//! symbol-scoped and dropped at the end of the call.
 //!
-//! * the declaring files' full declaration surfaces (containers and member
-//!   anchors resolve through them), remapped into the harvest's own intern
-//!   table — the engine's table is not exported;
-//! * the library's resolved reference rows naming the symbol (the
-//!   assembler filters them to the primary declaration's file);
-//! * the resolved supertype targets of `(file, symbol)`, mapped from the
-//!   built library index's [`dartq_index::SubtypeEdge`]s onto
-//!   [`dartq_index::TargetRef`]s.
-//!
-//! Harvesting is symbol-filtered: files that do not declare the name
-//! contribute nothing. The reverse import graph and the test graph build
-//! once per call from the engine's import CSR — the same per-query
-//! posture `impact_after_analysis` keeps over the same CSR. When the
-//! engine grows a first-class index face, both this harvest and that
-//! per-call build are the seams to delete.
+//! The reverse import graph and the test graph build once per call from
+//! the engine's import CSR — the same per-query posture `impact` keeps
+//! over the same CSR. The semantic fold plays no role in the report, so
+//! the face skips it (`semdiag = None`); the collectors this face retired
+//! skipped it the same way.
 //!
 //! The JSON answer is the assembler's serialized report routed through
 //! `dartq-schema`'s `validate(payload, Domain::Explain)` where the payload
@@ -31,22 +26,17 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use dartq_ai::explain::{self as query, SymbolDeclHit};
 use dartq_ai::rev_import_graph::RevImportGraph;
-use dartq_diagnostics::Diagnostic;
-use dartq_engine::{Engine, LibraryView, SemanticDiagnoser};
-use dartq_index::{DeclRow, LibraryBuilder, RefRow, TargetRef, TestGraph, capture};
-use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
-use dartq_parser::ParserFeatures;
-use dartq_source::{FileId, StringTable};
+use dartq_engine::Engine;
+use dartq_index::{RefRow, TargetRef, TestGraph};
+use dartq_source::FileId;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::Verbosity;
 use crate::analyze::{AnalyzeError, prelude};
-use crate::check::scan_file_at;
 use crate::impact::library_identities;
 use crate::workspace::{WorkspaceError, engine_config};
 
@@ -65,10 +55,10 @@ pub enum ExplainError {
     Analyze(#[from] AnalyzeError),
 }
 
-/// Runs the explain face over the workspace at `dir`: assemble the engine
-/// (the [`ExplainCollector`] installed), run the discover+analyze prelude
-/// (the harvest rides the analyze fan-out), and return the report for
-/// `symbol` as schema-valid JSON.
+/// Runs the explain face over the workspace at `dir`: assemble the engine,
+/// run the discover+analyze prelude (the read-after-write the report
+/// reflects), and answer for `symbol` from the maintained index state as
+/// schema-valid JSON.
 ///
 /// # Errors
 ///
@@ -80,33 +70,79 @@ pub fn explain(
     symbol: &str,
     verbosity: Verbosity,
 ) -> Result<Value, ExplainError> {
-    let collector = Arc::new(ExplainCollector::new(symbol.to_owned()));
     let (mut config, _dir) = engine_config(dir, sdk)?;
-    config.semdiag = Some(collector.clone() as Arc<dyn SemanticDiagnoser>);
+    // The report reads the maintained index state; the semantic fold's
+    // diagnostics are discarded on this face, so the fold is skipped.
+    config.semdiag = None;
     let mut engine =
         Engine::new(config).map_err(|error| ExplainError::Engine(error.to_string()))?;
     prelude(&mut engine)?;
-    Ok(explain_after_analysis(&engine, &collector, verbosity))
+    Ok(explain_answer(&engine, symbol, verbosity))
 }
 
-/// The report over an already-analyzed engine — the daemon path, which
-/// installs [`ExplainCollector::new`] on its engine config at assembly and
-/// holds the arc. `collector` must be the one the engine was built with:
-/// an unharvested collector is indistinguishable from an unknown symbol.
-#[must_use]
-pub fn explain_after_analysis(
-    engine: &Engine,
-    collector: &ExplainCollector,
-    verbosity: Verbosity,
-) -> Value {
-    let harvest = collector.harvest.lock().expect("harvest lock poisoned");
-    let sym = harvest.strings.intern(&collector.symbol);
+/// The report over an already-analyzed engine: the adapter over the
+/// maintained index state (transient, symbol-scoped — dropped at the end
+/// of the call) feeding the assembler.
+///
+/// # Panics
+///
+/// Panics on engine-contract violations, surfaced never clamped: a live
+/// library member without a capture, or an answer file id missing from
+/// the engine's file table, is a program bug.
+fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value {
+    // The queried name interns into the engine's table once — the rows'
+    // native table (the documented query posture: the only side effect).
+    let sym = engine.strings().intern(symbol);
+
+    // Declaration hits from the maintained captures: live libraries ×
+    // members, the equal-name run per declaring file. The rows borrow the
+    // captures — nothing copies.
+    let libraries = engine.libraries();
+    let mut hits: Vec<SymbolDeclHit<'_>> = Vec::new();
+    let mut hit_files: BTreeMap<u32, Vec<FileId>> = BTreeMap::new();
+    for (library, members) in &libraries {
+        let library = library.index();
+        for &file in members {
+            let capture = engine.file_capture(file).expect("analyzed member");
+            if let Some(rows) = capture.index.by_name(sym) {
+                hits.extend(
+                    rows.iter().map(|decl| SymbolDeclHit { library, file, decl }),
+                );
+                hit_files.entry(library).or_default().push(file);
+            }
+        }
+    }
+
+    // The reference rows naming the symbol and the hit files' resolved
+    // supertype targets — one pass over the maintained surfaces (the
+    // by-name union the assembler filters to the primary declaration).
+    let mut refs: Vec<RefRow> = Vec::new();
+    let mut supers: BTreeMap<FileId, Vec<TargetRef>> = BTreeMap::new();
+    for (library, surface) in engine.library_surfaces() {
+        refs.extend(
+            surface
+                .refs()
+                .iter()
+                .filter(|row| row.target_name == sym)
+                .copied(),
+        );
+        if let Some(files) = hit_files.get(&library.index()) {
+            for &file in files {
+                let targets = surface
+                    .supertypes_of(file, sym)
+                    .map_or(Vec::new(), |edges| {
+                        edges.iter().map(|edge| edge.supertype).collect()
+                    });
+                supers.insert(file, targets);
+            }
+        }
+    }
 
     // The graph faces over the engine's import CSR — the substrate
     // `impact` reads (one build each per call).
     let csr = engine.library_import_graph();
     let count = csr.nodes();
-    let idents = library_identities(engine, &engine.libraries());
+    let idents = library_identities(engine, &libraries);
     let neighbors = |library: u32| -> &[u32] {
         let start = csr.offsets()[library as usize] as usize;
         let end = csr.offsets()[library as usize + 1] as usize;
@@ -117,13 +153,13 @@ pub fn explain_after_analysis(
         idents[library as usize].as_deref()
     });
 
-    // Stable path text for every file id the harvest carries (internal ids
+    // Stable path text for every file id the answer carries (internal ids
     // never leave the engine boundary).
     let file_table = engine.file_table();
     let mut ids: Vec<FileId> = Vec::new();
-    ids.extend(harvest.surfaces.iter().map(|(_, file, _)| *file));
-    ids.extend(harvest.refs.iter().map(|row| row.file));
-    ids.extend(harvest.supers.iter().flat_map(|(_, targets)| {
+    ids.extend(hits.iter().map(|hit| hit.file));
+    ids.extend(refs.iter().map(|row| row.file));
+    ids.extend(supers.values().flat_map(|targets| {
         targets.iter().filter_map(|target| match target {
             TargetRef::Decl(file, _) => Some(*file),
             TargetRef::Name(_) => None,
@@ -136,61 +172,36 @@ pub fn explain_after_analysis(
         .map(|&file| {
             file_table
                 .path(file)
-                .expect("harvested file")
+                .expect("answer file")
                 .display()
                 .to_string()
         })
         .collect();
 
-    // Per-file lookup maps for the closures below: one build each instead
-    // of an O(surfaces)/O(supers) linear find per reference row — the same
-    // build-once posture as the `file_labels` sort above. A file appears at
-    // most once per harvest vec (one library, one hit-file pass).
-    let surfaces_of: BTreeMap<FileId, &[DeclRow]> = harvest
-        .surfaces
-        .iter()
-        .map(|(_, file, surface)| (*file, surface.as_slice()))
-        .collect();
-    let supers_of: BTreeMap<FileId, &[TargetRef]> = harvest
-        .supers
-        .iter()
-        .map(|(file, targets)| (*file, targets.as_slice()))
-        .collect();
-
-    let hits: Vec<SymbolDeclHit<'_>> = harvest
-        .surfaces
-        .iter()
-        .flat_map(|(library, file, surface)| {
-            surface
-                .iter()
-                .filter(|row| row.name == sym)
-                .map(move |row| SymbolDeclHit {
-                    library: *library,
-                    file: *file,
-                    decl: row,
-                })
-        })
-        .collect();
     let report = query::explain(
-        &collector.symbol,
+        symbol,
         verbosity.into(),
         &hits,
-        &harvest.refs,
-        |file| surfaces_of.get(&file).map_or(&[], |surface| *surface),
-        |file, _| supers_of.get(&file).map_or(&[], |targets| *targets),
+        &refs,
+        |file| {
+            engine
+                .file_capture(file)
+                .map_or(&[][..], |capture| capture.index.decls())
+        },
+        |file, _| supers.get(&file).map_or(&[][..], |targets| targets.as_slice()),
         &importers,
         |library| idents[library as usize].as_deref().expect("live library"),
         |file| {
-            let index = ids.binary_search(&file).expect("harvested file label");
+            let index = ids.binary_search(&file).expect("answer file label");
             &file_labels[index]
         },
         &tests,
-        &harvest.strings,
+        engine.strings(),
     );
     // One serialization into the answer `Value`, then one serialization of
     // that Value to the validator's &str face (`dartq-schema::validate` is
-    // string-typed) — the parsed-back round trip of the older shape is
-    // gone: the report is converted exactly twice, never re-parsed.
+    // string-typed) — the report is converted exactly twice, never
+    // re-parsed.
     let value = serde_json::to_value(&report).expect("explain report serializes");
     let json = serde_json::to_string(&value).expect("explain report serializes");
     dartq_schema::validate(&json, dartq_schema::Domain::Explain).unwrap_or_else(|violation| {
@@ -207,118 +218,6 @@ impl From<Verbosity> for query::Verbosity {
             Verbosity::Minimal => query::Verbosity::Minimal,
             Verbosity::Compact => query::Verbosity::Compact,
             Verbosity::Full => query::Verbosity::Full,
-        }
-    }
-}
-
-/// Harvests the queried symbol's index surfaces through the analyze
-/// fan-out's one public window ([`LibraryView`]). The harvest data is the
-/// assembler's input faces, symbol-filtered at capture time.
-pub struct ExplainCollector {
-    symbol: String,
-    harvest: Mutex<Harvest>,
-}
-
-impl ExplainCollector {
-    /// The collector for one `explain` query over `symbol`.
-    #[must_use]
-    pub fn new(symbol: String) -> Self {
-        Self {
-            symbol,
-            harvest: Mutex::default(),
-        }
-    }
-}
-
-/// What one harvest holds. `StringId`s are remapped into `strings` (the
-/// engine's intern table is not exported); `FileId`s stay engine-native —
-/// the report's labels resolve through the engine's file table.
-#[derive(Default)]
-struct Harvest {
-    strings: StringTable,
-    /// Full declaration surfaces of the files that declare the symbol, as
-    /// `(engine library id, file, rows)` — full, so the rows' container
-    /// anchors index validly.
-    surfaces: Vec<(u32, FileId, Vec<DeclRow>)>,
-    /// Resolved reference rows naming the symbol (the by-name union).
-    refs: Vec<RefRow>,
-    /// The resolved supertype targets of `(file, symbol)` per hit file.
-    supers: Vec<(FileId, Vec<TargetRef>)>,
-}
-
-impl SemanticDiagnoser for ExplainCollector {
-    fn diagnose_library(&self, view: LibraryView<'_>, _out: &mut Vec<Diagnostic>) {
-        let queried = view.strings.intern(&self.symbol);
-        let mut harvest = self.harvest.lock().expect("harvest lock poisoned");
-        let local = harvest.strings.intern(&self.symbol);
-        let library = view.library.index() as u32;
-        let mut builder = LibraryBuilder::new(view.graph_library, view.graph, view.namespaces);
-        let mut hit_files: Vec<FileId> = Vec::new();
-        for &file in view.files {
-            let facts = view.facts.get(&file).expect("analyzed member");
-            let bytes = view.store.get(facts.content()).expect("resident content");
-            let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-            // The apply-phase version derivation (the engine capture's): the
-            // owning package's version, or the default when the file belongs
-            // to no package.
-            let version = view
-                .packages
-                .containing(view.file_table.path(file).expect("interned path"))
-                .and_then(|identity| identity.language_version)
-                .map_or(
-                    DEFAULT_LANGUAGE_VERSION,
-                    dartq_pub::LanguageVersion::into_inner,
-                );
-            let (settled, scanned, _) = scan_file_at(text, version, file);
-            let captured = capture(
-                file,
-                text,
-                &scanned.tokens,
-                ParserFeatures::from_feature_set(FeatureSet::for_language_version(settled)),
-                view.strings,
-            );
-            if captured.index.by_name(queried).is_some() {
-                hit_files.push(file);
-                let surface = captured
-                    .index
-                    .decls()
-                    .iter()
-                    .map(|row| DeclRow {
-                        name: harvest.strings.intern(view.strings.resolve(row.name)),
-                        ..*row
-                    })
-                    .collect();
-                harvest.surfaces.push((library, file, surface));
-            }
-            builder.add_file(&captured);
-        }
-        let surface = builder.finish();
-        harvest.refs.extend(
-            surface
-                .refs()
-                .iter()
-                .filter(|row| row.target_name == queried)
-                .map(|row| RefRow {
-                    target_name: local,
-                    ..*row
-                }),
-        );
-        for file in hit_files {
-            let targets = surface
-                .supertypes_of(file, queried)
-                .unwrap_or_default()
-                .iter()
-                .map(|edge| match edge.supertype {
-                    TargetRef::Decl(target_file, name) => TargetRef::Decl(
-                        target_file,
-                        harvest.strings.intern(view.strings.resolve(name)),
-                    ),
-                    TargetRef::Name(name) => {
-                        TargetRef::Name(harvest.strings.intern(view.strings.resolve(name)))
-                    }
-                })
-                .collect();
-            harvest.supers.push((file, targets));
         }
     }
 }

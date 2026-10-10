@@ -1,38 +1,26 @@
-//! The `dartq index` face (PRD §15.1): build the dartq-index symbol index
-//! over the analyzed workspace and report what it built.
+//! The `dartq index` face (PRD §15.1): report the dartq-index symbol index
+//! the analyzed workspace maintains.
 //!
 //! # Build shape
 //!
-//! The index assembly (per-library capture + resolution through the
-//! namespace tables, folded into `dartq_index::SymbolIndex`) lives behind
-//! the engine's `pub(crate)` query face, which answers by-name only. This
-//! face rides the engine's one public per-library window — the
-//! [`dartq_engine::SemanticDiagnoser`] hook, whose [`dartq_engine::LibraryView`]
-//! carries exactly the query face's inputs (member files, resolved graph,
-//! namespaces, intern table): the collector re-runs the capture fan-out at
-//! diagnose time and tallies the finished surfaces. When the engine grows a
-//! first-class index face (build-once + row totals), this collector is the
-//! seam to delete.
-//!
-//! The collector replaces the default semantic diagnoser on this face's
-//! engine: the face reports counts, not diagnostics, so the semantic fold
-//! would be whole-workspace work on discarded output. The scan settlement
-//! is `crate::check::scan_file_at` — the same `@dart` override contract the
-//! engine's capture applies; the capture face produces no diagnostics, so
-//! the above-latest warning rides back dropped.
+//! The index is the engine's maintained state, not a face-side rebuild:
+//! analyze recaptures every changed file into the per-file captures and
+//! rebuilds each live library's reference surface at its `LibraryAnalyzed`
+//! point (index-design-spec §6/§8) — the same state `query_symbols`
+//! serves. This face tallies it through the engine's read hooks
+//! ([`dartq_engine::Engine::file_capture`] /
+//! [`dartq_engine::Engine::library_surfaces`]): no scan, no parse, no
+//! second capture pass. The semantic fold plays no role in the counts, so
+//! the face skips it (`semdiag = None`); the collector this face retired
+//! skipped it the same way.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use dartq_engine::{Engine, LibraryView, SemanticDiagnoser};
-use dartq_language::FeatureSet;
-use dartq_parser::ParserFeatures;
+use dartq_engine::Engine;
 use serde_json::json;
 use thiserror::Error;
 
 use crate::analyze::{AnalyzeError, prelude};
-use crate::check::scan_file_at;
 use crate::workspace::{WorkspaceError, engine_config};
 
 /// Why an index run aborts: the workspace assembly (usage tier) or the
@@ -85,15 +73,19 @@ impl IndexRun {
     }
 }
 
-/// One index run over the workspace at `dir`: assemble the engine (the
-/// collector diagnoser installed), run the discover+analyze prelude (the
-/// read-after-write the index reflects — the collector harvests during the
-/// analyze fan-out), and return the tallied totals.
+/// One index run over the workspace at `dir`: assemble the engine, run the
+/// discover+analyze prelude (the read-after-write the counts reflect), and
+/// tally the maintained index state's row totals.
 ///
 /// `full` is the §15.1 grammar's `--full`: force a rebuild instead of
-/// reusing incremental state. The engine has no resident index yet — every
-/// run builds fresh — so both modes build full; the flag pins the grammar
-/// until engine-side incremental index maintenance lands.
+/// reusing incremental state. One CLI run assembles a fresh engine and
+/// analyzes the whole workspace, so the tallies are a full build every
+/// time; the flag pins the grammar.
+///
+/// # Panics
+///
+/// Panics on an engine-contract violation, surfaced never clamped: a live
+/// library member without a capture is a program bug.
 ///
 /// # Errors
 ///
@@ -104,71 +96,40 @@ pub fn run(dir: &Path, sdk: Option<&Path>, full: bool) -> Result<IndexRun, Index
     // the parameter stays honest when incremental reuse arrives.
     let _ = full;
     let (mut config, _dir) = engine_config(dir, sdk)?;
-    let collector = Arc::new(IndexCollector::default());
-    config.semdiag = Some(collector.clone() as Arc<dyn SemanticDiagnoser>);
+    // The counts read the maintained index state; the semantic fold's
+    // diagnostics are discarded on this face, so the fold is skipped.
+    config.semdiag = None;
     let mut engine = Engine::new(config).map_err(|error| IndexError::Engine(error.to_string()))?;
     prelude(&mut engine)?;
-    Ok(IndexRun {
-        files: collector.files.load(Ordering::Relaxed),
-        libraries: collector.libraries.load(Ordering::Relaxed),
-        symbols: collector.symbols.load(Ordering::Relaxed),
-        references: collector.references.load(Ordering::Relaxed),
-    })
-}
 
-/// Harvests the per-library index surfaces the analyze fan-out offers
-/// through [`LibraryView`], tallying row totals. The counters are atomic:
-/// `diagnose_library` runs on the batch fan-out workers.
-#[derive(Default)]
-struct IndexCollector {
-    files: AtomicUsize,
-    libraries: AtomicUsize,
-    symbols: AtomicUsize,
-    references: AtomicUsize,
-}
-
-impl SemanticDiagnoser for IndexCollector {
-    fn diagnose_library(
-        &self,
-        view: LibraryView<'_>,
-        _out: &mut Vec<dartq_diagnostics::Diagnostic>,
-    ) {
-        self.libraries.fetch_add(1, Ordering::Relaxed);
-        self.files.fetch_add(view.files.len(), Ordering::Relaxed);
-
-        let mut builder =
-            dartq_index::LibraryBuilder::new(view.graph_library, view.graph, view.namespaces);
-        for &file in view.files {
-            let facts = view.facts.get(&file).expect("analyzed member");
-            let bytes = view.store.get(facts.content()).expect("resident content");
-            let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-            // The apply-phase version derivation (the engine capture's): the
-            // owning package's version, or the default when the file belongs
-            // to no package.
-            let version = view
-                .packages
-                .containing(view.file_table.path(file).expect("interned path"))
-                .and_then(|identity| identity.language_version)
-                .map_or(
-                    dartq_language::DEFAULT_LANGUAGE_VERSION,
-                    dartq_pub::LanguageVersion::into_inner,
-                );
-            let (settled, scanned, _) = scan_file_at(text, version, file);
-            let captured = dartq_index::capture(
-                file,
-                text,
-                &scanned.tokens,
-                ParserFeatures::from_feature_set(FeatureSet::for_language_version(settled)),
-                view.strings,
-            );
-            self.symbols
-                .fetch_add(captured.index.len(), Ordering::Relaxed);
-            builder.add_file(&captured);
+    // The row totals off the maintained state: member files and their
+    // declaration rows (the captures), the live libraries and their
+    // resolved reference rows (the surfaces).
+    let libraries = engine.libraries();
+    let mut files = 0;
+    let mut symbols = 0;
+    for (_, members) in &libraries {
+        files += members.len();
+        for &file in members {
+            symbols += engine
+                .file_capture(file)
+                .expect("analyzed member")
+                .index
+                .len();
         }
-        let surface = builder.finish();
-        self.references
-            .fetch_add(surface.refs().len(), Ordering::Relaxed);
     }
+    let mut built = 0;
+    let mut references = 0;
+    for (_, surface) in engine.library_surfaces() {
+        built += 1;
+        references += surface.reference_count();
+    }
+    Ok(IndexRun {
+        files,
+        libraries: built,
+        symbols,
+        references,
+    })
 }
 
 #[cfg(test)]
