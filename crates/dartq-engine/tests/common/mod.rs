@@ -72,7 +72,7 @@ impl Fixture {
         write("sdk/version", "3.13.1\n");
         write(
             "sdk/lib/libraries.json",
-            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "math": {"uri": "math/math.dart"}}}}"#,
         );
         write(
             "sdk/lib/_internal/allowed_experiments.json",

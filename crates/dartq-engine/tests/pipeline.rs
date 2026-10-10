@@ -9,7 +9,7 @@ mod common;
 use std::path::Path;
 
 use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0};
-use dartq_diagnostics::{AnalysisOutput, FileLayoutProvider, Severity, write_json};
+use dartq_diagnostics::{AnalysisOutput, DiagnosticType, FileLayoutProvider, Severity, write_json};
 use dartq_engine::{CancellationToken, EngineError, RevalidateGate};
 use dartq_language::DEFAULT_LANGUAGE_VERSION;
 use dartq_source::FileId;
@@ -512,4 +512,119 @@ fn merged_diagnostics_interleave_across_libraries() {
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(keys, sorted, "merged output must be canonically ordered");
+}
+
+/// The directive-combinator static warnings (`undefined_hidden_name` /
+/// `undefined_shown_name`; dead_code_verifier.dart:138-161): every written
+/// `show`/`hide` token the resolved target's export scope defines under
+/// neither spelling reports at the token — WARNING severity, the verbatim
+/// oracle message with the target library's URI as `{0}`, the verbatim
+/// correction, and the written token's span — while a defined name stays
+/// silent on both clause kinds and a directive whose target has no library
+/// is suppressed entirely (the nonexistent-library gate :63/:91; the
+/// missing target's own `uri_does_not_exist` is the root cause). `{0}` is
+/// the target's absolute `file:///` URI for analysis-set libraries and
+/// `dart:<name>` for SDK faces — the oracle's corpus-run spelling.
+#[test]
+fn undefined_combinator_names_report_per_written_token() {
+    let main = "\
+import 'existing.dart' hide nope;
+import 'existing.dart' show nope, greet;
+import 'existing.dart' hide greet;
+import 'dart:math' hide nope2;
+import 'missing.dart' hide alsoGone;
+
+void main() {}
+";
+    let fixture = Fixture::new(&[("lib/main.dart", main), ("lib/existing.dart", GREETER_0)]);
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("analyze");
+    let main_file = engine
+        .file_table()
+        .try_file_id(&fixture.path("lib/main.dart"))
+        .expect("main.dart resident");
+    let existing_uri = format!("file://{}", fixture.path("lib/existing.dart").display());
+
+    let findings: Vec<(u32, u32, &str, String)> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.file == main_file
+                && matches!(
+                    diagnostic.code.name,
+                    "undefined_hidden_name" | "undefined_shown_name"
+                )
+        })
+        .map(|diagnostic| {
+            assert_eq!(
+                diagnostic.severity,
+                Severity::Warning,
+                "STATIC_WARNING rows are oracle-WARNING"
+            );
+            assert_eq!(
+                diagnostic.code.dtype,
+                DiagnosticType::StaticWarning
+            );
+            (diagnostic.range.offset, diagnostic.range.length, diagnostic.code.name, diagnostic.message.clone())
+        })
+        .collect();
+
+    // Token spans (file offsets): line 1 `hide nope` puts the token at
+    // column 28 (offset 28); line 2 `show nope` same column → offset 62;
+    // line 4 `import 'dart:math' hide nope2;` starts at 110, token at
+    // column 24 → offset 134. Emission order is the deterministic face —
+    // fixture source order within the file (the canonical merge is
+    // offset-major), pinned explicitly, no re-sort.
+    assert_eq!(
+        findings,
+        vec![
+            (
+                28,
+                4,
+                "undefined_hidden_name",
+                format!(
+                    "The library '{existing_uri}' doesn't export a member with the hidden name \
+                     'nope'."
+                )
+            ),
+            (
+                62,
+                4,
+                "undefined_shown_name",
+                format!(
+                    "The library '{existing_uri}' doesn't export a member with the shown name \
+                     'nope'."
+                )
+            ),
+            (
+                134,
+                5,
+                "undefined_hidden_name",
+                format!(
+                    "The library 'dart:math' doesn't export a member with the hidden name \
+                     'nope2'."
+                )
+            ),
+        ],
+        "one report per written undefined token; `greet` (defined) and `alsoGone` \
+         (unresolved target) stay silent"
+    );
+
+    // The verbatim corrections ride along (registry rows
+    // diagnostic.g.dart:16936-16951/:17196-17212).
+    for diagnostic in &diagnostics {
+        match diagnostic.code.name {
+            "undefined_hidden_name" => assert_eq!(
+                diagnostic.correction.as_deref(),
+                Some("Try removing the name from the list of hidden members.")
+            ),
+            "undefined_shown_name" => assert_eq!(
+                diagnostic.correction.as_deref(),
+                Some("Try removing the name from the list of shown members.")
+            ),
+            _ => {}
+        }
+    }
 }

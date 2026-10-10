@@ -817,6 +817,32 @@ pub(crate) fn uri_diagnostic(
     )
 }
 
+/// One directive-combinator static warning — the two-placeholder sibling of
+/// [`uri_diagnostic`]: the `undefined_hidden_name`/`undefined_shown_name`
+/// templates carry `{0}` (the target library's URI spelling) and `{1}` (the
+/// written combinator name); the rest of the descriptor-driven shape is
+/// identical (the family decides TYPE and severity, the published flag and
+/// the verbatim correction ride along).
+pub(crate) fn combinator_diagnostic(
+    info: dartq_resolution::ResolutionCodeInfo,
+    library_uri: &str,
+    name: &str,
+    range: SourceRange,
+    file: FileId,
+) -> Diagnostic {
+    Diagnostic::new(
+        info.dtype.severity(),
+        CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
+        info
+            .message
+            .replace("{0}", library_uri)
+            .replace("{1}", name),
+        file,
+        range,
+        info.correction.map(str::to_owned),
+    )
+}
+
 /// Parse-recovery diagnostics through the engine's listener (pass 1 of 2;
 /// see `recompute_facts` for the two-pass note). The listener moves into the
 /// parser (the trait is not object-safe over `&mut` here), so diagnostics

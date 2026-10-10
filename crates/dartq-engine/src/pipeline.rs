@@ -14,7 +14,7 @@ use dartq_diagnostics::Diagnostic;
 use dartq_index::FileCapture;
 use dartq_resolution::{
     Combinators, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
-    ResolutionCode, ResolvedTarget,
+    ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
 use dartq_semantic::MicroKind;
 use dartq_source::{FileId, FileTable, StringTable};
@@ -25,7 +25,8 @@ use crate::cancel::{CancellationToken, Cancelled};
 use crate::event::EngineEvent;
 use crate::l1;
 use crate::state::{
-    DirectiveKind, EngineState, FactsKey, LibraryId, LibraryInfo, LibraryResult, ScannedFace,
+    DirectiveFacts, DirectiveKind, EngineState, FactsKey, LibraryId, LibraryInfo, LibraryResult,
+    ScannedFace,
 };
 use crate::{CsrGraph, LibraryView, SemanticDiagnoser};
 
@@ -39,6 +40,11 @@ use crate::{CsrGraph, LibraryView, SemanticDiagnoser};
 pub(crate) struct ResolvedGraph {
     pub graph: LibraryGraph,
     pub graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId>,
+    /// The synthetic `dart:` SDK face nodes by library name — the
+    /// directive-side lookup for the combinator check's `dart:` face (the
+    /// graph build joins External imports to these nodes; the nodes have no
+    /// engine-library mapping, so `graph_ids` cannot answer for them).
+    sdk_faces: FxHashMap<String, dartq_resolution::LibraryId>,
     namespaces: OnceLock<Namespaces>,
 }
 
@@ -225,6 +231,39 @@ fn diagnose_library(
                     directive.uri_span,
                     *file,
                 ));
+            }
+            // Directive-combinator static warnings (dead_code_verifier.dart
+            // :85-98/:58-70 visit the import/export directives alike): every
+            // written `show`/`hide` token the resolved target's export scope
+            // defines under neither spelling reports at the token, unless the
+            // directive has no resolved target — the oracle's
+            // nonexistent-library gate (:63/:91; the missing target is the
+            // reported root cause and replaces the combinator symptom). Each
+            // clause kind picks its code face (`hide` →
+            // `undefined_hidden_name`, `show` → `undefined_shown_name`).
+            if matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export)
+                && directive.combinators.written().next().is_some()
+                && let Some((target, library_uri)) =
+                    combinator_check_target(state, resolved, directive)
+            {
+                for found in
+                    resolved
+                        .graph
+                        .undefined_combinator_names(Some(target), &directive.combinators)
+                {
+                    let info = if found.hidden {
+                        UNDEFINED_HIDDEN_NAME
+                    } else {
+                        UNDEFINED_SHOWN_NAME
+                    };
+                    out.push(l1::combinator_diagnostic(
+                        info,
+                        &library_uri,
+                        state.strings.resolve(found.name),
+                        found.span,
+                        *file,
+                    ));
+                }
             }
         }
     }
@@ -580,6 +619,10 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     ResolvedGraph {
         graph,
         graph_ids,
+        sdk_faces: sdk_faces
+            .into_iter()
+            .map(|(name, node)| (name.to_owned(), node))
+            .collect(),
         namespaces: OnceLock::new(),
     }
 }
@@ -605,6 +648,43 @@ fn graph_target(
             .get(&file)
             .and_then(|library| graph_ids.get(library).copied()),
         _ => None,
+    }
+}
+
+/// The combinator-check face of one import/export directive: its resolved
+/// graph target paired with the `{0}` message spelling of that target (the
+/// oracle's ``${library.uri}``, dead_code_verifier.dart:156) — `dart:<name>`
+/// for the synthetic SDK faces, the defining file's absolute `file:///` URI
+/// for analysis-set libraries (the oracle's corpus-run spelling; the same
+/// decision dartq-resolution's `undefined_combinator_names` doc pins).
+/// `None` for an edgeless directive — the oracle's nonexistent-library gate
+/// (dead_code_verifier.dart:63/:91): the missing target is the reported root
+/// cause and replaces the combinator symptom.
+fn combinator_check_target(
+    state: &EngineState,
+    resolved: &ResolvedGraph,
+    directive: &DirectiveFacts,
+) -> Option<(dartq_resolution::LibraryId, String)> {
+    match directive.target {
+        ResolvedTarget::Resolved(file) => {
+            let library = state.library_of_file.get(&file).copied()?;
+            let info = state.libraries.info(library)?;
+            let path = state.files.path(info.defining)?;
+            Some((
+                graph_target(state, &resolved.graph_ids, directive.target)?,
+                format!("file://{}", path.display()),
+            ))
+        }
+        ResolvedTarget::External => {
+            let node = directive
+                .uri
+                .as_deref()
+                .and_then(|uri| uri.strip_prefix("dart:"))
+                .and_then(|name| resolved.sdk_faces.get(name))
+                .copied()?;
+            Some((node, resolved.graph.uri(node).to_owned()))
+        }
+        ResolvedTarget::Missing => None,
     }
 }
 
