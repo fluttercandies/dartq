@@ -816,7 +816,7 @@ impl<'o> Interp<'o> {
         });
     }
 
-    fn exec_end(&mut self) {
+    fn exec_end(&mut self, is_expr: bool) {
         let collecting = self.collect.is_some();
         let frame = self.stack.pop().expect("exec frame");
         let Frame::Exec {
@@ -836,6 +836,12 @@ impl<'o> Interp<'o> {
         }
         if is_closure {
             self.current = saved;
+        }
+        // Net one value for the consumer (crate contract, see
+        // `SwitchExprBlockEnd`/`ListLitEnd`): a function expression leaves
+        // its value where the initializer/argument/assignment pops it.
+        if is_expr {
+            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
         }
     }
 
@@ -1153,8 +1159,8 @@ impl<'o> Interp<'o> {
                 self.exec_begin(*is_closure, events, i, match_of);
                 Control::Continue
             }
-            Ev::ExecEnd => {
-                self.exec_end();
+            Ev::ExecEnd { is_expr } => {
+                self.exec_end(*is_expr);
                 Control::Continue
             }
             Ev::ForBegin { span } => self.for_begin(*span, events, i, match_of),
@@ -1228,7 +1234,7 @@ fn build_match_map(events: &[Ev]) -> Vec<u32> {
                 }
             }
             ExecBegin { .. } => exec_stack.push(i),
-            ExecEnd => {
+            ExecEnd { .. } => {
                 if let Some(begin) = exec_stack.pop() {
                     match_of[begin] = i as u32;
                     match_of[i] = begin as u32;

@@ -26,10 +26,16 @@ pub enum Ev {
     ExecBegin {
         is_closure: bool,
     },
-    ExecEnd,
+    /// `is_expr`: the executable ended as an expression (function
+    /// expression) and nets one value for its consumer; a local function
+    /// declaration ends as a statement and nets none.
+    ExecEnd {
+        is_expr: bool,
+    },
     BlockBodyBegin,
     BlockBodyEnd,
-    /// `=>` body: the expression was already processed; this is the exit.
+    /// `=>` body: consumes the body's value; the function's own value for
+    /// the consumer is netted at `ExecEnd { is_expr: true }`.
     ExprBody,
     EmptyBody,
     AsyncModifier {

@@ -347,10 +347,11 @@ fn labeled_case_group_terminates() {
 }
 
 /// An arrow body's value is consumed by the function and the function
-/// expression leaves its own value: `InitializerEnd` finds a right-hand
-/// side even when the body itself leaves nothing (a `throw` body). Before
-/// the fix the `ExprBody` no-op shadow leaked the body's value — with a
-/// `throw` body nothing was left and the variable stayed unwritten.
+/// expression leaves its own value at `ExecEnd`: `InitializerEnd` finds a
+/// right-hand side even when the body itself leaves nothing (a `throw`
+/// body). Before the fix the `ExprBody` no-op shadow leaked the body's
+/// value — with a `throw` body nothing was left and the variable stayed
+/// unwritten.
 #[test]
 fn arrow_body_nets_one_value() {
     let source = "void f() { var g = () => throw 1; g; }";
@@ -523,7 +524,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
 /// enclosing replay's REAL loop frame (the rollback truncates only the
 /// tail, so a mid-stack removal loses the outer loop's exit model — its
 /// cond-false path — for good, and code after the loop is misreported
-/// dead). Shape: `while (a) { () { while (b) {} }(); return; } 1;` — the
+/// dead). Shape: `while (a) { g() { while (b) {} } return; } 1;` — the
 /// body ends unreachable, so only the loop exit's cond-false join keeps
 /// the trailing statement alive.
 #[test]
@@ -544,7 +545,7 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::WhileBegin { span: span(2) },
         Ev::WhileBodyBegin,
         Ev::WhileEnd,
-        Ev::ExecEnd,
+        Ev::ExecEnd { is_expr: false },
         Ev::ReturnBegin { span: span(3) },
         Ev::ReturnEnd { has_expression: false },
         Ev::WhileEnd,
@@ -1014,10 +1015,75 @@ fn assert_join_with_message_invariants() {
 /// condition's assignment holds while the message runs (so the message
 /// read is clean) but the exit joins the pre-assert state, and the read
 /// after the statement is definitely unassigned.
+///
+/// Replayed at the buffer level because the source-level path cannot fire
+/// assert events yet: `begin_assert`/`end_assert` stay at their no-op
+/// listener defaults until dartq-parser re-exports `AssertKind` (see the
+/// forward.rs header), so the recorder cannot record the
+/// `AssertBegin`/`AssertEnd` pair. The stream below is exactly the buffer
+/// that forwarding will produce for the corpus source.
 #[test]
 fn assert_condition_write_unassigned_after() {
-    let source = "void f() { late int v; assert((v = 0) >= 0, v); v; }";
-    assert_eq!(unassigned_snippets(source), ["v"]);
+    use crate::ev::{BinOp, Ev};
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::{IdentifierContext, TokenSpan};
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        // late int v;
+        Ev::VarDeclBegin {
+            late: true,
+            is_final: false,
+            span: span(1),
+        },
+        Ev::InitializedIdent { name: 0 },
+        Ev::NoInitializer,
+        Ev::VarDeclEnd,
+        // assert((v = 0) >= 0, v);
+        Ev::AssertBegin { span: span(2) },
+        // Condition `(v = 0) >= 0`: the target read's fact is retracted by
+        // the plain assignment (the identifier is the write), and the
+        // assignment holds on the condition-true path.
+        Ev::Ident {
+            name: 0,
+            token: span(3),
+            context: IdentifierContext::Expression,
+        },
+        Ev::OtherExpr { span: span(4) },
+        Ev::Assign { plain: true },
+        Ev::BinaryBegin { op: BinOp::Other },
+        Ev::OtherExpr { span: span(5) },
+        Ev::BinaryEnd { op: BinOp::Other },
+        // Message `v`: reads the post-assignment state, so no fact.
+        Ev::Ident {
+            name: 0,
+            token: span(6),
+            context: IdentifierContext::Expression,
+        },
+        Ev::AssertEnd,
+        // v; — the exit joined the pre-assert state: definitely unassigned.
+        Ev::Ident {
+            name: 0,
+            token: span(7),
+            context: IdentifierContext::Expression,
+        },
+        Ev::ExprStmt { span: span(8) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert_eq!(
+        interp
+            .facts
+            .iter()
+            .filter(|fact| matches!(fact, FlowFact::UnassignedRead { span: s, .. } if *s == span(7)))
+            .count(),
+        1
+    );
 }
 
 // —— pattern assignment and pattern declarations ——————————————————————————
@@ -1209,7 +1275,7 @@ fn closure_await_demotes_captured_reads() {
         },
         Ev::SendNoArgs,
         Ev::AwaitEnd,
-        Ev::ExecEnd,
+        Ev::ExecEnd { is_expr: false },
         // x = 1; — the anywhere-write that arms the demotion.
         Ev::Ident {
             name: 0,

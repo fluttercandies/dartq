@@ -145,11 +145,13 @@ impl<'t> Flow<'t> {
     }
 
     /// Executable end: closes the outermost recording and runs the
-    /// pipeline over it.
-    fn exec_end(&mut self) {
+    /// pipeline over it. `is_expr` marks function-expression ends, which
+    /// net one value for the consumer (crate contract, see
+    /// `SwitchExprBlockEnd`/`ListLitEnd`).
+    fn exec_end(&mut self, is_expr: bool) {
         self.exec_depth = self.exec_depth.saturating_sub(1);
         if self.exec_depth > 0 {
-            self.record(Ev::ExecEnd);
+            self.record(Ev::ExecEnd { is_expr });
             return;
         }
         let Some(events) = self.buffer.take() else {
@@ -175,7 +177,7 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, _end: Token) {
-        self.exec_end();
+        self.exec_end(false);
     }
 
     fn begin_method(
@@ -202,7 +204,7 @@ impl<'t> ParserListener for Flow<'t> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        self.exec_end();
+        self.exec_end(false);
     }
 
     fn begin_constructor(
@@ -230,7 +232,7 @@ impl<'t> ParserListener for Flow<'t> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        self.exec_end();
+        self.exec_end(false);
     }
 
     fn begin_factory(
@@ -245,7 +247,7 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
-        self.exec_end();
+        self.exec_end(false);
     }
 
     fn begin_local_function_declaration(&mut self, _token: Token) {
@@ -253,7 +255,7 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_local_function_declaration(&mut self, _end: Token) {
-        self.exec_end();
+        self.exec_end(false);
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
@@ -261,7 +263,7 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_function_expression(&mut self, _begin: Token, _end: Token) {
-        self.exec_end();
+        self.exec_end(true);
     }
 
     fn begin_named_function_expression(&mut self, _token: Token) {
@@ -269,7 +271,7 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_named_function_expression(&mut self, _end: Token) {
-        self.exec_end();
+        self.exec_end(true);
     }
 
     // —— bodies ————————————————————————————————————————————————————————

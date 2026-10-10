@@ -403,10 +403,9 @@ impl<'o> Interp<'o> {
             Ev::AwaitBegin => {}
             Ev::ExprBody => {
                 // The arrow body's value is consumed by the function; the
-                // function expression leaves its own (trivial) value for
-                // the consumer's pop.
+                // function's own value for the consumer is netted at
+                // `ExecEnd` (crate contract, see `SwitchExprBlockEnd`).
                 self.exprs.pop();
-                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             _ => return false,
         }
