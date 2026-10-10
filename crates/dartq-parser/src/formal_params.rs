@@ -480,16 +480,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let follower = self.cursor.look_kind(1);
                 let name = self.peek_span();
                 if follower == TokenKind::Lt {
-                    // `skip` is relative to the token *before* the `<` —
-                    // capture it before stepping onto the group.
-                    let before_lt = self.peek_id();
                     self.cursor.advance();
                     type_param = self.compute_type_param_or_arg_on_lt(false);
-                    if !matches!(type_param, TypeParamOrArg::None) {
-                        let closer = type_param.skip(before_lt);
-                        if self.kind_at(self.offset_of(closer) + 1) == TokenKind::OpenParen {
-                            shape_matched = true;
-                        }
+                    // The shape follower is read after the group (official
+                    // `closer.next!`), computed from the `<` offset so a
+                    // raw-compound closer (`>>`/`>=`) reads its split
+                    // remainder.
+                    if self.type_arg_follower(&type_param, self.cursor.real_pos())
+                        == TokenKind::OpenParen
+                    {
+                        shape_matched = true;
                     }
                 } else if follower == TokenKind::OpenParen {
                     shape_matched = true;

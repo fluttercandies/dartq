@@ -9,6 +9,7 @@ mod expressions;
 mod features;
 mod gate_351;
 mod gate_410;
+mod gate_445;
 mod gate_m0;
 mod gate_m0_wave1;
 mod gate_m0_wave2;

@@ -1295,9 +1295,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             );
             let is_generic_open = follower == TokenKind::Lt && {
                 let type_param = self.compute_type_param_or_arg_on_lt(false);
-                let after = type_param.skip(self.peek_id());
+                // The literal opener is read after the group (official
+                // `typeArg.skip(newKeyword).next!`), computed from the `<`
+                // offset so a raw-compound closer reads its split remainder.
                 matches!(
-                    self.kind_at(self.offset_of(after) + 1),
+                    self.type_arg_follower(&type_param, self.cursor.real_pos()),
                     TokenKind::OpenCurly | TokenKind::OpenSquare | TokenKind::Index
                 )
             };

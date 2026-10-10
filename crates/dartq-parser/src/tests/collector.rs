@@ -200,6 +200,22 @@ impl ParserListener for Collector {
     fn handle_literal_bool(&mut self, _: TokenSpan) {
         self.log.push(("handle", "literal_bool"));
     }
+    fn handle_literal_set_or_map(
+        &mut self,
+        _: usize,
+        _: TokenSpan,
+        _: Option<TokenSpan>,
+        _: TokenSpan,
+        _: bool,
+    ) {
+        self.log.push(("handle", "literal_set_or_map"));
+    }
+    fn begin_new_expression(&mut self, _: TokenSpan) {
+        self.log.push(("begin", "new_expression"));
+    }
+    fn end_new_expression(&mut self, _: TokenSpan) {
+        self.log.push(("end", "new_expression"));
+    }
 
     // —— declarations (#18) ————————————————————————————————————————————
     fn begin_class_declaration(
