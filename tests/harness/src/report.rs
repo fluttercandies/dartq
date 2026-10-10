@@ -1,13 +1,17 @@
-//! Differential report output: JSON (full diff entries, for regression analysis) + Markdown (summary, <= 100 lines).
+//! Differential report output: JSON (full diff entries, for regression analysis) + Markdown (summary, <= 100 lines)
+//! + raw per-side machine outputs (`raw-outputs.json`, written on every gate run: both sides' complete
+//! parsed diagnostics, all severities, unfiltered — the post-hoc attribution data plane).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::compare::{Comparison, Distribution};
+use crate::machine::{EntryKeyBuilder, MachineDiag};
 
 pub(crate) struct RunMeta {
     pub(crate) corpus_dir: String,
@@ -61,6 +65,116 @@ impl Verdict {
 /// Maximum entries shown per side in the Markdown diff table; the rest is counted in a trailing line pointing to the full JSON.
 const MD_DIFF_CAP: usize = 20;
 
+/// Filename of the raw per-side machine outputs, written next to `report.json` on every gate run.
+const RAW_OUTPUTS_FILE: &str = "raw-outputs.json";
+
+/// Raw per-side machine outputs of one gate run: the complete parsed diagnostics of both
+/// sides exactly as captured (all severities, all TYPEs, before any severity/type/codes
+/// filter), parallel to `corpora`. Persisted on every gate run so post-hoc attribution
+/// (e.g. WARNING parity) has full per-instance data even when the gate itself filters
+/// to ERROR-only.
+pub(crate) struct RawSideOutputs<'a> {
+    /// Corpus dirs with their merge labels; `oracle`/`dartq` are parallel arrays
+    /// (one diagnostic list per corpus dir, in run order).
+    pub(crate) corpora: &'a [(Option<String>, PathBuf)],
+    pub(crate) oracle: &'a [Vec<MachineDiag>],
+    pub(crate) dartq: &'a [Vec<MachineDiag>],
+}
+
+/// Additive `raw_outputs` pointer in `report.json`: where the complete per-side machine
+/// outputs live and how many instances each side produced. The pre-existing report faces
+/// keep their shape; this field is additive.
+#[derive(Serialize)]
+struct JsonRawOutputsPointer {
+    file: &'static str,
+    oracle_instances: usize,
+    dartq_instances: usize,
+}
+
+#[derive(Serialize)]
+struct JsonRawOutputs {
+    oracle: JsonRawSide,
+    dartq: JsonRawSide,
+}
+
+/// One side's raw diagnostics: one record per diagnostic instance, all severities
+/// retained (the gate's severity/type/codes filters never apply here).
+#[derive(Serialize)]
+struct JsonRawSide {
+    /// Total instance count across all corpora.
+    instances: usize,
+    /// Per-corpus sections in run order (parallel to the run's `--corpus-dir` list).
+    corpora: Vec<JsonRawCorpus>,
+}
+
+#[derive(Serialize)]
+struct JsonRawCorpus {
+    /// The corpus dir as run (canonical), matching its `meta.corpus_dir` entry.
+    dir: String,
+    /// Merge label; `null` for a single-corpus run (same convention as the entry keys).
+    label: Option<String>,
+    diagnostics: Vec<JsonRawDiag>,
+}
+
+/// One raw diagnostic instance. `code`/`file` use the entry-key form (lowercase code,
+/// corpus-relative label-prefixed file) so records join against `report.json`'s
+/// `filters.*.entries` and diff lists; severity/message/location are verbatim.
+#[derive(Serialize)]
+struct JsonRawDiag {
+    code: String,
+    file: String,
+    severity: &'static str,
+    dtype: String,
+    line: u32,
+    column: u32,
+    length: u32,
+    message: String,
+}
+
+/// Build one side's raw JSON: per-corpus sections with every parsed instance in
+/// emission order. Size is linear in the diagnostics actually produced (bounded by
+/// corpus size); the per-corpus sections share the run's canonicalize memo via
+/// [`EntryKeyBuilder`] per corpus.
+fn build_raw_side(
+    corpora: &[(Option<String>, PathBuf)],
+    per_corpus: &[Vec<MachineDiag>],
+) -> JsonRawSide {
+    let mut instances = 0;
+    let mut sections = Vec::with_capacity(per_corpus.len());
+    for ((label, dir), diags) in corpora.iter().zip(per_corpus) {
+        let mut keys = EntryKeyBuilder::new(dir);
+        let diagnostics = diags
+            .iter()
+            .map(|d| {
+                let (code, file) = keys.key(d);
+                JsonRawDiag {
+                    file: match label {
+                        Some(label) => format!("{label}/{file}"),
+                        None => file,
+                    },
+                    code,
+                    severity: d.severity.as_str(),
+                    dtype: d.dtype.clone(),
+                    line: d.line,
+                    column: d.col,
+                    length: d.length,
+                    message: d.message.clone(),
+                }
+            })
+            .collect();
+        instances += diags.len();
+        sections.push(JsonRawCorpus {
+            dir: dir.display().to_string(),
+            label: label.clone(),
+            diagnostics,
+        });
+    }
+    JsonRawSide {
+        instances,
+        corpora: sections,
+    }
+}
+
 #[derive(Serialize)]
 struct JsonReport<'a> {
     meta: JsonMeta<'a>,
@@ -76,6 +190,9 @@ struct JsonReport<'a> {
     oracle_distribution: JsonDistribution,
     oracle_only: Vec<JsonDiffEntry>,
     dartq_only: Vec<JsonDiffEntry>,
+    /// Additive pointer to the raw per-side machine outputs (all severities,
+    /// unfiltered); the faces above keep their shape.
+    raw_outputs: JsonRawOutputsPointer,
 }
 
 /// Per-side filter accounting (see `compare::Side::dropped_by_filter`):
@@ -203,9 +320,29 @@ pub(crate) fn write_reports(
     cmp: &Comparison,
     meta: &RunMeta,
     verdict: Verdict,
+    raw: &RawSideOutputs<'_>,
     out_dir: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
     fs::create_dir_all(out_dir).map_err(|e| format!("creating {}: {e}", out_dir.display()))?;
+
+    // Raw per-side machine outputs first: the report.json pointer references this
+    // file, so a failed raw write aborts the whole report (never a dangling pointer).
+    // Serialized straight into a buffered file writer — the full JSON text is never
+    // buffered in memory, and the explicit flush surfaces write errors while the
+    // error path can still name the file.
+    let raw_json = JsonRawOutputs {
+        oracle: build_raw_side(raw.corpora, raw.oracle),
+        dartq: build_raw_side(raw.corpora, raw.dartq),
+    };
+    let raw_path = out_dir.join(RAW_OUTPUTS_FILE);
+    let mut raw_file = std::io::BufWriter::new(
+        fs::File::create(&raw_path).map_err(|e| format!("creating {}: {e}", raw_path.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut raw_file, &raw_json)
+        .map_err(|e| format!("writing {}: {e}", raw_path.display()))?;
+    raw_file
+        .flush()
+        .map_err(|e| format!("writing {}: {e}", raw_path.display()))?;
 
     let json = JsonReport {
         meta: json_meta(meta),
@@ -267,6 +404,11 @@ pub(crate) fn write_reports(
                 sample_message: e.sample_message.clone(),
             })
             .collect(),
+        raw_outputs: JsonRawOutputsPointer {
+            file: RAW_OUTPUTS_FILE,
+            oracle_instances: raw_json.oracle.instances,
+            dartq_instances: raw_json.dartq.instances,
+        },
     };
     let json_text =
         serde_json::to_string_pretty(&json).map_err(|e| format!("serializing report: {e}"))?;
@@ -457,8 +599,16 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_{}", std::process::id()));
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let corpora = [(None, PathBuf::from("/corpus"))];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
         let (json_path, md_path) =
-            write_reports(&cmp, &meta, Verdict::Fail, &out).expect("reports");
+            write_reports(&cmp, &meta, Verdict::Fail, &raw, &out).expect("reports");
 
         let json_text = fs::read_to_string(&json_path).expect("json");
         let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
@@ -507,6 +657,15 @@ mod tests {
             filters["oracle"]["pre_filter_total"], 30,
             "existing accounting fields unchanged"
         );
+        // Additive raw_outputs pointer: file name + per-side instance counts
+        assert_eq!(parsed["raw_outputs"]["file"], "raw-outputs.json");
+        assert_eq!(parsed["raw_outputs"]["oracle_instances"], 30);
+        assert_eq!(parsed["raw_outputs"]["dartq_instances"], 5);
+        let raw_parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("raw-outputs.json")).expect("raw"))
+                .expect("valid raw json");
+        assert_eq!(raw_parsed["oracle"]["instances"], 30);
+        assert_eq!(raw_parsed["dartq"]["instances"], 5);
 
         let md = fs::read_to_string(&md_path).expect("md");
         assert!(
@@ -564,8 +723,16 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_drop_{}", std::process::id()));
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let corpora = [(None, PathBuf::from("/corpus"))];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
         let (json_path, md_path) =
-            write_reports(&cmp, &meta, Verdict::Pass, &out).expect("reports");
+            write_reports(&cmp, &meta, Verdict::Pass, &raw, &out).expect("reports");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
@@ -583,6 +750,169 @@ mod tests {
         );
 
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// Raw per-side outputs, the core contract: every gate run persists both
+    /// sides' complete parsed diagnostics (all severities, unfiltered) to
+    /// `raw-outputs.json` — even when the gate itself filters to ERROR-only —
+    /// and report.json carries the additive `raw_outputs` pointer. Records use
+    /// the entry-key code/file form (joinable against the report faces) with
+    /// verbatim severity, message and location.
+    #[test]
+    fn raw_outputs_keep_every_severity_unfiltered_on_error_only_gate() {
+        let root = std::env::temp_dir().join(format!("dq_raw_{}", std::process::id()));
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).expect("mkdir");
+        std::fs::write(lib.join("a.dart"), "var x = 1;").expect("a.dart");
+        std::fs::write(lib.join("b.dart"), "var y = 2;").expect("b.dart");
+        let root_canon = root.canonicalize().expect("canonicalize root");
+
+        let diag = |severity: Severity, code: &str, file: &str, message: &str| MachineDiag {
+            severity,
+            dtype: match severity {
+                Severity::Error => "SYNTACTIC_ERROR".into(),
+                Severity::Warning => "STATIC_WARNING".into(),
+                Severity::Info => "LINT".into(),
+            },
+            code: code.into(),
+            file: lib.join(file),
+            line: 1,
+            col: 1,
+            length: 1,
+            message: message.into(),
+        };
+        // Oracle: one diagnostic per severity tier; dartq: two warnings, one
+        // sharing the oracle's (code, file) key, one dartq-only.
+        let oracle = vec![
+            diag(Severity::Error, "EXPECTED_TOKEN", "a.dart", "Expected to find ';'."),
+            diag(Severity::Warning, "UNUSED_LOCAL_VARIABLE", "a.dart", "The value of the local variable 'x' isn't used."),
+            diag(Severity::Info, "PREFER_SINGLE_QUOTES", "b.dart", "Unnecessary use of double quotes."),
+        ];
+        let dartq = vec![
+            diag(Severity::Warning, "unused_local_variable", "a.dart", "The value of the local variable 'x' isn't used."),
+            diag(Severity::Warning, "DEAD_CODE", "b.dart", "Dead code."),
+        ];
+        // ERROR-only gate: the filters drop the WARNING/INFO tiers from the
+        // comparison — the raw outputs must keep them anyway.
+        let keep = |d: &MachineDiag| d.severity == Severity::Error;
+        let cmp = compare(
+            &build_side_labeled(&oracle, &root_canon, None, keep),
+            &build_side_labeled(&dartq, &root_canon, None, keep),
+        );
+        let meta = RunMeta {
+            corpus_dir: root_canon.display().to_string(),
+            oracle_cmd: "dart analyze".into(),
+            dartq_cmd: "dartq check".into(),
+            oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
+            threshold: 0.99,
+            severity_filter: "ERROR".into(),
+            type_filter: "all".into(),
+            codes_file: String::new(),
+        };
+
+        let out = std::env::temp_dir().join(format!("dq_raw_out_{}", std::process::id()));
+        let oracle_lists = [oracle];
+        let dartq_lists = [dartq];
+        let corpora = [(None, root_canon.clone())];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
+        let (json_path, _) = write_reports(&cmp, &meta, Verdict::Pass, &raw, &out).expect("reports");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
+        // Gate face: ERROR-only, both sides reduce to the one shared key -> pass
+        assert_eq!(parsed["oracle_total"], 1);
+        assert_eq!(parsed["dartq_total"], 1);
+        assert_eq!(parsed["passed"], true);
+
+        // Pointer matches the persisted raw file
+        assert_eq!(parsed["raw_outputs"]["file"], "raw-outputs.json");
+        assert_eq!(parsed["raw_outputs"]["oracle_instances"], 3);
+        assert_eq!(parsed["raw_outputs"]["dartq_instances"], 2);
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out.join("raw-outputs.json")).expect("raw file"),
+        )
+        .expect("valid raw json");
+
+        // All severities retained on the oracle side despite the ERROR-only gate
+        let oracle_diags = raw["oracle"]["corpora"][0]["diagnostics"]
+            .as_array()
+            .expect("oracle diagnostics");
+        assert_eq!(raw["oracle"]["instances"], 3);
+        assert_eq!(oracle_diags.len(), 3);
+        let severities: Vec<&str> = oracle_diags
+            .iter()
+            .map(|d| d["severity"].as_str().expect("severity"))
+            .collect();
+        assert_eq!(severities, ["ERROR", "WARNING", "INFO"]);
+
+        // Record fields: entry-key code/file, verbatim message and location
+        let expected_token = &oracle_diags[0];
+        assert_eq!(expected_token["code"], "expected_token");
+        assert_eq!(
+            expected_token["file"], "lib/a.dart",
+            "corpus-relative file key"
+        );
+        assert_eq!(expected_token["dtype"], "SYNTACTIC_ERROR");
+        assert_eq!(expected_token["message"], "Expected to find ';'.");
+        assert_eq!(expected_token["line"], 1);
+        assert_eq!(expected_token["column"], 1);
+        assert_eq!(expected_token["length"], 1);
+        assert_eq!(raw["dartq"]["instances"], 2);
+        let dartq_codes: Vec<&str> = raw["dartq"]["corpora"][0]["diagnostics"]
+            .as_array()
+            .expect("dartq diagnostics")
+            .iter()
+            .map(|d| d["code"].as_str().expect("code"))
+            .collect();
+        assert_eq!(
+            dartq_codes,
+            ["unused_local_variable", "dead_code"],
+            "dartq-only raw instances retained verbatim"
+        );
+
+        // Corpus section header: canonical dir, single-corpus label = null
+        assert_eq!(raw["oracle"]["corpora"][0]["dir"], root_canon.display().to_string());
+        assert!(raw["oracle"]["corpora"][0]["label"].is_null());
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Multi-corpus raw outputs: per-corpus sections in run order, file keys
+    /// label-prefixed exactly like the merged entry keys.
+    #[test]
+    fn raw_outputs_prefix_files_with_corpus_labels() {
+        let mk = |code: &str| MachineDiag {
+            severity: Severity::Error,
+            dtype: "SYNTACTIC_ERROR".into(),
+            code: code.into(),
+            file: PathBuf::from("/c1/lib/a.dart"),
+            line: 1,
+            col: 1,
+            length: 1,
+            message: "m".into(),
+        };
+        let corpora = vec![
+            (Some("m0".to_string()), PathBuf::from("/c1")),
+            (Some("m1".to_string()), PathBuf::from("/c2")),
+        ];
+        let per_corpus = vec![vec![mk("EXPECTED_TOKEN")], vec![]];
+        let side = build_raw_side(&corpora, &per_corpus);
+        assert_eq!(side.instances, 1);
+        assert_eq!(side.corpora.len(), 2);
+        assert_eq!(side.corpora[0].dir, "/c1");
+        assert_eq!(side.corpora[0].label.as_deref(), Some("m0"));
+        assert_eq!(
+            side.corpora[0].diagnostics[0].file, "m0/lib/a.dart",
+            "label-prefixed file key, same convention as the merged entry keys"
+        );
+        assert_eq!(side.corpora[1].dir, "/c2");
+        assert!(side.corpora[1].diagnostics.is_empty());
     }
 
     /// Skipped gate (pure-report mode: the severity filter drops the ERROR tier):
@@ -620,8 +950,16 @@ mod tests {
         };
 
         let out = std::env::temp_dir().join(format!("dq_report_skip_{}", std::process::id()));
+        let oracle_lists = [vec![mk("EXPECTED_TOKEN")]];
+        let dartq_lists = [vec![mk("EXPECTED_TOKEN")]];
+        let corpora = [(None, PathBuf::from("/corpus"))];
+        let raw = RawSideOutputs {
+            corpora: &corpora,
+            oracle: &oracle_lists,
+            dartq: &dartq_lists,
+        };
         let (json_path, md_path) =
-            write_reports(&cmp, &meta, Verdict::Skipped, &out).expect("reports");
+            write_reports(&cmp, &meta, Verdict::Skipped, &raw, &out).expect("reports");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");

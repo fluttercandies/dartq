@@ -121,6 +121,10 @@ fn print_usage() {
       the corpus is auto-bisected to attribute the panicking files; the run
       still fails as a harness error (exit 2) and writes a dartq_panic_files
       attribution report under --out.
+      Raw outputs: every run persists both sides' complete machine outputs
+      (all severities, unfiltered) to raw-outputs.json under --out, so
+      post-hoc parity attribution (e.g. WARNING) works even when the gate
+      filters to ERROR-only; report.json carries a raw_outputs pointer.
       Exit codes: 0 = ERROR jaccard >= threshold (default {DEFAULT_THRESHOLD})
       or the gate not in scope under --severity-filter (verdict SKIPPED,
       pure-report mode), 1 = below threshold, 2 = harness error.
@@ -305,7 +309,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     // Oracle reference version, captured once per run (PRD §19.1: every report records it)
     let oracle_version = oracle::dart_version(&opts.oracle_dart).map_err(Outcome::Error)?;
     let oracle_diags = analyze_corpora(&corpora, |dir| oracle.analyze(dir, opts.oracle_format))?;
-    let oracle_side = build_filtered_side(&corpora, oracle_diags, &filters);
+    let oracle_side = build_filtered_side(&corpora, &oracle_diags, &filters);
     // Fail before the dartq run: a vacuous oracle side would pass at 1.0 without judging anything
     check_oracle_vacuity(&oracle_side, filters.error_in_scope(), opts.allow_vacuous)?;
     // The dartq contract is always machine; only the e2e self-check (dartq side = dart analyze itself) follows the oracle format
@@ -332,7 +336,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         }
     };
 
-    let dartq_side = build_filtered_side(&corpora, dartq_diags, &filters);
+    let dartq_side = build_filtered_side(&corpora, &dartq_diags, &filters);
     let cmp = compare(&oracle_side, &dartq_side);
 
     let verdict = gate_verdict(
@@ -340,8 +344,15 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
         cmp.error_jaccard(),
         opts.threshold,
     );
+    // Every gate run persists both sides' raw machine outputs (all severities,
+    // unfiltered) next to the reports — the post-hoc attribution data plane.
+    let raw = report::RawSideOutputs {
+        corpora: &corpora,
+        oracle: &oracle_diags,
+        dartq: &dartq_diags,
+    };
     let (json_path, md_path) =
-        report::write_reports(&cmp, &meta, verdict, &opts.out).map_err(Outcome::Error)?;
+        report::write_reports(&cmp, &meta, verdict, &raw, &opts.out).map_err(Outcome::Error)?;
 
     let stats: Vec<String> = cmp
         .severities
@@ -640,16 +651,18 @@ fn check_oracle_vacuity(
 }
 
 /// Filter per corpus dir, build a side per dir, then merge; key prefixes come from the corpora labels (None for a single corpus).
+/// Borrows the per-corpus diagnostic lists: the unfiltered raw outputs stay alive for
+/// [`report::write_reports`], which persists them on every run.
 fn build_filtered_side(
     corpora: &[(Option<String>, PathBuf)],
-    per_corpus_diags: Vec<Vec<MachineDiag>>,
+    per_corpus_diags: &[Vec<MachineDiag>],
     filters: &Filters,
 ) -> Side {
     let sides = corpora
         .iter()
         .zip(per_corpus_diags)
         .map(|((label, canon), diags)| {
-            build_side_labeled(&diags, canon, label.as_deref(), |d| filters.keep(d))
+            build_side_labeled(diags, canon, label.as_deref(), |d| filters.keep(d))
         })
         .collect();
     merge_sides(sides)
