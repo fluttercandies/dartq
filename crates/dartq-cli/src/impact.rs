@@ -36,6 +36,7 @@ pub(crate) struct ImpactArgs {
     #[arg(default_value = ".")]
     pub(crate) dir: PathBuf,
     /// Dart SDK root; defaults to `$DART_SDK`.
+    #[arg(long)]
     pub(crate) sdk: Option<PathBuf>,
 }
 
@@ -93,11 +94,52 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Cli, Command};
+    use clap::Parser as _;
     use std::fs;
+
+    /// The CLI face's grammar, mirroring the sibling faces' parse tests:
+    /// `--sdk` is an option and `path`/`dir` the only positionals — the
+    /// shape that preceded the `#[arg(long)]` restore (a bare third
+    /// positional silently filling `sdk`) must reject.
+    #[test]
+    fn impact_args_parse() {
+        fn parse(args: &[&str]) -> ImpactArgs {
+            match Cli::try_parse_from(std::iter::once("dartq").chain(args.iter().copied()))
+                .expect("parse")
+                .command
+            {
+                Some(Command::Impact(args)) => args,
+                Some(_) => panic!("expected the impact command for {args:?}"),
+                None => panic!("expected a subcommand"),
+            }
+        }
+
+        let args = parse(&["impact", "lib/a.dart"]);
+        assert_eq!(args.path, PathBuf::from("lib/a.dart"));
+        assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
+        assert!(args.sdk.is_none(), "no sdk by default");
+
+        let args = parse(&["impact", "--sdk", "/sdk", "/pkg/lib/a.dart", "/pkg"]);
+        assert_eq!(args.sdk, Some(PathBuf::from("/sdk")), "--sdk parses");
+        assert_eq!(args.path, PathBuf::from("/pkg/lib/a.dart"));
+        assert_eq!(args.dir, PathBuf::from("/pkg"));
+
+        for rejected in [
+            &["impact", "lib/a.dart", "/pkg", "/sdk"][..],
+            &["impact", "--bogus"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("dartq").chain(rejected.iter().copied()))
+                    .is_err(),
+                "must reject {rejected:?}"
+            );
+        }
+    }
 
     /// The fixture shape of the analyze/query faces' tests: a real package
     /// directory with a stub SDK (`sdk/lib/libraries.json` is the only file
-    /// [`dartq_sdk::SdkSnapshot::load`] needs), a lib pair, and the
+    /// `dartq_sdk::SdkSnapshot::load` needs), a lib pair, and the
     /// convention-placed test that reaches the lib through its package URI.
     fn fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("dq_cli_impact_{tag}_{}", std::process::id()));

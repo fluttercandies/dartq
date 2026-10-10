@@ -8,6 +8,10 @@
 //! - `--dry-run` only outputs the patches, never writes (§15.6); without it
 //!   the edits apply in place (the machine document still prints, as the
 //!   record of what was written);
+//! - applies collect-then-write: every file's patched buffer is computed in
+//!   memory before any file changes on disk (a read or patch failure leaves
+//!   nothing mutated), and a write failing midway prints which files were
+//!   already mutated before the internal-error exit;
 //! - `--format=machine` emits one single-line §15.6 JSON object per patched
 //!   file — empty context strings omitted (§15.7); the default format is a
 //!   human listing;
@@ -134,8 +138,7 @@ pub(crate) fn run_entry(args: &FixArgs) -> u8 {
 }
 
 /// One fix run: the fix source stage (`dartq_commands::fix::collect` —
-/// usage tier on a missing target), output, and — without `--dry-run` —
-/// the in-place apply.
+/// usage tier on a missing target), then the apply + report stages.
 fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     let per_file: Vec<FileFixes> = match fix::collect(&args.paths) {
         Ok(per_file) => per_file,
@@ -148,10 +151,24 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
+    apply_and_report(&per_file, args.dry_run, args.format, out)
+}
 
-    let mut statuses: Vec<Vec<EditOutcome>> = Vec::new();
-    if !args.dry_run {
-        for fixes in &per_file {
+/// The apply + report stages over collected fix sets, collect-then-write:
+/// every file's patched buffer is computed in memory first — a read or
+/// patch failure here leaves nothing on disk mutated — and only then do
+/// the writes run; one failing midway prints which files were already
+/// mutated before the internal-error exit. The report follows: machine
+/// rows, or the human listing carrying the per-fix outcomes.
+fn apply_and_report(
+    per_file: &[FileFixes],
+    dry_run: bool,
+    format: FixFormat,
+    out: &mut impl Write,
+) -> u8 {
+    let mut staged: Vec<(&str, String, Vec<EditOutcome>)> = Vec::new();
+    if !dry_run {
+        for fixes in per_file {
             let text = match fs::read_to_string(&fixes.path) {
                 Ok(text) => text,
                 Err(error) => {
@@ -164,20 +181,29 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
             };
             let edits: Vec<fix::Edit> = fixes.fixes.iter().map(|f| f.edit.clone()).collect();
             let (patched, outcome) = fix::apply(&text, &edits);
-            if let Err(error) = fs::write(&fixes.path, &patched) {
-                eprintln!(
-                    "dartq: internal error: writing {} failed: {error}",
-                    fixes.path
-                );
-                return exit::INTERNAL_ERROR;
-            }
-            statuses.push(outcome);
+            staged.push((&fixes.path, patched, outcome));
         }
     }
 
-    let written = match args.format {
-        FixFormat::Machine => write_machine(out, &per_file),
-        FixFormat::Default => write_human(out, &per_file, &statuses, args.dry_run),
+    let mut statuses: Vec<Vec<EditOutcome>> = Vec::new();
+    for (index, (path, patched, outcome)) in staged.iter().enumerate() {
+        if let Err(error) = fs::write(path, patched) {
+            eprintln!("dartq: internal error: writing {path} failed: {error}");
+            let mutated: Vec<&str> = staged[..index].iter().map(|(path, _, _)| *path).collect();
+            if !mutated.is_empty() {
+                eprintln!(
+                    "dartq: partial write; files already mutated: {}",
+                    mutated.join(", ")
+                );
+            }
+            return exit::INTERNAL_ERROR;
+        }
+        statuses.push(outcome.clone());
+    }
+
+    let written = match format {
+        FixFormat::Machine => write_machine(out, per_file),
+        FixFormat::Default => write_human(out, per_file, &statuses, dry_run),
     }
     .and_then(|()| out.flush());
     if let Err(error) = written {
@@ -192,6 +218,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser as _;
+    use dartq_source::LineIndex;
 
     /// The CLI face: defaults and flags; the zero-fix run prints the human
     /// summary (machine face stays silent) and exits clean; a missing
@@ -250,6 +277,116 @@ mod tests {
         let args = parse(&["fix", "/nonexistent/dq_fix_target"]);
         assert_eq!(run(&args, &mut out), exit::USAGE);
         assert!(out.is_empty(), "stdout stays empty on usage errors");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `unnecessary_new` fix set addressed to `path` — the exact edit
+    /// the rule materializes over this source in dartq-commands (keyword
+    /// plus trailing space at offset 19..23, verified in its
+    /// `new_expression_end_to_end` test). The CLI's collect stage has no
+    /// row source wired yet (dartq-commands `collect` reports zero patch
+    /// sets), so the write-back tests stage the collected set directly.
+    fn unnecessary_new_fix(path: &std::path::Path) -> FileFixes {
+        let source = "void f() { var a = new B(); }\n";
+        let lines = LineIndex::new(source);
+        FileFixes {
+            path: path.display().to_string(),
+            fixes: vec![fix::RuleFix {
+                rule: "unnecessary_new",
+                message: "Unnecessary 'new' keyword.".to_owned(),
+                edit: fix::anchored_edit(source, &lines, 19, 4, ""),
+            }],
+        }
+    }
+
+    /// The destructive write-back end to end (the zero-fix paths above
+    /// never touch disk): `--dry-run` proposes without writing; the apply
+    /// run rewrites the file's bytes on disk to the patched text, tags the
+    /// row `[applied]` with the rule named, and exits clean.
+    #[test]
+    fn fix_apply_rewrites_the_file_on_disk() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_apply_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("a.dart");
+        fs::write(&path, "void f() { var a = new B(); }\n").expect("write");
+        let per_file = vec![unnecessary_new_fix(&path)];
+
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, true, FixFormat::Default, &mut out),
+            exit::CLEAN
+        );
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(text.contains("1 proposed fix in 1 file."), "{text}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "void f() { var a = new B(); }\n",
+            "dry run never writes"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "void f() { var a = B(); }\n",
+            "the fix rewrote the file in place"
+        );
+        let text = String::from_utf8(out).expect("utf-8");
+        let applied = text
+            .lines()
+            .find(|l| l.contains("[applied]"))
+            .expect("applied row");
+        assert!(
+            applied.contains("unnecessary_new") && applied.contains("Unnecessary 'new' keyword."),
+            "the applied row names the rule: {applied}"
+        );
+        assert!(text.contains("1 fix applied in 1 file."), "{text}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The collect-then-write contract's failure half: when a write fails
+    /// midway, the earlier files stay mutated (the partial-write record on
+    /// stderr names them), the failing write never lands, stdout stays
+    /// empty, and the run exits internal. The second file reads fine but
+    /// is read-only, so the failure lands at the write stage — the stage
+    /// where earlier files may already be mutated.
+    #[cfg(unix)]
+    #[test]
+    fn partial_write_failure_keeps_the_mutated_files_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_partial_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let first = root.join("a.dart");
+        fs::write(&first, "void f() { var a = new B(); }\n").expect("write");
+        let second = root.join("b.dart");
+        fs::write(&second, "void f() { var a = new B(); }\n").expect("write");
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        let per_file = vec![unnecessary_new_fix(&first), unnecessary_new_fix(&second)];
+        let mut out = Vec::new();
+        let code = apply_and_report(&per_file, false, FixFormat::Default, &mut out);
+        // Restore the mode before asserting so cleanup cannot fail on it.
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).expect("restore mode");
+        assert_eq!(code, exit::INTERNAL_ERROR);
+        assert_eq!(
+            fs::read_to_string(&first).expect("read"),
+            "void f() { var a = B(); }\n",
+            "the earlier file stays mutated; the record on stderr names it"
+        );
+        assert_eq!(
+            fs::read_to_string(&second).expect("read"),
+            "void f() { var a = new B(); }\n",
+            "the failing write never landed"
+        );
+        assert!(out.is_empty(), "stdout stays empty on internal errors");
 
         fs::remove_dir_all(&root).ok();
     }

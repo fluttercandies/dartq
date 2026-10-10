@@ -14,7 +14,7 @@
 //! Output is the §15.7 JSON contract (`schema_version: 1`): the queried
 //! file plus the matrix in axis order (CLI flags first, then contexts in
 //! file order). Contexts add rows, never row fields. The axis verdict rule
-//! and the `first_failure` ordering live in [`dartq_ai::compatibility`].
+//! and the `first_failure` ordering live in `dartq_ai::compatibility`.
 //!
 //! Exit codes follow the query faces: 0 on a successful query —
 //! incompatible axes are the answer's data, not a failure — 64 usage, 4
@@ -133,7 +133,7 @@ mod tests {
     /// The fixture shape of the impact face's tests: a real package
     /// directory with stub SDKs (`version` + `lib/libraries.json` +
     /// `lib/_internal/allowed_experiments.json` are all
-    /// [`dartq_sdk::SdkSnapshot::load`] needs) and one lib file whose
+    /// `dartq_sdk::SdkSnapshot::load` needs) and one lib file whose
     /// `dart:async` import resolves only on the SDK whose library table
     /// carries it (the URI layer needs no source bodies; the stub body
     /// exists so a lazy read finds a file).

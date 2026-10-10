@@ -14,21 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-dartq-ai = { path = "../dartq-ai" }
 dartq-commands = { path = "../dartq-commands" }
 dartq-daemon = { path = "../dartq-daemon" }
 dartq-diagnostics = { path = "../dartq-diagnostics" }
 dartq-engine = { path = "../dartq-engine" }
-dartq-index = { path = "../dartq-index" }
-dartq-language = { path = "../dartq-language" }
-dartq-lints = { path = "../dartq-lints" }
-dartq-package = { path = "../dartq-package" }
-dartq-parser = { path = "../dartq-parser" }
-dartq-pub = { path = "../dartq-pub" }
-dartq-scanner = { path = "../dartq-scanner" }
-dartq-sdk = { path = "../dartq-sdk" }
-dartq-source = { path = "../dartq-source" }
 serde_json = { workspace = true }
+
+# Test-only: the main.rs tests build `Diagnostic`s over a `FileTable`, and
+# the fix face's write-back tests anchor edits with a `LineIndex`.
+[dev-dependencies]
+dartq-source = { path = "../dartq-source" }
 
 # The metrics hook reads peak RSS through getrusage (engine-api-spec §3);
 # unix-only until a non-unix story exists.

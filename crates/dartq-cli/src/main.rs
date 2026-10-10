@@ -33,6 +33,15 @@
 //!   (Jaccard input); 4/64 are harness-own failures. The query face uses
 //!   the same tiers: 0 on success (zero results included), 64 usage, 4
 //!   internal.
+//!
+//! The daemon face is the one deviation from the crash tier: it installs no
+//! catch-unwind, so a panic on the main thread unwinds out of `main` and
+//! the process exits with the Rust runtime's default 101 instead of 4. The
+//! crash tier exists to keep a partial diagnostic set from masquerading as
+//! a harness-valid {0,1,2,3} result; the daemon serves an LSP stream, not
+//! a diagnostic set, and its reader/watch threads' panics are thread-local
+//! regardless — the main loop observes the channel disconnect and ends the
+//! session through the transport's own exit path.
 
 use std::collections::BTreeMap;
 use std::fs;
