@@ -29,11 +29,11 @@ pub mod library_graph;
 pub mod namespace;
 pub mod uri;
 
-pub use codes::{ResolutionCode, ResolutionCodeInfo};
+pub use codes::{ResolutionCode, ResolutionCodeInfo, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME};
 pub use conditional::{Configuration, SelectedUri, resolve_conditional};
 pub use library_graph::{
     CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
-    LibraryGraphBuilder, LibraryId, LocalLookup,
+    LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
 };
 pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces};
 pub use uri::{

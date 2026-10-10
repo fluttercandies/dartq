@@ -14,7 +14,10 @@
 //! `element/scope.dart:530-535`); an import-side `as` prefix still registers
 //! with an empty table downstream (the namespace layer's contract). The §4.2
 //! codes for such directives stay with the caller's
-//! [`crate::UriResolution`]; this layer only computes namespaces.
+//! [`crate::UriResolution`]; this layer only computes namespaces — except
+//! for the directive-combinator static warnings
+//! ([`LibraryGraph::undefined_combinator_names`]), whose emit-side decision
+//! is a pure export-scope query over a resolved edge.
 //!
 //! # Export scopes (pinned oracle behavior)
 //!
@@ -248,6 +251,20 @@ pub struct ExportEntry {
     pub file: FileId,
     /// `true` for a local public declaration, `false` for a re-export.
     pub is_local: bool,
+}
+
+/// One undefined directive-combinator name ([`LibraryGraph::
+/// undefined_combinator_names`]): a written `show`/`hide` identifier neither
+/// spelling of which the directive target's export scope defines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndefinedCombinatorName {
+    /// The written (bare) identifier — the report anchor and the message's
+    /// `{1}` argument (`dead_code_verifier.dart:141-158` anchors at the name
+    /// token with `name.name.lexeme`).
+    pub name: StringId,
+    /// `true` for a `hide` clause (`undefined_hidden_name`), `false` for
+    /// `show` (`undefined_shown_name`).
+    pub hidden: bool,
 }
 
 /// One spelling's slot in a library's locals layer.
@@ -652,6 +669,79 @@ impl LibraryGraph {
         self.nodes[lib.index() as usize].export_scope.get(&name)
     }
 
+    /// The directive-combinator findings for one resolved directive edge:
+    /// every written `show`/`hide` name the target's export scope does not
+    /// define — the `undefined_hidden_name`/`undefined_shown_name`
+    /// `STATIC_WARNING` pair ([`crate::codes::UNDEFINED_HIDDEN_NAME`]/[
+    /// `crate::codes::UNDEFINED_SHOWN_NAME`]).
+    ///
+    /// Decision order mirrors the oracle exactly. The namespace is the
+    /// target library's export scope — `element_resolver.dart:407-432`
+    /// `_resolveCombinators` resolves each written name against
+    /// `library.exportNamespace` through both spellings (`get2(name)`,
+    /// `get2('name=')`), and `dead_code_verifier.dart:141-158`
+    /// `_checkCombinator` reports only when both faces come back null.
+    /// dartq's export scope is that namespace with setters under their
+    /// `name=` spelling, so a name is defined iff either probe hits; the
+    /// getter probe first keeps the common hit case at one lookup. Every
+    /// clause is checked independently in source order — `show`/`hide`
+    /// interplay never couples the decisions (`show noSuch hide noSuch`
+    /// reports both codes), and an `as` prefix or `deferred` is not
+    /// consulted (`dead_code_verifier.dart:77-113` checks every import and
+    /// export directive's combinators alike). The clause sets carry
+    /// [`Combinators::new`]'s `name=` expansions; the written set is bare
+    /// identifiers (combinator grammar has no `=`), so the expanded
+    /// spellings are filtered out. Written duplicates collapse through the
+    /// constructor's dedupe where the oracle's token-list loop would report
+    /// twice — one under-report, never a false positive.
+    ///
+    /// `target` is the directive's resolved target library, passed as the
+    /// edge carries it: `None` (invalid URI, missing file, not a library)
+    /// yields nothing — the oracle's `importedLibrary == null ||
+    /// library.isOriginNotExistingFile` gate (`dead_code_verifier.dart:104-
+    /// 112`; the missing target is the reported root cause and replaces the
+    /// combinator symptom). Synthetic `dart:` face nodes decide from the
+    /// names they carry, exactly the corpus fixtures' shape.
+    ///
+    /// Message arguments for the caller: `{1}` is the written name's text;
+    /// `{0}` is the oracle's `${library.uri}` — `dart:<name>` for SDK faces
+    /// (the synthetic node's uri spelling is exactly that), but the
+    /// defining file's `file:///` URI for analysis-set libraries, which is
+    /// *not* a package-lib node's `package:` identity spelling (oracle runs
+    /// print `file:///…` there) — render `{0}` from the target's file path,
+    /// not [`Self::uri`].
+    pub fn undefined_combinator_names<'a>(
+        &'a self,
+        strings: &'a StringTable,
+        target: Option<LibraryId>,
+        combinators: &'a Combinators,
+    ) -> impl Iterator<Item = UndefinedCombinatorName> + 'a {
+        target.into_iter().flat_map(move |target| {
+            combinators.clauses().iter().flat_map(move |clause| {
+                let (hidden, names) = match clause {
+                    CombinatorClause::Show(names) => (false, names),
+                    CombinatorClause::Hide(names) => (true, names),
+                };
+                names
+                    .iter()
+                    .copied()
+                    .filter(move |&name| {
+                        // A `name=` entry is the constructor's setter
+                        // expansion, never written (grammar has no `=`).
+                        !strings.resolve(name).ends_with('=')
+                            && self.exported(target, name).is_none()
+                            && self
+                                .exported(
+                                    target,
+                                    strings.intern(&format!("{}=", strings.resolve(name))),
+                                )
+                                .is_none()
+                    })
+                    .map(move |name| UndefinedCombinatorName { name, hidden })
+            })
+        })
+    }
+
     /// The locals link of the scope chain for `name` (either spelling): what
     /// `lib` itself declares, before any import is consulted. The oracle
     /// couples the two faces of a base name — `_lookupLibrary` hands back
@@ -731,6 +821,193 @@ mod tests {
             deferred: false,
             combinators: Combinators::unfiltered(),
         }
+    }
+
+    /// One-clause combinator list over `names` — `hidden: true` builds
+    /// `hide`, else `show`.
+    fn combinators(hidden: bool, names: &[&str], strings: &StringTable) -> Combinators {
+        let names: Box<[StringId]> = names.iter().map(|n| strings.intern(n)).collect();
+        let clause = if hidden {
+            CombinatorClause::Hide(names)
+        } else {
+            CombinatorClause::Show(names)
+        };
+        Combinators::new([clause], strings)
+    }
+
+    /// The undefined-combinator findings as (name text, hidden) pairs.
+    fn findings(
+        graph: &LibraryGraph,
+        strings: &StringTable,
+        target: Option<LibraryId>,
+        combinators: &Combinators,
+    ) -> Vec<(String, bool)> {
+        graph
+            .undefined_combinator_names(strings, target, combinators)
+            .map(|found| (strings.resolve(found.name).to_owned(), found.hidden))
+            .collect()
+    }
+
+    // ---- directive-combinator diagnostics ----
+
+    /// The corpus fixtures' shapes: a combinator naming a member the target's
+    /// export face does not define reports with the clause's code face —
+    /// `hide` as `undefined_hidden_name`, `show` as `undefined_shown_name` —
+    /// while a defined name stays silent on both clause kinds.
+    #[test]
+    fn combinator_misses_report_per_clause_and_defined_names_stay_silent() {
+        let mut rig = Rig::new();
+        let math = rig.builder.intern("dart:math");
+        let face_file = rig.file("<dart:math>");
+        rig.declare(math, "max", face_file);
+        rig.declare(math, "min", face_file);
+        let strings = rig.strings;
+        let graph = rig.builder.finish();
+
+        assert_eq!(
+            findings(
+                &graph,
+                strings,
+                Some(math),
+                &combinators(true, &["noSuchName"], strings)
+            ),
+            [("noSuchName".to_owned(), true)]
+        );
+        assert_eq!(
+            findings(
+                &graph,
+                strings,
+                Some(math),
+                &combinators(false, &["noSuchName"], strings)
+            ),
+            [("noSuchName".to_owned(), false)]
+        );
+        let defined = Combinators::new(
+            [
+                CombinatorClause::Show(Box::from([strings.intern("max")])),
+                CombinatorClause::Hide(Box::from([strings.intern("min")])),
+            ],
+            strings,
+        );
+        assert!(findings(&graph, strings, Some(math), &defined).is_empty());
+    }
+
+    /// The oracle checks export directives' combinators identically
+    /// (`visitExportDirective`, `dead_code_verifier.dart:77-89`): an export
+    /// edge's `show` of an unexported name reports the shown-name warning.
+    #[test]
+    fn export_directive_combinators_are_checked() {
+        let mut rig = Rig::new();
+        let math = rig.builder.intern("dart:math");
+        let face_file = rig.file("<dart:math>");
+        rig.declare(math, "max", face_file);
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let strings = rig.strings;
+        rig.builder.export(
+            consumer,
+            ExportEdge {
+                target: Some(math),
+                combinators: combinators(false, &["noSuch"], strings),
+            },
+        );
+        let graph = rig.builder.finish();
+
+        let edge = &graph.export_edges(consumer)[0];
+        assert_eq!(
+            findings(&graph, strings, edge.target, &edge.combinators),
+            [("noSuch".to_owned(), false)]
+        );
+    }
+
+    /// A name defined only as a setter is defined for the check (the
+    /// both-spellings probe, `element_resolver.dart:429-431`:
+    /// `get2(name)` / `get2('name=')`), and the constructor's `name=`
+    /// expansions are never reported — an empty face yields each written
+    /// name once, not its setter spelling too.
+    #[test]
+    fn setter_face_defines_and_expansions_never_report() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let t_file = rig.file("t.dart");
+        rig.declare(target, "foo=", t_file); // setter-only top-level
+        let empty = rig.builder.intern("package:e/e.dart"); // exports nothing
+        let strings = rig.strings;
+        let graph = rig.builder.finish();
+
+        assert!(
+            findings(
+                &graph,
+                strings,
+                Some(target),
+                &combinators(false, &["foo"], strings)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            findings(
+                &graph,
+                strings,
+                Some(empty),
+                &combinators(true, &["max"], strings)
+            ),
+            [("max".to_owned(), true)]
+        );
+    }
+
+    /// Suppression and interplay per the oracle: an unresolved target
+    /// (`None` — the `importedLibrary == null ||
+    /// library.isOriginNotExistingFile` gate) yields nothing; clauses decide
+    /// independently in source order (`show noSuch hide noSuch` reports both
+    /// codes); an `as` prefix is not consulted (`dead_code_verifier.dart:
+    /// 100-113` checks prefixed imports' combinators alike).
+    #[test]
+    fn suppression_clause_interplay_and_prefix_insensitivity() {
+        let mut rig = Rig::new();
+        let math = rig.builder.intern("dart:math");
+        let face_file = rig.file("<dart:math>");
+        rig.declare(math, "max", face_file);
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let strings = rig.strings;
+        let both = Combinators::new(
+            [
+                CombinatorClause::Show(Box::from([strings.intern("noSuch")])),
+                CombinatorClause::Hide(Box::from([strings.intern("noSuch")])),
+            ],
+            strings,
+        );
+        let mixed = Combinators::new(
+            [
+                CombinatorClause::Show(Box::from([strings.intern("max")])),
+                CombinatorClause::Hide(Box::from([strings.intern("noSuch")])),
+            ],
+            strings,
+        );
+        rig.builder.import(
+            consumer,
+            ImportEdge {
+                target: Some(math),
+                prefix: Some(strings.intern("m")),
+                deferred: false,
+                combinators: both.clone(),
+            },
+        );
+        let graph = rig.builder.finish();
+
+        assert!(findings(&graph, strings, None, &both).is_empty());
+        assert_eq!(
+            findings(&graph, strings, Some(math), &both),
+            [("noSuch".to_owned(), false), ("noSuch".to_owned(), true)]
+        );
+        assert_eq!(
+            findings(&graph, strings, Some(math), &mixed),
+            [("noSuch".to_owned(), true)]
+        );
+        // The prefixed edge decides identically — the prefix is not consulted.
+        let edge = &graph.import_edges(consumer)[0];
+        assert_eq!(
+            findings(&graph, strings, edge.target, &edge.combinators),
+            [("noSuch".to_owned(), false), ("noSuch".to_owned(), true)]
+        );
     }
 
     // ---- combinators ----

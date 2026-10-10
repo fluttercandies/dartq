@@ -22,6 +22,18 @@
 //! part/part-of family, `duplicate_part`, and the `ambiguous_*` use-point
 //! codes are emitted by the library-graph/namespace layer and only have
 //! their frozen descriptors here.
+//!
+//! The two directive-combinator static warnings
+//! ([`UNDEFINED_HIDDEN_NAME`]/[`UNDEFINED_SHOWN_NAME`]) are registered as
+//! companion descriptor consts beside the table instead of variants, for one
+//! structural reason: the engine's persisted directive-code slot
+//! (`PersistedResolutionCode`) exhaustively mirrors [`ResolutionCode`] by
+//! design, and these two codes never ride it — they are not URI-target
+//! outcomes but directive-combinator checks the semantic layer emits with
+//! the combinator name spans ([`crate::library_graph::
+//! LibraryGraph::undefined_combinator_names`]), data the URI slot does not
+//! carry. Extending the frozen enum for them would trip the persistence
+//! tripwire in a foreign crate for a slot they can never occupy.
 
 use dartq_diagnostics::DiagnosticType;
 
@@ -101,6 +113,41 @@ pub struct ResolutionCodeInfo {
     /// `documentation` key exactly for these codes.
     pub has_published: bool,
 }
+
+/// `import`/`export` `hide` clause names a member the target library's
+/// export namespace does not define — registry row verbatim
+/// (`diagnostic.g.dart:16936`, dart 3.15 main). `STATIC_WARNING`, published;
+/// `{0}` is the target library's URI, `{1}` the hidden name. The oracle
+/// checks both name spellings against `library.exportNamespace`
+/// (`element_resolver.dart:407-432` `_resolveCombinators`) and reports only
+/// when neither the getter nor the setter face resolves
+/// (`dead_code_verifier.dart:141-158` `_checkCombinator`); the check is
+/// suppressed entirely when the directive target has no library or its
+/// origin file does not exist (`dead_code_verifier.dart:104-112`). The
+/// emit-side decision face is [`crate::library_graph::
+/// LibraryGraph::undefined_combinator_names`].
+pub const UNDEFINED_HIDDEN_NAME: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "undefined_hidden_name",
+    machine: "UNDEFINED_HIDDEN_NAME",
+    message: "The library '{0}' doesn't export a member with the hidden name '{1}'.",
+    correction: Some("Try removing the name from the list of hidden members."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// `import`/`export` `show` clause names a member the target library's
+/// export namespace does not define — the `show`-clause twin of
+/// [`UNDEFINED_HIDDEN_NAME`], registry row verbatim
+/// (`diagnostic.g.dart:17198`, dart 3.15 main). Same decision face, same
+/// suppression, `STATIC_WARNING`, published.
+pub const UNDEFINED_SHOWN_NAME: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "undefined_shown_name",
+    machine: "UNDEFINED_SHOWN_NAME",
+    message: "The library '{0}' doesn't export a member with the shown name '{1}'.",
+    correction: Some("Try removing the name from the list of shown members."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
 
 impl ResolutionCode {
     /// The frozen official descriptor of this code. Correction texts, families,
@@ -368,5 +415,42 @@ mod tests {
             ResolutionCode::UriWithInterpolation.info().message,
             "URIs can't use string interpolation."
         );
+    }
+
+    /// Registry-true descriptors of the directive-combinator companion rows
+    /// (pinned live registry: `undefinedHiddenName` diagnostic.g.dart:16936,
+    /// `undefinedShownName` :17198 — both `STATIC_WARNING`, published, with
+    /// corrections; messages oracle-verified against dart 3.13.1).
+    #[test]
+    fn combinator_rows_are_verbatim_oracle_descriptors() {
+        assert_eq!(UNDEFINED_HIDDEN_NAME.name, "undefined_hidden_name");
+        assert_eq!(UNDEFINED_HIDDEN_NAME.machine, "UNDEFINED_HIDDEN_NAME");
+        assert_eq!(
+            UNDEFINED_HIDDEN_NAME.message,
+            "The library '{0}' doesn't export a member with the hidden name '{1}'."
+        );
+        assert_eq!(
+            UNDEFINED_HIDDEN_NAME.correction,
+            Some("Try removing the name from the list of hidden members.")
+        );
+        assert_eq!(UNDEFINED_HIDDEN_NAME.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(UNDEFINED_HIDDEN_NAME.has_published);
+        }
+
+        assert_eq!(UNDEFINED_SHOWN_NAME.name, "undefined_shown_name");
+        assert_eq!(UNDEFINED_SHOWN_NAME.machine, "UNDEFINED_SHOWN_NAME");
+        assert_eq!(
+            UNDEFINED_SHOWN_NAME.message,
+            "The library '{0}' doesn't export a member with the shown name '{1}'."
+        );
+        assert_eq!(
+            UNDEFINED_SHOWN_NAME.correction,
+            Some("Try removing the name from the list of shown members.")
+        );
+        assert_eq!(UNDEFINED_SHOWN_NAME.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(UNDEFINED_SHOWN_NAME.has_published);
+        }
     }
 }
