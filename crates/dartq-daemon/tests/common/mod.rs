@@ -141,11 +141,18 @@ impl Workspace {
 }
 
 /// A throwaway snapshot-store root (removed first so assertions on its
-/// contents start clean).
+/// contents start clean). The sequence suffix makes every call a unique
+/// tree: two callers passing the same `name`, or a crashed prior run whose
+/// pid was recycled, can never share state — the `name` stays in the path
+/// only for diagnosability of leftovers.
 #[must_use]
 pub fn store_root(name: &str) -> PathBuf {
-    let root =
-        std::env::temp_dir().join(format!("dartq-daemon-snap-{}-{name}", std::process::id()));
+    static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "dartq-daemon-snap-{}-{}-{name}",
+        std::process::id(),
+        STORE_SEQ.fetch_add(1, Relaxed),
+    ));
     let _ = std::fs::remove_dir_all(&root);
     root
 }

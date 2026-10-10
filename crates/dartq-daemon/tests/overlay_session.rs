@@ -22,6 +22,16 @@ use serde_json::{Value, json};
 /// can never yank another test's workspace mid-session.
 static WORKSPACE: Mutex<()> = Mutex::new(());
 
+/// Poisoning is recovered deliberately: the guard protects no cross-test
+/// state (every test owns a unique workspace and store root), so a
+/// panicking holder has already failed loudly and the waiters only need
+/// the serialization.
+fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
+    WORKSPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A second syntactic error, distinct from anything the base fixture
 /// produces — agent B's overlay signature.
 const AGENT_B_MAIN: &str = "void b() { z }\n";
@@ -66,7 +76,7 @@ fn codes(result: &Value) -> Vec<&str> {
 /// immunity to agent views, and the delta subset with its cursor echo.
 #[test]
 fn two_agents_edit_and_delta_over_one_base() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let main_uri = dartq_uri(&workspace, "lib/main.dart");
     let mut h = spawn(&workspace, &store_root("overlay-scenario"));
@@ -275,7 +285,7 @@ fn two_agents_edit_and_delta_over_one_base() {
 /// delta echo validates against the published query schema.
 #[test]
 fn session_economics_save_bytes_and_stay_schema_valid() {
-    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let _guard = workspace_lock();
     let workspace = Workspace::new("void main() {}\n");
     // One file, several rows: the repeated long path is what the
     // economics collapse.
