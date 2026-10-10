@@ -17,6 +17,10 @@ use dartq_plugin::{
 };
 use dartq_source::FileTable;
 
+mod support;
+
+use support::dart_available;
+
 /// Generous handshake budget: a cold `dart` JIT start must fit inside one
 /// request timeout (PRD §14.3 default is 10 s; CI cold caches get slack).
 const REQUEST_MS: u64 = 120_000;
@@ -43,6 +47,10 @@ fn spawn_echo() -> PluginRuntime {
 
 #[test]
 fn engine_diagnostics_round_trip_through_the_dart_host() {
+    if !dart_available() {
+        println!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return;
+    }
     let mut runtime = spawn_echo();
     assert_eq!(
         runtime.negotiated().map(CapabilitySet::names),
@@ -107,6 +115,10 @@ fn engine_diagnostics_round_trip_through_the_dart_host() {
 
 #[test]
 fn empty_feed_sends_no_frame() {
+    if !dart_available() {
+        println!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return;
+    }
     let mut runtime = spawn_echo();
     let before = runtime.stats();
     runtime

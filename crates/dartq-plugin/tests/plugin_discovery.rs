@@ -17,6 +17,10 @@ use dartq_plugin::{
 };
 use dartq_source::FileTable;
 
+mod support;
+
+use support::dart_available;
+
 /// Generous handshake/write budget: a cold `dart` JIT start must fit inside
 /// one request timeout (PRD §14.3 default is 10 s; CI cold caches get slack).
 const REQUEST_MS: u64 = 120_000;
@@ -71,6 +75,10 @@ fn fixture_manifest() -> String {
 
 #[test]
 fn discovery_spawns_the_fixture_and_round_trips_fixes() {
+    if !dart_available() {
+        println!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return;
+    }
     let workspace = Workspace::new("roundtrip");
     workspace.write_fixture("fixer", &fixture_manifest());
     // A broken manifest and a manifest-less directory: neither may hide the

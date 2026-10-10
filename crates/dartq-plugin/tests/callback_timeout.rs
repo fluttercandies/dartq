@@ -12,12 +12,20 @@ use dartq_plugin::{
 };
 use dartq_source::FileTable;
 
+mod support;
+
+use support::dart_available;
+
 fn host_package_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host")
 }
 
 #[test]
 fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
+    if !dart_available() {
+        println!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return;
+    }
     let manifest = Manifest::parse(
         r#"{"name": "slow", "version": "0.1.0", "entrypoint": "bin/slow_plugin.dart",
             "capabilities": ["lint", "fix"],

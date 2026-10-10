@@ -14,13 +14,16 @@
 //! own shutdown paths — the tests never kill or wait on them directly.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use dartq_diagnostics::Severity;
 use dartq_plugin::{
     CapabilitySet, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
 };
 use dartq_source::FileTable;
+
+mod support;
+
+use support::dart_available;
 
 /// Generous request budget: a cold `dart run` JIT start must fit inside one
 /// (PRD §14.3 default is 10 s; CI cold caches get the same slack as
@@ -30,16 +33,6 @@ const REQUEST_MS: u64 = 120_000;
 
 fn host_package_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host")
-}
-
-/// Whether a `dart` executable answers on `PATH`; a CI runner without the
-/// Dart SDK skips the live suite instead of going red.
-fn dart_available() -> bool {
-    Command::new("dart")
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
 }
 
 /// Spawns the fixture: `dart run bin/live_plugin.dart [args...]` inside the
@@ -131,7 +124,8 @@ fn live_plugin_mid_session_death_isolated_as_plugin_crashed() {
         "the death is reported with its cause, got {error:?}"
     );
     assert_eq!(
-        runtime.stats().restarts, 0,
+        runtime.stats().restarts,
+        0,
         "a death discovered mid-request absorbs no restart budget"
     );
 

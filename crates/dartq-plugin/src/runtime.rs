@@ -68,7 +68,7 @@
 //! - `feed` skips unknown [`FileId`]s (a caller-contract violation, same
 //!   posture as `FileLayoutProvider`) rather than failing a whole batch.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -467,10 +467,11 @@ impl PluginRuntime {
     }
 
     /// The graceful teardown: `shutdown` request, reply awaited under the
-    /// request budget, then the handle closes the plugin's stdin — the
-    /// host's read loop ends on that EOF and its process exits, which the
-    /// reaping joins on. Consumes the runtime — after `shutdown` there is no
-    /// session left (wire contract).
+    /// request budget, then the handle closes the plugin's stdin (the host's
+    /// graceful exit signal) and kills the child before joining the
+    /// generation, so the teardown never waits past that budget for a plugin
+    /// to exit. Consumes the runtime — after `shutdown` there is no session
+    /// left (wire contract).
     ///
     /// A child already dead when `shutdown` is called surfaces its crash.
     ///
@@ -515,9 +516,9 @@ impl PluginRuntime {
             Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
         };
         if outcome.is_ok() {
-            // Session over (wire contract). Closing stdin first is what ends
-            // the host's read loop and its process; reaping before that would
-            // wait on a child that is waiting on our EOF. The writer thread
+            // Session over (wire contract). Closing stdin first is the
+            // graceful signal: a well-behaved host ends its read loop on the
+            // EOF and exits on its own, no kill needed. The writer thread
             // owns the handle, so the close is a command to it.
             if let Some(commands) = &self.commands
                 && commands.send(WriterCommand::Close).is_ok()
@@ -529,8 +530,16 @@ impl PluginRuntime {
                         .saturating_duration_since(Instant::now()),
                 );
             }
+            // Kill before joining: the reply is acked and the session is
+            // Terminated, so nothing of value is left in the child, but a
+            // plugin that hangs in a cleanup handler never closes its stdout
+            // — the reader below stays parked in `fill_buf` — and both the
+            // join and the reap would wait forever, wedging the caller past
+            // any budget. The kill closes the pipes and ends the reader
+            // deterministically (and reaps the child, a no-op when it already
+            // exited on the stdin EOF).
+            self.kill_child();
             self.join_generation();
-            self.reap_child();
         }
         outcome
     }
@@ -784,7 +793,7 @@ fn spawn_reader(
     std::thread::Builder::new()
         .name("dartq-plugin-reader".to_owned())
         .spawn(move || {
-            let outcome = run_reader(stdout, &session, &pending, &events, &stats);
+            let outcome = run_reader(BufReader::new(stdout), &session, &pending, &events, &stats);
             alive.store(false, Ordering::Relaxed);
             if let Err(reason) = outcome {
                 *death.lock().expect("death lock") = Some(reason.clone());
@@ -797,17 +806,16 @@ fn spawn_reader(
 /// Reads frames until the stream ends or the contract breaks. `Ok(())` only
 /// when the plugin answered `shutdown` (the clean exit).
 fn run_reader(
-    stdout: ChildStdout,
+    mut stdout: impl BufRead,
     session: &Mutex<Session>,
     pending: &Mutex<Vec<PluginDiagnostic>>,
     events: &Sender<ProtocolEvent>,
     stats: &PluginStats,
 ) -> Result<(), String> {
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
         line.clear();
-        match read_bounded_line(&mut reader, &mut line) {
+        match read_bounded_line(&mut stdout, &mut line) {
             Ok(LineRead::Eof) => {
                 let terminated =
                     session.lock().expect("session lock").state() == SessionState::Terminated;
@@ -832,8 +840,17 @@ fn run_reader(
             Err(e) => return Err(e.to_string()),
         }
         stats.bytes_in(u64::try_from(line.len()).unwrap_or(u64::MAX));
-        if line.last() == Some(&b'\r') {
+        // Strip the terminator (`\n`, tolerating `\r\n`) before the empty
+        // check: `read_bounded_line` returns the line with its terminator,
+        // so this is where framing noise is normalized — a stray blank line
+        // is skipped, not decoded as a malformed frame. Same framing as
+        // `FrameDecoder::push` and the Dart host, so one blank line can
+        // never tear the session down.
+        if line.last() == Some(&b'\n') {
             line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
         }
         if line.is_empty() {
             continue;
@@ -1221,6 +1238,49 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0, LineRead::Oversize);
         assert_eq!(lines[0].1.len(), MAX_FRAME_SIZE + 1);
+    }
+
+    #[test]
+    fn reader_skips_blank_lines_and_decodes_crlf_frames() {
+        let init_reply = r#"{"schema_version":1,"id":1,"method":"initialize","params":{"protocol_version":1,"capabilities":["lint"]}}"#;
+        let diagnostic = r#"{"schema_version":1,"id":null,"method":"notification/diagnostic","params":{"file":"lib/main.dart","severity":"warning","code":"p/lint","message":"framing","offset":1,"length":2}}"#;
+        // One stray blank line between two valid frames, the second
+        // CRLF-terminated: framing noise both the pure decoder
+        // (`FrameDecoder::push`) and the Dart host tolerate — the reader
+        // must too, instead of tearing the session down over it.
+        let stream = format!("{init_reply}\n\n{diagnostic}\r\n");
+
+        let session = Mutex::new({
+            let mut session = Session::new(CapabilitySet::all());
+            session.send_initialize().expect("arm the handshake");
+            session
+        });
+        let pending = Mutex::new(Vec::new());
+        let (events, rx) = mpsc::channel();
+        let stats = PluginStats::default();
+
+        let outcome = run_reader(
+            Cursor::new(stream.into_bytes()),
+            &session,
+            &pending,
+            &events,
+            &stats,
+        );
+
+        // The session was alive at EOF (never Terminated): the exact death
+        // reason distinguishes a clean stream end from a framing teardown.
+        assert_eq!(
+            outcome,
+            Err("plugin process closed the connection".to_owned()),
+            "a blank line must not surface as a protocol violation"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ProtocolEvent::Initialized(_))),
+            "the handshake reply was processed across the blank line"
+        );
+        let drained = pending.lock().expect("pending lock");
+        assert_eq!(drained.len(), 1, "the CRLF-terminated frame decoded");
+        assert_eq!(drained[0].code, "p/lint");
     }
 
     #[test]
