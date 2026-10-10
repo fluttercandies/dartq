@@ -607,16 +607,28 @@ fn extra_entry_demotes_the_generation() {
 /// F1's plain-IO-error window: a re-save that fails at the tables write
 /// (its entries already replaced claimed files) leaves the previous
 /// coherent generation loadable — same manifest, same file set — never a
-/// mixture of unreadable halves.
+/// mixture of unreadable halves. The surgery fails the tables write
+/// without touching the previous `tables.json`: the generation directory
+/// is made read-only so the tables temp file cannot be created, while the
+/// entries directory stays writable and the claimed entry is replaced
+/// first — the save order (entries → tables → header) then leaves the old
+/// manifest facing exactly the claimed file set.
+#[cfg(unix)]
 #[test]
 fn failed_tables_write_keeps_the_last_coherent_generation() {
+    use std::os::unix::fs::PermissionsExt;
+
     let cache = TempCache::new("failed-tables");
     let header = save_two_entries(&cache);
     let generation = gen_dir(&cache.path, &header);
 
-    // Block the tables write: a directory where tables.json must go.
-    fs::remove_file(generation.join("tables.json")).expect("remove tables");
-    fs::create_dir(generation.join("tables.json")).expect("block tables path");
+    // Block the tables write: no new file can be created in a read-only
+    // generation directory. The previous tables.json survives untouched.
+    let writable = fs::metadata(&generation)
+        .expect("generation metadata")
+        .permissions();
+    fs::set_permissions(&generation, fs::Permissions::from_mode(writable.mode() & !0o200))
+        .expect("block tables write");
 
     let store = cache.store(DEFAULT_CAPACITY_BYTES);
     let error = store
@@ -631,7 +643,7 @@ fn failed_tables_write_keeps_the_last_coherent_generation() {
         .expect_err("tables write fails");
     assert!(matches!(error, SaveError::Io(_)));
 
-    fs::remove_dir(generation.join("tables.json")).expect("unblock tables path");
+    fs::set_permissions(&generation, writable).expect("unblock tables write");
     let snapshot = store.load::<TestPayload>(&header).expect("coherent v1");
     assert_eq!(snapshot.entries.len(), 2);
     let main = snapshot

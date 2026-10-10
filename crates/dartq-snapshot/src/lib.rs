@@ -39,7 +39,11 @@
 //! - **Guaranteed loadable**: the last generation whose `save` completed
 //!   every rename. Every returned entry passed its blake3-128 checksum and
 //!   JSON decode, and the entry files on disk are exactly the set the
-//!   manifest claims.
+//!   manifest claims. A re-save that failed mid-way keeps the generation
+//!   loadable when its entry set is a subset of the current claim — the
+//!   rewritten entry files carry the new payloads (same key, same id) —
+//!   while a failed save whose set adds keys leaves extra files that demote
+//!   the generation to a miss.
 //! - **Guaranteed lost**: any save whose renames did not all complete —
 //!   including the mixed middle of a torn re-save, which the manifest gate
 //!   demotes to a miss. There is no fsync anywhere; after power loss even
