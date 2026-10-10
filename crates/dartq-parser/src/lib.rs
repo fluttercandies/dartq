@@ -107,9 +107,9 @@ mod tests;
 pub use cursor::TokenCursor;
 pub use features::ParserFeatures;
 pub use listener::{
-    ConstantPatternContext, ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind,
-    ExperimentalFlag, FormalParameterKind, IdentifierContext, MemberKind, NullListener,
-    ParserListener, PatternContext,
+    AssertKind, BlockKind, ConstantPatternContext, ConstructorReferenceContext,
+    DeclarationHeaderKind, DeclarationKind, ExperimentalFlag, FormalParameterKind,
+    IdentifierContext, MemberKind, NullListener, ParserListener, PatternContext,
 };
 pub use message::Message;
 pub use parser::Parser;
