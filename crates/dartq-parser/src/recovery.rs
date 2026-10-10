@@ -464,21 +464,28 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     }
 
     /// Official `ensureSemicolon` (`parser_impl.dart:5093`): consumes `;` or
-    /// reports `Expected ';' after this.` and synthesizes one.
+    /// reports and synthesizes one.
     ///
-    /// Two official details live here: the report anchors on
-    /// `findPreviousNonZeroLengthToken(token)` — the last consumed token,
-    /// walked back over zero-width synthetics (an inserted identifier in
-    /// front of the insertion point must not capture the anchor) — and the
-    /// inserted `;` drains everything queued in front of it, so the parse
-    /// resumes at the token the official stream carries as `token.next`.
+    /// Three official details live here. The report anchors on
+    /// `findPreviousNonZeroLengthToken(token)` (`parser_impl.dart:5106`,
+    /// helper at `:11400`) — the last consumed token, walked back over
+    /// zero-width synthetics (an inserted identifier in front of the
+    /// insertion point must not capture the anchor) — and the diag spans
+    /// that token, so `void f() { x }` reports at the `x`, offset 11
+    /// length 1. The message text is the shared `EXPECTED_TOKEN` problem
+    /// text `Expected to find ';'.`: the 3.13.1 oracle's machine output for
+    /// this face (`dart analyze --format=machine` probe); the 3.15 source
+    /// passes `diag.expectedAfterButGot` (`:5107`), which surfaces as the
+    /// same analyzer shared code. Finally the inserted `;` drains
+    /// everything queued in front of it, so the parse resumes at the token
+    /// the official stream carries as `token.next`.
     pub(crate) fn ensure_semicolon(&mut self) -> TokenSpan {
         if let Some(id) = self.cursor.opt_kind(TokenKind::Semicolon) {
             return self.span_of(id);
         }
         let at = self.peek_span();
         let anchor = self.last_consumed_anchor();
-        self.report(msg::expected_after_but_got(";"), anchor);
+        self.report(msg::expected_token(";"), anchor);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Semicolon, at.range.offset);

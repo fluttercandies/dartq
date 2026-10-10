@@ -395,16 +395,31 @@ fn duplicate_deferred_and_prefix() {
 }
 
 #[test]
-fn deferred_without_as_is_silent() {
-    // The loop's `deferred`-without-`as` special case emits the prefix
-    // event and records nothing (official :1046-1051): no diagnostic.
+fn deferred_recovery_trio_matches_oracle() {
+    // The special-case `deferred` routes through the recovery listener
+    // (recovery_listeners.dart:68), so the bookkeeping records it — the
+    // three oracle faces (r5 corpus targeted/deferred_*.dart):
+    // `deferred` without a prefix reports missingPrefixInDeferredImport
+    // (parser_impl.dart:1103), after a prefix reports deferredAfterPrefix
+    // (:1059), and a second `deferred` reports duplicateDeferred (:1065).
     let c = parse("import 'a.dart' deferred;");
-    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(
+        c.error_codes(),
+        ["missing_prefix_in_deferred_import"],
+        "{:?}",
+        c.errors
+    );
     c.assert_sequence(&[
         ("handle", "import_prefix"),
         ("handle", "import_prefix"),
         ("handle", "recover_import"),
     ]);
+
+    let c = parse("import 'a.dart' as m deferred;");
+    assert_eq!(c.error_codes(), ["deferred_after_prefix"], "{:?}", c.errors);
+
+    let c = parse("import 'a.dart' deferred deferred as m;");
+    assert_eq!(c.error_codes(), ["duplicate_deferred"], "{:?}", c.errors);
 }
 
 #[test]

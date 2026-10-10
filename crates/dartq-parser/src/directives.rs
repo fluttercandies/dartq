@@ -253,35 +253,50 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.skip_unexpected_token();
             self.parse_conditional_uri_star();
             // `deferred` not followed by `as`: emit the prefix event for it
-            // without recording it (official :1046-1051 — the special case
-            // bypasses the recovery listener's bookkeeping).
+            // (official :1057-1062). The call routes through the recovery
+            // listener (`recovery_listeners.dart:68` records the deferred
+            // keyword on every `handleImportPrefix`), so the bookkeeping
+            // below covers this arm too — the deferred-after-prefix and
+            // duplicate faces anchor here.
+            let recorded_deferred;
+            let recorded_as;
             if self.peek_kind() == TokenKind::Keyword(Keyword::Deferred)
                 && self.cursor.look_kind(1) != TokenKind::Keyword(Keyword::As)
             {
                 let deferred = self.peek_span();
                 self.listener.handle_import_prefix(Some(deferred), None);
                 self.cursor.advance();
+                recorded_deferred = Some(deferred);
+                // The special case hands `asKeyword = null` to the recovery
+                // listener (:1060), resetting the field — the `as` block
+                // below stays silent this iteration.
+                recorded_as = None;
             } else {
                 let prefix = self.parse_import_prefix_opt();
-                if let Some(d) = prefix.deferred {
-                    if first_deferred.is_some() {
-                        self.report(msg::duplicate_deferred(), d);
-                    } else {
-                        if has_prefix {
-                            self.report(msg::deferred_after_prefix(), d);
-                        }
-                        first_deferred = Some(d);
-                    }
-                }
-                if let Some(a) = prefix.as_kw {
+                recorded_deferred = prefix.deferred;
+                recorded_as = prefix.as_kw;
+            }
+            // Bookkeeping order mirrors the do-loop: the deferred block
+            // (:1055-1070) precedes the `as` block (:1071-1082) in every
+            // iteration.
+            if let Some(d) = recorded_deferred {
+                if first_deferred.is_some() {
+                    self.report(msg::duplicate_deferred(), d);
+                } else {
                     if has_prefix {
-                        self.report(msg::duplicate_prefix(), a);
-                    } else {
-                        if has_combinator {
-                            self.report(msg::prefix_after_combinator(), a);
-                        }
-                        has_prefix = true;
+                        self.report(msg::deferred_after_prefix(), d);
                     }
+                    first_deferred = Some(d);
+                }
+            }
+            if let Some(a) = recorded_as {
+                if has_prefix {
+                    self.report(msg::duplicate_prefix(), a);
+                } else {
+                    if has_combinator {
+                        self.report(msg::prefix_after_combinator(), a);
+                    }
+                    has_prefix = true;
                 }
             }
             let pass_combinator = self.parse_combinator_star();

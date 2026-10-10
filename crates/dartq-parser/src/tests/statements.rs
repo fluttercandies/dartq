@@ -579,3 +579,19 @@ fn statement_flood_respects_diagnostics_cap() {
         "the listener sees exactly the capped count"
     );
 }
+
+// —— expression-statement missing-`;` face —————————————————————————————————
+
+#[test]
+fn expression_statement_missing_semicolon_matches_oracle() {
+    // 3.13.1 oracle probe (`dart analyze --format=machine` on
+    // `void f() { x }`): `EXPECTED_TOKEN` "Expected to find ';'." spanning
+    // the `x` itself — offset 11, length 1. That is the general
+    // `ensureSemicolon` anchor (`findPreviousNonZeroLengthToken`,
+    // parser_impl.dart:5106/:11400), not a fixture special case.
+    let c = parse("void f() { x }");
+    assert_eq!(c.error_codes(), ["expected_token"]);
+    assert_eq!(c.errors[0].1, 11);
+    assert_eq!(c.errors[0].2, 12);
+    assert_eq!(c.texts[0], "Expected to find ';'.");
+}

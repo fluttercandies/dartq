@@ -331,7 +331,11 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn unexpected_token(lexeme: &str) -> Message {
-        Message::new(UNEXPECTED_TOKEN, format!("Unexpected token '{lexeme}'."))
+        // The analyzer re-words the fasta shared code for its own surface
+        // (`analyzer/lib/src/diagnostic/diagnostic.g.dart:17343-17346`,
+        // name `unexpected_token`: "Unexpected text '{0}'."), which is what
+        // `dart analyze --format=machine` prints.
+        Message::new(UNEXPECTED_TOKEN, format!("Unexpected text '{lexeme}'."))
     }
 
     pub(crate) fn unexpected_tokens() -> Message {
@@ -1476,13 +1480,27 @@ pub(crate) mod msg {
         )
     }
 
-    pub(crate) fn positional_parameter_with_equals() -> Message {
+    /// `:` on a required-positional formal (`void f(int x: 1)`, oracle
+    /// `namedParameterOutsideGroup`).
+    pub(crate) fn named_parameter_outside_group() -> Message {
         Message::new(
             local_code(
-                "positional_parameter_with_equals",
-                "POSITIONAL_PARAMETER_WITH_EQUALS",
+                "named_parameter_outside_group",
+                "NAMED_PARAMETER_OUTSIDE_GROUP",
             ),
-            "Positional optional parameters can't use ':' or '=' to specify a default value.",
+            "Named parameters must be enclosed in curly braces ('{' and '}').",
+        )
+    }
+
+    /// `:` on an optional-positional formal (`void f([int x: 1])`, oracle
+    /// `wrongSeparatorForPositionalParameter`).
+    pub(crate) fn wrong_separator_for_positional_parameter() -> Message {
+        Message::new(
+            local_code(
+                "wrong_separator_for_positional_parameter",
+                "WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER",
+            ),
+            "The default value of a positional parameter should be preceded by '='.",
         )
     }
 

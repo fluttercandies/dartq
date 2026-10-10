@@ -2353,6 +2353,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     pub(crate) fn parse_invalid_top_level_declaration(&mut self) {
         let at = self.peek_span();
         let kind = self.peek_kind();
+        // A zero-width scanner-recovery closer (e.g. the EOF-pinned `)` of
+        // a `(` a declaration recovery took over) is a recovery artifact:
+        // the scanner channel already carries its unbalanced-group face, so
+        // it is consumed silently here — the layer that actually sees it —
+        // instead of stacking a declaration face on top. The span is
+        // genuinely zero-width (the scanner pushes recovery closers with
+        // length 0, lexer/mod.rs:910; real tokens are never zero-width).
+        if matches!(
+            kind,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly
+        ) && at.range.length == 0
+        {
+            self.cursor.advance();
+            return;
+        }
         if kind == TokenKind::Semicolon {
             self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
         } else {

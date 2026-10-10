@@ -4,6 +4,7 @@
 use super::collector::{latest_features, scan_ok, setup};
 use crate::listener::{ParserListener, Token};
 use crate::parser::Parser;
+use dartq_language::{FeatureSet, LanguageVersion};
 
 fn parse(source: &'static str) -> super::collector::Collector {
     let mut p = setup(source);
@@ -261,8 +262,45 @@ fn required_parameter_with_default_reports() {
 
 #[test]
 fn positional_default_with_colon_reports() {
+    // `:` on an optional-positional formal wants `=` (oracle
+    // `wrongSeparatorForPositionalParameter`, r5 corpus
+    // wrong_separator_for_positional_parameter.dart).
     let c = parse("class C { void m([int a: 1]) {} }");
-    assert_eq!(c.error_codes(), ["positional_parameter_with_equals"]);
+    assert_eq!(c.error_codes(), ["wrong_separator_for_positional_parameter"]);
+}
+
+#[test]
+fn colon_on_required_positional_reports_named_parameter_outside_group() {
+    // `:` on a required-positional formal reads as the named-group separator
+    // used outside its group (oracle `namedParameterOutsideGroup`, r5 corpus
+    // named_parameter_outside_group.dart: `void f(int x: 1) {}`).
+    let c = parse("class C { void m(int a: 1) {} }");
+    assert_eq!(c.error_codes(), ["named_parameter_outside_group"]);
+}
+
+#[test]
+fn required_modifier_walk_matches_official_order() {
+    // `required` on a non-named formal reports `extraneous_modifier` once at
+    // the first token after the walk (modifier_context.dart:212-221); a
+    // repeat reports `duplicatedModifier` inside the walk (:594) — walk
+    // order first, walk-end second. Named formals stay silent; a doubled
+    // named `required` only duplicates.
+    let c = parse("class C { void m(required required int x) {} }");
+    assert_eq!(
+        c.error_codes(),
+        ["duplicated_modifier", "extraneous_modifier"],
+        "{:?}",
+        c.errors
+    );
+
+    let c = parse("class C { void m(required int x) {} }");
+    assert_eq!(c.error_codes(), ["extraneous_modifier"], "{:?}", c.errors);
+
+    let c = parse("class C { void m({required x}) {} }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+
+    let c = parse("class C { void m({required required x}) {} }");
+    assert_eq!(c.error_codes(), ["duplicated_modifier"], "{:?}", c.errors);
 }
 
 #[test]
@@ -489,4 +527,107 @@ fn switch_expression_missing_body_reports_on_close_paren() {
     assert_eq!(c.error_codes(), ["expected_body"]);
     assert_eq!(c.errors[0].1, 9);
     assert_eq!(c.errors[0].2, 10);
+}
+
+// —— feature-off class-head `(` recovery (probe-verified) ————————————————
+
+/// Parses `source` with a 3.9 feature set (predates the primary-constructors
+/// `enabledIn` 3.13.0, matching the 3.13.1 oracle's default probe
+/// environment) and returns the listener plus the scanner-diagnostic codes.
+/// The scanner channel is merged by the caller: an unclosed `(` legitimately
+/// carries a scanner-level `expected_token(')')` (the same fixture class as
+/// `unclosed_formal_relocation`, whose rig is
+/// `gate_m0_wave3.rs::assert_codes_with_scanner`).
+fn parse_off_with_scanner(
+    source: &'static str,
+) -> (super::collector::Collector, Vec<String>) {
+    let config = dartq_scanner::ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: true,
+    };
+    let mut files = dartq_source::FileTable::new();
+    let file = files.intern(std::path::Path::new("test.dart"));
+    let result = dartq_scanner::scan(source, config, file);
+    let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+    let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let scanner_codes: Vec<String> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name.to_owned())
+        .collect();
+    let features = crate::ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 9),
+    ));
+    let mut p = Parser::new(text, table, features, super::collector::Collector::default());
+    p.parse_unit();
+    (p.listener, scanner_codes)
+}
+
+#[test]
+fn class_head_paren_off_matches_oracle_face_set() {
+    // 3.13.1 oracle probe of the minimal file `class C( {}`: the paren is
+    // not a parameter list at a feature-off class head (3.15 main parses
+    // class-head formals unconditionally, parser_impl.dart:3782-3838 — that
+    // is our feature-on path). The `{}`-remnant parses as a member with no
+    // type and no name, and the pending paren closes at EOF. Full face set
+    // over the merged scanner+parser channel: expected_token(';') at the
+    // `{`, missing_identifier + missing_const_final_var_or_type at the `}`,
+    // expected_executable at the pending paren's EOF position, and the
+    // scanner's unbalanced-group expected_token(')') pinned at the same
+    // spot (diag.rs:22).
+    let (c, scanner) = parse_off_with_scanner("class C( {}");
+    let mut codes = c.error_codes();
+    codes.extend(scanner);
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            "expected_executable",
+            "expected_token",
+            "expected_token",
+            "missing_const_final_var_or_type",
+            "missing_identifier",
+        ]
+    );
+    c.assert_sequence(&[
+        ("begin", "class_declaration"),
+        ("begin", "body"),
+        ("end", "body"),
+        ("end", "class_declaration"),
+    ]);
+    // Follower fixture (3.13.1 oracle probe of `class C( {}\nclass D {}`,
+    // verbatim): the oracle consumes D's keyword as a junk member inside
+    // C — `unexpected_token` "Unexpected text '('." at the `(`, the shared
+    // remnant faces, then `expected_executable` spanning `class` with the
+    // pending paren's `expected_token(')')` anchored at the same boundary.
+    // Merged 6-row multiset: [unexpected_token, expected_token(';'),
+    // missing_identifier, missing_const_final_var_or_type,
+    // expected_executable, expected_token(')')]. Our parser carries the
+    // `)`-face count via the scanner's EOF row (the scanner runs eagerly,
+    // so its unbalanced-group row is unconditional) and lets D parse as
+    // its own declaration — observably identical at (code, file): the
+    // oracle emits no rows for D either.
+    let (c2, scanner2) = parse_off_with_scanner("class C( {}\nclass D {}");
+    let mut codes2 = c2.error_codes();
+    codes2.extend(scanner2);
+    codes2.sort();
+    assert_eq!(
+        codes2,
+        [
+            "expected_executable",
+            "expected_token",
+            "expected_token",
+            "missing_const_final_var_or_type",
+            "missing_identifier",
+            "unexpected_token",
+        ]
+    );
+    // Span + text parity (oracle rows 1|8|1 and 2|1|5): the
+    // unexpected_token spans the `(` token alone with the analyzer's
+    // re-worded text, and the junk-member face spans the boundary keyword
+    // alone (parser-channel order: the three remnant faces, then the two
+    // follower faces).
+    assert_eq!(c2.errors[3], ("unexpected_token".to_string(), 7, 8));
+    assert_eq!(c2.texts[3], "Unexpected text '('.");
+    assert_eq!(c2.errors[4], ("expected_executable".to_string(), 12, 17));
 }

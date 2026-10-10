@@ -298,6 +298,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
         let in_function_type = member_kind == MemberKind::GeneralizedFunctionType;
 
+        // The caller's kind, untouched by the walk's optional-named upgrade —
+        // the walk-end `required` gate tests it (modifier_context.dart:212-221).
+        let original_parameter_kind = parameter_kind;
         let mut required: Option<TokenSpan> = None;
         let mut covariant: Option<TokenSpan> = None;
         let mut var_final_or_const: Option<TokenSpan> = None;
@@ -366,11 +369,31 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.report(msg::duplicated_modifier("required"), t);
                 }
                 TokenKind::Keyword(Keyword::Required) => {
+                    // Recorded silently; the walk-end gate reports it once
+                    // (modifier_context.dart:212-221).
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("required"), t);
+                    required.get_or_insert(t);
                 }
                 _ => break,
+            }
+        }
+        // Walk-end `required` gate (modifier_context.dart:212-221): one
+        // `extraneous_modifier` at the first `required` when the formal's
+        // kind never named it; repeats already reported `duplicated_modifier`
+        // inside the walk. Primary constructors tolerate it on named formals.
+        if let Some(t) = required {
+            let kind_named = matches!(
+                original_parameter_kind,
+                FormalParameterKind::OptionalNamed | FormalParameterKind::RequiredNamed
+            );
+            let gate = if member_kind == MemberKind::PrimaryConstructor {
+                !kind_named
+            } else {
+                original_parameter_kind != FormalParameterKind::OptionalNamed
+            };
+            if gate {
+                self.report(msg::extraneous_modifier("required"), t);
             }
         }
         if member_kind == MemberKind::GeneralizedFunctionType
@@ -604,16 +627,25 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     initializer_end.unwrap(),
                     parameter_kind,
                 );
-                // Official :2386-2395: required-positional default reports
-                // `requiredParameterWithDefault`; optional-positional `:`
-                // reports `positionalParameterWithEquals`; function-typed
-                // contexts report `functionTypeDefaultValue`.
+                // Official separator split (:2386-2395 at the r5 anchor;
+                // 3.15 folded the two `:` faces into
+                // requiredParameterWithDefault/positionalParameterWithEquals,
+                // the 3.13 oracle keeps the dedicated codes the corpus pins):
+                // `:` on a required positional reads as the named-group
+                // separator used outside its group; `:` on an optional
+                // positional wants `=`; a plain `=` default is the
+                // requiredParameterWithDefault face; function-typed contexts
+                // forbid defaults outright.
                 if parameter_kind == FormalParameterKind::RequiredPositional {
-                    self.report(msg::required_parameter_with_default(), equals);
+                    if separator == TokenKind::Colon {
+                        self.report(msg::named_parameter_outside_group(), equals);
+                    } else {
+                        self.report(msg::required_parameter_with_default(), equals);
+                    }
                 } else if parameter_kind == FormalParameterKind::OptionalPositional
                     && separator == TokenKind::Colon
                 {
-                    self.report(msg::positional_parameter_with_equals(), equals);
+                    self.report(msg::wrong_separator_for_positional_parameter(), equals);
                 } else if in_function_type
                     || member_kind == MemberKind::FunctionTypeAlias
                     || member_kind == MemberKind::FunctionTypedParameter

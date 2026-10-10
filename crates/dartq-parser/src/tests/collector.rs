@@ -41,11 +41,13 @@ pub(crate) fn latest_features() -> crate::ParserFeatures {
 /// Flat event log entry: `("begin", "pattern")` style.
 pub(crate) type Logged = (&'static str, &'static str);
 
-/// Listener that records recoverable errors (code, start, end in UTF-16)
+/// Listener that records recoverable errors (code, start, end in UTF-16),
+/// their problem texts (parallel to `errors`, for message-template pins),
 /// and a log of the structural events the tests observe.
 #[derive(Default)]
 pub(crate) struct Collector {
     pub errors: Vec<(String, u32, u32)>,
+    pub texts: Vec<String>,
     pub log: Vec<Logged>,
 }
 
@@ -71,6 +73,7 @@ impl Collector {
 
 impl ParserListener for Collector {
     fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {
+        self.texts.push(message.text);
         self.errors.push((
             message.code.name.to_owned(),
             start.range.offset,
