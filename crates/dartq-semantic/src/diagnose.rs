@@ -7672,7 +7672,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // `handle_no_type` disarmed it for untyped groups); every name in
         // the group binds it.
         engine.pending_decl_ty = engine.armed_ty.take();
-        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
+        // Field groups arm earlier (`begin_fields`, which precedes their
+        // name events — this event follows them there): re-arming here
+        // would wipe the already-queued const names, so only a local
+        // group (this event precedes its names) arms.
+        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const")
+            && !engine.const_group
+        {
             engine.arm_const_group();
         }
     }
