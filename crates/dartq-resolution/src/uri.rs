@@ -1037,9 +1037,11 @@ fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
     match base {
         BaseUri::Package { package, path } => {
             let merged = remove_dot_segments(&merge_paths(path, &reference.path));
-            if merged.starts_with("..") {
-                // Escaped the package root (`../../…`): no package URI can
-                // express it; the oracle's pathSegments then start at `..`.
+            // Escaped the package root: the FIRST segment is exactly `..`
+            // (the oracle's `pathSegments.first == '..'` equality check), so
+            // no package URI can express it. A segment merely *starting* with
+            // `..` (`..foo.dart`) is a legal name, not an escape.
+            if merged == ".." || merged.starts_with("../") {
                 Composed::Other
             } else {
                 Composed::Package {
@@ -1309,6 +1311,12 @@ mod tests {
             write("pkg_a/lib/a.dart", "// fixture\n");
             write("pkg_a/lib/sub/b.dart", "// fixture\n");
             write("pkg_a/lib/c.dart", "// fixture\n");
+            // Names whose first segment merely begins with `..` are legal
+            // files (the oracle pins a `pathSegments.first == '..'`
+            // EQUALITY check, not a prefix test).
+            write("pkg_a/lib/..foo.dart", "// fixture\n");
+            write("pkg_a/lib/..foo/c.dart", "// fixture\n");
+            write("pkg_a/lib/..foo/x.dart", "// fixture\n");
             write("app/lib/main.dart", "// fixture\n");
             write("app/lib/util.dart", "// fixture\n");
             write("app/bin/tool.dart", "// fixture\n");
@@ -1530,6 +1538,63 @@ mod tests {
         );
         assert_eq!(code_of(&escape), ResolutionCode::UriDoesNotExist);
         assert_eq!(escape.target, ResolvedTarget::Missing);
+    }
+
+    /// A first segment merely *beginning* with `..` is a legal name, not an
+    /// escape: the oracle checks `pathSegments.first == '..'` (equality), so
+    /// `..foo.dart` resolves inside the package instead of reporting a
+    /// nonexistent URI.
+    #[test]
+    fn dotdot_prefixed_segment_is_not_a_package_escape() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        // Lib-root container: the lib-relative reference passes through
+        // `merge_paths` verbatim (base path has no `/`).
+        let root = container(&fixture, &mut files, "pkg_a/lib/a.dart");
+        let sibling = resolver(&fixture, &mut files).resolve(
+            root,
+            Some("..foo.dart"),
+            DirectiveKind::ImportExport,
+        );
+        let ResolvedUri::Package { package, rel, file } = sibling.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "pkg_a");
+        assert_eq!(rel, PathBuf::from("..foo.dart"));
+        assert_eq!(file, fixture.workspace.root.join("pkg_a/lib/..foo.dart"));
+        assert_eq!(sibling.code, None);
+
+        // A container whose own lib-relative path starts with such a
+        // segment composes relatives inside it.
+        let nested = container(&fixture, &mut files, "pkg_a/lib/..foo/c.dart");
+        let resolution = resolver(&fixture, &mut files).resolve(
+            nested,
+            Some("x.dart"),
+            DirectiveKind::ImportExport,
+        );
+        let ResolvedUri::Package { package, rel, file } = resolution.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "pkg_a");
+        assert_eq!(rel, PathBuf::from("..foo/x.dart"));
+        assert_eq!(file, fixture.workspace.root.join("pkg_a/lib/..foo/x.dart"));
+        assert_eq!(resolution.code, None);
+
+        // True escapes still escape: `../x.dart` from the lib root and a
+        // bare `..` both leave the package unresolvably.
+        for reference in ["../x.dart", ".."] {
+            let escape = resolver(&fixture, &mut files).resolve(
+                root,
+                Some(reference),
+                DirectiveKind::ImportExport,
+            );
+            assert_eq!(
+                escape.uri,
+                ResolvedUri::Unresolved(UnresolvedKind::NotExist)
+            );
+            assert_eq!(code_of(&escape), ResolutionCode::UriDoesNotExist);
+            assert_eq!(escape.target, ResolvedTarget::Missing);
+        }
     }
 
     /// `import ''` resolves to the containing file itself (`resolveUri`
