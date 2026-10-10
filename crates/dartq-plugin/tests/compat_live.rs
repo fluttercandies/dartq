@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    CapabilitySet, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, Severity as WireSeverity,
-    crash_diagnostic, discover,
+    CapabilitySet, Manifest, PluginRuntime, RuntimeError, Severity as WireSeverity, SpawnSpec,
+    StdioPolicy, crash_diagnostic, discover,
 };
 use dartq_source::{FileTable, LineIndex, utf16_offset_to_byte};
 
@@ -80,8 +80,16 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     let a = files.intern(Path::new("lib/a.dart"));
     let b = files.intern(Path::new("lib/b.dart"));
     let notes = files.intern(Path::new("notes.txt"));
-    let a_path = files.path(a).expect("interned").to_string_lossy().into_owned();
-    let b_path = files.path(b).expect("interned").to_string_lossy().into_owned();
+    let a_path = files
+        .path(a)
+        .expect("interned")
+        .to_string_lossy()
+        .into_owned();
+    let b_path = files
+        .path(b)
+        .expect("interned")
+        .to_string_lossy()
+        .into_owned();
 
     // Engine diagnostics: offsets are UTF-16; the first row spans the
     // emoji's surrogate pair.
@@ -91,7 +99,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
             URI_DOES_NOT_EXIST,
             "Target of URI doesn't exist: 'x.dart'.",
             a,
-            SourceRange { offset: 8, length: 2 },
+            SourceRange {
+                offset: 8,
+                length: 2,
+            },
             None,
         ),
         Diagnostic::new(
@@ -99,7 +110,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
             URI_DOES_NOT_EXIST,
             "Target of URI doesn't exist: 'y.dart'.",
             a,
-            SourceRange { offset: 10, length: 4 },
+            SourceRange {
+                offset: 10,
+                length: 4,
+            },
             None,
         ),
         Diagnostic::new(
@@ -107,7 +121,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
             URI_DOES_NOT_EXIST,
             "Target of URI doesn't exist: 'z.dart'.",
             b,
-            SourceRange { offset: 0, length: 1 },
+            SourceRange {
+                offset: 0,
+                length: 1,
+            },
             None,
         ),
         Diagnostic::new(
@@ -115,7 +132,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
             URI_DOES_NOT_EXIST,
             "non-Dart files are not analyzed by the rule",
             notes,
-            SourceRange { offset: 0, length: 4 },
+            SourceRange {
+                offset: 0,
+                length: 4,
+            },
             None,
         ),
     ];
@@ -128,7 +148,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     assert_eq!(findings[0].code, "compat/companion");
     assert_eq!(findings[0].severity, WireSeverity::Warning);
     assert_eq!(findings[0].message, "companion for `uri_does_not_exist`");
-    assert_eq!(findings[0].offset, 8, "UTF-16 surrogate-pair range carried through");
+    assert_eq!(
+        findings[0].offset, 8,
+        "UTF-16 surrogate-pair range carried through"
+    );
     assert_eq!(findings[0].length, 2);
     assert_eq!(findings[1].offset, 10);
     assert_eq!(findings[1].length, 4);
@@ -182,14 +205,27 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
         })
         .collect();
     let merged = merge(engine_rows, plugin_rows);
-    assert_eq!(merged.len(), 7, "engine + plugin rows, nothing deduped away");
+    assert_eq!(
+        merged.len(),
+        7,
+        "engine + plugin rows, nothing deduped away"
+    );
     assert_eq!(merged[0].offset, 8, "engine rows first, in order");
     assert_eq!(merged[3].offset, 0, "the notes.txt engine row is intact");
     // Plugin rows sort by offset across the file set (the daemon's sort key
     // is the offset alone): b.dart@0, a.dart@8, a.dart@10.
-    assert_eq!((merged[4].file.as_str(), merged[4].offset), (b_path.as_str(), 0));
-    assert_eq!((merged[5].file.as_str(), merged[5].offset), (a_path.as_str(), 8));
-    assert_eq!((merged[6].file.as_str(), merged[6].offset), (a_path.as_str(), 10));
+    assert_eq!(
+        (merged[4].file.as_str(), merged[4].offset),
+        (b_path.as_str(), 0)
+    );
+    assert_eq!(
+        (merged[5].file.as_str(), merged[5].offset),
+        (a_path.as_str(), 8)
+    );
+    assert_eq!(
+        (merged[6].file.as_str(), merged[6].offset),
+        (a_path.as_str(), 10)
+    );
 
     // The fixes face: the range fix anchored at the requested UTF-16 range,
     // then the message-only suggestion.
@@ -266,12 +302,16 @@ fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
     assert_eq!(diagnostic.code.name, "dartq/plugin_crashed");
     assert_eq!(diagnostic.severity, Severity::Error);
     assert!(
-        diagnostic.message.contains("compat") && diagnostic.message.contains("closed the connection"),
+        diagnostic.message.contains("compat")
+            && diagnostic.message.contains("closed the connection"),
         "message names the plugin and the cause: {}",
         diagnostic.message
     );
 
-    assert!(matches!(runtime.shutdown(), Err(RuntimeError::Crashed { .. })));
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(RuntimeError::Crashed { .. })
+    ));
 }
 
 /// The content the engine holds for the other files of the set (the test

@@ -21,7 +21,10 @@
 //!   `request/fixes` and awaits the reply under the manifest's callback
 //!   budget (§14.3 CPU row, default 5 s). An overrun kills the child and
 //!   consumes the restart budget, surfacing
-//!   [`RuntimeError::CallbackTimeout`].
+//!   [`RuntimeError::CallbackTimeout`]. The analyze push has no reply to
+//!   await, so the monitor enforces the same budget on the demand itself:
+//!   the clock [`PluginRuntime::feed`] opens must close with produced
+//!   diagnostics before `callback_ms` elapses.
 //!
 //! [`PluginRuntime::stats`] is the §14.3 observability face (peak RSS, frame
 //! and byte counters, guard drops, restart count) the daemon/CLI read.
@@ -41,7 +44,7 @@
 //! | Dimension | Mechanism here |
 //! | --- | --- |
 //! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. |
-//! | CPU | `request/fixes` awaits its reply under the manifest's `callback_ms`; an overrun kills the child and consumes the restart budget. |
+//! | CPU | `request/fixes` awaits its reply under the manifest's `callback_ms`; an overrun kills the child and consumes the restart budget. The analyze demand is enforced against the same budget: feeding engine diagnostics opens a clock in the monitor, closed when the child produces diagnostics (or dies); a demand still open past `callback_ms` kills the child through the same path. |
 //! | IPC | `initialize` and `shutdown` run under the manifest's `request_ms`; every stdin write is bounded by the same deadline (writer thread). |
 //! | Crash | Child death never propagates: the runtime relaunches within the manifest's retry budget (counted in `stats.restarts`), then reports [`RuntimeError::Crashed`] — the terminal form names the exhausted budget. |
 //! | Frame guard | Lines beyond [`MAX_FRAME_SIZE`] are dropped before buffering (counted) and tear the session down — the transport never resynchronizes. |
@@ -71,7 +74,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -231,7 +234,9 @@ enum ProtocolEvent {
     /// The `shutdown` reply was accepted.
     ShutdownComplete,
     /// The session ended abnormally (protocol violation or lost stream).
-    Dead(String),
+    /// A pure signal — the cause lives in the authoritative death slot,
+    /// which the reader fills before sending this event.
+    Dead,
 }
 
 /// One command to the per-generation writer thread (the only stdin writer).
@@ -320,6 +325,60 @@ impl PendingDiagnostics {
     }
 }
 
+/// The analyze demand's wall clock (§14.3 CPU row, analyze path): closed at
+/// birth, opened by [`PluginRuntime::feed`] when a batch goes on the wire,
+/// closed when the child produces diagnostics or the generation dies. The
+/// stored value is the runtime's age in milliseconds at open time
+/// ([`AnalyzeClock::CLOSED`] when closed), so the monitor reads the open
+/// demand's age against one shared reference instant without a second
+/// atomic.
+#[derive(Debug)]
+struct AnalyzeClock {
+    open_at_millis: AtomicU64,
+}
+
+impl AnalyzeClock {
+    const CLOSED: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Self {
+            open_at_millis: AtomicU64::new(Self::CLOSED),
+        }
+    }
+
+    /// Opens the demand unless already open. A re-feed while open must not
+    /// refresh the clock: a plugin that acknowledges every batch without
+    /// ever producing would otherwise push the budget out forever and the
+    /// monitor could never fire.
+    fn open(&self, created: Instant) {
+        let _ = self.open_at_millis.compare_exchange(
+            Self::CLOSED,
+            elapsed_millis(created),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Closes the demand: diagnostics arrived (the reader) or the generation
+    /// died (the kill paths and the monitor's own kill).
+    fn close(&self) {
+        self.open_at_millis.store(Self::CLOSED, Ordering::Relaxed);
+    }
+
+    /// The open demand's age, `None` when closed.
+    fn open_for(&self, created: Instant) -> Option<Duration> {
+        let open_at = self.open_at_millis.load(Ordering::Relaxed);
+        (open_at != Self::CLOSED)
+            .then(|| Duration::from_millis(elapsed_millis(created).saturating_sub(open_at)))
+    }
+}
+
+/// Milliseconds since `created`, clamped below the [`AnalyzeClock::CLOSED`]
+/// sentinel.
+fn elapsed_millis(created: Instant) -> u64 {
+    u64::try_from(created.elapsed().as_millis()).unwrap_or(AnalyzeClock::CLOSED - 1)
+}
+
 /// One live plugin: child process, session, isolation monitor, counters.
 ///
 /// Created by [`PluginRuntime::spawn`]; `&mut self` methods make the handle
@@ -340,6 +399,7 @@ pub struct PluginRuntime {
     child: Arc<Mutex<Option<Child>>>,
     events: mpsc::Receiver<ProtocolEvent>,
     pending: Arc<PendingDiagnostics>,
+    analyze_clock: Arc<AnalyzeClock>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
@@ -349,6 +409,7 @@ pub struct PluginRuntime {
     negotiated: Option<CapabilitySet>,
 
     // Across generations.
+    created: Instant,
     stats: Arc<PluginStats>,
     restarts_used: u32,
 }
@@ -386,6 +447,7 @@ impl PluginRuntime {
             child: Arc::new(Mutex::new(None)),
             events,
             pending: Arc::new(PendingDiagnostics::default()),
+            analyze_clock: Arc::new(AnalyzeClock::new()),
             running: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             death: Arc::new(Mutex::new(None)),
@@ -394,6 +456,7 @@ impl PluginRuntime {
             monitor: None,
             negotiated: None,
             stats: Arc::new(PluginStats::default()),
+            created: Instant::now(),
             restarts_used: 0,
         };
         runtime.launch_with_budget()?;
@@ -411,7 +474,10 @@ impl PluginRuntime {
     /// the cycle (PRD §14.2). An empty slice sends nothing.
     ///
     /// A child that died since the last call is restarted here (within
-    /// budget) before the push.
+    /// budget) before the push. The push opens the §14.3 analyze clock: the
+    /// child must produce diagnostics (or die) within the manifest's
+    /// `callback_ms`, or the monitor kills it through the ordinary crash
+    /// path.
     ///
     /// # Errors
     ///
@@ -426,7 +492,13 @@ impl PluginRuntime {
         }
         self.ensure_alive()?;
         let frame = engine_diagnostics_frame(&wire_diagnostics(diagnostics, files));
-        self.write_frame(&frame)
+        self.write_frame(&frame)?;
+        // §14.3 CPU row, analyze path: the demand's clock opens with the
+        // batch on the wire and closes when the child produces diagnostics
+        // (reader) or the generation dies — the monitor kills a demand still
+        // open past the callback budget.
+        self.analyze_clock.open(self.created);
+        Ok(())
     }
 
     /// Drains the diagnostics the plugin emitted since the last call
@@ -533,7 +605,11 @@ impl PluginRuntime {
                 }
                 Ok(reply)
             }
-            Ok(ProtocolEvent::Dead(reason)) => Err(RuntimeError::Crashed { reason }),
+            // The death slot is authoritative (the reader records the cause
+            // before sending the event; killers record before killing), so
+            // build the error from it — which also adds the uniform
+            // restart-budget suffix at the accounting point.
+            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
             Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
                 reason: "plugin re-handshaked mid-session".to_owned(),
             }),
@@ -595,7 +671,8 @@ impl PluginRuntime {
                 .saturating_duration_since(Instant::now()),
         ) {
             Ok(ProtocolEvent::ShutdownComplete) => Ok(()),
-            Ok(ProtocolEvent::Dead(reason)) => Err(RuntimeError::Crashed { reason }),
+            // Authoritative death slot, as in `request_fixes` (see there).
+            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
             Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
                 reason: "plugin re-handshaked mid-session".to_owned(),
             }),
@@ -692,6 +769,7 @@ impl PluginRuntime {
         let (events_tx, events_rx) = mpsc::channel();
         self.events = events_rx;
         self.pending = Arc::new(PendingDiagnostics::default());
+        self.analyze_clock = Arc::new(AnalyzeClock::new());
         self.running = Arc::new(AtomicBool::new(true));
         self.alive = Arc::new(AtomicBool::new(true));
         self.death = Arc::new(Mutex::new(None));
@@ -707,6 +785,7 @@ impl PluginRuntime {
             Arc::clone(&self.session),
             Arc::clone(&self.pending),
             events_tx,
+            Arc::clone(&self.analyze_clock),
             Arc::clone(&self.alive),
             Arc::clone(&self.death),
             Arc::clone(&self.stats),
@@ -715,6 +794,9 @@ impl PluginRuntime {
         self.monitor = Some(spawn_monitor(
             pid,
             self.memory_cap_bytes,
+            self.callback_timeout,
+            self.created,
+            Arc::clone(&self.analyze_clock),
             Arc::clone(&self.child),
             Arc::clone(&self.running),
             Arc::clone(&self.alive),
@@ -737,7 +819,8 @@ impl PluginRuntime {
                 self.negotiated = Some(caps);
                 Ok(())
             }
-            Ok(ProtocolEvent::Dead(reason)) => Err(RuntimeError::Crashed { reason }),
+            // Authoritative death slot, as in `request_fixes` (see there).
+            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
             Ok(ProtocolEvent::ShutdownComplete) => Err(RuntimeError::Crashed {
                 reason: "plugin answered shutdown before initialize".to_owned(),
             }),
@@ -795,6 +878,9 @@ impl PluginRuntime {
     /// killer knows the death deterministically, the reader's EOF only later
     /// — and a write into the dead child's pipe must never be attempted.
     fn kill_child(&mut self) {
+        // The demand ends with the generation: a killed child can no longer
+        // produce diagnostics, and a stale-open clock must not outlive it.
+        self.analyze_clock.close();
         self.alive.store(false, Ordering::Relaxed);
         let child = self.child.lock().expect("child lock").take();
         if let Some(mut child) = child {
@@ -884,6 +970,7 @@ fn spawn_reader(
     session: Arc<Mutex<Session>>,
     pending: Arc<PendingDiagnostics>,
     events: Sender<ProtocolEvent>,
+    clock: Arc<AnalyzeClock>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
     stats: Arc<PluginStats>,
@@ -891,11 +978,28 @@ fn spawn_reader(
     std::thread::Builder::new()
         .name("dartq-plugin-reader".to_owned())
         .spawn(move || {
-            let outcome = run_reader(BufReader::new(stdout), &session, &pending, &events, &stats);
+            let outcome = run_reader(
+                BufReader::new(stdout),
+                &session,
+                &pending,
+                &events,
+                &stats,
+                &clock,
+            );
             alive.store(false, Ordering::Relaxed);
             if let Err(reason) = outcome {
-                *death.lock().expect("death lock") = Some(reason.clone());
-                let _ = events.send(ProtocolEvent::Dead(reason));
+                // First-writer-wins on the death slot: every deterministic
+                // killer (monitor budget arms, request/write deadlines)
+                // records the cause BEFORE flipping `alive`/killing, so this
+                // EOF is only the downstream observation of that kill and
+                // must not clobber the authoritative record. A genuine
+                // plugin-initiated close still lands — no prior writer.
+                let mut slot = death.lock().expect("death lock");
+                if slot.is_none() {
+                    *slot = Some(reason);
+                }
+                drop(slot);
+                let _ = events.send(ProtocolEvent::Dead);
             }
         })
         .expect("spawn reader thread")
@@ -913,6 +1017,7 @@ fn run_reader(
     pending: &PendingDiagnostics,
     events: &Sender<ProtocolEvent>,
     stats: &PluginStats,
+    clock: &AnalyzeClock,
 ) -> Result<(), String> {
     let mut decoder = FrameDecoder::default();
     loop {
@@ -956,6 +1061,9 @@ fn run_reader(
                     let _ = events.send(ProtocolEvent::Initialized(caps));
                 }
                 Ok(Incoming::Diagnostic(diagnostic)) => {
+                    // §14.3 CPU row: produced diagnostics close the analyze
+                    // demand's clock.
+                    clock.close();
                     pending.push(diagnostic)?;
                 }
                 Ok(Incoming::ShutdownComplete) => {
@@ -1011,6 +1119,9 @@ fn spawn_writer(
 fn spawn_monitor(
     pid: u32,
     memory_cap_bytes: u64,
+    callback_timeout: Duration,
+    created: Instant,
+    clock: Arc<AnalyzeClock>,
     child: Arc<Mutex<Option<Child>>>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
@@ -1021,6 +1132,31 @@ fn spawn_monitor(
         .name("dartq-plugin-monitor".to_owned())
         .spawn(move || {
             while running.load(Ordering::Relaxed) {
+                // §14.3 CPU row, analyze path: a fed demand that has produced
+                // no diagnostics for longer than the callback budget is the
+                // same isolation breach as the memory row. Checked before the
+                // RSS sample because unsampled targets report no RSS at all —
+                // the budget must hold everywhere. Record the cause so the
+                // crash diagnostic names the timeout, flip `alive` so the
+                // next interaction restarts instead of writing into the
+                // dying pipe, kill, and close the clock (the demand ends
+                // with the generation).
+                if let Some(open_for) = clock.open_for(created) {
+                    if open_for > callback_timeout {
+                        *death.lock().expect("death lock") = Some(format!(
+                            "no diagnostics were produced within the {} ms \
+                             analyze callback budget",
+                            callback_timeout.as_millis()
+                        ));
+                        alive.store(false, Ordering::Relaxed);
+                        if let Some(mut child) = child.lock().expect("child lock").take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        clock.close();
+                        break;
+                    }
+                }
                 match sample_rss(pid) {
                     // A zero sample (process gone) never raises the peak.
                     Some(rss) if rss > 0 => {
@@ -1205,6 +1341,55 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn analyze_clock_opens_once_and_closes() {
+        let clock = AnalyzeClock::new();
+        assert_eq!(
+            clock.open_for(Instant::now()),
+            None,
+            "closed at birth: nothing was fed"
+        );
+
+        // A runtime "created" 500 ms ago; feeding opens the demand against
+        // that reference instant. Storage is whole milliseconds
+        // (ms-truncated at open and at read), so the first read may
+        // legitimately be 0 — this pin tests the storage contract, not ns
+        // precision. Every open-state read passes the SAME reference the
+        // monitor holds (`created`): a fresh `Instant::now()` would measure
+        // elapsed ≈ 0 against the stored open-at and read 0 forever.
+        let created = Instant::now() - Duration::from_millis(500);
+        clock.open(created);
+        let first = clock.open_for(created).expect("open after the feed");
+
+        // The age advances on the ms grid as the runtime ages.
+        std::thread::sleep(Duration::from_millis(2));
+        let aged = clock.open_for(created).expect("still open");
+        assert!(
+            aged >= first + Duration::from_millis(2),
+            "the age tracks the runtime clock on the ms grid: {aged:?} after {first:?}"
+        );
+
+        // A re-feed while open must not refresh the clock — a plugin that
+        // acks every batch without producing would otherwise reset the
+        // budget forever and the monitor could never fire. Read across the
+        // re-feed: a refresh would drop the age back toward 0.
+        clock.open(created);
+        let after = clock
+            .open_for(created)
+            .expect("still open after the re-feed");
+        assert!(
+            after >= aged,
+            "the first open wins: {after:?} must not be younger than {aged:?}"
+        );
+
+        clock.close();
+        assert_eq!(
+            clock.open_for(Instant::now()),
+            None,
+            "closed when diagnostics arrive or the generation dies"
+        );
+    }
+
+    #[test]
     fn crash_diagnostic_namespaces_deadline_and_death_failures() {
         let anchor = {
             let mut files = FileTable::new();
@@ -1259,6 +1444,7 @@ mod tests {
             &pending,
             &events,
             &stats,
+            &AnalyzeClock::new(),
         );
 
         // The session was alive at EOF (never Terminated): the exact death
@@ -1305,6 +1491,7 @@ mod tests {
             &pending,
             &events,
             &stats,
+            &AnalyzeClock::new(),
         );
 
         let reason = outcome.expect_err("overflow must be a protocol violation");
