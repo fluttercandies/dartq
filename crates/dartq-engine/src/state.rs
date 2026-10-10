@@ -207,6 +207,10 @@ pub(crate) struct LibraryResult {
     /// The [`LibraryInfo::part_targets`] snapshot this result was computed
     /// from; `close` compares it against the rebuilt identity.
     pub part_targets: Box<[FileId]>,
+    /// The library's diagnostics in canonical order (path bytes, offset,
+    /// code name, message, length, correction — `pipeline::
+    /// compare_canonical`): sorted once per recompute at store time, so the
+    /// analyze-time merge interleaves the runs without re-sorting the cache.
     pub diagnostics: Vec<Diagnostic>,
 }
 

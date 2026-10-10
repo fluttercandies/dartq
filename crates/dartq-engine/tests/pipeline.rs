@@ -415,3 +415,101 @@ fn capture_face_shares_the_override_settlement() {
     assert_eq!(answer.decls[0].file, main);
     assert_eq!(answer.decls[0].name, "standalone");
 }
+
+/// The multi-library merge pin (#234): three libraries registered in an
+/// order that differs from canonical path order, two diagnostics per
+/// library — the merged output must interleave the per-library runs into
+/// canonical (path, offset) order, byte-matching the retired
+/// concatenate-per-id-then-stable-sort. A regression to per-library
+/// concatenation (or any reordering) fails either the interleave
+/// precondition or the independent legacy-key sort below.
+#[test]
+fn merged_diagnostics_interleave_across_libraries() {
+    const SOURCE: &str = "void main() {\n  nope1();\n  nope2();\n}\n";
+    let fixture = Fixture::new(&[
+        ("lib/m.dart", SOURCE),
+        ("lib/z.dart", SOURCE),
+        ("lib/a.dart", SOURCE),
+    ]);
+    let mut engine = fixture.engine();
+    // Registration order m, z, a: the library ids must not follow path
+    // order, so the merge has real interleaving to do.
+    for relative in ["lib/m.dart", "lib/z.dart", "lib/a.dart"] {
+        engine.set_content(&fixture.path(relative), SOURCE.as_bytes());
+    }
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("analyze");
+    assert_eq!(
+        diagnostics.len(),
+        6,
+        "two undefined calls per library, got {diagnostics:?}"
+    );
+
+    // The fixture discriminates: concatenating the diagnostics grouped by
+    // library id (stable, so each library's offsets stay in order) differs
+    // from the merged order.
+    let library_of = |diagnostic: &dartq_diagnostics::Diagnostic| {
+        engine
+            .library_of(diagnostic.file)
+            .expect("owned file")
+            .index()
+    };
+    let concatenated: Vec<(u32, u32)> = {
+        let mut keyed: Vec<(u32, u32)> = diagnostics
+            .iter()
+            .map(|diagnostic| (library_of(diagnostic), diagnostic.range.offset))
+            .collect();
+        keyed.sort_by_key(|&(library, _)| library);
+        keyed
+    };
+    let merged: Vec<(u32, u32)> = diagnostics
+        .iter()
+        .map(|diagnostic| (library_of(diagnostic), diagnostic.range.offset))
+        .collect();
+    assert_ne!(
+        concatenated, merged,
+        "fixture degenerated: library ids follow path order, the pin no longer exercises interleaving"
+    );
+
+    // Canonical order, byte-matched against the retired owned-key sort.
+    let mut expected = diagnostics.clone();
+    expected.sort_by_cached_key(|diagnostic| {
+        (
+            engine
+                .file_table()
+                .path(diagnostic.file)
+                .expect("diagnosed file resident")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            diagnostic.range.offset,
+            diagnostic.code.name,
+            diagnostic.message.clone(),
+            diagnostic.range.length,
+            diagnostic.correction.clone(),
+        )
+    });
+    assert_eq!(expected, diagnostics, "merge must match the canonical sort");
+
+    // And the primary key is non-decreasing end to end.
+    let keys: Vec<(Vec<u8>, u32)> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                engine
+                    .file_table()
+                    .path(diagnostic.file)
+                    .expect("diagnosed file resident")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+                diagnostic.range.offset,
+            )
+        })
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "merged output must be canonically ordered");
+}

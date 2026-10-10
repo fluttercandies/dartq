@@ -1,11 +1,12 @@
 //! `analyze`: apply → resolution-graph build → topological recompute of the
-//! dirty libraries (batch fan-out) → merged, canonically sorted diagnostics
-//! (incremental-l1-spec §3.2 step 6, engine-api-spec §1.3).
+//! dirty libraries (batch fan-out) → k-way merge of the per-library
+//! canonically-sorted diagnostic runs (incremental-l1-spec §3.2 step 6,
+//! engine-api-spec §1.3).
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::Diagnostic;
@@ -14,7 +15,7 @@ use dartq_resolution::{
     ResolutionCode, ResolvedTarget,
 };
 use dartq_semantic::MicroKind;
-use dartq_source::FileId;
+use dartq_source::{FileId, FileTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -78,7 +79,7 @@ pub(crate) fn analyze(
         .par_iter()
         .map(|library| {
             if cancel.check().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
+                cancelled.store(true, AtomicOrdering::Relaxed);
                 return None;
             }
             let start = Instant::now();
@@ -93,12 +94,16 @@ pub(crate) fn analyze(
         })
         .collect();
 
-    // Store completed results and emit their events in work order.
+    // Store completed results and emit their events in work order. The run
+    // enters the cache in canonical order — sorted once per recompute — and
+    // moves in without a clone; every later analyze merges the stored runs
+    // as-is (see `merge_canonical`).
     let mut completed: FxHashSet<LibraryId> = FxHashSet::default();
-    for (library, slot) in order.iter().zip(&computed) {
-        let Some((duration, diagnostics)) = slot else {
+    for (library, slot) in order.iter().zip(computed) {
+        let Some((duration, mut diagnostics)) = slot else {
             continue;
         };
+        diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
         let info = state.libraries.info(*library).expect("live library");
         state.results.insert(
             *library,
@@ -106,18 +111,18 @@ pub(crate) fn analyze(
                 content: info.content.clone(),
                 deps: info.deps.clone(),
                 part_targets: info.part_targets.clone(),
-                diagnostics: diagnostics.clone(),
+                diagnostics,
             },
         );
         completed.insert(*library);
         on_event(EngineEvent::LibraryAnalyzed {
             library: *library,
             from_cache: false,
-            duration: *duration,
+            duration,
         });
     }
 
-    if cancelled.load(Ordering::Relaxed) {
+    if cancelled.load(AtomicOrdering::Relaxed) {
         // Cancelled run: completed libraries keep their results (complete
         // units per §3.1), the rest stay dirty for the next analyze.
         state.invalidated = dirty
@@ -144,14 +149,20 @@ pub(crate) fn analyze(
         });
     }
 
-    // Merge: every live library's (fresh or cached) set, canonically sorted.
-    let mut out = Vec::new();
-    for library in state.libraries.live() {
-        if let Some(result) = state.results.get(&library) {
-            out.extend(result.diagnostics.iter().cloned());
-        }
-    }
-    canonical_sort(state, &mut out);
+    // Merge: every live library's (fresh or cached) run, each already in
+    // canonical order — the k-way merge interleaves with borrowed
+    // comparisons only: no per-diagnostic key materialization, no re-sort of
+    // the cached sets. A zero-dirty analyze allocates just the output.
+    let runs: Vec<&[Diagnostic]> = state
+        .libraries
+        .live()
+        .filter_map(|library| state.results.get(&library))
+        .map(|result| result.diagnostics.as_slice())
+        .collect();
+    let mut out = Vec::with_capacity(runs.iter().map(|run| run.len()).sum::<usize>());
+    merge_canonical(&state.files, &runs, |diagnostic| {
+        out.push(diagnostic.clone());
+    });
     Ok(out)
 }
 
@@ -443,33 +454,116 @@ fn topo_order(state: &EngineState, dirty: &[LibraryId]) -> Vec<LibraryId> {
     order
 }
 
-/// The canonical diagnostic order (engine-api-spec §1.3): file path byte
-/// order, offset, code name — with message, length, and correction as
-/// deterministic tiebreakers so incremental and full arms byte-match. The key
-/// is owned (`sort_by_cached_key` keys cannot borrow the sorted items) and is
-/// computed once per element.
-pub(crate) fn canonical_sort(state: &EngineState, diagnostics: &mut [Diagnostic]) {
-    diagnostics.sort_by_cached_key(|diagnostic| diagnostic_key(state, diagnostic));
+/// The canonical diagnostic order (engine-api-spec §1.3) as a borrowed
+/// comparison: file path byte order, offset, code name — message, length,
+/// and correction as deterministic tiebreakers, in the exact field order of
+/// the retired owned-key sort. Everything compares in place (path bytes from
+/// the file table, texts from the diagnostics), so neither the store-time
+/// run sort nor the analyze-time merge materializes a key.
+fn compare_canonical(files: &FileTable, a: &Diagnostic, b: &Diagnostic) -> Ordering {
+    let path = |diagnostic: &Diagnostic| {
+        files
+            .path(diagnostic.file)
+            .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+    };
+    path(a)
+        .cmp(path(b))
+        .then_with(|| a.range.offset.cmp(&b.range.offset))
+        .then_with(|| a.code.name.cmp(b.code.name))
+        .then_with(|| a.message.cmp(&b.message))
+        .then_with(|| a.range.length.cmp(&b.range.length))
+        .then_with(|| a.correction.cmp(&b.correction))
 }
 
-fn diagnostic_key(
-    state: &EngineState,
-    diagnostic: &Diagnostic,
-) -> (Vec<u8>, u32, &'static str, String, u32, Option<String>) {
-    let path = state
-        .files
-        .path(diagnostic.file)
-        .map_or_else(Vec::new, |path| {
-            path.as_os_str().as_encoded_bytes().to_vec()
-        });
-    (
-        path,
-        diagnostic.range.offset,
-        diagnostic.code.name,
-        diagnostic.message.clone(),
-        diagnostic.range.length,
-        diagnostic.correction.clone(),
-    )
+/// Cross-library merge of the per-library diagnostic runs, each stored in
+/// canonical order ([`LibraryResult::diagnostics`]): a binary min-heap over
+/// run heads pops the global minimum per output slot — O(D log L) borrowed
+/// comparisons and O(L) heap space, with no per-diagnostic key allocation
+/// and no re-sort of the cached sets. Ties resolve by run ordinal then
+/// position — the ascending-library-id order the retired
+/// concatenate-then-stable-sort preserved — so the output is byte-identical
+/// to that sort.
+fn merge_canonical<'a>(
+    files: &FileTable,
+    runs: &[&'a [Diagnostic]],
+    mut emit: impl FnMut(&'a Diagnostic),
+) {
+    /// Min-heap sift-down over `(run, position)` entries under `less`.
+    fn sift_down(
+        heap: &mut [(usize, usize)],
+        mut root: usize,
+        less: &impl Fn(&(usize, usize), &(usize, usize)) -> bool,
+    ) {
+        loop {
+            let left = 2 * root + 1;
+            let right = left + 1;
+            let mut best = root;
+            if left < heap.len() && less(&heap[left], &heap[best]) {
+                best = left;
+            }
+            if right < heap.len() && less(&heap[right], &heap[best]) {
+                best = right;
+            }
+            if best == root {
+                return;
+            }
+            heap.swap(root, best);
+            root = best;
+        }
+    }
+
+    /// Min-heap sift-up over `(run, position)` entries under `less`.
+    fn sift_up(
+        heap: &mut [(usize, usize)],
+        mut child: usize,
+        less: &impl Fn(&(usize, usize), &(usize, usize)) -> bool,
+    ) {
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if !less(&heap[child], &heap[parent]) {
+                return;
+            }
+            heap.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    let less = |a: &(usize, usize), b: &(usize, usize)| match compare_canonical(
+        files,
+        &runs[a.0][a.1],
+        &runs[b.0][b.1],
+    ) {
+        Ordering::Less => true,
+        Ordering::Equal => a < b,
+        Ordering::Greater => false,
+    };
+
+    let mut heap: Vec<(usize, usize)> = Vec::new();
+    for (run, source) in runs.iter().enumerate() {
+        if source.is_empty() {
+            continue;
+        }
+        heap.push((run, 0));
+        let index = heap.len() - 1;
+        sift_up(&mut heap, index, &less);
+    }
+
+    while let Some(&(run, position)) = heap.first() {
+        emit(&runs[run][position]);
+        // Vacate the root with the heap's tail, then re-enter the run's
+        // successor — if the run continues — from the top.
+        let last = heap.pop().expect("heap non-empty");
+        if let Some(slot) = heap.first_mut() {
+            *slot = last;
+            sift_down(&mut heap, 0, &less);
+        }
+        let next = position + 1;
+        if next < runs[run].len() {
+            heap.push((run, next));
+            let index = heap.len() - 1;
+            sift_up(&mut heap, index, &less);
+        }
+    }
 }
 
 /// Library-level import dependency graph in CSR form: `offsets[i]..offsets[i+1]`
@@ -526,4 +620,123 @@ fn csr_from_rows(rows: &[Vec<u32>]) -> CsrGraph {
         offsets.push(edges.len() as u32);
     }
     CsrGraph { offsets, edges }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
+    use dartq_source::{FileTable, SourceRange};
+
+    use super::*;
+
+    fn diagnostic(files: &mut FileTable, path: &str, offset: u32, message: &str) -> Diagnostic {
+        let file = files.intern(Path::new(path));
+        Diagnostic::new(
+            Severity::Error,
+            CodeInfo::new(
+                "undefined_function",
+                "UNDEFINED_FUNCTION",
+                DiagnosticType::CompileTimeError,
+                false,
+            ),
+            message,
+            file,
+            SourceRange { offset, length: 4 },
+            None,
+        )
+    }
+
+    /// A stored run: diagnostics of one library, canonically sorted — the
+    /// shape `LibraryResult::diagnostics` has since #234.
+    fn run(files: &mut FileTable, entries: &[(&str, u32, &str)]) -> Vec<Diagnostic> {
+        let mut run: Vec<Diagnostic> = entries
+            .iter()
+            .map(|&(path, offset, message)| diagnostic(files, path, offset, message))
+            .collect();
+        run.sort_by(|a, b| compare_canonical(files, a, b));
+        run
+    }
+
+    /// The retired owned-key full sort: the byte-parity oracle for
+    /// `merge_canonical` (the #234 pre-merge shape — concatenate the runs in
+    /// library-id order, then `sort_by_cached_key` the owned key).
+    fn legacy_sorted(files: &FileTable, mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+        diagnostics.sort_by_cached_key(|diagnostic| {
+            (
+                files.path(diagnostic.file).map_or_else(Vec::new, |path| {
+                    path.as_os_str().as_encoded_bytes().to_vec()
+                }),
+                diagnostic.range.offset,
+                diagnostic.code.name,
+                diagnostic.message.clone(),
+                diagnostic.range.length,
+                diagnostic.correction.clone(),
+            )
+        });
+        diagnostics
+    }
+
+    fn merged(files: &FileTable, runs: &[&[Diagnostic]]) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        merge_canonical(files, runs, |diagnostic| out.push(diagnostic.clone()));
+        out
+    }
+
+    /// The merge must reproduce the retired full sort byte for byte: paths
+    /// weaving across three runs, tiebreakers below the offset level, an
+    /// exact cross-run duplicate (equal keys pop in run order), and an empty
+    /// run in the mix.
+    #[test]
+    fn merge_matches_the_owned_key_full_sort() {
+        let mut files = FileTable::new();
+        let library_a = run(
+            &mut files,
+            &[
+                ("/w/z.dart", 40, "z one"),
+                ("/w/a.dart", 10, "a one"),
+                ("/w/a.dart", 10, "a tie a"), // same path+offset: message decides
+            ],
+        );
+        let library_b = run(
+            &mut files,
+            &[
+                ("/w/m.dart", 20, "m one"),
+                ("/w/m.dart", 30, "m two"),
+                ("/w/a.dart", 10, "a tie a"), // exact duplicate of library_a's tie
+            ],
+        );
+        let library_c = run(
+            &mut files,
+            &[
+                ("/w/b.dart", 5, "b one"),
+                ("/w/m.dart", 20, "m one"),   // cross-run duplicate
+                ("/w/a.dart", 10, "a tie b"), // length decides below the message
+            ],
+        );
+        let stored = [
+            library_a.as_slice(),
+            library_b.as_slice(),
+            &[][..],
+            library_c.as_slice(),
+        ];
+
+        let concatenated: Vec<Diagnostic> = stored
+            .iter()
+            .flat_map(|library| library.iter().cloned())
+            .collect();
+        let expected = legacy_sorted(&files, concatenated);
+        let actual = merged(&files, &stored);
+        assert_eq!(expected, actual);
+    }
+
+    /// No runs, or only empty runs: the merge emits nothing.
+    #[test]
+    fn merge_of_empty_runs_emits_nothing() {
+        let files = FileTable::new();
+        assert_eq!(merged(&files, &[]), Vec::new());
+        let empty: [&[Diagnostic]; 3] = [&[], &[], &[]];
+        assert_eq!(merged(&files, &empty), Vec::new());
+    }
 }
