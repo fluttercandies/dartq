@@ -20,4 +20,5 @@ mod patterns;
 mod recovery;
 mod statements;
 mod termination;
+mod type_compute;
 mod types;

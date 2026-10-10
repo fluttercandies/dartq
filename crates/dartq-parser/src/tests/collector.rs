@@ -119,6 +119,12 @@ impl ParserListener for Collector {
     fn handle_send(&mut self, _: TokenSpan, _: TokenSpan) {
         self.log.push(("handle", "send"));
     }
+    fn handle_send_without_arguments(&mut self, _: Token, _: Token, _: Token) {
+        // Official argument-less send (`handleSendWithoutArguments`,
+        // listener.dart:1368): a bare-identifier constant-pattern operand
+        // fires this variant, not `handle_send`.
+        self.log.push(("handle", "send_without_arguments"));
+    }
     fn handle_type_argument_application(&mut self, _: TokenSpan) {
         self.log.push(("handle", "type_argument_application"));
     }
