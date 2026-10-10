@@ -1,19 +1,31 @@
 //! Alignment of the published schemas with what the real producers emit:
-//! a genuine `dartq-ai` impact report must pass validation, and single-field
-//! mutations must fail with the violation named. The diagnostics payloads
-//! mirror the envelope `dartq-diagnostics` actually writes (`{"version":1,…}`).
+//! genuine `dartq-ai` impact and compatibility reports must pass validation,
+//! and single-field mutations must fail with the violation named. The
+//! diagnostics payloads mirror the envelope `dartq-diagnostics` actually
+//! writes (`{"version":1,…}`). Hand-derived per-face fixtures with writer
+//! provenance live in `tests/output_faces.rs`.
 
+use dartq_ai::compatibility::{COMPAT_SCHEMA_VERSION, CompatReport};
 use dartq_ai::impact::{
     AffectedTarget, AffectedTest, ChangedSymbol, EnvironmentImpact, IMPACT_SCHEMA_VERSION,
     ImpactLevel, ImpactReport,
 };
-use dartq_schema::{Domain, SCHEMA_VERSION_DIAGNOSTICS, SCHEMA_VERSION_IMPACT, SchemaViolation};
+use dartq_schema::{
+    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_DIAGNOSTICS, SCHEMA_VERSION_IMPACT,
+    SchemaViolation,
+};
 
 /// Pin: dartq-ai owns the authoritative impact contract version; the schema
 /// crate's mirror must never drift.
 #[test]
 fn impact_version_constant_matches_dartq_ai() {
     assert_eq!(SCHEMA_VERSION_IMPACT, IMPACT_SCHEMA_VERSION);
+}
+
+/// Pin: dartq-ai owns the authoritative compatibility contract version.
+#[test]
+fn compat_version_constant_matches_dartq_ai() {
+    assert_eq!(SCHEMA_VERSION_COMPAT, COMPAT_SCHEMA_VERSION);
 }
 
 fn fixture_report() -> ImpactReport {
@@ -60,6 +72,29 @@ fn empty_impact_report_passes_validation() {
     };
     let payload = serde_json::to_string(&report).expect("serialize");
     validate_ok(&payload, Domain::Impact);
+}
+
+/// The §15.8 session fields ride the impact envelope absent-tolerant: a
+/// daemon answer carrying the symbol table and a delta cursor validates.
+#[test]
+fn impact_report_with_session_fields_passes_validation() {
+    let mut value = serde_json::to_value(fixture_report()).expect("value");
+    let object = value.as_object_mut().expect("object");
+    object.insert(
+        "symbols".to_owned(),
+        serde_json::json!({"s1": "a.dart|fb", "s2": "package:foo/a.dart|fb.fma"}),
+    );
+    object.insert("since".to_owned(), serde_json::json!(1_700_000_000));
+    validate_ok(&value.to_string(), Domain::Impact);
+}
+
+#[test]
+fn impact_symbol_table_value_without_path_form_is_named() {
+    let mut value = serde_json::to_value(fixture_report()).expect("value");
+    value["symbols"] = serde_json::json!({"s1": "fb"});
+    let violation = violation_of(&value.to_string(), Domain::Impact);
+    assert_eq!(violation.path, "symbols.s1");
+    assert_eq!(violation.expected, "a `label|name` path reference");
 }
 
 #[test]
@@ -120,6 +155,51 @@ fn non_json_payload_names_the_syntax_error() {
     assert_eq!(violation.expected, "a JSON document");
 }
 
+// ---------------------------------------------------------------------------
+// Compatibility: a genuine `dartq-ai` report end to end.
+// ---------------------------------------------------------------------------
+
+/// The three-shape matrix: clean, error-carrying, and SDK-load-failed axes —
+/// the producer's own serialization must validate as published.
+#[test]
+fn real_compat_report_passes_validation() {
+    let report = CompatReport {
+        schema_version: COMPAT_SCHEMA_VERSION,
+        file: "/w/lib/a.dart".to_owned(),
+        matrix: vec![
+            dartq_ai::compatibility::AxisCompat {
+                sdk: "3.5.0".to_owned(),
+                compatible: true,
+                first_failure: None,
+                error: None,
+            },
+            dartq_ai::compatibility::AxisCompat {
+                sdk: "3.13.1".to_owned(),
+                compatible: false,
+                first_failure: Some(dartq_ai::compatibility::Failure {
+                    code: "uri_does_not_exist".to_owned(),
+                    file: "/w/lib/a.dart".to_owned(),
+                    line: 1,
+                    col: 8,
+                    message: "Target of URI doesn't exist: dart:async".to_owned(),
+                }),
+                error: None,
+            },
+            dartq_ai::compatibility::AxisCompat {
+                sdk: "/sdk/broken".to_owned(),
+                compatible: false,
+                first_failure: None,
+                error: Some(dartq_ai::compatibility::AxisError {
+                    kind: dartq_ai::compatibility::AxisError::SDK_UNAVAILABLE.to_owned(),
+                    message: "no version file".to_owned(),
+                }),
+            },
+        ],
+    };
+    let payload = serde_json::to_string(&report).expect("serialize");
+    validate_ok(&payload, Domain::Compat);
+}
+
 fn envelope() -> serde_json::Value {
     serde_json::json!({
         "version": SCHEMA_VERSION_DIAGNOSTICS,
@@ -162,6 +242,35 @@ fn envelope_without_optional_keys_passes_validation() {
     validate_ok(&value.to_string(), Domain::Diagnostics);
 }
 
+/// The minimal tier (§15.8.1) keeps exactly `code` + `location` per row —
+/// a valid shape of the same envelope.
+#[test]
+fn minimal_diagnostic_row_passes_validation() {
+    let mut value = envelope();
+    value["diagnostics"][0] = serde_json::json!({
+        "code": "undefined_identifier",
+        "location": {
+            "file": "lib/main.dart",
+            "range": {
+                "start": {"offset": 0, "line": 1, "column": 1},
+                "end": {"offset": 8, "line": 1, "column": 9},
+            },
+        },
+    });
+    validate_ok(&value.to_string(), Domain::Diagnostics);
+}
+
+/// Red line (§15.8): a row without its location is never valid, in any
+/// tier.
+#[test]
+fn diagnostic_row_without_location_is_named() {
+    let mut value = envelope();
+    value["diagnostics"][0] = serde_json::json!({"code": "undefined_identifier"});
+    let violation = violation_of(&value.to_string(), Domain::Diagnostics);
+    assert_eq!(violation.path, "diagnostics[0].location");
+    assert_eq!(violation.found, "missing");
+}
+
 #[test]
 fn lowercase_severity_is_named() {
     let mut value = envelope();
@@ -170,18 +279,6 @@ fn lowercase_severity_is_named() {
     assert_eq!(violation.path, "diagnostics[0].severity");
     assert_eq!(violation.expected, "\"INFO\" or \"WARNING\" or \"ERROR\"");
     assert_eq!(violation.found, "\"error\"");
-}
-
-#[test]
-fn missing_problem_message_is_named() {
-    let mut value = envelope();
-    value["diagnostics"][0]
-        .as_object_mut()
-        .expect("object")
-        .remove("problemMessage");
-    let violation = violation_of(&value.to_string(), Domain::Diagnostics);
-    assert_eq!(violation.path, "diagnostics[0].problemMessage");
-    assert_eq!(violation.found, "missing");
 }
 
 #[test]
