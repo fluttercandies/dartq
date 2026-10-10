@@ -553,9 +553,11 @@ impl<'o> Interp<'o> {
                 };
                 self.stack.remove(frame_index);
                 // Exhaustiveness of switch expressions is unmounted (needs
-                // the resolver); an unmatched-hole joins nothing.
+                // the resolver); an unmatched-hole joins nothing. A
+                // recovered case-less switch has no alternatives: carry the
+                // entry state instead of joining two absent states.
                 self.current = self
-                    .join(combined, None)
+                    .join(combined.or(Some(previous.clone())), None)
                     .inherit_tested(&previous, &mut self.lists);
             }
             Ev::AssertBegin { span } => {

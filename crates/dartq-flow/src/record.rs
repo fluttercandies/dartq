@@ -59,10 +59,20 @@ impl<'t> Flow<'t> {
     /// (parser-inserted) get a unique id keyed on the token handle.
     fn name(&mut self, token: TokenSpan) -> u32 {
         let index = token.id as usize;
-        let key: Box<str> = match self.tokens.get(index) {
-            Some(_) => self.tokens.lexeme(self.source, index).into(),
-            None => format!("#{}", token.id).into(),
-        };
+        // The lookup borrows the lexeme: identifiers are the hottest flow
+        // event and a repeat occurrence (the common case) must not
+        // allocate; the owning key is built only on first sight.
+        if self.tokens.get(index).is_some() {
+            let lexeme = self.tokens.lexeme(self.source, index);
+            if let Some(&id) = self.names.get(lexeme) {
+                return id;
+            }
+            let id = self.names.len() as u32;
+            self.names.insert(lexeme.into(), id);
+            return id;
+        }
+        // Parser-inserted synthetic tokens key on the token handle.
+        let key: Box<str> = format!("#{}", token.id).into();
         if let Some(&id) = self.names.get(&key) {
             return id;
         }

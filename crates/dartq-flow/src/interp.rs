@@ -842,6 +842,13 @@ impl<'o> Interp<'o> {
     /// Ends the innermost matching loop frame: joins its exit states
     /// (official `whileStatement_end`/`forEach_end`).
     pub(crate) fn loop_exit(&mut self, collection: bool) {
+        // A collect run pushes no loop frames of its own: a loop-end event
+        // under collect must not touch the stack, or it removes a REAL
+        // frame of the enclosing replay — and the rollback (tail truncate)
+        // cannot restore a mid-stack removal.
+        if self.collecting() {
+            return;
+        }
         let Some(index) = self
             .stack
             .iter()

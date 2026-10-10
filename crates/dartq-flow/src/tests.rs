@@ -517,3 +517,69 @@ fn c_style_collection_for_closes_its_loop_frame() {
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
 }
+
+/// A closure's effect collect inside an enclosing loop replays the inner
+/// loop's end event: that collect-mode `loop_exit` must not pop the
+/// enclosing replay's REAL loop frame (the rollback truncates only the
+/// tail, so a mid-stack removal loses the outer loop's exit model — its
+/// cond-false path — for good, and code after the loop is misreported
+/// dead). Shape: `while (a) { () { while (b) {} }(); return; } 1;` — the
+/// body ends unreachable, so only the loop exit's cond-false join keeps
+/// the trailing statement alive.
+#[test]
+fn closure_collect_keeps_enclosing_loop_frame() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::WhileBegin { span: span(1) },
+        Ev::WhileBodyBegin,
+        Ev::ExecBegin { is_closure: true },
+        Ev::WhileBegin { span: span(2) },
+        Ev::WhileBodyBegin,
+        Ev::WhileEnd,
+        Ev::ExecEnd,
+        Ev::ReturnBegin { span: span(3) },
+        Ev::ReturnEnd { has_expression: false },
+        Ev::WhileEnd,
+        Ev::ExprStmt { span: span(4) },
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
+
+/// A recovered case-less switch expression (`switch (x) {}` from parser
+/// recovery) has no alternatives to join: the block end must carry the
+/// entry state instead of joining two absent states (a panic before the
+/// fallback).
+#[test]
+fn case_less_switch_expression_does_not_panic() {
+    use crate::ev::Ev;
+    use crate::interp::Interp;
+    use crate::ty::NameTypeOps;
+    use dartq_parser::TokenSpan;
+    use dartq_source::SourceRange;
+    let span = |offset: u32| TokenSpan {
+        id: offset,
+        range: SourceRange { offset, length: 1 },
+    };
+    let events = vec![
+        Ev::SwitchExprBegin { span: span(1) },
+        Ev::SwitchExprBlockBegin,
+        Ev::SwitchExprBlockEnd,
+    ];
+    let mut interp = Interp::new(&NameTypeOps);
+    interp.run(events);
+    assert!(interp.stack.is_empty());
+    assert!(interp.facts.is_empty());
+    assert!(interp.reachable());
+}
