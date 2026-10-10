@@ -1,6 +1,6 @@
 /// The host main loop: stdio transport for one plugin session.
 ///
-/// The dartiq core spawns this process per plugin (PRD section 14.2) and
+/// The dartq core spawns this process per plugin (PRD section 14.2) and
 /// speaks the wire contract of the Rust crate `dartq-plugin`. The loop
 /// enforces the 16 MiB frame bound on raw bytes before any decode, so host
 /// memory stays bounded when the core misbehaves.

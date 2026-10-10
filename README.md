@@ -69,7 +69,7 @@ dartq impact lib/models/user.dart
 # Compatibility matrix: one file analyzed under several SDK roots.
 dartq compat lib/api.dart --sdk-root ~/fvm/versions/3.5.0 \
                            --sdk-root ~/fvm/versions/3.13.0
-# Or through dartiq.yaml contexts (see below); both flags are repeatable.
+# Or through dartq.yaml contexts (see below); both flags are repeatable.
 dartq compat lib/api.dart --context beta
 
 # Fixes: --dry-run only prints the patch document; without it, edits
@@ -135,9 +135,9 @@ Content-Length: 71
 {"jsonrpc":"2.0","id":1,"method":"dartq/query","params":{"name":"Foo"}}
 ```
 
-## Workspace Config: dartiq.yaml
+## Workspace Config: dartq.yaml
 
-An optional `dartiq.yaml` at the workspace root configures the faces. It is
+An optional `dartq.yaml` at the workspace root configures the faces. It is
 all-optional — an absent file is the zero-config default — unknown keys are
 ignored, and an optional `version` key (currently `1`) guards the shape.
 Today `contexts` feeds `dartq compat`; the other sections are parsed and
@@ -300,7 +300,7 @@ these numbers.
   in `dartq-schema`'s crate docs (`crates/dartq-schema`). The diagnostics
   envelope deliberately keys its contract `version`, not `schema_version`,
   for byte parity with `dart analyze --format=json`.
-- `dartiq.yaml`'s optional `version` key is currently `1`; any other value
+- `dartq.yaml`'s optional `version` key is currently `1`; any other value
   is rejected with a usage error.
 - The on-disk snapshot format is internal to the engine — not a published
   contract.
@@ -329,7 +329,7 @@ Honest state of the current tree:
 
 ## Publication
 
-dartiq is not published to crates.io — build from source.
+dartq is not published to crates.io — build from source.
 
 ## Development Gates
 

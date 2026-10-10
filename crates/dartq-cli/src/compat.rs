@@ -5,7 +5,7 @@
 //! one package discovery, axis failure isolation) and the report assembly
 //! live in [`dartq_commands::compat`] — the one implementation the daemon's
 //! `dartq/compat` shares. This binary adds argument parsing, the axis-root
-//! resolution (explicit `--sdk-root` roots, then the `dartiq.yaml` contexts
+//! resolution (explicit `--sdk-root` roots, then the `dartq.yaml` contexts
 //! — all declared ones by default, the `--context` labels' subset when
 //! given — through [`dartq_commands::config::compat_axis_roots`], falling
 //! back to `$DART_SDK` when nothing declared any axis), the tier mapping,
@@ -43,9 +43,9 @@ pub(crate) struct CompatArgs {
     /// `$DART_SDK` (the single default axis).
     #[arg(long = "sdk-root")]
     pub(crate) sdk_roots: Vec<PathBuf>,
-    /// A dartiq.yaml context label, one matrix axis each; repeatable.
+    /// A dartq.yaml context label, one matrix axis each; repeatable.
     /// Empty selects every declared context; unknown labels are usage
-    /// errors. Needs a dartiq.yaml at the workspace root.
+    /// errors. Needs a dartq.yaml at the workspace root.
     #[arg(long = "context")]
     pub(crate) contexts: Vec<String>,
 }
@@ -111,7 +111,7 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
     exit::CLEAN
 }
 
-/// The single default axis when neither the flags nor dartiq.yaml declared
+/// The single default axis when neither the flags nor dartq.yaml declared
 /// any: `$DART_SDK`, else the usage-tier error (the pre-config behavior,
 /// byte-identical). `None` is the usage tier (the message is already
 /// printed), mirroring the other engine faces' SDK resolution.
@@ -296,13 +296,13 @@ mod tests {
     /// declared first on purpose — file order, not the sorted order.
     fn write_context_config(root: &std::path::Path) {
         fs::write(
-            root.join("dartiq.yaml"),
+            root.join("dartq.yaml"),
             "version: 1\ncontexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
         )
         .expect("config");
     }
 
-    /// The dartiq.yaml contract end to end: a config declaring two contexts
+    /// The dartq.yaml contract end to end: a config declaring two contexts
     /// is the whole axis set — no `--sdk-root`, no `--context` — and the
     /// matrix answers in file order with the frozen row shape.
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// Usage tier: an unknown label, and `--context` where no dartiq.yaml
+    /// Usage tier: an unknown label, and `--context` where no dartq.yaml
     /// declares contexts.
     #[test]
     fn context_errors_are_usage() {

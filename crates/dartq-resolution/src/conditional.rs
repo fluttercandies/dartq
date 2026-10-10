@@ -34,7 +34,7 @@
 //! non-`dart.library.` name the CFE's `getLibrarySupportValue` returns `""`,
 //! so a written `if (foo == '')` would match under `dart compile`; the
 //! analyzer's declared-variables comparison never matches an undeclared
-//! name, and dart analyze is the oracle dartiq differentiates against.
+//! name, and dart analyze is the oracle dartq differentiates against.
 
 use dartq_sdk::SdkLibraries;
 use rustc_hash::FxHashSet;

@@ -1,4 +1,4 @@
-//! Persistent snapshot substrate for dartiq's M3 cold-start path (PRD §12,
+//! Persistent snapshot substrate for dartq's M3 cold-start path (PRD §12,
 //! §17.2 L2).
 //!
 //! # The accelerator invariant

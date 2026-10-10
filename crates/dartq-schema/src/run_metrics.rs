@@ -26,8 +26,8 @@ pub fn run_metrics_schema() -> &'static Value {
 static RUN_METRICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/run-metrics.json",
-        "title": "dartiq run metrics (schema_version 1)",
+        "$id": "dartq/schema/v1/run-metrics.json",
+        "title": "dartq run metrics (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": [

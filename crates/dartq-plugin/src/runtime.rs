@@ -26,7 +26,7 @@
 //! [`PluginRuntime::stats`] is the §14.3 observability face (peak RSS, frame
 //! and byte counters, guard drops, restart count) the daemon/CLI read.
 //! [`crash_diagnostic`] converts a terminal [`RuntimeError`] into the
-//! `dartiq/`-namespace [`Diagnostic`] the output layer merges (PRD §14.3:
+//! `dartq/`-namespace [`Diagnostic`] the output layer merges (PRD §14.3:
 //! a plugin failure is one tool diagnostic, never an engine failure).
 //!
 //! # Discovery
@@ -123,7 +123,7 @@ pub enum StdioPolicy {
     /// Discard (default; an unread pipe could block the plugin).
     #[default]
     Null,
-    /// Pass through to dartiq's own stderr (tests, debugging).
+    /// Pass through to dartq's own stderr (tests, debugging).
     Inherit,
 }
 
@@ -1050,12 +1050,12 @@ fn wire_diagnostics(diagnostics: &[Diagnostic], files: &FileTable) -> Vec<Plugin
         .collect()
 }
 
-/// Converts a runtime failure into the `dartiq/`-namespace engine diagnostic
+/// Converts a runtime failure into the `dartq/`-namespace engine diagnostic
 /// the output layer merges (PRD §14.3: a plugin failure costs one tool
 /// diagnostic, never engine state). Deadline overruns map to
-/// `dartiq/plugin_timeout`, everything else — process death, wire
+/// `dartq/plugin_timeout`, everything else — process death, wire
 /// violations, restart-budget exhaustion, spawn failures — to
-/// `dartiq/plugin_crashed`, with the underlying cause in the message.
+/// `dartq/plugin_crashed`, with the underlying cause in the message.
 ///
 /// The diagnostic points at `anchor`, a `FileId` the caller chooses (plugin
 /// failures are tool-level, not file-level). Plugin *findings* stay
@@ -1164,7 +1164,7 @@ mod tests {
         let timeout =
             crash_diagnostic("slow", &RuntimeError::CallbackTimeout { ms: 5_000 }, anchor);
         assert_eq!(timeout.code, DARTQ_PLUGIN_TIMEOUT);
-        assert_eq!(timeout.code.name, "dartiq/plugin_timeout");
+        assert_eq!(timeout.code.name, "dartq/plugin_timeout");
         assert_eq!(timeout.severity, EngineSeverity::Error);
         assert_eq!(timeout.file, anchor);
         assert!(
@@ -1181,7 +1181,7 @@ mod tests {
             anchor,
         );
         assert_eq!(crashed.code, DARTQ_PLUGIN_CRASHED);
-        assert_eq!(crashed.code.name, "dartiq/plugin_crashed");
+        assert_eq!(crashed.code.name, "dartq/plugin_crashed");
         assert!(crashed.message.contains("closed the connection"));
     }
 

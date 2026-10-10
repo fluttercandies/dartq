@@ -20,7 +20,7 @@
 //!
 //! The axis verdict rule and the `first_failure` ordering live in
 //! [`dartq_ai::compatibility`]. SDK-root *resolution* (the CLI's
-//! `--sdk-root` args, the `$DART_SDK` fallback, and the `dartiq.yaml`
+//! `--sdk-root` args, the `$DART_SDK` fallback, and the `dartq.yaml`
 //! context locators via [`crate::config::compat_axis_roots`]) stays at the
 //! process edges: this core takes explicit roots.
 

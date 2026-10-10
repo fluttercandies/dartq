@@ -1,4 +1,4 @@
-/// Wire frames and the newline-delimited JSON codec of the dartiq plugin
+/// Wire frames and the newline-delimited JSON codec of the dartq plugin
 /// protocol (server side).
 ///
 /// Mirrors `src/frame.rs` of the Rust crate `dartq-plugin` — the wire schema,

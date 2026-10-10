@@ -1,4 +1,4 @@
-//! The `dartiq.yaml` workspace config (PRD §15.9) and the compat face's
+//! The `dartq.yaml` workspace config (PRD §15.9) and the compat face's
 //! axis-root resolution.
 //!
 //! The config is all-optional: an absent file is [`load`]'s `Ok(None)` and
@@ -36,16 +36,16 @@ pub enum ConfigError {
     /// the CLI's usage-tier text).
     #[error("{0}")]
     Invalid(String),
-    /// `dartiq.yaml` exists but cannot be read.
+    /// `dartq.yaml` exists but cannot be read.
     #[error("{0}")]
     Io(#[from] io::Error),
 }
 
-/// The parsed `dartiq.yaml` (PRD §15.9). Every section is optional and
+/// The parsed `dartq.yaml` (PRD §15.9). Every section is optional and
 /// unknown keys are ignored — a reader that survives forward-compatible
 /// config, matching the pub-tooling convention.
 #[derive(Debug, Clone, Default)]
-pub struct DartiqConfig {
+pub struct DartqConfig {
     /// The declared SDK contexts, in file order.
     pub contexts: Vec<ContextConfig>,
     /// The §18.2 generated-file policy.
@@ -108,7 +108,7 @@ pub struct CacheDefaults {
     pub size_limit_gib: u64,
 }
 
-/// Loads `dir/dartiq.yaml` — the workspace root's config. (§15.9's full
+/// Loads `dir/dartq.yaml` — the workspace root's config. (§15.9's full
 /// lookup order — explicit `--config`, per-pub-project roots — lands with
 /// its consumers; the root file is this round's contract.) `Ok(None)` is
 /// the absent file: every consumer keeps its zero-config behavior,
@@ -118,8 +118,8 @@ pub struct CacheDefaults {
 ///
 /// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
 /// the file exists but cannot be read.
-pub fn load(dir: &Path) -> Result<Option<DartiqConfig>, ConfigError> {
-    let text = match fs::read_to_string(dir.join("dartiq.yaml")) {
+pub fn load(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
+    let text = match fs::read_to_string(dir.join("dartq.yaml")) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -158,8 +158,8 @@ pub fn compat_axis_roots(
             return Ok(axes);
         }
         return Err(ConfigError::Invalid(format!(
-            "no dartiq.yaml in {} (--context needs a config declaring contexts)",
-            dir.join("dartiq.yaml").display()
+            "no dartq.yaml in {} (--context needs a config declaring contexts)",
+            dir.join("dartq.yaml").display()
         )));
     };
     if contexts.is_empty() {
@@ -264,14 +264,14 @@ fn push_unique(axes: &mut Vec<PathBuf>, root: PathBuf) {
     }
 }
 
-fn parse(text: &str) -> Result<DartiqConfig, ConfigError> {
+fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
     let value: serde_yaml::Value = serde_yaml::from_str(text)
-        .map_err(|error| ConfigError::Invalid(format!("invalid dartiq.yaml: {error}")))?;
+        .map_err(|error| ConfigError::Invalid(format!("invalid dartq.yaml: {error}")))?;
     let raw: RawConfig = serde_yaml::from_value(value.clone())
-        .map_err(|error| ConfigError::Invalid(format!("invalid dartiq.yaml: {error}")))?;
+        .map_err(|error| ConfigError::Invalid(format!("invalid dartq.yaml: {error}")))?;
     if raw.version.is_some_and(|version| version != 1) {
         return Err(ConfigError::Invalid(format!(
-            "unsupported dartiq.yaml version: {} (expected 1)",
+            "unsupported dartq.yaml version: {} (expected 1)",
             raw.version.expect("checked above")
         )));
     }
@@ -280,16 +280,16 @@ fn parse(text: &str) -> Result<DartiqConfig, ConfigError> {
         None | Some(serde_yaml::Value::Null) => {}
         Some(declared) => {
             let declared = declared.as_mapping().ok_or_else(|| {
-                ConfigError::Invalid("dartiq.yaml: `contexts` must be a label → context mapping".into())
+                ConfigError::Invalid("dartq.yaml: `contexts` must be a label → context mapping".into())
             })?;
             for (key, entry) in declared {
                 let Some(label) = key.as_str() else {
                     return Err(ConfigError::Invalid(
-                        "dartiq.yaml: `contexts` keys must be strings".into(),
+                        "dartq.yaml: `contexts` keys must be strings".into(),
                     ));
                 };
                 let context: RawContext = serde_yaml::from_value(entry.clone()).map_err(|error| {
-                    ConfigError::Invalid(format!("dartiq.yaml: context `{label}`: {error}"))
+                    ConfigError::Invalid(format!("dartq.yaml: context `{label}`: {error}"))
                 })?;
                 contexts.push(ContextConfig {
                     label: label.to_owned(),
@@ -300,7 +300,7 @@ fn parse(text: &str) -> Result<DartiqConfig, ConfigError> {
             }
         }
     }
-    Ok(DartiqConfig {
+    Ok(DartqConfig {
         contexts,
         generated: raw.generated,
         memory: raw.memory,
@@ -375,7 +375,7 @@ mod tests {
     }
 
     fn write_config(root: &Path, yaml: &str) {
-        fs::write(root.join("dartiq.yaml"), yaml).expect("config");
+        fs::write(root.join("dartq.yaml"), yaml).expect("config");
     }
 
     /// The config's two contexts are the whole axis set — no explicit
@@ -480,7 +480,7 @@ mod tests {
             ("contexts:\n  bad:\n    sdk: registry:foo\n", "unsupported sdk locator `registry:foo`"),
             ("contexts:\n  bad:\n    sdk: \"fvm:\"\n", "empty fvm version"),
             ("contexts: [a, b]\n", "`contexts` must be a label → context mapping"),
-            ("version: 2\n", "unsupported dartiq.yaml version: 2"),
+            ("version: 2\n", "unsupported dartq.yaml version: 2"),
         ] {
             write_config(&root, yaml);
             let error = compat_axis_roots(&root, &[], &[]).expect_err(yaml);
@@ -493,7 +493,7 @@ mod tests {
         // `--context` with no config file at all.
         let bare = fixture("noconfig");
         let error = compat_axis_roots(&bare, &[], &["x".to_owned()]).expect_err("no config");
-        assert!(error.to_string().contains("no dartiq.yaml"), "{error}");
+        assert!(error.to_string().contains("no dartq.yaml"), "{error}");
         // A malformed file is the same structured tier.
         write_config(&bare, "contexts: {a: [unclosed\n");
         assert!(matches!(

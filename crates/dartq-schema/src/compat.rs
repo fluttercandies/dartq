@@ -38,8 +38,8 @@ static COMPAT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     });
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/compat-report.json",
-        "title": "dartiq compatibility report (schema_version 1)",
+        "$id": "dartq/schema/v1/compat-report.json",
+        "title": "dartq compatibility report (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "file", "matrix"],

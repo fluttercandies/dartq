@@ -1,4 +1,4 @@
-# Unit-Test Inventory — dartiq workspace
+# Unit-Test Inventory — dartq workspace
 
 Human-auditable companion to `coverage-gate.sh`. This inventory exists BEFORE
 llvm-cov numbers land: it records which critical behaviors are already pinned

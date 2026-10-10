@@ -1,4 +1,4 @@
-/// Host-side Dart package of the dartiq plugin protocol (PRD section 14).
+/// Host-side Dart package of the dartq plugin protocol (PRD section 14).
 ///
 /// Mirrors the observable interface shape of `analysis_server_plugin`
 /// ([Plugin], [PluginRegistry]) and implements the server side of the wire

@@ -199,8 +199,8 @@ pub const DARTQ_MISSING_GENERATED_SOURCE: CodeInfo = CodeInfo::new(
 /// A plugin process died or broke the wire contract (PRD §14.3 crash and
 /// memory isolation; the restart budget's exhaustion is the terminal form).
 pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
-    "dartiq/plugin_crashed",
-    "DARTIQ/PLUGIN_CRASHED",
+    "dartq/plugin_crashed",
+    "DARTQ/PLUGIN_CRASHED",
     DiagnosticType::Tool,
     false,
 );
@@ -208,8 +208,8 @@ pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
 /// or the per-callback budget on `request/fixes`); the child is killed
 /// (PRD §14.3 CPU and IPC rows).
 pub const DARTQ_PLUGIN_TIMEOUT: CodeInfo = CodeInfo::new(
-    "dartiq/plugin_timeout",
-    "DARTIQ/PLUGIN_TIMEOUT",
+    "dartq/plugin_timeout",
+    "DARTQ/PLUGIN_TIMEOUT",
     DiagnosticType::Tool,
     false,
 );

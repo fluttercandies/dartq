@@ -27,8 +27,8 @@ pub fn impact_schema() -> &'static Value {
 static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/impact-report.json",
-        "title": "dartiq impact report (schema_version 1)",
+        "$id": "dartq/schema/v1/impact-report.json",
+        "title": "dartq impact report (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "changed", "affected", "affected_tests", "affected_environments"],

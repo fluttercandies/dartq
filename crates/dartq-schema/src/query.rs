@@ -29,8 +29,8 @@ pub fn query_schema() -> &'static Value {
 static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/query-answer.json",
-        "title": "dartiq query answer (schema_version 1)",
+        "$id": "dartq/schema/v1/query-answer.json",
+        "title": "dartq query answer (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "name", "declarations", "references"],

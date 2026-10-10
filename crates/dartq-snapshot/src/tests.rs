@@ -807,7 +807,7 @@ fn xdg_cache_home_selects_the_cache_root() {
     // SAFETY: tests run single-threaded; env access serialized by env_lock.
     unsafe { std::env::set_var("XDG_CACHE_HOME", &base.path) };
     let store = SnapshotStore::open(SnapshotConfig::default()).expect("open");
-    assert_eq!(store.root(), base.path.join("dartiq"));
+    assert_eq!(store.root(), base.path.join("dartq"));
 }
 
 #[test]
@@ -818,7 +818,7 @@ fn unset_xdg_cache_home_falls_back_to_home() {
     unsafe { std::env::remove_var("XDG_CACHE_HOME") };
     unsafe { std::env::set_var("HOME", &base.path) };
     let store = SnapshotStore::open(SnapshotConfig::default()).expect("open");
-    assert_eq!(store.root(), base.path.join(".cache").join("dartiq"));
+    assert_eq!(store.root(), base.path.join(".cache").join("dartq"));
 }
 
 #[test]
@@ -829,5 +829,5 @@ fn relative_xdg_cache_home_is_ignored() {
     unsafe { std::env::set_var("XDG_CACHE_HOME", "relative/cache") };
     unsafe { std::env::set_var("HOME", &base.path) };
     let store = SnapshotStore::open(SnapshotConfig::default()).expect("open");
-    assert_eq!(store.root(), base.path.join(".cache").join("dartiq"));
+    assert_eq!(store.root(), base.path.join(".cache").join("dartq"));
 }

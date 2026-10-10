@@ -32,7 +32,7 @@ const RECENCY_MARKER: &str = "recency";
 static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Store construction parameters. `root: None` resolves the XDG default
-/// (`$XDG_CACHE_HOME/dartiq`, falling back to `$HOME/.cache/dartiq`).
+/// (`$XDG_CACHE_HOME/dartq`, falling back to `$HOME/.cache/dartq`).
 #[derive(Clone, Debug)]
 pub struct SnapshotConfig {
     pub root: Option<PathBuf>,
@@ -347,7 +347,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
-/// `$XDG_CACHE_HOME/dartiq`, or `$HOME/.cache/dartiq` when unset, empty, or
+/// `$XDG_CACHE_HOME/dartq`, or `$HOME/.cache/dartq` when unset, empty, or
 /// relative (the XDG spec requires an absolute path).
 fn default_cache_root() -> io::Result<PathBuf> {
     let base = if let Some(dir) = std::env::var_os("XDG_CACHE_HOME")
@@ -360,7 +360,7 @@ fn default_cache_root() -> io::Result<PathBuf> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
         PathBuf::from(home).join(".cache")
     };
-    Ok(base.join("dartiq"))
+    Ok(base.join("dartq"))
 }
 
 /// Total file size and newest file timestamp under `dir`, recursively,

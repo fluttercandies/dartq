@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# repro-tuple.sh — emit the PRD §19.5 reproducibility tuple for a dartiq run.
+# repro-tuple.sh — emit the PRD §19.5 reproducibility tuple for a dartq run.
 #
 # What it captures (the environment identity face of §19.5):
 #   - git_head:            HEAD commit the working tree is based on

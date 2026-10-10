@@ -41,8 +41,8 @@ static DIAGNOSTICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     });
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/diagnostics-json.json",
-        "title": "dartiq diagnostics JSON envelope (version 1)",
+        "$id": "dartq/schema/v1/diagnostics-json.json",
+        "title": "dartq diagnostics JSON envelope (version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": ["version", "diagnostics"],

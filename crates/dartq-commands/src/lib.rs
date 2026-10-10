@@ -12,7 +12,7 @@
 //! * [`workspace`] — the workspace/SDK assembly behind every engine-backed
 //!   face ([`EngineConfig`] plus the canonical package directory).
 //! * [`check`] — the M0 scan+parse pipeline.
-//! * [`config`] — the `dartiq.yaml` workspace config (PRD §15.9) plus the
+//! * [`config`] — the `dartq.yaml` workspace config (PRD §15.9) plus the
 //!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
 //! * [`query`] — the symbol index query over the analyzed state.

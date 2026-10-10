@@ -2,7 +2,7 @@
 //! overruns the manifest's `callback_ms` kills the child and consumes one
 //! restart at the error site; repeated overruns exhaust the budget into the
 //! terminal [`RuntimeError::Crashed`], which [`crash_diagnostic`] turns into
-//! the `dartiq/plugin_crashed` diagnostic the output layer merges.
+//! the `dartq/plugin_crashed` diagnostic the output layer merges.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -53,11 +53,11 @@ fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
     );
     assert!(runtime.negotiated().is_some());
 
-    // The failure converts to the dartiq/ timeout diagnostic.
+    // The failure converts to the dartq/ timeout diagnostic.
     let mut files = FileTable::new();
     let anchor = files.intern(Path::new("lib/main.dart"));
     let diagnostic = crash_diagnostic("slow", &error, anchor);
-    assert_eq!(diagnostic.code.name, "dartiq/plugin_timeout");
+    assert_eq!(diagnostic.code.name, "dartq/plugin_timeout");
     assert!(diagnostic.message.contains("slow"));
 
     // The fresh generation answers shutdown; nothing leaks.
@@ -117,6 +117,6 @@ fn repeated_callback_overruns_exhaust_the_budget_into_a_terminal_crash() {
     let mut files = FileTable::new();
     let anchor = files.intern(Path::new("lib/main.dart"));
     let diagnostic = crash_diagnostic("staller", &terminal, anchor);
-    assert_eq!(diagnostic.code.name, "dartiq/plugin_crashed");
+    assert_eq!(diagnostic.code.name, "dartq/plugin_crashed");
     assert!(diagnostic.message.contains("staller"));
 }

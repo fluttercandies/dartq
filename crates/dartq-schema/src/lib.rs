@@ -1,4 +1,4 @@
-//! Machine-readable JSON schemas for dartiq's versioned output faces, plus
+//! Machine-readable JSON schemas for dartq's versioned output faces, plus
 //! the lightweight structural validator CI runs against real output (PRD
 //! §15.7: the diagnostics/patch/impact report schemas ship with the version,
 //! in-crate, so tooling can check outputs against their published shapes).

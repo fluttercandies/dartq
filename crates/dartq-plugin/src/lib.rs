@@ -1,4 +1,4 @@
-//! dartiq plugin protocol: the IPC contract between the Rust core and the
+//! dartq plugin protocol: the IPC contract between the Rust core and the
 //! per-plugin Dart host process (PRD §14).
 //!
 //! Plugins never enter the Rust core. Each plugin runs as its own sidecar
@@ -85,7 +85,7 @@
 //!   converts and pushes it (`notification/engine_diagnostics`, one batch
 //!   per analyze cycle) and drains plugin-emitted diagnostics back for the
 //!   caller's output merge. No engine crate changes are required.
-//! - **§14.1 extension points**: the wire layer is dartiq's own v1 (the
+//! - **§14.1 extension points**: the wire layer is dartq's own v1 (the
 //!   official `analyzer_plugin` protocol is pre-1.0 and adapted here, risk
 //!   R2); the official `registerAssist`/`registerFixForRule` API shape is
 //!   mirrored by the host package's `Plugin`/`PluginRegistry`. The rich
@@ -100,8 +100,8 @@
 //!   deadline; child death restarts within the manifest's retry budget and
 //!   never takes the engine down.
 //! - **§13.3 output face**: [`runtime::crash_diagnostic`] converts a
-//!   terminal [`runtime::RuntimeError`] into a `dartiq/plugin_crashed` /
-//!   `dartiq/plugin_timeout` [`dartq_diagnostics::Diagnostic`] for the
+//!   terminal [`runtime::RuntimeError`] into a `dartq/plugin_crashed` /
+//!   `dartq/plugin_timeout` [`dartq_diagnostics::Diagnostic`] for the
 //!   daemon's output merge; plugin *findings* stay wire-form
 //!   ([`session::PluginDiagnostic`]).
 //!
@@ -110,8 +110,8 @@
 //! The lifecycle mirrors the official plugin system's observable contract
 //! (`.third/dart-sdk/pkg/analysis_server_plugin/lib/src/plugin_server.dart`):
 //! version check first, then registration/work, then shutdown, with fixes
-//! requested per location. The method names are dartiq's own (the official
-//! wire protocol is pre-1.0 and dartiq adapts at this layer, PRD §14.1).
+//! requested per location. The method names are dartq's own (the official
+//! wire protocol is pre-1.0 and dartq adapts at this layer, PRD §14.1).
 
 pub mod capability;
 pub mod discovery;

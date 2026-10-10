@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# coverage-gate.sh — unit-test coverage gate for the dartiq workspace.
+# coverage-gate.sh — unit-test coverage gate for the dartq workspace.
 #
 # Runs `cargo llvm-cov` over every workspace test target (--tests: lib unit
 # tests + integration tests; benches are never built or run), parses the

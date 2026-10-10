@@ -1,7 +1,7 @@
 # dartq_plugin_host
 
-Host-side Dart package of the dartiq plugin protocol (PRD section 14, M4
-milestone). The dartiq core spawns one process running
+Host-side Dart package of the dartq plugin protocol (PRD section 14, M4
+milestone). The dartq core spawns one process running
 `bin/dartq_plugin_host.dart` per plugin; the process speaks the wire contract
 specified by the Rust crate `dartq-plugin` (`crates/dartq-plugin`, the single
 source of truth for the protocol) and hosts third-party plugins behind an

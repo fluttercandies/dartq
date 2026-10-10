@@ -10,11 +10,11 @@ use dartq_schema::{
     SCHEMA_VERSION_RUN_METRICS, validate,
 };
 
-/// The v1 freeze: every dartiq-native face ships at contract version 1.
+/// The v1 freeze: every dartq-native face ships at contract version 1.
 /// Bumping any of these is a major version event (crate docs, versioning
 /// discipline).
 #[test]
-fn dartiq_native_faces_are_frozen_at_v1() {
+fn dartq_native_faces_are_frozen_at_v1() {
     assert_eq!(SCHEMA_VERSION_FIX_PATCH, 1);
     assert_eq!(SCHEMA_VERSION_QUERY, 1);
     assert_eq!(SCHEMA_VERSION_COMPAT, 1);
@@ -172,7 +172,7 @@ fn fix_missing_file_is_named() {
 /// the top-level row (main.rs:967), spelled `-` on the machine face
 /// (main.rs:931); `qualified` is a plain string on every row (main.rs:982).
 /// `schema_version` is the §15.7 v1 addition (maintainer ruling: every
-/// dartiq-native face carries it); the writer at main.rs:991 does not emit
+/// dartq-native face carries it); the writer at main.rs:991 does not emit
 /// it yet — a tracked CLI-lane gap, not a schema liberty.
 #[test]
 fn compact_query_answer_passes_validation() {

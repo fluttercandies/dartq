@@ -26,8 +26,8 @@ pub fn fix_patch_schema() -> &'static Value {
 static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartiq/schema/v1/fix-patch.json",
-        "title": "dartiq fix patch document (schema_version 1)",
+        "$id": "dartq/schema/v1/fix-patch.json",
+        "title": "dartq fix patch document (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
         "required": ["file", "schema_version", "edits"],

@@ -1,4 +1,4 @@
-//! Capability vocabulary and negotiation for the dartiq plugin protocol.
+//! Capability vocabulary and negotiation for the dartq plugin protocol.
 //!
 //! The negotiated set is always the **intersection** of the core's supported
 //! capabilities and the plugin's advertised ones. Unknown capability names on
