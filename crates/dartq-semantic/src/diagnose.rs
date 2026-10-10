@@ -126,9 +126,11 @@
 //!   scope-tracked in this pass (the model does not capture them) — a body
 //!   reference to a local never reaches the library lookup.
 //! * `dynamic` is a language builtin, not an import — never `undefined_class`.
-//! * `await` as a bare read/type name inside an executable reports
-//!   `undefined_identifier_await` instead (dart-sdk main
-//!   `named_type_resolver.dart:815`, `property_element_resolver.dart:2143`).
+//! * `await` reports `undefined_identifier_await` instead of the family's
+//!   own code at both oracle sites: a bare read inside an executable
+//!   (`property_element_resolver.dart:2143`) and the unresolved simple
+//!   type name of a declaration parse (`named_type_resolver.dart:814-818`
+//!   — `await x;` in a sync body keeps the declaration parse).
 //! * `is`/`as` type operands and type arguments carry other oracle codes
 //!   (`type_test_with_undefined_name`, `cast_to_non_type`,
 //!   `non_type_as_type_argument`) — none frozen, so this pass under-reports
@@ -3309,7 +3311,18 @@ impl<'a> Engine<'a> {
             }
             TypeVerdict::Missing => {
                 if !suppressed && !self.guard.ignore(None, row.name) {
-                    self.emit(SemanticCode::UndefinedClass, row.range, name_text, "");
+                    // A declaration parse keeps `await` in the type position:
+                    // the unresolved simple name carries the await code, not
+                    // `undefined_class` (named_type_resolver.dart:814-818 —
+                    // `importPrefix == null && lexeme == 'await'` fires
+                    // `undefinedIdentifierAwait` at the NamedType and
+                    // returns before the `undefinedClass` fallthrough; the
+                    // message names `await` itself, no arguments).
+                    if row.name == self.intern("await") {
+                        self.emit(SemanticCode::UndefinedIdentifierAwait, row.range, "", "");
+                    } else {
+                        self.emit(SemanticCode::UndefinedClass, row.range, name_text, "");
+                    }
                 }
                 self.record_miss(row.name, row.range, false, NameUse::Type);
             }
@@ -7179,28 +7192,21 @@ mod tests {
         );
     }
 
-    /// `await` in a sync body is `undefined_identifier_await` (no
-    /// arguments); in an async body the parser reads `await` as a real
-    /// await-expression and nothing fires.
-    ///
-    /// Hand-trace: the parser reads `await` as a plain identifier in `f`'s
-    /// sync body; `in_executable` holds and the guard passes → the
-    /// no-argument emit; `x` still reports `undefined_identifier`. In `g`
-    /// the async modifier makes `await` an expression — no identifier event.
-    ///
-    /// RED (parser gap, #339): the statement-position await probe
-    /// (`looks_like_await_or_yield_expression`, statements.rs) returns
-    /// "declaration" for `await x;` in a sync body, so `await x` parses as
-    /// a variable declaration (type `await`, name `x`) — the engine sees a
-    /// missing type use (`undefined_class`) and no `x` read. Un-reds when
-    /// the probe stops reading `await name` as a declaration head in sync
-    /// contexts.
+    /// `await x;` in a sync body keeps the official declaration parse
+    /// (`gate_351.rs::await_statement_shapes_follow_official_dispatch`):
+    /// the engine sees `await` as an unresolved type-use row and reports
+    /// `undefined_identifier_await` at the type name's span (no arguments);
+    /// `x` is the declared variable — no `undefined_identifier`. In `g`'s
+    /// async body the parser reads `await` as a real await-expression
+    /// reading the defined `f` — nothing fires, the vector stays a single
+    /// row (named_type_resolver.dart:814-818, property_element_resolver
+    /// .dart:2143; `COMPILE_TIME_ERROR`, severity `Error`).
     #[test]
     fn await_in_sync_body_reports_await_code() {
         let report = report("void f() { await x; } void g() async { await f; }");
         assert_eq!(
             code_names(&report),
-            ["undefined_identifier_await", "undefined_identifier"],
+            ["undefined_identifier_await"],
             "{:?}",
             code_names(&report)
         );
@@ -7208,6 +7214,10 @@ mod tests {
             report.diagnostics[0].message,
             "Undefined name 'await' in function body not marked with 'async'."
         );
+        // The NamedType node's span: the `await` name token (offset 11,
+        // length 5).
+        assert_eq!(report.diagnostics[0].range.offset, 11);
+        assert_eq!(report.diagnostics[0].range.length, 5);
     }
 
     /// Defined names never report: a top-level function as a value, and a
