@@ -635,6 +635,15 @@ impl LibraryGraph {
         self.nodes.is_empty()
     }
 
+    /// Every library in the graph — described libraries and nodes registered
+    /// only as directive-edge targets alike (the latter export nothing, see
+    /// the module contracts). Creation is O(1) with no allocation, each
+    /// library is yielded exactly once, and the iteration order is
+    /// unspecified: callers must not depend on it.
+    pub fn libraries(&self) -> impl Iterator<Item = LibraryId> {
+        (0..self.nodes.len()).map(LibraryId::from_index)
+    }
+
     /// The canonical identity string of `lib`.
     #[must_use]
     pub fn uri(&self, lib: LibraryId) -> &str {
@@ -1531,5 +1540,46 @@ mod tests {
         assert!(edge.deferred);
         assert_eq!(edge.prefix, Some(prefix));
         assert!(edge.target.is_none());
+    }
+
+    // ---- library enumeration ----
+
+    /// `libraries` enumerates every interned node — declared libraries and
+    /// edge-target-only nodes alike — exactly once per walk, stable across
+    /// repeated walks, with each id answering the per-library faces.
+    #[test]
+    fn libraries_enumerate_every_node_exactly_once() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let lib_b = rig.builder.intern("package:b/b.dart");
+        let c = rig.builder.intern("package:c/c.dart"); // edge target only
+        let a_file = rig.file("a.dart");
+        rig.declare(a, "aName", a_file);
+        rig.export(a, Some(lib_b));
+        rig.builder.import(a, import_edge(Some(c)));
+        let graph = rig.builder.finish();
+
+        let sort = |walk: Vec<LibraryId>| {
+            let mut ids = walk;
+            ids.sort_by_key(|id| id.index());
+            ids
+        };
+        let first = sort(graph.libraries().collect());
+        let second = sort(graph.libraries().collect());
+        assert_eq!(first, vec![a, lib_b, c], "every node, no duplicates");
+        assert_eq!(first, second, "stable across repeated walks");
+        assert_eq!(first.len(), graph.len());
+        for lib in graph.libraries() {
+            assert!(graph.uri(lib).starts_with("package:"));
+        }
+    }
+
+    /// An empty graph yields nothing.
+    #[test]
+    fn libraries_of_empty_graph_yield_nothing() {
+        let strings = StringTable::new();
+        let graph = LibraryGraphBuilder::new(&strings).finish();
+        assert!(graph.is_empty());
+        assert_eq!(graph.libraries().count(), 0);
     }
 }
