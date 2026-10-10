@@ -708,7 +708,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseVariableInitializerOpt`.
-    fn parse_variable_initializer_opt(&mut self) {
+    pub(crate) fn parse_variable_initializer_opt(&mut self) {
         if self.peek_kind() != TokenKind::Eq {
             let next = self.peek_span();
             self.listener.handle_no_variable_initializer(next);

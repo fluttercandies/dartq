@@ -1,7 +1,9 @@
 //! Declaration grammar tests (#18): top-level declarations, class members,
 //! typedefs, enums, extensions, extension types, and their recovery paths.
 
-use super::collector::setup;
+use super::collector::{latest_features, scan_ok, setup};
+use crate::listener::{ParserListener, Token};
+use crate::parser::Parser;
 
 fn parse(source: &'static str) -> super::collector::Collector {
     let mut p = setup(source);
@@ -297,14 +299,80 @@ fn empty_unit_is_two_events() {
 fn field_initializer_parses_full_expression() {
     let c = parse("class C { int x = 1 + 2 * 3; }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    // The binary events prove the expression went through the full
-    // engine (the retired diet skip emitted no expression events).
+    // The official shape folds a field initializer into
+    // `VariablesDeclaration > InitializedIdentifier > VariableInitializer`
+    // (ast_builder.dart:1749 builds `VariableDeclaration(equals,
+    // initializer)`; no `FieldInitializer` node for fields). The binary
+    // events prove the expression went through the full engine (the
+    // retired diet skip emitted no expression events).
     c.assert_sequence(&[
-        ("begin", "field_initializer"),
+        ("begin", "variables_declaration"),
+        ("begin", "initialized_identifier"),
+        ("begin", "variable_initializer"),
         ("begin", "binary_expression"),
         ("end", "binary_expression"),
-        ("end", "field_initializer"),
+        ("end", "variable_initializer"),
+        ("end", "initialized_identifier"),
+        ("end", "variables_declaration"),
     ]);
+}
+
+/// The lint-end proof for #502: a `late` field group's `VariablesDeclaration`
+/// span head is the `late` token (collapse map §3.3 head-is-late; official
+/// `VariableDeclarationList` begins at `lateKeyword`), and the initializer
+/// rides `InitializedIdentifier > VariableInitializer` — the shape the
+/// lints bridge collapse map dispatches `unnecessary_late` on.
+#[test]
+fn late_field_variables_declaration_head_is_the_late_token() {
+    fn declaration_heads(source: &'static str) -> Vec<usize> {
+        struct Heads {
+            heads: Vec<usize>,
+        }
+        impl ParserListener for Heads {
+            fn begin_variables_declaration(
+                &mut self,
+                token: Token,
+                _: Option<Token>,
+                _: Option<Token>,
+            ) {
+                self.heads
+                    .push(usize::try_from(token.range.offset).expect("offset fits usize"));
+            }
+        }
+        let (table, text) = scan_ok(source);
+        let mut parser = Parser::new(text, table, latest_features(), Heads { heads: Vec::new() });
+        parser.parse_unit();
+        parser.listener.heads
+    }
+
+    let static_field = "class C { static late int x = 0; }\n";
+    assert_eq!(
+        declaration_heads(static_field),
+        vec![static_field.find("late").unwrap()],
+        "static late field: `late` is the VariablesDeclaration head"
+    );
+    let top_level = "late var y = 1;\n";
+    assert_eq!(
+        declaration_heads(top_level),
+        vec![0],
+        "top-level late variable: `late` is the VariablesDeclaration head"
+    );
+
+    // Parser-level diagnostic parity with the oracle probes (dart analyze,
+    // 2026-10-10): the initialized/late/const field shapes below are
+    // parser-clean; the oracle's `const_instance_field` and
+    // `final_not_initialized` on the last two are resolution-phase codes
+    // outside the parser surface.
+    for source in [
+        "class C { int x = 1 + 2 * 3; }\n",
+        "class C { late int x = 0; }\n",
+        "late var y = 1;\n",
+        "class D { const int z = 1, w = 2; }\n",
+        "class E { static late int s = 0; final int a; }\n",
+    ] {
+        let c = parse(source);
+        assert!(c.errors.is_empty(), "{source:?}: {:?}", c.errors);
+    }
 }
 
 /// Drives [`Parser::parse_initializers_opt`] directly on a `:`-led source

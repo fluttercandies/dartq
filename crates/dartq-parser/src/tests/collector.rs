@@ -561,6 +561,12 @@ impl ParserListener for Collector {
     fn end_initialized_identifier(&mut self, _: Token) {
         self.log.push(("end", "initialized_identifier"));
     }
+    fn begin_variable_initializer(&mut self, _: Token) {
+        self.log.push(("begin", "variable_initializer"));
+    }
+    fn end_variable_initializer(&mut self, _: Token) {
+        self.log.push(("end", "variable_initializer"));
+    }
     fn begin_try_statement(&mut self, _: Token) {
         self.log.push(("begin", "try_statement"));
     }

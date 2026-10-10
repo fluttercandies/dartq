@@ -1667,6 +1667,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::final_and_covariant_late_with_initializer(), c);
         }
 
+        // Official `VariableDeclarationList` head (`_endClassFields`,
+        // ast_builder.dart): `late` when present, else the var/final/const
+        // keyword, else the type start — `late` must be the span head
+        // (collapse map §3.3 head-is-late).
+        let decl_head = mods
+            .late_kw
+            .or(mods.var_final_or_const)
+            .unwrap_or_else(|| self.span_at_mark(before_type));
+        self.listener
+            .begin_variables_declaration(decl_head, mods.late_kw, mods.var_final_or_const);
         let mut field_count = 1usize;
         self.parse_field_initializer_opt(first_name, kind, &mods);
         while self.peek_kind() == TokenKind::Comma {
@@ -1676,6 +1686,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             field_count += 1;
         }
         let end = self.ensure_semicolon();
+        self.listener
+            .end_variables_declaration(field_count, Some(end));
 
         match kind {
             DeclarationKind::Extension => {
@@ -1726,18 +1738,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseFieldInitializerOpt`.
+    ///
+    /// The official `ast_builder` folds the field-initializer events into
+    /// `VariableDeclaration(equals, initializer)` (`ast_builder.dart:1749`)
+    /// — the `VariablesDeclaration > InitializedIdentifier` shape. No
+    /// `FieldInitializer` node exists for fields; that node is the
+    /// constructor `this.x = ...` initializer only (`ast_builder.dart:729`).
     fn parse_field_initializer_opt(
         &mut self,
         name: TokenSpan,
         kind: DeclarationKind,
         mods: &MemberModifiers,
     ) {
+        self.listener.begin_initialized_identifier(name);
         if self.peek_kind() == TokenKind::Eq {
-            let assignment = self.peek_span();
-            self.listener.begin_field_initializer(assignment);
-            self.cursor.advance();
-            let end = self.parse_expression();
-            self.listener.end_field_initializer(assignment, end);
+            self.parse_variable_initializer_opt();
         } else {
             if let Some(vfc) = mods.var_final_or_const {
                 let lexeme = self.cursor.lexeme(vfc.id);
@@ -1754,8 +1769,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             }
             let next = self.peek_span();
-            self.listener.handle_no_field_initializer(next);
+            self.listener.handle_no_variable_initializer(next);
         }
+        self.listener.end_initialized_identifier(name);
     }
 
     /// Official `parseMethodTypeVar` (`<...>` after a method name).
