@@ -78,6 +78,7 @@ pub mod codec;
 pub(crate) mod commands;
 pub mod jsonrpc;
 pub mod lsp;
+pub(crate) mod plugins;
 pub mod session;
 pub mod uri;
 mod watch;
