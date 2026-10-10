@@ -111,7 +111,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let _ = self.parse_expression();
                     if set_map {
                         if self.peek_kind() == TokenKind::Colon {
-                            has_set_entry.get_or_insert(false);
+                            // `hasSetEntry ??= !isMapEntry` (:8593-8598) is
+                            // touched only for a top-level simple entry
+                            // (`info == simpleEntry`); a control-flow body
+                            // rides the machine branch (:8606-8662), which
+                            // never touches it. `pending` is empty exactly
+                            // at the top level (else continuations re-enter
+                            // with `Pending::IfElse` pushed).
+                            if pending.is_empty() {
+                                has_set_entry.get_or_insert(false);
+                            }
                             let (colon, value_marker) = self.parse_map_entry_rest();
                             self.listener.handle_literal_map_entry(
                                 colon,
@@ -119,7 +128,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                                 None,
                                 value_marker,
                             );
-                        } else {
+                        } else if pending.is_empty() {
                             has_set_entry.get_or_insert(true);
                         }
                     }
@@ -727,6 +736,28 @@ mod tests {
         assert_eq!(p.listener.if_control_flow, 1);
         assert_eq!(p.listener.end_if, 1);
         assert_eq!(p.listener.set_or_map, vec![false]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn top_level_simple_entry_still_sets_has_set_entry() {
+        // The gate is per-entry (official `info == simpleEntry` :8593): a
+        // literal holding a top-level simple entry still decides. `{1, if
+        // (b) 2}` sets hasSetEntry=true before the if-element (which must
+        // not overwrite it, first-wins :8598); `{if (b) 1, 2}` leaves it
+        // unset through the gated body and decides on the trailing simple
+        // entry. Both report the set-or-map with hasSetEntry=true.
+        let mut p = literal_parser("{1, if (b) 2}");
+        let _ = p.parse_set_or_map_literal(None);
+        assert_eq!(p.listener.if_control_flow, 1);
+        assert_eq!(p.listener.end_if, 1);
+        assert_eq!(p.listener.int_literals, 2);
+        assert_eq!(p.listener.set_or_map, vec![true]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        let mut p = literal_parser("{if (b) 1, 2}");
+        let _ = p.parse_set_or_map_literal(None);
+        assert_eq!(p.listener.set_or_map, vec![true]);
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
     }
 
