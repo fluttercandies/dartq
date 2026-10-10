@@ -8,6 +8,7 @@
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,7 +43,15 @@ pub struct Workspace {
 impl Workspace {
     #[must_use]
     pub fn new(main_dart: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("dartq-daemon-test-{}", std::process::id()));
+        // A unique tree per instance: session tests run in parallel, and a
+        // shared pid-scoped path would have each setup's remove_dir_all
+        // tear down another test's files mid-read.
+        static WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-daemon-test-{}-{}",
+            std::process::id(),
+            WORKSPACE_SEQ.fetch_add(1, Relaxed),
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let write = |relative: &str, content: &str| {
             let path = root.join(relative);
@@ -220,7 +229,7 @@ pub fn spawn(workspace: &Workspace, store_root: &Path) -> Harness {
         let output = output.clone();
         thread::Builder::new()
             .name("dartq-daemon-test-server".into())
-            .spawn(move || run(std::io::BufReader::new(reader), output, session))
+            .spawn(move || run(std::io::BufReader::new(reader), output, session, None))
             .expect("server thread spawns")
     };
     Harness {

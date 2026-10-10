@@ -35,7 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analysis_options;
 use crate::event::EngineEvent;
-use crate::scheduler::{DrainReport, Scheduler, Task};
+use crate::scheduler::{DrainReport, Scheduler, Task, Tier};
 use crate::{AffectedReport, Engine, EngineConfig, EngineError};
 
 /// A small stable integer naming one open context. Opaque, process-lifetime
@@ -296,7 +296,10 @@ impl Runtime {
     }
 
     /// Enqueues one task against `id`'s queue (PRD §16.5), stamped with the
-    /// context's current epoch. Returns the stamped task.
+    /// context's current epoch. `tier` is the task's precedence within its
+    /// class (see [`Tier`]); the caller owns the mapping — the daemon wires
+    /// it where each intake path enters the scheduler. Returns the stamped
+    /// task.
     ///
     /// # Errors
     ///
@@ -305,6 +308,7 @@ impl Runtime {
         &mut self,
         id: ContextId,
         write: bool,
+        tier: Tier,
         cookie: u64,
     ) -> Result<Task, EngineError> {
         // Direct field access keeps the context borrow disjoint from the
@@ -318,6 +322,7 @@ impl Runtime {
             context: id,
             epoch: context.epoch,
             write,
+            tier,
             cookie,
         };
         self.scheduler.enqueue(task);
@@ -326,8 +331,9 @@ impl Runtime {
 
     /// The single drain point (§16.5, §16.6): pops every queued task,
     /// drops stale-epoch ones, and returns the live set in writer-priority
-    /// order — every pending write (context ascending, arrival order),
-    /// then every read (same order).
+    /// order, tier-ordered within each class — every pending write
+    /// (interactive first, then normal, background; context ascending,
+    /// arrival order within a tier), then every read (same order).
     ///
     /// # Panics
     ///

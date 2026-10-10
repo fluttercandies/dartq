@@ -64,7 +64,7 @@ pub use cancel::{CancellationToken, Cancelled};
 pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
 pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
-pub use scheduler::{DrainReport, Task};
+pub use scheduler::{DrainReport, Task, Tier};
 pub use state::{DirectiveFacts, DirectiveKind, LibraryId, ScannedFace, UnitFacts};
 
 /// Everything immutable across the engine's lifetime (§1.1): the M1 slice
