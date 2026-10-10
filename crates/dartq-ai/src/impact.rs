@@ -66,11 +66,13 @@ pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
 pub struct FileSnapshot {
     /// The content identity ([`content_hash`] over the library's bytes).
     pub content_hash: [u8; 32],
-    /// The library-face names, ascending, deduplicated.
+    /// The library-face names, ascending, deduplicated — asserted by
+    /// [`impact`] in every build (the verdicts are merge walks over it).
     pub top_level_names: Box<[StringId]>,
 }
 
 /// One changed library: the before/after surface pair the verdicts compare.
+/// Duplicate entries for one library resolve last-wins (see [`impact`]).
 #[derive(Debug, Clone)]
 pub struct LibraryChange {
     /// The changed library, in the query's id space.
@@ -176,10 +178,24 @@ pub fn api_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
 /// The per-symbol signature verdict — the #282 seam's per-name half. The v1
 /// proxy keys on the name's presence: an added or removed declaration is a
 /// signature change; a body edit under a stable name is invisible until the
-/// the `SignatureHash` gate lands.
+/// `SignatureHash` gate lands.
+///
+/// `before` and `after` must be ascending and deduplicated (the
+/// [`FileSnapshot`] contract) — `binary_search` on unsorted input answers
+/// arbitrarily instead of panicking.
 #[must_use]
 pub fn symbol_signature_changed(before: &[StringId], after: &[StringId], name: StringId) -> bool {
+    debug_assert!(
+        is_ascending(before) && is_ascending(after),
+        "name sets must be ascending and deduplicated"
+    );
     before.binary_search(&name).is_ok() != after.binary_search(&name).is_ok()
+}
+
+/// The snapshot name-set precondition the verdicts stand on: strictly
+/// ascending, which also rules out duplicates.
+fn is_ascending(names: &[StringId]) -> bool {
+    names.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// The names present in exactly one of the two sorted, deduplicated sets —
@@ -213,6 +229,9 @@ fn diff_names(before: &[StringId], after: &[StringId]) -> Vec<StringId> {
 /// `imports_of(lib)` yields the resolved import targets of `lib` (the
 /// caller's id space, `0..library_count`); `label_of(lib)` yields the
 /// library's stable path text. Both borrow caller state through `'a`.
+/// Duplicate entries for one library resolve last-wins: the last
+/// [`LibraryChange`] for a library is authoritative, earlier ones
+/// contribute nothing.
 ///
 /// # Panics
 ///
@@ -220,6 +239,13 @@ fn diff_names(before: &[StringId], after: &[StringId]) -> Vec<StringId> {
 /// sized by input, so a four-billion-library workspace is a program bug to
 /// surface, not truncate (the dartq-index "surface, never clamp" contract
 /// this query shares).
+///
+/// Panics on out-of-contract caller data too: a [`LibraryChange`] id or an
+/// `imports_of` target at or beyond `library_count` stops on the array
+/// bounds check (debug builds assert first, naming the offending id), and
+/// a snapshot whose `top_level_names` are not ascending and deduplicated
+/// is rejected in every build — the merge walks behind the verdicts would
+/// silently mis-diff it otherwise.
 #[must_use]
 pub fn impact<'a>(
     library_count: usize,
@@ -229,6 +255,19 @@ pub fn impact<'a>(
     strings: &StringTable,
     changes: &[LibraryChange],
 ) -> ImpactReport {
+    // The verdicts are merge walks over the snapshot name sets: an
+    // unsorted or duplicated set would silently mis-diff (arbitrary
+    // binary_search answers, dropped merge entries), so the caller
+    // contract is asserted in every build — a rejected input beats a
+    // wrong verdict.
+    for change in changes {
+        assert!(
+            is_ascending(&change.before.top_level_names)
+                && is_ascending(&change.after.top_level_names),
+            "FileSnapshot.top_level_names must be ascending and deduplicated"
+        );
+    }
+
     // The inverted graph, built once (the rust-analyzer posture) as flat
     // CSR — two counting passes over the id space, one allocation per
     // array; the ascending fill keeps each row's importers ascending.
@@ -237,6 +276,10 @@ pub fn impact<'a>(
     let mut offsets = vec![0u32; library_count + 1];
     for lib in 0..count {
         for &target in imports_of(lib) {
+            debug_assert!(
+                target < count,
+                "import target {target} out of range 0..{count}"
+            );
             offsets[target as usize + 1] += 1;
         }
     }
@@ -262,8 +305,14 @@ pub fn impact<'a>(
     let mut seed_changed = vec![false; library_count];
     let mut api = vec![false; library_count];
     for change in changes {
-        seed_changed[change.library as usize] = true;
-        api[change.library as usize] = api_changed(&change.before, &change.after);
+        let lib = change.library as usize;
+        debug_assert!(
+            lib < library_count,
+            "LibraryChange.library {} out of range 0..{library_count}",
+            change.library
+        );
+        seed_changed[lib] = true;
+        api[lib] = api_changed(&change.before, &change.after);
     }
     let mut direct_semantic = vec![false; library_count];
     for (lib, &is_api) in api.iter().enumerate() {
@@ -291,9 +340,24 @@ pub fn impact<'a>(
 
     // Changed rows: the name-set diff per change, each row's verdict from
     // the seam. Honest no-op changes (equal hashes, equal sets) yield no
-    // rows and a content-only closure.
+    // rows and a content-only closure. Duplicate entries for one library
+    // resolve last-wins — the api marks already overwrite that way — so
+    // the superseded entries ship no rows and contradictory symbol rows
+    // are impossible by construction.
+    let mut superseded = vec![false; changes.len()];
+    let mut seen = vec![false; library_count];
+    for (i, change) in changes.iter().enumerate().rev() {
+        if seen[change.library as usize] {
+            superseded[i] = true;
+        } else {
+            seen[change.library as usize] = true;
+        }
+    }
     let mut changed_rows: Vec<ChangedSymbol> = Vec::new();
-    for change in changes {
+    for (i, change) in changes.iter().enumerate() {
+        if superseded[i] {
+            continue;
+        }
         let before = &change.before.top_level_names;
         let after = &change.after.top_level_names;
         for name in diff_names(before, after) {
@@ -649,5 +713,143 @@ mod tests {
         assert!(report.affected.is_empty());
         assert!(report.affected_tests.is_empty());
         assert_eq!(report.affected_environments.len(), 1);
+    }
+
+    /// An out-of-range [`LibraryChange`] id is a caller bug that panics
+    /// with the offending id in the message (debug assert; release stops
+    /// on the array bounds check) — surfaced, never clamped.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_change_library_panics() {
+        let fx = fixture();
+        let tests = TestGraph::default();
+        let change = LibraryChange {
+            library: 9,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot(&fx.strings, &["fa", "fb"]),
+        };
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+    }
+
+    /// An `imports_of` target beyond the id space is a caller bug that
+    /// panics with the offending target (debug assert; release stops on
+    /// the array bounds check) — the inverted CSR never drops or wraps an
+    /// edge.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_import_target_panics() {
+        let fx = fixture();
+        let imports: [&[u32]; 2] = [&[], &[7]];
+        let tests = TestGraph::default();
+        let _ = impact(
+            2,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &[],
+        );
+    }
+
+    /// An unsorted snapshot is rejected with a panic in every build — the
+    /// merge walks behind the verdicts would silently mis-diff it
+    /// otherwise, and a wrong verdict is the one failure this query must
+    /// never ship.
+    #[test]
+    #[should_panic(expected = "ascending")]
+    fn unsorted_snapshot_is_rejected_not_misdiffed() {
+        let fx = fixture();
+        let mut after = snapshot(&fx.strings, &["fa", "fb"]);
+        after.top_level_names = vec![fx.fb, fx.fa].into_boxed_slice();
+        let tests = TestGraph::default();
+        let change = LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after,
+        };
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+    }
+
+    /// The other face of the sortedness contract: a contract-valid input
+    /// still answers byte-identically — the defenses add nothing to the
+    /// output.
+    #[test]
+    fn sorted_snapshot_answers_byte_identically() {
+        let fx = fixture();
+        let imports: [&[u32]; 2] = [&[], &[0]];
+        let tests = TestGraph::default();
+        let report = impact(
+            2,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &[LibraryChange {
+                library: 0,
+                before: snapshot(&fx.strings, &["fa"]),
+                after: snapshot(&fx.strings, &["fa", "fb"]),
+            }],
+        );
+        assert_eq!(
+            report,
+            ImpactReport {
+                schema_version: IMPACT_SCHEMA_VERSION,
+                changed: vec![ChangedSymbol {
+                    symbol: "a.dart|fb".to_string(),
+                    signature_changed: true,
+                }],
+                affected: vec![AffectedTarget {
+                    path: "b.dart".to_string(),
+                    impact: ImpactLevel::Semantic,
+                }],
+                affected_tests: vec![],
+                affected_environments: vec![EnvironmentImpact {
+                    label: "default".to_string(),
+                    compatible: true,
+                }],
+            },
+        );
+    }
+
+    /// Two changes for one library resolve last-wins: the superseded
+    /// earlier entry ships no rows and its api verdict is discarded, so
+    /// contradictory symbol rows are impossible by construction.
+    #[test]
+    fn duplicate_change_last_entry_wins() {
+        let fx = fixture();
+        let imports: [&[u32]; 2] = [&[], &[0]];
+        let tests = TestGraph::default();
+        let adds_fb = LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot(&fx.strings, &["fa", "fb"]),
+        };
+        let mut body_only = LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot(&fx.strings, &["fa"]),
+        };
+        body_only.after.content_hash = content_hash(b"reformatted");
+        let report = impact(
+            2,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &[adds_fb, body_only],
+        );
+        assert!(
+            report.changed.is_empty(),
+            "the superseded entry ships no rows"
+        );
+        assert_eq!(
+            report
+                .affected
+                .iter()
+                .map(|row| (row.path.as_str(), row.impact))
+                .collect::<Vec<_>>(),
+            vec![("b.dart", ImpactLevel::ContentOnly)],
+            "the last entry's content-only verdict rules"
+        );
     }
 }
