@@ -1951,7 +1951,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // directly and the entry ends on the real keyword (the
                     // remaining `= expr` then re-enters the member loop as
                     // the official cascade does).
-                    let at = self.peek_span_at(2);
+                    let at = self.look_span_at(2);
                     self.report(msg::missing_identifier(), at);
                     self.report(msg::missing_assignment_in_initializer(), head);
                     self.cursor.advance(); // `this`
@@ -1988,7 +1988,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             // before `this`; we emit the same two reports and parse
             // `<name> = this`, leaving the follower to the initializer loop
             // at the same break point as the oracle.
-            let at = self.peek_span_at(1);
+            let at = self.look_span_at(1);
             self.report(msg::expected_but_got("."), at);
             self.report(msg::missing_assignment_in_initializer(), head);
             self.synthetic(TokenKind::Identifier, head.range.offset);
@@ -2001,17 +2001,31 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 return self.parse_initializer_expression_rest();
             }
             // Recovery (:4890-4903): a non-operator follower means the name
-            // is the assignment target — insert `= <synthetic name>` after
-            // it. `Token.isOperator` covers real operators; group punctuation
-            // and `.` are excluded (`kind_precedence` is `Some` for `.`,
-            // matching the explicit `!next2.isA(PERIOD)` rider).
+            // is the assignment target — the official stream is
+            // `x = <synthetic>(3)` (`rewriter.insertSyntheticToken(next, EQ)`
+            // + `insertSyntheticIdentifier`, issue_31192), so the head is the
+            // assignment LHS and the queued synthetic pair is the RHS. The
+            // queue splices at the cursor (it cannot land after the head), so
+            // the official event stream is driven directly: head send, the
+            // inserted `=`, the synthetic primary, the assignment event.
             let follower = self.cursor.look_kind(1);
             if crate::expressions::kind_precedence(follower).is_none() {
                 self.report(msg::missing_assignment_in_initializer(), head);
-                let at = self.peek_span_at(1);
-                self.synthetic(TokenKind::Eq, at.range.offset);
-                self.synthetic(TokenKind::Identifier, at.range.offset);
-                return self.parse_initializer_expression_rest();
+                let at = self.look_span_at(1);
+                // LHS: the bare name with its no-arguments send face (the
+                // follower `(` belongs to the RHS, not to the target).
+                let lhs = self.ensure_identifier(IdentifierContext::Expression);
+                self.listener.handle_no_type_arguments(at);
+                self.listener.handle_no_arguments(at);
+                self.listener.handle_send(lhs, lhs);
+                let equals = self.synthetic(TokenKind::Eq, at.range.offset);
+                self.cursor.advance(); // the inserted `=`
+                let name = self.synthetic(TokenKind::Identifier, at.range.offset);
+                self.cursor.advance(); // the synthetic RHS primary
+                let end = self.parse_send_from_identifier(name);
+                self.listener.handle_assignment_expression(equals, end);
+                self.listener.end_initializer(end);
+                return end;
             }
             // Operator/`.` follower: fall through to the synthetic-assignment
             // recovery with the head untouched.
@@ -2043,7 +2057,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             n += 1;
         }
         if self.cursor.look_kind(n) == TokenKind::OpenParen
-            && let Some(close) = self.cursor.table_matching_end(self.peek_span_at(n).id)
+            && let Some(close) = self.cursor.table_matching_end(self.look_span_at(n).id)
             && matches!(
                 self.kind_at(self.offset_of(close) + 1),
                 TokenKind::Period | TokenKind::QuestionPeriod | TokenKind::OpenSquare
@@ -2069,7 +2083,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             let name = self.cursor.look_kind(n);
             if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
                 // Official `expressionContinuation.ensureIdentifier`.
-                let at = self.peek_span_at(n);
+                let at = self.look_span_at(n);
                 self.report(msg::missing_identifier(), at);
                 self.synthetic(TokenKind::Identifier, at.range.offset);
             }
@@ -2083,7 +2097,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 // gets the synthetic here (:4936-4944).
                 let name = self.cursor.look_kind(n + 1);
                 if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
-                    let at = self.peek_span_at(n + 1);
+                    let at = self.look_span_at(n + 1);
                     self.synthetic(TokenKind::Identifier, at.range.offset);
                 }
             } else if next == TokenKind::Eq {
@@ -2100,18 +2114,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // assignment itself; this is the declaring-class rider.
                     self.report(
                         msg::field_initialized_outside_declaring_class(),
-                        self.peek_span_at(n - 1),
+                        self.look_span_at(n - 1),
                     );
                 }
             } else {
                 // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
                 // false)` (:4948-4952): wrap the follower in empty parens.
-                let at = self.peek_span_at(n);
+                let at = self.look_span_at(n);
                 self.report(msg::expected_after_but_got("("), at);
                 self.synthetic(TokenKind::OpenParen, at.range.offset);
                 self.synthetic(TokenKind::CloseParen, at.range.offset);
             }
-        } else if let Some(close) = self.cursor.table_matching_end(self.peek_span_at(n).id) {
+        } else if let Some(close) = self.cursor.table_matching_end(self.look_span_at(n).id) {
             let after = self.kind_at(self.offset_of(close) + 1);
             if matches!(
                 after,

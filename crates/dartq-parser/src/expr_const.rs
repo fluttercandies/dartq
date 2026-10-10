@@ -526,7 +526,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     // a `!` (`e.f!<T>(c)`); a lone `!` stays for the postfix
                     // arm below.
                     if self.peek_kind() == TokenKind::Bang
-                        && self.cursor.peek_kind_ahead(1) == TokenKind::Lt
+                        && self.cursor.look_kind(1) == TokenKind::Lt
                     {
                         let bang = self.peek_span();
                         self.listener.handle_non_null_assert_expression(bang);
@@ -622,7 +622,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             // Named argument: `id:`.
             let named =
-                self.peek_is_identifier() && self.cursor.peek_kind_ahead(1) == TokenKind::Colon;
+                self.peek_is_identifier() && self.cursor.look_kind(1) == TokenKind::Colon;
             if named {
                 let name = self.peek_span();
                 self.cursor.advance();
@@ -823,7 +823,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     _ => None,
                 };
                 if let Some(class) = class
-                    && self.cursor.peek_kind_ahead(1) != TokenKind::Period
+                    && self.cursor.look_kind(1) != TokenKind::Period
                 {
                     // The token after the (optional) type-argument group must
                     // open the collection.

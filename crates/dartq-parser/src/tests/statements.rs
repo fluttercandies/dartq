@@ -70,12 +70,24 @@ fn local_function_block_body() {
 
 #[test]
 fn if_else_chain() {
+    // `else if` chains nest (official `parseIfStatement`,
+    // parser_impl.dart:10129-10150: `endIfStatement` fires only after the
+    // else statement parses, so the inner ifs close first). The input has
+    // TWO if heads — the trailing `else { e; }` is a plain block, not a
+    // third if — and that block parses inside the inner if, before both
+    // ends.
     let c = parse("void f() { if (a) { b; } else if (c) { d; } else { e; } }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     c.assert_sequence(&[
         ("begin", "if_statement"),
-        ("end", "if_statement"),
+        ("begin", "block"),
+        ("end", "block"),
         ("begin", "if_statement"),
+        ("begin", "block"),
+        ("end", "block"),
+        ("begin", "block"),
+        ("end", "block"),
+        ("end", "if_statement"),
         ("end", "if_statement"),
     ]);
 }
@@ -308,11 +320,16 @@ fn await_for_outside_async_is_event_only() {
 
 #[test]
 fn expression_statement_recovery_is_bounded() {
+    // Official `{ + }` face: parseUnaryExpression rewrites the prefix `+`
+    // away (rewriteAndRecover, parser_impl.dart:7904-7912), reporting
+    // unsupportedPrefixPlus — pseudo-shared with missing_identifier
+    // (diagnostic.g.dart:3008-3013) — and the statement's missing `;`
+    // reports expected_but_got at the `}`. Exactly two diagnostics; the
+    // recovery stays bounded.
     let c = parse("void f() { + }");
-    let codes = c.error_codes();
-    assert!(
-        codes.iter().all(|code| code == "expected_token"),
-        "generic expected_token family only: {codes:?}"
+    assert_eq!(
+        c.error_codes(),
+        ["missing_identifier", "expected_token"]
     );
     c.assert_sequence(&[
         ("begin", "block_function_body"),

@@ -275,7 +275,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     TokenKind::Keyword(Keyword::Mixin) => {
                         if self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::Class) {
                             self.check_declaration();
-                            let class_keyword = self.peek_span_at(1);
+                            let class_keyword = self.look_span_at(1);
                             let mods = self.parse_class_modifiers(modifier_start, class_keyword);
                             if let Some(f) = mods.final_kw {
                                 self.report(msg::final_mixin_class(), f);
@@ -1246,9 +1246,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.listener.handle_no_class_body(semi);
         } else {
             if self.peek_kind() != TokenKind::OpenCurly {
-                // Recovery: out-of-order/duplicate clauses, then a block.
+                // Recovery: out-of-order/duplicate clauses (the missing body
+                // itself is ensured once, by the body parser below — official
+                // `parseClassOrMixinOrExtensionBodyImpl` only asserts the `{`
+                // its caller's `ensureBlock` guaranteed, so the class header's
+                // own `ensureBlock` report and the body's must not stack).
                 self.parse_class_header_recovery(DeclarationHeaderKind::Class, header);
-                self.ensure_block(msg_block_kind_class());
             }
             self.parse_class_or_mixin_or_extension_body(DeclarationKind::Class, name);
         }
@@ -1545,7 +1548,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         } else {
             if self.peek_kind() != TokenKind::OpenCurly {
                 self.parse_mixin_header_recovery(clauses, augment.is_some());
-                self.ensure_block(msg_block_kind_mixin());
             }
             self.parse_class_or_mixin_or_extension_body(DeclarationKind::Mixin, name);
         }
@@ -1762,7 +1764,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         break;
                     }
                 }
-                self.ensure_block(msg_block_kind_extension());
             }
             self.parse_class_or_mixin_or_extension_body(
                 DeclarationKind::Extension,
@@ -1832,7 +1833,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     ..HeaderClauses::default()
                 };
                 self.parse_class_header_recovery(DeclarationHeaderKind::ExtensionType, seen);
-                self.ensure_block(msg_block_kind_extension_type());
             }
             self.parse_class_or_mixin_or_extension_body(DeclarationKind::ExtensionType, name);
         }

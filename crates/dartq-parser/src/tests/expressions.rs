@@ -375,14 +375,21 @@ fn throw_expression_shapes() {
 
 #[test]
 fn await_expression_events_split_by_async_state() {
-    // Sync context: `end_invalid_await_expression`, no diagnostic (the
-    // await-not-async code has no pinned-oracle surface).
+    // Sync context: `await x;` is NOT an await expression — a sync `await`
+    // that fails `looksLikeAwaitExpression` routes to
+    // parseExpressionStatementOrDeclaration (parser_impl.dart:6805-6815;
+    // `looksLikeExpressionAfterAwaitOrYield` :10591-10609 rejects `x ;`),
+    // so it parses as a local variable declaration with no diagnostics and
+    // no await events. The `end_invalid_await_expression` face belongs to
+    // await-expression-shaped sync code (`await f();`).
     let c = parse("void f() { await x; }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    c.assert_sequence(&[
-        ("begin", "await_expression"),
-        ("end", "invalid_await_expression"),
-    ]);
+    assert!(
+        c.log.contains(&("begin", "variables_declaration")),
+        "{:?}",
+        c.log
+    );
+    assert!(!c.log.contains(&("begin", "await_expression")), "{:?}", c.log);
 
     // Async context: the plain end event.
     let c = parse("void f() async { await x; }");
@@ -512,6 +519,44 @@ fn collection_control_flow_nesting_closes_in_order() {
         ("end", "for_in_control_flow"),
         ("end", "if_control_flow"),
     ]);
+}
+
+/// Collection for-element heads mirror the statement decision order
+/// (official `ForCondition.parse`, literal_entry_info_impl.dart:24-81): the
+/// for-parts scan parses a pattern head itself, so the `=`/`in` split reads
+/// the token after the pattern — a pattern for-in head keeps the for-in
+/// shape instead of eating the `(` as the parts keyword. Regression: the
+/// collection-side head used to skip the pattern parse (silent mis-parse
+/// found by the dartq-flow lane).
+#[test]
+fn collection_for_pattern_head_lands_on_in() {
+    let c = parse("void f() { var l = [for (var (a, b) in pairs) a]; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "for_control_flow"),
+        ("end", "for_in_control_flow"),
+    ]);
+
+    // Pattern head with the C-style continuation
+    // (`for ( pattern = expression ; ... ; ... )`).
+    let c = parse("void f() { var l = [for (var (a, b) = pair; c; i++) a]; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "for_control_flow"),
+        ("end", "for_control_flow"),
+    ]);
+
+    // A set/map element takes the same head machinery.
+    let c = parse("void f() { var m = {for (var (k, v) in pairs) k: v}; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "for_control_flow"),
+        ("end", "for_in_control_flow"),
+    ]);
+
+    // The statement form keeps its decision order too.
+    let c = parse("void f() { for (var (a, b) in pairs) a; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
 }
 
 // —— dot shorthands, implicit creation, new/const ————————————————————————

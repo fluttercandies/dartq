@@ -579,7 +579,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if self.peek_is_identifier() || !identifier_is_optional {
             self.ensure_identifier(IdentifierContext::RecordFieldDeclaration);
         } else {
-            let next = self.peek_span_at(1);
+            let next = self.look_span_at(1);
             self.listener.handle_no_name(next);
         }
         self.listener.end_record_type_entry();

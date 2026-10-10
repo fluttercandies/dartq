@@ -553,7 +553,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// Official `parsePartOf` :1330: `part of (qualified | uri) ;`.
     fn parse_part_of(&mut self, part_keyword: TokenSpan) {
-        let of_kw = self.peek_span_at(1);
+        let of_kw = self.look_span_at(1);
         self.listener.begin_part_of(part_keyword);
         self.cursor.advance(); // `part`
         self.cursor.advance(); // `of`

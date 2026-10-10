@@ -279,7 +279,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         return self.parse_variable_pattern(context, Some(type_info));
                     }
                 }
-                if self.cursor.peek_kind_ahead(1) == TokenKind::CloseParen {
+                if self.cursor.look_kind(1) == TokenKind::CloseParen {
                     // `()`: empty record pattern.
                     let left = self.peek_span();
                     self.cursor.advance();
@@ -686,7 +686,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 colon = Some(self.peek_span());
                 self.cursor.advance();
             } else if kind != TokenKind::OpenParen
-                && self.cursor.peek_kind_ahead(1) == TokenKind::Colon
+                && self.cursor.look_kind(1) == TokenKind::Colon
             {
                 was_record = true;
                 let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
@@ -760,7 +760,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();
-            } else if self.cursor.peek_kind_ahead(1) == TokenKind::Colon {
+            } else if self.cursor.look_kind(1) == TokenKind::Colon {
                 let name = self.ensure_identifier(IdentifierContext::NamedArgumentReference);
                 colon = Some(name);
                 self.cursor.advance();

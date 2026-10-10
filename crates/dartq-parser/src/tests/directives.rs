@@ -3,8 +3,11 @@
 //! `DirectiveContext` ordering checks, and the out-of-order-clause import
 //! recovery (official `parseImportRecovery`, `parser_impl.dart:995`).
 
-use super::collector::{Collector, scan_ok, setup};
+use super::collector::{Collector, latest_features, scan_ok, setup};
+use crate::listener::{ParserListener, Token};
+use crate::message::Message;
 use crate::parser::Parser;
+use crate::token_id::TokenSpan;
 
 fn parse(source: &'static str) -> Collector {
     let mut p = setup(source);
@@ -60,6 +63,124 @@ fn import_conditional_uris() {
         ("end", "conditional_uris"),
         ("end", "import"),
     ]);
+}
+
+/// Captures the conditional-clause payloads in source order (#512): every
+/// clause's dotted condition name and its string literals — the candidate
+/// URI last, an earlier entry the `==` value. ASCII sources only (UTF-16
+/// offsets slice as bytes).
+#[derive(Default)]
+struct ConditionalPayloads {
+    text: &'static str,
+    errors: Vec<String>,
+    /// `(dotted name, string bodies)` per `if` clause, in source order.
+    clauses: Vec<(String, Vec<String>)>,
+    /// Begin offset of the literal string currently open.
+    pending_string: Option<usize>,
+}
+
+impl ConditionalPayloads {
+    /// Parses `source` and drains the capture.
+    fn of(source: &'static str) -> Self {
+        let (table, text) = scan_ok(source);
+        let mut parser = Parser::new(
+            text,
+            table,
+            latest_features(),
+            Self {
+                text,
+                ..Default::default()
+            },
+        );
+        parser.parse_unit();
+        parser.listener
+    }
+}
+
+impl ParserListener for ConditionalPayloads {
+    fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+        self.errors.push(message.code.name.to_owned());
+    }
+
+    fn begin_conditional_uri(&mut self, _: Token) {
+        self.clauses.push((String::new(), Vec::new()));
+    }
+
+    fn handle_dotted_name(&mut self, _: usize, first: Token) {
+        // The dotted name is the maximal identifier/period run at the first
+        // identifier's offset — the parser consumed it contiguously.
+        let start = first.range.offset as usize;
+        let end = self.text[start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'))
+            .map_or(self.text.len(), |relative| start + relative);
+        if let Some(clause) = self.clauses.last_mut() {
+            clause.0 = self.text[start..end].to_owned();
+        }
+    }
+
+    fn begin_literal_string(&mut self, begin: Token) {
+        self.pending_string = Some(begin.range.offset as usize);
+    }
+
+    fn end_literal_string(&mut self, _: usize, end: Token) {
+        let start = self.pending_string.take().expect("string begin seen");
+        let stop = end.range.offset as usize + end.range.length as usize;
+        // Plain single-segment literals in these sources: strip the quotes.
+        let body = self.text[start..stop].trim_matches(|c| c == '\'' || c == '"');
+        if let Some(clause) = self.clauses.last_mut() {
+            clause.1.push(body.to_owned());
+        }
+    }
+}
+
+/// The clause payloads ride the events in source order: the dotted variable
+/// verbatim (bare and `==` forms), the candidate URI last per clause — the
+/// shape the resolution fork consumes (#512). The directive's own primary
+/// URI fires before any clause opens and is not captured.
+#[test]
+fn conditional_uri_payloads_in_source_order() {
+    let listener = ConditionalPayloads::of(
+        "import 'a.dart' if (dart.library.io) 'io.dart' \
+         if (mode == 'release') 'release.dart' if (p.q) 'pq.dart';",
+    );
+    assert!(listener.errors.is_empty(), "{:?}", listener.errors);
+    assert_eq!(
+        listener.clauses,
+        vec![
+            ("dart.library.io".to_owned(), vec!["io.dart".to_owned()]),
+            (
+                "mode".to_owned(),
+                vec!["release".to_owned(), "release.dart".to_owned()]
+            ),
+            ("p.q".to_owned(), vec!["pq.dart".to_owned()]),
+        ]
+    );
+}
+
+/// Missing candidate URI (official `ensureLiteralString` :5075): the error
+/// pair reports on the offending token and a synthetic empty string stands
+/// in as the candidate.
+#[test]
+fn conditional_uri_payloads_missing_candidate_uri() {
+    let listener = ConditionalPayloads::of("import 'a.dart' if (x);");
+    assert_eq!(
+        listener.errors,
+        ["unexpected_token", "expected_string_literal"]
+    );
+    assert_eq!(listener.clauses, vec![("x".to_owned(), vec![String::new()])]);
+}
+
+/// Garbage between the condition and the closer (official :1124-1136): the
+/// intervening token is reported, the real `)` is jumped to, and the
+/// candidate URI still binds to the clause.
+#[test]
+fn conditional_uri_payloads_garbage_before_close() {
+    let listener = ConditionalPayloads::of("import 'a.dart' if (x y) 'b.dart';");
+    assert_eq!(listener.errors, ["unexpected_token"]);
+    assert_eq!(
+        listener.clauses,
+        vec![("x".to_owned(), vec!["b.dart".to_owned()])]
+    );
 }
 
 #[test]

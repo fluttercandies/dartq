@@ -275,6 +275,21 @@ impl<'s, 't> TokenCursor<'s, 't> {
         }
     }
 
+    /// Id of the token `n` positions ahead, queued inserted tokens first,
+    /// then the real stream — the [`Self::look_kind`] counterpart for
+    /// callers that need the span. O(1); EOF-pinned past the end.
+    pub(crate) fn look_id(&self, n: usize) -> TokenId {
+        if self.head == QUEUE_EMPTY {
+            return (self.pos + n).min(self.table.len() - 1) as TokenId;
+        }
+        let queued = self.inserted.len() - self.head;
+        if n < queued {
+            (self.table.len() + self.head + n) as TokenId
+        } else {
+            (self.pos + (n - queued)).min(self.table.len() - 1) as TokenId
+        }
+    }
+
     /// Forward jump for the GFT type-variable pass: moves to a strictly
     /// later real token (queue must be empty). Paired with [`Self::reset`].
     pub(crate) fn jump_to(&mut self, id: TokenId) {
@@ -627,6 +642,24 @@ mod tests {
         let gt = cursor.consume_closer();
         assert_eq!(cursor.resolve(gt).0, TokenKind::Gt);
         assert_eq!(cursor.peek().kind, TokenKind::Gt);
+    }
+
+    #[test]
+    fn look_id_and_look_kind_read_through_the_queue() {
+        // With a split remainder queued, the queue-aware faces see the
+        // parser-visible stream (`>` then `b`), unlike the raw-table reads.
+        let (mut cursor, _src) = cursor("a >> b");
+        cursor.advance(); // `a`
+        let _gt = cursor.consume_closer(); // `>>` splits: `>` queued
+        assert_eq!(cursor.peek().kind, TokenKind::Gt);
+        assert_eq!(cursor.look_kind(0), TokenKind::Gt);
+        assert_eq!(cursor.look_kind(1), TokenKind::Identifier); // `b`
+        let b = cursor.look_id(1);
+        assert_eq!(cursor.resolve(b).0, TokenKind::Identifier);
+        assert_eq!(cursor.lexeme(b), "b");
+        cursor.advance(); // the queued `>`
+        assert_eq!(cursor.peek().kind, TokenKind::Identifier);
+        assert_eq!(cursor.look_id(0), b);
     }
 
     #[test]

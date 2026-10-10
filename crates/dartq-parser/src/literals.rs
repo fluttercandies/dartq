@@ -701,11 +701,13 @@ mod tests {
 
     #[test]
     fn set_entry_wins_over_later_map_entry() {
-        // F4: `hasSetEntry ??=` is first-wins (official :7926) — `{1, 2: 3}`
-        // leans set even though a map entry follows.
+        // F4: `hasSetEntry ??=` is first-wins (official :8598) — `{1, 2: 3}`
+        // leans set even though a map entry follows. Both entries ride
+        // `parseExpression` (:8596) and the map-entry tail parses its value
+        // expression too (:8610), so three `handleLiteralInt` events fire.
         let mut p = literal_parser("{1, 2: 3}");
         let _ = p.parse_set_or_map_literal(None);
-        assert_eq!(p.listener.int_literals, 2);
+        assert_eq!(p.listener.int_literals, 3);
         assert_eq!(p.listener.map_entries, 1);
         assert_eq!(p.listener.set_or_map, vec![true]);
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
@@ -761,12 +763,17 @@ mod tests {
         // ensureIdentifier(namedRecordFieldReference) reports
         // missing_identifier on the `:` and emits a synthetic name — the
         // record-literal path never emits handleNoName (that is record
-        // *pattern* recovery, official :11568).
+        // *pattern* recovery, official :11568). The synthetic lands via
+        // `insertSyntheticIdentifier` (parser_impl.dart:4056-4068), which
+        // reports and rewrites WITHOUT a `handleIdentifier` event, so the
+        // named-field name fires zero identifier events (and
+        // `expectedIdentifier` pseudo-shares missingIdentifier,
+        // diagnostic.g.dart:820-825).
         let mut p = literal_parser("(: 1)");
         let _ = p.parse_parenthesized_or_record_literal(None);
         assert_eq!(p.listener.errors, vec!["missing_identifier".to_string()]);
         assert_eq!(p.listener.no_name, 0);
-        assert_eq!(p.listener.identifiers, 1);
+        assert_eq!(p.listener.identifiers, 0);
         assert_eq!(p.listener.named_record_fields, 1);
 
         // A well-formed named field parses without diagnostics.

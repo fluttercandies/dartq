@@ -80,7 +80,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     fn peek_kind_ahead_identifier(&self, n: usize) -> bool {
-        crate::recovery::is_identifier(self.cursor.peek_kind_ahead(n))
+        crate::recovery::is_identifier(self.cursor.look_kind(n))
     }
 
     /// Official `parseArgumentsOptMetadata` (:9459): optional argument list;

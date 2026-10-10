@@ -215,8 +215,12 @@ fn duplicate_extends_reports_once() {
 
 #[test]
 fn implements_before_extends_reports_out_of_order() {
+    // The header recovery reports `implementsBeforeExtends` on the late
+    // `extends` (parser_impl.dart:3243-3248,
+    // parseDeclarationHeaderRecoveryInternal); `outOfOrderClauses` is the
+    // enum-header with/implements code (parser_impl.dart:2796).
     let c = parse("class C implements I extends A {}");
-    assert_eq!(c.error_codes(), ["out_of_order_clauses"]);
+    assert_eq!(c.error_codes(), ["implements_before_extends"]);
 }
 
 #[test]
@@ -236,11 +240,14 @@ fn missing_operator_keyword() {
 
 #[test]
 fn class_in_class_recovery() {
+    // Official `reportAndSkipClassInClass` (parser_impl.dart:11464-11485):
+    // report, `handleInvalidMember`, then a SILENT skip of the name and
+    // `{...}` body — the nested class emits no class events, so the only
+    // class_declaration/body events are the outer declaration's.
     let c = parse("class C { class D {} }");
     assert_eq!(c.error_codes(), ["class_in_class"]);
     c.assert_sequence(&[
         ("begin", "class_declaration"),
-        ("end", "class_declaration"),
         ("end", "body"),
         ("end", "class_declaration"),
     ]);
@@ -260,17 +267,28 @@ fn positional_default_with_colon_reports() {
 
 #[test]
 fn static_method_non_sync_setter_reports() {
+    // `setterNotSync` is a pseudoSharedCode: the analyzer surfaces it as
+    // `invalid_modifier_on_setter` (diagnostic.g.dart:2773-2777; report
+    // sites parser_impl.dart:4644/:6060).
     let c = parse("class C { static set g(int v) async {} }");
-    assert_eq!(c.error_codes(), ["setter_not_sync"]);
+    assert_eq!(c.error_codes(), ["invalid_modifier_on_setter"]);
 }
 
 #[test]
 fn missing_class_body_recovers_at_eof() {
+    // `handleNoClassBody` fires only for the `class C;` form
+    // (parser_impl.dart:3117-3125); a missing body at EOF goes through
+    // ensureBlock (parser_impl.dart:4984-5003), which reports the BlockKind
+    // message and inserts a synthetic `{}` that parses as an empty body.
+    // BlockKind.classDeclaration carries diag.expectedClassBody
+    // (block_kind.dart:27-30), surfacing as the registry `expected_body`
+    // (diagnostic.g.dart:697-703).
     let c = parse("class C");
-    assert_eq!(c.error_codes(), ["expected_token"]);
+    assert_eq!(c.error_codes(), ["expected_body"]);
     c.assert_sequence(&[
         ("begin", "class_declaration"),
-        ("handle", "no_class_body"),
+        ("begin", "body"),
+        ("end", "body"),
         ("end", "class_declaration"),
     ]);
 }
@@ -423,13 +441,11 @@ fn initializer_without_entry_reports_expected_an_initializer() {
 #[test]
 fn initializer_head_without_assignment_reports_missing_assignment() {
     // `: x(3) {}` — the missingAssignmentInInitializer script; the report
-    // anchors on the head `x`. KNOWN DIVERGENCE (first-lane engine): the
-    // oracle emits only the one report — its re-read consumes the queued
-    // synthetic `<syn>(3)` as the assignment RHS (parser_impl.dart:4894,
-    // issue_31192) — while the engine emits a trailing `missing_identifier`
-    // at the `(` because the queued synthetic identifier is not consumed as
-    // a primary. Left red as the repair pin; the primary report and its
-    // anchor match the oracle.
+    // anchors on the head `x`. The official stream is `x = <synthetic>(3)`
+    // (parser_impl.dart:4894, issue_31192): the head is the assignment LHS
+    // and the queued synthetic pair is the RHS, so exactly this one report
+    // fires (the queue splices at the cursor, so the event stream is driven
+    // directly instead of through the re-read).
     let c = initializers(": x(3) {}");
     assert_eq!(c.error_codes(), ["missing_assignment_in_initializer"]);
     assert_eq!(c.errors[0].1, 2);
@@ -468,7 +484,8 @@ fn switch_expression_missing_body_reports_on_close_paren() {
     let _ = p.parse_expression();
     let c = p.listener;
     // The per-kind shared-parser body codes all surface under the single
-    // analyzer registry name `expected_body` (diagnostic.g.dart).
+    // analyzer registry name `expected_body` (the nine same-name
+    // EXPECTED_BODY variants in the pinned syntactic_errors.g.dart).
     assert_eq!(c.error_codes(), ["expected_body"]);
     assert_eq!(c.errors[0].1, 9);
     assert_eq!(c.errors[0].2, 10);

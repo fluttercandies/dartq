@@ -615,10 +615,13 @@ pub(crate) mod msg {
     /// `expected{Class,Mixin,Enum,Extension,ExtensionType,Try,Catch,Finally,
     /// SwitchStatement,SwitchExpression}Body`: the shared parser's per-kind
     /// block-body codes all surface under the single analyzer registry name
-    /// `expected_body` (`diagnostic.g.dart` names every one `expected_body`),
-    /// each keeping its official fixed text. The template flavors
-    /// (`expectedEnumBody`, `expectedFunctionBody`) interpolate the offending
-    /// lexeme like the official templates.
+    /// `expected_body` (the pinned analyzer-8.4.1 `syntactic_errors.g.dart`
+    /// carries nine same-name `EXPECTED_BODY` ParserErrorCode constants, one
+    /// per CFE shared code; `diagnostic.g.dart` names each variant uniquely —
+    /// `ExpectedClassBody`, … — and binds it with `sharedCode`), each keeping
+    /// its official fixed text. The template flavors (`expectedEnumBody`,
+    /// `expectedFunctionBody`) interpolate the offending lexeme like the
+    /// official templates.
     pub(crate) fn expected_block_body(kind: BlockKind, _lexeme: &str) -> Message {
         if kind == BlockKind::Body {
             return expected_but_got("{");
@@ -1703,8 +1706,9 @@ pub(crate) enum BlockKind {
     /// A switch statement body.
     SwitchStatement,
     /// A switch expression body (`BlockKind.switchExpression`; official
-    /// `expectedSwitchExpressionBody` — a shared-parser own code, absent
-    /// from the syntax-codes capture, so `local_code`). Emit-vs-cull
+    /// `expectedSwitchExpressionBody`, whose `sharedCode` makes it one of
+    /// the nine same-name registry variants — it emits the name-level
+    /// `EXPECTED_BODY` like the rest of the family). Emit-vs-cull
     /// decision (pinned oracle, block_kind.dart:58 + parser_impl.dart
     /// :12433): EMIT — `ensureBlock` reports it live on `switch (n);`
     /// (script in messages.yaml), with the report anchored on the token

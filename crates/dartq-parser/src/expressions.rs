@@ -719,16 +719,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.parse_await_expression(allow_cascades)
             }
             TokenKind::Plus => {
-                // `unsupportedPrefixPlus` (:7196-7204): report + synthetic
-                // identifier operand; the `+` then falls to the binary loop.
-                // The CFE code is pseudo-shared with the analyzer's
-                // missing_identifier (error_converter.dart), which is what
-                // the pinned oracle surfaces, so report that directly.
+                // `unsupportedPrefixPlus` (:7904-7912): `rewriteAndRecover`
+                // REPLACES the `+` with a synthetic identifier — the `+`
+                // never re-reaches the binary loop — and `parsePrimary` then
+                // parses that synthetic (its one `handleIdentifier` comes
+                // from parseSend). The CFE code is pseudo-shared with the
+                // analyzer's missing_identifier (diagnostic.g.dart:3008-3013),
+                // the pinned oracle surface, so report that directly.
                 let plus = self.peek_span();
                 self.report(msg::missing_identifier(), plus);
-                let synthetic = self.synthetic(TokenKind::Identifier, plus.range.offset);
-                self.listener
-                    .handle_identifier(synthetic, IdentifierContext::Expression);
+                self.cursor.advance();
+                self.synthetic(TokenKind::Identifier, plus.range.offset);
                 self.parse_primary(IdentifierContext::Expression)
             }
             TokenKind::Bang | TokenKind::Tilde => {
@@ -1552,8 +1553,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// was not recovered, :8880-8889), arguments, `handle_send`. Also the
     /// continuation of a rewritten `new` (`A.new`, `.new`) — official
     /// `_tryRewriteNewToIdentifier` (:3684) makes it an identifier so it can
-    /// name the unnamed constructor.
-    fn parse_send_from_identifier(&mut self, begin: TokenSpan) -> TokenSpan {
+    /// name the unnamed constructor — and of recovery-spliced synthetic
+    /// heads (the initializer synthetic-assignment stream).
+    pub(crate) fn parse_send_from_identifier(&mut self, begin: TokenSpan) -> TokenSpan {
         let mut type_arg = TypeParamOrArg::None;
         if self.peek_kind() == TokenKind::Lt {
             let candidate = self.compute_type_param_or_arg_on_lt(false);
@@ -1778,6 +1780,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.cursor.advance();
             close
         };
+        // Same up-front stall detection as the statement form
+        // (`report_for_parts_stall`): a scanner-pinned synthetic `(` closer
+        // would otherwise be consumed by the declaration-rest recovery
+        // before `parse_for_loop_parts_rest` could report the landing.
+        self.report_for_parts_stall(left_paren);
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             crate::statements::ExprStmtOrDecl::PatternHead { pattern_keyword } => {

@@ -492,12 +492,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 if !metadata_done {
                     self.parse_metadata_star();
                 }
+                // Official `parsePattern(beforeType,
+                // PatternContext.declaration)` runs inside this scan: both
+                // the `=` and `in` continuations start after the pattern
+                // (parser_impl.dart:9901-9911). The for-parts caller reads
+                // the `=`/`in` off the cursor, so the pattern must be
+                // consumed here regardless of mode.
+                self.parse_pattern(PatternContext::Declaration);
                 if for_parts {
                     return ExprStmtOrDecl::PatternHead {
                         pattern_keyword: vfc,
                     };
                 }
-                self.parse_pattern(PatternContext::Declaration);
                 let equals = self.peek_span();
                 self.cursor.advance();
                 let _ = self.parse_expression();
@@ -1002,31 +1008,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         // declaration-rest recovery consumes the enclosing block's `}` on the
         // way, so the stall point is detected up front: the first `}` inside
         // the group.
-        if let Some(end_id) = self.cursor.table_matching_end(left_paren.id)
-            && self.cursor.resolve(end_id).1
-        {
-            let mut n = 0usize;
-            while n < 256 {
-                let kind = self.cursor.look_kind(n);
-                if kind == TokenKind::Eof {
-                    break;
-                }
-                if kind == TokenKind::CloseCurly {
-                    let stall = self.peek_span_at(n);
-                    self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
-                    break;
-                }
-                n += 1;
-            }
-        }
+        self.report_for_parts_stall(left_paren);
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             ExprStmtOrDecl::PatternHead { pattern_keyword } => {
-                // Official `parseExpressionStatementOrDeclarationAfterModifiers`
-                // parses the pattern (PatternContext.declaration) before
-                // returning; both the `=` and `in` continuations start after
-                // it.
-                let _ = self.parse_pattern(PatternContext::Declaration);
+                // The pattern was already parsed by the for-parts scan (the
+                // official `parsePattern` inside
+                // `parseExpressionStatementOrDeclarationAfterModifiers`);
+                // both the `=` and `in` continuations start after it.
                 if self.peek_kind() == TokenKind::Eq {
                     let equals = self.peek_span();
                     self.cursor.advance();
@@ -1065,6 +1054,32 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 } else {
                     self.parse_for_rest(for_kw, left_paren);
                 }
+            }
+        }
+    }
+
+    /// The up-front stall detection shared by the statement and collection
+    /// for-heads (the engine translation of `parseForLoopPartsRest`
+    /// :10369-10373): with a scanner-pinned synthetic `(` closer the parts
+    /// parse can never land on the group's closer, and the declaration-rest
+    /// recovery would consume the enclosing block's `}` on the way, so the
+    /// first `}` inside the group is reported before it is eaten.
+    pub(crate) fn report_for_parts_stall(&mut self, left_paren: TokenSpan) {
+        if let Some(end_id) = self.cursor.table_matching_end(left_paren.id)
+            && self.cursor.resolve(end_id).1
+        {
+            let mut n = 0usize;
+            while n < 256 {
+                let kind = self.cursor.look_kind(n);
+                if kind == TokenKind::Eof {
+                    break;
+                }
+                if kind == TokenKind::CloseCurly {
+                    let stall = self.look_span_at(n);
+                    self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
+                    break;
+                }
+                n += 1;
             }
         }
     }
@@ -1763,7 +1778,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     ) -> TokenSpan {
         if self.peek_kind() == TokenKind::Keyword(Keyword::Native) {
             let native = self.peek_span();
-            let has_name = self.cursor.peek_kind_ahead(1) == TokenKind::String;
+            let has_name = self.cursor.look_kind(1) == TokenKind::String;
             self.cursor.advance();
             if has_name {
                 self.parse_literal_string();
@@ -1811,7 +1826,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
                 // Stray keyword/identifier before `=>` (user is typing).
                 if is_keyword_or_identifier(next)
-                    && self.cursor.peek_kind_ahead(1) == TokenKind::Function
+                    && self.cursor.look_kind(1) == TokenKind::Function
                 {
                     let at = self.peek_span();
                     self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
@@ -1820,7 +1835,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
                 // Stray keyword/identifier before `{`: skip and fall through.
                 if is_keyword_or_identifier(next)
-                    && self.cursor.peek_kind_ahead(1) == TokenKind::OpenCurly
+                    && self.cursor.look_kind(1) == TokenKind::OpenCurly
                 {
                     let at = self.peek_span();
                     self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);

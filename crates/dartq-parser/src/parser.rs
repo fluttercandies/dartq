@@ -164,11 +164,14 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         self.cursor.peek().span
     }
 
-    /// Span of the real token `n` positions ahead of the cursor (compute
-    /// paths only; EOF-pinned).
+    /// Queue-aware span of the token `n` positions ahead — queued inserted
+    /// tokens first, then the real stream. Event paths under queued recovery
+    /// must read through this face (or [`TokenCursor::look_kind`]): the raw
+    /// table reads desync from the tokens the parser actually sees. O(1);
+    /// EOF-pinned past the end.
     #[inline]
-    pub(crate) fn peek_span_at(&self, n: usize) -> TokenSpan {
-        let id = (self.cursor.real_pos() + n).min(self.table.len() - 1) as TokenId;
+    pub(crate) fn look_span_at(&self, n: usize) -> TokenSpan {
+        let id = self.cursor.look_id(n);
         TokenSpan::new(id, self.cursor.span(id))
     }
 
