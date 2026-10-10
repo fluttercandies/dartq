@@ -333,6 +333,339 @@ impl<'a> TypeSystem<'a> {
         matches!(self.table.get(from).kind(), TypeKind::Dynamic)
     }
 
+    /// `canBeSubtypeOf` (`type_system.dart:150-330`): whether an instance of
+    /// `left` could possibly also be an instance of `right` — the disjointness
+    /// question behind `pattern_never_matches_value_type`. Wider than
+    /// [`TypeSystem::is_subtype`] in both directions (`num` vs `int`,
+    /// `int` vs `num`), and by construction `is_subtype(left, right) ⇒
+    /// can_be_subtype_of(left, right)`, so "the cast/pattern is unnecessary"
+    /// (is-subtype) and "the pattern never matches" (cannot-be-subtype) are
+    /// mutually exclusive — the official invariant, pinned by tests here.
+    ///
+    /// Decision order is the source order: `Null` arms, both-nullable,
+    /// function-vs-interface pairs, `FutureOr` splits, then the
+    /// interface/interface region — enum-constant enumeration, same-element
+    /// argument recursion, and the closed-subclass walks
+    /// (`ClassElementImpl.allSubtypes`, element.dart:167-210 — dartq's
+    /// injected [`TypeHierarchy::direct_subclasses`] facts stand in; depth
+    /// completeness of that closure is the fact source's responsibility, the
+    /// official takes it from the same-library scan). Deviations, each
+    /// answer-preserving:
+    ///
+    /// - Extension-type erasure is the identity (no extension types in M1).
+    /// - The int/double cross ("can happen in JavaScript",
+    ///   type_system.dart:223-227) is omitted as observationally dead at
+    ///   this layer: neither core `int` nor `double` is sealed or an enum,
+    ///   so the pair falls through to the conservative `true` default here
+    ///   exactly as the official's cross answers.
+    /// - Enum-constant enumeration uses the enum's this-type as the
+    ///   constants' type (exact for non-generic enums; dartq carries a
+    ///   constant count, not per-constant declared types) plus the
+    ///   is-subtype short-circuit, which only restores answers the official
+    ///   derives from per-constant concrete types of generic enums — a
+    ///   subset relation can never contradict "some constant matches".
+    /// - `resolveToBound` on the interface/type-parameter paths is the
+    ///   identity (declared bounds are M2).
+    #[must_use]
+    pub fn can_be_subtype_of(&self, left: TypeId, right: TypeId) -> bool {
+        let a = self.table.get(left);
+        let b = self.table.get(right);
+
+        // If one is `Null`, then the other must be nullable
+        // (type_system.dart:164-169).
+        let left_nullable = !self.is_non_nullable(left);
+        let right_nullable = !self.is_non_nullable(right);
+        if matches!(a.kind(), TypeKind::Null) {
+            return right_nullable;
+        }
+        if matches!(b.kind(), TypeKind::Null) {
+            return left_nullable;
+        }
+        // If none is `Null`, but both are nullable, they match at `Null`
+        // (type_system.dart:172-174).
+        if left_nullable && right_nullable {
+            return true;
+        }
+
+        // Could be `void Function()` vs `Object`/`Function`
+        // (type_system.dart:177-180) and the symmetric arm (:182-185).
+        let left_functional =
+            |decl: TypeDeclId| decl == self.core().function || decl == self.core().object;
+        match (a.kind(), b.kind()) {
+            (TypeKind::Function { .. }, TypeKind::Interface { decl, .. }) => {
+                return left_functional(decl);
+            }
+            (TypeKind::Interface { decl, .. }, TypeKind::Function { .. }) => {
+                return left_functional(decl);
+            }
+            _ => {}
+        }
+
+        // `FutureOr<T> = T || Future<T>`: attempt both sides to the other
+        // (type_system.dart:188-201). `FutureOr<T>?` splits the same way —
+        // the wrapper's `?` only adds `Null` to the value set, and the
+        // `Null` arms above already settled the nullable-vs-nullable cases.
+        if let TypeKind::FutureOr { base } = a.kind() {
+            let future = self.intern_future(base);
+            return self.can_be_subtype_of(base, right) || self.can_be_subtype_of(future, right);
+        }
+        if let TypeKind::FutureOr { base } = b.kind() {
+            let future = self.intern_future(base);
+            return self.can_be_subtype_of(left, base) || self.can_be_subtype_of(left, future);
+        }
+
+        // The interface/interface region (type_system.dart:204-278).
+        if let (
+            TypeKind::Interface {
+                decl: left_decl, ..
+            },
+            TypeKind::Interface {
+                decl: right_decl, ..
+            },
+        ) = (a.kind(), b.kind())
+        {
+            // The int/double cross (type_system.dart:223-227) is
+            // observationally dead at this layer — see the doc comment.
+
+            // If the left is an enum, we know the types of all its instances
+            // (type_system.dart:229-241).
+            if self.hierarchy.enum_constant_count(left_decl).is_some() {
+                if self.is_subtype(left, right) {
+                    return true;
+                }
+                let constants_type = self.this_type(left_decl);
+                return self.is_subtype(constants_type, right);
+            }
+
+            if left_decl == right_decl {
+                return self.can_be_subtype_of_interfaces(left, right);
+            }
+
+            // If we know all subtypes of the left, only they can implement
+            // the right (type_system.dart:243-262). Candidates are the left
+            // instantiation itself plus the closed subclass set as
+            // this-types, in the official order.
+            if let Some(subclasses) = self.hierarchy.direct_subclasses(left_decl) {
+                if let Some(as_right) = self.as_instance_of(left, right_decl)
+                    && self.can_be_equal_arguments(as_right, right)
+                {
+                    return true;
+                }
+                for &sub in subclasses {
+                    let sub_ty = self.this_type(sub);
+                    if let Some(as_right) = self.as_instance_of(sub_ty, right_decl)
+                        && self.can_be_equal_arguments(as_right, right)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            // Symmetric: if we know all subtypes of the right, only they can
+            // implement the left (type_system.dart:263-278).
+            if let Some(subclasses) = self.hierarchy.direct_subclasses(right_decl) {
+                if let Some(as_left) = self.as_instance_of(right, left_decl) {
+                    if self.can_be_subtype_of_interfaces(left, as_left) {
+                        return true;
+                    }
+                }
+                for &sub in subclasses {
+                    let sub_ty = self.this_type(sub);
+                    if let Some(as_left) = self.as_instance_of(sub_ty, left_decl)
+                        && self.can_be_subtype_of_interfaces(left, as_left)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        // Record arms (type_system.dart:282-322): a record is neither a
+        // function nor a non-trivial interface, and record/record needs
+        // matching shapes with pairwise compatible fields; everything else
+        // conservatively can.
+        if let TypeKind::Record { .. } = a.kind() {
+            if matches!(b.kind(), TypeKind::Function { .. }) {
+                return false;
+            }
+            if let TypeKind::Interface { decl, .. } = b.kind() {
+                return decl == self.core().object || Some(decl) == self.core().record;
+            }
+        }
+        if let TypeKind::Record { .. } = b.kind() {
+            if matches!(a.kind(), TypeKind::Function { .. }) {
+                return false;
+            }
+            if let TypeKind::Interface { decl, .. } = a.kind() {
+                return decl == self.core().object || Some(decl) == self.core().record;
+            }
+        }
+        if let (TypeKind::Record { shape: sub }, TypeKind::Record { shape: sup }) =
+            (a.kind(), b.kind())
+        {
+            let sub_shape = self.table.record_shape(sub);
+            let sup_shape = self.table.record_shape(sup);
+            if sub_shape.positional.len() != sup_shape.positional.len() {
+                return false;
+            }
+            for i in 0..sub_shape.positional.len() {
+                if !self.can_be_subtype_of(
+                    self.table.arg(sub_shape.positional.offset() + i),
+                    self.table.arg(sup_shape.positional.offset() + i),
+                ) {
+                    return false;
+                }
+            }
+            if sub_shape.named.len() != sup_shape.named.len() {
+                return false;
+            }
+            for i in 0..sub_shape.named.len() {
+                let (x, y) = (sub_shape.named.offset() + i, sup_shape.named.offset() + i);
+                if self.table.named_names_cmp(x, y) != std::cmp::Ordering::Equal {
+                    return false;
+                }
+                if !self.can_be_subtype_of(self.table.named_ty(x), self.table.named_ty(y)) {
+                    return false;
+                }
+            }
+        }
+
+        // Conservative default (type_system.dart:324): dynamic, void, type
+        // parameters, function/function, and every undecided shape answer
+        // "could be".
+        true
+    }
+
+    /// The declaration's "this-type": its instantiation over its own type
+    /// parameters — the `elementThis` of the official closed-subclass scan
+    /// (element.dart:183/:199).
+    fn this_type(&self, decl: TypeDeclId) -> TypeId {
+        let info = self.hierarchy.decl(decl).expect("declared owner");
+        let params = info.type_parameters.clone();
+        let args: Vec<TypeId> = params
+            .iter()
+            .map(|&param| {
+                self.table
+                    .intern(UninternedType::TypeParameter { parameter: param }, false)
+            })
+            .collect();
+        self.table
+            .intern(UninternedType::Interface { decl, args }, false)
+    }
+
+    /// `asInstanceOf` over this-type and instantiated roots: the
+    /// instantiation of `from` viewed as an instance of `target`, walking
+    /// the supertype edges with live substitution — `None` when `target` is
+    /// not a supertype of `from`. Iterative with a visited set; claims a
+    /// pooled walk unit like [`TypeSystem::interface_subtype`].
+    fn as_instance_of(&self, from: TypeId, target: TypeDeclId) -> Option<TypeId> {
+        let TypeKind::Interface {
+            decl: from_decl,
+            args: from_args,
+        } = self.table.get(from).kind()
+        else {
+            return None;
+        };
+        let (mut visited, mut frontier) = match self.walk.try_borrow_mut() {
+            Ok(mut scratch) => {
+                let mut unit = scratch.units.pop().unwrap_or_default();
+                unit.visited.clear();
+                unit.frontier.clear();
+                (unit.visited, unit.frontier)
+            }
+            Err(_) => (StampSet::new(), Vec::new()),
+        };
+        let info = self.hierarchy.decl(from_decl).expect("declared owner");
+        for &edge in &info.supertypes {
+            frontier.push(self.instantiate(edge, info, from_args));
+        }
+        let mut answer = None;
+        while let Some(current) = frontier.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let TypeKind::Interface { decl, args } = self.table.get(current).kind() else {
+                continue;
+            };
+            if decl == target {
+                answer = Some(current);
+                break;
+            }
+            let info = self.hierarchy.decl(decl).expect("declared owner");
+            for &edge in &info.supertypes {
+                frontier.push(self.instantiate(edge, info, args));
+            }
+        }
+        if let Ok(mut scratch) = self.walk.try_borrow_mut() {
+            scratch.units.push(WalkUnit { visited, frontier });
+        }
+        answer
+    }
+
+    /// `canBeSubtypeOfInterfaces` (type_system.dart:213-235): both sides
+    /// instantiate the same element; the answer is the pairwise
+    /// [`TypeSystem::can_be_subtype_of`] over the arguments.
+    fn can_be_subtype_of_interfaces(&self, left: TypeId, right: TypeId) -> bool {
+        let (
+            TypeKind::Interface {
+                args: left_args, ..
+            },
+            TypeKind::Interface {
+                args: right_args, ..
+            },
+        ) = (self.table.get(left).kind(), self.table.get(right).kind())
+        else {
+            return false;
+        };
+        debug_assert_eq!(left_args.len(), right_args.len());
+        for i in 0..left_args.len() {
+            if !self.can_be_subtype_of(
+                self.table.arg(left_args.offset() + i),
+                self.table.arg(right_args.offset() + i),
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `_canBeEqualArguments` (type_system.dart:1786-1802): optimistically,
+    /// same-element instantiations can be equal when every argument pair
+    /// can (`_canBeEqualTo`, type_system.dart:1804-1814 — two interface
+    /// types can be equal only under the same element; everything else
+    /// conservatively can).
+    fn can_be_equal_arguments(&self, left: TypeId, right: TypeId) -> bool {
+        let (
+            TypeKind::Interface {
+                args: left_args, ..
+            },
+            TypeKind::Interface {
+                args: right_args, ..
+            },
+        ) = (self.table.get(left).kind(), self.table.get(right).kind())
+        else {
+            return false;
+        };
+        debug_assert_eq!(left_args.len(), right_args.len());
+        for i in 0..left_args.len() {
+            let a = self.table.arg(left_args.offset() + i);
+            let b = self.table.arg(right_args.offset() + i);
+            let can_equal = match (self.table.get(a).kind(), self.table.get(b).kind()) {
+                (
+                    TypeKind::Interface { decl: decl_a, .. },
+                    TypeKind::Interface { decl: decl_b, .. },
+                ) => decl_a == decl_b,
+                _ => true,
+            };
+            if !can_equal {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Total order on top types (`isMoreTop`, `type_system.dart:1124-1189`).
     #[must_use]
     pub fn is_more_top(&self, t: TypeId, s: TypeId) -> bool {
@@ -1104,5 +1437,396 @@ mod tests {
         assert_eq!(stamps.epoch, 1);
         assert!(stamps.insert(id));
         assert!(!stamps.insert(id));
+    }
+}
+
+/// `can_be_subtype_of` pins and the mutual-exclusion law
+/// (`canBeSubtypeOf ⊇ isSubtypeOf`, type_system.dart:150-330).
+#[cfg(test)]
+mod can_be_subtype_tests {
+    use super::*;
+    use crate::hierarchy::CoreDecls;
+    use crate::ids::{TypeDeclId, TypeParamId};
+    use crate::ty::{NamedMember, UninternedFunction, UninternedRecord};
+
+    const OBJECT: TypeDeclId = TypeDeclId::from_raw(1);
+    const FUTURE: TypeDeclId = TypeDeclId::from_raw(2);
+    const FUNCTION: TypeDeclId = TypeDeclId::from_raw(3);
+    const RECORD: TypeDeclId = TypeDeclId::from_raw(9);
+    const NUM: TypeDeclId = TypeDeclId::from_raw(4);
+    const INT: TypeDeclId = TypeDeclId::from_raw(5);
+    const STRING: TypeDeclId = TypeDeclId::from_raw(6);
+    const SEALED: TypeDeclId = TypeDeclId::from_raw(20);
+    const SUB_A: TypeDeclId = TypeDeclId::from_raw(21);
+    const SUB_B: TypeDeclId = TypeDeclId::from_raw(22);
+    const SEALED_G: TypeDeclId = TypeDeclId::from_raw(23);
+    const SUB_G_A: TypeDeclId = TypeDeclId::from_raw(24);
+    const ENUM: TypeDeclId = TypeDeclId::from_raw(30);
+    const OTHER: TypeDeclId = TypeDeclId::from_raw(40);
+    const BOX: TypeDeclId = TypeDeclId::from_raw(41);
+
+    fn itf(table: &TypeTable, decl: TypeDeclId, args: &[TypeId]) -> TypeId {
+        table.intern(
+            UninternedType::Interface {
+                decl,
+                args: args.to_vec(),
+            },
+            false,
+        )
+    }
+
+    fn nullable(table: &TypeTable, ty: UninternedType) -> TypeId {
+        table.intern(ty, true)
+    }
+
+    fn fixture() -> (TypeTable, TypeHierarchy) {
+        let table = TypeTable::new();
+        let (g, box_e) = (TypeParamId::from_raw(1), TypeParamId::from_raw(2));
+        let g_ty = table.intern(UninternedType::TypeParameter { parameter: g }, false);
+        let hierarchy = TypeHierarchy::builder(CoreDecls {
+            object: OBJECT,
+            future: FUTURE,
+            function: FUNCTION,
+            record: Some(RECORD),
+        })
+        .decl(OBJECT, Vec::new())
+        .decl(FUTURE, vec![box_e])
+        .decl(FUNCTION, Vec::new())
+        .decl(RECORD, Vec::new())
+        .decl(NUM, Vec::new())
+        .decl(INT, Vec::new())
+        .decl(STRING, Vec::new())
+        .decl(SEALED, Vec::new())
+        .decl(SUB_A, Vec::new())
+        .decl(SUB_B, Vec::new())
+        .decl(SEALED_G, vec![g])
+        .decl(SUB_G_A, Vec::new())
+        .decl(ENUM, Vec::new())
+        .decl(OTHER, Vec::new())
+        .decl(BOX, vec![box_e])
+        .supertype(NUM, itf(&table, OBJECT, &[]))
+        .supertype(INT, itf(&table, NUM, &[]))
+        .supertype(STRING, itf(&table, OBJECT, &[]))
+        .supertype(SEALED, itf(&table, OBJECT, &[]))
+        .supertype(SUB_A, itf(&table, SEALED, &[]))
+        .supertype(SUB_B, itf(&table, SEALED, &[]))
+        .supertype(SEALED_G, itf(&table, OBJECT, &[]))
+        .supertype(SUB_G_A, itf(&table, SEALED_G, &[g_ty]))
+        .supertype(ENUM, itf(&table, OBJECT, &[]))
+        .supertype(OTHER, itf(&table, OBJECT, &[]))
+        .supertype(BOX, itf(&table, OBJECT, &[]))
+        .sealed(SEALED)
+        .sealed(SEALED_G)
+        .enumeration(ENUM, 3)
+        .build(&table)
+        .expect("fixture hierarchy is valid");
+        (table, hierarchy)
+    }
+
+    #[test]
+    fn can_be_subtype_of_official_pins() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let int_q = nullable(
+            &table,
+            UninternedType::Interface {
+                decl: INT,
+                args: vec![],
+            },
+        );
+        let num = itf(&table, NUM, &[]);
+        let num_q = nullable(
+            &table,
+            UninternedType::Interface {
+                decl: NUM,
+                args: vec![],
+            },
+        );
+        let string = itf(&table, STRING, &[]);
+        let null = table.intern(UninternedType::Null, false);
+        let never = table.intern(UninternedType::Never, false);
+        let dynamic = table.intern(UninternedType::Dynamic, false);
+        let void_ty = table.intern(UninternedType::Void, false);
+        let object = itf(&table, OBJECT, &[]);
+
+        // The doc example: both directions of the num/int pair.
+        assert!(sys.can_be_subtype_of(num, int));
+        assert!(sys.can_be_subtype_of(int, num));
+        assert!(sys.can_be_subtype_of(int, int));
+
+        // Nullability arms.
+        assert!(sys.can_be_subtype_of(int, int_q));
+        assert!(sys.can_be_subtype_of(int_q, int));
+        assert!(sys.can_be_subtype_of(int_q, int_q));
+        assert!(sys.can_be_subtype_of(num_q, int_q));
+        assert!(!sys.can_be_subtype_of(null, int));
+        assert!(sys.can_be_subtype_of(null, int_q));
+        assert!(sys.can_be_subtype_of(null, null));
+        assert!(sys.can_be_subtype_of(never, int));
+        assert!(sys.can_be_subtype_of(never, never));
+
+        // Unsealed leaves are conservative-true (official parity: neither
+        // side has a closed subtype set, and dynamic/void fall to the
+        // default arm).
+        assert!(sys.can_be_subtype_of(int, string));
+        assert!(sys.can_be_subtype_of(dynamic, int));
+        assert!(sys.can_be_subtype_of(void_ty, object));
+
+        // The sealed closure: only the closed candidate set can implement
+        // the other side.
+        let sealed = itf(&table, SEALED, &[]);
+        let sub_a = itf(&table, SUB_A, &[]);
+        let sub_b = itf(&table, SUB_B, &[]);
+        let other = itf(&table, OTHER, &[]);
+        assert!(sys.can_be_subtype_of(sealed, sub_a));
+        assert!(sys.can_be_subtype_of(sealed, sub_b));
+        assert!(!sys.can_be_subtype_of(sealed, other));
+        assert!(sys.can_be_subtype_of(sub_a, sealed));
+        assert!(!sys.can_be_subtype_of(sealed, num));
+        // Subclasses of a sealed class are themselves open — conservative.
+        assert!(sys.can_be_subtype_of(sub_a, other));
+
+        // Enum-constant enumeration: an enum can be its supertypes and
+        // itself, but not an unrelated sealed class.
+        let enum_ty = itf(&table, ENUM, &[]);
+        assert!(sys.can_be_subtype_of(enum_ty, enum_ty));
+        assert!(sys.can_be_subtype_of(enum_ty, object));
+        assert!(!sys.can_be_subtype_of(enum_ty, sealed));
+        let enum_q = nullable(
+            &table,
+            UninternedType::Interface {
+                decl: ENUM,
+                args: vec![],
+            },
+        );
+        assert!(sys.can_be_subtype_of(enum_q, object));
+        assert!(!sys.can_be_subtype_of(enum_q, sealed));
+
+        // Generic sealed classes: the right-closure walk finds the left
+        // among the candidates (each candidate-as-left is checked against
+        // the left's own arguments — the official is conservative here and
+        // never consults the right's instantiation).
+        let sealed_g_int = itf(&table, SEALED_G, &[int]);
+        let sealed_g_string = itf(&table, SEALED_G, &[string]);
+        let sub_g_a = itf(&table, SUB_G_A, &[]);
+        assert!(sys.can_be_subtype_of(sub_g_a, sealed_g_int));
+        assert!(sys.can_be_subtype_of(sub_g_a, sealed_g_string));
+
+        // Function/interface pairs: functions meet Object and bare
+        // Function; a concrete interface meets a concrete function type
+        // under neither (type_system.dart:182-185 answers `false`), while
+        // the bare-`Function` pair falls to the conservative default.
+        let fn_int = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: int,
+                    type_parameters: Vec::new(),
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                    required_positional: 0,
+                },
+                false,
+            )
+            .expect("valid signature");
+        let bare_function = itf(&table, FUNCTION, &[]);
+        assert!(sys.can_be_subtype_of(fn_int, object));
+        assert!(sys.can_be_subtype_of(fn_int, bare_function));
+        assert!(!sys.can_be_subtype_of(fn_int, int));
+        assert!(!sys.can_be_subtype_of(int, fn_int));
+        assert!(sys.can_be_subtype_of(bare_function, fn_int));
+
+        // Records: never functions; interfaces only at Object/Record.
+        let pair_int = table
+            .intern_record(
+                UninternedRecord {
+                    positional: vec![int],
+                    named: Vec::new(),
+                },
+                false,
+            )
+            .expect("valid shape");
+        let pair_string = table
+            .intern_record(
+                UninternedRecord {
+                    positional: vec![string],
+                    named: Vec::new(),
+                },
+                false,
+            )
+            .expect("valid shape");
+        assert!(sys.can_be_subtype_of(pair_int, pair_int));
+        assert!(sys.can_be_subtype_of(pair_int, pair_string));
+        assert!(!sys.can_be_subtype_of(pair_int, fn_int));
+        assert!(sys.can_be_subtype_of(pair_int, object));
+        let arity_mismatch = table
+            .intern_record(
+                UninternedRecord {
+                    positional: vec![int, int],
+                    named: Vec::new(),
+                },
+                false,
+            )
+            .expect("valid shape");
+        assert!(!sys.can_be_subtype_of(pair_int, arity_mismatch));
+    }
+
+    #[test]
+    fn can_be_subtype_of_futureor_splits() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let string = itf(&table, STRING, &[]);
+        let future_or_int = table.intern(UninternedType::FutureOr { base: int }, false);
+        let future_or_int_q = table.intern(UninternedType::FutureOr { base: int }, true);
+        let future_or_string = table.intern(UninternedType::FutureOr { base: string }, false);
+
+        // `FutureOr<T> = T || Future<T>`: both legs are candidates, in both
+        // directions, and the nullable wrapper only adds `Null`.
+        assert!(sys.can_be_subtype_of(future_or_int, int));
+        assert!(sys.can_be_subtype_of(int, future_or_int));
+        assert!(sys.can_be_subtype_of(future_or_int_q, int));
+        assert!(sys.can_be_subtype_of(future_or_int, string));
+        assert!(sys.can_be_subtype_of(string, future_or_int));
+        // Both FutureOr pairs split into unsealed leaf pairs on at least one
+        // leg (`Future<int>` vs `String`, `int` vs `Future<String>`), and
+        // unsealed leaves are conservatively true.
+        assert!(sys.can_be_subtype_of(future_or_int, future_or_string));
+        assert!(sys.can_be_subtype_of(future_or_string, future_or_int));
+    }
+
+    /// The load-bearing invariant: `isSubtypeOf(a, b) ⇒ canBeSubtypeOf(a, b)`
+    /// over every ordered pair of a corpus spanning all ten kinds. This is
+    /// what keeps "the cast/subtype check is unnecessary" and "the pattern
+    /// never matches" mutually exclusive.
+    #[test]
+    fn mutual_exclusion_law_over_fixture_corpus() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let int_q = nullable(
+            &table,
+            UninternedType::Interface {
+                decl: INT,
+                args: vec![],
+            },
+        );
+        let num = itf(&table, NUM, &[]);
+        let num_q = nullable(
+            &table,
+            UninternedType::Interface {
+                decl: NUM,
+                args: vec![],
+            },
+        );
+        let string = itf(&table, STRING, &[]);
+        let param = TypeParamId::from_raw(9);
+        let t = table.intern(UninternedType::TypeParameter { parameter: param }, false);
+        let t_q = table.intern(UninternedType::TypeParameter { parameter: param }, true);
+        let fn_int = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: int,
+                    type_parameters: Vec::new(),
+                    positional: vec![num],
+                    named: vec![NamedMember {
+                        name: "x".to_string(),
+                        ty: int,
+                        required: true,
+                    }],
+                    required_positional: 1,
+                },
+                false,
+            )
+            .expect("valid signature");
+        let fn_q = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: int,
+                    type_parameters: Vec::new(),
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                    required_positional: 0,
+                },
+                true,
+            )
+            .expect("valid signature");
+        let record = table
+            .intern_record(
+                UninternedRecord {
+                    positional: vec![int],
+                    named: vec![NamedMember {
+                        name: "y".to_string(),
+                        ty: num,
+                        required: false,
+                    }],
+                },
+                false,
+            )
+            .expect("valid shape");
+        let record_q = table
+            .intern_record(
+                UninternedRecord {
+                    positional: vec![int],
+                    named: Vec::new(),
+                },
+                true,
+            )
+            .expect("valid shape");
+
+        let corpus = vec![
+            int,
+            int_q,
+            num,
+            num_q,
+            string,
+            itf(&table, OBJECT, &[]),
+            itf(&table, SEALED, &[]),
+            itf(&table, SUB_A, &[]),
+            itf(&table, SUB_B, &[]),
+            itf(&table, SEALED_G, &[int]),
+            itf(&table, SUB_G_A, &[]),
+            itf(&table, ENUM, &[]),
+            nullable(
+                &table,
+                UninternedType::Interface {
+                    decl: ENUM,
+                    args: vec![],
+                },
+            ),
+            itf(&table, OTHER, &[]),
+            itf(&table, FUNCTION, &[]),
+            itf(&table, BOX, &[int]),
+            table.intern(UninternedType::Null, false),
+            table.intern(UninternedType::Never, false),
+            table.intern(UninternedType::Dynamic, false),
+            table.intern(UninternedType::Void, false),
+            table.intern(UninternedType::Invalid, false),
+            table.intern(UninternedType::FutureOr { base: int }, false),
+            table.intern(UninternedType::FutureOr { base: int }, true),
+            table.intern(UninternedType::FutureOr { base: int_q }, false),
+            t,
+            t_q,
+            fn_int,
+            fn_q,
+            record,
+            record_q,
+        ];
+        for (i, &a) in corpus.iter().enumerate() {
+            for &b in corpus.iter().skip(i) {
+                if sys.is_subtype(a, b) {
+                    assert!(
+                        sys.can_be_subtype_of(a, b),
+                        "law violated: is_subtype({a:?}, {b:?}) but !can_be_subtype_of"
+                    );
+                }
+                if sys.is_subtype(b, a) {
+                    assert!(
+                        sys.can_be_subtype_of(b, a),
+                        "law violated: is_subtype({b:?}, {a:?}) but !can_be_subtype_of"
+                    );
+                }
+            }
+        }
     }
 }

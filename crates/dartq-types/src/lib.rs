@@ -81,21 +81,34 @@
 
 mod error;
 mod exhaustive;
+mod generic_function;
 mod hierarchy;
+mod instantiate_to_bound;
 mod ids;
 mod lub;
+mod provably;
 mod suffix;
 mod system;
 mod table;
 mod ty;
+mod variance;
 
 pub use error::TypeError;
 pub use exhaustive::{
     BaseTy, Case, Exhaustiveness, ExhaustivenessWorld, Key, Report, Single, Space, TypedModel,
     TypedNames, TypedTy, Witness, compute,
 };
+pub use generic_function::{
+    Boundedness, TypeArgumentIssue, instantiate_function, is_well_bounded, regular_bounded_issues,
+    replace_top_bottom,
+};
 pub use hierarchy::{CoreDecls, DeclInfo, TypeHierarchy, TypeHierarchyBuilder};
 pub use ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
+pub use instantiate_to_bound::{
+    BoundsInstantiation, get_free_parameters, instantiate_interface_to_bounds,
+    instantiate_type_formals_to_bounds,
+};
+pub use provably::TypeCheckVerdict;
 pub use suffix::NullabilitySuffix;
 pub use system::TypeSystem;
 pub use table::TypeTable;
@@ -103,3 +116,4 @@ pub use ty::{
     FunctionSigData, NamedMember, PoolRange, RecordShapeData, Type, TypeKind, UninternedFunction,
     UninternedRecord, UninternedType,
 };
+pub use variance::{ParamFacts, ParamFactsTable, Variance, arguments_related, variance_in_type};

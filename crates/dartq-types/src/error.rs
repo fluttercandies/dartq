@@ -104,4 +104,27 @@ pub enum TypeError {
         /// The number of positional parameters.
         total: usize,
     },
+
+    /// A generic-function instantiation was handed a type that is not a
+    /// function type (`FunctionTypeImpl.instantiate` is a function-type
+    /// method, `type.dart:308`).
+    #[error("generic instantiation requires a function type, got {actual:?}")]
+    NotFunctionType {
+        /// The kind that was supplied instead.
+        actual: TypeKind,
+    },
+
+    /// A generic-function instantiation received the wrong number of type
+    /// arguments — the official `ArgumentError`
+    /// (`type.dart:311-315`).
+    #[error(
+        "type argument count {actual} does not match the {expected} type \
+         parameter(s) of the function type"
+    )]
+    FunctionInstantiationArity {
+        /// The signature's type-parameter count.
+        expected: usize,
+        /// The supplied argument count.
+        actual: usize,
+    },
 }
