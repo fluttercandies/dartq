@@ -7,6 +7,7 @@
 library;
 
 import 'diagnostic.dart';
+import 'edits.dart';
 import 'frame.dart';
 import 'plugin_config.dart';
 
@@ -30,12 +31,21 @@ typedef EngineDiagnosticsHandler = List<PluginDiagnostic> Function(
   List<PluginDiagnostic> engineDiagnostics,
 );
 
+/// Signature of the hook serving the core's `request/fixes` (only called
+/// when the session is ready). Pure function: the returned changes are
+/// serialized into the reply frame, best (lowest priority) first.
+typedef FixesHandler = List<PrioritizedChange> Function(
+  String file,
+  int offset,
+  int length,
+);
+
 /// Drives one plugin session: answers the core's `initialize`,
 /// `request/fixes`, and `shutdown`, feeds the engine's diagnostics to the
 /// plugin, and frames the plugin's diagnostics for delivery.
 class PluginSession {
   /// Builds a session for a plugin described by [config].
-  PluginSession({required this.config, this.onEngineDiagnostics});
+  PluginSession({required this.config, this.onEngineDiagnostics, this.onRequestFixes});
 
   /// The plugin this session serves (its capabilities are advertised during
   /// the handshake).
@@ -44,6 +54,12 @@ class PluginSession {
   /// Called with each engine diagnostics batch the core pushes. Optional:
   /// plugins that only serve `request/fixes` need no subscription.
   final EngineDiagnosticsHandler? onEngineDiagnostics;
+
+  /// Called for each `request/fixes` the core sends. Optional: a plugin
+  /// without a fixes handler answers with the empty set — the protocol
+  /// layer is complete either way; serving real fixes needs the engine
+  /// Query API (PRD section 14.2).
+  final FixesHandler? onRequestFixes;
 
   final List<PluginFrame> _outbound = <PluginFrame>[];
 
@@ -160,10 +176,24 @@ class PluginSession {
         'request/fixes is only valid after initialize completes',
       );
     }
-    // Serving real fixes needs the engine Query API (PRD section 14.2),
-    // which lands with the engine-side wiring; until then the honest answer
-    // for any location is the empty set — the protocol layer is complete.
-    return PluginFrame.request(id, frame.method, {'fixes': const []});
+    final handler = onRequestFixes;
+    if (handler == null) {
+      // No fixes handler: the honest answer for any location is the empty
+      // set (real fixes need the engine Query API, PRD section 14.2).
+      return PluginFrame.request(id, frame.method, {'fixes': const <Object?>[]});
+    }
+    final file = frame.params['file'];
+    final offset = frame.params['offset'];
+    final length = frame.params['length'];
+    if (file is! String || offset is! int || length is! int) {
+      throw const PluginProtocolException(
+        'request/fixes payload requires string `file`, int `offset`, int `length`',
+      );
+    }
+    final changes = handler(file, offset, length);
+    return PluginFrame.request(id, frame.method, {
+      'fixes': [for (final change in changes) change.toJson()],
+    });
   }
 
   PluginFrame _handleShutdown(int id, PluginFrame frame) {

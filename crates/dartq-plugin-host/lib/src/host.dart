@@ -18,7 +18,8 @@ import 'plugin_session.dart';
 /// from [config], and writes each reply line through [send] (one JSON line,
 /// without the trailing newline). Plugin-emitted diagnostics go through
 /// [onEngineDiagnostics] (its return value is sent back as
-/// `notification/diagnostic` frames).
+/// `notification/diagnostic` frames); `request/fixes` is served by
+/// [onRequestFixes].
 ///
 /// Throws on the first wire-contract violation (malformed UTF-8/JSON,
 /// foreign schema version, oversize frame); the process must then exit —
@@ -28,10 +29,12 @@ Future<void> runPluginHost(
   required Stream<List<int>> input,
   required Future<void> Function(String line) send,
   EngineDiagnosticsHandler? onEngineDiagnostics,
+  FixesHandler? onRequestFixes,
 }) async {
   final session = PluginSession(
     config: config,
     onEngineDiagnostics: onEngineDiagnostics,
+    onRequestFixes: onRequestFixes,
   );
   final buffer = BytesBuilder(copy: false);
   await for (final chunk in input) {

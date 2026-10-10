@@ -196,10 +196,27 @@ pub const DARTQ_MISSING_GENERATED_SOURCE: CodeInfo = CodeInfo::new(
     DiagnosticType::Tool,
     false,
 );
+/// A plugin process died or broke the wire contract (PRD §14.3 crash and
+/// memory isolation; the restart budget's exhaustion is the terminal form).
+pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
+    "dartiq/plugin_crashed",
+    "DARTQ/PLUGIN_CRASHED",
+    DiagnosticType::Tool,
+    false,
+);
+/// A plugin overran a wall-clock deadline (handshake/shutdown request budget
+/// or the per-callback budget on `request/fixes`); the child is killed
+/// (PRD §14.3 CPU and IPC rows).
+pub const DARTQ_PLUGIN_TIMEOUT: CodeInfo = CodeInfo::new(
+    "dartiq/plugin_timeout",
+    "DARTQ/PLUGIN_TIMEOUT",
+    DiagnosticType::Tool,
+    false,
+);
 
 /// The hand-written codes above: M0-measured families outside the generated
 /// table, plus the dartq-own namespace.
-const OWN_CODES: [CodeInfo; 12] = [
+const OWN_CODES: [CodeInfo; 14] = [
     DUPLICATE_DEFINITION,
     AWAIT_IN_WRONG_CONTEXT,
     URI_DOES_NOT_EXIST,
@@ -212,6 +229,8 @@ const OWN_CODES: [CodeInfo; 12] = [
     DARTQ_INTERNAL_ERROR,
     DARTQ_MEMORY_DEGRADED,
     DARTQ_MISSING_GENERATED_SOURCE,
+    DARTQ_PLUGIN_CRASHED,
+    DARTQ_PLUGIN_TIMEOUT,
 ];
 
 /// Name → [`CodeInfo`] lookup over the builtin code set (generated official

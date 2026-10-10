@@ -69,8 +69,14 @@ pub enum Incoming {
     Initialized(CapabilitySet),
     /// A `notification/diagnostic` produced by the plugin.
     Diagnostic(PluginDiagnostic),
-    /// The reply to a `request/fixes`.
-    Fixes(FixesReply),
+    /// The reply to a `request/fixes`; carries the correlation id the
+    /// runtime awaits on.
+    Fixes {
+        /// The request id this reply completes.
+        id: u64,
+        /// The parsed reply payload.
+        reply: FixesReply,
+    },
     /// The `shutdown` reply was accepted; the session is over.
     ShutdownComplete,
 }
@@ -398,7 +404,7 @@ impl Session {
             (MethodKind::Fixes, SessionState::Ready) => {
                 let reply: FixesReply = parse_payload(&frame)?;
                 self.outstanding.remove(pos);
-                Ok(Incoming::Fixes(reply))
+                Ok(Incoming::Fixes { id, reply })
             }
             (MethodKind::Shutdown, SessionState::AwaitingShutdownReply) => {
                 self.outstanding.remove(pos);
@@ -647,7 +653,11 @@ mod tests {
         );
         let reply = Frame::request(request.id.expect("id"), METHOD_REQUEST_FIXES, fixes);
         match session.handle(reply).expect("handle") {
-            Incoming::Fixes(FixesReply { fixes }) => {
+            Incoming::Fixes {
+                id,
+                reply: FixesReply { fixes },
+            } => {
+                assert_eq!(id, request.id.expect("id"));
                 assert_eq!(fixes.len(), 1);
                 assert_eq!(fixes[0].message, "add const");
                 assert_eq!(fixes[0].edits[0].replacement, "const x");

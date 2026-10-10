@@ -17,17 +17,33 @@
 //!   [`CodeInfo`]s are `&'static`-interned, so namespacing plugin codes into
 //!   the engine's diagnostic set is the daemon/CLI output layer's job
 //!   (PRD §14 fix sources), not the transport's.
+//! - [`PluginRuntime::request_fixes`] is the fix face: it sends
+//!   `request/fixes` and awaits the reply under the manifest's callback
+//!   budget (§14.3 CPU row, default 5 s). An overrun kills the child and
+//!   consumes the restart budget, surfacing
+//!   [`RuntimeError::CallbackTimeout`].
 //!
 //! [`PluginRuntime::stats`] is the §14.3 observability face (peak RSS, frame
 //! and byte counters, guard drops, restart count) the daemon/CLI read.
+//! [`crash_diagnostic`] converts a terminal [`RuntimeError`] into the
+//! `dartiq/`-namespace [`Diagnostic`] the output layer merges (PRD §14.3:
+//! a plugin failure is one tool diagnostic, never an engine failure).
+//!
+//! # Discovery
+//!
+//! [`crate::discovery`] turns an on-disk workspace into spawn-ready
+//! manifests (the `<workspace>/plugins/*/dartq_plugin.json` convention plus
+//! explicit override paths); each hit launches through
+//! [`SpawnSpec::dart`].
 //!
 //! # PRD §14.3 conformance
 //!
 //! | Dimension | Mechanism here |
 //! | --- | --- |
 //! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. |
-//! | CPU / IPC | Per-callback wall-clock enforcement needs the `request/fixes` surface (not exposed on the runtime yet — no fix requests are sent this milestone); `initialize` and `shutdown` already run under the manifest's request deadline. |
-//! | Crash | Child death never propagates: the runtime relaunches within the manifest's retry budget (counted in `stats.restarts`), then reports [`RuntimeError::Crashed`]. The `plugin_crashed` diagnostic itself is emitted by the daemon layer, which owns the output merge. |
+//! | CPU | `request/fixes` awaits its reply under the manifest's `callback_ms`; an overrun kills the child and consumes the restart budget. |
+//! | IPC | `initialize` and `shutdown` run under the manifest's `request_ms`; every stdin write is bounded by the same deadline (writer thread). |
+//! | Crash | Child death never propagates: the runtime relaunches within the manifest's retry budget (counted in `stats.restarts`), then reports [`RuntimeError::Crashed`] — the terminal form names the exhausted budget. |
 //! | Frame guard | Lines beyond [`MAX_FRAME_SIZE`] are dropped before buffering (counted) and tear the session down — the transport never resynchronizes. |
 //!
 //! # Threading (std threads only, per the workspace runtime policy)
@@ -35,15 +51,20 @@
 //! Per generation (one child process): a reader thread owns the child's
 //! stdout, the [`Session`] state machine (behind a mutex shared with the
 //! handle), and the pending-diagnostics buffer; a monitor thread samples RSS
-//! and enforces the memory budget; the handle thread does every stdin write
-//! (`&mut self` makes it the only writer). All shared counters are atomics;
-//! the only cross-thread locks are the two leaf mutexes (session, pending)
-//! and the child handle, never nested.
+//! and enforces the memory budget; a writer thread owns the child's stdin
+//! and is the only process writing to it — the handle (`&mut self`) feeds it
+//! frames and awaits per-write acks, which bounds every write without ever
+//! blocking the handle on a full pipe. All shared counters are atomics; the
+//! only cross-thread locks are the three leaf mutexes (session, pending,
+//! child) and the death slot, never nested.
 //!
 //! # Known bounds
 //!
-//! - A stdin write blocks when the child stops reading and the 64 KiB pipe
-//!   fills; write-side timeouts arrive with the daemon's request loop.
+//! - The stdin write deadline is the manifest's `request_ms` — a plugin that
+//!   stops draining its input pipe is killed as a protocol violation, but
+//!   the kill (like every crash path) restarts lazily at the next
+//!   interaction. `request_fixes` alone restarts eagerly, so its
+//!   `stats.restarts` consumption is observable at the error site.
 //! - `feed` skips unknown [`FileId`]s (a caller-contract violation, same
 //!   posture as `FileLayoutProvider`) rather than failing a whole batch.
 
@@ -56,8 +77,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dartq_diagnostics::{Diagnostic, Severity as EngineSeverity};
-use dartq_source::FileTable;
+use dartq_diagnostics::{
+    DARTQ_PLUGIN_CRASHED, DARTQ_PLUGIN_TIMEOUT, Diagnostic, Severity as EngineSeverity, SourceRange,
+};
+use dartq_source::{FileId, FileTable};
 use memchr::memchr;
 use thiserror::Error;
 
@@ -65,7 +88,7 @@ use crate::capability::CapabilitySet;
 use crate::frame::{Frame, MAX_FRAME_SIZE, ProtocolError, decode_line, encode_frame};
 use crate::manifest::Manifest;
 use crate::session::{
-    Incoming, PluginDiagnostic, Session, SessionError, SessionState, Severity,
+    FixesReply, Incoming, PluginDiagnostic, Session, SessionError, SessionState, Severity,
     engine_diagnostics_frame,
 };
 use crate::stats::{PluginStats, PluginStatsSnapshot};
@@ -156,6 +179,15 @@ pub enum RuntimeError {
         /// The enforced budget in milliseconds.
         ms: u64,
     },
+    /// The plugin overran the manifest's `callback_ms` budget on
+    /// `request/fixes` (§14.3 CPU row): the child was killed and one restart
+    /// consumed; the terminal form when the budget is spent is
+    /// [`RuntimeError::Crashed`].
+    #[error("plugin `request/fixes` timed out after {ms} ms (callback budget)")]
+    CallbackTimeout {
+        /// The enforced callback budget in milliseconds.
+        ms: u64,
+    },
     /// The plugin violated the wire contract or died; after the restart
     /// budget is exhausted this is terminal.
     #[error("plugin crashed: {reason}")]
@@ -179,10 +211,22 @@ pub enum RuntimeError {
 enum ProtocolEvent {
     /// The `initialize` reply was accepted.
     Initialized(CapabilitySet),
+    /// The `request/fixes` reply with the correlation id it completes.
+    FixesReply { id: u64, reply: FixesReply },
     /// The `shutdown` reply was accepted.
     ShutdownComplete,
     /// The session ended abnormally (protocol violation or lost stream).
     Dead(String),
+}
+
+/// One command to the per-generation writer thread (the only stdin writer).
+enum WriterCommand {
+    /// Write one encoded frame (the trailing newline included) and ack the
+    /// outcome.
+    Write(Vec<u8>),
+    /// Drop the stdin handle: the EOF that ends the host's read loop during
+    /// a graceful shutdown.
+    Close,
 }
 
 /// One live plugin: child process, session, isolation monitor, counters.
@@ -194,12 +238,14 @@ enum ProtocolEvent {
 pub struct PluginRuntime {
     spec: SpawnSpec,
     request_timeout: Duration,
+    callback_timeout: Duration,
     restart_budget: u32,
     memory_cap_bytes: u64,
 
     // Per generation (one child process); replaced on every launch.
     session: Arc<Mutex<Session>>,
-    stdin: Option<ChildStdin>,
+    commands: Option<Sender<WriterCommand>>,
+    acks: mpsc::Receiver<std::io::Result<()>>,
     child: Arc<Mutex<Option<Child>>>,
     events: mpsc::Receiver<ProtocolEvent>,
     pending: Arc<Mutex<Vec<PluginDiagnostic>>>,
@@ -207,6 +253,7 @@ pub struct PluginRuntime {
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
     reader: Option<JoinHandle<()>>,
+    writer: Option<JoinHandle<()>>,
     monitor: Option<JoinHandle<()>>,
     negotiated: Option<CapabilitySet>,
 
@@ -231,6 +278,7 @@ impl PluginRuntime {
     /// wire contract, plus the codec/session error variants.
     pub fn spawn(spec: SpawnSpec) -> Result<Self, RuntimeError> {
         let request_timeout = Duration::from_millis(spec.manifest.timeouts.request_ms);
+        let callback_timeout = Duration::from_millis(spec.manifest.timeouts.callback_ms);
         let restart_budget = spec.manifest.timeouts.request_retries;
         let memory_cap_bytes = u64::from(spec.manifest.memory_budget_mb) * 1024 * 1024;
         let (events_tx, events) = mpsc::channel();
@@ -238,10 +286,12 @@ impl PluginRuntime {
         let mut runtime = Self {
             spec,
             request_timeout,
+            callback_timeout,
             restart_budget,
             memory_cap_bytes,
             session: Arc::new(Mutex::new(Session::new(CapabilitySet::all()))),
-            stdin: None,
+            commands: None,
+            acks: mpsc::channel().1,
             child: Arc::new(Mutex::new(None)),
             events,
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -249,6 +299,7 @@ impl PluginRuntime {
             alive: Arc::new(AtomicBool::new(false)),
             death: Arc::new(Mutex::new(None)),
             reader: None,
+            writer: None,
             monitor: None,
             negotiated: None,
             stats: Arc::new(PluginStats::default()),
@@ -330,6 +381,85 @@ impl PluginRuntime {
         }
     }
 
+    /// Sends `request/fixes` for `file` at the given UTF-16 range and awaits
+    /// the reply under the manifest's `callback_ms` budget (§14.3 CPU row).
+    /// Requires the `fix` capability to have been negotiated.
+    ///
+    /// A child that died since the last call is restarted here (within
+    /// budget) before the request. An overrun kill consumes one restart and
+    /// relaunches before the error surfaces, so the next call meets a fresh
+    /// child; a spent restart budget turns the failure into the terminal
+    /// [`RuntimeError::Crashed`].
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::CallbackTimeout`] when the reply misses the callback
+    /// budget (child killed and restarted), [`RuntimeError::Crashed`] when
+    /// the child dies or breaks the contract mid-request, session errors for
+    /// a non-ready session or an unnegotiated `fix` capability, plus
+    /// transport failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an internal mutex is poisoned — a thread panicked while
+    /// holding it, a program bug, not a plugin failure.
+    pub fn request_fixes(
+        &mut self,
+        file: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<FixesReply, RuntimeError> {
+        self.ensure_alive()?;
+        let frame = self
+            .session
+            .lock()
+            .expect("session lock")
+            .send_fixes_request(file, offset, length)?;
+        let request_id = frame.id.expect("fixes requests carry an id");
+        self.write_frame(&frame)?;
+
+        let callback_ms = self.callback_timeout.as_millis();
+        let deadline = Instant::now() + self.callback_timeout;
+        match self
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(ProtocolEvent::FixesReply { id, reply }) => {
+                if id != request_id {
+                    return Err(RuntimeError::Crashed {
+                        reason: format!(
+                            "`request/fixes` reply id {id} does not match the outstanding \
+                             request {request_id}"
+                        ),
+                    });
+                }
+                Ok(reply)
+            }
+            Ok(ProtocolEvent::Dead(reason)) => Err(RuntimeError::Crashed { reason }),
+            Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
+                reason: "plugin re-handshaked mid-session".to_owned(),
+            }),
+            Ok(ProtocolEvent::ShutdownComplete) => Err(RuntimeError::Crashed {
+                reason: "plugin answered shutdown before request/fixes".to_owned(),
+            }),
+            Err(RecvTimeoutError::Timeout) => {
+                // §14.3 CPU row: a callback that overruns its budget is a
+                // misbehaving child — kill it and consume one restart so the
+                // consumption is observable at this error site.
+                let reason = format!(
+                    "`request/fixes` was not answered within the {callback_ms} ms callback budget"
+                );
+                *self.death.lock().expect("death lock") = Some(reason);
+                self.kill_child();
+                self.ensure_alive()?;
+                Err(RuntimeError::CallbackTimeout {
+                    ms: u64::try_from(callback_ms).unwrap_or(u64::MAX),
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
+        }
+    }
+
     /// The isolation metrics snapshot (PRD §14.3).
     #[must_use]
     pub fn stats(&self) -> PluginStatsSnapshot {
@@ -370,6 +500,12 @@ impl PluginRuntime {
             Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
                 reason: "plugin re-handshaked mid-session".to_owned(),
             }),
+            // Unreachable through the session machine (shutdown is sent only
+            // from Ready with the fixes reply already consumed); a stray
+            // reply is a contract break like any other.
+            Ok(ProtocolEvent::FixesReply { .. }) => Err(RuntimeError::Crashed {
+                reason: "unsolicited request/fixes reply".to_owned(),
+            }),
             Err(RecvTimeoutError::Timeout) => {
                 self.kill_child();
                 Err(RuntimeError::ShutdownTimeout {
@@ -381,8 +517,18 @@ impl PluginRuntime {
         if outcome.is_ok() {
             // Session over (wire contract). Closing stdin first is what ends
             // the host's read loop and its process; reaping before that would
-            // wait on a child that is waiting on our EOF.
-            self.stdin = None;
+            // wait on a child that is waiting on our EOF. The writer thread
+            // owns the handle, so the close is a command to it.
+            if let Some(commands) = &self.commands
+                && commands.send(WriterCommand::Close).is_ok()
+            {
+                // The writer is idle here (the last write acked); the deadline
+                // only keeps a pathological ack from stalling teardown.
+                let _ = self.acks.recv_timeout(
+                    self.request_deadline()
+                        .saturating_duration_since(Instant::now()),
+                );
+            }
             self.join_generation();
             self.reap_child();
         }
@@ -443,9 +589,12 @@ impl PluginRuntime {
         self.alive = Arc::new(AtomicBool::new(true));
         self.death = Arc::new(Mutex::new(None));
         self.negotiated = None;
-        self.stdin = Some(stdin);
         *self.child.lock().expect("child lock") = Some(child);
 
+        let (commands, commands_rx) = mpsc::channel();
+        let (acks, acks_rx) = mpsc::channel();
+        self.commands = Some(commands);
+        self.acks = acks_rx;
         self.reader = Some(spawn_reader(
             stdout,
             Arc::clone(&self.session),
@@ -455,12 +604,14 @@ impl PluginRuntime {
             Arc::clone(&self.death),
             Arc::clone(&self.stats),
         ));
+        self.writer = Some(spawn_writer(stdin, commands_rx, acks));
         self.monitor = Some(spawn_monitor(
             pid,
             self.memory_cap_bytes,
             Arc::clone(&self.child),
             Arc::clone(&self.running),
             Arc::clone(&self.alive),
+            Arc::clone(&self.death),
             Arc::clone(&self.stats),
         ));
 
@@ -483,6 +634,12 @@ impl PluginRuntime {
             Ok(ProtocolEvent::ShutdownComplete) => Err(RuntimeError::Crashed {
                 reason: "plugin answered shutdown before initialize".to_owned(),
             }),
+            // Unreachable through the session machine (no fixes request is
+            // outstanding during the handshake); a stray reply is a contract
+            // break like any other.
+            Ok(ProtocolEvent::FixesReply { .. }) => Err(RuntimeError::Crashed {
+                reason: "unsolicited request/fixes reply".to_owned(),
+            }),
             Err(RecvTimeoutError::Timeout) => {
                 self.kill_child();
                 Err(RuntimeError::HandshakeTimeout {
@@ -493,14 +650,19 @@ impl PluginRuntime {
         }
     }
 
-    /// Stops the monitor, reaps the child, joins the reader — for the
-    /// generation being replaced. Must run before a new launch overwrites
-    /// the per-generation fields.
+    /// Stops the monitor, reaps the child, joins the reader and writer — for
+    /// the generation being replaced. Must run before a new launch overwrites
+    /// the per-generation fields. The writer's command channel is dropped
+    /// first so a parked writer exits even when the kill cannot unblock it.
     fn teardown_generation(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.commands = None;
         self.kill_child();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
         // Monitors exit within one poll tick; they hold only their own
         // generation's Arcs and are detached here.
@@ -509,8 +671,12 @@ impl PluginRuntime {
 
     fn join_generation(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.commands = None;
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
         if let Some(monitor) = self.monitor.take() {
             let _ = monitor.join();
@@ -518,14 +684,16 @@ impl PluginRuntime {
     }
 
     /// Kills the child and reaps it (kill on an exited child is a no-op
-    /// error; the `wait` is what prevents zombies).
+    /// error; the `wait` is what prevents zombies). Also flips `alive`: the
+    /// killer knows the death deterministically, the reader's EOF only later
+    /// — and a write into the dead child's pipe must never be attempted.
     fn kill_child(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
         let child = self.child.lock().expect("child lock").take();
         if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.stdin = None;
     }
 
     fn reap_child(&mut self) {
@@ -533,16 +701,17 @@ impl PluginRuntime {
         if let Some(mut child) = child {
             let _ = child.wait();
         }
-        self.stdin = None;
     }
 
     fn crash_error(&self) -> RuntimeError {
-        let reason = self
-            .death
-            .lock()
-            .expect("death lock")
-            .clone()
-            .unwrap_or_else(|| "plugin process is no longer alive".to_owned());
+        let death = self.death.lock().expect("death lock").clone();
+        let mut reason = death.unwrap_or_else(|| "plugin process is no longer alive".to_owned());
+        if self.restarts_used >= self.restart_budget {
+            reason = format!(
+                "{reason}; restart budget of {} exhausted",
+                self.restart_budget
+            );
+        }
         RuntimeError::Crashed { reason }
     }
 
@@ -550,17 +719,46 @@ impl PluginRuntime {
         Instant::now() + self.request_timeout
     }
 
-    /// The only writer: the handle thread (`&mut self`).
+    /// Sends one frame through the writer thread and awaits its ack under
+    /// the request deadline. The only stdin writer is the writer thread, so
+    /// a child that stops draining its pipe blocks that thread — never the
+    /// handle — and the deadline turns the stall into a protocol violation:
+    /// the child is killed, the death recorded, and the restart happens at
+    /// the caller's next interaction (like every crash path).
+    ///
+    /// # Errors
+    ///
+    /// Codec failures, [`RuntimeError::Crashed`] on a write deadline overrun
+    /// or a dead writer, and transport I/O errors acked by the writer.
     fn write_frame(&mut self, frame: &Frame) -> Result<(), RuntimeError> {
         let mut bytes = encode_frame(frame)?.into_bytes();
         bytes.push(b'\n');
-        let stdin = self.stdin.as_mut().expect("stdin present while alive");
-        stdin.write_all(&bytes)?;
-        stdin.flush()?;
-        self.stats.frame_out();
-        self.stats
-            .bytes_out(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        Ok(())
+        let byte_len = bytes.len();
+        let commands = self.commands.as_ref().expect("writer present while alive");
+        if commands.send(WriterCommand::Write(bytes)).is_err() {
+            // The writer exited: the generation is winding down.
+            return Err(self.crash_error());
+        }
+        match self.acks.recv_timeout(self.request_timeout) {
+            Ok(Ok(())) => {
+                self.stats.frame_out();
+                self.stats
+                    .bytes_out(u64::try_from(byte_len).unwrap_or(u64::MAX));
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e.into()),
+            Err(RecvTimeoutError::Timeout) => {
+                let reason = format!(
+                    "plugin stopped reading its input pipe (stdin write exceeded the {} ms \
+                     request budget)",
+                    self.request_timeout.as_millis()
+                );
+                *self.death.lock().expect("death lock") = Some(reason);
+                self.kill_child();
+                Err(self.crash_error())
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
+        }
     }
 }
 
@@ -666,14 +864,49 @@ fn run_reader(
                 let _ = events.send(ProtocolEvent::ShutdownComplete);
                 return Ok(());
             }
-            // The runtime never sends `request/fixes`; a matching reply id
-            // cannot exist, so the session machine would have errored first.
-            Ok(Incoming::Fixes(_)) => {
-                return Err("unsolicited request/fixes reply".to_owned());
+            Ok(Incoming::Fixes { id, reply }) => {
+                let _ = events.send(ProtocolEvent::FixesReply { id, reply });
             }
             Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+/// Spawns the per-generation stdin writer: the only thread writing to the
+/// child, so a full pipe blocks it instead of the runtime handle, and the
+/// handle-side deadline in [`PluginRuntime::write_frame`] bounds every write.
+fn spawn_writer(
+    mut stdin: ChildStdin,
+    commands: mpsc::Receiver<WriterCommand>,
+    acks: Sender<std::io::Result<()>>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("dartq-plugin-writer".to_owned())
+        .spawn(move || {
+            while let Ok(command) = commands.recv() {
+                match command {
+                    WriterCommand::Write(bytes) => {
+                        let outcome = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+                        let alive = outcome.is_ok();
+                        // Unbounded channel: the ack never blocks the writer,
+                        // so a failed write still lets the thread exit even
+                        // when the handle stopped listening.
+                        let _ = acks.send(outcome);
+                        if !alive {
+                            return; // pipe broken; the generation is over
+                        }
+                    }
+                    // Graceful shutdown: dropping the handle is the EOF that
+                    // ends the host's read loop.
+                    WriterCommand::Close => {
+                        drop(stdin);
+                        let _ = acks.send(Ok(()));
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn writer thread")
 }
 
 fn spawn_monitor(
@@ -682,6 +915,7 @@ fn spawn_monitor(
     child: Arc<Mutex<Option<Child>>>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    death: Arc<Mutex<Option<String>>>,
     stats: Arc<PluginStats>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -694,8 +928,16 @@ fn spawn_monitor(
                         stats.observe_rss(rss);
                         if rss > memory_cap_bytes {
                             // §14.3 memory enforcement: over-budget child
-                            // dies; the reader's EOF turns this into the
-                            // ordinary crash/restart path.
+                            // dies. Record the cause so the crash diagnostic
+                            // can name the memory row, and flip `alive` so
+                            // the next interaction restarts instead of
+                            // writing into the dying pipe; the reader's EOF
+                            // turns this into the ordinary crash path.
+                            *death.lock().expect("death lock") = Some(format!(
+                                "RSS sample {rss} exceeded the {memory_cap_bytes}-byte \
+                                 memory budget"
+                            ));
+                            alive.store(false, Ordering::Relaxed);
                             if let Some(mut child) = child.lock().expect("child lock").take() {
                                 let _ = child.kill();
                                 let _ = child.wait();
@@ -808,6 +1050,56 @@ fn wire_diagnostics(diagnostics: &[Diagnostic], files: &FileTable) -> Vec<Plugin
         .collect()
 }
 
+/// Converts a runtime failure into the `dartiq/`-namespace engine diagnostic
+/// the output layer merges (PRD §14.3: a plugin failure costs one tool
+/// diagnostic, never engine state). Deadline overruns map to
+/// `dartiq/plugin_timeout`, everything else — process death, wire
+/// violations, restart-budget exhaustion, spawn failures — to
+/// `dartiq/plugin_crashed`, with the underlying cause in the message.
+///
+/// The diagnostic points at `anchor`, a `FileId` the caller chooses (plugin
+/// failures are tool-level, not file-level). Plugin *findings* stay
+/// wire-form (`PluginDiagnostic`): engine `CodeInfo`s are `&'static`-interned,
+/// so namespacing runtime-owned plugin codes is the daemon merge's job, not
+/// this conversion's.
+#[must_use]
+pub fn crash_diagnostic(plugin: &str, error: &RuntimeError, anchor: FileId) -> Diagnostic {
+    let (code, reason) = match error {
+        RuntimeError::HandshakeTimeout { ms } => (
+            DARTQ_PLUGIN_TIMEOUT,
+            format!("handshake did not complete within {ms} ms"),
+        ),
+        RuntimeError::ShutdownTimeout { ms } => (
+            DARTQ_PLUGIN_TIMEOUT,
+            format!("shutdown did not complete within {ms} ms"),
+        ),
+        RuntimeError::CallbackTimeout { ms } => (
+            DARTQ_PLUGIN_TIMEOUT,
+            format!("`request/fixes` was not answered within {ms} ms (callback budget)"),
+        ),
+        RuntimeError::Crashed { reason } => (DARTQ_PLUGIN_CRASHED, reason.clone()),
+        RuntimeError::Spawn { .. } | RuntimeError::Wire(_) => {
+            (DARTQ_PLUGIN_CRASHED, error.to_string())
+        }
+        // Session state-machine failures and pipe errors surface only through
+        // the killed-session paths above in practice; as a diagnostic they
+        // are still crashes.
+        RuntimeError::Protocol(e) => (DARTQ_PLUGIN_CRASHED, e.to_string()),
+        RuntimeError::Io(e) => (DARTQ_PLUGIN_CRASHED, e.to_string()),
+    };
+    Diagnostic::new(
+        EngineSeverity::Error,
+        code,
+        format!("plugin `{plugin}`: {reason}"),
+        anchor,
+        SourceRange {
+            offset: 0,
+            length: 0,
+        },
+        None,
+    )
+}
+
 // --- bounded line reader ---
 
 /// Outcome of one bounded line read.
@@ -863,6 +1155,36 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn crash_diagnostic_namespaces_deadline_and_death_failures() {
+        let anchor = {
+            let mut files = FileTable::new();
+            files.intern(Path::new("lib/main.dart"))
+        };
+        let timeout =
+            crash_diagnostic("slow", &RuntimeError::CallbackTimeout { ms: 5_000 }, anchor);
+        assert_eq!(timeout.code, DARTQ_PLUGIN_TIMEOUT);
+        assert_eq!(timeout.code.name, "dartiq/plugin_timeout");
+        assert_eq!(timeout.severity, EngineSeverity::Error);
+        assert_eq!(timeout.file, anchor);
+        assert!(
+            timeout.message.contains("slow") && timeout.message.contains("5000"),
+            "message names the plugin and the budget: {}",
+            timeout.message
+        );
+
+        let crashed = crash_diagnostic(
+            "dies",
+            &RuntimeError::Crashed {
+                reason: "plugin process closed the connection".to_owned(),
+            },
+            anchor,
+        );
+        assert_eq!(crashed.code, DARTQ_PLUGIN_CRASHED);
+        assert_eq!(crashed.code.name, "dartiq/plugin_crashed");
+        assert!(crashed.message.contains("closed the connection"));
+    }
+
     fn read_lines(input: &[u8]) -> Vec<(LineRead, String)> {
         let mut reader = Cursor::new(input);
         let mut buf = Vec::new();
@@ -904,11 +1226,12 @@ mod tests {
     #[test]
     fn wire_conversion_maps_fields_and_skips_unknown_files() {
         let mut files = FileTable::new();
-        // An absolute, already-clean spelling: the table normalizes paths
-        // (cwd-relative names absolutize), so the expected wire form is the
-        // canonical spelling itself.
         let source = std::env::temp_dir().join("dartq_plugin_wire_test.dart");
         let known = files.intern(&source);
+        // The table normalizes paths (existing ancestors canonicalize — the
+        // macOS `/tmp` symlink included), so the wire carries the table's
+        // stored spelling, not the interned spelling.
+        let normalized = files.path(known).expect("interned").to_path_buf();
         // A forgotten id is a permanent hole: exactly the "unknown FileId"
         // the conversion must skip.
         files.intern(Path::new("removed.dart"));
@@ -941,7 +1264,7 @@ mod tests {
         ];
         let wire = wire_diagnostics(&diagnostics, &files);
         assert_eq!(wire.len(), 1, "unknown FileId is skipped");
-        assert_eq!(wire[0].file, source.to_string_lossy());
+        assert_eq!(wire[0].file, normalized.to_string_lossy());
         assert_eq!(wire[0].severity, Severity::Warning);
         assert_eq!(wire[0].code, "uri_does_not_exist");
         assert_eq!(wire[0].offset, 12);

@@ -76,9 +76,11 @@
 //!
 //! [`runtime::PluginRuntime`] is the engine-facing face this contract serves:
 //!
-//! - **§14.2 process model**: one child process per plugin, wire-only
-//!   contact — the plugin never holds a core reference. The engine read face
-//!   is the existing [`dartq_diagnostics::Diagnostic`] output of
+//! - **§14.2 process model**: [`discovery`] locates manifests (the
+//!   `<workspace>/plugins/*/dartq_plugin.json` convention plus explicit
+//!   overrides), and one child process runs per plugin, wire-only contact —
+//!   the plugin never holds a core reference. The engine read face is the
+//!   existing [`dartq_diagnostics::Diagnostic`] output of
 //!   `dartq_engine::Engine::analyze` plus `file_table()`; the runtime
 //!   converts and pushes it (`notification/engine_diagnostics`, one batch
 //!   per analyze cycle) and drains plugin-emitted diagnostics back for the
@@ -88,16 +90,20 @@
 //!   R2); the official `registerAssist`/`registerFixForRule` API shape is
 //!   mirrored by the host package's `Plugin`/`PluginRegistry`. The rich
 //!   Query API (AST/element/type pulls) is a later milestone — this surface
-//!   carries the diagnostics round trip only.
+//!   carries the diagnostics round trip and `request/fixes` only.
 //! - **§14.3 isolation**: per-plugin counters (peak child RSS, frame/byte
 //!   totals per direction, 16 MiB guard drops, restart count) via
 //!   [`runtime::PluginRuntime::stats`] → [`stats::PluginStatsSnapshot`];
 //!   RSS over the manifest's `memory_budget_mb` kills the child (Linux
-//!   `VmHWM`, macOS `proc_pid_rusage`); child death restarts within the
-//!   manifest's retry budget and never takes the engine down;
-//!   `initialize`/`shutdown` run under the manifest's request deadline. The
-//!   `plugin_crashed` diagnostic is emitted by the daemon output layer,
-//!   which owns the merge.
+//!   `VmHWM`, macOS `proc_pid_rusage`); `request/fixes` runs under the
+//!   manifest's `callback_ms` and `initialize`/`shutdown` under the request
+//!   deadline; child death restarts within the manifest's retry budget and
+//!   never takes the engine down.
+//! - **§13.3 output face**: [`runtime::crash_diagnostic`] converts a
+//!   terminal [`runtime::RuntimeError`] into a `dartiq/plugin_crashed` /
+//!   `dartiq/plugin_timeout` [`dartq_diagnostics::Diagnostic`] for the
+//!   daemon's output merge; plugin *findings* stay wire-form
+//!   ([`session::PluginDiagnostic`]).
 //!
 //! # Relationship to `analysis_server_plugin`
 //!
@@ -108,6 +114,7 @@
 //! wire protocol is pre-1.0 and dartiq adapts at this layer, PRD §14.1).
 
 pub mod capability;
+pub mod discovery;
 pub mod frame;
 pub mod manifest;
 pub mod runtime;
@@ -115,6 +122,7 @@ pub mod session;
 pub mod stats;
 
 pub use capability::{Capability, CapabilitySet};
+pub use discovery::{DiscoveredPlugin, DiscoveryIssue, DiscoveryReport, discover};
 pub use frame::{
     Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS,
     METHOD_INITIALIZE, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError,
@@ -123,7 +131,7 @@ pub use frame::{
 pub use manifest::{
     DEFAULT_MEMORY_BUDGET_MB, MANIFEST_FILE_NAME, Manifest, ManifestError, Timeouts,
 };
-pub use runtime::{PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
+pub use runtime::{PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic};
 pub use session::{
     FixesReply, Incoming, PluginDiagnostic, PrioritizedChange, Session, SessionError, SessionState,
     Severity, SourceEdit, engine_diagnostics_frame,

@@ -34,5 +34,5 @@ export 'src/plugin_config.dart'
         defaultRequestRetries,
         defaultRequestTimeoutMs;
 export 'src/plugin_session.dart'
-    show EngineDiagnosticsHandler, PluginSession, SessionState;
+    show EngineDiagnosticsHandler, FixesHandler, PluginSession, SessionState;
 export 'src/registry.dart' show PluginRegistry, PluginRegistryImpl;
