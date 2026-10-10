@@ -286,24 +286,30 @@ pub(crate) mod prefer_generic_function_type_aliases {
 pub(crate) mod unnecessary_constructor_name {
     use super::{Check, Group, NodeKind, RuleSpec};
 
-    /// Official: `pkg/linter/lib/src/rules/unnecessary_constructor_name.dart:41-72`
-    /// — a constructor (or instance-creation) `.new` name reports at the
-    /// name token. Two element-based guards are approximated syntactically:
-    /// the duplicate-unnamed-constructor bail counts unnamed constructors
-    /// among the enclosing `DeclarationBody` siblings (each `Constructor`
-    /// with at most one `Identifier` child is unnamed), and the
-    /// extension-type primary-constructor exemption is skipped (primary
-    /// constructors are outside the current substrate). The instance-creation
-    /// face dispatches on `Send` with a `Qualified` callee — a syntax-only
-    /// proxy for `InstanceCreationExpression` (a non-creation `X.new` access
-    /// is not expressible Dart). Message: `diagnostic.g.dart`
-    /// `unnecessaryConstructorName`.
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_constructor_name.dart`
+    /// — a written `.new` constructor name reports at the name token. Faces
+    /// (registry :35-39): the constructor declaration (:41-57), the primary
+    /// constructor declaration (:70-80), and the instance creation
+    /// (:59-62). The element guards are approximated on the declaration
+    /// slices: the duplicate bail counts every constructor whose written
+    /// name is absent or `new` (the canonical unnamed name, :43-50) —
+    /// non-constructor members never count — and the extension-type
+    /// exemption (:51-58) bails on a secondary constructor whose primary
+    /// constructor carries no name. The instance-creation face dispatches
+    /// on `Send` with a `Qualified` callee — a syntax-only proxy for
+    /// `InstanceCreationExpression` (the production tiling keeps no
+    /// `Qualified` child on sends, so the face stays on hand-built
+    /// shapes). Message: `diagnostic.g.dart` `unnecessaryConstructorName`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_constructor_name",
         group: Group::Recommended,
         problem: "Unnecessary '.new' constructor name.",
         correction: "Try removing the '.new'.",
-        kinds: &[NodeKind::Constructor, NodeKind::Send],
+        kinds: &[
+            NodeKind::Constructor,
+            NodeKind::PrimaryConstructor,
+            NodeKind::Send,
+        ],
         check,
     };
 
@@ -311,49 +317,128 @@ pub(crate) mod unnecessary_constructor_name {
         let node = c.node();
         match c.kind(node) {
             NodeKind::Constructor => check_declaration(c, node),
+            NodeKind::PrimaryConstructor => check_primary(c, node),
             NodeKind::Send => check_creation(c, node),
             _ => {}
         }
     }
 
-    /// The constructor-name `Identifier` (the second one; the first names
-    /// the enclosing type), or `None` when unnamed.
+    /// The written constructor name: the identifier in the
+    /// method-continuation context (the class-name echo carries the method
+    /// context), or `None` when unnamed.
     fn constructor_name(c: &Check<'_>, node: u32) -> Option<u32> {
-        c.direct_children(node)
+        let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
+        c.direct_children(node).iter().copied().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+        })
+    }
+
+    /// The written primary-constructor name (the primary-constructor
+    /// context identifier), or `None` when unnamed.
+    fn primary_name(c: &Check<'_>, node: u32) -> Option<u32> {
+        let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
+        c.direct_children(node).iter().copied().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+        })
+    }
+
+    /// Whether more than one constructor of the type carries the canonical
+    /// unnamed name (`constructors.where((c) => c.name == 'new')`, :43-50):
+    /// every unnamed constructor and every `new`-spelled one counts, on the
+    /// body's secondary constructors and the primary itself.
+    fn duplicate_new(c: &Check<'_>, owner: u32, primary: Option<u32>) -> bool {
+        let mut count = 0usize;
+        let members: Vec<u32> = c.direct_children(owner).iter().copied().collect();
+        for member in members {
+            match c.kind(member) {
+                NodeKind::Constructor => {
+                    if is_unnamed_or_new(c, member) {
+                        count += 1;
+                    }
+                }
+                NodeKind::DeclarationBody => {
+                    let ctors: Vec<u32> = c
+                        .direct_children(member)
+                        .iter()
+                        .copied()
+                        .filter(|&kid| c.kind(kid) == NodeKind::Constructor)
+                        .collect();
+                    count += ctors
+                        .into_iter()
+                        .filter(|&ctor| is_unnamed_or_new(c, ctor))
+                        .count();
+                }
+                _ => {}
+            }
+        }
+        if let Some(primary) = primary
+            && primary_name(c, primary).is_none_or(|name| c.lexeme(c.head_token(name)) == "new")
+        {
+            count += 1;
+        }
+        count > 1
+    }
+
+    /// No written name (the unnamed form, canonically `new`) or spelled
+    /// `new`.
+    fn is_unnamed_or_new(c: &Check<'_>, ctor: u32) -> bool {
+        match constructor_name(c, ctor) {
+            None => true,
+            Some(name) => c.lexeme(c.head_token(name)) == "new",
+        }
+    }
+
+    /// The owner type's written primary constructor, if any.
+    fn owner_primary(c: &Check<'_>) -> Option<u32> {
+        let owner = c.ancestor(2)?;
+        c.direct_children(owner)
             .iter()
             .copied()
-            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
-            .nth(1)
+            .find(|&kid| c.kind(kid) == NodeKind::PrimaryConstructor)
     }
 
     fn check_declaration(c: &mut Check<'_>, node: u32) {
-        // The constructor name is the second `Identifier` child (the first
-        // names the enclosing type, collapse map §3.3).
         let Some(name) = constructor_name(c, node) else {
             return; // unnamed constructor: `node.name == null`
         };
         if c.lexeme(c.head_token(name)) != "new" {
             return;
         }
-        // Duplicate unnamed constructors already error (:45-52) — an
-        // unnamed constructor is one without a name `Identifier` or one
-        // explicitly spelled `new` (the canonical name of the unnamed
-        // form). The owner is the enclosing `DeclarationBody`.
+        // The extension-type exemption (:51-58): a secondary constructor
+        // whose primary constructor is unnamed needs the qualified form.
+        if let Some(owner) = c.ancestor(2)
+            && c.kind(owner) == NodeKind::ExtensionTypeDeclaration
+            && owner_primary(c).is_some_and(|p| primary_name(c, p).is_none())
+        {
+            return;
+        }
+        // Duplicate unnamed constructors already error (:45-52).
         let body = c.ancestor(1).expect("constructor has an owner");
-        // Collect first: the count re-enters `direct_children` per member
-        // and the scratch RefCell forbids a live outer guard.
-        let members: Vec<u32> = c.direct_children(body).iter().copied().collect();
-        let unnamed = members
-            .into_iter()
-            .filter(|&member| {
-                c.kind(member) != NodeKind::Constructor
-                    || match constructor_name(c, member) {
-                        None => true,
-                        Some(name) => c.lexeme(c.head_token(name)) == "new",
-                    }
-            })
-            .count();
-        if unnamed > 1 {
+        if duplicate_new(c, body, owner_primary(c)) {
+            return;
+        }
+        let token = c.head_token(name);
+        let start = c
+            .unit
+            .tokens
+            .get(token as usize)
+            .expect("name token")
+            .utf16_offset;
+        c.report(start..start, &[]);
+    }
+
+    /// `visitPrimaryConstructorDeclaration` (:70-80): a written `.new`
+    /// primary-constructor name reports at the name token, unless the
+    /// duplicate count fires.
+    fn check_primary(c: &mut Check<'_>, node: u32) {
+        let Some(name) = primary_name(c, node) else {
+            return; // the unnamed primary: `constructorName == null`
+        };
+        if c.lexeme(c.head_token(name)) != "new" {
+            return;
+        }
+        let owner = c.ancestor(1).expect("primary constructor has an owner");
+        if duplicate_new(c, owner, Some(node)) {
             return;
         }
         let token = c.head_token(name);
@@ -2206,148 +2291,75 @@ mod tests {
     /// `test/rules/unnecessary_constructor_name_test.dart` `test_withNew`.
     #[test]
     fn constructor_name_reports_new() {
-        let source = "class A { A.new(); }";
-        // class0 A1 {2 A3 .4 new5 (6 )7 ;8 }9
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::TopLevelDeclaration, 0);
-                identifier(b, 1, 2);
-                b.begin(NodeKind::ClassDeclaration, 0);
-                b.patch(0, 0);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::DeclarationBody, 2);
-                b.begin(NodeKind::Constructor, 3);
-                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                identifier(b, 3, 4);
-                identifier(b, 5, 6);
-                b.begin(NodeKind::FormalParameters, 6);
-                b.end(NodeKind::FormalParameters, 8);
-                b.end(NodeKind::Constructor, 9);
-                b.end(NodeKind::DeclarationBody, 10);
-                b.end(NodeKind::ClassDeclaration, 10);
-                b.end(NodeKind::TopLevelDeclaration, 10);
-            }),
-        );
+        let f = Fixture::parse("class A { A.new(); }");
         let lints = f.run(&one_rule("unnecessary_constructor_name"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary '.new' constructor name.");
-        assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "new", 0))
+        );
     }
 
-    /// An unnamed constructor has no name token to check.
+    /// An unnamed constructor has no name token to check; a differently
+    /// named constructor is not `.new`.
     #[test]
-    fn constructor_name_unnamed_passes() {
-        let source = "class A { A(); }";
-        // class0 A1 {2 A3 (4 )5 ;6 }7
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::TopLevelDeclaration, 0);
-                identifier(b, 1, 2);
-                b.begin(NodeKind::ClassDeclaration, 0);
-                b.patch(0, 0);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::DeclarationBody, 2);
-                b.begin(NodeKind::Constructor, 3);
-                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                identifier(b, 3, 4);
-                b.begin(NodeKind::FormalParameters, 4);
-                b.end(NodeKind::FormalParameters, 6);
-                b.end(NodeKind::Constructor, 7);
-                b.end(NodeKind::DeclarationBody, 8);
-                b.end(NodeKind::ClassDeclaration, 8);
-                b.end(NodeKind::TopLevelDeclaration, 8);
-            }),
-        );
+    fn constructor_name_unnamed_and_named_other_pass() {
+        let f = Fixture::parse("class A { A(); }");
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+
+        let f = Fixture::parse("class A { A.named(); }");
         assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
     }
 
-    /// A named constructor other than `new` passes.
-    #[test]
-    fn constructor_name_named_other_passes() {
-        let source = "class A { A.named(); }";
-        // class0 A1 {2 A3 .4 named5 (6 )7 ;8 }9
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::TopLevelDeclaration, 0);
-                identifier(b, 1, 2);
-                b.begin(NodeKind::ClassDeclaration, 0);
-                b.patch(0, 0);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::DeclarationBody, 2);
-                b.begin(NodeKind::Constructor, 3);
-                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                identifier(b, 3, 4);
-                identifier(b, 5, 6);
-                b.begin(NodeKind::FormalParameters, 6);
-                b.end(NodeKind::FormalParameters, 8);
-                b.end(NodeKind::Constructor, 9);
-                b.end(NodeKind::DeclarationBody, 10);
-                b.end(NodeKind::ClassDeclaration, 10);
-                b.end(NodeKind::TopLevelDeclaration, 10);
-            }),
-        );
-        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
-    }
-
-    /// Duplicate unnamed constructors already error (:45-52) — no report
-    /// (`A.new()` and `A()` are both the unnamed constructor).
+    /// Duplicate unnamed constructors already error (:45-52): with a
+    /// second unnamed (or `new`-spelled) constructor the bail fires.
+    /// Non-constructor members never count toward the bail — the flagged
+    /// count divergence (a field sibling no longer silences the report).
     #[test]
     fn constructor_name_duplicate_unnamed_bails() {
-        let source = "class A { A.new(); A(); }";
-        // class0 A1 {2 A3 .4 new5 (6 )7 ;8 A9 (10 )11 ;12 }13
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::TopLevelDeclaration, 0);
-                identifier(b, 1, 2);
-                b.begin(NodeKind::ClassDeclaration, 0);
-                b.patch(0, 0);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::DeclarationBody, 2);
-                b.begin(NodeKind::Constructor, 3);
-                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                identifier(b, 3, 4);
-                identifier(b, 5, 6);
-                b.begin(NodeKind::FormalParameters, 6);
-                b.end(NodeKind::FormalParameters, 8);
-                b.end(NodeKind::Constructor, 9);
-                b.begin(NodeKind::Constructor, 9);
-                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                identifier(b, 9, 10);
-                b.begin(NodeKind::FormalParameters, 10);
-                b.end(NodeKind::FormalParameters, 12);
-                b.end(NodeKind::Constructor, 13);
-                b.end(NodeKind::DeclarationBody, 14);
-                b.end(NodeKind::ClassDeclaration, 14);
-                b.end(NodeKind::TopLevelDeclaration, 14);
-            }),
+        let f = Fixture::parse("class A { A(); A.new(); }");
+        assert!(
+            f.run(&one_rule("unnecessary_constructor_name")).is_empty(),
+            "two constructors named `new` — the duplicate error owns it"
         );
+
+        let f = Fixture::parse("class A { int a = 0; A.new(); }");
+        assert_eq!(
+            f.run(&one_rule("unnecessary_constructor_name")).len(),
+            1,
+            "a field sibling is not an unnamed constructor"
+        );
+    }
+
+    /// The primary-constructor face (:70-80): a `.new` primary name
+    /// reports; the unnamed primary has no name token.
+    #[test]
+    fn constructor_name_primary_faces() {
+        let f = Fixture::parse("extension type E.new(int x) {}");
+        let lints = f.run(&one_rule("unnecessary_constructor_name"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "new", 0))
+        );
+
+        let f = Fixture::parse("class C.new(int x);");
+        assert_eq!(f.run(&one_rule("unnecessary_constructor_name")).len(), 1);
+
+        let f = Fixture::parse("extension type E(int x) {}");
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+
+        let f = Fixture::parse("extension type E.named(int x) {}");
+        assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
+    }
+
+    /// The extension-type exemption (:51-58): a secondary constructor
+    /// `.new` inside an extension type whose primary constructor is
+    /// unnamed stays — the qualified form is necessary there.
+    #[test]
+    fn constructor_name_extension_type_unnamed_primary_bails() {
+        let f = Fixture::parse("extension type E(int x) { E.other(); E.new(); }");
         assert!(f.run(&one_rule("unnecessary_constructor_name")).is_empty());
     }
 

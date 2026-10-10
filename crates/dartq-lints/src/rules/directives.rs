@@ -255,18 +255,24 @@ pub(crate) mod library_annotations {
         c.report(range, &[]);
     }
 
-    /// The syntax face of `isPragmaLateTrust` (:84-95): the annotation names
-    /// `pragma` (last name segment; the official pins the dart:core
-    /// constructor through the element model, so a user-prefixed
-    /// `foo.pragma` over-approximates) with exactly one positional string
-    /// argument `'dart2js:late:trust'`. The named `name:` form is a compile
-    /// error upstream (the factory takes one positional) and never fires.
+    /// The syntax face of `isPragmaLateTrust` (:84-95): the official pins
+    /// the dart:core `pragma` constructor through the element model. The
+    /// written face: the annotation carries a single unprefixed `pragma`
+    /// name — a prefixed `foo.pragma` carries two name identifiers and
+    /// never matches (the official resolves only the unprefixed core
+    /// constructor), and a same-file `pragma` declaration bails (the
+    /// element identity, the conservative family). Exactly one positional
+    /// string argument `'dart2js:late:trust'`; the named `name:` form is a
+    /// compile error upstream (the factory takes one positional) and never
+    /// fires.
     fn is_pragma_late_trust(c: &Check<'_>, meta: u32) -> bool {
         let mut name = None;
         let mut arguments = None;
         for kid in c.collect_direct(meta) {
             match c.kind(kid) {
-                NodeKind::Identifier | NodeKind::Qualified if name.is_none() => name = Some(kid),
+                NodeKind::Identifier if name.is_none() => name = Some(kid),
+                // A second name segment (`foo.pragma`) is a prefix chain.
+                NodeKind::Identifier | NodeKind::Qualified => return false,
                 NodeKind::Arguments => arguments = Some(kid),
                 _ => {}
             }
@@ -274,18 +280,11 @@ pub(crate) mod library_annotations {
         let Some(name) = name else {
             return false;
         };
-        let segment = match c.kind(name) {
-            NodeKind::Identifier => c.lexeme(c.head_token(name)),
-            // The qualified tail is its last Identifier child.
-            _ => c
-                .collect_direct(name)
-                .into_iter()
-                .rev()
-                .find(|&k| c.kind(k) == NodeKind::Identifier)
-                .map(|k| c.lexeme(c.head_token(k)))
-                .unwrap_or_default(),
-        };
-        if segment != "pragma" {
+        if c.lexeme(c.head_token(name)) != "pragma" {
+            return false;
+        }
+        let decls = crate::rules::expressions::same_file::scan(c);
+        if crate::rules::expressions::same_file::declares_name(c, &decls, "pragma") {
             return false;
         }
         let Some(arguments) = arguments else {
@@ -464,9 +463,15 @@ pub(crate) mod provide_deprecation_message {
     /// and which carries no argument list reports at the annotation.
     ///
     /// Approximation (documented): the element pin is taken from the name —
-    /// the last name segment lexeme `deprecated` — so a user-declared
-    /// `deprecated` constant over-reports and the dart:core pin is dropped
-    /// (the `library_annotations` pragma-branch precedent). Message:
+    /// a single unprefixed `deprecated` (a prefixed `foo.deprecated`
+    /// resolves through an import prefix whose target is unknown here and
+    /// never matches; the production slice carries the prefix chain as a
+    /// second name identifier), bailing when a same-file declaration
+    /// shadows the name. `@Deprecated` — the class, not the constant —
+    /// stays silent per the element pin (`isDeprecated`, :37-42); the
+    /// oracle reports it only under a compile error (a bare class
+    /// annotation is always `no_annotation_constructor_arguments`), a
+    /// face unreachable on valid code. Message:
     /// `diagnostic.g.dart` `provideDeprecationMessage`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "provide_deprecation_message",
@@ -480,32 +485,30 @@ pub(crate) mod provide_deprecation_message {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let kids = c.collect_direct(node);
-        // `node.arguments == null` (:40). A bare `@deprecated` has no
-        // Arguments child; `@deprecated()` keeps it and passes.
+        // `node.arguments == null` (:40). A bare `@deprecated` emits
+        // `NoArguments`; `@deprecated()` keeps a real one and passes.
         if kids.iter().any(|&kid| c.kind(kid) == NodeKind::Arguments) {
             return;
         }
-        // `elementAnnotation.isDeprecated` through the name face: the last
-        // name segment (`@deprecated` bare, `@a.deprecated` prefixed — the
-        // official resolves through any import prefix, so the prefixed face
-        // over-approximates exactly like the pragma branch).
-        let name = kids
-            .iter()
-            .find(|&&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::Qualified));
+        // `elementAnnotation.isDeprecated` (:37-42): the unprefixed core
+        // constant — a single name identifier; a second one is a prefix
+        // chain (`foo.deprecated`) whose target is not the constant.
+        let mut name = None;
+        for kid in kids {
+            match c.kind(kid) {
+                NodeKind::Identifier if name.is_none() => name = Some(kid),
+                NodeKind::Identifier | NodeKind::Qualified => return,
+                _ => {}
+            }
+        }
         let Some(name) = name else {
             return;
         };
-        let segment = match c.kind(*name) {
-            NodeKind::Identifier => c.lexeme(c.head_token(*name)),
-            _ => c
-                .collect_direct(*name)
-                .into_iter()
-                .rev()
-                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
-                .map(|kid| c.lexeme(c.head_token(kid)))
-                .unwrap_or_default(),
-        };
-        if segment != "deprecated" {
+        if c.lexeme(c.head_token(name)) != "deprecated" {
+            return;
+        }
+        let decls = crate::rules::expressions::same_file::scan(c);
+        if crate::rules::expressions::same_file::declares_name(c, &decls, "deprecated") {
             return;
         }
         let range = c.utf16_span(node);
@@ -1275,5 +1278,52 @@ mod tests {
             }),
         );
         assert!(f.run(&one_rule("provide_deprecation_message")).is_empty());
+    }
+
+    // —— element-model pins (#468, production-bridge fixtures) ————————————
+
+    /// The pragma face reports on a non-library target; a prefixed
+    /// `foo.pragma` never matches (the official pins the unprefixed
+    /// dart:core `pragma` constructor, library_annotations.dart:84-95).
+    #[test]
+    fn library_annotations_prefixed_pragma_is_inert() {
+        let f = Fixture::parse("@pragma('dart2js:late:trust') class C {}");
+        assert_eq!(hits(&f, "library_annotations").len(), 1);
+
+        let f = Fixture::parse("@foo.pragma('dart2js:late:trust') class C {}");
+        assert!(hits(&f, "library_annotations").is_empty());
+    }
+
+    /// A same-file `pragma` declaration shadows the dart:core constructor —
+    /// the element identity (:84-95) bails; a wrong pragma value is inert.
+    #[test]
+    fn library_annotations_same_file_shadow_and_value_gate() {
+        let f = Fixture::parse("class pragma {}\n@pragma('dart2js:late:trust') class C {}");
+        assert!(hits(&f, "library_annotations").is_empty());
+
+        let f = Fixture::parse("@pragma('other') class C {}");
+        assert!(hits(&f, "library_annotations").is_empty());
+    }
+
+    /// A bare `@deprecated` (the dart:core constant, no argument list)
+    /// reports; a prefixed `foo.deprecated` never matches; `@Deprecated` —
+    /// the class, not the constant (:37-42) — and an argument-carrying form
+    /// pass; a same-file `deprecated` declaration bails.
+    #[test]
+    fn provide_deprecation_message_constant_faces() {
+        let f = Fixture::parse("@deprecated int top = 0;");
+        assert_eq!(hits(&f, "provide_deprecation_message").len(), 1);
+
+        let f = Fixture::parse("@foo.deprecated int top = 0;");
+        assert!(hits(&f, "provide_deprecation_message").is_empty());
+
+        let f = Fixture::parse("@Deprecated int top = 0;");
+        assert!(hits(&f, "provide_deprecation_message").is_empty());
+
+        let f = Fixture::parse("@deprecated() int top = 0;");
+        assert!(hits(&f, "provide_deprecation_message").is_empty());
+
+        let f = Fixture::parse("const String deprecated = 'x';\n@deprecated int top = 0;");
+        assert!(hits(&f, "provide_deprecation_message").is_empty());
     }
 }

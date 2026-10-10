@@ -345,7 +345,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
 
 pub(crate) mod non_constant_identifier_names {
     use super::{Check, Group, NodeKind, RuleSpec, is_just_underscores};
-    use crate::rules::{NONE_TOKEN, member_name};
+    use crate::rules::NONE_TOKEN;
 
     /// Official: `pkg/linter/lib/src/rules/non_constant_identifier_names.dart:36-169`
     /// — every non-constant identifier (variables, functions, methods,
@@ -355,10 +355,15 @@ pub(crate) mod non_constant_identifier_names {
     /// names, all parameters (:57-66, 70-72, 97-107). Message:
     /// `diagnostic.g.dart` `nonConstantIdentifierNames`.
     ///
-    /// Positions not dispatched (approximation, documented): pattern-field
-    /// variables report through the pattern dispatch alone (the official
-    /// double-visits the same name), and extension-type /
-    /// primary-constructor names need the primary-constructor substrate.
+    /// Pattern-field variables (:124-131) report through the pattern
+    /// dispatch alone — the official double-visits the same name
+    /// (`visitPatternField` and `visitDeclaredVariablePattern` both check
+    /// it), one report per name is the same surface; object-pattern fields
+    /// are unproducible through the bridge (an upstream parser/bridge
+    /// pairing bug panics on them). The primary-constructor name positions
+    /// (:87-91, :123-125): an extension-type representation-constructor
+    /// name checks without the underscore exemption, a class primary
+    /// constructor name with it.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "non_constant_identifier_names",
         group: Group::Core,
@@ -371,6 +376,7 @@ pub(crate) mod non_constant_identifier_names {
             NodeKind::DeclaredVariablePattern,
             NodeKind::FormalParameters,
             NodeKind::OptionalFormalParameters,
+            NodeKind::PrimaryConstructor,
             NodeKind::TopLevelMethod,
             NodeKind::LocalFunctionDeclaration,
             NodeKind::Method,
@@ -474,23 +480,54 @@ pub(crate) mod non_constant_identifier_names {
                     check_plain(c, name, true);
                 }
             }
-            NodeKind::TopLevelMethod | NodeKind::LocalFunctionDeclaration => {
+            NodeKind::TopLevelMethod => {
+                // The name rides the top-level-function context word (the
+                // production slice keeps a typed return's name identifier
+                // ahead of it).
+                let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+                let name = c.direct_children(node).iter().copied().find(|&ch| {
+                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                });
+                if let Some(name) = name {
+                    check_plain(c, c.head_token(name), false);
+                }
+            }
+            NodeKind::LocalFunctionDeclaration => {
+                // The production shape carries the name in a `FunctionName`
+                // node owning no children.
                 let name = c
                     .direct_children(node)
                     .iter()
                     .copied()
-                    .find(|&ch| c.kind(ch) == NodeKind::Identifier);
+                    .find(|&ch| c.kind(ch) == NodeKind::FunctionName);
                 if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
                 }
             }
             NodeKind::Method => {
                 // Operators keep their punctuation names (:135-138): only
-                // Identifier names are checked.
-                if let Some(name) =
-                    member_name(c, node).filter(|&n| c.kind(n) == NodeKind::Identifier)
-                {
+                // method-context identifier names are checked.
+                let ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
+                let name = c.direct_children(node).iter().copied().find(|&ch| {
+                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                });
+                if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
+                }
+            }
+            NodeKind::PrimaryConstructor => {
+                // The representation-constructor name (`:87-91` extension
+                // types — no underscore exemption; `:123-125` class primary
+                // constructors — just-underscores exempt).
+                let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
+                let name = c.direct_children(node).iter().copied().find(|&ch| {
+                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                });
+                if let Some(name) = name {
+                    let underscores_ok = c
+                        .ancestor(1)
+                        .is_none_or(|owner| c.kind(owner) != NodeKind::ExtensionTypeDeclaration);
+                    check_plain(c, c.head_token(name), underscores_ok);
                 }
             }
             NodeKind::RecordLiteral => {
@@ -711,8 +748,7 @@ pub(crate) mod avoid_types_as_parameter_names {
     ];
 
     const FORMAL_PROBLEM: &str = "The parameter name '{0}' matches a visible type name.";
-    const FORMAL_CORRECTION: &str =
-        "Try adding a name for the parameter or changing the parameter name to not match an existing type.";
+    const FORMAL_CORRECTION: &str = "Try adding a name for the parameter or changing the parameter name to not match an existing type.";
     const TYPE_PROBLEM: &str = "The type parameter name '{0}' matches a visible type name.";
     const TYPE_CORRECTION: &str =
         "Try changing the type parameter name to not match an existing type.";
@@ -764,9 +800,13 @@ pub(crate) mod avoid_types_as_parameter_names {
         if !BUILTIN_TYPES.contains(&name) {
             return;
         }
-        let catch_clause = c.path.iter().rev().skip(1).take(2).any(|&ancestor| {
-            c.kind(ancestor) == NodeKind::CatchClause
-        });
+        let catch_clause = c
+            .path
+            .iter()
+            .rev()
+            .skip(1)
+            .take(2)
+            .any(|&ancestor| c.kind(ancestor) == NodeKind::CatchClause);
         if catch_clause {
             // The catch face checks the exception parameter only (:49-59) —
             // the first formal under the clause (the stack-trace parameter
@@ -779,8 +819,8 @@ pub(crate) mod avoid_types_as_parameter_names {
                 .find(|&ancestor| c.kind(ancestor) == NodeKind::CatchClause);
             let Some(clause) = clause else { return };
             let window = c.children(clause);
-            let first = (window.start..window.end)
-                .find(|&id| c.kind(id) == NodeKind::FormalParameter);
+            let first =
+                (window.start..window.end).find(|&id| c.kind(id) == NodeKind::FormalParameter);
             if first != Some(node) {
                 return;
             }
@@ -980,8 +1020,10 @@ pub(crate) mod use_super_parameters {
             seen.push(name);
             // An argument that names no parameter is not a formal element —
             // a bad state (:155-156).
-            let Some((param_index, named_group)) =
-                table.iter().find(|entry| entry.0 == name).map(|e| (e.1, e.2))
+            let Some((param_index, named_group)) = table
+                .iter()
+                .find(|entry| entry.0 == name)
+                .map(|e| (e.1, e.2))
             else {
                 return;
             };
@@ -1014,7 +1056,12 @@ pub(crate) mod use_super_parameters {
         let Some(&return_type) = names.first() else {
             return;
         };
-        let end_token = c.unit.ast.token_range(names.get(1).copied().unwrap_or(return_type)).end - 1;
+        let end_token = c
+            .unit
+            .ast
+            .token_range(names.get(1).copied().unwrap_or(return_type))
+            .end
+            - 1;
         let range = utf16_start(c, c.head_token(return_type))..utf16_end(c, end_token);
         // The official fills `{0}` with the bare parameter name (:93-98);
         // the multiple form fills it with the pre-quoted
@@ -1773,6 +1820,45 @@ mod tests {
         assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
     }
 
+    /// The context-name faces (production-bridge fixtures): a typed
+    /// return's method / top-level function name still reports (the name
+    /// identifier rides its context word past the type), a local function
+    /// name reports through its `FunctionName` node, and a primary
+    /// constructor name reports (:87-91 extension types, :123-125 class
+    /// primary constructors).
+    #[test]
+    fn non_constant_context_name_positions() {
+        let f = Fixture::parse("class C { String MY() => ''; }");
+        assert_eq!(f.run(&one_rule("non_constant_identifier_names")).len(), 1);
+
+        let f = Fixture::parse("String FY() => '';");
+        assert_eq!(f.run(&one_rule("non_constant_identifier_names")).len(), 1);
+
+        let f = Fixture::parse("void main() { void LY() {} }");
+        assert_eq!(f.run(&one_rule("non_constant_identifier_names")).len(), 1);
+
+        let f = Fixture::parse("class C.Foo(int x) {}");
+        assert_eq!(f.run(&one_rule("non_constant_identifier_names")).len(), 1);
+
+        let f = Fixture::parse("extension type E.Foo(int x) {}");
+        assert_eq!(f.run(&one_rule("non_constant_identifier_names")).len(), 1);
+    }
+
+    /// Lower-camel primary constructor names pass on both owners (the
+    /// camel gate; the class-side underscore exemption is unobservable —
+    /// just-underscore names are valid lowerCamelCase either way).
+    #[test]
+    fn non_constant_primary_camel_passes() {
+        let f = Fixture::parse("class C.foo(int x) {}");
+        assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
+
+        let f = Fixture::parse("extension type E.foo(int x) {}");
+        assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
+
+        let f = Fixture::parse("extension type E(int x) {}");
+        assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
+    }
+
     // —— file_names ——————————————————————————————————————————————————————
 
     #[test]
@@ -1931,13 +2017,7 @@ mod tests {
     /// One `FormalParameter` in a `FormalParameters` wrapper: `type_at` is
     /// the written type token or `NONE` (implicit), `receiver_at` the
     /// `this.`/`super.` token or `NONE`.
-    fn formal(
-        b: &mut AstBuilder,
-        type_at: u32,
-        name_at: u32,
-        receiver_at: u32,
-        end_at: u32,
-    ) {
+    fn formal(b: &mut AstBuilder, type_at: u32, name_at: u32, receiver_at: u32, end_at: u32) {
         // The span head is the leftmost written piece: type, receiver, name.
         let head = if type_at != NONE {
             type_at
@@ -2184,7 +2264,10 @@ mod tests {
         let f = single_super_fixture(default_b_constructor);
         let lints = super_hits(&f);
         assert_eq!(lints.len(), 1);
-        assert_eq!(lints[0].message, "Parameter 'x' could be a super parameter.");
+        assert_eq!(
+            lints[0].message,
+            "Parameter 'x' could be a super parameter."
+        );
         assert_eq!(
             lints[0].correction,
             Some("Trying converting 'x' to a super parameter.".to_owned())
