@@ -458,38 +458,152 @@ fn flatten_node(node: Node) -> Vec<Sequence> {
 /// The `DoubleStar` negative lookahead of `ast.dart:229-252` (`../` or `/`
 /// prefixes) is elided: validators only ever see paths produced by listing
 /// under a root, which never carry those prefixes.
+///
+/// The flattened node list is the compiled matcher: literals are stored once
+/// at construction and compared as UTF-8 byte slices, so a call walks `text`
+/// with byte cursors and never heap-allocates. `/` is ASCII and never occurs
+/// inside a multi-byte sequence, so byte scanning for separators is exact; a
+/// character is decoded only where exactly one is consumed (`?`, `[...]`,
+/// one star absorption step).
+///
+/// The `DoubleStar`-absorbing-a-separator case defeats last-star-only greedy
+/// two-pointer strategies (`**/*.g.dart` vs `a/b/x.g.dart`: the trailing
+/// `*` hits its `/` wall while the `**` needed to absorb more), so star
+/// absorptions are explored depth-first, shortest-first — the same order as
+/// the naive `iter().any()` recursion this replaces, making results
+/// identical by construction. Adversarial `*a*a*a*…` blowup is bounded by
+/// [`Memo`]: a (star, position) state whose suffix already failed is never
+/// re-expanded. With at most two stars the raw depth-first search is O(n²)
+/// already, so the memo — the only allocation site — stays disabled and the
+/// common exclude shapes never allocate.
 fn matches(nodes: &[Node], text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    matches_sequence(nodes, &chars)
+    let stars = nodes
+        .iter()
+        .filter(|node| matches!(node, Node::Star | Node::DoubleStar))
+        .count();
+    let mut memo = (stars > 2).then(|| Memo { bits: Vec::new() });
+    matches_from(nodes, 0, text, 0, &mut memo)
 }
 
-fn matches_sequence(nodes: &[Node], text: &[char]) -> bool {
-    let Some((first, rest)) = nodes.split_first() else {
-        return text.is_empty();
-    };
-    match first {
-        Node::Literal(literal) => {
-            let literal: Vec<char> = literal.chars().collect();
-            text.len() >= literal.len()
-                && text[..literal.len()] == literal[..]
-                && matches_sequence(rest, &text[literal.len()..])
-        }
-        Node::Star => (0..=text.len())
-            .take_while(|&index| index == 0 || text[index - 1] != '/')
-            .any(|index| matches_sequence(rest, &text[index..])),
-        Node::DoubleStar => (0..=text.len()).any(|index| matches_sequence(rest, &text[index..])),
-        Node::AnyChar => !text.is_empty() && text[0] != '/' && matches_sequence(rest, &text[1..]),
-        Node::Range { negated, ranges } => {
-            !text.is_empty()
-                && text[0] != '/'
-                && ranges
-                    .iter()
-                    .any(|(lo, hi)| *lo <= text[0] && text[0] <= *hi)
-                    != *negated
-                && matches_sequence(rest, &text[1..])
-        }
-        Node::Options(_) => unreachable!("options are flattened before matching"),
+/// Memo of star states proven unsatisfiable: one bit per (star ordinal,
+/// byte position). Only built for patterns with three or more stars, where
+/// depth-first search would otherwise re-expand O(n^k) state combinations.
+/// Bits are appended on first `record`, so the allocation happens only when
+/// an actual failed star state is encountered.
+struct Memo {
+    bits: Vec<u64>,
+}
+
+impl Memo {
+    /// Bit index of star `node`'s state at byte `position`; `positions` is
+    /// `text.len() + 1` (every reachable byte offset plus end-of-text).
+    fn index(nodes: &[Node], node: usize, position: usize, positions: usize) -> usize {
+        let ordinal = nodes[..node]
+            .iter()
+            .filter(|node| matches!(node, Node::Star | Node::DoubleStar))
+            .count();
+        (ordinal * (positions / 64 + 1) * 64) + position
     }
+
+    fn failed(&self, nodes: &[Node], node: usize, position: usize, positions: usize) -> bool {
+        let index = Self::index(nodes, node, position, positions);
+        self.bits
+            .get(index / 64)
+            .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+
+    fn record(&mut self, nodes: &[Node], node: usize, position: usize, positions: usize) {
+        let index = Self::index(nodes, node, position, positions);
+        if self.bits.len() <= index / 64 {
+            self.bits.resize(index / 64 + 1, 0);
+        }
+        self.bits[index / 64] |= 1 << (index % 64);
+    }
+}
+
+/// Depth-first full match of `nodes[node..]` against `text[pos..]`. `pos` is
+/// always a char boundary: cursors advance by whole literals and whole
+/// chars only.
+fn matches_from(
+    nodes: &[Node],
+    node: usize,
+    text: &str,
+    pos: usize,
+    memo: &mut Option<Memo>,
+) -> bool {
+    let bytes = text.as_bytes();
+    let positions = bytes.len() + 1;
+    let mut node = node;
+    let mut pos = pos;
+    loop {
+        let Some(current) = nodes.get(node) else {
+            return pos == bytes.len();
+        };
+        match current {
+            Node::Literal(literal) => {
+                let literal = literal.as_bytes();
+                if !bytes[pos..].starts_with(literal) {
+                    return false;
+                }
+                node += 1;
+                pos += literal.len();
+            }
+            Node::Star | Node::DoubleStar => {
+                let crossing = matches!(current, Node::DoubleStar);
+                if memo
+                    .as_ref()
+                    .is_some_and(|memo| memo.failed(nodes, node, pos, positions))
+                {
+                    return false;
+                }
+                // Absorption lengths shortest-first; a `Star` stops at the
+                // next `/`, a `DoubleStar` runs to end of text.
+                let mut end = pos;
+                loop {
+                    if matches_from(nodes, node + 1, text, end, memo) {
+                        return true;
+                    }
+                    let Some(c) = char_at(text, end) else {
+                        break;
+                    };
+                    if !crossing && c == '/' {
+                        break;
+                    }
+                    end += c.len_utf8();
+                }
+                if let Some(memo) = memo {
+                    memo.record(nodes, node, pos, positions);
+                }
+                return false;
+            }
+            Node::AnyChar => {
+                let Some(c) = char_at(text, pos) else {
+                    return false;
+                };
+                if c == '/' {
+                    return false;
+                }
+                node += 1;
+                pos += c.len_utf8();
+            }
+            Node::Range { negated, ranges } => {
+                let Some(c) = char_at(text, pos) else {
+                    return false;
+                };
+                if c == '/' || ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi) == *negated {
+                    return false;
+                }
+                node += 1;
+                pos += c.len_utf8();
+            }
+            Node::Options(_) => unreachable!("options are flattened before matching"),
+        }
+    }
+}
+
+/// Decodes the char at byte offset `pos`, `None` past the end.
+fn char_at(text: &str, pos: usize) -> Option<char> {
+    text[pos..].chars().next()
 }
 
 /// A `StringScanner` over chars (parser.dart uses UTF-16 offsets; the
@@ -905,5 +1019,251 @@ mod tests {
         assert!(Glob::new("a/**").expect("parse").list_sync(&dir).is_err());
         assert!(listed("missing/**", &dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_star_wall_trap_cases() {
+        // Shapes where a last-star-only greedy strategy is incomplete: the
+        // trailing `*` hits its `/` wall while an earlier `**` must absorb
+        // the separator.
+        assert!(matches("**/*x", "a/b/x"));
+        assert!(matches("**/*.g.dart", "a/b/x.g.dart"));
+        assert!(matches("**/*/*.dart", "a/b/c/x.dart"));
+        assert!(!matches("**/*/*.dart", "a/b.dart"));
+        assert!(matches("*a*/*b*", "xa/yb"));
+    }
+
+    #[test]
+    fn multi_star_backtracking_is_bounded() {
+        // Nine `*a` pairs against an all-`a` path: naive re-expansion is
+        // ~C(400, 9) ≈ 10^17 (star, position) combinations and would hang;
+        // memoized, every (star, position) state expands once.
+        let glob = Glob::new("*a*a*a*a*a*a*a*a*b").expect("parse");
+        let path = "a".repeat(400);
+        let start = std::time::Instant::now();
+        assert!(!glob.matches_path(&path));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
+
+        let mut hit = path;
+        hit.push('b');
+        assert!(glob.matches_path(&hit));
+    }
+
+    /// The pre-optimization matcher (char vectors, naive backtracking),
+    /// kept verbatim as the differential oracle for the byte-cursor
+    /// matcher.
+    fn naive_matches(nodes: &[Node], text: &str) -> bool {
+        fn step(nodes: &[Node], text: &[char]) -> bool {
+            let Some((first, rest)) = nodes.split_first() else {
+                return text.is_empty();
+            };
+            match first {
+                Node::Literal(literal) => {
+                    let literal: Vec<char> = literal.chars().collect();
+                    text.len() >= literal.len()
+                        && text[..literal.len()] == literal[..]
+                        && step(rest, &text[literal.len()..])
+                }
+                Node::Star => (0..=text.len())
+                    .take_while(|&index| index == 0 || text[index - 1] != '/')
+                    .any(|index| step(rest, &text[index..])),
+                Node::DoubleStar => (0..=text.len()).any(|index| step(rest, &text[index..])),
+                Node::AnyChar => !text.is_empty() && text[0] != '/' && step(rest, &text[1..]),
+                Node::Range { negated, ranges } => {
+                    !text.is_empty()
+                        && text[0] != '/'
+                        && ranges
+                            .iter()
+                            .any(|(lo, hi)| *lo <= text[0] && text[0] <= *hi)
+                            != *negated
+                        && step(rest, &text[1..])
+                }
+                Node::Options(_) => unreachable!("options are flattened before matching"),
+            }
+        }
+        let chars: Vec<char> = text.chars().collect();
+        step(nodes, &chars)
+    }
+
+    #[test]
+    fn matcher_agrees_with_naive_char_backtracking() {
+        // Exhaustive over short node lists and texts, mixing multi-byte
+        // characters with separators to pin the byte-cursor decoding.
+        fn pool(index: usize) -> Node {
+            match index {
+                0 => Node::Literal("a".to_owned()),
+                1 => Node::Literal("/".to_owned()),
+                2 => Node::Literal("é".to_owned()),
+                3 => Node::Star,
+                4 => Node::DoubleStar,
+                5 => Node::AnyChar,
+                _ => Node::Range {
+                    negated: index % 2 == 1,
+                    ranges: vec![('a', 'b')],
+                },
+            }
+        }
+        const POOL: usize = 7;
+        // Fixed-seed xorshift keeps the randomized phase reproducible.
+        fn next(state: &mut u64, bound: usize) -> usize {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            usize::try_from(*state % (bound as u64)).expect("bounded remainder fits usize")
+        }
+        let alphabet = ['a', 'b', '/', 'é'];
+        for length in 0u32..=2 {
+            for combo in 0..POOL.pow(length) {
+                let nodes: Vec<Node> = (0..length)
+                    .scan(combo, |combo, _| {
+                        let index = *combo % POOL;
+                        *combo /= POOL;
+                        Some(pool(index))
+                    })
+                    .collect();
+                for text_length in 0u32..=4 {
+                    for text_combo in 0..alphabet.len().pow(text_length) {
+                        let text: String = (0..text_length)
+                            .scan(text_combo, |combo, _| {
+                                let c = alphabet[*combo % alphabet.len()];
+                                *combo /= alphabet.len();
+                                Some(c)
+                            })
+                            .collect();
+                        assert_eq!(
+                            super::matches(&nodes, &text),
+                            naive_matches(&nodes, &text),
+                            "nodes {nodes:?} text {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Randomized longer cases, including shapes that engage the memo
+        // (three or more stars).
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..3000 {
+            let mut nodes: Vec<Node> = Vec::new();
+            for _ in 0..next(&mut state, 5) {
+                nodes.push(match next(&mut state, 7) {
+                    0 => Node::Literal("a".to_owned()),
+                    1 => Node::Literal("/".to_owned()),
+                    2 => Node::Literal("é".to_owned()),
+                    3 | 4 => Node::Star,
+                    5 => Node::DoubleStar,
+                    _ => Node::AnyChar,
+                });
+            }
+            let mut text = String::new();
+            for _ in 0..next(&mut state, 7) {
+                text.push(['a', 'b', '/', 'é'][next(&mut state, 4)]);
+            }
+            assert_eq!(
+                super::matches(&nodes, &text),
+                naive_matches(&nodes, &text),
+                "nodes {nodes:?} text {text:?}"
+            );
+        }
+    }
+
+    /// Counts allocations by forwarding to the system allocator.
+    ///
+    /// Installed crate-wide for the test binary; the counter is only read
+    /// by [`matching_hot_path_allocates_nothing`].
+    struct CountingAllocator;
+
+    static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: forwarded with the caller's layout.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: ptr/layout pair received from the caller.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: forwarded with the caller's layout.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: forwarded with the caller's layout and new size.
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: CountingAllocator = CountingAllocator;
+
+    #[test]
+    fn matching_hot_path_allocates_nothing() {
+        // Realistic analysis-options exclude shapes, all with at most two
+        // stars — the memo stays disabled and matching must be pure slice
+        // arithmetic.
+        let globs: Vec<Glob> = [
+            "*.g.dart",
+            "*.freezed.dart",
+            "**/*.g.dart",
+            "**/build/",
+            "build/",
+            "packages/*/lib/**",
+            "?.dart",
+            "[tf]ail*",
+        ]
+        .iter()
+        .map(|pattern| Glob::new(pattern).expect("parse"))
+        .collect();
+        let paths: Vec<String> = [
+            "lib/main.dart",
+            "lib/src/deep/nested/module.dart",
+            "a/b/c/deep/x.g.dart",
+            "x.g.dart",
+            "build/web/main.js",
+            "sub/build/out.freezed.dart",
+            "out.freezed.dart",
+            "packages/foo/lib/foo.dart",
+            "test/glob_test.dart",
+            "tool/generate.dart",
+            "é/漢字/naïve.dart",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        // Construction allocations are out of scope; reset before matching.
+        ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut hits = 0;
+        for _ in 0..100 {
+            for glob in &globs {
+                for path in &paths {
+                    if glob.matches_path(path) {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "matches_path allocated on the hot path"
+        );
+        assert!(hits > 0, "corpus must exercise matching paths");
     }
 }
