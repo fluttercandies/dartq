@@ -40,9 +40,11 @@
 //! * Static types are name-level ([`ty::NameTypeOps`]): a `Ty` is a
 //!   type name plus nullability (or `dynamic`/`Never`/unknown). Promotions
 //!   that need real subtyping (`x is T` where `T` crosses a class
-//!   hierarchy) are decided optimistically on name compatibility; no
-//!   subtype-based *else* promotions are inferred. A full `dartq-types`
-//!   back-end plugs in through [`ty::TypeOps`].
+//!   hierarchy) are decided optimistically on name compatibility. The
+//!   else-branch factored promotion follows the official `factorType`
+//!   rules cut to the name level (a `T?` remainder promotes to `Never?`,
+//!   a bottom remainder marks the branch unreachable). A full
+//!   `dartq-types` back-end plugs in through [`ty::TypeOps`].
 //! * Field promotion (private final instance fields) and promoted
 //!   properties are not mounted — property reads are opaque values.
 //! * Sub-pattern promotions (list/map/record/object pattern fields),

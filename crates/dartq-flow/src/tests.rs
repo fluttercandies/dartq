@@ -70,6 +70,76 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
         .collect()
 }
 
+/// Token span for hand-driven event sequences (arbitrary anchor).
+fn tspan(offset: u32) -> dartq_parser::TokenSpan {
+    dartq_parser::TokenSpan {
+        id: offset,
+        range: dartq_source::SourceRange { offset, length: 1 },
+    }
+}
+
+/// A named-type event for hand-driven sequences.
+fn named_ty(name: u32, nullable: bool) -> crate::ev::Ev {
+    crate::ev::Ev::Type {
+        base: crate::ty::Base::Name(name),
+        nullable,
+    }
+}
+
+/// A bare identifier read for hand-driven sequences.
+fn read(name: u32) -> crate::ev::Ev {
+    crate::ev::Ev::Ident {
+        name,
+        token: tspan(name),
+        context: dartq_parser::IdentifierContext::Expression,
+    }
+}
+
+/// An `x is T` / `x is! T` event sequence.
+fn is_test(name: u32, ty: crate::ev::Ev, is_not: bool) -> Vec<crate::ev::Ev> {
+    vec![
+        read(name),
+        crate::ev::Ev::IsBegin,
+        ty,
+        crate::ev::Ev::IsOperator { is_not },
+        crate::ev::Ev::IsEnd,
+    ]
+}
+
+/// A `T x = e;` declaration sequence opening its own executable (the
+/// initializer nets one value).
+fn declared(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
+    [
+        vec![crate::ev::Ev::ExecBegin { is_closure: false }],
+        decl_block(name, ty),
+    ]
+    .concat()
+}
+
+/// A declaration inside an already-open executable.
+fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
+    vec![
+        crate::ev::Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: tspan(0),
+        },
+        ty,
+        crate::ev::Ev::InitializedIdent { name },
+        crate::ev::Ev::InitializerBegin,
+        crate::ev::Ev::OtherExpr { span: tspan(1) },
+        crate::ev::Ev::InitializerEnd,
+        crate::ev::Ev::VarDeclEnd,
+    ]
+}
+
+/// Drives a hand-built buffer through a fresh interpreter (name-level ops).
+fn interp_of(events: Vec<crate::ev::Ev>) -> crate::interp::Interp<'static> {
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps);
+    interp.run(events);
+    interp
+}
+
 /// reachability basics: code after `return` is dead
 /// (official reachability/data/early_exit.dart).
 #[test]
@@ -340,6 +410,27 @@ fn while_true_no_break_kills_exit() {
 #[test]
 fn pattern_declaration_assigns() {
     let source = "void f(Object o) { var (a, b) = (1, 2); a; b; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A cast pattern's primary is a pattern, not an expression: the parser
+/// reuses the as-operator events for `p as T` (patterns.rs:176-187), so
+/// `AsEnd` must not pop an operand off the empty expr stack (the "as
+/// operand" panic), and the cast refines the pattern's declared variable
+/// on the matched path (shared_type_analyzer.dart:145-152).
+#[test]
+fn cast_pattern_does_not_pop_the_expr_stack() {
+    // Wildcard primary: nothing to pop, no crash, sound facts.
+    let source = "void f(Object? o) { switch (o) { case _ as Object?: 1; } }";
+    assert!(facts_of(source).is_empty());
+    // Declared primary: the pattern variable is assigned on the matched
+    // path. The soundness read lives in the guard — guard events run
+    // under the pattern's matched state, before `CaseBegin` resets
+    // `current` to the pre-case state (interp_stmt.rs:439; the head
+    // state never lands in the group because `PatternBegin` replaces
+    // the Switch-kind `PatternState`, so `case_pattern_end` skips —
+    // a known gap, not this pin's subject).
+    let source = "void f(Object? o) { switch (o) { case var x as int when x > 0: 1; } }";
     assert!(unassigned_snippets(source).is_empty());
 }
 
@@ -1594,4 +1685,215 @@ fn live_try_block_records_scope_only() {
     let source = "void f() { try { var x = 1; x; } finally {} }";
     assert!(dead_snippets(source).is_empty());
     assert!(unassigned_snippets(source).is_empty());
+}
+
+// —— promotion-machinery pins (audit #543 fixes) ——————————————————————
+
+/// Assignment demotion keeps the least-specific suffix (official
+/// `_demoteViaAssignment`, flow_analysis.dart:4888-4928): after `num? x`
+/// promotes through `is num` then `is int` (chain [int, num] most-specific
+/// first), a write of a `num` value drops the stale `int` head and keeps
+/// exactly `num`. The old prefix-keeping demotion retained both entries.
+#[test]
+fn assignment_demotion_keeps_the_least_specific_suffix() {
+    use crate::ev::Ev;
+    use crate::model::NIL;
+    use crate::ty::{Base, Ty};
+    const NUM: u32 = 101;
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    const OTHER: u32 = 8;
+    let events: Vec<Ev> = [
+        vec![Ev::ExecBegin { is_closure: false }],
+        decl_block(X, named_ty(NUM, true)),
+        decl_block(OTHER, named_ty(NUM, false)),
+        is_test(X, named_ty(NUM, false), false),
+        is_test(X, named_ty(INT, false), false),
+        vec![
+            read(X),
+            // `x = other;`: the right-hand side is a `num` value.
+            read(OTHER),
+            Ev::Assign { plain: true },
+            Ev::ExecEnd { is_expr: false },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(events);
+    let model = interp.current.model(0);
+    assert!(
+        model.promoted != NIL,
+        "a promotion must survive a `num` write into `num? x`"
+    );
+    assert_eq!(
+        interp.lists.head(model.promoted),
+        Ty {
+            base: Base::Name(NUM),
+            nullable: false
+        }
+    );
+    assert_eq!(
+        interp.lists.iter(model.promoted).count(),
+        1,
+        "the stale `int` head must drop from the chain"
+    );
+}
+
+/// The `is!` then-branch carries the factored remainder (official
+/// `tryPromoteForTypeCheck`'s typeIfFalse,
+/// flow_analysis.dart:4143-4179): `int? x` under `x is! int` reads
+/// `Never?` — the Null knowledge — on the then path
+/// (`factorType(int?, int) = Never?`,
+/// factor_type.dart:11-45). The old unmatched arm kept the state
+/// unchanged.
+#[test]
+fn is_not_then_branch_carries_the_factored_remainder() {
+    use crate::ev::Ev;
+    use crate::ty::{Base, Ty};
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    let events: Vec<Ev> = [declared(X, named_ty(INT, true)), is_test(X, named_ty(INT, false), true)]
+        .concat();
+    let interp = interp_of(events);
+    let model = interp.current.model(0);
+    assert_eq!(
+        interp.lists.head(model.promoted),
+        Ty {
+            base: Base::Never,
+            nullable: true
+        }
+    );
+}
+
+/// A bottom factored remainder marks the else branch unreachable
+/// (official `ifFalseIsUnreachable`, flow_analysis.dart:4159-4173 — the
+/// sound arm; `sound-flow-analysis` is enabled-by-default and expired,
+/// experiments/flags.dart:309-315): `int x` cannot fail `x is int?`, so
+/// the else branch is dead code.
+#[test]
+fn bottom_remainder_marks_the_else_branch_unreachable() {
+    use crate::ev::Ev;
+    use crate::facts::FlowFact;
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, false)),
+        vec![Ev::IfBegin { span: tspan(2) }],
+        is_test(X, named_ty(INT, true), false),
+        vec![
+            Ev::ThenBegin,
+            Ev::ElseBegin,
+            Ev::ExprStmt { span: tspan(3) },
+            Ev::OtherExpr { span: tspan(4) },
+            Ev::IfEnd { has_else: true },
+            Ev::ExecEnd { is_expr: false },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(events);
+    assert!(
+        matches!(interp.facts.as_slice(), [FlowFact::DeadCode { .. }]),
+        "the else branch of `x is int?` on `int x` is provably dead: {:?}",
+        interp.facts
+    );
+}
+
+/// `??` types as the LHS's non-null form (official `ifNullExpression_end`,
+/// flow_analysis.dart:7071-7080, with the skip-path promotion mounted at
+/// `ifNullExpression_rightBegin`, :7086-7104). The old engine gave `??`
+/// no split and a typeless result.
+#[test]
+fn if_null_types_as_the_lhs_non_null_form() {
+    use crate::ev::Ev;
+    use crate::ty::{Base, Ty};
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, true)),
+        vec![
+            read(X),
+            Ev::BinaryBegin {
+                op: crate::ev::BinOp::IfNull,
+            },
+            read(X),
+            Ev::OtherExpr { span: tspan(2) },
+            Ev::BinaryEnd {
+                op: crate::ev::BinOp::IfNull,
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(events);
+    let result = interp.exprs.last().expect("?? leaves its value");
+    assert_eq!(
+        result.ty,
+        Ty {
+            base: Base::Name(INT),
+            nullable: false
+        }
+    );
+}
+
+/// The `??` skip-path promotion feeds the write's types-of-interest pass:
+/// `int? x = g(); x = x ?? 0;` leaves `x` promoted to `int` (the written
+/// type is the LHS's non-null form). The RHS itself evaluates on the
+/// LHS-null path — unpromoted (official `ifNullExpression_rightBegin`,
+/// flow_analysis.dart:7086-7104).
+#[test]
+fn if_null_write_repromotes_via_types_of_interest() {
+    use crate::ev::Ev;
+    use crate::ty::{Base, Ty};
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, true)),
+        vec![
+            read(X),
+            Ev::BinaryBegin {
+                op: crate::ev::BinOp::IfNull,
+            },
+            read(X),
+            Ev::OtherExpr { span: tspan(2) },
+            Ev::BinaryEnd {
+                op: crate::ev::BinOp::IfNull,
+            },
+            Ev::Assign { plain: true },
+            Ev::ExecEnd { is_expr: false },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(events);
+    let model = interp.current.model(0);
+    assert_eq!(
+        interp.lists.head(model.promoted),
+        Ty {
+            base: Base::Name(INT),
+            nullable: false
+        }
+    );
+}
+
+/// The true-branch promotion-step gates (official `tryPromoteToType` +
+/// `isValidPromotionStep`, flow_analysis.dart:4137-4145, :7229-7246): a
+/// redundant `x is int` on `int x` must NOT promote (the old factoring
+/// pass fed `factor(int, int) = Never` straight into the chain, and an
+/// `x is int?` on `int x` promoted to `int?`).
+#[test]
+fn redundant_is_checks_do_not_promote() {
+    use crate::ev::Ev;
+    use crate::model::NIL;
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    for tested_nullable in [false, true] {
+        let events: Vec<Ev> = [
+            declared(X, named_ty(INT, false)),
+            is_test(X, named_ty(INT, tested_nullable), false),
+        ]
+        .concat();
+        let interp = interp_of(events);
+        assert_eq!(
+            interp.current.model(0).promoted,
+            NIL,
+            "tested_nullable={tested_nullable}: a redundant `is` is not a promotion step"
+        );
+    }
 }

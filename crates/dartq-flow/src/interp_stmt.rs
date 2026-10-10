@@ -80,7 +80,7 @@ impl<'o> Interp<'o> {
                 let effects = if end == NIL {
                     Effects::default()
                 } else {
-                    self.collect_ranges(events, &[i..end as usize])
+                    self.collect_ranges(events, &[i..end as usize], match_of)
                 };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
@@ -117,7 +117,7 @@ impl<'o> Interp<'o> {
                 let effects = if end == NIL {
                     Effects::default()
                 } else {
-                    self.collect_ranges(events, &[i..end as usize])
+                    self.collect_ranges(events, &[i..end as usize], match_of)
                 };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
@@ -252,7 +252,7 @@ impl<'o> Interp<'o> {
                             )
                         })
                         .unwrap_or(end);
-                    self.collect_ranges(events, &[i + 1..body_end])
+                    self.collect_ranges(events, &[i + 1..body_end], match_of)
                 };
                 let pre = self.current.clone();
                 self.split_cur();
@@ -738,7 +738,7 @@ impl<'o> Interp<'o> {
 
     /// One-event lookahead: closes the current case alternative group
     /// before its first body event (official `switch_endAlternatives`).
-    pub(crate) fn maybe_close_case_group(&mut self, events: &[Ev]) {
+    pub(crate) fn maybe_close_case_group(&mut self, events: &[Ev], match_of: &[u32]) {
         // The close runs its own collect over the switch block, and the
         // frame keeps `case_open` until it returns — a collect run's
         // re-stepped events would re-enter here for the same still-open
@@ -776,7 +776,7 @@ impl<'o> Interp<'o> {
         if labeled {
             // Labeled case bodies can be jumped into from anywhere in the
             // switch: conservatively join every write in the block.
-            let effects = self.collect_ranges(events, &[block.start..block.end]);
+            let effects = self.collect_ranges(events, &[block.start..block.end], match_of);
             let previous = match &self.stack[frame_index] {
                 Frame::Switch { previous, .. } => previous.clone(),
                 _ => return,

@@ -131,8 +131,45 @@ impl<'o> Interp<'o> {
                     } else {
                         (left_if_false, left_if_true)
                     };
-                    self.stack.push(Frame::Branch { branch: other });
+                    self.stack.push(Frame::Branch {
+                        branch: other,
+                        ifnull_ty: None,
+                    });
                     self.current = taken;
+                }
+                BinOp::IfNull => {
+                    // Official `ifNullExpression_rightBegin`
+                    // (flow_analysis.dart:7086-7104): split; the SKIP path
+                    // (LHS was non-null — the path that skips the RHS,
+                    // official `shortcutState`) carries the LHS's non-null
+                    // promotion (`tryMarkNonNullable(...).ifTrue`), while
+                    // the RHS itself evaluates on the LHS-null path (the
+                    // split state, unchanged).
+                    let left = self.exprs.pop().expect("binary left");
+                    self.split_cur();
+                    let shortcut = match left.reference {
+                        Some(var) => {
+                            let promoted = self.ops.promote_to_non_null(left.ty);
+                            if promoted != left.ty {
+                                self.current.clone().finish_type_test(
+                                    self.ops,
+                                    &mut self.lists,
+                                    var,
+                                    None,
+                                    Some(promoted),
+                                )
+                            } else {
+                                self.current.clone()
+                            }
+                        }
+                        None => self.current.clone(),
+                    };
+                    // `??` types as the LHS's non-null form.
+                    let result_ty = self.ops.promote_to_non_null(left.ty);
+                    self.stack.push(Frame::Branch {
+                        branch: shortcut,
+                        ifnull_ty: Some(result_ty),
+                    });
                 }
                 _ => {}
             },
@@ -141,7 +178,11 @@ impl<'o> Interp<'o> {
                     let right = self.exprs.pop().expect("binary right");
                     let (right_if_true, right_if_false) = self.cond_split(&right);
                     let frame = self.stack.pop().expect("branch frame");
-                    let Frame::Branch { branch: other } = frame else {
+                    let Frame::Branch {
+                        branch: other,
+                        ifnull_ty: _,
+                    } = frame
+                    else {
                         self.stack.push(frame);
                         return true;
                     };
@@ -152,6 +193,32 @@ impl<'o> Interp<'o> {
                     };
                     self.current = if_true.clone();
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
+                    expr.branches = Some((if_true, if_false));
+                    self.exprs.push(expr);
+                }
+                BinOp::IfNull => {
+                    // Official `ifNullExpression_end`
+                    // (flow_analysis.dart:7071-7080): join the RHS-exit
+                    // state with the non-null skip path. The conditional
+                    // split of the whole expression contributes the skip
+                    // path to both branches (its truthiness is the LHS
+                    // value's — unknowable at the name level), the same
+                    // convention as the And/Or arms above.
+                    let right = self.exprs.pop().expect("binary right");
+                    let (right_if_true, right_if_false) = self.cond_split(&right);
+                    let frame = self.stack.pop().expect("branch frame");
+                    let Frame::Branch {
+                        branch: shortcut,
+                        ifnull_ty,
+                    } = frame
+                    else {
+                        self.stack.push(frame);
+                        return true;
+                    };
+                    let if_true = self.join(Some(shortcut.clone()), Some(right_if_true));
+                    let if_false = self.join(Some(shortcut), Some(right_if_false));
+                    self.current = if_true.clone();
+                    let mut expr = Expr::trivial(ifnull_ty.unwrap_or(Ty::UNKNOWN));
                     expr.branches = Some((if_true, if_false));
                     self.exprs.push(expr);
                 }
@@ -200,7 +267,10 @@ impl<'o> Interp<'o> {
                 }
                 self.exprs.push(expr);
             }
-            Ev::AsBegin => self.in_as_cast = true,
+            Ev::AsBegin => {
+                self.in_as_cast = true;
+                self.as_base = self.exprs.len();
+            }
             Ev::AsOperator => {
                 let cast_ty = self.tested_ty.take().unwrap_or(Ty::UNKNOWN);
                 self.as_cast_pending = Some(cast_ty);
@@ -210,6 +280,30 @@ impl<'o> Interp<'o> {
                 let Some(cast_ty) = self.as_cast_pending.take() else {
                     return true;
                 };
+                if self.exprs.len() == self.as_base {
+                    // A cast pattern (`p as T`; parser patterns.rs:176-187
+                    // reuses the as-operator events): the primary pattern is
+                    // not an expression, so nothing landed on the expr
+                    // stack. The cast refines the pattern's declared
+                    // variable on the matched path
+                    // (shared_type_analyzer.dart:145-152).
+                    if let Some((name, _)) = self
+                        .pattern
+                        .as_ref()
+                        .and_then(|p| p.pending_decls.last().copied())
+                        && let Some(var) = self.resolve(name)
+                        && let Some(promoted) = self.promotion_candidate(var, cast_ty)
+                    {
+                        self.current = self.current.clone().finish_type_test(
+                            self.ops,
+                            &mut self.lists,
+                            var,
+                            None,
+                            Some(promoted),
+                        );
+                    }
+                    return true;
+                }
                 let operand = self.exprs.pop().expect("as operand");
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, cast_ty);
@@ -378,7 +472,10 @@ impl<'o> Interp<'o> {
             Ev::IfControlFlowBegin => {
                 let cond = self.exprs.pop().expect("element condition");
                 let (if_true, if_false) = self.cond_split(&cond);
-                self.stack.push(Frame::Branch { branch: if_false });
+                self.stack.push(Frame::Branch {
+                    branch: if_false,
+                    ifnull_ty: None,
+                });
                 self.current = if_true;
             }
             Ev::ThenControlFlow => {}
@@ -386,7 +483,7 @@ impl<'o> Interp<'o> {
                 // The then-element is consumed; the else-element runs under
                 // the condition-false branch.
                 self.exprs.pop();
-                if let Some(Frame::Branch { branch }) = self.stack.last() {
+                if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
                     self.current = branch.clone();
                 }
             }
@@ -396,7 +493,7 @@ impl<'o> Interp<'o> {
                     // The then-element was popped at ElseControlFlow.
                 }
                 let frame = self.stack.pop().expect("if-element frame");
-                let Frame::Branch { branch } = frame else {
+                let Frame::Branch { branch, .. } = frame else {
                     self.stack.push(frame);
                     return true;
                 };
@@ -442,20 +539,31 @@ impl<'o> Interp<'o> {
         }
     }
 
-    /// The promotion target for a type check: the tested type factored
-    /// against every existing promotion (official
-    /// `tryPromoteForTypeCheck`). `None` when the check target is
-    /// unknowable at the name level.
+    /// The promotion target for a type check (official
+    /// `tryPromoteForTypeCheck`'s true branch,
+    /// flow_analysis.dart:4137-4145): the tested type factored against
+    /// every existing promotion, then the promotion-step gate (official
+    /// `tryPromoteToType` + `isValidPromotionStep`,
+    /// flow_analysis.dart:7229-7246, sound arm — `sound-flow-analysis` is
+    /// enabled-by-default and expired, `experiments/flags.dart:309-315`):
+    /// a bottom candidate (`x is int` twice factors to `Never`) and a
+    /// candidate the current type already subsumes (`x is int?` on
+    /// `int x`) are not steps. `None` when no step exists.
     fn promotion_candidate(&mut self, var: u32, tested: Ty) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
                 let model = self.current.model(var);
+                let previous = self.promoted_type_of(var, &model);
                 let mut candidate = tested;
                 for ty in self.lists.iter(model.promoted) {
                     candidate = self.ops.factor(candidate, ty);
                 }
-                Some(candidate)
+                if self.ops.is_bottom(candidate) || self.ops.is_subtype(previous, candidate) {
+                    None
+                } else {
+                    Some(candidate)
+                }
             }
         }
     }
@@ -476,8 +584,18 @@ impl<'o> Interp<'o> {
     }
 
     /// A successful type test on `var`: returns (matched, unmatched)
-    /// states (official `_finishTypeTest` splitting).
+    /// states (official `tryPromoteForTypeCheck`,
+    /// flow_analysis.dart:4118-4179). The matched branch promotes to the
+    /// gated candidate; the unmatched branch promotes to the factored
+    /// remainder `factor(previous, tested)`, and a bottom remainder marks
+    /// it unreachable (official `ifFalseIsUnreachable`, the sound arm —
+    /// `sound-flow-analysis` is enabled-by-default and expired,
+    /// `experiments/flags.dart:309-315`).
     fn branch_type_test(&mut self, var: u32, tested: Ty, promoted: Option<Ty>) -> (State, State) {
+        let previous = {
+            let model = self.current.model(var);
+            self.promoted_type_of(var, &model)
+        };
         let matched = self.current.clone().finish_type_test(
             self.ops,
             &mut self.lists,
@@ -485,7 +603,28 @@ impl<'o> Interp<'o> {
             Some(tested),
             promoted,
         );
-        (matched, self.current.clone())
+        let factored = self.ops.factor(previous, tested);
+        let unmatched = if self.ops.is_bottom(factored) {
+            self.current.clone().set_unreachable(&mut self.reach)
+        } else {
+            // Official `isValidPromotionStep`: the factor output is a
+            // subtype of `previous` by construction, so the step is valid
+            // exactly when `previous` is not a subtype of it (no mutual
+            // subtypes, no repeats).
+            let factored = if self.ops.is_subtype(previous, factored) {
+                None
+            } else {
+                Some(factored)
+            };
+            self.current.clone().finish_type_test(
+                self.ops,
+                &mut self.lists,
+                var,
+                Some(tested),
+                factored,
+            )
+        };
+        (matched, unmatched)
     }
 
     /// The official `_equalityCheck` at the name level: a null literal on

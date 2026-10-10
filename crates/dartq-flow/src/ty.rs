@@ -113,9 +113,16 @@ pub trait TypeOps {
 /// * a non-nullable type is a subtype of its nullable form;
 /// * name equality with nullability subsumption otherwise.
 ///
-/// Factoring: `from <: what` → `Never`; nullable `from` with `what` its
-/// non-null form (or `Null`) → the non-null form; otherwise `from`
-/// unchanged (no else-branch promotion without real subtyping).
+/// Factoring (official `factorType`,
+/// `pkg/front_end/lib/src/type_inference/factor_type.dart:11-45`): the
+/// remainder of `from` after an `is`-check against `what` removed it —
+/// `from <: what` → `Never`; nullable `from = R?` → `factor(R, what)` when
+/// `Null <: what` (i.e. `what` is nullable), else `factor(R, what)?`; the
+/// `FutureOr` arms need a real hierarchy (unmodeled); otherwise `from`
+/// unchanged. So the else branch of `x is T` on `T? x` promotes to `Never?`
+/// (the Null knowledge), and a bottom remainder marks the branch
+/// unreachable (sound flow — `sound-flow-analysis` is enabled-by-default
+/// and expired, `experiments/flags.dart:309-315`).
 pub struct NameTypeOps;
 
 impl TypeOps for NameTypeOps {
@@ -145,13 +152,17 @@ impl TypeOps for NameTypeOps {
         if from.nullable
             && !matches!(
                 from.base,
-                Base::Dynamic | Base::Unknown | Base::Null | Base::Never
+                Base::Dynamic | Base::Unknown | Base::Void | Base::Null | Base::Never
             )
         {
-            let non_null = from.non_null();
-            if what == non_null || what.base == Base::Null {
-                return non_null;
+            // Rule 2 of factorType: `T = R?` factors as `factor(R, what)`
+            // when `Null <: what`, else `factor(R, what)?`. `Null <: what`
+            // at the name level is exactly `what` being nullable.
+            let r = from.non_null();
+            if what.nullable {
+                return self.factor(r, what);
             }
+            return self.factor(r, what).make_nullable();
         }
         from
     }

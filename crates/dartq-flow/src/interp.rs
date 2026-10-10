@@ -115,6 +115,9 @@ pub(crate) enum Frame {
     },
     Branch {
         branch: State,
+        /// `??`'s result type — the LHS's non-null form (official `??`
+        /// typing); `None` for the boolean-operator branches.
+        ifnull_ty: Option<Ty>,
     },
     Cascade {
         exprs_base: usize,
@@ -311,6 +314,10 @@ pub(crate) struct Interp<'o> {
     pub(crate) in_decl: bool,
     pub(crate) in_type_test: bool,
     pub(crate) in_as_cast: bool,
+    /// The expr-stack depth when `AsBegin` fired: a cast pattern's primary
+    /// is a pattern, not an expression, so an unchanged depth at `AsEnd`
+    /// identifies the pattern face (`p as T` — no operand was pushed).
+    pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
     pub(crate) anywhere: Effects,
 
@@ -356,6 +363,7 @@ impl<'o> Interp<'o> {
             in_decl: false,
             in_type_test: false,
             in_as_cast: false,
+            as_base: 0,
             for_header_depth: 0,
             anywhere: Effects::default(),
             collect: None,
@@ -367,7 +375,7 @@ impl<'o> Interp<'o> {
     /// replay.
     pub(crate) fn run(&mut self, events: Vec<Ev>) {
         let match_of = build_match_map(&events);
-        self.anywhere = self.collect_ranges(&events, &[0..events.len()]);
+        self.anywhere = self.collect_ranges(&events, &[0..events.len()], &match_of);
         let mut i = 0;
         while i < events.len() {
             let control = self.step(&events, i, &match_of);
@@ -528,8 +536,16 @@ impl<'o> Interp<'o> {
 
     /// Runs the event ranges once in collect mode and returns the bottom
     /// effect frame. All flow-state mutations are rolled back and fact
-    /// emission is suppressed.
-    pub(crate) fn collect_ranges(&mut self, events: &[Ev], ranges: &[Range<usize>]) -> Effects {
+    /// emission is suppressed. The real match table is passed through so
+    /// extent handlers behave identically in collect runs (they read
+    /// `match_of` before their collect guards only by convention — the
+    /// empty table removed that fragile invariant).
+    pub(crate) fn collect_ranges(
+        &mut self,
+        events: &[Ev],
+        ranges: &[Range<usize>],
+        match_of: &[u32],
+    ) -> Effects {
         let snapshot = Snapshot {
             current: self.current.clone(),
             exprs_len: self.exprs.len(),
@@ -543,7 +559,7 @@ impl<'o> Interp<'o> {
         for range in ranges {
             let mut i = range.start;
             while i < range.end {
-                match self.step(events, i, &MATCH_NONE) {
+                match self.step(events, i, match_of) {
                     Control::Continue => i += 1,
                     // Extent handlers consume wholesale in collect runs too.
                     Control::Jump(to) => i = to.max(range.start),
@@ -854,7 +870,7 @@ impl<'o> Interp<'o> {
             return;
         }
         let end = end as usize;
-        let effects = self.collect_ranges(events, &[i + 1..end]);
+        let effects = self.collect_ranges(events, &[i + 1..end], match_of);
         self.cjoin(&FxHashSet::default(), &effects.written);
         let saved = self.current.clone();
         let anywhere_written = self.anywhere.written.clone();
@@ -983,7 +999,8 @@ impl<'o> Interp<'o> {
         collection: bool,
     ) {
         let base = self.exprs.len();
-        let effects = self.collect_ranges(events, &[bounds.init.start..bounds.body.end]);
+        let effects =
+            self.collect_ranges(events, &[bounds.init.start..bounds.body.end], match_of);
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);
@@ -1117,7 +1134,7 @@ impl<'o> Interp<'o> {
             // loop head. Replaying the marker would fire the statement-form
             // handler too: a second pop plus a stray non-collection frame.
             self.run_range(events, i + 1..parts, match_of);
-            self.for_in_parts_at(events, i + 1, parts, end, true);
+            self.for_in_parts_at(events, i + 1, parts, end, true, match_of);
             self.run_range(events, parts + 1..end, match_of);
             self.loop_exit(true);
         }
@@ -1129,7 +1146,7 @@ impl<'o> Interp<'o> {
     /// The loop head of a statement-form for-in (official
     /// `forEach_bodyBegin`): pops the iterable, splits, and conservatively
     /// joins the body's writes.
-    fn for_in_parts(&mut self, events: &[Ev], i: usize, _match_of: &[u32]) {
+    fn for_in_parts(&mut self, events: &[Ev], i: usize, match_of: &[u32]) {
         if self.collect.is_some() {
             return;
         }
@@ -1143,7 +1160,7 @@ impl<'o> Interp<'o> {
             .rev()
             .find(|&j| matches!(events[j], Ev::ForBegin { .. }))
             .map_or(i, |j| j + 1);
-        self.for_in_parts_at(events, head_start, i, end, false);
+        self.for_in_parts_at(events, head_start, i, end, false, match_of);
     }
 
     fn for_in_parts_at(
@@ -1153,6 +1170,7 @@ impl<'o> Interp<'o> {
         i: usize,
         end: usize,
         collection: bool,
+        match_of: &[u32],
     ) {
         // The iterable expression value is on the stack; it contributes no
         // promotion state.
@@ -1178,7 +1196,7 @@ impl<'o> Interp<'o> {
             Some(start) => start..end,
             None => i + 1..end,
         };
-        let effects = self.collect_ranges(events, &[body]);
+        let effects = self.collect_ranges(events, &[body], match_of);
         let previous = self.current.clone();
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
@@ -1205,7 +1223,7 @@ impl<'o> Interp<'o> {
             ev,
             Ev::CaseBegin { .. } | Ev::CaseExprBegin | Ev::CaseNoWhen | Ev::CaseExprEnd { .. }
         ) {
-            self.maybe_close_case_group(events);
+            self.maybe_close_case_group(events, match_of);
         }
         match ev {
             Ev::ExecBegin { is_closure } => {
@@ -1312,6 +1330,3 @@ fn build_match_map(events: &[Ev]) -> Vec<u32> {
     }
     match_of
 }
-
-/// Empty match table for collect runs.
-static MATCH_NONE: [u32; 0] = [];

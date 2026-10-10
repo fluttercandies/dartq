@@ -113,8 +113,9 @@ impl ReachArena {
 }
 
 /// A cons-cell pool for promoted-type and tested-type chains. Chains are
-/// ordered least- to most-specific (the official invariant), shared freely
-/// across states, and never mutated in place.
+/// ordered most- to least-specific (the mirror of the official least- to
+/// most-specific list order — `add_promoted` conses onto the front), shared
+/// freely across states, and never mutated in place.
 #[derive(Default)]
 pub(crate) struct Lists {
     cells: Vec<(Ty, u32)>,
@@ -287,20 +288,18 @@ impl State {
                 },
             );
         }
-        // Demote: keep the longest chain prefix the written type still
-        // satisfies (official `_demoteViaAssignment`). Chains are stored
-        // most-specific-first, so the "prefix" is a suffix of the stored
-        // list; rebuild it in order.
+        // Demote: drop the most-specific entries the written type no longer
+        // satisfies and keep the least-specific remainder (official
+        // `_demoteViaAssignment`, flow_analysis.dart:4888-4928: the official
+        // list is least- to most-specific and keeps `sublist(0, k)` for the
+        // largest k with `written <: promotedTypes[k-1]`; dartq chains store
+        // the mirror order — most-specific first — so the kept prefix of the
+        // official list is a suffix here). Rebuild the kept suffix in order.
         let nodes: Vec<Ty> = lists.iter(model.promoted).collect();
-        let total = nodes.len();
         let mut promoted = NIL;
-        for keep in (1..=total).rev() {
-            let top = nodes[keep - 1];
-            if ops.is_subtype(written, top) {
-                for ty in nodes.iter().take(keep).rev() {
-                    promoted = lists.cons(*ty, promoted);
-                }
-                break;
+        if let Some(keep_from) = nodes.iter().position(|&ty| ops.is_subtype(written, ty)) {
+            for ty in nodes[keep_from..].iter().rev() {
+                promoted = lists.cons(*ty, promoted);
             }
         }
         if promote_to_interest && !promoted_is(lists, promoted, written) {
@@ -510,17 +509,10 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
         return a;
     }
     let captured = a.captured() || b.captured();
-    let promoted = if captured {
-        NIL
-    } else if a.version != b.version {
-        // Written on one path since the branch: the join cannot trust
-        // either chain (official `rebaseForward`'s version check keeps the
-        // base promotions; at a join the conservative reading is the
-        // common prefix of both).
-        join_promoted(a.promoted, b.promoted, lists)
-    } else {
-        join_promoted(a.promoted, b.promoted, lists)
-    };
+    // Written on one path since the branch or not, the conservative join is
+    // the common (less specific) chain prefix either way; write-captured on
+    // either path keeps no promotion at all (official `joinPromotionInfo`).
+    let promoted = if captured { NIL } else { join_promoted(a.promoted, b.promoted, lists) };
     let tested = union_tested(a.tested, b.tested, lists);
     VarModel {
         promoted,

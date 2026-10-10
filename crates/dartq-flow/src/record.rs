@@ -435,10 +435,15 @@ impl<'t> ParserListener for Flow<'t> {
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
         let id = self.name(name);
+        // Classify on the type-name TOKEN's own lexeme: `name.id` is the
+        // token index while `id` is the interned name id — unrelated
+        // namespaces. Indexing the table by the interned id classified a
+        // special base only when the ids collided (every fixture starting
+        // `void f(` made `void` collide by accident).
         let base = match self
             .tokens
-            .get(id as usize)
-            .map(|_| self.tokens.lexeme(self.source, id as usize))
+            .get(name.id as usize)
+            .map(|_| self.tokens.lexeme(self.source, name.id as usize))
         {
             Some("dynamic") => crate::ty::Base::Dynamic,
             Some("void") => crate::ty::Base::Void,
@@ -1208,5 +1213,66 @@ mod tests {
             second_a, first_a,
             "the same lexeme interns to the same id across tokens"
         );
+    }
+
+    /// Type-base classification reads the type-name TOKEN's lexeme: the
+    /// old code indexed the token table by the interned name id, so
+    /// `dynamic`, `Never`, and every `void` past the file's head
+    /// classified as a plain named type (`void` only worked because every
+    /// fixture began `void f(`, colliding id 0 with token 0).
+    #[test]
+    fn type_bases_classify_on_the_type_token_not_the_interned_id() {
+        let source = "int x; void f(dynamic d) { if (d is Never) {} }";
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+        );
+        assert!(result.diagnostics.is_empty());
+        let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+        // The Nth token with the given lexeme.
+        let index_of = |lexeme: &str| -> u32 {
+            (0..)
+                .map(|i| i as u32)
+                .find(|&i| {
+                    tokens
+                        .get(i as usize)
+                        .is_some_and(|_| tokens.lexeme(source, i as usize) == lexeme)
+                })
+                .unwrap_or_else(|| panic!("token {lexeme} not found"))
+        };
+        let sp = |id: u32| TokenSpan {
+            id,
+            range: dartq_source::SourceRange {
+                offset: id * 2,
+                length: 1,
+            },
+        };
+
+        let mut flow = Flow::new(tokens, source);
+        flow.begin_top_level_method(sp(0), None, None);
+        // Interned in this order: int=0, void=1, dynamic=2, Never=3 — the
+        // old code read tokens[0..=3] ("int", "x", ";", "void") instead of
+        // each type name's own token.
+        flow.handle_type(sp(index_of("int")), None);
+        flow.handle_type(sp(index_of("void")), None);
+        flow.handle_type(sp(index_of("dynamic")), None);
+        flow.handle_type(sp(index_of("Never")), None);
+
+        let events = flow.buffer.as_ref().unwrap();
+        let bases: Vec<crate::ty::Base> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Ev::Type { base, .. } => Some(*base),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(bases.first(), Some(crate::ty::Base::Name(0))));
+        assert_eq!(bases.get(1), Some(&crate::ty::Base::Void));
+        assert_eq!(bases.get(2), Some(&crate::ty::Base::Dynamic));
+        assert_eq!(bases.get(3), Some(&crate::ty::Base::Never));
     }
 }
