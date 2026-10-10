@@ -145,7 +145,16 @@ pub enum Ev {
         span: TokenSpan,
     },
     LabeledBegin {
+        /// Interned id of the statement's first label (`None` only when a
+        /// recovered label never recorded a name — the frame exists but
+        /// matches no jump).
+        label: Option<u32>,
         span: TokenSpan,
+    },
+    /// An additional label of the innermost labeled statement (`a: b: s`):
+    /// appends to the open labeled frame's match set.
+    LabelDecl {
+        id: u32,
     },
     LabeledEnd,
     TryBegin {
@@ -333,7 +342,7 @@ impl Ev {
             | Ev::Block { span, .. }
             | Ev::ReturnBegin { span }
             | Ev::YieldBegin { span }
-            | Ev::LabeledBegin { span }
+            | Ev::LabeledBegin { span, .. }
             | Ev::AssertBegin { span }
             | Ev::IfBegin { span }
             | Ev::WhileBegin { span }

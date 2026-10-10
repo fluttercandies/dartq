@@ -163,6 +163,71 @@ fn for_break_after_assignment() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
+/// official `getLabelTarget` (flow_analysis_visitor.dart:487): a labeled
+/// break resolves to the labeled statement's loop, skipping the
+/// intervening inner loop. Before label ids were carried on the events
+/// this degraded to nearest-jump-target resolution: the break then exited
+/// the INNER loop, `x = 1;` stayed live and the exit read came out
+/// assigned.
+#[test]
+fn labeled_break_targets_labeled_loop_not_nearest() {
+    let source =
+        "void f(bool b) { int x; a: while (true) { while (true) { break a; } x = 1; } x; }";
+    assert_eq!(dead_snippets(source), ["x"]);
+    assert_eq!(unassigned_snippets(source), ["x"]);
+}
+
+/// The same walk for a labeled statement over a switch: the break lands
+/// in the switch's break model, keeping the code after it alive.
+#[test]
+fn labeled_break_targets_labeled_switch_through_loop() {
+    let source = "void f(bool b) { a: switch (b ? 1 : 2) { case 1: while (true) { break a; } case 2: break a; } 1; }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// A multi-label statement resolves a jump to ANY of its labels
+/// (`a: b: s` — the official scans every label of the labeled statement;
+/// `break b` must match through the recorded `LabelDecl`).
+#[test]
+fn labeled_break_matches_any_label_of_the_statement() {
+    let source =
+        "void f(bool b) { int x; a: b: while (true) { while (true) { break b; } x = 1; } x; }";
+    assert_eq!(dead_snippets(source), ["x"]);
+    assert_eq!(unassigned_snippets(source), ["x"]);
+}
+
+/// Unlabeled breaks keep the nearest-jump-target semantics: the inner
+/// loop is the target even under a labeled outer one.
+#[test]
+fn unlabeled_break_still_targets_nearest_loop() {
+    let source = "void f(bool b) { a: while (true) { while (true) { if (b) break; } 1; } }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// A labeled continue resolves to its labeled loop, skipping the
+/// intervening inner loop: the re-entry path it joins (before any
+/// assignment) must reach the exit. The outer loop is a `do` — only do
+/// and C-style `for` joins consume continue models.
+#[test]
+fn labeled_continue_targets_labeled_loop_not_nearest() {
+    let source = "void f(bool b) { int x; a: do { while (b) { if (b) { continue a; } x = 1; } x = 1; } while (b); x; }";
+    assert_eq!(unassigned_snippets(source), ["x"]);
+}
+
+/// official strictness: `continue` onto a label of a non-loop statement
+/// joins the labeled context's continue model, which nothing ever reads —
+/// the only observable is the dead path, and the enclosing loop's
+/// re-entry state stays untouched (a wrong nearest-loop routing would
+/// pollute the do-loop's continue model and turn the exit read
+/// possibly-unassigned). The enclosing loop is a `do`: only do and
+/// C-style `for` joins consume continue models.
+#[test]
+fn continue_labeled_non_loop_leaves_loop_models_untouched() {
+    let source =
+        "void f(bool b) { int x; do { c: { if (b) continue c; x = 1; } x = 1; } while (b); x; }";
+    assert!(unassigned_snippets(source).is_empty());
+}
+
 /// official reachability/data/switch.dart `case_falls_through_end`: a
 /// case body that falls through leaves the code after the switch alive.
 #[test]
@@ -312,7 +377,6 @@ fn try_finally_fallthrough_alive() {
 /// shape the defect lives on. dartq-parser owns the mis-parse; the flow
 /// side is fixed (single head, extent consumed wholesale in collect runs,
 /// element placeholder value).
-#[ignore = "blocked: parser mis-parses collection-element for-heads (dartq-parser lane) — no ForInParts extent is produced to pin"]
 #[test]
 fn collection_for_in_assignment_element_no_panic() {
     let source = "void f(List<int> b) { int x; x = [for (var a in b) a]; x; }";
@@ -329,7 +393,6 @@ fn collection_for_in_assignment_element_no_panic() {
 /// loop variable's `VarDeclBegin` resets the flat `pending_inits` list),
 /// so `InitializerEnd` finds no variable to write. dartq-parser owns the
 /// mis-parse; the pending-init pairing is a flow-side follow-up.
-#[ignore = "blocked: parser mis-parses collection-element for-heads (dartq-parser lane); stray VarDeclBegin clears pending_inits"]
 #[test]
 fn collection_for_in_initializer_write_reaches_later_reads() {
     let source = "void f(List<int> b) { var x = [for (var a in b) a]; x; }";

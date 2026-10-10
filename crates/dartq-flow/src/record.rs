@@ -32,9 +32,12 @@ pub struct Flow<'t> {
     /// Lexeme to interned name id (dense `u32` for the interpreter).
     names: FxHashMap<Box<str>, u32>,
     /// The most recent label-reference identifier (a break/continue
-    /// target's name — the break/continue events themselves carry only
-    /// `has_target`).
+    /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
+    /// Label-declaration names since the last consuming event (a labeled
+    /// statement begin, or a switch case begin — case labels are counted
+    /// on `CaseBegin` and never attach to a labeled statement).
+    pending_labels: Vec<u32>,
     /// Recording buffer of the outermost active executable, if any.
     buffer: Option<Vec<Ev>>,
     /// Executable nesting depth inside the active recording.
@@ -49,6 +52,7 @@ impl<'t> Flow<'t> {
             source,
             names: FxHashMap::default(),
             pending_label_ref: None,
+            pending_labels: Vec::new(),
             buffer: None,
             exec_depth: 0,
             facts: Vec::new(),
@@ -611,11 +615,24 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn handle_label(&mut self, _colon: Token) {
-        // Label declarations are tracked through the label name event.
+        // The label name arrives through `handle_identifier`
+        // (`LabelDeclaration`); the colon carries no id.
     }
 
     fn begin_labeled_statement(&mut self, token: Token, _label_count: usize) {
-        self.record(Ev::LabeledBegin { span: token });
+        // The first label rides `LabeledBegin`, the rest follow as
+        // `LabelDecl` — one frame tracks every label of the statement, so
+        // `a: b: s` resolves a jump to either name (official
+        // `getLabelTarget` scans every label of the labeled statement).
+        let labels = std::mem::take(&mut self.pending_labels);
+        let first = labels.first().copied();
+        self.record(Ev::LabeledBegin {
+            label: first,
+            span: token,
+        });
+        for id in labels.into_iter().skip(1) {
+            self.record(Ev::LabelDecl { id });
+        }
     }
 
     fn end_labeled_statement(&mut self, _label_count: usize) {
@@ -673,6 +690,9 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, _token: Token) {
+        // Case labels are counted on `CaseBegin`; drop their name
+        // captures so they can never attach to a later labeled statement.
+        self.pending_labels.clear();
         self.record(Ev::CaseBegin {
             label_count,
             expression_count,
@@ -763,6 +783,12 @@ impl<'t> ParserListener for Flow<'t> {
                 // the next break/continue event, which carries only
                 // `has_target`.
                 self.pending_label_ref = Some(self.name(token));
+            }
+            IdentifierContext::LabelDeclaration => {
+                // A label name (`label:` on a statement or a switch case),
+                // consumed by the enclosing construct's begin event.
+                let id = self.name(token);
+                self.pending_labels.push(id);
             }
             _ => {}
         }
@@ -1090,5 +1116,97 @@ impl<'t> ParserListener for Flow<'t> {
     fn begin_rethrow_statement(&mut self, _token: Token) {}
     fn end_rethrow_statement(&mut self, _rethrow_kw: Token, _end: Token) {
         self.record(Ev::Rethrow);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ev::Ev;
+    use dartq_parser::{IdentifierContext, ParserListener};
+    use dartq_scanner::ScanConfig;
+
+    /// Label ids ride the recorded events: the first label on
+    /// `LabeledBegin`, additional labels on `LabelDecl`, and the
+    /// break/continue target on `Break`/`Continue` — interned by lexeme,
+    /// so the same name at different tokens resolves to the same id.
+    #[test]
+    fn label_ids_are_recorded_and_stable() {
+        let source = "void f() { a: b: break a; a: break a; }";
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+        );
+        assert!(result.diagnostics.is_empty());
+        let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+        // The Nth token with the given lexeme (labels recur in the source).
+        let id_of = |lexeme: &str, occurrence: usize| -> u32 {
+            let mut seen = 0;
+            for index in 0.. {
+                match tokens.get(index) {
+                    Some(_) if tokens.lexeme(source, index) == lexeme => {
+                        if seen == occurrence {
+                            return index as u32;
+                        }
+                        seen += 1;
+                    }
+                    Some(_) => {}
+                    None => panic!("token {lexeme}#{occurrence} not found"),
+                }
+            }
+            unreachable!()
+        };
+        let sp = |id: u32| TokenSpan {
+            id,
+            range: dartq_source::SourceRange {
+                offset: id * 2,
+                length: 1,
+            },
+        };
+        let (a1, a2, b) = (id_of("a", 0), id_of("a", 1), id_of("b", 0));
+
+        let mut flow = Flow::new(tokens, source);
+        flow.begin_top_level_method(sp(0), None, None);
+        // `a: b: break a;`
+        flow.handle_identifier(sp(a1), IdentifierContext::LabelDeclaration);
+        flow.handle_identifier(sp(b), IdentifierContext::LabelDeclaration);
+        flow.begin_labeled_statement(sp(a1), 2);
+        flow.handle_identifier(sp(a1), IdentifierContext::LabelReference);
+        flow.handle_break_statement(true, sp(a1), sp(a1));
+        flow.end_labeled_statement(2);
+        // `a: break a;` — a different `a` token, same lexeme.
+        flow.handle_identifier(sp(a2), IdentifierContext::LabelDeclaration);
+        flow.begin_labeled_statement(sp(a2), 1);
+        flow.handle_identifier(sp(a2), IdentifierContext::LabelReference);
+        flow.handle_break_statement(true, sp(a2), sp(a2));
+        flow.end_labeled_statement(1);
+
+        let events = flow.buffer.as_ref().unwrap();
+        assert_eq!(events.len(), 7);
+        let Ev::LabeledBegin { label: first_a, .. } = events[0] else {
+            panic!("expected LabeledBegin, got {:?}", events[0]);
+        };
+        let Ev::LabelDecl { id: b_id } = events[1] else {
+            panic!("expected LabelDecl, got {:?}", events[1]);
+        };
+        assert_ne!(Some(b_id), first_a, "distinct labels intern distinctly");
+        let Ev::Break { label, .. } = events[2] else {
+            panic!("expected Break, got {:?}", events[2]);
+        };
+        assert_eq!(label, first_a, "the break target carries its label id");
+        let Ev::LabeledBegin {
+            label: second_a, ..
+        } = events[4]
+        else {
+            panic!("expected LabeledBegin, got {:?}", events[4]);
+        };
+        assert_eq!(
+            second_a, first_a,
+            "the same lexeme interns to the same id across tokens"
+        );
     }
 }

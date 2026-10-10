@@ -12,7 +12,13 @@ use crate::ty::{Base, Ty};
 impl<'o> Interp<'o> {
     /// Handles one expression-layer event; `false` means the event belongs
     /// to another layer.
-    pub(crate) fn expr_step(&mut self, ev: &Ev, events: &[Ev], i: usize, _match_of: &[u32]) -> bool {
+    pub(crate) fn expr_step(
+        &mut self,
+        ev: &Ev,
+        events: &[Ev],
+        i: usize,
+        _match_of: &[u32],
+    ) -> bool {
         match ev {
             Ev::Ident {
                 name,

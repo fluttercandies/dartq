@@ -163,7 +163,13 @@ pub(crate) enum Frame {
         body_depth: Option<usize>,
         block: Range<usize>,
     },
+    /// A labeled statement: a labeled break's target. `label` is the
+    /// first label's interned id (`None` only when a recovered label
+    /// never recorded a name); `extra_labels` holds the remaining labels
+    /// of the statement (`a: b: s` — either name targets it).
     Labeled {
+        label: Option<u32>,
+        extra_labels: Vec<u32>,
         checkpoint: u32,
         break_model: Option<State>,
     },
@@ -679,29 +685,74 @@ impl<'o> Interp<'o> {
 
     // —— jump targets ————————————————————————————————————————————————————
 
-    /// Finds the innermost break target frame (top-down): the nearest loop
-    /// or switch statement; labeled statements only for labeled breaks.
-    pub(crate) fn find_break_target(&self, labeled: bool) -> Option<usize> {
-        for (index, frame) in self.stack.iter().enumerate().rev() {
-            match frame {
-                Frame::While { .. } => return Some(index),
-                Frame::Switch { is_expr, .. } if !*is_expr => return Some(index),
-                Frame::Labeled { .. } if labeled => return Some(index),
-                _ => {}
+    /// Finds the innermost break target frame (top-down): with no label
+    /// the nearest loop or switch statement; with a label the frame the
+    /// label resolves to (official `getLabelTarget` walk, see
+    /// [`Interp::find_labeled_target`]).
+    pub(crate) fn find_break_target(&self, label: Option<u32>) -> Option<usize> {
+        match label {
+            Some(id) => self.find_labeled_target(id, true),
+            None => {
+                for (index, frame) in self.stack.iter().enumerate().rev() {
+                    match frame {
+                        Frame::While { .. } => return Some(index),
+                        Frame::Switch { is_expr, .. } if !*is_expr => return Some(index),
+                        _ => {}
+                    }
+                }
+                None
             }
         }
-        None
     }
 
-    /// Finds the innermost continue target: the nearest loop; labeled
-    /// statements only for labeled continues.
-    pub(crate) fn find_continue_target(&self, labeled: bool) -> Option<usize> {
-        for (index, frame) in self.stack.iter().enumerate().rev() {
-            match frame {
-                Frame::While { .. } => return Some(index),
-                Frame::Labeled { .. } if labeled => return Some(index),
-                _ => {}
+    /// Finds the innermost continue target: with no label the nearest
+    /// loop; with a label the frame the label resolves to. `continue`
+    /// never targets a switch (the official joins a continue model no
+    /// switch end ever reads — a no-op), so it resolves to nothing there.
+    pub(crate) fn find_continue_target(&self, label: Option<u32>) -> Option<usize> {
+        match label {
+            Some(id) => self.find_labeled_target(id, false),
+            None => {
+                for (index, frame) in self.stack.iter().enumerate().rev() {
+                    if matches!(frame, Frame::While { .. }) {
+                        return Some(index);
+                    }
+                }
+                None
             }
+        }
+    }
+
+    /// Resolves a labeled `break`/`continue` to its target frame: the
+    /// official `getLabelTarget` walk (flow_analysis_visitor.dart:487)
+    /// ported to frames. The nearest (top-down) `Labeled` frame carrying
+    /// the label id is found; when its labeled statement's inner
+    /// statement is a loop — or a switch, for `break` — that inner frame
+    /// is the target, so the join lands in the context that owns the
+    /// jump's exit (official lines 511-520); otherwise the labeled frame
+    /// itself. No match means no context: official `handleBreak`/
+    /// `handleContinue` join nothing and just mark the path unreachable.
+    fn find_labeled_target(&self, label: u32, is_break: bool) -> Option<usize> {
+        for (index, frame) in self.stack.iter().enumerate().rev() {
+            let matches = match frame {
+                Frame::Labeled {
+                    label: Some(id),
+                    extra_labels,
+                    ..
+                } => *id == label || extra_labels.contains(&label),
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            // The labeled statement's inner statement, when a loop or
+            // switch, owns the frame directly above.
+            return match self.stack.get(index + 1) {
+                Some(Frame::While { .. }) => Some(index + 1),
+                Some(Frame::Switch { is_expr: false, .. }) if is_break => Some(index + 1),
+                Some(Frame::Switch { .. }) => None,
+                _ => Some(index),
+            };
         }
         None
     }
@@ -736,17 +787,19 @@ impl<'o> Interp<'o> {
     /// `handleContinue`).
     pub(crate) fn do_continue(&mut self, index: usize) {
         let checkpoint = match &self.stack[index] {
-            Frame::While { checkpoint, .. } | Frame::Labeled { checkpoint, .. } => *checkpoint,
+            Frame::While { checkpoint, .. } => *checkpoint,
+            // A labeled continue onto a non-loop labeled statement: the
+            // official joins its context's continue model, which nothing
+            // ever reads — the only observable is the dead path.
+            Frame::Labeled { .. } => {
+                self.unreachable_cur();
+                return;
+            }
             _ => return,
         };
         let joined = self.current.clone().unsplit_to(&mut self.reach, checkpoint);
         let prior = match &mut self.stack[index] {
             Frame::While { continue_model, .. } => continue_model.take(),
-            Frame::Labeled { .. } => {
-                // A labeled continue targets the labeled LOOP: routed to
-                // the loop frame by `find_continue_target` in practice.
-                None
-            }
             _ => None,
         };
         let joined = self.join(prior, Some(joined));

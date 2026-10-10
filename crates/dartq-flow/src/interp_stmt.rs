@@ -180,7 +180,7 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                match self.find_break_target(label.is_some()) {
+                match self.find_break_target(*label) {
                     Some(index) => self.do_break(index),
                     None => self.current = self.current.clone().set_unreachable(&mut self.reach),
                 }
@@ -190,21 +190,33 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                match self.find_continue_target(label.is_some()) {
+                match self.find_continue_target(*label) {
                     Some(index) => self.do_continue(index),
                     None => self.current = self.current.clone().set_unreachable(&mut self.reach),
                 }
             }
-            Ev::LabeledBegin { span } => {
+            Ev::LabeledBegin { label, span } => {
                 self.dead_code(*span);
                 if self.collecting() {
                     return true;
                 }
                 let checkpoint = self.current.reach;
                 self.stack.push(Frame::Labeled {
+                    label: *label,
+                    extra_labels: Vec::new(),
                     checkpoint,
                     break_model: None,
                 });
+            }
+            Ev::LabelDecl { id } => {
+                if self.collecting() {
+                    return true;
+                }
+                // An additional label of the innermost labeled statement
+                // (`a: b: s`): either name targets the statement.
+                if let Some(Frame::Labeled { extra_labels, .. }) = self.stack.last_mut() {
+                    extra_labels.push(*id);
+                }
             }
             Ev::LabeledEnd => {
                 if self.collecting() {

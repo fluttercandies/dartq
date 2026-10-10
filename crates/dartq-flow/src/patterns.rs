@@ -162,7 +162,10 @@ impl<'o> Interp<'o> {
         };
         let unmatched = self.apply_pattern_exit(pattern, false);
         if let Some(frame_index) = self.switch_frame() {
-            if let Frame::Switch { unmatched: slot, .. } = &mut self.stack[frame_index] {
+            if let Frame::Switch {
+                unmatched: slot, ..
+            } = &mut self.stack[frame_index]
+            {
                 *slot = unmatched;
             }
         }
