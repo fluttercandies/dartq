@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace, FileElements,
-    Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
+    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
+    FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
 /// A span projection: `SourceRange`'s two public columns (`SourceRange`
@@ -122,6 +122,7 @@ pub struct PersistedMemberEntry {
     pub is_static: bool,
     pub is_abstract: bool,
     pub is_external: bool,
+    pub is_final: bool,
     pub type_params: u16,
     pub type_param_names: Vec<u32>,
     pub var_ty: PersistedTy,
@@ -132,6 +133,7 @@ pub struct PersistedMemberEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedContainer {
     pub kind: PersistedContainerKind,
+    pub is_abstract: bool,
     pub superclass: Option<u32>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
     pub type_params: u16,
@@ -269,6 +271,7 @@ impl<'a> Slice<'a> {
             is_static: entry.is_static,
             is_abstract: entry.is_abstract,
             is_external: entry.is_external,
+            is_final: entry.is_final,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
             var_ty: self.ty(&entry.var_ty),
@@ -478,6 +481,7 @@ impl PersistedContainer {
                 ContainerKind::Extension => PersistedContainerKind::Extension,
                 ContainerKind::ExtensionType => PersistedContainerKind::ExtensionType,
             },
+            is_abstract: container.is_abstract,
             superclass: container.superclass.map(|name| s.id(name)),
             members: container
                 .members
@@ -516,6 +520,7 @@ impl PersistedContainer {
                 PersistedContainerKind::Extension => ContainerKind::Extension,
                 PersistedContainerKind::ExtensionType => ContainerKind::ExtensionType,
             },
+            is_abstract: self.is_abstract,
             superclass: self.superclass.map(|at| ids[at as usize]),
             members: self
                 .members
@@ -524,7 +529,11 @@ impl PersistedContainer {
                 .collect(),
             type_params: self.type_params,
             sealed: self.sealed,
-            with_clause: self.with_clause.iter().map(|&at| ids[at as usize]).collect(),
+            with_clause: self
+                .with_clause
+                .iter()
+                .map(|&at| ids[at as usize])
+                .collect(),
             implements_clause: self
                 .implements_clause
                 .iter()
@@ -578,6 +587,7 @@ impl PersistedMemberEntry {
             is_static: self.is_static,
             is_abstract: self.is_abstract,
             is_external: self.is_external,
+            is_final: self.is_final,
             type_params: self.type_params,
             type_param_names: self
                 .type_param_names
@@ -639,6 +649,7 @@ mod tests {
             is_static: false,
             is_abstract: false,
             is_external: false,
+            is_final: false,
             type_params: 1,
             type_param_names: Box::new([name(text)]),
             var_ty: Ty::Unknown,
@@ -677,6 +688,7 @@ mod tests {
             name("C"),
             Container {
                 kind: ContainerKind::Class,
+                is_abstract: true,
                 superclass: Some(name("Object")),
                 members: [name("m"), name("m=")]
                     .into_iter()
@@ -743,9 +755,6 @@ mod tests {
         let restored_face = &restored.extension_faces[0];
         assert_eq!(restored_face.name, Some(name("E")));
         assert_eq!(restored_face.on_type, Some(name("int")));
-        assert_eq!(
-            restored_c.primary_formals[0].formal.name,
-            name("rep")
-        );
+        assert_eq!(restored_c.primary_formals[0].formal.name, name("rep"));
     }
 }

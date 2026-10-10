@@ -305,6 +305,41 @@ pub enum SemanticCode {
     /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation of
     /// `hasRepresentationSelfReference` — direct self references only).
     ExtensionTypeRepresentationDependsOnItself,
+    // —— #498: the abstract-completeness family (all `COMPILE_TIME_ERROR`) ——
+    /// `Missing concrete implementation of '{0}'.` — a concrete class or
+    /// enum lacks an implementation of one inherited abstract member
+    /// (`inheritance_override.dart:954` `_reportInheritedAbstractMembers`).
+    /// One registry code, five message tiers by list length (the
+    /// `sharedName` split, `messages.yaml`).
+    InheritsAbstractMemberOne,
+    /// `Missing concrete implementations of '{0}' and '{1}'.` — the
+    /// two-member tier of [`SemanticCode::InheritsAbstractMemberOne`].
+    InheritsAbstractMemberTwo,
+    /// `Missing concrete implementations of '{0}', '{1}', and '{2}'.` — the
+    /// three-member tier.
+    InheritsAbstractMemberThree,
+    /// `Missing concrete implementations of '{0}', '{1}', '{2}', and
+    /// '{3}'.` — the four-member tier.
+    InheritsAbstractMemberFour,
+    /// `Missing concrete implementations of '{0}', '{1}', '{2}', '{3}', and
+    /// {4} more.` — the five-or-more tier; `{4}` is the remaining count.
+    InheritsAbstractMemberFivePlus,
+    // —— #498: the interface-conflict family (all `COMPILE_TIME_ERROR`) ——
+    /// `Superinterfaces don't have a valid override for '{0}': {1}.` — the
+    /// same-name super-interface candidates share a kind but none validly
+    /// overrides the others and no class-local member resolves the name
+    /// (`inheritance_manager3.dart` `_combineSignaturesImpl`, reported by
+    /// `inheritance_override.dart:186-204`); `{1}` is the
+    /// `Class.member (signature)` list.
+    InconsistentInheritance,
+    /// `'{0}' is inherited as a getter (from '{1}') and also a method (from
+    /// '{2}').` — a name's super-interface candidates mix getter and method
+    /// kinds, which no override can resolve (`inheritance_manager3.dart`
+    /// `_checkForGetterMethodConflict`). Reported even when the class
+    /// declares the name (verified against the oracle: the row anchors at
+    /// the local declaration there — we keep the class-name anchor, a
+    /// documented span divergence).
+    InconsistentInheritanceGetterAndMethod,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -496,23 +531,39 @@ impl SemanticCode {
             Self::DeadCode => ("dead_code", "DEAD_CODE"),
             // One code name with two message texts (the `uniqueName` split,
             // `ambiguous_extension_member_access_two` / `_three_or_more`).
-            Self::AmbiguousExtensionMemberTwo | Self::AmbiguousExtensionMemberThreeOrMore => {
-                (
-                    "ambiguous_extension_member_access",
-                    "AMBIGUOUS_EXTENSION_MEMBER_ACCESS",
-                )
-            }
+            Self::AmbiguousExtensionMemberTwo | Self::AmbiguousExtensionMemberThreeOrMore => (
+                "ambiguous_extension_member_access",
+                "AMBIGUOUS_EXTENSION_MEMBER_ACCESS",
+            ),
             Self::MemberWithClassName => ("member_with_class_name", "MEMBER_WITH_CLASS_NAME"),
             Self::ExtensionTypeDeclaresMemberOfObject => (
                 "extension_type_declares_member_of_object",
                 "EXTENSION_TYPE_DECLARES_MEMBER_OF_OBJECT",
             ),
-            Self::ExpectedRepresentationType => {
-                ("expected_representation_type", "EXPECTED_REPRESENTATION_TYPE")
-            }
+            Self::ExpectedRepresentationType => (
+                "expected_representation_type",
+                "EXPECTED_REPRESENTATION_TYPE",
+            ),
             Self::ExtensionTypeRepresentationDependsOnItself => (
                 "extension_type_representation_depends_on_itself",
                 "EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF",
+            ),
+            // One registry code across the five tiers (the `sharedName`
+            // split); the tier lives in the message shape.
+            Self::InheritsAbstractMemberOne
+            | Self::InheritsAbstractMemberTwo
+            | Self::InheritsAbstractMemberThree
+            | Self::InheritsAbstractMemberFour
+            | Self::InheritsAbstractMemberFivePlus => (
+                "non_abstract_class_inherits_abstract_member",
+                "NON_ABSTRACT_CLASS_INHERITS_ABSTRACT_MEMBER",
+            ),
+            Self::InconsistentInheritance => {
+                ("inconsistent_inheritance", "INCONSISTENT_INHERITANCE")
+            }
+            Self::InconsistentInheritanceGetterAndMethod => (
+                "inconsistent_inheritance_getter_and_method",
+                "INCONSISTENT_INHERITANCE_GETTER_AND_METHOD",
             ),
         };
         let dtype = self.dtype();
@@ -526,6 +577,9 @@ impl SemanticCode {
             Self::WrongNumberOfTypeArgumentsFunction
                 | Self::MemberWithClassName
                 | Self::ExpectedRepresentationType
+                // `inconsistentInheritanceGetterAndMethod` carries no
+                // published docs (`messages.yaml` hasPublishedDocs: false).
+                | Self::InconsistentInheritanceGetterAndMethod
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -708,6 +762,17 @@ impl SemanticCode {
             // The no-argument representation rows route through `message3`.
             Self::ExtensionTypeDeclaresMemberOfObject
             | Self::ExtensionTypeRepresentationDependsOnItself => self.message3("", "", ""),
+            // The #498 abstract-completeness tiers route to their slot
+            // counts; the two- and three-member tiers and the getter/method
+            // row fill their slots through `message3`.
+            Self::InheritsAbstractMemberOne => {
+                format!("Missing concrete implementation of '{a0}'.")
+            }
+            Self::InconsistentInheritance => {
+                format!("Superinterfaces don't have a valid override for '{a0}': {a1}.")
+            }
+            Self::InheritsAbstractMemberFour => self.message4(a0, a1, "", ""),
+            Self::InheritsAbstractMemberFivePlus => self.message5(a0, a1, "", "", ""),
             Self::MemberWithClassName => {
                 "A class member can't have the same name as the enclosing class.".to_string()
             }
@@ -720,13 +785,18 @@ impl SemanticCode {
             | Self::ArgumentTypeNotAssignable
             | Self::ReturnOfInvalidType(_)
             | Self::InvalidNullAwareOperator => self.message3(a0, a1, ""),
-            // Three-argument rows route through `message3`.
+            // Three-argument rows route through `message3` — including the
+            // #498 two/three-tier missing-implementation shapes and the
+            // getter/method conflict row.
             Self::WrongNumberOfParametersForOperator
             | Self::WrongNumberOfTypeArguments
             | Self::WrongNumberOfTypeArgumentsExtension
             | Self::WrongNumberOfTypeArgumentsFunction
             | Self::NonExhaustiveSwitchStatement
-            | Self::NonExhaustiveSwitchExpression => self.message3(a0, a1, ""),
+            | Self::NonExhaustiveSwitchExpression
+            | Self::InheritsAbstractMemberTwo
+            | Self::InheritsAbstractMemberThree
+            | Self::InconsistentInheritanceGetterAndMethod => self.message3(a0, a1, ""),
             // The four-placeholder `_element` row routes through `message4`
             // (the kind word leads); real emissions go through `emit4`.
             Self::WrongNumberOfTypeArgumentsElement(kind) => self.message4(kind.word(), a0, a1, ""),
@@ -833,6 +903,18 @@ impl SemanticCode {
             Self::ExtensionTypeRepresentationDependsOnItself => {
                 "The extension type representation can't depend on itself.".to_string()
             }
+            // The #498 list tiers (messages.yaml, the sharedName family):
+            // comma-and lists, the five-or-more one trailing the remaining
+            // count.
+            Self::InheritsAbstractMemberTwo => {
+                format!("Missing concrete implementations of '{a0}' and '{a1}'.")
+            }
+            Self::InheritsAbstractMemberThree => {
+                format!("Missing concrete implementations of '{a0}', '{a1}', and '{a2}'.")
+            }
+            Self::InconsistentInheritanceGetterAndMethod => format!(
+                "'{a0}' is inherited as a getter (from '{a1}') and also a method (from '{a2}')."
+            ),
             // One- and two-placeholder rows: the extra placeholder is
             // ignored (the descriptor stays total over the frozen set).
             _ => self.message(a0, a1),
@@ -874,6 +956,9 @@ impl SemanticCode {
                     "The {a0} '{a1}' is declared with {a2} type parameters, but {a3} type arguments are given."
                 )
             }
+            Self::InheritsAbstractMemberFour => {
+                format!("Missing concrete implementations of '{a0}', '{a1}', '{a2}', and '{a3}'.")
+            }
             // Other rows keep their own (shorter) templates.
             _ => self.message(a0, a1),
         }
@@ -892,6 +977,11 @@ impl SemanticCode {
             Self::InvalidOverrideSetter => format!(
                 "The setter '{a1}.{a0}' ('{a2}') isn't a valid override of '{a3}.{a0}' ('{a4}')."
             ),
+            Self::InheritsAbstractMemberFivePlus => {
+                format!(
+                    "Missing concrete implementations of '{a0}', '{a1}', '{a2}', '{a3}', and {a4} more."
+                )
+            }
             // Other rows keep their own (shorter) templates.
             _ => self.message(a0, a1),
         }
@@ -973,6 +1063,13 @@ mod tests {
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExpectedRepresentationType,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+            SemanticCode::InheritsAbstractMemberOne,
+            SemanticCode::InheritsAbstractMemberTwo,
+            SemanticCode::InheritsAbstractMemberThree,
+            SemanticCode::InheritsAbstractMemberFour,
+            SemanticCode::InheritsAbstractMemberFivePlus,
+            SemanticCode::InconsistentInheritance,
+            SemanticCode::InconsistentInheritanceGetterAndMethod,
         ];
         for code in codes {
             let info = code.code_info();
@@ -1025,84 +1122,94 @@ mod tests {
         );
     }
 
+    /// The severity pin's coverage list — grows with each implemented batch
+    /// (a data table, so it lives outside the test body).
+    const SEVERITY_CODES: &[SemanticCode] = &[
+        SemanticCode::DuplicateDefinition,
+        SemanticCode::UndefinedAnnotation,
+        SemanticCode::UndefinedClass,
+        SemanticCode::UndefinedConstructorInInitializer,
+        SemanticCode::UndefinedEnumConstructor,
+        SemanticCode::UndefinedEnumConstant,
+        SemanticCode::UndefinedExtensionGetter,
+        SemanticCode::UndefinedExtensionMethod,
+        SemanticCode::UndefinedExtensionOperator,
+        SemanticCode::UndefinedExtensionSetter,
+        SemanticCode::UndefinedFunction,
+        SemanticCode::UndefinedGetter,
+        SemanticCode::UndefinedIdentifier,
+        SemanticCode::UndefinedIdentifierAwait,
+        SemanticCode::UndefinedMethod,
+        SemanticCode::UndefinedNamedParameter,
+        SemanticCode::UndefinedOperator,
+        SemanticCode::UndefinedPrefixedName,
+        SemanticCode::UndefinedSetter,
+        SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+        SemanticCode::UndefinedSuperMember(SuperShape::Method),
+        SemanticCode::UndefinedSuperMember(SuperShape::Operator),
+        SemanticCode::UndefinedSuperMember(SuperShape::Setter),
+        SemanticCode::WrongNumberOfParametersForOperator,
+        SemanticCode::WrongNumberOfParametersForOperatorMinus,
+        SemanticCode::WrongNumberOfParametersForSetter,
+        SemanticCode::WrongNumberOfTypeArguments,
+        SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+        SemanticCode::WrongNumberOfTypeArgumentsEnum,
+        SemanticCode::WrongNumberOfTypeArgumentsExtension,
+        SemanticCode::WrongNumberOfTypeArgumentsFunction,
+        SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function),
+        SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
+        SemanticCode::InvalidAssignment,
+        SemanticCode::ArgumentTypeNotAssignable,
+        SemanticCode::ReturnOfInvalidType(ExecKind::Function),
+        SemanticCode::ReturnOfInvalidType(ExecKind::Method),
+        SemanticCode::InvalidNullAwareOperator,
+        SemanticCode::NonExhaustiveSwitchStatement,
+        SemanticCode::NonExhaustiveSwitchExpression,
+        SemanticCode::UnreachableSwitchCase,
+        SemanticCode::UnreachableSwitchDefault,
+        SemanticCode::ConstInitializedWithNonConstantValue,
+        SemanticCode::ConstWithNonConstantArgument,
+        SemanticCode::NonConstantListElement,
+        SemanticCode::NonConstantSetElement,
+        SemanticCode::NonConstantMapElement,
+        SemanticCode::NonConstantRecordField,
+        SemanticCode::ConstEvalTypeBool,
+        SemanticCode::ConstEvalTypeBoolInt,
+        SemanticCode::ConstEvalTypeBoolNumString,
+        SemanticCode::ConstEvalTypeInt,
+        SemanticCode::ConstEvalTypeNum,
+        SemanticCode::ConstEvalTypeNumString,
+        SemanticCode::ConstEvalTypeString,
+        SemanticCode::ConstEvalThrowsException,
+        SemanticCode::ConstEvalThrowsIdbze,
+        SemanticCode::ConstEvalPrimitiveEquality,
+        SemanticCode::ConstEvalMethodInvocation,
+        SemanticCode::RecursiveCompileTimeConstant,
+        SemanticCode::InvalidOverride,
+        SemanticCode::InvalidOverrideSetter,
+        SemanticCode::DeadCode,
+        SemanticCode::AmbiguousExtensionMemberTwo,
+        SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+        SemanticCode::MemberWithClassName,
+        SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+        SemanticCode::ExpectedRepresentationType,
+        SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+        SemanticCode::InheritsAbstractMemberOne,
+        SemanticCode::InheritsAbstractMemberTwo,
+        SemanticCode::InheritsAbstractMemberThree,
+        SemanticCode::InheritsAbstractMemberFour,
+        SemanticCode::InheritsAbstractMemberFivePlus,
+        SemanticCode::InconsistentInheritance,
+        SemanticCode::InconsistentInheritanceGetterAndMethod,
+    ];
+
     /// The severity derivation is the diagnostic layer's: every row's
     /// severity equals its tier's ([`DiagnosticType::severity`], the
     /// `dtype_matches_oracle_severity` invariant) — the pin against a
     /// reintroduced hand-rolled mapping.
     #[test]
     fn severity_folds_onto_the_tier_derivation() {
-        let codes = [
-            SemanticCode::DuplicateDefinition,
-            SemanticCode::UndefinedAnnotation,
-            SemanticCode::UndefinedClass,
-            SemanticCode::UndefinedConstructorInInitializer,
-            SemanticCode::UndefinedEnumConstructor,
-            SemanticCode::UndefinedEnumConstant,
-            SemanticCode::UndefinedExtensionGetter,
-            SemanticCode::UndefinedExtensionMethod,
-            SemanticCode::UndefinedExtensionOperator,
-            SemanticCode::UndefinedExtensionSetter,
-            SemanticCode::UndefinedFunction,
-            SemanticCode::UndefinedGetter,
-            SemanticCode::UndefinedIdentifier,
-            SemanticCode::UndefinedIdentifierAwait,
-            SemanticCode::UndefinedMethod,
-            SemanticCode::UndefinedNamedParameter,
-            SemanticCode::UndefinedOperator,
-            SemanticCode::UndefinedPrefixedName,
-            SemanticCode::UndefinedSetter,
-            SemanticCode::UndefinedSuperMember(SuperShape::Getter),
-            SemanticCode::UndefinedSuperMember(SuperShape::Method),
-            SemanticCode::UndefinedSuperMember(SuperShape::Operator),
-            SemanticCode::UndefinedSuperMember(SuperShape::Setter),
-            SemanticCode::WrongNumberOfParametersForOperator,
-            SemanticCode::WrongNumberOfParametersForOperatorMinus,
-            SemanticCode::WrongNumberOfParametersForSetter,
-            SemanticCode::WrongNumberOfTypeArguments,
-            SemanticCode::WrongNumberOfTypeArgumentsConstructor,
-            SemanticCode::WrongNumberOfTypeArgumentsEnum,
-            SemanticCode::WrongNumberOfTypeArgumentsExtension,
-            SemanticCode::WrongNumberOfTypeArgumentsFunction,
-            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function),
-            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
-            SemanticCode::InvalidAssignment,
-            SemanticCode::ArgumentTypeNotAssignable,
-            SemanticCode::ReturnOfInvalidType(ExecKind::Function),
-            SemanticCode::ReturnOfInvalidType(ExecKind::Method),
-            SemanticCode::InvalidNullAwareOperator,
-            SemanticCode::NonExhaustiveSwitchStatement,
-            SemanticCode::NonExhaustiveSwitchExpression,
-            SemanticCode::UnreachableSwitchCase,
-            SemanticCode::UnreachableSwitchDefault,
-            SemanticCode::ConstInitializedWithNonConstantValue,
-            SemanticCode::ConstWithNonConstantArgument,
-            SemanticCode::NonConstantListElement,
-            SemanticCode::NonConstantSetElement,
-            SemanticCode::NonConstantMapElement,
-            SemanticCode::NonConstantRecordField,
-            SemanticCode::ConstEvalTypeBool,
-            SemanticCode::ConstEvalTypeBoolInt,
-            SemanticCode::ConstEvalTypeBoolNumString,
-            SemanticCode::ConstEvalTypeInt,
-            SemanticCode::ConstEvalTypeNum,
-            SemanticCode::ConstEvalTypeNumString,
-            SemanticCode::ConstEvalTypeString,
-            SemanticCode::ConstEvalThrowsException,
-            SemanticCode::ConstEvalThrowsIdbze,
-            SemanticCode::ConstEvalPrimitiveEquality,
-            SemanticCode::ConstEvalMethodInvocation,
-            SemanticCode::RecursiveCompileTimeConstant,
-            SemanticCode::InvalidOverride,
-            SemanticCode::InvalidOverrideSetter,
-            SemanticCode::DeadCode,
-            SemanticCode::AmbiguousExtensionMemberTwo,
-            SemanticCode::AmbiguousExtensionMemberThreeOrMore,
-            SemanticCode::MemberWithClassName,
-            SemanticCode::ExtensionTypeDeclaresMemberOfObject,
-            SemanticCode::ExpectedRepresentationType,
-            SemanticCode::ExtensionTypeRepresentationDependsOnItself,
-        ];
-        for code in codes {
+        for code in SEVERITY_CODES {
             assert_eq!(
                 code.severity(),
                 code.dtype().severity(),

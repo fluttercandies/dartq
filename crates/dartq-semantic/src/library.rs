@@ -43,9 +43,7 @@
 //! the resolution layer for the diagnostic tickets; when the directive
 //! milestone lands, the file→library fold moves behind this same API.
 
-use dartq_resolution::{
-    LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces,
-};
+use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -255,7 +253,12 @@ pub(crate) fn owner_library(
             .import_edges(lib)
             .iter()
             .filter_map(|edge| edge.target)
-            .chain(graph.export_edges(lib).iter().filter_map(|edge| edge.target));
+            .chain(
+                graph
+                    .export_edges(lib)
+                    .iter()
+                    .filter_map(|edge| edge.target),
+            );
         for target in targets {
             if !seen.insert(target.index()) {
                 continue;
@@ -341,15 +344,9 @@ pub fn member_lookup<'a>(
             if !seen.insert(*mixin) {
                 return None;
             }
-            if let Some(entry) = resolve_container(
-                graph,
-                namespaces,
-                index,
-                owner_lib,
-                found_owner,
-                *mixin,
-            )
-            .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+            if let Some(entry) =
+                resolve_container(graph, namespaces, index, owner_lib, found_owner, *mixin)
+                    .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
             {
                 return Some(entry);
             }

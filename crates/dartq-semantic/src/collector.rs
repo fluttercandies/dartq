@@ -79,8 +79,8 @@ use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace, FileElements,
-    Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
+    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
+    FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
 use dartq_source::SourceRange;
@@ -99,6 +99,8 @@ struct OpenContainer {
     name: Option<(StringId, SourceRange)>,
     kind: ContainerKind,
     superclass: Option<StringId>,
+    /// The header's `abstract` modifier (class-family only).
+    is_abstract: bool,
     members: FxHashMap<StringId, MemberEntry>,
     type_params: u16,
     /// The `sealed` modifier was present on the class header.
@@ -164,6 +166,9 @@ struct PendingMember {
     is_static: bool,
     /// The `external` modifier was present.
     is_external: bool,
+    /// A function body opened (`{ ... }` or `=> ...`) — its absence with a
+    /// non-external member is the abstract shape.
+    has_body: bool,
     type_params: u16,
     /// The member's own type-parameter names, in declaration order.
     type_param_names: Vec<StringId>,
@@ -220,6 +225,8 @@ struct Builder<'src, 'tab> {
     /// latches, `end_fields` clears).
     field_abstract: bool,
     field_external: bool,
+    /// The field group's `final` modifier (the abstract-field setter split).
+    field_final: bool,
     /// The current field group's static bit (`None` = no group open).
     field_static: Option<bool>,
     pending_member: Option<PendingMember>,
@@ -280,6 +287,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_on_type: None,
             field_abstract: false,
             field_external: false,
+            field_final: false,
             field_static: None,
             pending_member: None,
             pending_top: None,
@@ -403,6 +411,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             name,
             kind,
             superclass: None,
+            is_abstract: false,
             members: FxHashMap::default(),
             type_params: header_type_params,
             sealed: false,
@@ -460,6 +469,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.file.container_order.push(name);
             self.file.containers.entry(name).or_insert(Container {
                 kind: open.kind,
+                is_abstract: open.is_abstract,
                 superclass: open.superclass,
                 members,
                 type_params: open.type_params,
@@ -483,6 +493,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn mark_sealed(&mut self) {
         if let Some(open) = self.containers.last_mut() {
             open.sealed = true;
+        }
+    }
+
+    /// Marks the open container `abstract` (the class header's `abstract`
+    /// modifier; class-family declarations only).
+    fn mark_abstract(&mut self) {
+        if let Some(open) = self.containers.last_mut() {
+            open.is_abstract = true;
         }
     }
 
@@ -529,7 +547,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 }
                 HeaderClause::On => open.on_clause.extend(claimed.into_iter().map(|(n, _)| n)),
             }
-            open.header_residue.extend(residue.into_iter().map(|(n, _)| n));
+            open.header_residue
+                .extend(residue.into_iter().map(|(n, _)| n));
         }
     }
 
@@ -557,9 +576,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     ) {
         // The extension on-type latch (a container is always open here).
         if self.header_capture_open
-            && self.containers.last().is_some_and(|open| {
-                open.kind == ContainerKind::Extension
-            })
+            && self
+                .containers
+                .last()
+                .is_some_and(|open| open.kind == ContainerKind::Extension)
         {
             match context {
                 IdentifierContext::TypeReference => {
@@ -776,7 +796,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_class_declaration(
         &mut self,
         _begin: Token,
-        _abstract_kw: Option<Token>,
+        abstract_kw: Option<Token>,
         _sealed_kw: Option<Token>,
         _base_kw: Option<Token>,
         _interface_kw: Option<Token>,
@@ -792,6 +812,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if sealed {
             builder.mark_sealed();
         }
+        if abstract_kw.is_some() {
+            builder.mark_abstract();
+        }
     }
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
@@ -805,7 +828,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_named_mixin_application(
         &mut self,
         _begin: Token,
-        _abstract_kw: Option<Token>,
+        abstract_kw: Option<Token>,
         _sealed_kw: Option<Token>,
         _base_kw: Option<Token>,
         _interface_kw: Option<Token>,
@@ -817,6 +840,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut *self.builder.borrow_mut();
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
+        if abstract_kw.is_some() {
+            builder.mark_abstract();
+        }
     }
 
     fn end_named_mixin_application(
@@ -1061,6 +1087,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     let is_static = builder.field_static.unwrap_or(false);
                     let is_abstract = builder.field_abstract;
                     let is_external = builder.field_external;
+                    let is_final = builder.field_final;
                     if context == IdentifierContext::TopLevelVariableDeclaration {
                         builder.declare_top(
                             name,
@@ -1081,6 +1108,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     is_static,
                                     is_abstract,
                                     is_external,
+                                    is_final,
                                     type_params: 0,
                                     type_param_names: Box::default(),
                                     var_ty: ty,
@@ -1116,6 +1144,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 is_static: true,
                                 is_abstract: false,
                                 is_external: false,
+                                is_final: false,
                                 type_params: 0,
                                 type_param_names: Box::default(),
                                 var_ty: Ty::UNKNOWN,
@@ -1200,6 +1229,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = Some(static_kw.is_some());
         builder.field_abstract = _abstract_kw.is_some();
         builder.field_external = _external_kw.is_some();
+        builder.field_final = _var_final_or_const
+            .and_then(|t| builder.tokens.get(t.id as usize))
+            .is_some_and(|tok| &builder.source[tok.byte_range()] == "final");
     }
 
     fn end_fields(
@@ -1222,6 +1254,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.armed_ty = None;
         builder.field_abstract = false;
         builder.field_external = false;
+        builder.field_final = false;
     }
 
     fn end_top_level_fields(
@@ -1243,6 +1276,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.armed_ty = None;
         builder.field_abstract = false;
         builder.field_external = false;
+        builder.field_final = false;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1267,12 +1301,30 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             shape,
             is_static: static_kw.is_some(),
             is_external: _external_kw.is_some(),
+            has_body: false,
             type_params: 0,
             type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
         });
         builder.executable_header_done = false;
+    }
+
+    /// A block function body opened inside the pending member — the
+    /// has-body mark (its absence at `end_method` is the abstract shape).
+    /// A closure in a formal default fires this before any real body, which
+    /// can only mislabel an abstract member concrete: the under-report
+    /// direction.
+    fn begin_block_function_body(&mut self, _token: Token) {
+        if let Some(pending) = self.builder.borrow_mut().pending_member.as_mut() {
+            pending.has_body = true;
+        }
+    }
+
+    fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
+        if let Some(pending) = self.builder.borrow_mut().pending_member.as_mut() {
+            pending.has_body = true;
+        }
     }
 
     fn end_method(
@@ -1294,8 +1346,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 let entry = MemberEntry {
                     kind,
                     is_static: pending.is_static,
-                    is_abstract: false,
+                    // A body-less non-external method/getter/setter is the
+                    // abstract shape (`void m();`); the `abstract` fields'
+                    // bit latched at `begin_fields`.
+                    is_abstract: !pending.has_body && !pending.is_external,
                     is_external: pending.is_external,
+                    is_final: false,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,
@@ -1549,11 +1605,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             let open = builder.containers.last_mut().expect("checked above");
             open.primary_formals.push(RepFormal {
-                formal: Formal {
-                    name,
-                    ty,
-                    required,
-                },
+                formal: Formal { name, ty, required },
                 name_range: range,
             });
         }
@@ -1991,10 +2043,7 @@ mod tests {
     #[test]
     fn extends_overflow_lands_in_residue() {
         let strings = StringTable::new();
-        let elements = build(
-            "class A {} class B {} class C extends A, B {}",
-            &strings,
-        );
+        let elements = build("class A {} class B {} class C extends A, B {}", &strings);
         let c = elements.container(id(&strings, "C")).expect("C");
         assert_eq!(c.superclass, Some(id(&strings, "A")));
         assert!(c.implements_clause.is_empty(), "{:?}", c.implements_clause);
@@ -2024,10 +2073,7 @@ mod tests {
     #[test]
     fn extension_on_type_prefers_the_continuation() {
         let strings = StringTable::new();
-        let elements = build(
-            "class T {} extension E on p.T { void m() {} }",
-            &strings,
-        );
+        let elements = build("class T {} extension E on p.T { void m() {} }", &strings);
         let faces = elements.extension_faces();
         assert_eq!(faces.len(), 1);
         assert_eq!(faces[0].on_type, Some(id(&strings, "T")));
@@ -2038,10 +2084,7 @@ mod tests {
     #[test]
     fn extension_type_captures_representation_formals() {
         let strings = StringTable::new();
-        let elements = build(
-            "extension type E(int x) { void m(String y) {} }",
-            &strings,
-        );
+        let elements = build("extension type E(int x) { void m(String y) {} }", &strings);
         let e = elements.container(id(&strings, "E")).expect("E");
         assert_eq!(e.primary_formals.len(), 1, "{:?}", e.primary_formals);
         let rep = &e.primary_formals[0];

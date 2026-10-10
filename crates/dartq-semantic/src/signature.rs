@@ -251,6 +251,7 @@ impl<'a> Face<'a> {
         } else {
             "local"
         });
+        self.field(if entry.is_final { "final" } else { "mutable" });
         self.uint(u64::from(entry.type_params));
         for param in &entry.type_param_names {
             self.name(*param);
@@ -315,6 +316,7 @@ impl<'a> Face<'a> {
             let name = self.names[i];
             let Container {
                 kind,
+                is_abstract,
                 superclass,
                 members,
                 type_params,
@@ -338,6 +340,7 @@ impl<'a> Face<'a> {
                 ContainerKind::ExtensionType => "extensionType",
             });
             self.uint(u64::from(*type_params));
+            self.field(if *is_abstract { "abstract" } else { "concrete" });
             self.field(if *sealed { "sealed" } else { "unsealed" });
             match superclass {
                 Some(superclass) => self.name(*superclass),
@@ -360,7 +363,11 @@ impl<'a> Face<'a> {
             // The unclaimed header names hash too (L2 honesty: an edit that
             // only moves a name between a clause and the residue must flip
             // the gate), sorted by text — residue order is not semantic.
-            Self::sorted(self.strings, &mut self.inner, header_residue.iter().copied());
+            Self::sorted(
+                self.strings,
+                &mut self.inner,
+                header_residue.iter().copied(),
+            );
             self.usize(self.inner.len());
             for j in 0..self.inner.len() {
                 self.name(self.inner[j]);

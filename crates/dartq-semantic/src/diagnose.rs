@@ -79,6 +79,36 @@
 //! are a documented text divergence. Generic-method type-parameter
 //! compatibility and getter/setter cross-shape conflicts under-report.
 //!
+//! # The abstract-completeness and interface-conflict families (#498)
+//!
+//! Both ride the #453 face machinery at container granularity, mounted at
+//! the container's name event (`inheritance_override.dart:412-486` and
+//! `:160-207`). *Completeness* (the five-tier
+//! `non_abstract_class_inherits_abstract_member`): a concrete class or enum
+//! reports every interface name without a concrete implementation, the
+//! implemented sources being own members, the `with` mixins, and the super
+//! chain — `implements` and `on` faces contribute interface members only
+//! (`_addImplemented`). The exemptions mirror the official walk: `Object`
+//! members, an enum's `values`/`values=`, own-declared names (the
+//! `concrete_class_with_abstract_member` code owns those — under-report
+//! here), names a concrete direct superclass carries, cross-library private
+//! names (`isAccessibleFor`), and a concrete `noSuchMethod` anywhere on the
+//! implemented sources (the forwarder gate). A name the candidate merge
+//! dropped (a conflict) is absent from the interface — never reported
+//! missing. Abstract members are captured at the declaration
+//! (body-less/`abstract`); an abstract field's non-final shape misses both
+//! its getter and its setter. *Conflicts* (`inconsistent_inheritance`
+//! and `_getter_and_method`): candidates accumulate per name in the
+//! official face order with a `with` mixin's own member replacing the
+//! accumulated list; a getter/method kind mix is unresolvable and reports
+//! even under a class-local declaration (oracle-verified), a same-kind
+//! merge without a valid override reports unless the class declares the
+//! name. A mixin declaration participates in the conflicts only. The
+//! conflict rows anchor at the class name (the oracle moves the
+//! getter/method row onto a local declaration when one exists — a span
+//! divergence, metric-neutral on the (code, file) gate). Every
+//! unresolvable face chain suppresses its container's whole check.
+//!
 //! # The flow-analysis mount (#449)
 //!
 //! Every flow-relevant listener event double-dispatches to a per-unit
@@ -712,6 +742,34 @@ enum Walk<'a> {
     ChainBroken,
 }
 
+/// One non-static member hit of a face-chain walk
+/// ([`Engine::face_entries`]).
+#[derive(Clone, Copy)]
+struct FaceEntry<'a> {
+    /// The member's lookup spelling (setters under `name=`).
+    name: StringId,
+    /// The member entry.
+    entry: &'a MemberEntry,
+    /// The declaring container's name (the message's enclosing class).
+    owner_name: StringId,
+    /// The file that owns the declaring container (the private-name
+    /// accessibility test).
+    owner_file: FileId,
+    /// The hop contributes to the official `implemented` map — own members,
+    /// `with` mixins, superclass hops; never an `implements` hop
+    /// (`inheritance_manager3.dart:333` `_addImplemented`).
+    concrete_source: bool,
+}
+
+/// The abstract-completeness check's interface view
+/// ([`Engine::collect_interface`]): the interface names in face order with a
+/// representative hit each, plus the names a concrete source implements.
+struct InterfaceView<'a> {
+    names: Vec<StringId>,
+    representative: FxHashMap<StringId, FaceEntry<'a>>,
+    implemented: FxHashSet<StringId>,
+}
+
 /// The implicit extension-application outcome for one member access
 /// ([`Engine::extension_application`]).
 enum ExtensionApp {
@@ -889,6 +947,10 @@ struct Engine<'a> {
     /// Extension types whose representation checks already ran this pass
     /// (one emission per container: an augmentation re-fires the event).
     reported_extension_types: FxHashSet<StringId>,
+    /// Containers whose face-inheritance checks (#498) already ran this
+    /// pass (one emission per container: an augmentation re-fires the
+    /// event).
+    reported_face_checks: FxHashSet<StringId>,
     /// The #279 constant-evaluation capture: expression folding while a
     /// const context is open ([`crate::const_eval`]).
     const_capture: ConstCapture,
@@ -1035,6 +1097,7 @@ impl<'a> Engine<'a> {
             primary_constructors_enabled,
             owner_libs: RefCell::new(FxHashMap::default()),
             reported_extension_types: FxHashSet::default(),
+            reported_face_checks: FxHashSet::default(),
         }
     }
 
@@ -1564,9 +1627,7 @@ impl<'a> Engine<'a> {
             ) else {
                 return Walk::ChainBroken;
             };
-            if !skip_own
-                && let Some(entry) = found.members.get(&member)
-            {
+            if !skip_own && let Some(entry) = found.members.get(&member) {
                 return Walk::Found(entry);
             }
             skip_own = false;
@@ -1574,15 +1635,23 @@ impl<'a> Engine<'a> {
             // of the earlier ones and of the superclass. The mixin names are
             // written in `found_owner` and resolve through that file's
             // library (probed by the container name it declares, #491 S2a).
-            let owner_lib = self.owner_library_of(found_owner, name).unwrap_or(scope_lib);
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
             for mixin in found.with_clause.iter().rev() {
                 if !seen.insert(*mixin) {
                     return Walk::ChainBroken;
                 }
                 let mixin_lib = owner_lib;
-                if let Some(entry) =
-                    resolve_container(self.graph, self.namespaces, self.index, mixin_lib, found_owner, *mixin)
-                        .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+                if let Some(entry) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    mixin_lib,
+                    found_owner,
+                    *mixin,
+                )
+                .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
                 {
                     return Walk::Found(entry);
                 }
@@ -1695,9 +1764,10 @@ impl<'a> Engine<'a> {
             // several direct faces (the applied `S&M2` superclass face and
             // the `M2` face both answer M2's member); the oracle's verdict
             // per inherited member is one diagnostic.
-            if broken_seen.iter().any(|prior: &&MemberEntry| {
-                std::ptr::eq(*prior, inherited)
-            }) {
+            if broken_seen
+                .iter()
+                .any(|prior: &&MemberEntry| std::ptr::eq(*prior, inherited))
+            {
                 continue;
             }
             if Self::override_broken(entry, inherited) {
@@ -1724,6 +1794,564 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    // —— abstract completeness + interface conflicts (#498) ———————————
+
+    /// Mounts both container-face families at the container's name event:
+    /// the same-name super-interface conflicts (`inconsistent_inheritance*`)
+    /// and the concrete class/enum abstract completeness
+    /// (`non_abstract_class_inherits_abstract_member`, five tiers). The
+    /// element model is complete (`collect` parsed before this pass) and the
+    /// name token anchors the emissions. Extensions and extension types have
+    /// no inheritance faces; a mixin declaration participates in the
+    /// conflicts only (the official completeness loop is
+    /// `ClassElementImpl && !isAbstract || EnumElementImpl`,
+    /// `inheritance_override.dart:412`). Both checks suppress on any
+    /// unresolvable face chain — the under-report direction.
+    fn check_face_inheritance(
+        &mut self,
+        container: StringId,
+        kind: ContainerKind,
+        name_range: SourceRange,
+    ) {
+        if matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        ) {
+            return;
+        }
+        // One emission pass per container (an augmentation re-fires the
+        // event for the same container).
+        if !self.reported_face_checks.insert(container) {
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        let Some(conflicted) = self.inheritance_conflicts(decl, name_range) else {
+            return;
+        };
+        if kind != ContainerKind::Mixin {
+            self.abstract_completeness(kind, decl, &conflicted, name_range);
+        }
+    }
+
+    /// The face's linearized chain, every non-static member: the face
+    /// container itself, its `with` mixins in reverse application order, its
+    /// `implements` interfaces, then the superclass hop, repeating per hop
+    /// ([`Engine::face_member`]'s climb, enumerating). `top_concrete` says
+    /// the face contributes implementations at all (a superclass or `with`
+    /// face); an `implements`/`on` face contributes interface members only,
+    /// so every hit is forced `concrete_source: false`
+    /// ([`FaceEntry::concrete_source`] — `_addImplemented`'s sources are own
+    /// members, mixins, and the super chain only,
+    /// `inheritance_manager3.dart:333`). `None` = an unresolvable or cyclic
+    /// hop — the caller suppresses rather than reports.
+    fn face_entries(&self, face: StringId, top_concrete: bool) -> Option<Vec<FaceEntry<'a>>> {
+        let mut name = face;
+        let mut owner = self.file;
+        let mut scope_lib = self.lib;
+        let mut seen = FxHashSet::default();
+        let mut hits: Vec<FaceEntry<'a>> = Vec::new();
+        loop {
+            if !seen.insert(name) {
+                return None;
+            }
+            let (found, found_owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                scope_lib,
+                owner,
+                name,
+            )?;
+            for (member, entry) in &found.members {
+                if !entry.is_static {
+                    hits.push(FaceEntry {
+                        name: *member,
+                        entry,
+                        owner_name: name,
+                        owner_file: found_owner,
+                        concrete_source: top_concrete,
+                    });
+                }
+            }
+            // The mixin/superclass names are written in `found_owner` and
+            // resolve through that file's library (#491 S2a).
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
+            for mixin in found.with_clause.iter().rev() {
+                if !seen.insert(*mixin) {
+                    return None;
+                }
+                if let Some((mixin_container, mixin_owner)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    owner_lib,
+                    found_owner,
+                    *mixin,
+                ) {
+                    for (member, entry) in &mixin_container.members {
+                        if !entry.is_static {
+                            hits.push(FaceEntry {
+                                name: *member,
+                                entry,
+                                owner_name: *mixin,
+                                owner_file: mixin_owner,
+                                concrete_source: true,
+                            });
+                        }
+                    }
+                }
+            }
+            for interface in &found.implements_clause {
+                if let Some((interface_container, interface_owner)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    owner_lib,
+                    found_owner,
+                    *interface,
+                ) {
+                    for (member, entry) in &interface_container.members {
+                        if !entry.is_static {
+                            hits.push(FaceEntry {
+                                name: *member,
+                                entry,
+                                owner_name: *interface,
+                                owner_file: interface_owner,
+                                concrete_source: false,
+                            });
+                        }
+                    }
+                }
+            }
+            // The chain ends here (Object is unindexed) — enumeration
+            // completes cleanly; only a broken named hop suppresses.
+            let Some(superclass) = found.superclass else {
+                return Some(hits);
+            };
+            scope_lib = owner_lib;
+            name = superclass;
+            owner = found_owner;
+        }
+    }
+
+    /// The same-name super-interface candidate conflicts
+    /// (`inheritance_override.dart:160-207` `_reportInterfaceConflicts`).
+    /// Candidates accumulate per name in the oracle's face order — the
+    /// superclass face (the applied chain), the `with` mixins in
+    /// application order, the `implements` interfaces, the `on` constraints
+    /// — with a `with` mixin's *own* member replacing the accumulated list
+    /// (the official application sequence). A name conflicts when its
+    /// candidates mix getter and method kinds — unresolvable, reported even
+    /// when the class declares the name (verified against the oracle) — or
+    /// the candidates share a kind, no candidate is a valid override of all
+    /// the others, and no class-local member resolves the name (the
+    /// official `map.containsKey` gate). Returns the conflicted names — a
+    /// conflict drops the name from the class's interface (the official
+    /// combine returns no signature), so the completeness check must not
+    /// report it missing. `None` = a broken face chain — the caller
+    /// suppresses.
+    fn inheritance_conflicts(
+        &mut self,
+        decl: &Container,
+        name_range: SourceRange,
+    ) -> Option<FxHashSet<StringId>> {
+        let mut faces: Vec<(StringId, bool, bool)> = Vec::new();
+        if let Some(superclass) = decl.superclass {
+            faces.push((superclass, false, true));
+        }
+        // `with`: candidates in application order, own-member replacement.
+        faces.extend(decl.with_clause.iter().map(|m| (*m, true, true)));
+        // `implements`/`on`: candidates only — never implementations.
+        faces.extend(decl.implements_clause.iter().map(|i| (*i, false, false)));
+        faces.extend(decl.on_clause.iter().map(|o| (*o, false, false)));
+        let mut order: Vec<StringId> = Vec::new();
+        let mut candidate_map: FxHashMap<StringId, Vec<FaceEntry<'a>>> = FxHashMap::default();
+        for (face, is_with, contributes) in &faces {
+            let entries = self.face_entries(*face, *contributes)?;
+            // Keep-first per name (the nearest member wins within a chain),
+            // name-sorted for a deterministic emission order.
+            let mut per_name: Vec<FaceEntry<'a>> = Vec::new();
+            let mut present = FxHashSet::default();
+            for hit in entries {
+                if present.insert(hit.name) {
+                    per_name.push(hit);
+                }
+            }
+            per_name.sort_unstable_by_key(|h| h.name);
+            for hit in per_name {
+                if let Some(list) = candidate_map.get_mut(&hit.name) {
+                    if *is_with && hit.owner_name == *face {
+                        // The mixin's own member replaces; a kind mismatch in
+                        // the replacement is itself the getter/method
+                        // conflict (`inheritance_manager3.dart:594-610`).
+                        if Self::kind_class(list[0].entry) != Self::kind_class(hit.entry) {
+                            self.emit_kind_conflict(hit.name, &list[0], &hit, name_range);
+                        }
+                        *list = vec![hit];
+                    } else {
+                        list.push(hit);
+                    }
+                } else {
+                    order.push(hit.name);
+                    candidate_map.insert(hit.name, vec![hit]);
+                }
+            }
+        }
+        // A class-local instance member resolves the same-kind conflict for
+        // its name (fields cover their setter half).
+        let mut declared: FxHashSet<StringId> = FxHashSet::default();
+        for (name, entry) in &decl.members {
+            if entry.is_static {
+                continue;
+            }
+            declared.insert(*name);
+            if entry.kind == MemberKind::Field && !entry.is_final {
+                let setter = self.setter_spelling(*name);
+                declared.insert(setter);
+            }
+        }
+        let mut conflicted: FxHashSet<StringId> = FxHashSet::default();
+        for name in order {
+            let list = &candidate_map[&name];
+            if list.len() >= 2 && self.emit_name_conflict(name, list, &declared, name_range) {
+                conflicted.insert(name);
+            }
+        }
+        Some(conflicted)
+    }
+
+    /// The candidate kind class: getter-shaped (getters and fields — the
+    /// interface sees a field as its getter), method, setter.
+    fn kind_class(entry: &MemberEntry) -> u8 {
+        match entry.kind {
+            MemberKind::Method => 0,
+            MemberKind::Setter => 1,
+            MemberKind::Getter | MemberKind::Field => 2,
+        }
+    }
+
+    /// One multi-candidate name's conflict verdict, emitted in place.
+    /// Returns whether the name is conflicted — dropped from the class's
+    /// interface, so the completeness check must not report it missing.
+    ///
+    /// The getter/method mix has no resolution
+    /// (`_checkForGetterMethodConflict`): the first getter-shaped and first
+    /// method candidate in face order name the interfaces. A class-local
+    /// instance member resolves the same-kind conflict for its name. The
+    /// name-level valid-override search then decides: a candidate not broken
+    /// against any other is a valid override. An incomparable pair reads as
+    /// compatible (`override_broken`'s suppression direction) — the check
+    /// never false-positives on types a subclass edge could still relate.
+    fn emit_name_conflict(
+        &mut self,
+        name: StringId,
+        list: &[FaceEntry<'a>],
+        declared: &FxHashSet<StringId>,
+        name_range: SourceRange,
+    ) -> bool {
+        let getter = list.iter().find(|c| Self::kind_class(c.entry) == 2);
+        let method = list.iter().find(|c| c.entry.kind == MemberKind::Method);
+        if let (Some(getter), Some(method)) = (getter, method) {
+            self.emit_kind_conflict(name, getter, method, name_range);
+            return true;
+        }
+        if declared.contains(&name) {
+            return false;
+        }
+        let has_valid = list.iter().enumerate().any(|(i, a)| {
+            list.iter()
+                .enumerate()
+                .all(|(j, b)| i == j || !Self::override_broken(a.entry, b.entry))
+        });
+        if has_valid {
+            return false;
+        }
+        let display = self.strings.resolve(name);
+        let signatures = list
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}.{} ({})",
+                    self.strings.resolve(c.owner_name),
+                    display,
+                    self.override_signature_text(c.entry)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.emit(
+            SemanticCode::InconsistentInheritance,
+            name_range,
+            display,
+            &signatures,
+        );
+        true
+    }
+
+    /// The getter/method kind conflict's emission: the member name, the
+    /// getter candidate's interface, the method candidate's interface.
+    fn emit_kind_conflict(
+        &mut self,
+        name: StringId,
+        getter: &FaceEntry<'a>,
+        method: &FaceEntry<'a>,
+        name_range: SourceRange,
+    ) {
+        self.emit3(
+            SemanticCode::InconsistentInheritanceGetterAndMethod,
+            name_range,
+            self.strings.resolve(name),
+            self.strings.resolve(getter.owner_name),
+            self.strings.resolve(method.owner_name),
+        );
+    }
+
+    /// The concrete class/enum abstract-completeness check
+    /// (`inheritance_override.dart:412-486`): every interface name without
+    /// a concrete implementation is a missing row, the five-tier message
+    /// rendering the sorted `Enclosing.member` descriptions. The exemptions
+    /// mirror the official walk: `Object` members (always implemented), an
+    /// enum's `values`/`values=`, names the class itself declares (the
+    /// concrete-class-with-abstract-member code owns those — not
+    /// implemented here, so they suppress), names a *concrete* direct
+    /// superclass's interface carries (`_isNotImplementedInConcreteSuper
+    /// Class` — the issue belongs there), cross-library private names
+    /// (`isAccessibleFor`), and a concrete `noSuchMethod` on the
+    /// implemented sources (the forwarder gate). A name the conflict pass
+    /// dropped (`conflicted`) is absent from the class's interface — never
+    /// reported missing here. An abstract field's non-final shape misses
+    /// both halves (getter and setter); a final one misses the getter only.
+    fn abstract_completeness(
+        &mut self,
+        kind: ContainerKind,
+        decl: &Container,
+        conflicted: &FxHashSet<StringId>,
+        name_range: SourceRange,
+    ) {
+        if kind == ContainerKind::Class && decl.is_abstract {
+            return;
+        }
+        // The concrete-superclass exemption's face: the direct superclass
+        // resolved, concrete, and carrying the name in its interface. A
+        // broken chain suppresses the whole check.
+        let concrete_super_names: Option<FxHashSet<StringId>> = match decl.superclass {
+            Some(superclass) => {
+                let Some((super_container, _)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    superclass,
+                ) else {
+                    return;
+                };
+                if super_container.kind == ContainerKind::Class && super_container.is_abstract {
+                    None
+                } else {
+                    let Some(hits) = self.face_entries(superclass, true) else {
+                        return;
+                    };
+                    Some(hits.into_iter().map(|h| h.name).collect())
+                }
+            }
+            None => None,
+        };
+        // Own instance members block the report for their names: a concrete
+        // one implements them, an abstract one is the
+        // `concrete_class_with_abstract_member` report's business (not
+        // implemented here, so it suppresses — never a false positive).
+        let mut implemented: FxHashSet<StringId> = FxHashSet::default();
+        let mut blocked: FxHashSet<StringId> = FxHashSet::default();
+        for (name, entry) in &decl.members {
+            if entry.is_static {
+                continue;
+            }
+            blocked.insert(*name);
+            if entry.kind == MemberKind::Field && !entry.is_final {
+                let setter = self.setter_spelling(*name);
+                blocked.insert(setter);
+                if !entry.is_abstract {
+                    implemented.insert(setter);
+                }
+            }
+            if !entry.is_abstract {
+                implemented.insert(*name);
+            }
+        }
+        let Some(InterfaceView {
+            names,
+            representative,
+            implemented: face_implemented,
+        }) = self.collect_interface(decl)
+        else {
+            return;
+        };
+        implemented.extend(face_implemented);
+        // An enum's synthesized `values` pair is always implemented.
+        let values = self.enum_synth_members[0];
+        let values_setter = self.setter_spelling(values);
+        let descriptions: Vec<String> = names
+            .into_iter()
+            .filter(|name| !blocked.contains(name))
+            .filter(|name| !self.object_members.contains(name))
+            .filter(|name| {
+                kind != ContainerKind::Enum || (*name != values && *name != values_setter)
+            })
+            .filter(|name| {
+                concrete_super_names
+                    .as_ref()
+                    .is_none_or(|names| !names.contains(name))
+            })
+            .filter(|name| !conflicted.contains(name))
+            .filter(|name| !implemented.contains(name))
+            .filter(|name| {
+                // `isAccessibleFor`: a *private* name inherited from another
+                // library can never be implemented — the oracle skips it.
+                // Public names are accessible from any importing library.
+                if !self.strings.resolve(*name).starts_with('_') {
+                    return true;
+                }
+                let hit = &representative[name];
+                hit.owner_file == self.file
+                    || self.owner_library_of(hit.owner_file, *name) == Some(self.lib)
+            })
+            .map(|name| self.member_description(&representative[&name], name))
+            .collect();
+        self.emit_missing_members(descriptions, name_range);
+    }
+
+    /// The interface view for the completeness check: every resolved face's
+    /// names (a non-final field carries its setter half), the first face in
+    /// order supplying the representative hit, and the names a concrete
+    /// source implements. `None` suppresses the whole check — a broken face
+    /// chain, or the noSuchMethod forwarder gate: a concrete noSuchMethod on
+    /// the implemented sources (own members, mixins, the super chain — never
+    /// an `implements` face) implements every interface name.
+    fn collect_interface(&mut self, decl: &Container) -> Option<InterfaceView<'a>> {
+        let mut faces: Vec<(StringId, bool)> = Vec::new();
+        faces.extend(decl.superclass.iter().map(|s| (*s, true)));
+        faces.extend(decl.with_clause.iter().map(|m| (*m, true)));
+        faces.extend(decl.implements_clause.iter().map(|i| (*i, false)));
+        faces.extend(decl.on_clause.iter().map(|o| (*o, false)));
+        let mut face_hits: Vec<Vec<FaceEntry<'a>>> = Vec::with_capacity(faces.len());
+        for (face, contributes) in faces {
+            face_hits.push(self.face_entries(face, contributes)?);
+        }
+        let no_such_method = self.object_members[3];
+        let forwarder_gate = decl
+            .members
+            .get(&no_such_method)
+            .is_some_and(|e| !e.is_static && !e.is_abstract)
+            || face_hits
+                .iter()
+                .flatten()
+                .any(|h| h.name == no_such_method && h.concrete_source && !h.entry.is_abstract);
+        if forwarder_gate {
+            return None;
+        }
+        let mut representative: FxHashMap<StringId, FaceEntry<'a>> = FxHashMap::default();
+        let mut names: Vec<StringId> = Vec::new();
+        let mut implemented: FxHashSet<StringId> = FxHashSet::default();
+        for hits in &face_hits {
+            let mut sorted = hits.clone();
+            sorted.sort_unstable_by_key(|h| h.name);
+            for hit in sorted {
+                let setter_half = match hit.entry.kind {
+                    MemberKind::Field if !hit.entry.is_final => {
+                        Some(self.setter_spelling(hit.name))
+                    }
+                    _ => None,
+                };
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    representative.entry(hit.name)
+                {
+                    slot.insert(hit);
+                    names.push(hit.name);
+                }
+                if let Some(setter) = setter_half
+                    && let std::collections::hash_map::Entry::Vacant(slot) =
+                        representative.entry(setter)
+                {
+                    slot.insert(hit);
+                    names.push(setter);
+                }
+                if hit.concrete_source && !hit.entry.is_abstract {
+                    implemented.insert(hit.name);
+                    if let Some(setter) = setter_half {
+                        implemented.insert(setter);
+                    }
+                }
+            }
+        }
+        Some(InterfaceView {
+            names,
+            representative,
+            implemented,
+        })
+    }
+
+    /// The description text of one missing member: `Enclosing.member`, the
+    /// official `setter ` prefix for setter spellings and none for methods.
+    fn member_description(&self, hit: &FaceEntry<'a>, name: StringId) -> String {
+        let owner = self.strings.resolve(hit.owner_name);
+        let text = self.strings.resolve(name);
+        if let Some(base) = text.strip_suffix('=') {
+            format!("setter {owner}.{base}")
+        } else if hit.entry.kind == MemberKind::Method {
+            format!("{owner}.{text}")
+        } else {
+            format!("getter {owner}.{text}")
+        }
+    }
+
+    /// The five-tier missing-implementation row: sorted descriptions select
+    /// the official message shape.
+    fn emit_missing_members(&mut self, mut descriptions: Vec<String>, name_range: SourceRange) {
+        descriptions.sort();
+        let code = match descriptions.len() {
+            0 => return,
+            1 => SemanticCode::InheritsAbstractMemberOne,
+            2 => SemanticCode::InheritsAbstractMemberTwo,
+            3 => SemanticCode::InheritsAbstractMemberThree,
+            4 => SemanticCode::InheritsAbstractMemberFour,
+            _ => SemanticCode::InheritsAbstractMemberFivePlus,
+        };
+        let message = match descriptions.len() {
+            1 => code.message(&descriptions[0], ""),
+            2 => code.message3(&descriptions[0], &descriptions[1], ""),
+            3 => code.message3(&descriptions[0], &descriptions[1], &descriptions[2]),
+            4 => code.message4(
+                &descriptions[0],
+                &descriptions[1],
+                &descriptions[2],
+                &descriptions[3],
+            ),
+            n => code.message5(
+                &descriptions[0],
+                &descriptions[1],
+                &descriptions[2],
+                &descriptions[3],
+                &(n - 4).to_string(),
+            ),
+        };
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            message,
+            self.file,
+            name_range,
+            None,
+        ));
     }
 
     // —— extension-type representation (#476) ————————————————————————————
@@ -1774,12 +2402,7 @@ impl<'a> Engine<'a> {
         // (:5411-5423, both non-returning): the field may not share the
         // type's name, nor an `Object` member's.
         if rep.formal.name == container {
-            self.emit(
-                SemanticCode::MemberWithClassName,
-                rep.name_range,
-                "",
-                "",
-            );
+            self.emit(SemanticCode::MemberWithClassName, rep.name_range, "", "");
         } else if self.object_members.contains(&rep.formal.name) {
             self.emit(
                 SemanticCode::ExtensionTypeDeclaresMemberOfObject,
@@ -1839,7 +2462,9 @@ impl<'a> Engine<'a> {
             // The mixin/superclass names are written in `found_owner` and
             // resolve through that file's library (probed by the container
             // name it declares, #491 S2a).
-            let owner_lib = self.owner_library_of(found_owner, name).unwrap_or(scope_lib);
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
             for mixin in found.with_clause.iter().rev() {
                 if !seen.insert(*mixin) {
                     return None;
@@ -1884,11 +2509,28 @@ impl<'a> Engine<'a> {
         };
         match (declared.formals.as_deref(), inherited.formals.as_deref()) {
             (Some(a), Some(b)) => {
-                // Positional arity, then the named set: both decidable at
-                // the name level.
-                if a.positional.len() != b.positional.len()
-                    || a.named.len() != b.named.len()
-                    || a.named.iter().any(|f| b.named_formal(f.name).is_none())
+                // Positional arity first: both directions break it.
+                if a.positional.len() != b.positional.len() {
+                    return true;
+                }
+                // The named set: every inherited name must survive (a
+                // dropped named parameter rejects calls the super accepts),
+                // and `required` may only tighten onto a parameter that is
+                // required in the super — a newly required parameter (added
+                // or strengthened) rejects calls without it. An added
+                // optional named parameter is the valid-override widening
+                // (oracle-verified: `void f(int x, {int? y})` over
+                // `void f(int x)` is clean).
+                for f in &b.named {
+                    match a.named_formal(f.name) {
+                        None => return true,
+                        Some(d) if d.required && !f.required => return true,
+                        Some(_) => {}
+                    }
+                }
+                if a.named
+                    .iter()
+                    .any(|d| d.required && b.named_formal(d.name).is_none())
                 {
                     return true;
                 }
@@ -4531,8 +5173,7 @@ impl<'a> Engine<'a> {
             .iter()
             .filter(|face| {
                 face.on_type == Some(receiver)
-                    && (face.members.contains_key(&member)
-                        || face.members.contains_key(&setter))
+                    && (face.members.contains_key(&member) || face.members.contains_key(&setter))
             })
             .map(|face| self.extension_display(face))
             .collect()
@@ -5253,8 +5894,14 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
+        // The face-inheritance checks read the element model (complete
+        // since `collect`) and anchor at this name token (#498).
+        if let Some(name) = name {
+            engine.check_face_inheritance(name, ContainerKind::Class, name_range);
+        }
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
@@ -5274,8 +5921,12 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
+        if let Some(name) = name {
+            engine.check_face_inheritance(name, ContainerKind::Class, name_range);
+        }
     }
 
     fn end_named_mixin_application(
@@ -5298,8 +5949,12 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Mixin, name);
+        if let Some(name) = name {
+            engine.check_face_inheritance(name, ContainerKind::Mixin, name_range);
+        }
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
@@ -5314,8 +5969,12 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Enum, name);
+        if let Some(name) = name {
+            engine.check_face_inheritance(name, ContainerKind::Enum, name_range);
+        }
     }
 
     fn end_enum_declaration(
@@ -10818,13 +11477,15 @@ mod tests {
         );
     }
 
-    /// An equal-arity method whose named-parameter set differs from the
-    /// inherited member emits too.
+    /// An equal-arity method whose named-parameter set narrows the
+    /// inherited face emits: dropping an inherited named parameter, or
+    /// adding one as `required`, rejects calls the super accepts. An added
+    /// optional named parameter is the valid widening and stays silent.
     #[test]
     fn named_set_mismatch_emits_invalid_override() {
         let rep = report(
             "class int {} class A { void f(int x) {} } \
-             class B extends A { void f(int x, {int y}) {} }",
+             class B extends A { void f(int x, {required int y}) {} }",
         );
         assert_eq!(
             code_names(&rep),
@@ -10834,8 +11495,15 @@ mod tests {
         );
         assert_eq!(
             rep.diagnostics[0].message,
-            "'B.f' ('void Function(int, {int y})') isn't a valid override of 'A.f' ('void Function(int)')."
+            "'B.f' ('void Function(int, {required int y})') isn't a valid override of 'A.f' ('void Function(int)')."
         );
+        // The widening arm: `{int? y}` added accepts every call the super
+        // accepts — no report (oracle-verified).
+        let rep = report(
+            "class int {} class A { void f(int x) {} } \
+             class B extends A { void f(int x, {int? y}) {} }",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// The type arm emits only when nullability decides: a nullable getter
@@ -11025,6 +11693,419 @@ mod tests {
             rep.diagnostics[0].message,
             "'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function()')."
         );
+    }
+
+    // —— abstract completeness + interface conflicts (#498) ————————————
+
+    /// The five message tiers, with the oracle-verified texts: the list is
+    /// the sorted `Enclosing.member` descriptions (`getter ` prefixed for
+    /// getter shapes, plain for methods — the oracle's sort places the
+    /// unprefixed method first).
+    #[test]
+    fn missing_member_tiers_render_the_five_shapes() {
+        let rep = report("abstract class A { void m(); } class B extends A {}");
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementation of 'A.m'."
+        );
+        for (count, expected) in [
+            (2, "Missing concrete implementations of 'A.a' and 'A.b'."),
+            (
+                3,
+                "Missing concrete implementations of 'A.a', 'A.b', and 'A.c'.",
+            ),
+            (
+                4,
+                "Missing concrete implementations of 'A.a', 'A.b', 'A.c', and 'A.d'.",
+            ),
+            (
+                5,
+                "Missing concrete implementations of 'A.a', 'A.b', 'A.c', 'A.d', and 1 more.",
+            ),
+        ] {
+            let members = "void a(); void b(); void c(); void d(); void e();"
+                .split("; ")
+                .take(count)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let rep = report(&format!(
+                "abstract class A {{ {members} }} class B extends A {{}}"
+            ));
+            assert_eq!(
+                code_names(&rep),
+                ["non_abstract_class_inherits_abstract_member"],
+                "{count}"
+            );
+            assert_eq!(rep.diagnostics[0].message, expected, "{count}");
+        }
+        // The description sort is the oracle's: the unprefixed method sorts
+        // before the prefixed getter.
+        let rep = report("abstract class A { void z(); int get a; } class B extends A {}");
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementations of 'A.z' and 'getter A.a'."
+        );
+    }
+
+    /// `implements` contributes interface members but never
+    /// implementations (`_addImplemented`'s sources are the super chain,
+    /// the mixins, and own members only): a concrete member on an
+    /// `implements` face still misses; the same member through `extends`
+    /// resolves.
+    #[test]
+    fn implements_never_implements_but_extends_resolves() {
+        let rep = report(
+            "class A { void m() {} } abstract class B { void m(); } class C implements A, B {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // The interface representative is the most specific candidate — the
+        // super-side one wins the description.
+        let rep = report(
+            "class A { void m() {} } abstract class B { void m(); } class C extends B implements A {}",
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementation of 'B.m'."
+        );
+        let rep = report("class A { void m() {} } class C extends A {}");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// The concrete-superclass exemption (`_isNotImplementedInConcreteSuper
+    /// Class`): the issue belongs to the concrete class that already lacks
+    /// the member. An abstract class exempts itself from the check; its own
+    /// abstract members are the `concrete_class_with_abstract_member`
+    /// report's business — not implemented here, so they suppress.
+    #[test]
+    fn abstract_and_concrete_super_exemptions() {
+        // An abstract class never reports.
+        let rep = report("abstract class A { void m(); } abstract class B extends A {}");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // A concrete class's own abstract member is the other code's row.
+        let rep = report("class C { void m(); }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // A concrete superclass whose interface has the name blocks the
+        // report for its subclasses.
+        let rep = report("class C { void m(); } class D extends C {}");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// A concrete `noSuchMethod` on the implemented sources (the class
+    /// itself, the super chain, a `with` mixin) gates the whole check — the
+    /// oracle's forwarder machinery implements every interface name.
+    #[test]
+    fn no_such_method_gates_completeness() {
+        let rep = report(
+            "class Invocation {} abstract class A { void m(); } \
+             class B extends A { noSuchMethod(Invocation i) => null; }",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        let rep = report(
+            "class Invocation {} abstract class A { void m(); } \
+             class S { noSuchMethod(Invocation i) => super.noSuchMethod(i); } \
+             class C extends S implements A {}",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// The getter/method kind collision is unresolvable — the class-local
+    /// declaration does not silence it (oracle-verified; the row anchors at
+    /// the class name here, the span divergence the module docs carry).
+    #[test]
+    fn getter_method_kind_collision_reports_despite_local_member() {
+        let rep = report(
+            "class int {} abstract class A { int get m; } abstract class B { void m(); } \
+             class C implements A, B {} \
+             class D implements A, B { int get m => 1; } \
+             class E implements A, B { void m() {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "inconsistent_inheritance_getter_and_method",
+                "inconsistent_inheritance_getter_and_method",
+                "inconsistent_inheritance_getter_and_method",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'m' is inherited as a getter (from 'A') and also a method (from 'B')."
+        );
+    }
+
+    /// The same-kind signature conflict reports the candidates in face
+    /// order with the name-level signatures; a class-local member whose
+    /// signature validly overrides every candidate resolves it (the
+    /// official `map.containsKey` gate).
+    #[test]
+    fn candidates_conflict_and_its_local_resolution() {
+        let rep = report(
+            "class int {} class A { void m({int? a}) {} } class B { void m({int? b}) {} } \
+             class C extends A implements B {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["inconsistent_inheritance"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Superinterfaces don't have a valid override for 'm': \
+             A.m (void Function({int? a})), B.m (void Function({int? b}))."
+        );
+        // The resolutions split (oracle-verified): the widened signature
+        // validly overrides both candidates, while `E.m` still rejects
+        // `B`'s `b:` calls — the per-member `invalid_override` reports
+        // (independent of the conflict row `C` carries above).
+        let rep = report(
+            "class int {} class A { void m({int? a}) {} } class B { void m({int? b}) {} } \
+             class D extends A implements B { void m({int? a, int? b}) {} } \
+             class E extends A implements B { void m({int? a}) {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?} {:#?}",
+            code_names(&rep),
+            rep.diagnostics
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'E.m' ('void Function({int? a})') isn't a valid override of 'B.m' ('void Function({int? b})')."
+        );
+    }
+
+    /// A `with` mixin's own member replaces the accumulated candidates (the
+    /// official application sequence): a kind mismatch in the replacement
+    /// is itself the getter/method conflict, a same-kind replacement is
+    /// clean, and a stacked application whose member validly overrides
+    /// every side resolves the whole name.
+    #[test]
+    fn mixin_replacement_resolves_and_conflicts() {
+        // Kind mismatch through the replacement: the getter survived on the
+        // superclass face, the mixin's own method replaces it.
+        let rep = report(
+            "class int {} abstract class A { int get m; } mixin M { void m() {} } class C extends A with M {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["inconsistent_inheritance_getter_and_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'m' is inherited as a getter (from 'A') and also a method (from 'M')."
+        );
+        // Same-kind replacement: clean.
+        let rep = report(
+            "abstract class B { void m(); } mixin M { void m() {} } class C extends B with M {}",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // The stacked resolution: the mixin's widened member validly
+        // overrides both the replaced super candidate and the interface
+        // candidate (oracle-verified — no row).
+        let rep = report(
+            "class int {} class A { void m({int? a}) {} } class B { void m({int? b}) {} } \
+             mixin M { void m({int? a, int? b}) {} } class C extends A with M implements B {}",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // Without the mixin's member the conflict surfaces.
+        let rep = report(
+            "class int {} class A { void m({int? a}) {} } class B { void m({int? b}) {} } \
+             mixin N { void other() {} } class C extends A with N implements B {}",
+        );
+        assert_eq!(code_names(&rep), ["inconsistent_inheritance"]);
+    }
+
+    /// A mixin declaration participates in the conflicts through its `on`
+    /// constraints (the completeness loop skips mixins entirely).
+    #[test]
+    fn mixin_on_clause_conflicts_but_mixins_never_miss() {
+        let rep = report(
+            "class int {} mixin A { void m({int? a}) {} } mixin B { void m({int? b}) {} } mixin C on A, B {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["inconsistent_inheritance"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Mixins take no part in the abstract-completeness loop.
+        let rep = report("class int {} mixin M { void m(); }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// Enums participate in the completeness check; an enum's synthesized
+    /// `values`/`values=` stay exempt (the official exemption arm), while
+    /// foreign abstract members report.
+    #[test]
+    fn enum_participates_with_values_exempt() {
+        let rep =
+            report("abstract class A { void a(); void b(); } enum E implements A { v1, v2; }");
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementations of 'A.a' and 'A.b'."
+        );
+        // The synthesized `values` getter satisfies the interface name.
+        let rep =
+            report("class int {} abstract class A { int get values; } enum E implements A { v }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// An abstract field's non-final shape misses both halves (getter and
+    /// setter, the setter displayed without the `=`); a final field misses
+    /// the getter only. A concrete field implements both.
+    #[test]
+    fn abstract_field_halves_split_by_final() {
+        let rep = report(
+            "class int {} abstract class A { abstract int x; abstract final int y; } class B extends A {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementations of 'getter A.x', 'getter A.y', and 'setter A.x'."
+        );
+        let rep =
+            report("class int {} class A { abstract int x; } class B extends A { int x = 0; }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// A private name inherited from another library can never be
+    /// implemented — the oracle skips it (`isAccessibleFor`); the public
+    /// sibling still reports.
+    #[test]
+    fn cross_library_private_names_are_inaccessible() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        let source_a = "abstract class A { void _priv(); void pub(); }";
+        let source_m = "import 'a.dart'; class B extends A {}";
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned_a = dartq_scanner::scan(
+            source_a,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_a,
+        );
+        let scanned_m = dartq_scanner::scan(
+            source_m,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_m,
+        );
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:t/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, _) in elements_a.declarations() {
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let rep = diagnose(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementation of 'A.pub'."
+        );
+    }
+
+    /// Empty clause lists and faceless declarations are silent; a named
+    /// mixin application participates like any concrete class.
+    #[test]
+    fn empty_clauses_are_silent_and_mixin_applications_participate() {
+        let rep = report("class C {} mixin M {} enum E { v }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // The application resolves the member through the mixin.
+        let rep =
+            report("abstract class A { void m(); } mixin M { void m() {} } class C = A with M;");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // Without the mixin's member the application misses.
+        let rep = report(
+            "abstract class A { void m(); } mixin N { void other() {} } class C = A with N;",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["non_abstract_class_inherits_abstract_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing concrete implementation of 'A.m'."
+        );
+        // An abstract named mixin application exempts itself.
+        let rep = report(
+            "abstract class A { void m(); } mixin N { void other() {} } abstract class C = A with N;",
+        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     // —— #449: the flow-analysis mount (dead_code first milestone) ————————
@@ -11543,11 +12624,7 @@ mod tests {
              mixin M2 { void other() {} } \
              class C extends B with M1, M2 { int f() { return m; } }",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// `super.member` walks the applied chain too: `super.h()` in
@@ -11600,4 +12677,3 @@ mod tests {
         );
     }
 }
-

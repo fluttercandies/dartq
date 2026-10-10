@@ -279,6 +279,9 @@ pub struct ExtensionFace {
 }
 
 /// One class member: kind, static/instance bit, and its executable facts.
+/// The modifier bits are the declaration's own flat flags — orthogonal in
+/// the grammar, so they stay flat here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberEntry {
     /// The member kind.
@@ -289,6 +292,11 @@ pub struct MemberEntry {
     pub is_abstract: bool,
     /// The `external` modifier was present (external members).
     pub is_external: bool,
+    /// The field group's `final` modifier (`final int x;`); false for every
+    /// other member shape. The abstract-completeness check splits an
+    /// abstract field's missing halves with it (a final field has no
+    /// setter).
+    pub is_final: bool,
     /// The member's own type parameters (`void m<T>()`); 0 when absent.
     pub type_params: u16,
     /// The member's own type-parameter names, in declaration order (the
@@ -310,6 +318,11 @@ pub struct MemberEntry {
 pub struct Container {
     /// The declaration family.
     pub kind: ContainerKind,
+    /// The `abstract` modifier was present on a class-family header
+    /// (classes and named mixin applications; always false for the other
+    /// kinds, which cannot be abstract). The abstract-completeness check
+    /// reads it (concrete classes only).
+    pub is_abstract: bool,
     /// The direct superclass name (`extends S` / a named mixin application's
     /// head type), name-level; `None` when absent or unrecoverable.
     pub superclass: Option<StringId>,
