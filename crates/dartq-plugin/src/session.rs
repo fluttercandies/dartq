@@ -22,13 +22,13 @@
 //! - Any `Err` from [`Session::handle`] is fatal: the caller must discard the
 //!   session and kill the plugin process. The session never resynchronizes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::capability::{Capability, CapabilitySet};
 use crate::frame::{
-    Frame, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_INITIALIZE, METHOD_REQUEST_FIXES,
-    METHOD_SHUTDOWN, PROTOCOL_VERSION,
+    Frame, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS, METHOD_INITIALIZE,
+    METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION,
 };
 
 /// Session lifecycle states, driven by [`Session::handle`] and the
@@ -134,8 +134,11 @@ pub enum SessionError {
     },
 }
 
-/// A diagnostic emitted by a plugin via `notification/diagnostic`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// A diagnostic flowing over the wire. Plugin-emitted diagnostics ride
+/// `notification/diagnostic` (plugin → core); engine diagnostics are pushed
+/// as `notification/engine_diagnostics` batches (core → plugin), so both
+/// directions share this one row shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginDiagnostic {
     /// Path of the file the diagnostic refers to.
     pub file: String,
@@ -154,7 +157,7 @@ pub struct PluginDiagnostic {
 }
 
 /// Severity vocabulary of plugin diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// An error diagnostic.
@@ -163,6 +166,16 @@ pub enum Severity {
     Warning,
     /// An informational diagnostic.
     Info,
+}
+
+/// Builds the core → plugin `notification/engine_diagnostics` batch carrying
+/// the engine's current diagnostics (one frame per analyze cycle). A
+/// notification: the plugin never replies to it.
+#[must_use]
+pub fn engine_diagnostics_frame(diagnostics: &[PluginDiagnostic]) -> Frame {
+    let mut params = Map::new();
+    params.insert("diagnostics".into(), json!(diagnostics));
+    Frame::notification(METHOD_ENGINE_DIAGNOSTICS, params)
 }
 
 /// The reply payload of `request/fixes`.

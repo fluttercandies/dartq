@@ -25,6 +25,11 @@ const String methodShutdown = 'shutdown';
 /// Plugin-to-core notification: diagnostics produced by the plugin.
 const String methodDiagnosticNotification = 'notification/diagnostic';
 
+/// Core-to-plugin notification: the engine's current diagnostics for the
+/// analyzed set, pushed once per analyze cycle as the plugin's diagnostic
+/// context (PRD section 14.2).
+const String methodEngineDiagnostics = 'notification/engine_diagnostics';
+
 /// Core-to-plugin: request source fixes for a location.
 const String methodRequestFixes = 'request/fixes';
 

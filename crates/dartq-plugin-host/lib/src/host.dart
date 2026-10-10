@@ -16,7 +16,9 @@ import 'plugin_session.dart';
 
 /// Reads newline-delimited frames from [input], drives the session built
 /// from [config], and writes each reply line through [send] (one JSON line,
-/// without the trailing newline).
+/// without the trailing newline). Plugin-emitted diagnostics go through
+/// [onEngineDiagnostics] (its return value is sent back as
+/// `notification/diagnostic` frames).
 ///
 /// Throws on the first wire-contract violation (malformed UTF-8/JSON,
 /// foreign schema version, oversize frame); the process must then exit —
@@ -25,8 +27,12 @@ Future<void> runPluginHost(
   PluginConfig config, {
   required Stream<List<int>> input,
   required Future<void> Function(String line) send,
+  EngineDiagnosticsHandler? onEngineDiagnostics,
 }) async {
-  final session = PluginSession(config: config);
+  final session = PluginSession(
+    config: config,
+    onEngineDiagnostics: onEngineDiagnostics,
+  );
   final buffer = BytesBuilder(copy: false);
   await for (final chunk in input) {
     if (buffer.length + chunk.length > maxFrameBytes) {
@@ -44,6 +50,11 @@ Future<void> runPluginHost(
         break;
       }
       await _serveLine(bytes.sublist(start, newline), session, send);
+      // Flush whatever the plugin emitted while this frame was served
+      // (replies and `notification/diagnostic` emissions alike), in order.
+      for (final frame in session.drainOutbound()) {
+        await send(frame.encode());
+      }
       start = newline + 1;
     }
     buffer.add(bytes.sublist(start));

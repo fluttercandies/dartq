@@ -22,27 +22,43 @@ enum SessionState {
   terminated,
 }
 
+/// Signature of the hook the host calls when the core pushes its engine
+/// diagnostics (`notification/engine_diagnostics`, one batch per analyze
+/// cycle). Pure function: whatever it returns is emitted back to the core as
+/// `notification/diagnostic` frames, in order.
+typedef EngineDiagnosticsHandler = List<PluginDiagnostic> Function(
+  List<PluginDiagnostic> engineDiagnostics,
+);
+
 /// Drives one plugin session: answers the core's `initialize`,
-/// `request/fixes`, and `shutdown`, and frames the plugin's diagnostics.
+/// `request/fixes`, and `shutdown`, feeds the engine's diagnostics to the
+/// plugin, and frames the plugin's diagnostics for delivery.
 class PluginSession {
   /// Builds a session for a plugin described by [config].
-  PluginSession({required this.config});
+  PluginSession({required this.config, this.onEngineDiagnostics});
 
   /// The plugin this session serves (its capabilities are advertised during
   /// the handshake).
   final PluginConfig config;
+
+  /// Called with each engine diagnostics batch the core pushes. Optional:
+  /// plugins that only serve `request/fixes` need no subscription.
+  final EngineDiagnosticsHandler? onEngineDiagnostics;
+
+  final List<PluginFrame> _outbound = <PluginFrame>[];
 
   SessionState _state = SessionState.awaitingInitialize;
 
   /// The current lifecycle state.
   SessionState get state => _state;
 
-  /// Feeds one inbound core frame; returns the reply frame to send, or null
-  /// when nothing should be written (v1 has no core-to-plugin notifications,
-  /// so frames without an id are dropped).
+  /// Feeds one inbound core frame. Requests return the reply frame to send;
+  /// core notifications (`notification/engine_diagnostics`) dispatch to
+  /// [onEngineDiagnostics] and return null.
   PluginFrame? handleFrame(PluginFrame frame) {
     final id = frame.id;
     if (id == null) {
+      _handleCoreNotification(frame);
       return null;
     }
     switch (frame.method) {
@@ -61,10 +77,54 @@ class PluginSession {
     }
   }
 
-  /// Frames [diagnostic] for the core; the caller sends the returned frame
-  /// over the wire.
-  PluginFrame diagnosticFrame(PluginDiagnostic diagnostic) =>
-      PluginFrame.notification(methodDiagnosticNotification, diagnostic.toJson());
+  /// Queues [diagnostic] for delivery to the core as
+  /// `notification/diagnostic`; the host loop flushes the queue after
+  /// serving each inbound frame.
+  void emitDiagnostic(PluginDiagnostic diagnostic) => _outbound.add(
+    PluginFrame.notification(methodDiagnosticNotification, diagnostic.toJson()),
+  );
+
+  /// The frames queued since the last drain, in emit order.
+  List<PluginFrame> drainOutbound() {
+    if (_outbound.isEmpty) {
+      return const <PluginFrame>[];
+    }
+    final drained = List<PluginFrame>.of(_outbound);
+    _outbound.clear();
+    return drained;
+  }
+
+  void _handleCoreNotification(PluginFrame frame) {
+    if (frame.method == methodEngineDiagnostics) {
+      _handleEngineDiagnostics(frame);
+      return;
+    }
+    // Protocol v1 has exactly one core-to-plugin notification; anything
+    // else is a contract break — fatal, matching the core's machine.
+    throw PluginProtocolException(
+      'unknown notification `${frame.method}` in state ${_state.name}',
+    );
+  }
+
+  void _handleEngineDiagnostics(PluginFrame frame) {
+    if (_state != SessionState.ready) {
+      throw const PluginProtocolException(
+        'notification/engine_diagnostics is only valid after initialize completes',
+      );
+    }
+    final entries = frame.params['diagnostics'];
+    if (entries is! List) {
+      throw const PluginProtocolException(
+        'engine_diagnostics payload requires a `diagnostics` array',
+      );
+    }
+    final emitted = onEngineDiagnostics?.call(
+      entries.map(_parseEngineDiagnostic).toList(growable: false),
+    );
+    if (emitted != null) {
+      emitted.forEach(emitDiagnostic);
+    }
+  }
 
   PluginFrame _handleInitialize(int id, PluginFrame frame) {
     if (_state != SessionState.awaitingInitialize) {
@@ -116,5 +176,58 @@ class PluginSession {
     }
     _state = SessionState.terminated;
     return PluginFrame.request(id, frame.method, const {});
+  }
+
+  static PluginDiagnostic _parseEngineDiagnostic(Object? entry) {
+    if (entry is! Map) {
+      throw const PluginProtocolException(
+        'engine diagnostic must be a JSON object',
+      );
+    }
+    final map = Map<String, Object?>.from(entry);
+    final severityName = map['severity'];
+    if (severityName is! String) {
+      throw const PluginProtocolException(
+        'engine diagnostic field `severity` must be a string',
+      );
+    }
+    final matches = Severity.values
+        .where((severity) => severity.name == severityName)
+        .toList();
+    if (matches.length != 1) {
+      throw PluginProtocolException(
+        'engine diagnostic field `severity` must be one of '
+        '${Severity.values.map((s) => s.name).join('/')}'
+        ', got `$severityName`',
+      );
+    }
+    return PluginDiagnostic(
+      file: _requireString(map, 'file'),
+      severity: matches.single,
+      code: _requireString(map, 'code'),
+      message: _requireString(map, 'message'),
+      offset: _nonNegativeInt(map, 'offset'),
+      length: _nonNegativeInt(map, 'length'),
+    );
+  }
+
+  static String _requireString(Map<String, Object?> map, String field) {
+    final value = map[field];
+    if (value is String) {
+      return value;
+    }
+    throw PluginProtocolException(
+      'engine diagnostic field `$field` must be a string',
+    );
+  }
+
+  static int _nonNegativeInt(Map<String, Object?> map, String field) {
+    final value = map[field] ?? 0;
+    if (value is int && value >= 0) {
+      return value;
+    }
+    throw PluginProtocolException(
+      'engine diagnostic field `$field` must be a non-negative integer',
+    );
   }
 }

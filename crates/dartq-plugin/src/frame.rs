@@ -31,6 +31,11 @@ pub const METHOD_INITIALIZE: &str = "initialize";
 pub const METHOD_SHUTDOWN: &str = "shutdown";
 /// Plugin-to-core notification: diagnostics produced by the plugin.
 pub const METHOD_DIAGNOSTIC_NOTIFICATION: &str = "notification/diagnostic";
+/// Core-to-plugin notification: the engine's current diagnostics for the
+/// analyzed set, pushed once per analyze cycle as the plugin's diagnostic
+/// context (PRD §14.2: plugins never hold core references — this batch is
+/// the push half of that contract).
+pub const METHOD_ENGINE_DIAGNOSTICS: &str = "notification/engine_diagnostics";
 /// Core-to-plugin: request source fixes for a location.
 pub const METHOD_REQUEST_FIXES: &str = "request/fixes";
 

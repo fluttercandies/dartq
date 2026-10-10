@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The engine feed face converts `Diagnostic`s (engine model) onto the wire;
+# `FileTable` resolves FileIds to the wire's path strings.
+dartq-diagnostics = { path = "../dartq-diagnostics" }
+dartq-source = { path = "../dartq-source" }
 memchr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

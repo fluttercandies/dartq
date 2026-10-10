@@ -203,6 +203,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dartq-ai",
+ "dartq-commands",
  "dartq-daemon",
  "dartq-diagnostics",
  "dartq-engine",
@@ -220,9 +221,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "dartq-commands"
+version = "0.1.0"
+dependencies = [
+ "dartq-ai",
+ "dartq-diagnostics",
+ "dartq-engine",
+ "dartq-index",
+ "dartq-language",
+ "dartq-lints",
+ "dartq-package",
+ "dartq-parser",
+ "dartq-pub",
+ "dartq-scanner",
+ "dartq-sdk",
+ "dartq-source",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "dartq-daemon"
 version = "0.1.0"
 dependencies = [
+ "dartq-commands",
  "dartq-diagnostics",
  "dartq-engine",
  "dartq-package",
@@ -341,6 +364,8 @@ dependencies = [
 name = "dartq-plugin"
 version = "0.1.0"
 dependencies = [
+ "dartq-diagnostics",
+ "dartq-source",
  "memchr",
  "serde",
  "serde_json",

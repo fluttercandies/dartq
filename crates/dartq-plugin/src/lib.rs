@@ -35,6 +35,7 @@
 //! | `request/fixes` | core → plugin | request | `{file, offset, length}` (UTF-16 units) |
 //! | `request/fixes` | plugin → core | reply | `{fixes: [{priority, message, edits: [{offset, length, replacement}]}]}` |
 //! | `notification/diagnostic` | plugin → core | notification | `{file, severity, code, message, offset, length}` |
+//! | `notification/engine_diagnostics` | core → plugin | notification | `{diagnostics: [{file, severity, code, message, offset, length}]}` |
 //!
 //! # Handshake and capability negotiation
 //!
@@ -71,6 +72,33 @@
 //! The Dart host implements the exact same schema (package `dartq_plugin_host`,
 //! `lib/src/frame.dart`); both files must change together.
 //!
+//! # Engine wiring and isolation metrics (M4, PRD §14 conformance)
+//!
+//! [`runtime::PluginRuntime`] is the engine-facing face this contract serves:
+//!
+//! - **§14.2 process model**: one child process per plugin, wire-only
+//!   contact — the plugin never holds a core reference. The engine read face
+//!   is the existing [`dartq_diagnostics::Diagnostic`] output of
+//!   `dartq_engine::Engine::analyze` plus `file_table()`; the runtime
+//!   converts and pushes it (`notification/engine_diagnostics`, one batch
+//!   per analyze cycle) and drains plugin-emitted diagnostics back for the
+//!   caller's output merge. No engine crate changes are required.
+//! - **§14.1 extension points**: the wire layer is dartiq's own v1 (the
+//!   official `analyzer_plugin` protocol is pre-1.0 and adapted here, risk
+//!   R2); the official `registerAssist`/`registerFixForRule` API shape is
+//!   mirrored by the host package's `Plugin`/`PluginRegistry`. The rich
+//!   Query API (AST/element/type pulls) is a later milestone — this surface
+//!   carries the diagnostics round trip only.
+//! - **§14.3 isolation**: per-plugin counters (peak child RSS, frame/byte
+//!   totals per direction, 16 MiB guard drops, restart count) via
+//!   [`runtime::PluginRuntime::stats`] → [`stats::PluginStatsSnapshot`];
+//!   RSS over the manifest's `memory_budget_mb` kills the child (Linux
+//!   `VmHWM`, macOS `proc_pid_rusage`); child death restarts within the
+//!   manifest's retry budget and never takes the engine down;
+//!   `initialize`/`shutdown` run under the manifest's request deadline. The
+//!   `plugin_crashed` diagnostic is emitted by the daemon output layer,
+//!   which owns the merge.
+//!
 //! # Relationship to `analysis_server_plugin`
 //!
 //! The lifecycle mirrors the official plugin system's observable contract
@@ -82,18 +110,22 @@
 pub mod capability;
 pub mod frame;
 pub mod manifest;
+pub mod runtime;
 pub mod session;
+pub mod stats;
 
 pub use capability::{Capability, CapabilitySet};
 pub use frame::{
-    Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_INITIALIZE,
-    METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError, decode_line,
-    encode_frame,
+    Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS,
+    METHOD_INITIALIZE, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError,
+    decode_line, encode_frame,
 };
 pub use manifest::{
     DEFAULT_MEMORY_BUDGET_MB, MANIFEST_FILE_NAME, Manifest, ManifestError, Timeouts,
 };
+pub use runtime::{PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
 pub use session::{
     FixesReply, Incoming, PluginDiagnostic, PrioritizedChange, Session, SessionError, SessionState,
-    Severity, SourceEdit,
+    Severity, SourceEdit, engine_diagnostics_frame,
 };
+pub use stats::{PluginStats, PluginStatsSnapshot};
