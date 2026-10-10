@@ -1493,22 +1493,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             TokenKind::Keyword(Keyword::Typedef) => {
                 self.report(msg::typedef_in_class(), next_span);
                 self.listener.handle_invalid_member(next_span);
-                // The oracle emits this single diagnostic for a well-formed
-                // in-class typedef; skip the declaration so the reparse adds
-                // no rider errors (official reportAndSkipTypedefInClass TODO).
-                self.cursor.advance(); // `typedef`
-                loop {
-                    match self.peek_kind() {
-                        TokenKind::Semicolon => {
-                            self.cursor.advance();
-                            break;
-                        }
-                        TokenKind::CloseCurly | TokenKind::Eof => break,
-                        _ => {
-                            self.cursor.advance();
-                        }
-                    }
-                }
+                // Official `reportAndSkipTypedefInClass` (:11510) reports and
+                // returns without skipping — the TODO above its skip loop was
+                // never implemented, so the body member loop reparses from
+                // the token after `typedef` and a well-formed alias shape
+                // (`typedef T = int;`) rides in as a plain field parse with
+                // its `missing_const_final_var_or_type` report. Consume the
+                // `typedef` keyword so the reparse starts there (the official
+                // loop re-enters with `token` parked on it).
+                self.cursor.advance();
                 return;
             }
             _ => {}

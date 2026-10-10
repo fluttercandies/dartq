@@ -123,6 +123,46 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return span;
         }
         if is_identifier(peek.kind) {
+            // Analyzer field/variable name check: a built-in keyword that
+            // names a top-level declaration (`mixin`, `extension`, ...) is a
+            // legal variable name only while the next token continues the
+            // declaration (`=`, `,`, `;`); otherwise it reads as the next
+            // declaration's head — report `missing_identifier`, splice the
+            // synthetic name, and leave the keyword for the declaration loop
+            // (oracle: `augment mixin M {}` reports at `mixin` and reparses
+            // the mixin; `int mixin = 3;` stays clean). Non-declaration
+            // built-ins (`abstract`, `covariant`, ...) stay accepted as
+            // names like any identifier (`augment abstract class C {}`
+            // keeps `abstract` as the field name).
+            if matches!(
+                context,
+                crate::listener::IdentifierContext::FieldDeclaration
+                    | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+            ) && matches!(
+                // Only non-reserved (built-in) heads reach here — `class`/
+                // `enum`/`typedef` are reserved and never pass
+                // `is_identifier`.
+                peek.kind,
+                TokenKind::Keyword(
+                    Keyword::Augment
+                        | Keyword::Extension
+                        | Keyword::Export
+                        | Keyword::Import
+                        | Keyword::Library
+                        | Keyword::Mixin
+                        | Keyword::Part
+                )
+            ) && !matches!(
+                self.cursor.look_kind(1),
+                TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon
+            ) {
+                self.report(msg::missing_identifier(), peek.span);
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+                self.cursor.advance();
+                return self.span_of(id);
+            }
             self.check_async_keyword_as_identifier(&peek, context);
             let id = self.cursor.advance();
             let span = self.span_of(id);
@@ -383,18 +423,69 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         self.ensure_identifier(context)
     }
 
-    /// Official `ensureSemicolon`: consumes `;` or reports
-    /// `Expected ';' after this.` and synthesizes one.
+    /// Official `ensureSemicolon` (`parser_impl.dart:5093`): consumes `;` or
+    /// reports `Expected ';' after this.` and synthesizes one.
+    ///
+    /// Two official details live here: the report anchors on
+    /// `findPreviousNonZeroLengthToken(token)` — the last consumed token,
+    /// walked back over zero-width synthetics (an inserted identifier in
+    /// front of the insertion point must not capture the anchor) — and the
+    /// inserted `;` drains everything queued in front of it, so the parse
+    /// resumes at the token the official stream carries as `token.next`.
     pub(crate) fn ensure_semicolon(&mut self) -> TokenSpan {
         if let Some(id) = self.cursor.opt_kind(TokenKind::Semicolon) {
             return self.span_of(id);
         }
         let at = self.peek_span();
-        self.report(msg::expected_after_but_got(";"), at);
+        let anchor = self.last_consumed_anchor();
+        self.report(msg::expected_after_but_got(";"), anchor);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Semicolon, at.range.offset);
-        self.cursor.advance();
+        while self.cursor.advance() != id {}
+        self.span_of(id)
+    }
+
+    /// Official report anchor for `reportRecoverableError(token, ...)`: the
+    /// last consumed token walked back over zero-width synthetics
+    /// (`findPreviousNonZeroLengthToken`, `parser_impl.dart:11400` — an
+    /// inserted identifier in front of the insertion point must not capture
+    /// the anchor). Falls back to the current token when nothing
+    /// non-zero-length was consumed yet.
+    #[allow(clippy::cast_possible_truncation)] // ids are u32 by design
+    pub(crate) fn last_consumed_anchor(&self) -> TokenSpan {
+        let table_len = self.table.len() as crate::token_id::TokenId;
+        let Some(mut id) = self.cursor.last_consumed_id() else {
+            return self.peek_span();
+        };
+        loop {
+            let (kind, synthetic) = self.cursor.resolve(id);
+            if id >= table_len {
+                // Inserted token. Split remainders carry real text and are
+                // valid anchors; a consumed synthetic steps to the previous
+                // inserted entry, or to the last real token consumed before
+                // the insertions.
+                if !synthetic {
+                    break;
+                }
+                if id == table_len {
+                    if self.cursor.real_pos() == 0 {
+                        return self.peek_span();
+                    }
+                    id = (self.cursor.real_pos() - 1) as crate::token_id::TokenId;
+                } else {
+                    id -= 1;
+                }
+                continue;
+            }
+            if !synthetic && kind != TokenKind::Eof && self.span_of(id).range.length > 0 {
+                break;
+            }
+            if id == 0 {
+                return self.peek_span();
+            }
+            id -= 1;
+        }
         self.span_of(id)
     }
 
@@ -456,6 +547,23 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// Forces one token of progress (official :445-456 / :10530-10537).
     pub(crate) fn force_advance(&mut self) {
         self.cursor.advance();
+    }
+
+    /// Official `recoverFromStackOverflow` (`parser_impl.dart:11386`), the
+    /// statement-depth fuse: report `stackOverflow`, insert a synthetic `;`
+    /// with its `handleEmptyStatement` event, skip to the enclosing `}` (or
+    /// EOF), and latch the terminal bailout so every grammar loop unwinds
+    /// without consuming further tokens.
+    pub(crate) fn recover_from_stack_overflow(&mut self) {
+        if self.is_bailed() {
+            return;
+        }
+        self.bail(msg::stack_overflow(crate::parser::MAX_DEPTH));
+        let semi = self.synthetic(TokenKind::Semicolon, self.peek_span().range.offset);
+        self.listener.handle_empty_statement(semi);
+        while !self.cursor.at_eof() && self.peek_kind() != TokenKind::CloseCurly {
+            self.cursor.advance();
+        }
     }
 }
 

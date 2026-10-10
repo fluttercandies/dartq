@@ -747,14 +747,21 @@ impl ComplexTypeParamOrArg {
                 // closer exists anywhere ahead, so the next iteration must
                 // examine a *new* real token — drain everything queued (the
                 // synthetics' events are already emitted) and force one real
-                // token forward when the iteration consumed none.
+                // token forward when the iteration consumed none. At EOF (or
+                // when nothing was consumed and nothing is queued) there is
+                // no next real token: close the group here instead of
+                // spinning on self-fed synthetics (termination invariant —
+                // every recovery loop consumes or exits, #495).
                 parser.report(msg::expected_but_got(","), parser.peek_span());
                 parser.synthetic(TokenKind::Comma, parser.peek_span().range.offset);
                 while parser.cursor.peek_id() as usize >= parser.table.len() {
                     parser.cursor.advance();
                 }
-                if !parser.cursor.at_eof() && parser.cursor.progress() == before {
-                    parser.force_advance();
+                if parser.cursor.at_eof() || parser.cursor.progress() == before {
+                    end = parser.peek_span();
+                    parser.listener.end_type_arguments(count, begin, end);
+                    parser.leave_depth();
+                    return end;
                 }
                 continue;
             }

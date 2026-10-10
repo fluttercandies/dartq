@@ -31,7 +31,7 @@
 //!   `ast_builder.dart:3825-3841`).
 //! * collection for-elements consume the `(` (`parseForLoopPartsStart`).
 
-use super::collector::{Collector, latest_features, setup};
+use super::collector::{Collector, latest_features, scan_ok, setup};
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.
 fn sorted_codes(source: &'static str) -> Vec<String> {
@@ -384,4 +384,218 @@ fn unclosed_formal_relocation() {
         ],
         "unclosed paren relocates at the brace",
     );
+}
+
+// —— #460: member & primary-constructor recovery ——————————————————————————
+
+/// Engine-mirror scan for the `augment`-headed shapes: the gate (l1.rs
+/// `scan_config`) derives the lexical gates from the feature set, and
+/// augmentations have no `enabledIn`, so `augment` lexes as an identifier
+/// exactly like the 3.13 oracle.
+fn assert_codes_engine(source: &'static str, expected: &[&str], label: &str) {
+    let config = dartq_scanner::ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: false,
+    };
+    let mut files = dartq_source::FileTable::new();
+    let file = files.intern(std::path::Path::new("test.dart"));
+    let result = dartq_scanner::scan(source, config, file);
+    assert!(
+        result.diagnostics.is_empty(),
+        "scanner diagnostics in {source:?}: {:?}",
+        result.diagnostics
+    );
+    let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+    let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let mut codes: Vec<String> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name.to_owned())
+        .collect();
+    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    p.parse_unit();
+    codes.extend(p.listener.error_codes());
+    codes.sort();
+    let expected: Vec<String> = {
+        let mut e = expected.iter().map(ToString::to_string).collect::<Vec<_>>();
+        e.sort();
+        e
+    };
+    assert_eq!(codes, expected, "{label}: diagnostic multiset diverged");
+}
+
+/// `new`-headed constructors with a `=`-redirection ride the redirecting
+/// factory body: the junk constructor reference splices a synthetic name
+/// without consuming the junk, so the missing `;` and the leftover tokens
+/// re-enter the member loop as `expected_class_member` (oracle:
+/// `constructor_head_error.dart` lines 2-3, `parser_impl.dart:6069/:6414/
+/// :11355`).
+#[test]
+fn new_constructor_redirect_cascade() {
+    assert_codes(
+        "class C {\n  new = 42;\n}\n",
+        &[
+            "missing_method_parameters",
+            "redirection_in_non_factory_constructor",
+            "missing_identifier",
+            "expected_token",
+            "expected_class_member",
+            "expected_class_member",
+        ],
+        "unnamed new constructor with junk redirection",
+    );
+    assert_codes(
+        "class C {\n  C() = 42;\n}\n",
+        &[
+            "redirection_in_non_factory_constructor",
+            "missing_identifier",
+            "expected_token",
+            "expected_class_member",
+            "expected_class_member",
+        ],
+        "constructor with junk redirection",
+    );
+}
+
+/// `this.new` in an initializer list: the reserved name splices a synthetic
+/// field name, the synthetic-assignment recovery re-reads the entry, and the
+/// leftover `new = 0` re-enters the member loop as a `new`-headed
+/// constructor missing parameters (oracle: `new_in_initializer.dart` line 3).
+#[test]
+fn new_constructor_this_initializer_cascade() {
+    assert_codes(
+        "class C {\n  new() : this.new = 0;\n}\n",
+        &[
+            "missing_assignment_in_initializer",
+            "missing_identifier",
+            "missing_function_body",
+            "missing_method_parameters",
+            "redirection_in_non_factory_constructor",
+            "missing_identifier",
+            "expected_token",
+            "expected_class_member",
+            "expected_class_member",
+        ],
+        "this.new initializer cascade",
+    );
+}
+
+/// `extend` is an identifier, not a keyword — the official misspelled-
+/// extends gate is lexeme-based over `isKeywordOrIdentifier`
+/// (`parser_impl.dart:3218`), so `class Bar extend A, B` recovers with the
+/// `expected_instead` report + the multi-extends rider instead of falling
+/// into the class-body lane (r5: `issue_22313.dart`'s `expected_body`
+/// over-report family).
+#[test]
+fn misspelled_extends_identifier_recovery() {
+    assert_codes(
+        "class A { }\nclass Bar extend A, B {\n  Bar() { }\n}\n",
+        &["expected_instead", "multiple_extends_clauses"],
+        "extend-typo header recovery",
+    );
+    assert_codes(
+        "class A { }\nclass Baz on A, B {\n  Baz() { }\n}\n",
+        &["expected_instead", "multiple_extends_clauses"],
+        "on-clause misspelling keeps the keyword arm",
+    );
+}
+
+/// `reportAndSkipTypedefInClass` (:11510) never skips — the body member
+/// loop reparses `T = int;` as a plain field, whose `parseFields` rides the
+/// `missing_const_final_var_or_type` report (r5: `typedef_in_class.dart`).
+#[test]
+fn typedef_in_class_reparse_rides_as_field() {
+    assert_codes(
+        "class C {\n  typedef T = int;\n}\n",
+        &["typedef_in_class", "missing_const_final_var_or_type"],
+        "in-class typedef reparse",
+    );
+}
+
+/// `augment`-headed declarations with the feature off (engine gate +
+/// 3.13 oracle): the field-name check rejects a top-level-declaration
+/// built-in whose follower cannot continue the declaration, splices the
+/// synthetic name, and leaves the keyword for the declaration loop.
+#[test]
+fn augment_headed_declaration_name_recovery() {
+    assert_codes_engine(
+        "augment mixin M {}\n",
+        &["missing_identifier", "expected_token"],
+        "augment mixin reparse",
+    );
+    assert_codes_engine(
+        "augment class C {}\n",
+        &["missing_const_final_var_or_type", "expected_token"],
+        "augment class fields fallback",
+    );
+    assert_codes_engine(
+        "augment abstract class C {}\n",
+        &["expected_token"],
+        "non-declaration built-in stays the field name",
+    );
+}
+
+/// `augment extension type ET {}`: the extension-type declaration reparses
+/// after the field fallback, so the primary-constructor pair fires —
+/// `missing_primary_constructor` anchored on the parser pointer and
+/// `expected_representation_field` on the body token (r5:
+/// `top_level_declarations.dart`; one point, two codes).
+#[test]
+fn augment_extension_type_representation_pair() {
+    assert_codes_engine(
+        "augment extension type ET {}\n",
+        &[
+            "missing_identifier",
+            "expected_token",
+            "missing_primary_constructor",
+            "expected_representation_field",
+        ],
+        "augment extension type without representation",
+    );
+    assert_codes_engine(
+        "extension type ET {}\n",
+        &[
+            "missing_primary_constructor",
+            "expected_representation_field",
+        ],
+        "extension type without representation",
+    );
+}
+
+/// The statement-depth fuse (`recoverFromStackOverflow`, :11386) fires the
+/// official triple: one `stack_overflow` report, a synthetic `;` with its
+/// `handleEmptyStatement` event, and the skip to `}`/EOF.
+#[test]
+fn stack_overflow_fuse_triple() {
+    let nested: &'static str =
+        Box::leak(format!("void f() {{ {} ; }}\n", "if (1) ".repeat(600)).into_boxed_str());
+    let (table, text) = scan_ok(nested);
+    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    p.parse_unit();
+    assert!(
+        p.is_bailed(),
+        "the depth fuse must latch the terminal bailout"
+    );
+    assert_eq!(
+        p.listener.error_codes(),
+        vec!["stack_overflow".to_owned()],
+        "exactly one stack_overflow report: {:?}",
+        p.listener.errors
+    );
+    p.listener.assert_sequence(&[("handle", "empty_statement")]);
+}
+
+/// Named mixin application headers carry their implements names through the
+/// real `handleImplements` event (the semantic collector attributes them to
+/// the implements face; audit #489 S1).
+#[test]
+fn named_mixin_application_implements_event() {
+    let mut p = setup("class A {}\nclass C = A with M implements I;\n");
+    p.parse_unit();
+    assert!(
+        p.listener.errors.is_empty(),
+        "clean header: {:?}",
+        p.listener.errors
+    );
+    p.listener.assert_sequence(&[("handle", "implements")]);
 }

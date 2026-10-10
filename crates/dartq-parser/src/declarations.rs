@@ -15,6 +15,7 @@ use crate::listener::{
     ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind, IdentifierContext,
     ParserListener,
 };
+use crate::members::is_keyword_or_identifier;
 use crate::members::is_modifier_kind;
 use crate::message::msg;
 use crate::parser::Parser;
@@ -1145,6 +1146,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     }
 
     /// Official `parseNamedMixinApplication`.
+    ///
+    /// The implements clause emits the real `handleImplements` event (the
+    /// official diet parser folds it into `endNamedMixinApplication`; the
+    /// dartq event stream carries clause names through `handle_implements`
+    /// so the semantic collector attributes them to the implements face
+    /// instead of the header residue).
     fn parse_named_mixin_application(&mut self, begin: TokenSpan, class_keyword: TokenSpan) {
         let equals = self.peek_span();
         self.cursor.advance();
@@ -1155,11 +1162,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {
             implements = Some(self.peek_span());
             self.cursor.advance();
+            let mut count = 1usize;
             self.parse_single_type_required();
             while self.peek_kind() == TokenKind::Comma {
                 self.cursor.advance();
                 self.parse_single_type_required();
+                count += 1;
             }
+            self.listener.handle_implements(implements, count);
+        } else {
+            self.listener.handle_implements(None, 0);
         }
         let end = self.ensure_semicolon();
         self.listener
@@ -1355,8 +1367,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             }
             // extends (`extend`/`on` read as a misspelled `extends` for every
-            // declaration kind; ExtensionType additionally rejects the clause)
-            if matches!(self.peek_kind(), TokenKind::Keyword(_))
+            // declaration kind; the official gate is lexeme-based over
+            // `isKeywordOrIdentifier` (:3218), so a plain identifier
+            // `extend` qualifies; ExtensionType additionally rejects the
+            // clause)
+            if is_keyword_or_identifier(self.peek_kind())
                 && matches!(self.cursor.lexeme(self.peek_id()), "extend" | "on")
             {
                 let misspelled = self.peek_span();
@@ -1567,9 +1582,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     }
                     clauses.extends = true;
                 }
-            } else if matches!(self.peek_kind(), TokenKind::Keyword(_))
+            } else if is_keyword_or_identifier(self.peek_kind())
                 && matches!(self.cursor.lexeme(self.peek_id()), "extend" | "extends")
             {
+                // Official :3519 — same lexeme-based gate as the class
+                // recovery; `extend` is an identifier, not a keyword.
                 self.report(msg::expected_instead("on"), self.peek_span());
                 self.cursor.advance();
                 let mut count = 1usize;
@@ -1959,8 +1976,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 // every extension type without a representation — including
                 // augmentations (no augmentation gating there) — and the
                 // verifier's synthesized empty formal list additionally yields
-                // `expectedRepresentationField`.
-                self.report(msg::missing_primary_constructor(), self.peek_span());
+                // `expectedRepresentationField`. The report anchors on the
+                // parser pointer (official :3876 `token`, the last consumed
+                // token — the declaration name when the `{` follows it).
+                self.report(
+                    msg::missing_primary_constructor(),
+                    self.last_consumed_anchor(),
+                );
                 self.report(msg::expected_representation_field(), self.peek_span());
             } else if let Some(c) = const_keyword {
                 match kind {

@@ -36,9 +36,16 @@ pub(crate) struct InsertedToken {
 }
 
 impl InsertedToken {
-    /// UTF-16 length: every inserted kind has a fixed ASCII lexeme.
+    /// UTF-16 span length for events. Split remainders carry their fixed
+    /// ASCII lexeme; recovery synthetics are zero-width (the official
+    /// `SyntheticToken` shape, `charEnd == charOffset`) — their events stay
+    /// inside the source even when inserted at the EOF recovery point
+    /// (#495).
     fn utf16_len(self) -> u32 {
-        self.kind.fixed_lexeme().map_or(1, str::len) as u32
+        if self.synthetic {
+            return 0;
+        }
+        self.kind.fixed_lexeme().map_or(0, str::len) as u32
     }
 
     fn range(self) -> SourceRange {

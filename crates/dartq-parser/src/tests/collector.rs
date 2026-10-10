@@ -699,6 +699,11 @@ impl ParserListener for Collector {
     fn end_part_of(&mut self, _: Token, _: Token, _: Token, _: bool) {
         self.log.push(("end", "part_of"));
     }
+
+    // —— clause events (#460) ——————————————————————————————————————————————
+    fn handle_implements(&mut self, _: Option<Token>, _: usize) {
+        self.log.push(("handle", "implements"));
+    }
 }
 
 /// Builds a parser over `source` with a fresh [`Collector`].

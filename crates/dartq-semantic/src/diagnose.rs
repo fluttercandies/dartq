@@ -11129,7 +11129,6 @@ mod tests {
     /// under-reports. Kept as the cross-lane pin — expected red until #460
     /// lands, never worked around here.
     #[test]
-    #[ignore = "named-mixin-application handle_implements emission lands with #460 (parser lane)"]
     fn named_mixin_application_implements_capture() {
         let strings = StringTable::new();
         let source = "class S {} mixin M {} class I {} class C = S with M implements I;";

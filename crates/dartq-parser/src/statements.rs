@@ -75,8 +75,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// `statementDepth`, 500) wraps [`Self::parse_statement_x`].
     pub(crate) fn parse_statement(&mut self) {
         if self.statement_depth >= MAX_DEPTH {
-            // Official `recoverFromStackOverflow`: report once and stop.
-            self.bail(msg::stack_overflow(MAX_DEPTH));
+            // Official `recoverFromStackOverflow` (:11386): report +
+            // empty-statement event + skip to `}`/EOF, then stop.
+            self.recover_from_stack_overflow();
             return;
         }
         self.statement_depth += 1;
