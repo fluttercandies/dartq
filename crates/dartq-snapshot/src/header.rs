@@ -15,10 +15,16 @@ use crate::blake3_128;
 /// frame embeds a blake3-128 stamp of the generation's `tables.json`
 /// bytes — tables are written first, entries carry the stamp, and `load`
 /// discards entries whose stamp mismatches, so an entry can only ever
-/// decode under the save group that wrote it. No on-disk back-compat is
-/// provided or needed: nothing consumes the format yet — the load-side
-/// wiring (#344) designs against this contract.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+/// decode under the save group that wrote it. v4 (#422 write
+/// amplification): the stamp narrowed to the *remap-slices serialization*
+/// — the manifest stays in `tables.json`'s atomic write but outside the
+/// hash, so an entry-set delta leaves the stamp (and every unchanged
+/// entry frame) byte-identical and `save` skips rewriting such files;
+/// `load` also rejects an entry whose payload key disagrees with its
+/// filename. No on-disk back-compat is provided or needed: nothing
+/// consumes the format yet — the load-side wiring (#344) designs against
+/// this contract.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// Identity of one snapshot generation (PRD §5.5, §5.6). A loaded
 /// generation is used only when every field equals what the caller

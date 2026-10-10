@@ -35,9 +35,12 @@ impl EntryKey {
 
 /// One stored entry. On disk: the blake3-128 hex checksum of the JSON
 /// bytes, a space, the blake3-128 hex stamp of the generation's
-/// `tables.json` bytes, a newline, then those bytes — so truncation and
-/// corruption are both caught by the checksum, and an entry is only ever
-/// decoded under the save group (the same tables) that wrote it (#338).
+/// remap-slices serialization, a newline, then those bytes — so truncation
+/// and corruption are both caught by the checksum, and an entry is only
+/// ever decoded under the save group (the same remap slices) that wrote it
+/// (#338). The entry-id manifest sharing `tables.json`'s atomic write is
+/// outside the stamp (#422): an entry-set delta leaves the frame — and the
+/// file — byte-identical.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry<T> {
     pub key: EntryKey,
@@ -63,8 +66,8 @@ pub(super) fn encode<T: Serialize>(
 /// Decodes a framed entry; `None` on any framing, checksum, or JSON
 /// failure (the accelerator invariant: corruption is a miss). The embedded
 /// tables stamp returns with the entry — the store compares it against the
-/// generation's current `tables.json` and treats a mismatch as *absent*
-/// (an entry from another save group), never as corrupt.
+/// generation's current remap-slices stamp and treats a mismatch as
+/// *absent* (an entry from another save group), never as corrupt.
 pub(super) fn decode<T: DeserializeOwned>(framed: &[u8]) -> Option<(Entry<T>, [u8; 16])> {
     let newline = framed.iter().position(|&b| b == b'\n')?;
     let (tags, payload) = (&framed[..newline], &framed[newline + 1..]);
@@ -77,7 +80,9 @@ pub(super) fn decode<T: DeserializeOwned>(framed: &[u8]) -> Option<(Entry<T>, [u
     if blake3_128(payload) != checksum {
         return None;
     }
-    serde_json::from_slice(payload).ok().map(|entry| (entry, stamp))
+    serde_json::from_slice(payload)
+        .ok()
+        .map(|entry| (entry, stamp))
 }
 
 #[cfg(test)]

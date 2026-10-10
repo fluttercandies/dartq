@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_atime, set_file_mtime};
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::entry::{self, Entry};
@@ -133,18 +133,20 @@ impl SnapshotStore {
     /// Loads the generation matching `expected`, or `None` on any
     /// mismatch, damage, or incompleteness: the header must equal
     /// `expected`, `tables.json` must parse, the entries directory must
-    /// exist, and the decodable entries whose tables stamp matches this
-    /// generation's `tables.json` must equal the entry-id manifest exactly
-    /// — a missing, extra, or undecodable entry demotes the whole
-    /// generation to a miss. There is no partial `Some`.
+    /// exist, and the decodable entries whose remap-slices stamp matches
+    /// this generation's tables — and whose payload keys agree with their
+    /// filenames — must equal the entry-id manifest exactly: a missing,
+    /// extra, or undecodable entry demotes the whole generation to a
+    /// miss. There is no partial `Some`.
     ///
-    /// The stamp check is the save-group pairing gate (#338): an entry file
-    /// only decodes under the tables it was saved with. A file whose stamp
-    /// mismatches — an earlier save's entry facing a newer tables, the
-    /// mixed middle of a torn re-save — is treated as *absent*, never
-    /// fatal; the manifest equality then decides. Stale files from an
-    /// interrupted sweep are therefore invisible residue, while a stamped
-    /// file outside the manifest still demotes the generation.
+    /// The stamp check is the save-group pairing gate (#338): an entry
+    /// file only decodes under the remap slices it was saved with. A file
+    /// whose stamp mismatches — an earlier save's entry facing slices that
+    /// changed since, the mixed middle of a torn re-save — is treated as
+    /// *absent*, never fatal; the manifest equality then decides. Stale
+    /// files from an interrupted sweep are therefore invisible residue,
+    /// while a stamped file outside the manifest still demotes the
+    /// generation.
     ///
     /// Entry order is deterministic (sorted by key id), and the load
     /// touches the generation's recency marker once, refreshing its access
@@ -158,13 +160,16 @@ impl SnapshotStore {
         }
         let tables_bytes = fs::read(generation.join("tables.json")).ok()?;
         let stored_tables: StoredTables = parse(&tables_bytes)?;
-        let tables_stamp = crate::blake3_128(&tables_bytes);
+        // Same derivation as `save`: the stamp hashes the remap-slices
+        // serialization, so a manifest-only rewrite of `tables.json` pairs
+        // with the entries unchanged (#422).
+        let tables_stamp = crate::blake3_128(&serde_json::to_vec(&stored_tables.tables).ok()?);
         let mut claimed = stored_tables.entry_ids;
         claimed.sort_unstable();
 
         // The entries directory must exist (a generation is its entries,
-        // even when the manifest is empty) and every decodable, stamped
-        // entry file must carry a claimed id.
+        // even when the manifest is empty) and every decodable, stamped,
+        // honestly-keyed entry file must carry a claimed id.
         let mut present: Vec<[u8; 16]> = Vec::with_capacity(claimed.len());
         let mut entries = Vec::with_capacity(claimed.len());
         for file in fs::read_dir(generation.join("entries")).ok()?.flatten() {
@@ -172,8 +177,21 @@ impl SnapshotStore {
                 continue;
             };
             let bytes = fs::read(file.path()).ok()?;
+            // #422 lazy-decode audit: every decoded entry here is consumed
+            // in full — the only callers are this crate's contract tests,
+            // and the planned #344 seam materializes each loaded entry
+            // (dartq-engine `state/persist.rs`) — so eager JSON decode
+            // stays; split into frame-verify + per-key payload parse only
+            // if a consumer that reads a subset of keys appears.
             let (decoded, stamp) = entry::decode::<T>(&bytes)?;
+            // A foreign stamp is an entry from another save group (#338).
+            // A payload key disagreeing with the filename is a relabeled
+            // file, served under a key it does not hold. Both are *absent*,
+            // never fatal.
             if stamp != tables_stamp {
+                continue;
+            }
+            if decoded.key.id() != id {
                 continue;
             }
             entries.push(decoded);
@@ -193,9 +211,13 @@ impl SnapshotStore {
     }
 
     /// Writes a generation: the remap tables with the entry-id manifest
-    /// folded in first (one atomic unit — the stamp source every entry
+    /// folded in first (one atomic unit — the tables stamp every entry
     /// frame embeds must exist before the entries do), then the stamped
-    /// entries, then the stale-entry sweep, then the header. `load` accepts
+    /// entries, then the stale-entry sweep, then the header. An entry file
+    /// whose new frame is byte-identical to the incumbent is recognized
+    /// and left untouched rather than rewritten (#422); `tables.json` is
+    /// always written, since its manifest is exactly what an entry-set
+    /// delta changes. `load` accepts
     /// the generation only when the directory holds precisely the stamped,
     /// claimed set — a torn save leaves old-stamped entries facing the new
     /// tables and demotes to a miss instead of loading a mixture of two
@@ -241,18 +263,32 @@ impl SnapshotStore {
             tables,
             entry_ids: &ids,
         })?;
-        // Tables first: the entry frames below embed the stamp of these
-        // exact bytes, pairing each entry with the save group that wrote it.
+        // The stamp covers only what entry payloads depend on (#422): the
+        // remap-slices serialization. The entry-id manifest shares
+        // tables.json's atomic write below (one unit, so a manifest can
+        // never face another save's entries) but stays outside the hash —
+        // an entry-set delta leaves the stamp, and every unchanged entry
+        // frame, byte-identical.
+        let tables_stamp = crate::blake3_128(&serde_json::to_vec(tables)?);
+        // Tables first: the entry frames below embed the tables stamp,
+        // pairing each entry with the save group that wrote it.
         atomic_write(&generation.join("tables.json"), &encoded_tables)?;
-        let tables_stamp = crate::blake3_128(&encoded_tables);
         let mut written = encoded_tables.len() as u64;
         for entry in entries {
             let framed = entry::encode(entry, tables_stamp)?;
+            let path = entries_dir.join(format!("{}.entry", hex::encode(entry.key.id())));
+            // A byte-identical frame is already on disk — the narrowed
+            // stamp makes this the common case for an entry-set delta — so
+            // the incumbent file is left untouched instead of rewritten;
+            // reading a small framed file and comparing is strictly
+            // cheaper than the temp+rename write. `tables.json` above is
+            // never skipped: its manifest is exactly what an entry-set
+            // delta changes.
+            if fs::read(&path).is_ok_and(|incumbent| incumbent == framed) {
+                continue;
+            }
             written += framed.len() as u64;
-            atomic_write(
-                &entries_dir.join(format!("{}.entry", hex::encode(entry.key.id()))),
-                &framed,
-            )?;
+            atomic_write(&path, &framed)?;
         }
         // Generational sweep: the manifest claims exactly `ids`, so entry
         // files left by an earlier save with a different set are removed —

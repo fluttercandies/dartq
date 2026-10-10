@@ -519,7 +519,7 @@ fn shrinking_resave_sweeps_residue_and_loads() {
     };
     fs::write(
         entry_file(3),
-        crate::entry::encode(&v3, tables_stamp(&cache, &header)).expect("encode v3"),
+        crate::entry::encode(&v3, tables_stamp(&tables())).expect("encode v3"),
     )
     .expect("plant torn entry");
     assert!(
@@ -543,27 +543,98 @@ fn shrinking_resave_sweeps_residue_and_loads() {
     assert!(entry_file(3).exists(), "the claimed entry stays");
 }
 
-/// The stamp of the generation's current `tables.json` bytes — the value
-/// entry frames embed and load pairs against.
-fn tables_stamp(cache: &TempCache, header: &GenerationHeader) -> [u8; 16] {
-    crate::blake3_128(
-        &fs::read(gen_dir(&cache.path, header).join("tables.json")).expect("tables bytes"),
-    )
+/// #422 write amplification, pinned: with the stamp narrowed to the
+/// remap-slices serialization, a re-save whose entry set only grows
+/// re-frames the surviving entries byte-identically, and their files are
+/// recognized and left untouched instead of rewritten (only the manifest
+/// change lands in `tables.json`, plus the genuinely new entry file).
+#[test]
+fn growing_resave_leaves_unchanged_entry_files_untouched() {
+    let cache = TempCache::new("skip-identical");
+    let header = save_one_entry(&cache);
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let survivor =
+        entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(1, 10).id())));
+    let before = fs::read(&survivor).expect("entry bytes");
+    // Park the file's mtime in the past: a rewrite (temp+rename) would
+    // bump it; the save's read-compare must not.
+    let parked = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
+    let _ = set_file_mtime(&survivor, parked);
+
+    store
+        .save(
+            &header,
+            &tables(),
+            &[
+                Entry {
+                    key: key(1, 10),
+                    payload: payload("main"),
+                },
+                Entry {
+                    key: key(2, 10),
+                    payload: payload("other"),
+                },
+            ],
+        )
+        .expect("growing re-save");
+
+    assert_eq!(
+        fs::read(&survivor).expect("entry bytes"),
+        before,
+        "the unchanged entry's file is byte-identical"
+    );
+    let modified = fs::metadata(&survivor)
+        .expect("entry metadata")
+        .modified()
+        .expect("mtime");
+    assert_eq!(
+        FileTime::from_system_time(modified),
+        parked,
+        "the unchanged entry's file is never rewritten"
+    );
+    assert!(
+        entries_dir(&cache.path, &header)
+            .join(format!("{}.entry", hex::encode(key(2, 10).id())))
+            .exists(),
+        "the added entry is written"
+    );
+    let snapshot = store.load::<TestPayload>(&header).expect("generation");
+    assert_eq!(snapshot.entries.len(), 2);
 }
 
-/// The save-group pairing gate (#338): entries only decode under the
-/// tables they were saved with. Rewriting `tables.json` — same manifest,
-/// different bytes — leaves every entry stale-stamped; they are discarded
-/// as absent and the claimed set can no longer be met: a miss, never a
-/// mixture of one save's tables with another's entries.
+/// The stamp entry frames embed: blake3-128 over the remap-slices
+/// serialization — the same derivation as `save` and `load` (#422).
+fn tables_stamp(tables: &RemapTables) -> [u8; 16] {
+    crate::blake3_128(&serde_json::to_vec(tables).expect("tables serialize"))
+}
+
+/// The save-group pairing gate (#338), stamp scope narrowed by #422:
+/// entries only decode under the *remap slices* they were saved with.
+/// Rewriting the slices — same manifest, same file shape, different value —
+/// leaves every entry stale-stamped; they are discarded as absent and the
+/// claimed set can no longer be met: a miss, never a mixture of one save's
+/// tables with another's entries. (A manifest-only or whitespace rewrite
+/// keeps the entries paired:
+/// [`manifest_bytes_outside_the_stamp_keep_the_entries_paired`].)
 #[test]
 fn rewritten_tables_discard_the_entries_saved_under_the_old_ones() {
     let cache = TempCache::new("stamp-mismatch");
     let header = save_one_entry(&cache);
     let generation = gen_dir(&cache.path, &header);
-    let mut tables_bytes = fs::read(generation.join("tables.json")).expect("tables");
-    tables_bytes.push(b'\n');
-    fs::write(generation.join("tables.json"), &tables_bytes).expect("rewrite tables");
+    // One extra interned string: a different remap-slices value under an
+    // unchanged manifest.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(generation.join("tables.json")).expect("tables"))
+            .expect("parse tables");
+    value["tables"]["strings"]
+        .as_array_mut()
+        .expect("strings array")
+        .push(serde_json::json!([2, "dart:async"]));
+    fs::write(
+        generation.join("tables.json"),
+        serde_json::to_vec(&value).expect("serialize tables"),
+    )
+    .expect("rewrite tables");
 
     assert!(
         cache
@@ -572,6 +643,27 @@ fn rewritten_tables_discard_the_entries_saved_under_the_old_ones() {
             .is_none(),
         "stale-stamped entries are discarded; the claim goes unmet"
     );
+}
+
+/// The other half of the narrowed stamp (#422): the entry-id manifest sits
+/// outside the hash, so a `tables.json` rewrite that leaves the
+/// remap-slices value unchanged (here: a trailing newline) keeps every
+/// entry paired, and the generation still loads whole.
+#[test]
+fn manifest_bytes_outside_the_stamp_keep_the_entries_paired() {
+    let cache = TempCache::new("manifest-outside-stamp");
+    let header = save_one_entry(&cache);
+    let generation = gen_dir(&cache.path, &header);
+    let mut tables_bytes = fs::read(generation.join("tables.json")).expect("tables");
+    tables_bytes.push(b'\n');
+    fs::write(generation.join("tables.json"), &tables_bytes).expect("rewrite tables");
+
+    let snapshot = cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .load::<TestPayload>(&header)
+        .expect("entries still pair with unchanged slices");
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].key, key(1, 10));
 }
 
 /// A stale-stamped file whose id the manifest never claimed is invisible
@@ -587,8 +679,7 @@ fn stale_stamped_residue_does_not_block_a_matching_generation() {
         payload: payload("residue"),
     };
     fs::write(
-        entries_dir(&cache.path, &header)
-            .join(format!("{}.entry", hex::encode(key(9, 10).id()))),
+        entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(9, 10).id()))),
         crate::entry::encode(&outsider, [0u8; 16]).expect("encode residue"),
     )
     .expect("plant stale residue");
@@ -651,8 +742,7 @@ fn extra_entry_demotes_the_generation() {
     };
     fs::write(
         entries_dir(&cache.path, &header).join(format!("{}.entry", hex::encode(key(9, 10).id()))),
-        crate::entry::encode(&outsider, tables_stamp(&cache, &header))
-            .expect("encode outsider"),
+        crate::entry::encode(&outsider, tables_stamp(&tables())).expect("encode outsider"),
     )
     .expect("plant valid entry");
 
@@ -661,6 +751,48 @@ fn extra_entry_demotes_the_generation() {
             .store(DEFAULT_CAPACITY_BYTES)
             .load::<TestPayload>(&header)
             .is_none()
+    );
+}
+
+/// Load-side hardening (#422): an entry file is served only under the key
+/// its payload actually carries. A relabeled file — payload key ≠ filename
+/// id — is *absent*: invisible residue under an unclaimed name, and a
+/// demoted generation when it occupies a claimed name (without the
+/// filename↔key cross-check, a validly stamped, checksummed impostor under
+/// a claimed name would load in place of the real entry).
+#[test]
+fn relabeled_entry_is_rejected() {
+    let cache = TempCache::new("relabeled");
+    let header = save_two_entries(&cache);
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let dir = entries_dir(&cache.path, &header);
+    let impostor = Entry {
+        key: key(9, 10),
+        payload: payload("impostor"),
+    };
+    let frame = crate::entry::encode(&impostor, tables_stamp(&tables())).expect("encode");
+
+    // An unclaimed name: rejected as absent — residue, not an extra.
+    fs::write(
+        dir.join(format!("{}.entry", hex::encode(key(8, 10).id()))),
+        &frame,
+    )
+    .expect("plant residue");
+    let snapshot = store
+        .load::<TestPayload>(&header)
+        .expect("rejected entry is residue, not fatal");
+    assert_eq!(snapshot.entries.len(), 2);
+    assert!(!snapshot.entries.iter().any(|entry| entry.key == key(9, 10)));
+
+    // A claimed name: the claim goes unmet — a miss, never the wrong key.
+    fs::write(
+        dir.join(format!("{}.entry", hex::encode(key(1, 10).id()))),
+        &frame,
+    )
+    .expect("relabel claimed entry");
+    assert!(
+        store.load::<TestPayload>(&header).is_none(),
+        "a relabeled claimed entry demotes the generation"
     );
 }
 
@@ -685,8 +817,11 @@ fn failed_tables_write_keeps_the_last_coherent_generation() {
     let writable = fs::metadata(&generation)
         .expect("generation metadata")
         .permissions();
-    fs::set_permissions(&generation, fs::Permissions::from_mode(writable.mode() & !0o200))
-        .expect("block tables write");
+    fs::set_permissions(
+        &generation,
+        fs::Permissions::from_mode(writable.mode() & !0o200),
+    )
+    .expect("block tables write");
 
     let store = cache.store(DEFAULT_CAPACITY_BYTES);
     let error = store

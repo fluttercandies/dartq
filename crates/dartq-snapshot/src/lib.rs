@@ -24,11 +24,15 @@
 //! before any large read. Entries are per-file facts keyed by [`EntryKey`]
 //! (content hash + feature fingerprint + semantic version, PRD §5.6); each
 //! entry file is a blake3-128 checksum, the blake3-128 *stamp* of the
-//! generation's `tables.json` bytes, then the payload JSON. `tables.json`
-//! carries the remap slices together with the entry-id manifest — the exact
-//! set of entry files the generation claims. [`SnapshotStore::save`] writes
+//! generation's remap-slices serialization, then the payload JSON.
+//! `tables.json` carries the remap slices together with the entry-id
+//! manifest — the exact set of entry files the generation claims. The
+//! manifest pairs with the slices in one atomic write but sits outside the
+//! stamp (#422): an entry-set delta leaves the stamp, and every unchanged
+//! entry frame, byte-identical. [`SnapshotStore::save`] writes
 //! the tables first (the stamp source must exist before the entries embed
-//! it), then the stamped entries, then sweeps every on-disk entry outside
+//! it), then the stamped entries — a frame already on disk byte-identically
+//! is left in place, not rewritten — then sweeps every on-disk entry outside
 //! the claim, then the header; [`SnapshotStore::load`] accepts the
 //! generation only when the stamped, decodable entries equal that claim
 //! exactly, so a torn or raced save can never load as a mixture of two
@@ -41,14 +45,16 @@
 //!
 //! - **Guaranteed loadable**: the last generation whose `save` completed
 //!   every rename. Every returned entry passed its blake3-128 checksum,
-//!   its tables stamp matches the generation's `tables.json`, and the
-//!   stamped entry files on disk are exactly the set the manifest claims.
-//!   A re-save that failed mid-way keeps the generation loadable when the
-//!   interrupted save had not yet replaced the tables (the old stamped
-//!   entries still pair with them); once the new tables have landed, the
-//!   old-stamped entries are discarded and the generation is a miss until
-//!   the save is retried. Every such outcome is an availability loss (one
-//!   reanalysis), never a correctness one.
+//!   its stamp matches the generation's remap slices, its payload key
+//!   agrees with its filename, and the stamped entry files on disk are
+//!   exactly the set the manifest claims. A re-save that failed mid-way
+//!   keeps the generation loadable when the interrupted save had not yet
+//!   replaced the tables (the old stamped entries still pair with them);
+//!   once the new tables have landed, the old entries no longer pair with
+//!   the new save group — stale stamp when the slices changed, manifest
+//!   mismatch when only the entry set did — and the generation is a miss
+//!   until the save is retried. Every such outcome is an availability
+//!   loss (one reanalysis), never a correctness one.
 //! - **Guaranteed lost**: any save whose renames did not all complete —
 //!   including the mixed middle of a torn re-save, which the stamp gate
 //!   (and the manifest gate behind it) demotes to a miss. There is no
