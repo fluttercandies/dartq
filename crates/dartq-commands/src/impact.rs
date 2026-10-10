@@ -328,6 +328,7 @@ mod tests {
                 "members": [],
                 "type_params": 0,
                 "sealed": false,
+                "is_abstract": false,
                 "with_clause": [],
                 "implements_clause": [],
                 "on_clause": [],

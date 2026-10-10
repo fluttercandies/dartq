@@ -424,19 +424,20 @@ impl Session {
         // store load, and the staged facts feed the first apply. A missing
         // or mismatched generation is a cold start (accelerator semantics),
         // never an error.
-        let open = |runtime: &mut Runtime, engine: EngineConfig| -> Result<ContextId, EngineError> {
-            let id = runtime.open_context(ContextConfig { engine, flags: 0 })?;
-            if let Some(store) = &store {
-                let engine = runtime
-                    .context_state_mut(id)
-                    .expect("the context opened above");
-                let header = engine.snapshot_header();
-                if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
-                    engine.ingest_facts_snapshot(snapshot);
+        let open =
+            |runtime: &mut Runtime, engine: EngineConfig| -> Result<ContextId, EngineError> {
+                let id = runtime.open_context(ContextConfig { engine, flags: 0 })?;
+                if let Some(store) = &store {
+                    let engine = runtime
+                        .context_state_mut(id)
+                        .expect("the context opened above");
+                    let header = engine.snapshot_header();
+                    if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
+                        engine.ingest_facts_snapshot(snapshot);
+                    }
                 }
-            }
-            Ok(id)
-        };
+                Ok(id)
+            };
         let default_context = open(&mut runtime, config)?;
         let mut contexts = FxHashMap::default();
         let mut context_ids = vec![default_context];
@@ -486,7 +487,8 @@ impl Session {
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
         for index in 0..self.context_ids.len() {
-            self.engine_mut(self.context_ids[index]).discover_workspace()?;
+            self.engine_mut(self.context_ids[index])
+                .discover_workspace()?;
         }
         self.ensure_read(self.default_context, Tier::Normal);
         Ok(())
@@ -1144,9 +1146,10 @@ impl Session {
         let changes = commands::Changes::new(&self.changed, agent_changed);
         // Disjoint field borrows: runtime (read), workspace_root/changed
         // (read), symbols (mutate).
-        let engine = self.runtime.context_state(context).expect(
-            "the read task's context lives for the session",
-        );
+        let engine = self
+            .runtime
+            .context_state(context)
+            .expect("the read task's context lives for the session");
         let mut drain = commands::Drain {
             engine,
             root: &self.workspace_root,
@@ -1274,11 +1277,7 @@ impl Session {
     /// none queued (the tier mapping lives in the module docs; callers pass
     /// it per intake path).
     fn ensure_read(&mut self, context: ContextId, tier: Tier) {
-        if self
-            .reads
-            .iter()
-            .any(|pending| pending.context == context)
-        {
+        if self.reads.iter().any(|pending| pending.context == context) {
             return;
         }
         let cookie = self.next_cookie();
@@ -2140,10 +2139,16 @@ mod tests {
 
         // Direct conversion allocates nothing bulk-sized: the line index
         // and the text are borrowed, never owned per diagnostic.
-        let diagnostics = session.analyze(session.default_context).expect("re-analysis");
+        let diagnostics = session
+            .analyze(session.default_context)
+            .expect("re-analysis");
         crate::probe::arm_bulk();
         for diagnostic in &diagnostics {
-            assert!(session.convert(session.default_context, diagnostic).is_some());
+            assert!(
+                session
+                    .convert(session.default_context, diagnostic)
+                    .is_some()
+            );
         }
         assert_eq!(
             crate::probe::bulk_bytes(),
@@ -2331,13 +2336,14 @@ mod tests {
         );
         assert_eq!(
             answer_codes(by_id(3)),
-            ["undefined_identifier", "expected_token"],
+            ["expected_token", "undefined_identifier"],
             "agent B sees only its own view's errors: {:?}",
             by_id(3)
         );
-        assert!(
-            answer_codes(by_id(4)).is_empty(),
-            "base check is the M0 disk pipeline (semantic error invisible): {:?}",
+        assert_eq!(
+            answer_codes(by_id(4)),
+            ["uri_does_not_exist"],
+            "base check reports the fixture's own missing import; both agent overlays stay invisible: {:?}",
             by_id(4)
         );
         assert_eq!(
@@ -2439,7 +2445,7 @@ mod tests {
         let turn = session.service();
         assert_eq!(
             answer_codes(&turn.answers[0].1),
-            ["undefined_identifier", "expected_token"],
+            ["expected_token", "undefined_identifier"],
             "the overlay masks the base edit: {:?}",
             turn.answers[0]
         );
@@ -2555,7 +2561,7 @@ mod tests {
         );
         assert_eq!(
             answer_codes(&turn.answers[0].1),
-            ["undefined_identifier", "expected_token"],
+            ["expected_token", "undefined_identifier"],
             "agent A still answers its own (masking) view: {:?}",
             turn.answers[0]
         );
@@ -2825,9 +2831,12 @@ mod tests {
         let mut base = workspace.engine_config();
         base.store = dartq_engine::pooled_memory_store(&pool);
         let root = store_root(name);
-        let session =
-            Session::with_contexts(base, [fork_config(&workspace, &pool)], store_at(root.clone()))
-                .expect("session");
+        let session = Session::with_contexts(
+            base,
+            [fork_config(&workspace, &pool)],
+            store_at(root.clone()),
+        )
+        .expect("session");
         (workspace, session, pool, root)
     }
 
@@ -2932,7 +2941,11 @@ mod tests {
             },
         );
         let turn = session.service();
-        assert!(turn.answers[0].1.is_ok(), "the shared tag answers: {:?}", turn.answers);
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the shared tag answers: {:?}",
+            turn.answers
+        );
 
         // The sink dirties on an overlay apply only.
         let uri = uri::from_path(&workspace.path("lib/main.dart"));
@@ -2977,12 +2990,9 @@ mod tests {
         let pool = dartq_engine::ContentPool::new();
         let mut base = workspace.engine_config();
         base.store = dartq_engine::pooled_memory_store(&pool);
-        let mut warm = Session::with_contexts(
-            base,
-            [fork_config(&workspace, &pool)],
-            store_at(root),
-        )
-        .expect("warm session");
+        let mut warm =
+            Session::with_contexts(base, [fork_config(&workspace, &pool)], store_at(root))
+                .expect("warm session");
         warm.sweep().expect("sweep");
         let _ = warm.service();
         warm.queue_command(
@@ -3035,7 +3045,10 @@ mod tests {
             CLEAN_MAIN.as_bytes(),
             "the buffer reached the worktree"
         );
-        assert!(session.agents["A"].files.is_empty(), "the staged entries freed");
+        assert!(
+            session.agents["A"].files.is_empty(),
+            "the staged entries freed"
+        );
 
         // The merge drains with the staged write: the base view publishes
         // clean, and the committed path's cursor moved at that drain.

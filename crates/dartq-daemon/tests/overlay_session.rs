@@ -143,7 +143,7 @@ fn two_agents_edit_and_delta_over_one_base() {
     );
     assert_eq!(
         codes(&answer_result(&h, 7)),
-        ["undefined_identifier", "expected_token"],
+        ["expected_token", "undefined_identifier"],
         "agent B's view carries only its own errors: {:?}",
         answer_result(&h, 7)
     );
@@ -217,7 +217,7 @@ fn two_agents_edit_and_delta_over_one_base() {
     assert_eq!(answer_result(&h, 10)["since"], 4, "the cursor echoes");
     assert_eq!(
         codes(&answer_result(&h, 11)),
-        ["undefined_identifier", "expected_token"],
+        ["expected_token", "undefined_identifier"],
         "delta before the overlay's cursor keeps the rows: {:?}",
         answer_result(&h, 11)
     );
@@ -437,7 +437,8 @@ fn overlay_commit_writes_back_over_rpc() {
         3,
     );
     assert_eq!(
-        answer_result(&h, 3)["committed"], 1,
+        answer_result(&h, 3)["committed"],
+        1,
         "the answer names the committed count"
     );
     assert_eq!(
@@ -452,7 +453,10 @@ fn overlay_commit_writes_back_over_rpc() {
     );
 
     // An unknown agent fails loud at intake.
-    h.step(&request(5, "dartq/overlay.commit", json!({"agentId": "ghost"})), 1);
+    h.step(
+        &request(5, "dartq/overlay.commit", json!({"agentId": "ghost"})),
+        1,
+    );
     let error = answer_error(&h, 5);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     assert!(
