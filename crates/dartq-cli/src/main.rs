@@ -45,7 +45,7 @@ use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
-use dartq_commands::layout::EngineLayout;
+use dartq_commands::layout::{EngineLayout, path_key, severity_rank};
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{engine_config, open_engine};
 use dartq_diagnostics::{
@@ -604,7 +604,7 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         severity_rank(a.severity)
             .cmp(&severity_rank(b.severity))
             .then_with(|| {
-                path_key(layout.file_path(a.file)).cmp(&path_key(layout.file_path(b.file)))
+                path_key(layout.file_path(a.file)).cmp(path_key(layout.file_path(b.file)))
             })
             .then_with(|| a.range.offset.cmp(&b.range.offset))
             .then_with(|| a.message.cmp(&b.message))
@@ -683,23 +683,6 @@ fn load_overlays(specs: &[String], dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>
             Ok((path, bytes))
         })
         .collect()
-}
-
-/// The oracle display order's severity rank (DiagnosticWithPath.
-/// _severityPriority: Error first — the mirror of dartq-commands' private
-/// `severity_rank`).
-fn severity_rank(severity: Severity) -> u8 {
-    match severity {
-        Severity::Error => 0,
-        Severity::Warning => 1,
-        Severity::Info => 2,
-    }
-}
-
-/// Plain byte key of a path — the oracle's `filePath.compareTo` string order
-/// (the mirror of dartq-commands' private `path_key`).
-fn path_key(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
 }
 
 /// The LSP daemon face: assemble the engine context, hand it to the daemon

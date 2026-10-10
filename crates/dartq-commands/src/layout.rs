@@ -64,7 +64,8 @@ impl FileLayoutProvider for EngineLayout<'_> {
 /// derivation (`DiagnosticType::severity` in dartq-diagnostics, shared by
 /// dartq-engine): this only orders already-derived severities to pick the
 /// output order.
-pub(crate) fn severity_rank(severity: Severity) -> u8 {
+#[must_use]
+pub fn severity_rank(severity: Severity) -> u8 {
     match severity {
         Severity::Error => 0,
         Severity::Warning => 1,
@@ -73,6 +74,29 @@ pub(crate) fn severity_rank(severity: Severity) -> u8 {
 }
 
 /// Plain byte key of a path — the oracle's `filePath.compareTo` string order.
-pub(crate) fn path_key(path: &Path) -> &[u8] {
+#[must_use]
+pub fn path_key(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The oracle display-order pin: severity ranks Error before Warning
+    /// before Info (`DiagnosticWithPath._severityPriority`) and `path_key`
+    /// is plain path-byte order (`filePath.compareTo`). The CLI's analyze
+    /// face imports this pair directly — this is the single implementation
+    /// of the contract, so any change here is a contract change.
+    #[test]
+    fn oracle_display_order_ranks() {
+        assert!(severity_rank(Severity::Error) < severity_rank(Severity::Warning));
+        assert!(severity_rank(Severity::Warning) < severity_rank(Severity::Info));
+
+        assert!(path_key(Path::new("a.dart")) < path_key(Path::new("lib/b.dart")));
+        assert_eq!(
+            path_key(Path::new("lib/a.dart")),
+            path_key(Path::new("lib/a.dart"))
+        );
+    }
 }
