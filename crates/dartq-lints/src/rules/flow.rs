@@ -474,6 +474,90 @@ pub(crate) mod avoid_returning_null_for_void {
     }
 }
 
+pub(crate) mod type_literal_in_constant_pattern {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
+    /// — a constant pattern whose expression is a type literal reports at
+    /// the pattern. The official bails for a `const`-marked pattern (:45-47)
+    /// and for a `Type`-typed matched value (:50-59, the raw-type
+    /// exemption); `case int:`-style built-in names report.
+    ///
+    /// Approximation (documented): the type-literal test
+    /// (`expression.staticType.isDartCoreType`, :61-63) is a resolution
+    /// question. The lexical face reports a bare identifier whose lexeme is
+    /// a built-in Dart type name — a set that can never be a type literal
+    /// miss (`int`, `String`, ...), while the over-report faces stay inside
+    /// the user-shadowed family: a user constant named like a built-in type
+    /// (`const String = 'x'; case String:`) and the `Type`-typed matched
+    /// value exemption (`Type t = ...; switch (t) { case int: }`) both
+    /// over-report. User type literals (`case MyType:` — indistinguishable
+    /// from a capitalized constant without resolution) under-report. Message:
+    /// `diagnostic.g.dart` `typeLiteralInConstantPattern`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "type_literal_in_constant_pattern",
+        group: Group::Core,
+        problem: "Use 'TypeName _' instead of a type literal.",
+        correction: "Replace with 'TypeName _'.",
+        kinds: &[NodeKind::ConstantPattern],
+        check,
+    };
+
+    /// The built-in type names a bare constant-pattern identifier can spell
+    /// (`dynamic` included; `void` is a keyword and never reaches an
+    /// identifier). The official test corpus exercises the dart:core names.
+    fn is_builtin_type_name(lexeme: &str) -> bool {
+        matches!(
+            lexeme,
+            "int"
+                | "double"
+                | "num"
+                | "bool"
+                | "String"
+                | "Object"
+                | "dynamic"
+                | "Never"
+                | "Null"
+                | "Function"
+                | "Iterable"
+                | "List"
+                | "Map"
+                | "Set"
+                | "Symbol"
+                | "Type"
+                | "Future"
+                | "Stream"
+                | "Enum"
+                | "Record"
+                | "Uri"
+                | "Pattern"
+                | "RegExp"
+                | "DateTime"
+                | "Duration"
+        )
+    }
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.constKeyword != null` bails (:45-47): a const-marked pattern
+        // owns the `const` keyword as its span head (collapse map §3.7).
+        if c.lexeme(c.head_token(node)) == "const" {
+            return;
+        }
+        let Some(expression) = super::first_child(c, node) else {
+            return;
+        };
+        if c.kind(expression) != NodeKind::Identifier {
+            return;
+        }
+        if !is_builtin_type_name(c.lexeme(c.head_token(expression))) {
+            return;
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1264,5 +1348,123 @@ mod tests {
         let lints = f.run(&one_rule("avoid_returning_null_for_void"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    // —— type_literal_in_constant_pattern ———————————————————————————————————
+
+    /// `case int:` — a built-in type name in constant-pattern position
+    /// reports over the pattern (`test/rules/type_literal_in_constant_pattern_test.dart`
+    /// `test_BuiltInTypePattern`).
+    #[test]
+    fn type_literal_reports_a_builtin_type_pattern() {
+        let source = "switch (x) { case int: break; }";
+        // switch0 (1 x2 )3 {4 case5 int6 :7 break8 ;9 }10
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.begin(NodeKind::ConstantPattern, 6);
+                identifier(b, 6, 7);
+                b.end(NodeKind::ConstantPattern, 7);
+                b.end(NodeKind::SwitchCase, 8);
+                b.end(NodeKind::SwitchBlock, 10);
+                b.end(NodeKind::SwitchStatement, 10);
+            }),
+        );
+        let lints = f.run(&one_rule("type_literal_in_constant_pattern"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'TypeName _' instead of a type literal."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 7));
+    }
+
+    /// A const-marked pattern bails (:45-47), a non-builtin constant
+    /// (`case color:`) never matches the name set, and a property access
+    /// (`case Foo.bar:`) is not a bare type literal.
+    #[test]
+    fn type_literal_const_marked_and_non_type_patterns_pass() {
+        let const_marked = "switch (x) { case const int: break; }";
+        // switch0 (1 x2 )3 {4 case5 const6 int7 :8 break9 ;10 }11
+        let f = Fixture::build(
+            const_marked,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.begin(NodeKind::ConstantPattern, 6);
+                identifier(b, 7, 8);
+                b.end(NodeKind::ConstantPattern, 8);
+                b.end(NodeKind::SwitchCase, 9);
+                b.end(NodeKind::SwitchBlock, 11);
+                b.end(NodeKind::SwitchStatement, 11);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
+        );
+
+        let user_constant = "switch (x) { case color: break; }";
+        let f = Fixture::build(
+            user_constant,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.begin(NodeKind::ConstantPattern, 6);
+                identifier(b, 6, 7);
+                b.end(NodeKind::ConstantPattern, 7);
+                b.end(NodeKind::SwitchCase, 8);
+                b.end(NodeKind::SwitchBlock, 10);
+                b.end(NodeKind::SwitchStatement, 10);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
+        );
+
+        let property = "switch (x) { case Foo.bar: break; }";
+        // switch0 (1 x2 )3 {4 case5 Foo6 .7 bar8 :9 break10 ;11 }12
+        let f = Fixture::build(
+            property,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                b.begin(NodeKind::SwitchCase, 5);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, 1);
+                b.begin(NodeKind::ConstantPattern, 6);
+                b.begin(NodeKind::DotAccess, 6);
+                b.patch(0, 7);
+                b.patch(1, NONE);
+                identifier(b, 6, 7);
+                identifier(b, 8, 9);
+                b.end(NodeKind::DotAccess, 9);
+                b.end(NodeKind::ConstantPattern, 9);
+                b.end(NodeKind::SwitchCase, 10);
+                b.end(NodeKind::SwitchBlock, 12);
+                b.end(NodeKind::SwitchStatement, 12);
+            }),
+        );
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
+        );
     }
 }

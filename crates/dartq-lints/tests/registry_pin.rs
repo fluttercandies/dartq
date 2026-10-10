@@ -153,23 +153,24 @@ fn recommended_rules_are_not_core_rules() {
     }
 }
 
-/// [`EnableSet`] stores one 64-bit word; the registry must stay within it.
+/// [`EnableSet`] stores two 64-bit words; the registry must stay within it.
 /// Grow `WORDS` together with this bound when the set outgrows a word.
 #[test]
 fn registry_fits_the_enable_set_word_count() {
     assert!(
-        RULES.len() <= 64,
-        "registry holds {} rules; EnableSet has a single 64-bit word",
+        RULES.len() <= 128,
+        "registry holds {} rules; EnableSet has two 64-bit words",
         RULES.len()
     );
 }
 
-/// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3
-/// and 12 #353-completion rules make 64 registered — every `package:lints`
-/// member is either here or documented-blocked in the crate docs.
+/// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3,
+/// 12 #353-completion and 4 #315-wave-3 rules make 68 registered — every
+/// `package:lints` member is either here or documented-blocked in the crate
+/// docs.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 64);
+    assert_eq!(RULES.len(), 68);
 }
 
 #[test]

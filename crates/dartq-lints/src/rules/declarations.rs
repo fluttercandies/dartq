@@ -1154,6 +1154,321 @@ pub(crate) mod unnecessary_nullable_for_final_variable_declarations {
     }
 }
 
+pub(crate) mod prefer_initializing_formals {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{NONE_TOKEN, first_child, token_seq_equal};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_initializing_formals.dart`
+    /// — a constructor initializer (`: x = p`) or a constructor-body
+    /// assignment (`this.x = p;`) that assigns a constructor parameter to
+    /// the same-named instance field of this class, with no other reference
+    /// to the parameter, reports at the initializer (:66-159). The
+    /// conversion must be safe: the field must be an actual (non-static,
+    /// non-setter) field of this class, and the parameter type must be a
+    /// subtype of the field type (:114-118).
+    ///
+    /// Approximations (documented): the field identity (`FieldElement` +
+    /// `enclosingElement == constructor's class`, :119-124) is taken as a
+    /// non-static field declared in the same class body (a constructor and
+    /// its class always share a file); the subtype check
+    /// (`typeSystem.isSubtypeOf`, :118) is approximated by written-type
+    /// lexeme equality — differing but subtype-related spellings
+    /// (`int` param for a `num` field) under-report, and equal spellings
+    /// are subtype-equal. The single-reference count
+    /// (`_ReferenceCounter`, :208-222) counts expression-position
+    /// identifiers with the parameter's lexeme (dot-access name sides
+    /// excluded — they name members), so a same-lexeme local declaration
+    /// in the body over-counts and skips (conservative). Private fields
+    /// skip — the `private_named_parameters` face is feature-gated off.
+    /// Primary constructors are outside the substrate. Message:
+    /// `diagnostic.g.dart` `preferInitializingFormals`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_initializing_formals",
+        group: Group::Recommended,
+        problem: "Use an initializing formal to assign a parameter to a field.",
+        correction: "Try using an initializing formal ('this.{0}') to initialize the field.",
+        kinds: &[NodeKind::Constructor],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        let Some(params_node) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return;
+        };
+        let params = constructor_params(c, params_node);
+        // The instance fields of this class (same file by construction).
+        let Some(owner) = c.ancestor(1) else {
+            return;
+        };
+        let fields = class_fields(c, owner);
+        let initializers = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::Initializers);
+        // Face A: initializer-list entries `x = p` / `this.x = p` — the
+        // initializer expression is the bare parameter.
+        let mut candidates: Vec<(&str, &str, u32)> = Vec::new();
+        if let Some(initializers) = initializers {
+            face_initializers(c, initializers, &mut candidates);
+        }
+        // Face B: body statements of the exact form `this.x = p;`.
+        let mut ref_roots: Vec<u32> = Vec::new();
+        if let Some(initializers) = initializers {
+            ref_roots.push(initializers);
+        }
+        if let Some(body) = kids.iter().copied().find(|&kid| {
+            matches!(c.kind(kid), NodeKind::Block | NodeKind::BlockBody)
+        }) {
+            ref_roots.push(body);
+            face_body(c, body, &mut candidates);
+        }
+        finish(c, &params, &fields, &ref_roots, &candidates);
+    }
+
+    /// The constructor's convertible parameters: `(name, written type)` for
+    /// plain formals only — receiver formals (`this.`/`super.`) are already
+    /// initializing/super formals, function-typed formals have no comparable
+    /// written type.
+    fn constructor_params<'a>(c: &Check<'a>, params_node: u32) -> Vec<(&'a str, Option<u32>)> {
+        let mut params: Vec<(&str, Option<u32>)> = Vec::new();
+        for param in c.collect_direct(params_node) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            let payload = c.payload(param);
+            if payload.first().copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+                continue; // this.x / super.x formal
+            }
+            let Some(&name) = payload.get(1) else {
+                continue;
+            };
+            if name == NONE_TOKEN {
+                continue;
+            }
+            let written = c.collect_direct(param).into_iter().find(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+                )
+            });
+            params.push((c.lexeme(name), written));
+        }
+        params
+    }
+
+    /// The non-static instance fields of the owner body: `(name, written
+    /// type)` shared per declaration.
+    fn class_fields<'a>(c: &Check<'a>, owner: u32) -> Vec<(&'a str, Option<u32>)> {
+        let mut fields: Vec<(&str, Option<u32>)> = Vec::new();
+        for member in c.collect_direct(owner) {
+            if c.kind(member) != NodeKind::Fields
+                || c.payload(member).first()
+                    != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            {
+                continue;
+            }
+            for decl in c.collect_direct(member) {
+                if c.kind(decl) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                let written = c
+                    .collect_direct(decl)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Type);
+                for var in c.collect_direct(decl) {
+                    if c.kind(var) != NodeKind::InitializedIdentifier {
+                        continue;
+                    }
+                    if let Some(name) = crate::rules::member_name(c, var) {
+                        fields.push((c.lexeme(c.head_token(name)), written));
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    /// Face A (:71-85): each `Initializer` naming a field and initialized
+    /// from a bare identifier pushes a candidate.
+    fn face_initializers<'a>(
+        c: &Check<'a>,
+        initializers: u32,
+        out: &mut Vec<(&'a str, &'a str, u32)>,
+    ) {
+        for initializer in c.collect_direct(initializers) {
+            if c.kind(initializer) != NodeKind::Initializer {
+                continue;
+            }
+            let initializer_kids = c.collect_direct(initializer);
+            let Some(&field_name) = initializer_kids.iter().find(|&&kid| {
+                c.kind(kid) == NodeKind::Identifier
+                    && c.payload(kid).first()
+                        == Some(&(dartq_parser::IdentifierContext::FieldInitializer as u32))
+            }) else {
+                continue;
+            };
+            let Some(field_init) = initializer_kids
+                .iter()
+                .copied()
+                .find(|&kid| c.kind(kid) == NodeKind::FieldInitializer)
+            else {
+                continue;
+            };
+            let Some(value) = first_child(c, field_init) else {
+                continue;
+            };
+            if c.kind(value) != NodeKind::Identifier {
+                continue;
+            }
+            out.push((
+                c.lexeme(c.head_token(field_name)),
+                c.lexeme(c.head_token(value)),
+                initializer,
+            ));
+        }
+    }
+
+    /// Face B (:87-102): body statements of the exact form `this.x = p;`.
+    fn face_body<'a>(c: &Check<'a>, body: u32, out: &mut Vec<(&'a str, &'a str, u32)>) {
+        let block = if c.kind(body) == NodeKind::Block {
+            body
+        } else {
+            match c
+                .collect_direct(body)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Block)
+            {
+                Some(block) => block,
+                None => return,
+            }
+        };
+        for statement in c.collect_direct(block) {
+            if c.kind(statement) != NodeKind::ExpressionStatement {
+                continue;
+            }
+            let Some(expression) = first_child(c, statement) else {
+                continue;
+            };
+            if c.kind(expression) != NodeKind::Assignment
+                || c.lexeme(
+                    c.payload(expression)
+                        .first()
+                        .copied()
+                        .expect("assignment op"),
+                ) != "="
+            {
+                continue;
+            }
+            let operands = c.collect_direct(expression);
+            if operands.len() < 2 {
+                continue;
+            }
+            let (lhs, rhs) = (operands[0], operands[1]);
+            // `AssignmentExpression(leftHandSide: PropertyAccess(target:
+            // ThisExpression))` (:92-102) — the exact form only.
+            if c.kind(lhs) != NodeKind::DotAccess || c.kind(rhs) != NodeKind::Identifier {
+                continue;
+            }
+            let lhs_kids = c.collect_direct(lhs);
+            if lhs_kids.first().map(|&kid| c.kind(kid)) != Some(NodeKind::ThisExpression) {
+                continue;
+            }
+            let Some(&field_name) = lhs_kids.last() else {
+                continue;
+            };
+            if c.kind(field_name) != NodeKind::Identifier {
+                continue;
+            }
+            out.push((
+                c.lexeme(c.head_token(field_name)),
+                c.lexeme(c.head_token(rhs)),
+                expression,
+            ));
+        }
+    }
+
+    /// The shared gates and the report (:104-159): one candidate per field,
+    /// a same-named non-private instance field of this class, written-type
+    /// equality, and no other reference to the parameter.
+    fn finish(
+        c: &mut Check<'_>,
+        params: &[(&str, Option<u32>)],
+        fields: &[(&str, Option<u32>)],
+        ref_roots: &[u32],
+        candidates: &[(&str, &str, u32)],
+    ) {
+        for &(field_name, param_name, node) in candidates {
+            // Multiple initializations of one field — the conversion is
+            // ambiguous, none of them lints (:48-53, `_nodesToLintByField`).
+            if candidates
+                .iter()
+                .filter(|(name, _, _)| *name == field_name)
+                .count()
+                > 1
+            {
+                continue;
+            }
+            if field_name.starts_with('_') {
+                continue; // private_named_parameters is off
+            }
+            let Some(&(_, param_type)) = params.iter().find(|(name, _)| *name == param_name)
+            else {
+                continue;
+            };
+            let Some(&(_, field_type)) = fields.iter().find(|(name, _)| *name == field_name)
+            else {
+                continue;
+            };
+            let (Some(param_type), Some(field_type)) = (param_type, field_type) else {
+                continue; // an unwritten type has no comparable spelling
+            };
+            if !token_seq_equal(c, param_type, field_type) {
+                continue;
+            }
+            let references = count_expression_refs(c, ref_roots, param_name);
+            if references != 1 {
+                continue;
+            }
+            let range = c.utf16_span(node);
+            c.report(range, &[field_name]);
+        }
+    }
+
+    /// The expression-position references to `name` across the constructor's
+    /// initializers and body. Only `Expression`-context identifiers count
+    /// (initializer names bind fields, not parameters), and dot-access name
+    /// sides are member reads, never parameter references.
+    fn count_expression_refs(c: &Check<'_>, roots: &[u32], name: &str) -> u32 {
+        let expression_ctx = dartq_parser::IdentifierContext::Expression as u32;
+        let mut count = 0;
+        for &root in roots {
+            let window = c.children(root);
+            for id in window.start..window.end {
+                if c.kind(id) != NodeKind::Identifier
+                    || c.payload(id).first() != Some(&expression_ctx)
+                    || c.lexeme(c.head_token(id)) != name
+                {
+                    continue;
+                }
+                if let Some(parent) = c.unit.ast.parent(id)
+                    && matches!(c.kind(parent), NodeKind::DotAccess | NodeKind::Qualified)
+                    && c.children(parent).end - 1 == id
+                {
+                    continue;
+                }
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 // —— shared helpers ———————————————————————————————————————————————————————
 
 /// The `get`/`set` keyword token of a member declaration, by lexeme.
@@ -2819,5 +3134,304 @@ mod tests {
             ))
             .is_empty()
         );
+    }
+
+    // —— prefer_initializing_formals ————————————————————————————————————————
+
+    /// `A(int x) { this.x = x; }` — the exact body form with a same-class
+    /// field, matching written types, and a single reference reports at the
+    /// assignment (`test/rules/prefer_initializing_formals_test.dart`
+    /// `test_declareFinal`-family positive).
+    #[test]
+    fn initializing_formals_reports_a_this_assignment() {
+        let source = "class A { int x = 0; A(int x) { this.x = x; } }";
+        // class0 A1 {2 int3 x4 =5 06 ;7 A8 (9 int10 x11 )12 {13 this14 .15 x16 =17 x18 ;19 }20 }21
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, NONE);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::FormalParameter, 10);
+                b.patch(0, NONE);
+                b.patch(1, 11);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::FormalParameter, 12);
+                b.end(NodeKind::FormalParameters, 13);
+                b.begin(NodeKind::Block, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Assignment, 14);
+                b.patch(0, 17);
+                b.begin(NodeKind::DotAccess, 14);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 14);
+                identifier(b, 16, 17);
+                b.end(NodeKind::DotAccess, 17);
+                identifier(b, 18, 19);
+                b.end(NodeKind::Assignment, 19);
+                b.end(NodeKind::ExpressionStatement, 20);
+                b.end(NodeKind::Block, 21);
+                b.end(NodeKind::Constructor, 21);
+                b.end(NodeKind::DeclarationBody, 22);
+                b.end(NodeKind::ClassDeclaration, 22);
+                b.end(NodeKind::TopLevelDeclaration, 22);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_initializing_formals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use an initializing formal to assign a parameter to a field."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using an initializing formal ('this.x') to initialize the field.")
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 14));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 19));
+    }
+
+    /// The initializer face `: x = x` reports over the whole initializer.
+    #[test]
+    fn initializing_formals_reports_an_initializer_entry() {
+        let source = "class A { int x = 0; A(int x) : x = x; }";
+        // class0 A1 {2 int3 x4 =5 06 ;7 A8 (9 int10 x11 )12 :13 x14 =15 x16 ;17 }18
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, 13);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::FormalParameter, 10);
+                b.patch(0, NONE);
+                b.patch(1, 11);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::FormalParameter, 12);
+                b.end(NodeKind::FormalParameters, 13);
+                b.begin(NodeKind::Initializers, 13);
+                b.begin(NodeKind::Initializer, 14);
+                b.begin(NodeKind::Identifier, 14);
+                b.patch(0, dartq_parser::IdentifierContext::FieldInitializer as u32);
+                b.end(NodeKind::Identifier, 15);
+                b.begin(NodeKind::FieldInitializer, 15);
+                b.patch(0, 15);
+                identifier(b, 16, 17);
+                b.end(NodeKind::FieldInitializer, 17);
+                b.end(NodeKind::Initializer, 17);
+                b.end(NodeKind::Initializers, 18);
+                b.leaf(NodeKind::EmptyBody, 17);
+                b.end(NodeKind::Constructor, 18);
+                b.end(NodeKind::DeclarationBody, 19);
+                b.end(NodeKind::ClassDeclaration, 19);
+                b.end(NodeKind::TopLevelDeclaration, 19);
+            }),
+        );
+        let lints = f.run(&one_rule("prefer_initializing_formals"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 14));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 17));
+    }
+
+    /// A written-type mismatch (`num` field, `int` parameter — the
+    /// initializing formal would not compile) passes (:114-118).
+    #[test]
+    fn initializing_formals_type_mismatch_passes() {
+        let source = "class A { num x = 0; A(int x) { this.x = x; } }";
+        // class0 A1 {2 num3 x4 =5 06 ;7 A8 (9 int10 x11 )12 {13 this14 .15 x16 =17 x18 ;19 }20 }21
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, NONE);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::FormalParameter, 10);
+                b.patch(0, NONE);
+                b.patch(1, 11);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::FormalParameter, 12);
+                b.end(NodeKind::FormalParameters, 13);
+                b.begin(NodeKind::Block, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Assignment, 14);
+                b.patch(0, 17);
+                b.begin(NodeKind::DotAccess, 14);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 14);
+                identifier(b, 16, 17);
+                b.end(NodeKind::DotAccess, 17);
+                identifier(b, 18, 19);
+                b.end(NodeKind::Assignment, 19);
+                b.end(NodeKind::ExpressionStatement, 20);
+                b.end(NodeKind::Block, 21);
+                b.end(NodeKind::Constructor, 21);
+                b.end(NodeKind::DeclarationBody, 22);
+                b.end(NodeKind::ClassDeclaration, 22);
+                b.end(NodeKind::TopLevelDeclaration, 22);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_initializing_formals")).is_empty());
+    }
+
+    /// A second reference to the parameter keeps the conversion potentially
+    /// semantic — no report (:208-222, count > 1).
+    #[test]
+    fn initializing_formals_extra_reference_passes() {
+        let source = "class A { int x = 0; A(int x) { this.x = x; print(x); } }";
+        // class0 A1 {2 int3 x4 =5 06 ;7 A8 (9 int10 x11 )12 {13 this14 .15 x16 =17 x18 ;19 print20 (21 x22 )23 ;24 }25 }26
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, NONE);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::FormalParameter, 10);
+                b.patch(0, NONE);
+                b.patch(1, 11);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 10, 11);
+                b.end(NodeKind::FormalParameter, 12);
+                b.end(NodeKind::FormalParameters, 13);
+                b.begin(NodeKind::Block, 13);
+                b.begin(NodeKind::ExpressionStatement, 13);
+                b.begin(NodeKind::Assignment, 14);
+                b.patch(0, 17);
+                b.begin(NodeKind::DotAccess, 14);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 14);
+                identifier(b, 16, 17);
+                b.end(NodeKind::DotAccess, 17);
+                identifier(b, 18, 19);
+                b.end(NodeKind::Assignment, 19);
+                b.end(NodeKind::ExpressionStatement, 20);
+                b.begin(NodeKind::ExpressionStatement, 20);
+                b.begin(NodeKind::Send, 20);
+                identifier(b, 20, 21);
+                b.begin(NodeKind::Arguments, 21);
+                identifier(b, 22, 23);
+                b.end(NodeKind::Arguments, 24);
+                b.end(NodeKind::Send, 24);
+                b.end(NodeKind::ExpressionStatement, 25);
+                b.end(NodeKind::Block, 26);
+                b.end(NodeKind::Constructor, 26);
+                b.end(NodeKind::DeclarationBody, 27);
+                b.end(NodeKind::ClassDeclaration, 27);
+                b.end(NodeKind::TopLevelDeclaration, 27);
+            }),
+        );
+        assert!(f.run(&one_rule("prefer_initializing_formals")).is_empty());
     }
 }

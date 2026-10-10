@@ -69,7 +69,7 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the #353 completion tranche. Order is registry order
+/// All rules through the #315 wave-3 tranche. Order is registry order
 /// ([`RuleId`] assignment), grouped core-first then alphabetically within
 /// each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
@@ -94,6 +94,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::collections::prefer_iterable_where_type::SPEC,
     &crate::rules::declarations::prefer_typing_uninitialized_variables::SPEC,
     &crate::rules::directives::provide_deprecation_message::SPEC,
+    &crate::rules::flow::type_literal_in_constant_pattern::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
     // —— recommended (`.third/lints/lib/recommended.yaml`) ——
@@ -110,6 +111,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::types::library_private_types_in_public_api::SPEC,
     &crate::rules::directives::no_leading_underscores_for_library_prefixes::SPEC,
     &crate::rules::names::no_leading_underscores_for_local_identifiers::SPEC,
+    &crate::rules::expressions::null_closures::SPEC,
     &crate::rules::expressions::prefer_adjacent_string_concatenation::SPEC,
     &crate::rules::collections::prefer_collection_literals::SPEC,
     &crate::rules::expressions::prefer_conditional_assignment::SPEC,
@@ -117,6 +119,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::collections::prefer_for_elements_to_map_from_iterable::SPEC,
     &crate::rules::declarations::prefer_function_declarations_over_variables::SPEC,
     &crate::rules::expressions::prefer_if_null_operators::SPEC,
+    &crate::rules::declarations::prefer_initializing_formals::SPEC,
     &crate::rules::collections::prefer_inlined_adds::SPEC,
     &crate::rules::expressions::prefer_interpolation_to_compose_strings::SPEC,
     &crate::rules::expressions::prefer_is_not_operator::SPEC,
@@ -134,6 +137,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::expressions::unnecessary_null_aware_assignments::SPEC,
     &crate::rules::expressions::unnecessary_null_in_if_null_operators::SPEC,
     &crate::rules::declarations::unnecessary_nullable_for_final_variable_declarations::SPEC,
+    &crate::rules::expressions::unnecessary_this::SPEC,
     &crate::rules::strings::unnecessary_string_escapes::SPEC,
     &crate::rules::declarations::type_init_formals::SPEC,
     &crate::rules::collections::unnecessary_to_list_in_spreads::SPEC,
@@ -159,15 +163,16 @@ pub struct EnableSet {
     words: [u64; WORDS],
 }
 
-/// `RULES.len()` will stay far below 64 for a long time; the word count is
-/// asserted in `tests/registry_pin.rs` so growth past one word is caught.
-const WORDS: usize = 1;
+/// `RULES.len()` outgrew one 64-bit word at 68 rules (wave 3, #315); the
+/// word count is asserted in `tests/registry_pin.rs` so further growth is
+/// caught together with the pin.
+const WORDS: usize = 2;
 
 impl EnableSet {
     /// Every registered rule.
     #[must_use]
     pub fn all() -> Self {
-        let mut set = Self { words: [0] };
+        let mut set = Self { words: [0; WORDS] };
         for i in 0..RULES.len() {
             set.set(RuleId(i as u16));
         }
@@ -182,7 +187,7 @@ impl EnableSet {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let mut set = Self { words: [0] };
+        let mut set = Self { words: [0; WORDS] };
         let mut unknown = Vec::new();
         for name in names {
             match rule_by_name(name) {
@@ -196,7 +201,7 @@ impl EnableSet {
     /// No rules enabled — the run is a no-op.
     #[must_use]
     pub fn none() -> Self {
-        Self { words: [0] }
+        Self { words: [0; WORDS] }
     }
 
     /// Enables one rule (test/ caller convenience).

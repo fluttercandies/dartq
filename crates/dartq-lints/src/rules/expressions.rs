@@ -1105,6 +1105,487 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
     }
 }
 
+pub(crate) mod null_closures {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/null_closures.dart` — a `null`
+    /// passed in a closure position of a known core API reports at the
+    /// argument. Three faces (:212-260): instance creations
+    /// (`Future(null)`, `Timer.periodic(d, null)`, ...), static calls
+    /// (`Future.wait(..., cleanUp: null)`, ...), and instance calls
+    /// (`list.map(null)`, ...). Positions come from the fixed tables
+    /// (:26-180); the report lands on the `null` literal, or on the whole
+    /// named argument for the named face (:286-291).
+    ///
+    /// Approximations (documented): the resolved-element matching
+    /// (`element is ClassElement`, `target.staticType` + supertype walk,
+    /// :222-250) is replaced by written-name matching. Instance creations
+    /// match the written type name, so a user subclass of `Future` named
+    /// otherwise under-reports (a rare legal family); static and instance
+    /// calls match the trailing identifier(s), so a user class or prefix
+    /// reusing a core name (`myObj.map(null)` on a nullable-closure
+    /// parameter) over-reports — the #353 `prefer_contains` receiver-name
+    /// precedent. Bare top-level calls (`map(null)`) never match — the
+    /// official bails with a null target (:222). `const Future(...)` shapes
+    /// are out (these types have no const constructors — erroneous code
+    /// only). Message: `diagnostic.g.dart` `nullClosures`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "null_closures",
+        group: Group::Recommended,
+        problem: "Closure can't be 'null' because it might be invoked.",
+        correction: "Try providing a non-null closure.",
+        kinds: &[
+            NodeKind::Send,
+            NodeKind::ImplicitCreation,
+            NodeKind::NewExpression,
+        ],
+        check,
+    };
+
+    /// The closure slots of one table entry: raw argument indexes (named
+    /// arguments come last in legal Dart, so the raw index of a non-named
+    /// argument is its positional index) and argument labels.
+    type Slots = (&'static [usize], &'static [&'static str]);
+
+    /// Creation face (`_constructorsWithNonNullableArguments`, :26-33);
+    /// the unnamed-constructor entries key on the type name alone.
+    const CONSTRUCTORS: &[((&str, Option<&str>), Slots)] = &[
+        (("Future", None), (&[0], &[])),
+        (("Future", Some("microtask")), (&[0], &[])),
+        (("Future", Some("sync")), (&[0], &[])),
+        (("Timer", None), (&[1], &[])),
+        (("Timer", Some("periodic")), (&[1], &[])),
+        (("List", Some("generate")), (&[1], &[])),
+    ];
+
+    /// Static face (`_staticFunctionsWithNonNullableArguments`, :172-178).
+    const STATICS: &[(&str, &str, Slots)] = &[
+        ("Future", "doWhile", (&[1], &[])),
+        ("Future", "forEach", (&[1], &[])),
+        ("Future", "wait", (&[], &["cleanUp"])),
+        ("Timer", "run", (&[0], &[])),
+    ];
+
+    /// Instance face (`_instanceMethodsWithNonNullableArguments`, :35-170),
+    /// keyed by method name.
+    const INSTANCE_METHODS: &[(&str, Slots)] = &[
+        ("any", (&[0], &[])),
+        ("complete", (&[0], &[])),
+        ("every", (&[0], &[])),
+        ("expand", (&[0], &[])),
+        ("firstWhere", (&[0], &["orElse"])),
+        ("forEach", (&[0], &[])),
+        ("fold", (&[1], &[])),
+        ("lastWhere", (&[0], &["orElse"])),
+        ("map", (&[0], &[])),
+        ("putIfAbsent", (&[1], &[])),
+        ("reduce", (&[0], &[])),
+        ("removeWhere", (&[0], &[])),
+        ("replaceAllMapped", (&[1], &[])),
+        ("replaceFirstMapped", (&[1], &[])),
+        ("retainWhere", (&[0], &[])),
+        ("singleWhere", (&[0], &["orElse"])),
+        ("skipWhile", (&[0], &[])),
+        ("splitMapJoin", (&[], &["onMatch", "onNonMatch"])),
+        ("takeWhile", (&[0], &[])),
+        ("then", (&[0], &["onError"])),
+        ("where", (&[0], &[])),
+    ];
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The arguments child and the identifier chain written before it
+        // (`a.Future`, `List.generate`, `x.map`, prefixed forms included).
+        let kids = c.collect_direct(node);
+        let Some(args_pos) = kids
+            .iter()
+            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments | NodeKind::NoArguments))
+        else {
+            return;
+        };
+        let mut chain: Vec<&str> = Vec::new();
+        for &callee in &kids[..args_pos] {
+            // A bare identifier callee is a leaf: its children window holds
+            // only descendants, so test the node itself first.
+            if c.kind(callee) == NodeKind::Identifier {
+                chain.push(c.lexeme(c.head_token(callee)));
+                continue;
+            }
+            let window = c.children(callee);
+            for id in window.start..window.end {
+                if c.kind(id) == NodeKind::Identifier {
+                    chain.push(c.lexeme(c.head_token(id)));
+                }
+            }
+        }
+        let Some(member_name) = chain.last() else {
+            return;
+        };
+        let member_name = *member_name;
+        // Which table matches: the single-name form is an unnamed
+        // constructor; a pair is a named constructor, a static call, or an
+        // instance call (the bare-call form never matches — the official
+        // bails on a null target, :222).
+        let slots: Option<Slots> = if chain.len() == 1 {
+            CONSTRUCTORS
+                .iter()
+                .find(|entry| entry.0 .0 == member_name && entry.0 .1.is_none())
+                .map(|entry| entry.1)
+        } else {
+            let class_name = chain[chain.len() - 2];
+            let constructor = CONSTRUCTORS
+                .iter()
+                .find(|entry| {
+                    entry.0 .0 == class_name
+                        && entry.0 .1 == Some(member_name)
+                })
+                .map(|entry| entry.1);
+            let function = STATICS
+                .iter()
+                .find(|entry| entry.0 == class_name && entry.1 == member_name)
+                .map(|entry| entry.2);
+            let instance = INSTANCE_METHODS
+                .iter()
+                .find(|entry| entry.0 == member_name)
+                .map(|entry| entry.1);
+            constructor.or(function).or(instance)
+        };
+        let Some((positions, named)) = slots else {
+            return;
+        };
+        // `_checkNullArgForClosure` (:268-293): a `null` in a closure slot
+        // reports at the null literal, or at the whole named argument.
+        for (i, &arg) in c.collect_direct(kids[args_pos]).iter().enumerate() {
+            if c.kind(arg) == NodeKind::NamedArgument {
+                let arg_kids = c.collect_direct(arg);
+                let Some(&name) = arg_kids.first() else {
+                    continue;
+                };
+                if c.kind(name) != NodeKind::Identifier
+                    || !named.contains(&c.lexeme(c.head_token(name)))
+                {
+                    continue;
+                }
+                let is_null = arg_kids
+                    .get(1)
+                    .is_some_and(|&value| c.kind(value) == NodeKind::LiteralNull);
+                if is_null {
+                    let range = c.utf16_span(arg);
+                    c.report(range, &[]);
+                }
+            } else if c.kind(arg) == NodeKind::LiteralNull && positions.contains(&i) {
+                let range = c.utf16_span(arg);
+                c.report(range, &[]);
+            }
+        }
+    }
+}
+
+pub(crate) mod unnecessary_this {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::NONE_TOKEN;
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_this.dart` — a `this.`
+    /// qualifier reports at the `this` keyword unless shadowing makes it
+    /// necessary. Two faces (:37-45): a constructor field initializer's
+    /// `this` reports unconditionally when written (:31-35 — `x = e;` is
+    /// the bare form), and a `this` in a property access / method invocation
+    /// reports when the unqualified name would resolve to the same member
+    /// (:47-64).
+    ///
+    /// Approximation (documented): the scope resolution
+    /// (`resolveNameInScope` + element identity, :66-99) is replaced by a
+    /// syntax-level shadow index. Locals, parameters, catch parameters,
+    /// loop variables, closure parameters, and local functions declared
+    /// before the use shadow (the `this.` stays); the enclosing member's
+    /// parameters shadow. When the enclosing class body declares an
+    /// instance member of the name, the unqualified form resolves to it and
+    /// the `this.` reports; otherwise the unit's top-level names make the
+    /// official conservative bail (:87-95) and the face skips. The unseen
+    /// over-report face is an inherited member plus a same-named name
+    /// imported from another library with an explicit `this.` — the
+    /// official bails on the import, the lexical face reports (narrow legal
+    /// family, the `prefer_contains` receiver-face precedent). Message:
+    /// `diagnostic.g.dart` `unnecessaryThis`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_this",
+        group: Group::Recommended,
+        problem: "Unnecessary 'this.' qualifier.",
+        correction: "Try removing 'this.'.",
+        kinds: &[NodeKind::ThisExpression, NodeKind::Initializer],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::Initializer => check_field_initializer(c),
+            NodeKind::ThisExpression => check_this(c),
+            _ => {}
+        }
+    }
+
+    /// `visitConstructorFieldInitializer` (:31-35): the written `this` on a
+    /// field initializer always reports — the bare `x = e;` form exists.
+    /// The `Initializer` node owns the `this` prefix (its span head; the
+    /// `FieldInitializer` child begins at the `=`, collapse map §3.3 both
+    /// rows).
+    fn check_field_initializer(c: &mut Check<'_>) {
+        if c.lexeme(c.head_token(c.node())) != "this" {
+            return;
+        }
+        let start = c.utf16_span(c.node()).start;
+        c.report(start..start, &[]);
+    }
+
+    /// `visitThisExpression` (:37-64): `this.name` accesses only.
+    fn check_this(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        if c.kind(parent) != NodeKind::DotAccess {
+            return;
+        }
+        // `!parent.isNullAware` (:49/:53).
+        if c.payload(parent).get(1).copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+            return;
+        }
+        let kids = c.collect_direct(parent);
+        if kids.first() != Some(&node) {
+            return;
+        }
+        let Some(&name) = kids.last() else {
+            return;
+        };
+        if c.kind(name) != NodeKind::Identifier {
+            return;
+        }
+        let name_lexeme = c.lexeme(c.head_token(name));
+        if member_shadows(c, node, name_lexeme) {
+            return;
+        }
+        if !owner_declares_instance_member(c, name_lexeme)
+            && unit_declares_top_level_name(c, name_lexeme)
+        {
+            // The official conservative bail (:87-95): a same-name visible
+            // in the outer scopes while the class has no instance member
+            // might shadow the inherited form — no report.
+            return;
+        }
+        let start = c.utf16_span(node).start;
+        c.report(start..start, &[]);
+    }
+
+    /// Whether any declaration visible between the use and the enclosing
+    /// instance member binds `name`. The walk stops at the member, after
+    /// collecting its own parameters.
+    fn member_shadows(c: &Check<'_>, use_node: u32, name: &str) -> bool {
+        let use_start = c.byte_span(use_node).start;
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                // The member boundary: its parameters shadow, then stop.
+                NodeKind::Method
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::TopLevelMethod
+                | NodeKind::PrimaryConstructorBody => {
+                    if collect_member_parameters(c, ancestor).contains(&name) {
+                        return true;
+                    }
+                    return false;
+                }
+                NodeKind::Block => {
+                    if block_declares_before(c, ancestor, use_start, name) {
+                        return true;
+                    }
+                }
+                NodeKind::CatchClause | NodeKind::ForIn => {
+                    if scope_declares(c, ancestor, name) {
+                        return true;
+                    }
+                }
+                NodeKind::FunctionExpression | NodeKind::NamedFunctionExpression => {
+                    // Parameters scope the whole body regardless of position.
+                    if collect_member_parameters(c, ancestor).contains(&name) {
+                        return true;
+                    }
+                }
+                NodeKind::LocalFunctionDeclaration => {
+                    // The function name binds from its declaration on; the
+                    // parameters scope the whole body.
+                    let names_decl = crate::rules::member_name(c, ancestor)
+                        .is_some_and(|decl| {
+                            c.lexeme(c.head_token(decl)) == name
+                                && c.byte_span(decl).start < use_start
+                        });
+                    if names_decl || collect_member_parameters(c, ancestor).contains(&name) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Local declarations of a block that precede the use: variables
+    /// (`VariablesDeclaration`) and pattern bindings.
+    fn block_declares_before(
+        c: &Check<'_>,
+        block: u32,
+        use_start: usize,
+        name: &str,
+    ) -> bool {
+        for decl in c.collect_direct(block) {
+            match c.kind(decl) {
+                NodeKind::VariablesDeclaration => {
+                    for var in c.collect_direct(decl) {
+                        if c.kind(var) != NodeKind::InitializedIdentifier {
+                            continue;
+                        }
+                        if let Some(var_name) = crate::rules::member_name(c, var)
+                            && c.lexeme(c.head_token(var_name)) == name
+                            && c.byte_span(var_name).start < use_start
+                        {
+                            return true;
+                        }
+                    }
+                }
+                NodeKind::PatternVarDeclStatement => {
+                    let window = c.children(decl);
+                    for id in window.start..window.end {
+                        if c.kind(id) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(id)) == name
+                            && c.byte_span(id).start < use_start
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Any name binding directly inside a catch clause / for-in header.
+    fn scope_declares(c: &Check<'_>, scope: u32, name: &str) -> bool {
+        let window = c.children(scope);
+        for id in window.start..window.end {
+            if c.kind(id) == NodeKind::Identifier && c.lexeme(c.head_token(id)) == name {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The parameter names of a member or closure (the `FormalParameters`
+    /// child's `FormalParameter` name words).
+    fn collect_member_parameters<'a>(c: &'a Check<'a>, member: u32) -> Vec<&'a str> {
+        let Some(params) = c
+            .collect_direct(member)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return Vec::new();
+        };
+        c.collect_direct(params)
+            .into_iter()
+            .filter(|&param| c.kind(param) == NodeKind::FormalParameter)
+            .filter_map(|param| {
+                let name = c.payload(param).get(1).copied()?;
+                (name != NONE_TOKEN).then(|| c.lexeme(name))
+            })
+            .collect()
+    }
+
+    /// Whether the enclosing class body declares an instance member named
+    /// `name` (a non-static field or a non-static method/getter/setter).
+    fn owner_declares_instance_member(c: &Check<'_>, name: &str) -> bool {
+        // The member's owner: the parent of the enclosing member on the path.
+        let Some(member_index) = c.path.iter().rposition(|&node| {
+            matches!(
+                c.kind(node),
+                NodeKind::Method | NodeKind::Constructor | NodeKind::PrimaryConstructorBody
+            )
+        }) else {
+            return false;
+        };
+        let Some(&owner) = member_index.checked_sub(1).and_then(|i| c.path.get(i)) else {
+            return false;
+        };
+        c.collect_direct(owner).into_iter().any(|member| {
+            match c.kind(member) {
+                NodeKind::Fields => {
+                    c.payload(member).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                        && field_names(c, member).contains(&name)
+                }
+                NodeKind::Method => {
+                    let kind = c.payload(member).first().copied();
+                    let instance = matches!(
+                        kind,
+                        Some(k) if k == dartq_parser::MemberKind::NonStaticMethod as u32
+                            || k == dartq_parser::MemberKind::ExtensionNonStaticMethod as u32
+                            || k == dartq_parser::MemberKind::ExtensionTypeNonStaticMethod as u32
+                    );
+                    instance
+                        && crate::rules::member_name(c, member)
+                            .is_some_and(|member_node| {
+                                c.lexeme(c.head_token(member_node)) == name
+                            })
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// The field names of one `Fields` member.
+    fn field_names<'a>(c: &'a Check<'_>, fields: u32) -> Vec<&'a str> {
+        c.collect_direct(fields)
+            .into_iter()
+            .filter(|&decl| c.kind(decl) == NodeKind::VariablesDeclaration)
+            .flat_map(|decl| c.collect_direct(decl))
+            .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+            .filter_map(|var| crate::rules::member_name(c, var))
+            .map(|name| c.lexeme(c.head_token(name)))
+            .collect()
+    }
+
+    /// Whether the compilation unit declares any top-level name `name`
+    /// (any namespace — values and types both make the official
+    /// resolution find a different element than the member, :87-95).
+    fn unit_declares_top_level_name(c: &Check<'_>, name: &str) -> bool {
+        let Some(root) = c.path.first().copied() else {
+            return false;
+        };
+        for top in c.collect_direct(root) {
+            match c.kind(top) {
+                NodeKind::TopLevelMethod | NodeKind::TopLevelDeclaration
+                    if crate::rules::member_name(c, top)
+                        .is_some_and(|n| c.lexeme(c.head_token(n)) == name) =>
+                {
+                    return true;
+                }
+                NodeKind::TopLevelFields => {
+                    for decl in c.collect_direct(top) {
+                        if c.kind(decl) == NodeKind::VariablesDeclaration
+                            && c.collect_direct(decl)
+                                .into_iter()
+                                .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+                                .filter_map(|var| crate::rules::member_name(c, var))
+                                .any(|n| c.lexeme(c.head_token(n)) == name)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
 pub(crate) mod prefer_interpolation_to_compose_strings {
     use super::{Check, Group, NodeKind, RuleSpec};
 
@@ -2656,5 +3137,460 @@ mod tests {
             f.run(&one_rule("prefer_interpolation_to_compose_strings"))
                 .is_empty()
         );
+    }
+
+    // —— null_closures ——————————————————————————————————————————————————————
+
+    /// `Future(null)` — a `null` in the unnamed-constructor closure slot
+    /// reports at the null (`test/rules/null_closures_test.dart`
+    /// `test_Future`).
+    #[test]
+    fn null_closures_reports_a_null_future_callback() {
+        let source = "Future(null);";
+        // Future0 (1 null2 )3 ;4
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::ImplicitCreation, 0);
+                b.patch(0, NONE);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Arguments, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::ImplicitCreation, 4);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
+        let lints = f.run(&one_rule("null_closures"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Closure can't be 'null' because it might be invoked."
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+    }
+
+    /// `new Future(null)` reports the same way through the explicit-new
+    /// shape.
+    #[test]
+    fn null_closures_reports_an_explicit_new_creation() {
+        let source = "new Future(null);";
+        // new0 Future1 (2 null3 )4 ;5
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::NewExpression, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::Arguments, 2);
+                b.leaf(NodeKind::LiteralNull, 3);
+                b.end(NodeKind::Arguments, 5);
+                b.end(NodeKind::NewExpression, 5);
+                b.end(NodeKind::ExpressionStatement, 6);
+            }),
+        );
+        let lints = f.run(&one_rule("null_closures"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 3));
+    }
+
+    /// `Future.wait(fs, cleanUp: null)` — the named slot reports over the
+    /// whole named argument (`test_nullFromFuture_wait`).
+    #[test]
+    fn null_closures_reports_a_named_null_over_the_argument() {
+        let source = "Future.wait(fs, cleanUp: null);";
+        // Future0 .1 wait2 (3 fs4 ,5 cleanUp6 :7 null8 )9 ;10
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::Qualified, 0);
+                b.patch(0, 1);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::Qualified, 3);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::NamedArgument, 6);
+                b.patch(0, 7);
+                identifier(b, 6, 7);
+                b.leaf(NodeKind::LiteralNull, 8);
+                b.end(NodeKind::NamedArgument, 9);
+                b.end(NodeKind::Arguments, 10);
+                b.end(NodeKind::Send, 10);
+                b.end(NodeKind::ExpressionStatement, 11);
+            }),
+        );
+        let lints = f.run(&one_rule("null_closures"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 9));
+    }
+
+    /// `Timer.periodic(d, null)` — the instance-creation named-constructor
+    /// face, positional slot 1.
+    #[test]
+    fn null_closures_reports_a_periodic_timer_callback() {
+        let source = "Timer.periodic(d, null);";
+        // Timer0 .1 periodic2 (3 d4 ,5 null6 )7 ;8
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, NONE);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.leaf(NodeKind::LiteralNull, 6);
+                b.end(NodeKind::Arguments, 8);
+                b.end(NodeKind::Send, 8);
+                b.end(NodeKind::ExpressionStatement, 9);
+            }),
+        );
+        let lints = f.run(&one_rule("null_closures"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+    }
+
+    /// A non-null closure passes, and a bare `map(null)` never matches —
+    /// the official bails with a null target (null_closures.dart:222).
+    #[test]
+    fn null_closures_non_null_and_bare_calls_pass() {
+        let non_null = "list.map(f);";
+        // list0 .1 map2 (3 f4 )5 ;6
+        let f = Fixture::build(
+            non_null,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::Send, 0);
+                b.begin(NodeKind::DotAccess, 0);
+                b.patch(0, 1);
+                b.patch(1, NONE);
+                identifier(b, 0, 1);
+                identifier(b, 2, 3);
+                b.end(NodeKind::DotAccess, 3);
+                b.begin(NodeKind::Arguments, 3);
+                identifier(b, 4, 5);
+                b.end(NodeKind::Arguments, 6);
+                b.end(NodeKind::Send, 6);
+                b.end(NodeKind::ExpressionStatement, 7);
+            }),
+        );
+        assert!(f.run(&one_rule("null_closures")).is_empty());
+
+        let bare = "map(null);";
+        // map0 (1 null2 )3 ;4
+        let f = Fixture::build(
+            bare,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::ExpressionStatement, 0);
+                b.begin(NodeKind::ImplicitCreation, 0);
+                b.patch(0, NONE);
+                identifier(b, 0, 1);
+                b.begin(NodeKind::Arguments, 1);
+                b.leaf(NodeKind::LiteralNull, 2);
+                b.end(NodeKind::Arguments, 4);
+                b.end(NodeKind::ImplicitCreation, 4);
+                b.end(NodeKind::ExpressionStatement, 5);
+            }),
+        );
+        assert!(f.run(&one_rule("null_closures")).is_empty());
+    }
+
+    // —— unnecessary_this ————————————————————————————————————————————————————
+
+    /// `this.x` in an instance method over a same-class field reports
+    /// zero-width at the `this` (`test/rules/unnecessary_this_test.dart`
+    /// `test_UnnecessaryThis`).
+    #[test]
+    fn unnecessary_this_reports_a_field_access() {
+        let source = "class C { int x = 0; int f() { return this.x; } }";
+        // class0 C1 {2 int3 x4 =5 06 ;7 int8 f9 (10 )11 {12 return13 this14 .15 x16 ;17 }18 }19
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Method, 8);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 10);
+                b.patch(3, NONE);
+                identifier(b, 9, 10);
+                b.begin(NodeKind::FormalParameters, 10);
+                b.end(NodeKind::FormalParameters, 12);
+                b.begin(NodeKind::BlockBody, 12);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 12);
+                b.begin(NodeKind::ReturnStatement, 13);
+                b.begin(NodeKind::DotAccess, 14);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 14);
+                identifier(b, 16, 17);
+                b.end(NodeKind::DotAccess, 17);
+                b.end(NodeKind::ReturnStatement, 18);
+                b.end(NodeKind::Block, 19);
+                b.end(NodeKind::BlockBody, 19);
+                b.end(NodeKind::Method, 19);
+                b.end(NodeKind::DeclarationBody, 20);
+                b.end(NodeKind::ClassDeclaration, 20);
+                b.end(NodeKind::TopLevelDeclaration, 20);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_this"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "Unnecessary 'this.' qualifier.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 14));
+    }
+
+    /// A parameter of the enclosing member shadows — the `this.` stays
+    /// (unnecessary_this.dart:87-95, `isRequestedName` branch).
+    #[test]
+    fn unnecessary_this_parameter_shadow_passes() {
+        let source = "class C { int f(int x) { return this.x; } }";
+        // class0 C1 {2 int3 f4 (5 int6 x7 )8 {9 return10 this11 .12 x13 ;14 }15 }16
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 5);
+                b.patch(3, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::FormalParameters, 5);
+                b.begin(NodeKind::FormalParameter, 6);
+                b.patch(0, NONE);
+                b.patch(1, 7);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.patch(4, 0);
+                b.leaf_span(NodeKind::Type, 6, 7);
+                b.end(NodeKind::FormalParameter, 8);
+                b.end(NodeKind::FormalParameters, 9);
+                b.begin(NodeKind::BlockBody, 9);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 9);
+                b.begin(NodeKind::ReturnStatement, 10);
+                b.begin(NodeKind::DotAccess, 11);
+                b.patch(0, 12);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 11);
+                identifier(b, 13, 14);
+                b.end(NodeKind::DotAccess, 14);
+                b.end(NodeKind::ReturnStatement, 15);
+                b.end(NodeKind::Block, 16);
+                b.end(NodeKind::BlockBody, 16);
+                b.end(NodeKind::Method, 16);
+                b.end(NodeKind::DeclarationBody, 17);
+                b.end(NodeKind::ClassDeclaration, 17);
+                b.end(NodeKind::TopLevelDeclaration, 17);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_this")).is_empty());
+    }
+
+    /// A local declared before the use in the same block shadows.
+    #[test]
+    fn unnecessary_this_local_shadow_passes() {
+        let source = "class C { int f() { int x = 1; return this.x; } }";
+        // class0 C1 {2 int3 f4 (5 )6 {7 int8 x9 =10 111 ;12 return13 this14 .15 x16 ;17 }18 }19
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Method, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 5);
+                b.patch(3, NONE);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::FormalParameters, 5);
+                b.end(NodeKind::FormalParameters, 7);
+                b.begin(NodeKind::BlockBody, 7);
+                b.patch(0, NONE);
+                b.patch(1, NONE);
+                b.begin(NodeKind::Block, 7);
+                b.begin(NodeKind::VariablesDeclaration, 8);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 8, 9);
+                b.begin(NodeKind::InitializedIdentifier, 9);
+                identifier(b, 9, 10);
+                b.begin(NodeKind::VariableInitializer, 10);
+                b.leaf(NodeKind::LiteralInt, 11);
+                b.end(NodeKind::VariableInitializer, 12);
+                b.end(NodeKind::InitializedIdentifier, 12);
+                b.end(NodeKind::VariablesDeclaration, 13);
+                b.begin(NodeKind::ReturnStatement, 13);
+                b.begin(NodeKind::DotAccess, 14);
+                b.patch(0, 15);
+                b.patch(1, NONE);
+                b.leaf(NodeKind::ThisExpression, 14);
+                identifier(b, 16, 17);
+                b.end(NodeKind::DotAccess, 17);
+                b.end(NodeKind::ReturnStatement, 18);
+                b.end(NodeKind::Block, 19);
+                b.end(NodeKind::BlockBody, 19);
+                b.end(NodeKind::Method, 19);
+                b.end(NodeKind::DeclarationBody, 20);
+                b.end(NodeKind::ClassDeclaration, 20);
+                b.end(NodeKind::TopLevelDeclaration, 20);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_this")).is_empty());
+    }
+
+    /// The written `this` on a constructor field initializer always reports
+    /// (unnecessary_this.dart:31-35); the bare `x = 1;` form passes.
+    #[test]
+    fn unnecessary_this_reports_an_initializer_this_and_bare_passes() {
+        let this_form = "class C { int x = 0; C() : this.x = 1; }";
+        // class0 C1 {2 int3 x4 =5 06 ;7 C8 (9 )10 :11 this12 .13 x14 =15 116 ;17 }18
+        let f = Fixture::build(
+            this_form,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, 11);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.end(NodeKind::FormalParameters, 11);
+                b.begin(NodeKind::Initializers, 11);
+                b.begin(NodeKind::Initializer, 12);
+                b.begin(NodeKind::FieldInitializer, 15);
+                b.patch(0, 15);
+                b.leaf(NodeKind::LiteralInt, 16);
+                b.end(NodeKind::FieldInitializer, 17);
+                b.end(NodeKind::Initializer, 17);
+                b.end(NodeKind::Initializers, 18);
+                b.leaf(NodeKind::EmptyBody, 17);
+                b.end(NodeKind::Constructor, 18);
+                b.end(NodeKind::DeclarationBody, 19);
+                b.end(NodeKind::ClassDeclaration, 19);
+                b.end(NodeKind::TopLevelDeclaration, 19);
+            }),
+        );
+        let lints = f.run(&one_rule("unnecessary_this"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, 12));
+
+        let bare_form = "class C { int x = 0; C() : x = 1; }";
+        // class0 C1 {2 int3 x4 =5 06 ;7 C8 (9 )10 :11 x12 =13 114 ;15 }16
+        let f = Fixture::build(
+            bare_form,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelDeclaration, 0);
+                identifier(b, 1, 2);
+                b.begin(NodeKind::ClassDeclaration, 0);
+                b.patch(0, 0);
+                b.patch(1, NONE);
+                b.patch(2, NONE);
+                b.patch(3, NONE);
+                b.begin(NodeKind::DeclarationBody, 2);
+                b.begin(NodeKind::Fields, 2);
+                b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+                b.begin(NodeKind::VariablesDeclaration, 3);
+                b.patch(0, NONE);
+                b.leaf_span(NodeKind::Type, 3, 4);
+                b.begin(NodeKind::InitializedIdentifier, 4);
+                identifier(b, 4, 5);
+                b.begin(NodeKind::VariableInitializer, 5);
+                b.leaf(NodeKind::LiteralInt, 6);
+                b.end(NodeKind::VariableInitializer, 7);
+                b.end(NodeKind::InitializedIdentifier, 7);
+                b.end(NodeKind::VariablesDeclaration, 8);
+                b.end(NodeKind::Fields, 8);
+                b.begin(NodeKind::Constructor, 8);
+                b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+                b.patch(1, NONE);
+                b.patch(2, 9);
+                b.patch(3, 11);
+                identifier(b, 8, 9);
+                b.begin(NodeKind::FormalParameters, 9);
+                b.end(NodeKind::FormalParameters, 11);
+                b.begin(NodeKind::Initializers, 11);
+                b.begin(NodeKind::Initializer, 12);
+                b.begin(NodeKind::FieldInitializer, 13);
+                b.patch(0, 13);
+                b.leaf(NodeKind::LiteralInt, 14);
+                b.end(NodeKind::FieldInitializer, 15);
+                b.end(NodeKind::Initializer, 15);
+                b.end(NodeKind::Initializers, 16);
+                b.leaf(NodeKind::EmptyBody, 15);
+                b.end(NodeKind::Constructor, 16);
+                b.end(NodeKind::DeclarationBody, 17);
+                b.end(NodeKind::ClassDeclaration, 17);
+                b.end(NodeKind::TopLevelDeclaration, 17);
+            }),
+        );
+        assert!(f.run(&one_rule("unnecessary_this")).is_empty());
     }
 }

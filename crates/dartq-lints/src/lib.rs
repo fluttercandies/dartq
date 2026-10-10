@@ -1,7 +1,8 @@
 //! dartq-lints — the built-in lint rule engine and the syntax-visible slice
 //! of the `package:lints` recommended/core sets (PRD §13), complete to the
-//! member level (#353): every set member is implemented under the documented
-//! lexical-approximation discipline or listed blocked with its fact.
+//! member level through #315: every set member is implemented under the
+//! documented lexical-approximation discipline or listed blocked with its
+//! fact.
 //!
 //! # Shape
 //!
@@ -29,7 +30,7 @@
 //! `pkg/linter/lib/src/rules/` and its message template in
 //! `pkg/linter/lib/src/diagnostic.g.dart`.
 //!
-//! Implemented (64):
+//! Implemented (68):
 //! - wave 1 (18): `avoid_empty_else`, `camel_case_extensions`,
 //!   `camel_case_types`, `curly_braces_in_flow_control_structures`,
 //!   `empty_catches`, `prefer_typing_uninitialized_variables` (core);
@@ -90,9 +91,17 @@
 //!   (over-report on user classes with the same method name);
 //!   `no_wildcard_variable_uses` gained a binding table the engine collects
 //!   in the same DFS ([`engine::WildcardScope`], feature-gated).
+//! - alignment wave 3 (4, #315): `type_literal_in_constant_pattern` (core);
+//!   `null_closures`, `prefer_initializing_formals`, `unnecessary_this`
+//!   (recommended). Same documented-approximation discipline: built-in type
+//!   names stand in for the type-literal test, written names for the
+//!   resolved core APIs of `null_closures`, same-file field + written-type
+//!   equality for the initializing-formal conversion, and a syntax shadow
+//!   index for the `this.` scope question. Each rule module spells out its
+//!   over/under-report faces.
 //!
 //! With this tranche every `package:lints` member has a terminal state:
-//! implemented (64), or documented-blocked with the exact resolution fact it
+//! implemented (68), or documented-blocked with the exact resolution fact it
 //! waits for (below).
 //!
 //! # Documented-blocked members, with the blocker
@@ -103,44 +112,43 @@
 //!   argument type), `null_check_on_nullable_type_parameter` (type-parameter
 //!   nullability), `unrelated_type_equality_checks` (operand type
 //!   relation), `unnecessary_string_interpolations` (operand already
-//!   String), `void_checks` (void-typed expressions),
-//!   `null_closures` (function-typed parameters).
+//!   String — the dominant hit face is `'${stringVar}'`, neither erroneous
+//!   nor user-shadowed), `void_checks` (void-typed expressions).
 //! - **Element model (member/type resolution)**: `implicit_call_tearoffs`
-//!   (callable `call` member), `type_literal_in_constant_pattern`
-//!   (identifier classification: type vs constant),
-//!   `valid_regexps` (constant evaluation for interpolated patterns plus an
-//!   ECMAScript-grammar regex validator — the Rust `regex` crate is a
-//!   different grammar and would misjudge valid patterns),
-//!   `avoid_types_as_parameter_names` (in-scope name resolution incl.
-//!   imports and type parameters — a same-file-only face under-reports the
-//!   dominant imported-type case).
+//!   (callable `call` member), `valid_regexps` (constant evaluation for
+//!   interpolated patterns plus an ECMAScript-grammar regex validator — the
+//!   Rust `regex` crate is a different grammar and would misjudge valid
+//!   patterns), `avoid_types_as_parameter_names` (in-scope name resolution
+//!   incl. imports and type parameters — a same-file-only face under-reports
+//!   the dominant imported-type case),
+//!   `invalid_runtime_check_with_js_interop_types` (JS-interop annotation
+//!   classification of the operand types).
 //! - **Inheritance / override graph**: `annotate_overrides`,
 //!   `unnecessary_overrides` (plus body-equivalence over resolved
-//!   elements), `overridden_fields`, `avoid_renaming_method_parameters`,
-//!   `use_super_parameters` (super-constructor parameter correspondence),
-//!   `prefer_initializing_formals` (field-on-this-class identity, subtype
-//!   check, and the single-reference count; the exact-form lexical port
-//!   false-positives on setter-only names and inherited fields — legal
-//!   code).
-//! - **Scope resolution beyond the file**: `unnecessary_this` needs the
-//!   library scope — an instance member `x` alongside an imported top-level
-//!   `x` makes `this.x` necessary, so the local-shadow index cannot decide;
-//!   `implementation_imports` needs the analyzed file's own package
-//!   identity (`package_config`).
+//!   elements — the inherited-declaration equality guard is what keeps
+//!   renamed-parameter overrides unreported), `overridden_fields`,
+//!   `avoid_renaming_method_parameters`,
+//!   `use_super_parameters` (super-constructor parameter correspondence).
+//! - **Scope resolution beyond the file**: `implementation_imports` needs
+//!   the analyzed file's own package identity (`package_config`) — the
+//!   import URI's `package:*/src/` face is visible, the same-package
+//!   comparison is not.
 //! - **Non-Dart artifacts**: `depend_on_referenced_packages` and
 //!   `secure_pubspec_urls` / `package_names` read the pubspec and the
 //!   package graph.
 //! - **Flow analysis (#278)**: `prefer_final_fields` (mutation analysis
-//!   across member bodies).
+//!   across member bodies; a per-unit write scan over-reports on fields
+//!   mutated in a sibling part file).
 //! - **Enum + constant evaluation**: `exhaustive_cases` (enum value
-//!   enumeration for switch exhaustiveness).
+//!   enumeration for switch exhaustiveness; the scrutinee's static type
+//!   picks the enum, which a same-file-only approximation cannot).
 //!
-//! (The pre-#353 notes naming `unnecessary_getters_setters`,
-//! `unnecessary_const`, `prefer_initializing_formals`, `unnecessary_this`,
-//! `avoid_print`, and `prefer_final_locals` were re-audited: the first two
-//! ported and moved above; `prefer_initializing_formals` /
-//! `unnecessary_this` kept blocked with sharper facts; `avoid_print` and
-//! `prefer_final_locals` are not `package:lints` members and never were.)
+//! (The pre-#353 notes naming `unnecessary_getters_setters` and
+//! `unnecessary_const` were re-audited and ported in that tranche;
+//! `prefer_initializing_formals` and `unnecessary_this`, kept blocked there
+//! with sharper facts, landed in #315 once their divergence families were
+//! argued inside the discipline; `avoid_print` and `prefer_final_locals`
+//! are not `package:lints` members and never were.)
 //!
 //! Era note: behavior aligns to the Dart 3.15 main linter in
 //! `.third/dart-sdk` (the fact source per AGENTS.md), with rule lists from
