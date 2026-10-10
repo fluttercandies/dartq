@@ -336,53 +336,82 @@ pub fn explain<'d, 's, 'l, 'f>(
     let primary = hits.first().copied();
 
     let declaration = primary.map(|hit| declaration_row(hit, &decls_of, &file_label_of, strings));
-    let methods = primary.map_or_else(Vec::new, |hit| member_rows(hit, &decls_of, strings));
     let targets: &'s [TargetRef] =
         primary.map_or(&[], |hit| supertypes_of(hit.file, hit.decl.name));
-    let supers = supertype_rows(targets, &file_label_of, strings);
-    let references = reference_rows(primary.map(|hit| hit.file), refs, &file_label_of);
 
-    let mut dependencies: Vec<DependencyRow> = match primary {
-        Some(hit) => importers
-            .importers_of(hit.library as usize)
-            .iter()
-            .map(|&lib| DependencyRow {
-                path: label_of(lib).to_owned(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    dependencies.sort_by(|a, b| a.path.cmp(&b.path));
-    dependencies.dedup_by(|a, b| a.path == b.path);
-
-    let mut affected: Vec<AffectedTest> = match primary {
-        Some(hit) => tests
-            .tests_of(hit.library)
-            .iter()
-            .map(|&lib| AffectedTest {
-                path: label_of(lib).to_owned(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    affected.sort_by(|a, b| a.path.cmp(&b.path));
-    affected.dedup_by(|a, b| a.path == b.path);
-
-    // `minimal` replaces the arrays with counts and trims the
-    // declaration's container (a convenience field, never a locator);
-    // `compact`/`full` carry the arrays, empty sections included.
+    // `minimal` replaces the arrays with counts and trims the declaration's
+    // container (a convenience field, never a locator); `compact`/`full`
+    // carry the arrays, empty sections included. Every count mirrors its
+    // row builder's predicate exactly — the member anchor set, the
+    // primary-file reference filter, the label-deduplicated graph joins —
+    // taken straight off the faces, so the tier never materializes the
+    // per-row Strings of the arrays it drops.
     let minimal = verbosity == Verbosity::Minimal;
-    let count = |rows: usize| u32::try_from(rows).expect("more than u32::MAX rows in one section");
-    let counts = minimal.then(|| SectionCounts {
-        inheritance: count(supers.len()),
-        interfaces: 0,
-        constructors: 0,
-        methods: count(methods.len()),
-        references: count(references.len()),
-        dependencies: count(dependencies.len()),
-        affected_tests: count(affected.len()),
+    let counts = minimal.then(|| {
+        let count =
+            |rows: usize| u32::try_from(rows).expect("more than u32::MAX rows in one section");
+        // `supertype_rows` maps its targets one to one — no filter, no
+        // dedup — so the row count is the target count.
+        let inheritance = targets.len();
+        // `member_rows`: rows anchored to a same-named surface row (Dart
+        // forbids same-name containers in one file, so the anchor set
+        // holds at most one row in honest input).
+        let methods = primary.map_or(0, |hit| {
+            let surface = decls_of(hit.file);
+            let containers: Vec<u32> = surface
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.name == hit.decl.name)
+                .map(|(index, _)| {
+                    u32::try_from(index).expect("more than u32::MAX declaration rows")
+                })
+                .collect();
+            surface
+                .iter()
+                .filter(|row| containers.contains(&row.container))
+                .count()
+        });
+        // `reference_rows`: only the primary declaration's use sites.
+        let references = primary.map_or(0, |hit| {
+            refs.iter()
+                .filter(|row| row.target_file == hit.file)
+                .count()
+        });
+        // Both graph joins sort and dedup by label text — `importers_of`
+        // keeps one entry per import directive, so a duplicated directive
+        // repeats the importer and the raw row length overcounts. Distinct
+        // borrowed labels are the exact predicate, minus the owned Strings.
+        let distinct = |ids: &[u32]| -> usize {
+            let mut labels: Vec<&str> = ids.iter().map(|&id| label_of(id)).collect();
+            labels.sort_unstable();
+            labels.dedup();
+            labels.len()
+        };
+        SectionCounts {
+            inheritance: count(inheritance),
+            interfaces: 0,
+            constructors: 0,
+            methods: count(methods),
+            references: count(references),
+            dependencies: count(match primary {
+                Some(hit) => distinct(importers.importers_of(hit.library as usize)),
+                None => 0,
+            }),
+            affected_tests: count(match primary {
+                Some(hit) => distinct(tests.tests_of(hit.library)),
+                None => 0,
+            }),
+        }
     });
+
     let sections = !minimal;
+    let methods =
+        sections.then(|| primary.map_or_else(Vec::new, |hit| member_rows(hit, &decls_of, strings)));
+    let inheritance = sections.then(|| supertype_rows(targets, &file_label_of, strings));
+    let references =
+        sections.then(|| reference_rows(primary.map(|hit| hit.file), refs, &file_label_of));
+    let dependencies = sections.then(|| dependency_rows(primary, importers, &label_of));
+    let affected_tests = sections.then(|| affected_test_rows(primary, tests, &label_of));
 
     ExplainReport {
         schema_version: EXPLAIN_SCHEMA_VERSION,
@@ -397,13 +426,13 @@ pub fn explain<'d, 's, 'l, 'f>(
                 row
             }
         }),
-        inheritance: sections.then_some(supers),
+        inheritance,
         interfaces: sections.then_some(Vec::new()),
         constructors: sections.then_some(Vec::new()),
-        methods: sections.then_some(methods),
-        references: sections.then_some(references),
-        dependencies: sections.then_some(dependencies),
-        affected_tests: sections.then_some(affected),
+        methods,
+        references,
+        dependencies,
+        affected_tests,
         counts,
     }
 }
@@ -514,6 +543,50 @@ fn reference_rows<'f>(
         None => Vec::new(),
     };
     rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.range.cmp(&b.range)));
+    rows
+}
+
+/// The `dependencies` rows: the declaring library's importers (the reverse
+/// edges), deduplicated by label, ascending.
+fn dependency_rows<'l>(
+    primary: Option<&SymbolDeclHit<'_>>,
+    importers: &RevImportGraph,
+    label_of: &impl Fn(u32) -> &'l str,
+) -> Vec<DependencyRow> {
+    let mut rows: Vec<DependencyRow> = match primary {
+        Some(hit) => importers
+            .importers_of(hit.library as usize)
+            .iter()
+            .map(|&lib| DependencyRow {
+                path: label_of(lib).to_owned(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    rows.dedup_by(|a, b| a.path == b.path);
+    rows
+}
+
+/// The `affected_tests` rows: the test libraries exercising the declaring
+/// library, deduplicated by label, ascending.
+fn affected_test_rows<'l>(
+    primary: Option<&SymbolDeclHit<'_>>,
+    tests: &TestGraph,
+    label_of: &impl Fn(u32) -> &'l str,
+) -> Vec<AffectedTest> {
+    let mut rows: Vec<AffectedTest> = match primary {
+        Some(hit) => tests
+            .tests_of(hit.library)
+            .iter()
+            .map(|&lib| AffectedTest {
+                path: label_of(lib).to_owned(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    rows.dedup_by(|a, b| a.path == b.path);
     rows
 }
 
@@ -742,6 +815,60 @@ mod tests {
         let value = serde_json::to_value(&report).expect("serialize");
         assert!(value.get("inheritance").is_none(), "arrays are dropped");
         assert_eq!(value["counts"]["methods"], 2);
+    }
+
+    /// Duplicate import directives (two resolved imports of one library)
+    /// put the same importer in the graph row twice; the compact rows dedup
+    /// by label and the minimal count must match them — the raw row length
+    /// would overcount.
+    #[test]
+    fn minimal_counts_match_the_rows_on_duplicate_imports() {
+        let fx = fixture();
+        let imports = |lib: u32| -> &'static [u32] {
+            match lib {
+                1 => &[0, 0], // b imports a through two directives
+                2..=3 => &[0],
+                _ => &[],
+            }
+        };
+        let importers = RevImportGraph::build(4, imports);
+        let tests = TestGraph::build(4, imports, |lib| {
+            Some(labels(lib).rsplit('/').next().unwrap_or("x"))
+        });
+        let supers = supertypes(&fx);
+        let faces = |verbosity| {
+            explain(
+                "Foo",
+                verbosity,
+                &hits(&fx),
+                &[],
+                |file| match file.index() {
+                    0 => &fx.surface_a,
+                    _ => &fx.surface_b,
+                },
+                |_, _| &supers,
+                &importers,
+                labels,
+                file_labels,
+                &tests,
+                &fx.strings,
+            )
+        };
+        let counts = faces(Verbosity::Minimal)
+            .counts
+            .expect("minimal carries counts");
+        assert_eq!(
+            counts.dependencies, 3,
+            "b's duplicate directive counts once"
+        );
+        assert_eq!(counts.affected_tests, 1);
+        let compact = faces(Verbosity::Compact);
+        assert_eq!(
+            compact.dependencies.as_ref().map(Vec::len),
+            Some(3),
+            "the rows the count must mirror"
+        );
+        assert_eq!(compact.affected_tests.as_ref().map(Vec::len), Some(1));
     }
 
     /// `full` is byte-equal to `compact` today (module docs, Verbosity).

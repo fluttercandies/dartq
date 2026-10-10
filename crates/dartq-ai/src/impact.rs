@@ -557,6 +557,87 @@ mod tests {
         );
     }
 
+    /// Cycle termination: `a` imports `b`, `b` imports `a` — both floods
+    /// (the L3 semantic flood and the visited closure) mark before they
+    /// push, so each node is enqueued at most once and the report returns:
+    /// the seed ships its Changed row, the cycle partner is reached exactly
+    /// once and tagged Semantic.
+    #[test]
+    fn two_cycle_import_graph_terminates_and_tags_both_sides() {
+        let fx = fixture();
+        // a=0 imports b, b=1 imports a — the two-cycle.
+        let imports: [&[u32]; 2] = [&[1], &[0]];
+        let tests = TestGraph::default();
+        let changes = [LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot(&fx.strings, &["fa", "fb"]),
+        }];
+        let report = impact(
+            2,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &changes,
+        );
+        assert_eq!(
+            report
+                .changed
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.dart|fb"],
+            "the seed's change ships its row"
+        );
+        assert_eq!(
+            report
+                .affected
+                .iter()
+                .map(|row| (row.path.as_str(), row.impact))
+                .collect::<Vec<_>>(),
+            vec![("b.dart", ImpactLevel::Semantic)],
+            "the cycle partner is visited once and tagged semantic"
+        );
+    }
+
+    /// Self-import termination: `a` importing itself is the one-node cycle
+    /// — the seed is marked before its self-edge can re-enqueue it, so the
+    /// report returns with the seed alone: its Changed row, no Affected row
+    /// (seeds never list as affected), no tests.
+    #[test]
+    fn self_import_cycle_terminates_on_the_seed_alone() {
+        let fx = fixture();
+        let imports: [&[u32]; 1] = [&[0]];
+        let tests = TestGraph::default();
+        let changes = [LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot(&fx.strings, &["fa", "fb"]),
+        }];
+        let report = impact(
+            1,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &changes,
+        );
+        assert_eq!(
+            report
+                .changed
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.dart|fb"]
+        );
+        assert!(
+            report.affected.is_empty(),
+            "the seed never lists as affected, self-edge or not"
+        );
+        assert!(report.affected_tests.is_empty());
+    }
+
     /// The flood boundary: a body-only change (hash moves, signature
     /// stable) visits its importers but leaves every one of them
     /// content-only — at every hop, not just the direct edge.
