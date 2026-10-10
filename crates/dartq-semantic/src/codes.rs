@@ -273,6 +273,38 @@ pub enum SemanticCode {
     /// reports per statement entered — a documented per-statement
     /// divergence.
     DeadCode,
+    // —— #476: the extension-application family (all `COMPILE_TIME_ERROR`) ——
+    /// `A member named '{0}' is defined in '{1}' and '{2}', and neither is
+    /// more specific.` — two applicable extensions both declare the member
+    /// and the M1 name level cannot separate them (`_isMoreSpecific`'s
+    /// SDK-ness and subtype steps decide nothing for same-`on`-type
+    /// candidates, `extension_member_resolver.dart:469-513`).
+    AmbiguousExtensionMemberTwo,
+    /// `A member named '{0}' is defined in {1}, and none are more specific.`
+    /// — the same verdict for three or more candidates; `{1}` is the
+    /// comma-and list of `extension 'E'` / `unnamed extension on 'T'`
+    /// displays (`extension_member_resolver.dart:119-124`).
+    AmbiguousExtensionMemberThreeOrMore,
+    // —— #476: the extension-type representation family ————————————————————
+    /// `A class member can't have the same name as the enclosing class.` —
+    /// the representation field's name equals the extension type's
+    /// (`error_verifier.dart:5411-5413`; `SYNTACTIC_ERROR` tier,
+    /// `diagnostic.g.dart:10552-10564`).
+    MemberWithClassName,
+    /// `Extension types can't declare members with the same name as a member
+    /// declared by 'Object'.` — the representation field's name is an
+    /// `Object` member (`error_verifier.dart:5416-5423`).
+    ExtensionTypeDeclaresMemberOfObject,
+    /// `Expected a representation type.` — the representation formal
+    /// declares no type (`error_verifier.dart:5450-5452`, the
+    /// primary-constructors-disabled arm; `SYNTACTIC_ERROR` tier,
+    /// `diagnostic.g.dart:5334-5345`).
+    ExpectedRepresentationType,
+    /// `The extension type representation can't depend on itself.` — the
+    /// representation field's declared type is the extension type itself
+    /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation of
+    /// `hasRepresentationSelfReference` — direct self references only).
+    ExtensionTypeRepresentationDependsOnItself,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -462,11 +494,39 @@ impl SemanticCode {
                 ("invalid_override", "INVALID_OVERRIDE")
             }
             Self::DeadCode => ("dead_code", "DEAD_CODE"),
+            // One code name with two message texts (the `uniqueName` split,
+            // `ambiguous_extension_member_access_two` / `_three_or_more`).
+            Self::AmbiguousExtensionMemberTwo | Self::AmbiguousExtensionMemberThreeOrMore => {
+                (
+                    "ambiguous_extension_member_access",
+                    "AMBIGUOUS_EXTENSION_MEMBER_ACCESS",
+                )
+            }
+            Self::MemberWithClassName => ("member_with_class_name", "MEMBER_WITH_CLASS_NAME"),
+            Self::ExtensionTypeDeclaresMemberOfObject => (
+                "extension_type_declares_member_of_object",
+                "EXTENSION_TYPE_DECLARES_MEMBER_OF_OBJECT",
+            ),
+            Self::ExpectedRepresentationType => {
+                ("expected_representation_type", "EXPECTED_REPRESENTATION_TYPE")
+            }
+            Self::ExtensionTypeRepresentationDependsOnItself => (
+                "extension_type_representation_depends_on_itself",
+                "EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF",
+            ),
         };
         let dtype = self.dtype();
-        // The function variant is the one wrong-number template without a
-        // `hasPublishedDocs` field (diagnostic.g.dart:18725-18744).
-        let published = !matches!(self, Self::WrongNumberOfTypeArgumentsFunction);
+        // Unpublished rows: the function variant is the one wrong-number
+        // template without a `hasPublishedDocs` field
+        // (diagnostic.g.dart:18725-18744); `memberWithClassName`
+        // (:10552-10564) and `expectedRepresentationType` (:5334-5345) carry
+        // none either.
+        let published = !matches!(
+            self,
+            Self::WrongNumberOfTypeArgumentsFunction
+                | Self::MemberWithClassName
+                | Self::ExpectedRepresentationType
+        );
         CodeInfo::new(name, machine, dtype, published)
     }
 
@@ -479,7 +539,9 @@ impl SemanticCode {
     #[must_use]
     pub const fn dtype(self) -> DiagnosticType {
         match self {
-            Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
+            Self::WrongNumberOfParametersForSetter
+            | Self::MemberWithClassName
+            | Self::ExpectedRepresentationType => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
@@ -638,6 +700,18 @@ impl SemanticCode {
             Self::UnreachableSwitchCase | Self::UnreachableSwitchDefault => {
                 self.message3("", "", "")
             }
+            // The ambiguity pair (a0 = member name; a1 = one display for the
+            // two-variant, the joined list for the three-or-more one).
+            Self::AmbiguousExtensionMemberTwo | Self::AmbiguousExtensionMemberThreeOrMore => {
+                self.message3(a0, a1, "")
+            }
+            // The no-argument representation rows route through `message3`.
+            Self::ExtensionTypeDeclaresMemberOfObject
+            | Self::ExtensionTypeRepresentationDependsOnItself => self.message3("", "", ""),
+            Self::MemberWithClassName => {
+                "A class member can't have the same name as the enclosing class.".to_string()
+            }
+            Self::ExpectedRepresentationType => "Expected a representation type.".to_string(),
             // No-argument flow row (diagnostic.g.dart:3546).
             Self::DeadCode => "Dead code.".to_string(),
             Self::WrongNumberOfTypeArgumentsConstructor
@@ -735,6 +809,29 @@ impl SemanticCode {
             // constant_verifier.dart:1141-1148).
             Self::UnreachableSwitchDefault => {
                 "This default clause is covered by the previous cases.".to_string()
+            }
+            // The extension-application ambiguity pair — one code name, two
+            // problem texts. The two-variant's `{1}`/`{2}` are *element*
+            // displays (`extension E1 on C`, the ExtensionElement toString,
+            // `ambiguous_extension_member_access_test.dart:54`); the
+            // three-or-more one takes the resolver's inline rendering
+            // (`extension 'E1'` / `unnamed extension on 'C'`,
+            // `extension_member_resolver.dart:119-124`) joined per
+            // `commaSeparatedWithAnd`.
+            Self::AmbiguousExtensionMemberThreeOrMore => format!(
+                "A member named '{a0}' is defined in {a1}, and none are more specific."
+            ),
+            Self::AmbiguousExtensionMemberTwo => format!(
+                "A member named '{a0}' is defined in '{a1}' and '{a2}', and neither is more specific."
+            ),
+            // The extension-type representation rows (the rep field's name
+            // and declared type are the decidable facts).
+            Self::ExtensionTypeDeclaresMemberOfObject => {
+                "Extension types can't declare members with the same name as a member declared by 'Object'."
+                    .to_string()
+            }
+            Self::ExtensionTypeRepresentationDependsOnItself => {
+                "The extension type representation can't depend on itself.".to_string()
             }
             // One- and two-placeholder rows: the extra placeholder is
             // ignored (the descriptor stays total over the frozen set).
@@ -870,6 +967,12 @@ mod tests {
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
             SemanticCode::DeadCode,
+            SemanticCode::AmbiguousExtensionMemberTwo,
+            SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+            SemanticCode::MemberWithClassName,
+            SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+            SemanticCode::ExpectedRepresentationType,
+            SemanticCode::ExtensionTypeRepresentationDependsOnItself,
         ];
         for code in codes {
             let info = code.code_info();
@@ -992,6 +1095,12 @@ mod tests {
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
             SemanticCode::DeadCode,
+            SemanticCode::AmbiguousExtensionMemberTwo,
+            SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+            SemanticCode::MemberWithClassName,
+            SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+            SemanticCode::ExpectedRepresentationType,
+            SemanticCode::ExtensionTypeRepresentationDependsOnItself,
         ];
         for code in codes {
             assert_eq!(

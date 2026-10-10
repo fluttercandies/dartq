@@ -43,7 +43,9 @@
 //! the resolution layer for the diagnostic tickets; when the directive
 //! milestone lands, the file→library fold moves behind this same API.
 
-use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
+use dartq_resolution::{
+    LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces,
+};
 use dartq_source::{FileId, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -227,6 +229,46 @@ pub fn lookup_scoped<'a>(
     }
 }
 
+/// The library whose scope resolves a name written in `owner_file`: the
+/// superclass/superface names of a container resolve in the declaring
+/// container's library (the oracle climbs the declaring library's scope
+/// chain), not in the diagnosing one. The graph maps `(library, name)` to
+/// the declaring file and `LibraryId` values are only constructible through
+/// the edges, so the answer is the first edge-reachable library (BFS over
+/// import/export edges from `start`) whose locals layer returns
+/// `owner_file` for the resolved spelling.
+pub(crate) fn owner_library(
+    graph: &LibraryGraph,
+    start: LibraryId,
+    owner_file: FileId,
+    name: StringId,
+) -> Option<LibraryId> {
+    if graph.local(start, name) == LocalLookup::Found(owner_file) {
+        return Some(start);
+    }
+    let mut seen = FxHashSet::default();
+    seen.insert(start.index());
+    let mut queue = Vec::new();
+    queue.push(start);
+    while let Some(lib) = queue.pop() {
+        let targets = graph
+            .import_edges(lib)
+            .iter()
+            .filter_map(|edge| edge.target)
+            .chain(graph.export_edges(lib).iter().filter_map(|edge| edge.target));
+        for target in targets {
+            if !seen.insert(target.index()) {
+                continue;
+            }
+            if graph.local(target, name) == LocalLookup::Found(owner_file) {
+                return Some(target);
+            }
+            queue.push(target);
+        }
+    }
+    None
+}
+
 /// Resolves a container by name: the file's own declarations first, then the
 /// library namespace. Returns the container and the file that owns it (for
 /// the superclass walk's next hop).
@@ -255,12 +297,16 @@ pub(crate) fn resolve_container<'a>(
 }
 
 /// Looks up `member` on `container`'s instance/static face: the container's
-/// member set, then direct-superclass name edges (each hop resolved
-/// file-locally first, then through the namespace; cycle-guarded).
+/// member set, then the mixin-application order (its own `with` mixins,
+/// last-applied first — `class X extends S with M1, M2` is the official
+/// sequence `S&M1 extends S` / `S&M2 extends S&M1` / `X extends S&M2`,
+/// `inheritance_manager3.dart:571-579`), then direct-superclass name edges.
+/// Each hop resolves file-locally first, then through the library that owns
+/// the declaring container (cycle-guarded).
 ///
 /// A `None` here is **not** proof of undefined — before reporting an
-/// instance-scope `undefined_*`, check the extension pool
-/// ([`FileElements::extension_member`]) of the library's files (the caller
+/// instance-scope `undefined_*`, check the extension faces
+/// ([`FileElements::extension_faces`]) of the library's files (the caller
 /// owns the file set; see the part seam in the module docs).
 #[must_use]
 pub fn member_lookup<'a>(
@@ -275,16 +321,42 @@ pub fn member_lookup<'a>(
     let mut name = container;
     let mut seen: FxHashSet<StringId> = FxHashSet::default();
     let mut owner = file;
+    let mut scope_lib = lib;
     loop {
         if !seen.insert(name) {
             return None; // malformed cyclic chain: treat as unresolved
         }
-        let (found, found_owner) = resolve_container(graph, namespaces, index, lib, owner, name)?;
+        let (found, found_owner) =
+            resolve_container(graph, namespaces, index, scope_lib, owner, name)?;
         if let Some(entry) = found.members.get(&member) {
             return Some(entry);
         }
+        // The stacked applications shadow the superclass chain in reverse
+        // declaration order (the later application wins). The mixin and
+        // superclass names are written in `found_owner` and resolve through
+        // that file's library (probed by the container name it declares,
+        // #491 S2a).
+        let owner_lib = owner_library(graph, lib, found_owner, name).unwrap_or(scope_lib);
+        for mixin in found.with_clause.iter().rev() {
+            if !seen.insert(*mixin) {
+                return None;
+            }
+            if let Some(entry) = resolve_container(
+                graph,
+                namespaces,
+                index,
+                owner_lib,
+                found_owner,
+                *mixin,
+            )
+            .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+            {
+                return Some(entry);
+            }
+        }
         name = found.superclass?;
         owner = found_owner;
+        scope_lib = owner_lib;
     }
 }
 
@@ -505,8 +577,7 @@ mod tests {
             index
                 .get(base_file)
                 .unwrap()
-                .extension_member(strings.intern("extG"))
-                .is_some()
+                .has_extension_member(strings.intern("extG"))
         );
     }
 }

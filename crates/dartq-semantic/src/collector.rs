@@ -16,15 +16,21 @@
 //!   `begin_enum_declaration`, `begin_extension_declaration`,
 //!   `begin_extension_type_declaration`) push an open container and seed its
 //!   top-level name; the matching end pops it. Unnamed extensions keep
-//!   capturing (no top-level name); their members surface only in the
-//!   extension pool.
+//!   capturing (no top-level name); their members surface only in their
+//!   [`ExtensionFace`].
 //! * Superclass edges: `handle_class_extends(Some(_))` and
 //!   `begin_named_mixin_application` arm a one-shot capture; the armed
 //!   `TypeReference`/`TypeReferenceContinuation` identifier names the
 //!   superclass (a qualified `p.S` keeps `S`, the continuation), committed
 //!   at `handle_qualified`/`handle_type` — the first type after `extends`
-//!   or the head type of a named mixin application. `on`/`with`/`implements`
-//!   faces are not captured (adjudicated cut).
+//!   or the head type of a named mixin application. `with`/`implements`/`on`
+//!   faces capture through their clause events, each event claiming only the
+//!   names written inside its clause; unclaimed names (`extends A, B`
+//!   overflow per `ast_builder.dart:3972-3982`, recovery residue) land in
+//!   [`Container::header_residue`] and are never consulted as super-faces.
+//!   Extensions latch their `on` type the same way (the [`ExtensionFace`]
+//!   applicability anchor), and extension types capture their
+//!   primary-constructor formals as the representation-field facts.
 //! * Field groups (`begin_fields` … `end_fields`/`end_top_level_fields`)
 //!   carry their `static` bit at open; each `FieldDeclaration`/
 //!   `TopLevelVariableDeclaration` identifier commits immediately under
@@ -73,8 +79,8 @@ use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, FileElements, Formal,
-    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace, FileElements,
+    Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
 use dartq_source::SourceRange;
@@ -102,6 +108,12 @@ struct OpenContainer {
     with_clause: Vec<StringId>,
     implements_clause: Vec<StringId>,
     on_clause: Vec<StringId>,
+    /// Unattributed header-window names (extends overflow, recovery
+    /// residue); never a super-face.
+    header_residue: Vec<StringId>,
+    /// Extension-type primary-constructor formals (the representation-field
+    /// family's facts); empty for every other kind.
+    primary_formals: Vec<RepFormal>,
     /// The enum's constants in declaration order.
     enum_constants: Vec<StringId>,
     /// The named constructor selectors declared so far, and whether an
@@ -126,6 +138,22 @@ enum HeaderClause {
     With,
     Implements,
     On,
+}
+
+/// The attribution a clause boundary event applies to the buffered window:
+/// the names the event claims join the clause list, the rest are residue
+/// (`Container::header_residue`) — never consulted as super-faces.
+enum ClauseClaim {
+    /// The clause keyword's offset (`handle_*_with_clause`): names written
+    /// after the keyword belong to the clause, names before it are the
+    /// `extends` overflow the oracle discards
+    /// (`ast_builder.dart:3972-3982`).
+    Keyword(u32),
+    /// The clause's own type count (`handle_implements` / `handle_mixin_on`
+    /// carry it): the trailing `count` names belong to the clause, anything
+    /// earlier is residue. A zero count claims nothing
+    /// (`handle_implements(None, 0)`).
+    Trailing(usize),
 }
 
 /// A class member executable between `begin_method` and `end_method`.
@@ -168,10 +196,26 @@ struct Builder<'src, 'tab> {
     /// A class-family header is open (`with`/`implements` type names route
     /// to [`Builder::header_interfaces`]).
     in_class_header: bool,
-    /// The header type names buffered since the last clause boundary; the
-    /// clause events (`handle_class_with_clause` / `handle_mixin_on` /
-    /// `handle_implements`, ...) drain it into the matching clause list.
-    header_interfaces: Vec<StringId>,
+    /// The header's clause type names buffered since the last clause
+    /// boundary, with each name's source offset; the clause events
+    /// (`handle_class_with_clause` / `handle_mixin_on` / `handle_implements`,
+    /// ...) split it into the event-attributed clause names and
+    /// [`Builder::header_residue`].
+    header_interfaces: Vec<(StringId, u32)>,
+    /// Header-window type names no clause event claimed: the `extends`
+    /// overflow the oracle throws away (`ast_builder.dart:3972-3982`) and
+    /// recovery residue. Committed to the open container's
+    /// [`Container::header_residue`] at the boundary events; never a
+    /// super-face.
+    header_residue: Vec<StringId>,
+    /// The open container's header window is still open (`begin_*_declaration`
+    /// through the body-open event): the extension on-type latch and the
+    /// extension-type primary-formal capture read it.
+    header_capture_open: bool,
+    /// The extension on-clause type name latched in the open header window
+    /// (the first honest `handle_type` name); consumed at
+    /// [`Builder::close_container`] into the [`ExtensionFace`].
+    extension_on_type: Option<StringId>,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
     field_abstract: bool,
@@ -231,6 +275,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             containers: Vec::new(),
             in_class_header: false,
             header_interfaces: Vec::new(),
+            header_residue: Vec::new(),
+            header_capture_open: false,
+            extension_on_type: None,
             field_abstract: false,
             field_external: false,
             field_static: None,
@@ -344,6 +391,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
         );
         self.header_interfaces.clear();
+        self.header_residue.clear();
+        // The extension on-type latch and the extension-type rep-formal
+        // capture open with the container and close at the body events.
+        self.header_capture_open = matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        );
+        self.extension_on_type = None;
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -354,6 +409,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             with_clause: Vec::new(),
             implements_clause: Vec::new(),
             on_clause: Vec::new(),
+            header_residue: Vec::new(),
+            primary_formals: Vec::new(),
             enum_constants: Vec::new(),
             ctor_named: Vec::new(),
             ctor_has_unnamed: true,
@@ -370,24 +427,34 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.header_super_open = false;
         self.super_candidate = None;
         self.in_class_header = false;
+        self.header_capture_open = false;
         self.header_interfaces.clear();
+        let extension_on_type = self.extension_on_type.take();
         let Some(open) = self.containers.pop() else {
             return;
         };
         let members = open.members;
-        if matches!(
-            open.kind,
-            ContainerKind::Extension | ContainerKind::ExtensionType
-        ) {
-            // Conservative suppression: every extension member (both static
-            // bits) joins the instance pool, so implicit extension
-            // application can only under-report, never false-positive.
-            for (name, entry) in &members {
-                self.file
-                    .extension_members
-                    .entry(*name)
-                    .or_insert_with(|| entry.clone());
-            }
+        if open.kind == ContainerKind::Extension && open.name.is_none() {
+            // An unnamed extension has no container entry: its application
+            // face owns the members outright. An on-type that never produced
+            // an honest name stays `None` — the face can never apply, so its
+            // members only ever suppress (under-report, never
+            // false-positive).
+            self.file.extension_faces.push(ExtensionFace {
+                name: None,
+                on_type: extension_on_type,
+                members,
+            });
+            return;
+        }
+        if open.kind == ContainerKind::Extension {
+            // A named extension is both an application face and a
+            // named container; the two hold the same member set.
+            self.file.extension_faces.push(ExtensionFace {
+                name: open.name.map(|(name, _)| name),
+                on_type: extension_on_type,
+                members: members.clone(),
+            });
         }
         if let Some((name, _range)) = open.name {
             self.file.container_order.push(name);
@@ -400,15 +467,16 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 with_clause: open.with_clause,
                 implements_clause: open.implements_clause,
                 on_clause: open.on_clause,
+                header_residue: open.header_residue,
+                primary_formals: open.primary_formals.into_boxed_slice(),
                 enum_constants: open.enum_constants,
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor: open.ctor_has_unnamed,
             });
-        } else {
-            for (name, entry) in members {
-                self.file.extension_members.entry(name).or_insert(entry);
-            }
         }
+        // Extension headers capture no residue (their window's types latch
+        // through `note_header_reference`, not the clause buffer), so
+        // nothing else to commit here.
     }
 
     /// Marks the open container `sealed` (the `sealed` modifier event).
@@ -419,52 +487,99 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Ends the declaration-header window (`handle_class_header` /
-    /// `handle_enum_header` / `handle_mixin_header`): residue joins the
-    /// container's `implements` list. The clause events normally drain the
-    /// window first, so what reaches here is recovery residue — plus a
-    /// named mixin application's `implements` names (its header close fires
-    /// no `handle_implements` event).
+    /// `handle_enum_header` / `handle_mixin_header`): every still-buffered
+    /// name is unattributed residue. The clause events normally drain the
+    /// window first, so what reaches here is recovery residue — plus a named
+    /// mixin application's `implements` names until the parser lands their
+    /// real `handle_implements(Some, count)` emission (ticket #460; until
+    /// then that form's interface edges under-report, never false-positive).
     fn end_header_window(&mut self) {
         self.in_class_header = false;
         let buffered = std::mem::take(&mut self.header_interfaces);
+        let residue = &mut self.header_residue;
         if let Some(open) = self.containers.last_mut() {
-            open.implements_clause.extend(buffered);
+            open.header_residue
+                .extend(buffered.into_iter().map(|(name, _)| name));
+        } else {
+            residue.extend(buffered.into_iter().map(|(name, _)| name));
         }
     }
 
-    /// Drains the names buffered since the last clause boundary into the
-    /// open container's `which` clause list (the parser fires a boundary
-    /// event after each clause's type list).
-    fn commit_header_clause(&mut self, which: HeaderClause) {
+    /// Splits the buffered window at a clause boundary: the claimed names go
+    /// to the open container's `which` clause list, the unclaimed ones to
+    /// its residue.
+    fn commit_header_clause(&mut self, which: HeaderClause, claim: ClauseClaim) {
         let buffered = std::mem::take(&mut self.header_interfaces);
+        let (claimed, residue) = match claim {
+            ClauseClaim::Keyword(offset) => {
+                let at = buffered.partition_point(|(_, at)| *at <= offset);
+                (buffered[at..].to_vec(), buffered[..at].to_vec())
+            }
+            ClauseClaim::Trailing(count) => {
+                let at = buffered.len().saturating_sub(count);
+                (buffered[at..].to_vec(), buffered[..at].to_vec())
+            }
+        };
         if let Some(open) = self.containers.last_mut() {
             match which {
-                HeaderClause::With => open.with_clause.extend(buffered),
-                HeaderClause::Implements => open.implements_clause.extend(buffered),
-                HeaderClause::On => open.on_clause.extend(buffered),
+                HeaderClause::With => open.with_clause.extend(claimed.into_iter().map(|(n, _)| n)),
+                HeaderClause::Implements => {
+                    open.implements_clause
+                        .extend(claimed.into_iter().map(|(n, _)| n));
+                }
+                HeaderClause::On => open.on_clause.extend(claimed.into_iter().map(|(n, _)| n)),
             }
+            open.header_residue.extend(residue.into_iter().map(|(n, _)| n));
         }
     }
 
-    /// Buffers one header clause type name (declarations.rs:1129-1172); the
-    /// clause-boundary events later decide the family it belongs to.
-    fn buffer_header_interface(&mut self, name: Option<StringId>) {
+    /// Buffers one header clause type name with its source offset
+    /// (declarations.rs:1129-1172); the clause-boundary events later claim
+    /// the names their event attributes and route the rest to residue.
+    fn buffer_header_interface(&mut self, name: Option<StringId>, offset: u32) {
         if let Some(name) = name {
-            self.header_interfaces.push(name);
+            self.header_interfaces.push((name, offset));
         }
     }
 
     /// Routes a class-header type reference: the `extends` head latches the
     /// superclass candidate (a qualified `p.S` through the continuation),
     /// and past it the `with`/`implements` names buffer toward the
-    /// container's interface edges.
-    fn note_header_reference(&mut self, context: IdentifierContext, name: Option<StringId>) {
+    /// container's interface edges. Inside an extension header window, the
+    /// first plain reference latches the `on` type and the qualified
+    /// continuation overwrites it (`on p.T` keeps `T`, the model's `p.S`
+    /// convention).
+    fn note_header_reference(
+        &mut self,
+        context: IdentifierContext,
+        name: Option<StringId>,
+        offset: u32,
+    ) {
+        // The extension on-type latch (a container is always open here).
+        if self.header_capture_open
+            && self.containers.last().is_some_and(|open| {
+                open.kind == ContainerKind::Extension
+            })
+        {
+            match context {
+                IdentifierContext::TypeReference => {
+                    if self.extension_on_type.is_none() {
+                        self.extension_on_type = name;
+                    }
+                }
+                IdentifierContext::TypeReferenceContinuation => {
+                    self.extension_on_type = name;
+                }
+                _ => {}
+            }
+            return;
+        }
         match context {
             IdentifierContext::TypeReference => {
                 if self.header_super_open && self.super_candidate.is_none() {
                     self.super_candidate = name;
                 } else if self.in_class_header {
-                    self.buffer_header_interface(name);
+                    self.buffer_header_interface(name, offset);
                 }
             }
             IdentifierContext::TypeReferenceContinuation if self.header_super_open => {
@@ -823,36 +938,69 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.builder.borrow_mut().commit_super_candidate();
     }
 
-    fn handle_named_mixin_application_with_clause(&mut self, _with: Token) {
+    fn handle_named_mixin_application_with_clause(&mut self, with: Token) {
         // The head type fired between `begin_named_mixin_application` and
-        // this event; the `with` list itself is not the superclass.
+        // this event; the `with` list itself is not the superclass. Names
+        // written before the `with` keyword are head-overflow residue.
+        let offset = with.range.offset;
         let mut builder = self.builder.borrow_mut();
         builder.commit_super_candidate();
-        builder.commit_header_clause(HeaderClause::With);
+        builder.commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
 
-    fn handle_class_with_clause(&mut self, _with_keyword: Token) {
+    fn handle_class_with_clause(&mut self, with_keyword: Token) {
+        let offset = with_keyword.range.offset;
         self.builder
             .borrow_mut()
-            .commit_header_clause(HeaderClause::With);
+            .commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
 
-    fn handle_enum_with_clause(&mut self, _with_keyword: Token) {
+    fn handle_enum_with_clause(&mut self, with_keyword: Token) {
+        let offset = with_keyword.range.offset;
         self.builder
             .borrow_mut()
-            .commit_header_clause(HeaderClause::With);
+            .commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
 
-    fn handle_mixin_on(&mut self, _on: Option<Token>, _count: usize) {
+    fn handle_mixin_on(&mut self, _on: Option<Token>, count: usize) {
         self.builder
             .borrow_mut()
-            .commit_header_clause(HeaderClause::On);
+            .commit_header_clause(HeaderClause::On, ClauseClaim::Trailing(count));
     }
 
-    fn handle_implements(&mut self, _implements: Option<Token>, _count: usize) {
+    fn handle_implements(&mut self, _implements: Option<Token>, count: usize) {
         self.builder
             .borrow_mut()
-            .commit_header_clause(HeaderClause::Implements);
+            .commit_header_clause(HeaderClause::Implements, ClauseClaim::Trailing(count));
+    }
+
+    fn begin_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, _token: Token) {
+        let mut builder = self.builder.borrow_mut();
+        // The header window closes with the body: extension on-types and
+        // extension-type representation formals stop being captured. The
+        // kind is informational here — the container's own kind decides.
+        let _ = kind;
+        builder.header_capture_open = false;
+    }
+
+    fn handle_no_class_body(&mut self, _semicolon: Token) {
+        self.builder.borrow_mut().header_capture_open = false;
+    }
+
+    fn handle_no_mixin_body(&mut self, _semicolon: Token) {
+        self.builder.borrow_mut().header_capture_open = false;
+    }
+
+    fn handle_no_enum_body(&mut self, _semicolon: Token) {
+        self.builder.borrow_mut().header_capture_open = false;
+    }
+
+    fn handle_no_extension_body(&mut self, _semicolon: Token) {
+        self.builder.borrow_mut().header_capture_open = false;
+    }
+
+    fn handle_no_extension_type_body(&mut self, _semicolon: Token) {
+        self.builder.borrow_mut().header_capture_open = false;
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
@@ -862,7 +1010,6 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             nullable: question.is_some(),
         });
     }
-
     fn handle_no_type(&mut self, _last_consumed: Token) {
         self.builder.borrow_mut().armed_ty = None;
     }
@@ -883,7 +1030,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let name = name_with_range.map(|(name, _)| name);
         match context {
             IdentifierContext::TypeReference | IdentifierContext::TypeReferenceContinuation => {
-                builder.note_header_reference(context, name);
+                let offset = name_with_range.map_or(0, |(_, range)| range.offset);
+                builder.note_header_reference(context, name, offset);
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the
@@ -1370,6 +1518,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             return;
         };
         let ty = builder.take_armed();
+        let required = matches!(
+            kind,
+            FormalParameterKind::RequiredPositional | FormalParameterKind::RequiredNamed
+        );
+        let formal = Formal { name, ty, required };
         if matches!(
             kind,
             FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
@@ -1379,17 +1532,29 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             if builder.named_formals.iter().any(|f| f.name == name) {
                 builder.record_duplicate(name, range);
             } else {
-                builder.named_formals.push(Formal {
-                    name,
-                    ty,
-                    required: kind == FormalParameterKind::RequiredNamed,
-                });
+                builder.named_formals.push(formal);
             }
         } else {
-            builder.positional_formals.push(Formal {
-                name,
-                ty,
-                required: kind == FormalParameterKind::RequiredPositional,
+            builder.positional_formals.push(formal);
+        }
+        // An extension type's primary-constructor formals double as the
+        // representation-field facts (`error_verifier.dart:5340-5460`
+        // reads `formalParameters.first`); the header window keeps body
+        // member formals out.
+        if builder.header_capture_open
+            && builder
+                .containers
+                .last()
+                .is_some_and(|open| open.kind == ContainerKind::ExtensionType)
+        {
+            let open = builder.containers.last_mut().expect("checked above");
+            open.primary_formals.push(RepFormal {
+                formal: Formal {
+                    name,
+                    ty,
+                    required,
+                },
+                name_range: range,
             });
         }
     }
@@ -1770,10 +1935,12 @@ mod tests {
         );
     }
 
-    /// Unnamed extensions keep no top-level name; their members and named
-    /// extensions' members both surface in the instance pool.
+    /// Unnamed extensions keep no top-level name; named and unnamed
+    /// extensions both produce one application face each, carrying the `on`
+    /// type (the applicability anchor) and the members under their lookup
+    /// spellings, static bit preserved.
     #[test]
-    fn merges_extension_members_into_pool() {
+    fn captures_extension_application_faces() {
         let strings = StringTable::new();
         let elements = build(
             "extension Named on int { void nm() {} static int ns = 0; } \
@@ -1784,10 +1951,103 @@ mod tests {
             elements.decl(id(&strings, "Named")).map(|d| d.kind),
             Some(MicroKind::Extension)
         );
-        let pool_member = |name: &str| elements.extension_member(id(&strings, name));
-        assert_eq!(pool_member("nm").map(|m| m.kind), Some(MemberKind::Method));
-        assert_eq!(pool_member("ns").map(|m| m.kind), Some(MemberKind::Field));
-        assert!(pool_member("ns").unwrap().is_static);
-        assert_eq!(pool_member("ue").map(|m| m.kind), Some(MemberKind::Getter));
+        let faces = elements.extension_faces();
+        assert_eq!(faces.len(), 2, "{faces:?}");
+        let named = faces
+            .iter()
+            .find(|f| f.name == Some(id(&strings, "Named")))
+            .expect("named face");
+        assert_eq!(named.on_type, Some(id(&strings, "int")));
+        fn face_member<'a>(
+            face: &'a crate::model::ExtensionFace,
+            name: &str,
+            strings: &StringTable,
+        ) -> Option<&'a crate::model::MemberEntry> {
+            face.members.get(&id(strings, name))
+        }
+        assert_eq!(
+            face_member(named, "nm", &strings).map(|m| m.kind),
+            Some(MemberKind::Method)
+        );
+        assert_eq!(
+            face_member(named, "ns", &strings).map(|m| m.kind),
+            Some(MemberKind::Field)
+        );
+        assert!(face_member(named, "ns", &strings).unwrap().is_static);
+        let unnamed = faces
+            .iter()
+            .find(|f| f.name.is_none())
+            .expect("unnamed face");
+        assert_eq!(unnamed.on_type, Some(id(&strings, "String")));
+        assert_eq!(
+            face_member(unnamed, "ue", &strings).map(|m| m.kind),
+            Some(MemberKind::Getter)
+        );
+    }
+
+    /// The `extends` overflow type (`extends A, B`) is residue
+    /// (`ast_builder.dart:3972-3982` throws the extras away), never an
+    /// `implements` entry — #491 S1, the audit #489 pin shape.
+    #[test]
+    fn extends_overflow_lands_in_residue() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class A {} class B {} class C extends A, B {}",
+            &strings,
+        );
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.superclass, Some(id(&strings, "A")));
+        assert!(c.implements_clause.is_empty(), "{:?}", c.implements_clause);
+        assert_eq!(c.header_residue, vec![id(&strings, "B")]);
+    }
+
+    /// Clause names after their keyword attribute to their clause; the
+    /// overflow before it stays residue. A real `implements` clause still
+    /// captures when an overflow precedes it.
+    #[test]
+    fn clause_events_claim_only_their_own_names() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class A {} class B {} class C {} class D {} \
+             class E extends A, B with C implements D {}",
+            &strings,
+        );
+        let e = elements.container(id(&strings, "E")).expect("E");
+        assert_eq!(e.superclass, Some(id(&strings, "A")));
+        assert_eq!(e.with_clause, vec![id(&strings, "C")]);
+        assert_eq!(e.implements_clause, vec![id(&strings, "D")]);
+        assert_eq!(e.header_residue, vec![id(&strings, "B")]);
+    }
+
+    /// An extension's `on` type latches through the continuation for
+    /// qualified references (`on p.T` keeps `T`).
+    #[test]
+    fn extension_on_type_prefers_the_continuation() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class T {} extension E on p.T { void m() {} }",
+            &strings,
+        );
+        let faces = elements.extension_faces();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].on_type, Some(id(&strings, "T")));
+    }
+
+    /// The extension type's primary-constructor formals are the
+    /// representation-field capture; body members stay out.
+    #[test]
+    fn extension_type_captures_representation_formals() {
+        let strings = StringTable::new();
+        let elements = build(
+            "extension type E(int x) { void m(String y) {} }",
+            &strings,
+        );
+        let e = elements.container(id(&strings, "E")).expect("E");
+        assert_eq!(e.primary_formals.len(), 1, "{:?}", e.primary_formals);
+        let rep = &e.primary_formals[0];
+        assert_eq!(rep.formal.name, id(&strings, "x"));
+        assert_eq!(rep.formal.ty, Ty::named(id(&strings, "int")));
+        assert!(e.members.get(&id(&strings, "m")).is_some());
+        assert!(e.members.get(&id(&strings, "x")).is_none());
     }
 }

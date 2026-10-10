@@ -242,6 +242,42 @@ impl Formals {
     }
 }
 
+/// One representation-field capture of an extension type's primary
+/// constructor (`extension type E(int x)` — the `int x` formal). The
+/// semantic representation checks (`error_verifier.dart:5340-5460`
+/// `_checkForExtensionTypeRepresentationErrorCodes` and the self-reference
+/// check at :5343-5354) read the name, its span, and the declared type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepFormal {
+    /// The formal's facts (name, declared type, required bit).
+    pub formal: Formal,
+    /// Source span of the formal's name token (the emission anchor).
+    pub name_range: SourceRange,
+}
+
+/// One extension declaration's application face: the identity the implicit
+/// member application resolves against (`extension_member_resolver.dart:85-128`
+/// `findExtension` + `applicable_extensions.dart:157-171` `applicableTo`).
+/// Named and unnamed extensions both produce one; extension types do not
+/// (their members surface on the extension type's own container face).
+#[derive(Clone, Debug)]
+pub struct ExtensionFace {
+    /// The declaring extension's name; `None` for an unnamed extension (the
+    /// ambiguity message renders the `on` type instead,
+    /// `extension_member_resolver.dart:119-124`).
+    pub name: Option<StringId>,
+    /// The `on` clause type name as written (a qualified `on p.T` keeps the
+    /// bare `T`, the model's `p.S` convention). `None` when the clause never
+    /// produced an honest name (missing clause recovery, synthetic
+    /// reference) — the face can never apply and its members are suppressed
+    /// from application (the oracle's `extendedType` fails to resolve; an
+    /// inapplicable extension never gates an `undefined_*`).
+    pub on_type: Option<StringId>,
+    /// The extension's members under their lookup spellings (setters under
+    /// `name=`), static bit preserved.
+    pub members: FxHashMap<StringId, MemberEntry>,
+}
+
 /// One class member: kind, static/instance bit, and its executable facts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberEntry {
@@ -293,6 +329,15 @@ pub struct Container {
     /// The `on` constraint names of a mixin, as written (constraint checks,
     /// not supertype edges); empty for every other container kind.
     pub on_clause: Vec<StringId>,
+    /// Header-window type names no clause event claimed: the `extends`
+    /// overflow types the oracle throws away (`ast_builder.dart:3972-3982`
+    /// `handleClassExtends` "throw them away for now and pick the first
+    /// one") and recovery residue. Never consulted as super-faces; hashed
+    /// into the API signature so an L2-relevant edit cannot hide here.
+    pub header_residue: Vec<StringId>,
+    /// An extension type's primary-constructor formals, in declaration
+    /// order (the representation-field family's facts); empty elsewhere.
+    pub primary_formals: Box<[RepFormal]>,
     /// An enum's constants in declaration order (the exhaustiveness
     /// witness order follows it, `types/enum.dart`); empty elsewhere.
     pub enum_constants: Vec<StringId>,
@@ -401,7 +446,7 @@ pub struct FileElements {
     pub(crate) decls: FxHashMap<StringId, TopDecl>,
     pub(crate) containers: FxHashMap<StringId, Container>,
     pub(crate) container_order: Vec<StringId>,
-    pub(crate) extension_members: FxHashMap<StringId, MemberEntry>,
+    pub(crate) extension_faces: Vec<ExtensionFace>,
     pub(crate) duplicates: Vec<DuplicateDecl>,
     pub(crate) arity_violations: Vec<ArityDecl>,
 }
@@ -428,14 +473,25 @@ impl FileElements {
         &self.container_order
     }
 
-    /// The extension-instance member pool entry under `name`: the merged
-    /// member names of every extension of the unit (named and unnamed,
-    /// static bit preserved). Before reporting an instance-scope
-    /// `undefined_*`, check this pool — extension application is name-level
-    /// opaque at M1.
+    /// Every extension application face of the unit, in declaration order
+    /// (named and unnamed extensions; extension types never produce one).
+    /// The implicit-application checks filter by `on` type and report the
+    /// ambiguity over the applicable candidates
+    /// ([`ExtensionFace`]).
     #[must_use]
-    pub fn extension_member(&self, name: StringId) -> Option<&MemberEntry> {
-        self.extension_members.get(&name)
+    pub fn extension_faces(&self) -> &[ExtensionFace] {
+        &self.extension_faces
+    }
+
+    /// Whether any extension face of the unit declares `name` under its
+    /// lookup spelling — the conservative gate for expression-typing paths
+    /// where the receiver type is unknown (the resolve-side analog of the
+    /// old merged pool: any-declaration suppresses, never false-positives).
+    #[must_use]
+    pub fn has_extension_member(&self, name: StringId) -> bool {
+        self.extension_faces
+            .iter()
+            .any(|face| face.members.contains_key(&name))
     }
 
     /// Every top-level declaration with its name, in arbitrary order.

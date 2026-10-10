@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, FileElements, Formal,
-    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace, FileElements,
+    Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
 /// A span projection: `SourceRange`'s two public columns (`SourceRange`
@@ -59,7 +59,7 @@ pub struct PersistedElements {
     /// Container names in declaration order (the exhaustiveness witness
     /// order).
     pub container_order: Vec<u32>,
-    pub extension_members: Vec<(u32, PersistedMemberEntry)>,
+    pub extension_faces: Vec<PersistedExtensionFace>,
     pub duplicates: Vec<PersistedDuplicate>,
     pub arity_violations: Vec<PersistedArity>,
 }
@@ -139,9 +139,30 @@ pub struct PersistedContainer {
     pub with_clause: Vec<u32>,
     pub implements_clause: Vec<u32>,
     pub on_clause: Vec<u32>,
+    pub header_residue: Vec<u32>,
+    pub primary_formals: Vec<PersistedRepFormal>,
     pub enum_constants: Vec<u32>,
     pub constructors: Vec<u32>,
     pub has_unnamed_constructor: bool,
+}
+
+/// One extension application face in payload form (the implicit-application
+/// candidates of the unit, declaration order).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedExtensionFace {
+    pub name: Option<u32>,
+    pub on_type: Option<u32>,
+    pub members: Vec<(u32, PersistedMemberEntry)>,
+}
+
+/// One extension-type representation formal in payload form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRepFormal {
+    pub name: u32,
+    pub ty: PersistedTy,
+    pub required: bool,
+    pub name_offset: u32,
+    pub name_length: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,10 +298,18 @@ impl PersistedElements {
             .map(|(name, container)| (s.id(*name), PersistedContainer::of(container, &mut s)))
             .collect();
         let container_order = s.ids(&elements.container_order);
-        let extension_members = elements
-            .extension_members
+        let extension_faces = elements
+            .extension_faces
             .iter()
-            .map(|(name, entry)| (s.id(*name), s.member(entry)))
+            .map(|face| PersistedExtensionFace {
+                name: face.name.map(|name| s.id(name)),
+                on_type: face.on_type.map(|name| s.id(name)),
+                members: face
+                    .members
+                    .iter()
+                    .map(|(name, entry)| (s.id(*name), s.member(entry)))
+                    .collect(),
+            })
             .collect();
         let duplicates = elements
             .duplicates
@@ -317,7 +346,7 @@ impl PersistedElements {
             decls,
             containers,
             container_order,
-            extension_members,
+            extension_faces,
             duplicates,
             arity_violations,
         }
@@ -345,10 +374,18 @@ impl PersistedElements {
                 .map(|(at, container)| (at_name(at), container.into_container(&ids)))
                 .collect(),
             container_order: self.container_order.iter().map(|&at| at_name(at)).collect(),
-            extension_members: self
-                .extension_members
+            extension_faces: self
+                .extension_faces
                 .into_iter()
-                .map(|(at, entry)| (at_name(at), entry.into_member_entry(&ids)))
+                .map(|face| ExtensionFace {
+                    name: face.name.map(|at| at_name(at)),
+                    on_type: face.on_type.map(|at| at_name(at)),
+                    members: face
+                        .members
+                        .into_iter()
+                        .map(|(at, entry)| (at_name(at), entry.into_member_entry(&ids)))
+                        .collect(),
+                })
                 .collect(),
             duplicates: self
                 .duplicates
@@ -452,6 +489,18 @@ impl PersistedContainer {
             with_clause: s.ids(&container.with_clause),
             implements_clause: s.ids(&container.implements_clause),
             on_clause: s.ids(&container.on_clause),
+            header_residue: s.ids(&container.header_residue),
+            primary_formals: container
+                .primary_formals
+                .iter()
+                .map(|rep| PersistedRepFormal {
+                    name: s.id(rep.formal.name),
+                    ty: s.ty(&rep.formal.ty),
+                    required: rep.formal.required,
+                    name_offset: rep.name_range.offset,
+                    name_length: rep.name_range.length,
+                })
+                .collect(),
             enum_constants: s.ids(&container.enum_constants),
             constructors: s.ids(&container.constructors),
             has_unnamed_constructor: container.has_unnamed_constructor,
@@ -482,6 +531,26 @@ impl PersistedContainer {
                 .map(|&at| ids[at as usize])
                 .collect(),
             on_clause: self.on_clause.iter().map(|&at| ids[at as usize]).collect(),
+            header_residue: self
+                .header_residue
+                .iter()
+                .map(|&at| ids[at as usize])
+                .collect(),
+            primary_formals: self
+                .primary_formals
+                .into_iter()
+                .map(|rep| RepFormal {
+                    formal: Formal {
+                        name: ids[rep.name as usize],
+                        ty: into_ty(rep.ty, ids),
+                        required: rep.required,
+                    },
+                    name_range: SourceRange {
+                        offset: rep.name_offset,
+                        length: rep.name_length,
+                    },
+                })
+                .collect(),
             enum_constants: self
                 .enum_constants
                 .iter()
@@ -618,13 +687,26 @@ mod tests {
                 with_clause: Vec::new(),
                 implements_clause: vec![name("I")],
                 on_clause: Vec::new(),
+                header_residue: vec![name("R")],
+                primary_formals: Box::new([RepFormal {
+                    formal: Formal {
+                        name: name("rep"),
+                        ty: Ty::named(name("int")),
+                        required: true,
+                    },
+                    name_range: range,
+                }]),
                 enum_constants: Vec::new(),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,
             },
         );
         elements.container_order.push(name("C"));
-        elements.extension_members.insert(name("e"), member("e"));
+        elements.extension_faces.push(ExtensionFace {
+            name: Some(name("E")),
+            on_type: Some(name("int")),
+            members: [(name("e"), member("e"))].into_iter().collect(),
+        });
         elements.duplicates.push(DuplicateDecl {
             name: name("d"),
             range,
@@ -652,10 +734,18 @@ mod tests {
         assert_eq!(restored.duplicates, elements.duplicates);
         assert_eq!(restored.arity_violations, elements.arity_violations);
         assert_eq!(restored.container_order, elements.container_order);
-        // Members and the extension pool are inside the hashed face; the
-        // signature check above covers them. Spot-check one map for shape.
+        // Members, the extension faces, and the representation formals are
+        // inside the hashed face; the signature check above covers them.
+        // Spot-check one map for shape.
         let restored_c = restored.container(name("C")).expect("container C");
         assert_eq!(restored_c.members.len(), 2);
         assert!(restored_c.members.contains_key(&name("m=")));
+        let restored_face = &restored.extension_faces[0];
+        assert_eq!(restored_face.name, Some(name("E")));
+        assert_eq!(restored_face.on_type, Some(name("int")));
+        assert_eq!(
+            restored_c.primary_formals[0].formal.name,
+            name("rep")
+        );
     }
 }

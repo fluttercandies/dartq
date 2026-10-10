@@ -56,7 +56,10 @@ use crate::model::{
 /// what [`FileElements::api_signature`] hashes. v1: the initial composition-F
 /// face (#282). v2: constructor selectors + the unnamed flag per container,
 /// and member type-parameter names (#350 — the constructor-undefined faces).
-pub const SIGNATURE_VERSION: u32 = 2;
+/// v3: the header-residue names per container and the extension faces with
+/// their `on` types (#491 S1 + #476 — the clause-attribution fix and the
+/// extension-application faces changed the hashed face).
+pub const SIGNATURE_VERSION: u32 = 3;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -104,7 +107,7 @@ impl FileElements {
         face.uint(u64::from(version));
         face.top_decls(self);
         face.containers(self);
-        face.extension_pool(self);
+        face.extension_faces(self);
         ApiSignature::truncate(&blake3::hash(&face.buf))
     }
 
@@ -319,6 +322,8 @@ impl<'a> Face<'a> {
                 with_clause,
                 implements_clause,
                 on_clause,
+                header_residue,
+                primary_formals,
                 enum_constants,
                 constructors,
                 has_unnamed_constructor,
@@ -352,6 +357,22 @@ impl<'a> Face<'a> {
             for supertype in implements_clause {
                 self.name(*supertype);
             }
+            // The unclaimed header names hash too (L2 honesty: an edit that
+            // only moves a name between a clause and the residue must flip
+            // the gate), sorted by text — residue order is not semantic.
+            Self::sorted(self.strings, &mut self.inner, header_residue.iter().copied());
+            self.usize(self.inner.len());
+            for j in 0..self.inner.len() {
+                self.name(self.inner[j]);
+            }
+            // The representation formals in declaration order (name, type,
+            // required bit) — the extension-type face.
+            self.usize(primary_formals.len());
+            for rep in primary_formals.iter() {
+                self.name(rep.formal.name);
+                self.ty(rep.formal.ty);
+                self.field(if rep.formal.required { "req" } else { "opt" });
+            }
             self.usize(enum_constants.len());
             for constant in enum_constants {
                 self.name(*constant);
@@ -378,15 +399,26 @@ impl<'a> Face<'a> {
         }
     }
 
-    fn extension_pool(&mut self, elements: &FileElements) {
-        Self::sorted(
-            self.strings,
-            &mut self.names,
-            elements.extension_members.keys().copied(),
-        );
-        for i in 0..self.names.len() {
-            let name = self.names[i];
-            self.member("extension-member", name, &elements.extension_members[&name]);
+    /// The extension application faces in declaration order: identity (`E`
+    /// or the unnamed marker), the `on` type, then every member's full shape
+    /// (per-face sorted by text — the face is a hash map).
+    fn extension_faces(&mut self, elements: &FileElements) {
+        self.usize(elements.extension_faces.len());
+        for face in &elements.extension_faces {
+            self.field("extension-face");
+            match face.name {
+                Some(name) => self.name(name),
+                None => self.field("<unnamed>"),
+            }
+            match face.on_type {
+                Some(on_type) => self.name(on_type),
+                None => self.field("no-on-type"),
+            }
+            Self::sorted(self.strings, &mut self.inner, face.members.keys().copied());
+            for j in 0..self.inner.len() {
+                let member_name = self.inner[j];
+                self.member("member", member_name, &face.members[&member_name]);
+            }
         }
     }
 }

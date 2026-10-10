@@ -252,10 +252,10 @@ use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::const_eval::{
     BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, IdentVerdict, UnOp, Verdict, eval,
 };
-use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
+use crate::library::{ElementIndex, ScopedHit, lookup_scoped, owner_library, resolve_container};
 use crate::model::{
-    ArityViolation, Container, ContainerKind, FileElements, Formals, MemberEntry, MemberKind,
-    MicroKind, TopDecl, Ty,
+    ArityViolation, Container, ContainerKind, ExtensionFace, FileElements, Formals, MemberEntry,
+    MemberKind, MicroKind, TopDecl, Ty,
 };
 use dartq_types::{
     Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Witness as EngineWitness,
@@ -712,6 +712,20 @@ enum Walk<'a> {
     ChainBroken,
 }
 
+/// The implicit extension-application outcome for one member access
+/// ([`Engine::extension_application`]).
+enum ExtensionApp {
+    /// No applicable extension declares the member: the `undefined_*` path
+    /// proceeds.
+    None,
+    /// Exactly one applicable extension declares it: the access is defined.
+    Single,
+    /// Two or more applicable extensions declare it and none is more
+    /// specific: `ambiguous_extension_member_access`, with the candidates'
+    /// display pair (element-shape, inline-shape) in face declaration order.
+    Ambiguous(Vec<(String, String)>),
+}
+
 /// A qualified-type prefix awaiting its name (`p` of `p.C`); dead when the
 /// prefix itself already reported and the name must not.
 struct TypePrefix {
@@ -864,6 +878,17 @@ struct Engine<'a> {
     /// The `@` token of the open metadata entry (the
     /// `undefined_annotation` anchor spans `@` through the name).
     annotation_at: Option<SourceRange>,
+    /// The representation checks gate on the primary-constructors feature
+    /// arm (`error_verifier.dart:5425` branches on
+    /// `Feature.primary_constructors`; the expected-representation-type row
+    /// lives in the disabled arm only).
+    primary_constructors_enabled: bool,
+    /// The hop-namespace memo (`(file, probed name)` → the owning library):
+    /// #491 S2a's reverse lookup, cached per probe.
+    owner_libs: RefCell<FxHashMap<(FileId, StringId), Option<LibraryId>>>,
+    /// Extension types whose representation checks already ran this pass
+    /// (one emission per container: an augmentation re-fires the event).
+    reported_extension_types: FxHashSet<StringId>,
     /// The #279 constant-evaluation capture: expression folding while a
     /// const context is open ([`crate::const_eval`]).
     const_capture: ConstCapture,
@@ -940,6 +965,7 @@ impl<'a> Engine<'a> {
         tokens: &'a TokenTable,
         file: FileId,
         lib: LibraryId,
+        primary_constructors_enabled: bool,
     ) -> Self {
         let guard = UndefinedGuard::build(graph, lib);
         let object_members = OBJECT_MEMBERS.map(|m| strings.intern(m));
@@ -1006,7 +1032,29 @@ impl<'a> Engine<'a> {
             arg_gates: Vec::new(),
             enum_element_open: false,
             const_string_begins: Vec::new(),
+            primary_constructors_enabled,
+            owner_libs: RefCell::new(FxHashMap::default()),
+            reported_extension_types: FxHashSet::default(),
         }
+    }
+
+    /// The library whose scope resolves `name` as written in `owner_file`
+    /// (#491 S2a): hop 2+ of a super-face climb resolves through the
+    /// declaring container's library, not the diagnosing one. Memoized per
+    /// `(file, name)` probe — the BFS over the graph edges repeats only for
+    /// distinct probes.
+    fn owner_library_of(&self, owner_file: FileId, name: StringId) -> Option<LibraryId> {
+        if owner_file == self.file {
+            return Some(self.lib);
+        }
+        if let Some(&cached) = self.owner_libs.borrow().get(&(owner_file, name)) {
+            return cached;
+        }
+        let found = owner_library(self.graph, self.lib, owner_file, name);
+        self.owner_libs
+            .borrow_mut()
+            .insert((owner_file, name), found);
+        found
     }
 
     fn intern(&self, name: &str) -> StringId {
@@ -1399,7 +1447,7 @@ impl<'a> Engine<'a> {
         if self
             .index
             .get(self.file)
-            .is_some_and(|f| f.extension_member(name).is_some())
+            .is_some_and(|f| f.has_extension_member(name))
         {
             return BareInfo::Plain { ty: Ty::UNKNOWN };
         }
@@ -1481,12 +1529,26 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Walks `container`'s member face over superclass name edges. Any
-    /// unresolvable hop breaks the chain (external type, unresolvable
-    /// superclass name): the caller suppresses rather than reports.
+    /// Walks `container`'s member face through the linearized supertype
+    /// chain: the container's own members, then its `with` mixins in reverse
+    /// application order (the official application sequence
+    /// `inheritance_manager3.dart:571-579` — `class X extends S with M1, M2`
+    /// is `S&M1 extends S`, `S&M2 extends S&M1`, `X extends S&M2`, so each
+    /// later mixin shadows the earlier ones and the superclass), then the
+    /// superclass name edges. Any unresolvable hop breaks the chain
+    /// (external type, unresolvable superclass name): the caller suppresses
+    /// rather than reports.
     fn walk_members(&self, container: StringId, member: StringId) -> Walk<'a> {
+        self.walk_from(container, member, false)
+    }
+
+    /// The climb behind [`Engine::walk_members`]: `skip_own` starts at the
+    /// container but excludes its own member map (the `super.member` shape —
+    /// the application classes `S&M2` are still the chain).
+    fn walk_from(&self, container: StringId, member: StringId, mut skip_own: bool) -> Walk<'a> {
         let mut name = container;
         let mut owner = self.file;
+        let mut scope_lib = self.lib;
         let mut seen: FxHashSet<StringId> = FxHashSet::default();
         loop {
             if !seen.insert(name) {
@@ -1496,39 +1558,63 @@ impl<'a> Engine<'a> {
                 self.graph,
                 self.namespaces,
                 self.index,
-                self.lib,
+                scope_lib,
                 owner,
                 name,
             ) else {
                 return Walk::ChainBroken;
             };
-            if let Some(entry) = found.members.get(&member) {
+            if !skip_own
+                && let Some(entry) = found.members.get(&member)
+            {
                 return Walk::Found(entry);
             }
-            match found.superclass {
-                Some(superclass) => {
-                    name = superclass;
-                    owner = found_owner;
+            skip_own = false;
+            // The stacked applications, later first: each shadows the members
+            // of the earlier ones and of the superclass. The mixin names are
+            // written in `found_owner` and resolve through that file's
+            // library (probed by the container name it declares, #491 S2a).
+            let owner_lib = self.owner_library_of(found_owner, name).unwrap_or(scope_lib);
+            for mixin in found.with_clause.iter().rev() {
+                if !seen.insert(*mixin) {
+                    return Walk::ChainBroken;
                 }
-                None => return Walk::Missing,
+                let mixin_lib = owner_lib;
+                if let Some(entry) =
+                    resolve_container(self.graph, self.namespaces, self.index, mixin_lib, found_owner, *mixin)
+                        .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+                {
+                    return Walk::Found(entry);
+                }
             }
+            let Some(superclass) = found.superclass else {
+                return Walk::Missing;
+            };
+            // The superclass name is written in the declaring container's
+            // file and resolves through that container's library (#491 S2a).
+            scope_lib = owner_lib;
+            name = superclass;
+            owner = found_owner;
         }
     }
 
-    /// `super.member`: the walk starts at the enclosing container's direct
-    /// superclass (its own members are excluded). A container without a
-    /// captured superclass edge (mixins: `on` constraints are not edges)
-    /// breaks the chain.
+    /// `super.member`: the walk starts at the enclosing container but skips
+    /// its own members — the official `S&M2` superclass chain still applies
+    /// (`super.m` in `class C extends S with M1, M2` resolves M2 over M1
+    /// over S). A container without a captured superclass edge and without
+    /// mixins (mixins: `on` constraints are not edges) breaks the chain.
     fn walk_super(&self, container: StringId, member: StringId) -> Walk<'a> {
-        let Some(superclass) = self
+        let Some(container_decl) = self
             .index
             .get(self.file)
             .and_then(|f| f.container(container))
-            .and_then(|c| c.superclass)
         else {
             return Walk::ChainBroken;
         };
-        self.walk_members(superclass, member)
+        if container_decl.superclass.is_none() && container_decl.with_clause.is_empty() {
+            return Walk::ChainBroken;
+        }
+        self.walk_from(container, member, true)
     }
 
     // —— invalid_override (#453: the inheritance-override family) ——————
@@ -1595,6 +1681,7 @@ impl<'a> Engine<'a> {
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
+        let mut broken_seen: Vec<&MemberEntry> = Vec::new();
         for face in faces {
             let Some((inherited, face_name)) = self.face_member(face, spelling) else {
                 // Unresolvable or cyclic face chain: suppression territory
@@ -1604,7 +1691,17 @@ impl<'a> Engine<'a> {
             if inherited.kind != entry.kind {
                 continue;
             }
+            // The stacked climb can surface one inherited member through
+            // several direct faces (the applied `S&M2` superclass face and
+            // the `M2` face both answer M2's member); the oracle's verdict
+            // per inherited member is one diagnostic.
+            if broken_seen.iter().any(|prior: &&MemberEntry| {
+                std::ptr::eq(*prior, inherited)
+            }) {
+                continue;
+            }
             if Self::override_broken(entry, inherited) {
+                broken_seen.push(inherited);
                 let display = self.strings.resolve(spelling);
                 let display = display.strip_suffix('=').unwrap_or(display);
                 let container_text = self.strings.resolve(container);
@@ -1629,11 +1726,90 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The nearest non-static `spelling` member on `face`'s chain: the face
-    /// container itself, then direct-superclass name edges (each hop
-    /// resolved file-locally first, then through the namespace; the visited
-    /// set guards cycles). `None` = an unresolvable or cyclic hop — the
-    /// caller suppresses rather than reports.
+    // —— extension-type representation (#476) ————————————————————————————
+
+    /// The semantic representation checks for one extension type, mounted at
+    /// the declaration's name event (the element model is complete —
+    /// `collect` parsed before this pass — and the name token anchors the
+    /// type-level emissions; the official dispatch order is
+    /// depends-on-itself first, the name checks last,
+    /// `error_verifier.dart:1184-1193`).
+    ///
+    /// The syntactic representation shapes (missing formals, `this.x`/`super.x`,
+    /// delimiters, function-typed suffixes, modifiers, multiple formals) are
+    /// the parser's (`expected_representation_field` /
+    /// `multiple_representation_fields` / `representation_field_modifier`);
+    /// this side reads the surviving single representation formal.
+    fn check_extension_type(&mut self, container: StringId, name_range: SourceRange) {
+        // One emission per container per pass: an augmentation declaration
+        // re-fires the event for the same container.
+        if !self.reported_extension_types.insert(container) {
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        if decl.kind != ContainerKind::ExtensionType {
+            return;
+        }
+        let Some(rep) = decl.primary_formals.first() else {
+            return;
+        };
+        // The representation can't depend on itself
+        // (`error_verifier.dart:5343-5354`, anchored at the type name). M1
+        // name-level: a direct `E` reference; a generic `List<E>`-shaped
+        // dependency stays an under-report.
+        if rep.formal.ty == Ty::named(container) {
+            self.emit(
+                SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+                name_range,
+                "",
+                "",
+            );
+        }
+        // `_checkForExtensionTypeRepresentationErrorCodes`'s name checks
+        // (:5411-5423, both non-returning): the field may not share the
+        // type's name, nor an `Object` member's.
+        if rep.formal.name == container {
+            self.emit(
+                SemanticCode::MemberWithClassName,
+                rep.name_range,
+                "",
+                "",
+            );
+        } else if self.object_members.contains(&rep.formal.name) {
+            self.emit(
+                SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+                rep.name_range,
+                "",
+                "",
+            );
+        }
+        // The disabled-arm representation-type requirement
+        // (:5449-5452): a typeless representation formal — alongside, not
+        // instead of, the modifier check the parser owns.
+        if rep.formal.ty == Ty::UNKNOWN && !self.primary_constructors_enabled {
+            self.emit(
+                SemanticCode::ExpectedRepresentationType,
+                rep.name_range,
+                "",
+                "",
+            );
+        }
+    }
+
+    /// The nearest non-static `spelling` member on `face`'s linearized
+    /// chain: the face container itself, then its `with` mixins in reverse
+    /// application order (the official superclass face of
+    /// `class C extends S with M1, M2` is the applied `S&M2` interface —
+    /// `inheritance_override.dart:344-351` — so the climb sees M2 over M1
+    /// over S), then direct-superclass name edges (each hop resolved
+    /// file-locally first, then through the declaring container's library,
+    /// #491 S2a; the visited set guards cycles). `None` = an unresolvable or
+    /// cyclic hop — the caller suppresses rather than reports.
     fn face_member(
         &self,
         face: StringId,
@@ -1641,6 +1817,7 @@ impl<'a> Engine<'a> {
     ) -> Option<(&'a MemberEntry, StringId)> {
         let mut name = face;
         let mut owner = self.file;
+        let mut scope_lib = self.lib;
         let mut seen = FxHashSet::default();
         loop {
             if !seen.insert(name) {
@@ -1650,7 +1827,7 @@ impl<'a> Engine<'a> {
                 self.graph,
                 self.namespaces,
                 self.index,
-                self.lib,
+                scope_lib,
                 owner,
                 name,
             )?;
@@ -1659,7 +1836,31 @@ impl<'a> Engine<'a> {
             {
                 return Some((entry, name));
             }
-            name = found.superclass?;
+            // The mixin/superclass names are written in `found_owner` and
+            // resolve through that file's library (probed by the container
+            // name it declares, #491 S2a).
+            let owner_lib = self.owner_library_of(found_owner, name).unwrap_or(scope_lib);
+            for mixin in found.with_clause.iter().rev() {
+                if !seen.insert(*mixin) {
+                    return None;
+                }
+                let mixin_lib = owner_lib;
+                if let Some((mixin_container, _)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    mixin_lib,
+                    found_owner,
+                    *mixin,
+                ) && let Some(entry) = mixin_container.members.get(&spelling)
+                    && !entry.is_static
+                {
+                    return Some((entry, *mixin));
+                }
+            }
+            let superclass = found.superclass?;
+            scope_lib = owner_lib;
+            name = superclass;
             owner = found_owner;
         }
     }
@@ -4075,12 +4276,13 @@ impl<'a> Engine<'a> {
         {
             return; // locally declared: the regular walk already decided
         }
-        if self
-            .index
-            .get(self.file)
-            .is_some_and(|f| f.extension_member(row.name).is_some())
-        {
-            return;
+        match self.extension_application(container, row.name) {
+            ExtensionApp::None => {}
+            ExtensionApp::Single => return,
+            ExtensionApp::Ambiguous(displays) => {
+                self.emit_extension_ambiguity(row.name, row.range, displays);
+                return;
+            }
         }
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
         let name_text = self.strings.resolve(row.name);
@@ -4210,7 +4412,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Runs the walk(s) an access needs and applies the shared suppressions
-    /// (broken chain, extension pool, `Object` members). A write also
+    /// (broken chain, extension application, `Object` members). A write also
     /// accepts the setter spelling (`name=`): a same-named getter, field, or
     /// method suppresses with the oracle's assignment-to-* codes, a setter
     /// defines the write.
@@ -4227,9 +4429,162 @@ impl<'a> Engine<'a> {
         if row.name == self.intern("==") || self.object_members.contains(&row.name) {
             return true;
         }
+        if super_walk {
+            // Extensions do not apply to `super` accesses; the conservative
+            // any-face gate keeps the under-report direction for the
+            // unresolvable-receiver shapes.
+            return self
+                .index
+                .get(self.file)
+                .is_some_and(|f| f.has_extension_member(row.name));
+        }
+        match self.extension_application(container, row.name) {
+            ExtensionApp::None => false,
+            ExtensionApp::Single => true,
+            ExtensionApp::Ambiguous(displays) => {
+                self.emit_extension_ambiguity(row.name, row.range, displays);
+                true
+            }
+        }
+    }
+
+    /// The implicit-application outcome for `member` against a receiver
+    /// whose resolved container is `receiver`
+    /// (`extension_member_resolver.dart:85-128` `findExtension` +
+    /// `applicable_extensions.dart:157-171` `applicableTo`): the same-file
+    /// faces whose `on` type spells the receiver's name and that declare the
+    /// member under its base or setter spelling. A face with an absent or
+    /// unresolvable `on` type never matches a resolved receiver — its
+    /// members are suppressed from application (the oracle's `extendedType`
+    /// fails to resolve; an inapplicable extension never gates an
+    /// `undefined_*`).
+    ///
+    /// Two or more applicable candidates are never separable at the M1 name
+    /// level: `_isMoreSpecific` (`extension_member_resolver.dart:469-513`)
+    /// decides on SDK-ness and subtype relations between the instantiated
+    /// `on` types, and same-named `on` types answer equal — so the access is
+    /// ambiguous by the oracle's definition. The `Ambiguous` payload carries
+    /// the candidates' display pairs (the error path only; `None`/`Single`
+    /// allocate nothing).
+    fn extension_application(&mut self, receiver: StringId, member: StringId) -> ExtensionApp {
+        let setter = self.setter_spelling(member);
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let empty: Vec<ExtensionFace> = Vec::new();
+        let faces = self
+            .index
+            .get(self.file)
+            .map(|f| f.extension_faces())
+            .unwrap_or(&empty);
+        for face in faces {
+            if face.on_type != Some(receiver) {
+                continue;
+            }
+            if face.members.contains_key(&member) || face.members.contains_key(&setter) {
+                if candidates.len() == 1 {
+                    return ExtensionApp::Ambiguous(self.ambiguity_displays(receiver, member));
+                }
+                candidates.push(self.extension_display(face));
+            }
+        }
+        match candidates.len() {
+            0 => ExtensionApp::None,
+            1 => ExtensionApp::Single,
+            _ => ExtensionApp::Ambiguous(candidates),
+        }
+    }
+
+    /// The display pair of one applicable face: the element shape
+    /// (`extension E on C`, the ExtensionElement toString — the official
+    /// two-variant argument, `ambiguous_extension_member_access_test.dart:54`)
+    /// and the resolver's inline shape (`extension 'E'` / `unnamed extension
+    /// on 'C'`, `extension_member_resolver.dart:119-124`).
+    fn extension_display(&self, face: &ExtensionFace) -> (String, String) {
+        let name = face.name.map(|n| self.strings.resolve(n).to_string());
+        let on_type = self
+            .strings
+            .resolve(face.on_type.expect("an applicable face has an on type"))
+            .to_string();
+        let element = match &name {
+            Some(name) => format!("extension {name} on {on_type}"),
+            None => format!("extension on {on_type}"),
+        };
+        let inline = match name {
+            Some(name) => format!("extension '{name}'"),
+            None => format!("unnamed extension on '{on_type}'"),
+        };
+        (element, inline)
+    }
+
+    /// Every applicable candidate's display pair, re-walked in face
+    /// declaration order (the three-or-more error path).
+    fn ambiguity_displays(
+        &mut self,
+        receiver: StringId,
+        member: StringId,
+    ) -> Vec<(String, String)> {
+        let setter = self.setter_spelling(member);
+        let empty: Vec<ExtensionFace> = Vec::new();
         self.index
             .get(self.file)
-            .is_some_and(|f| f.extension_member(row.name).is_some())
+            .map(|f| f.extension_faces())
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|face| {
+                face.on_type == Some(receiver)
+                    && (face.members.contains_key(&member)
+                        || face.members.contains_key(&setter))
+            })
+            .map(|face| self.extension_display(face))
+            .collect()
+    }
+
+    /// Emits the `ambiguous_extension_member_access` verdict for the
+    /// applicable candidates: the two-variant message for exactly two, the
+    /// joined-list variant for more (`diagnostic.g.dart:338-348` for
+    /// three-or-more, :363-374 for two), anchored at the access. The list
+    /// renders per `commaSeparatedWithAnd`
+    /// (`utilities/extensions/string.dart:41-104`): `a and b`, then
+    /// `a, b, and c` from three on.
+    fn emit_extension_ambiguity(
+        &mut self,
+        member: StringId,
+        range: SourceRange,
+        candidates: Vec<(String, String)>,
+    ) {
+        let name_text = self.strings.resolve(member).to_string();
+        let (code, a1, a2) = match candidates.as_slice() {
+            [first, second] => (
+                SemanticCode::AmbiguousExtensionMemberTwo,
+                first.0.clone(),
+                second.0.clone(),
+            ),
+            _ => {
+                let inlines: Vec<String> =
+                    candidates.into_iter().map(|(_, inline)| inline).collect();
+                let list = match inlines.len() {
+                    0 | 1 => inlines.into_iter().next().unwrap_or_default(),
+                    2 => {
+                        let mut it = inlines.into_iter();
+                        format!(
+                            "{} and {}",
+                            it.next().unwrap_or_default(),
+                            it.next().unwrap_or_default()
+                        )
+                    }
+                    _ => {
+                        let last = inlines.last().expect("non-empty above").clone();
+                        let head = &inlines[..inlines.len() - 1];
+                        format!("{}, and {}", head.join(", "), last)
+                    }
+                };
+                (
+                    SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+                    list,
+                    String::new(),
+                )
+            }
+        };
+        self.emit3(code, range, &name_text, &a1, &a2);
     }
 
     /// Whether the plain member walk finds `member` on `container`.
@@ -4770,7 +5125,15 @@ pub fn diagnose(
     index: &ElementIndex,
 ) -> FileReport {
     let engine = Rc::new(RefCell::new(Engine::new(
-        graph, namespaces, index, strings, source, tokens, file, lib,
+        graph,
+        namespaces,
+        index,
+        strings,
+        source,
+        tokens,
+        file,
+        lib,
+        features.primary_constructors_enabled,
     )));
     let flow = Rc::new(RefCell::new(Flow::new(tokens, source)));
     let mut parser = Parser::new(
@@ -4994,7 +5357,13 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        let name_range = name.range;
         let name = engine.name_of(name);
+        // The representation checks read the element model (complete since
+        // `collect`) and anchor at this name token.
+        if let Some(name) = name {
+            engine.check_extension_type(name, name_range);
+        }
         engine.push_container_frame(ContainerKind::Extension, name);
     }
 
@@ -10734,4 +11103,502 @@ mod tests {
         let report = report("void f(c) { if (c) { return; } 1; }");
         assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
+
+    // —— #491 S1: header-window attribution —————————————————————————————
+
+    /// The audit #489 pin: `extends A, B` reports only the parser's
+    /// `multiple_extends` (not in this pass's report); `B` is residue, so
+    /// `C.f` never checks against it and no dartq-only `invalid_override`
+    /// fires (`ast_builder.dart:3972-3982` throws the overflow away).
+    ///
+    /// Hand-trace: `B` reaches the buffer after `A` latched the superclass;
+    /// `handle_implements(None, 0)` claims nothing, so `B` lands in
+    /// `header_residue` — `check_override`'s face list never sees it.
+    #[test]
+    fn extends_overflow_is_never_a_super_face() {
+        let report = report(
+            "class int {} class A {} class B { void f(int x) {} } \
+             class C extends A, B { void f() {} }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// A named mixin application's `implements` names wait for the parser's
+    /// real `handle_implements(Some, count)` emission (ticket #460, parser
+    /// lane): until it lands they are residue and the interface edge
+    /// under-reports. Kept as the cross-lane pin — expected red until #460
+    /// lands, never worked around here.
+    #[test]
+    #[ignore = "named-mixin-application handle_implements emission lands with #460 (parser lane)"]
+    fn named_mixin_application_implements_capture() {
+        let strings = StringTable::new();
+        let source = "class S {} mixin M {} class I {} class C = S with M implements I;";
+        let file = FileTable::new().intern(Path::new("nma.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let elements = collect(
+            source,
+            &scanned.tokens,
+            ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+                LanguageVersion::new(3, 15),
+            )),
+            &strings,
+        );
+        let intern = |text: &str| strings.intern(text);
+        let c = elements.container(intern("C")).expect("container C");
+        assert_eq!(
+            c.implements_clause,
+            vec![intern("I")],
+            "the interface edge must attribute to the implements clause"
+        );
+    }
+
+    /// A three-file hop resolves the superclass name in the declaring
+    /// container's library (the oracle climbs the declaring library's scope
+    /// chain, not the diagnosing one): `S` lives in n2 and extends n3's `T`;
+    /// the diagnosing library imports n1's conflicting `T`. The climb must
+    /// reach n3's `T.m(int)` — arity-broken against `C.m()` — not n1's
+    /// compatible `T.m()`.
+    ///
+    /// Hand-trace: hop 1 `S` resolves through main's import face to n2's
+    /// file; hop 2 probes the library whose locals declare `T` in n2's file —
+    /// n3's — and resolves its `T` through n3's namespace.
+    #[test]
+    fn superclass_hop_resolves_in_the_declaring_library() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let sources = [
+            ("n1.dart", "class T { void m() {} }"),
+            ("n3.dart", "class int {} class T { void m(int x) {} }"),
+            ("n2.dart", "import 'n3.dart'; class S extends T {}"),
+            (
+                "main.dart",
+                "import 'n1.dart'; import 'n2.dart'; class C extends S { void m() {} }",
+            ),
+        ];
+        let mut index = ElementIndex::default();
+        let mut tokens_by_file = Vec::new();
+        for (path, source) in sources {
+            let file = files.intern(Path::new(path));
+            let scanned = dartq_scanner::scan(
+                source,
+                ScanConfig {
+                    enable_triple_shift: true,
+                    enable_augmentations: true,
+                },
+                file,
+            );
+            assert!(scanned.diagnostics.is_empty(), "{path}");
+            let elements = collect(source, &scanned.tokens, features, &strings);
+            index.insert(file, elements);
+            tokens_by_file.push(scanned.tokens);
+        }
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let n1 = builder.intern("package:t/n1.dart");
+        let n3 = builder.intern("package:t/n3.dart");
+        let n2 = builder.intern("package:t/n2.dart");
+        let main = builder.intern("package:t/main.dart");
+        for (at, (path, _source)) in sources.iter().enumerate() {
+            let lib = match at {
+                0 => n1,
+                1 => n3,
+                2 => n2,
+                _ => main,
+            };
+            let file = files.intern(Path::new(path));
+            let elements = collect(sources[at].1, &tokens_by_file[at], features, &strings);
+            for (name, decl) in elements.declarations() {
+                if decl.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(lib, name, file);
+            }
+        }
+        builder.import(
+            n2,
+            ImportEdge {
+                target: Some(n3),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        builder.import(
+            main,
+            ImportEdge {
+                target: Some(n1),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        builder.import(
+            main,
+            ImportEdge {
+                target: Some(n2),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let main_file = files.intern(Path::new("main.dart"));
+        let report = diagnose(
+            sources[3].1,
+            &tokens_by_file[3],
+            features,
+            &strings,
+            main_file,
+            main,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// One applicable extension defines the access; the same-named member of
+    /// a *non-applicable* extension does not (the applicability filter —
+    /// `applicable_extensions.dart:157-171` gates on the receiver type, so
+    /// an extension `on` another type never suppresses an `undefined_*`).
+    ///
+    /// Hand-trace: `E.on_type == "int"` never matches the resolved `C`
+    /// receiver; the flat-pool predecessor suppressed this report.
+    #[test]
+    fn inapplicable_extension_member_reports_undefined() {
+        let report = report(
+            "class int {} class C {} extension E on int { void m() {} } \
+             void main() { C().m(); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_method"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A single applicable extension defines the access silently.
+    #[test]
+    fn single_applicable_extension_defines_the_access() {
+        let report = report(
+            "class C {} extension E on C { void m() {} } \
+             void main() { C().m(); C().m2; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// Two applicable extensions both declaring the member report
+    /// `ambiguous_extension_member_access` once (the two-candidate message
+    /// text; `diagnostic.g.dart:363-374`) — and the access counts as
+    /// resolved, so no `undefined_method` stacks on top.
+    ///
+    /// Hand-trace: both faces carry `on_type == "C"`; `_isMoreSpecific`
+    /// cannot separate same-`on`-type candidates at the M1 name level.
+    #[test]
+    fn two_applicable_extensions_report_the_ambiguity() {
+        let report = report(
+            "class C {} extension E1 on C { void m() {} } \
+             extension E2 on C { void m() {} } \
+             void main() { C().m(); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["ambiguous_extension_member_access"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A member named 'm' is defined in 'extension E1 on C' and 'extension E2 on C', and neither is more specific."
+        );
+    }
+
+    /// Three or more candidates take the joined-list variant with the
+    /// `commaSeparatedWithAnd` rendering
+    /// (`utilities/extensions/string.dart:41-104`: Oxford 'and'), including
+    /// the unnamed-extension display.
+    #[test]
+    fn three_applicable_extensions_use_the_list_variant() {
+        let report = report(
+            "class C {} extension E1 on C { void m() {} } \
+             extension E2 on C { void m() {} } \
+             extension on C { void m() {} } \
+             void main() { C().m(); }",
+        );
+        assert_eq!(code_names(&report), ["ambiguous_extension_member_access"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A member named 'm' is defined in extension 'E1', extension 'E2', and unnamed extension on 'C', and none are more specific."
+        );
+    }
+
+    /// The on-type's own member wins: interface members precede extension
+    /// application (`findExtension` runs only after the interface lookup
+    /// misses), so no ambiguity fires against an extension on the same type.
+    #[test]
+    fn own_member_shadows_the_applicable_extensions() {
+        let report = report(
+            "class int {} class String {} class C { void m() {} } \
+             extension E1 on C { void m(int x) {} } \
+             extension E2 on C { void m(String x) {} } \
+             void main() { C().m(); }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// An unresolved `on` type suppresses the face from application
+    /// entirely: `extension E on Undefined` never gates an `undefined_*`
+    /// (the oracle's `extendedType` fails to resolve), while the type
+    /// reference itself reports.
+    #[test]
+    fn unresolved_on_type_suppresses_the_face() {
+        let report = report(
+            "extension E on Undefined { void m() {} } \
+             class C {} void main() { C().m(); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_class", "undefined_method"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A setter-only extension gates a write through the setter spelling
+    /// (`havingMemberWithBaseName` couples the field's getter/setter pair;
+    /// `applicable_extensions.dart:104-115`).
+    #[test]
+    fn setter_only_extension_defines_the_write() {
+        let report = report(
+            "class int {} class C {} extension E on C { set s(int v) {} } \
+             void main() { C().s = 1; }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// Extension-type members are not implicit-application candidates: the
+    /// face set holds plain extensions only, so an unrelated class's access
+    /// reports (the old merged pool suppressed it), while the extension
+    /// type's own receiver still resolves through its container face.
+    #[test]
+    fn extension_type_members_stay_out_of_the_faces() {
+        let miss = report(
+            "class int {} extension type T(int x) { void m() {} } \
+             class C {} void main() { C().m(); }",
+        );
+        assert_eq!(
+            code_names(&miss),
+            ["undefined_method"],
+            "{:?}",
+            code_names(&miss)
+        );
+        let hit = report(
+            "class int {} extension type T(int x) { void m() {} } \
+             void main() { T(1).m(); }",
+        );
+        assert!(code_names(&hit).is_empty(), "{:?}", code_names(&hit));
+    }
+
+    // —— #476 item 2: extension-type representation ———————————————————————
+
+    /// The representation field sharing the extension type's name reports
+    /// `member_with_class_name` at the field's name
+    /// (`error_verifier.dart:5411-5413`).
+    #[test]
+    fn representation_named_like_the_type_reports() {
+        let report = report("class int {} extension type E(int E) {}");
+        assert_eq!(
+            code_names(&report),
+            ["member_with_class_name"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A class member can't have the same name as the enclosing class."
+        );
+    }
+
+    /// The representation field named like an `Object` member reports
+    /// `extension_type_declares_member_of_object`
+    /// (`error_verifier.dart:5416-5423`).
+    #[test]
+    fn representation_named_like_an_object_member_reports() {
+        let report = report("class int {} extension type E(int hashCode) {}");
+        assert_eq!(
+            code_names(&report),
+            ["extension_type_declares_member_of_object"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Extension types can't declare members with the same name as a member declared by 'Object'."
+        );
+    }
+
+    /// A representation field typed with the extension type itself reports
+    /// `extension_type_representation_depends_on_itself` at the type's name
+    /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation
+    /// covers direct references — `List<E>` shapes stay an under-report).
+    #[test]
+    fn self_referential_representation_reports() {
+        let report = report("extension type E(E x) {}");
+        assert_eq!(
+            code_names(&report),
+            ["extension_type_representation_depends_on_itself"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The extension type representation can't depend on itself."
+        );
+    }
+
+    /// A clean representation emits nothing from the semantic side, and the
+    /// 3.15 language version runs the official primary-constructors-enabled
+    /// arm (`enabled_in: 3.13`), where the typeless-representation row is
+    /// deliberately absent (`error_verifier.dart:5425` feature branch).
+    #[test]
+    fn clean_representation_stays_silent() {
+        let clean = report("class int {} extension type E(int x) {}");
+        assert!(code_names(&clean).is_empty(), "{:?}", code_names(&clean));
+        let typeless = report("class int {} extension type E(it) {}");
+        assert!(
+            code_names(&typeless).is_empty(),
+            "{:?}",
+            code_names(&typeless)
+        );
+    }
+
+    // —— #476 item 3: the mixin application chain —————————————————————————
+
+    /// A mixin-only member resolves through the stacked application:
+    /// `C().m()` finds `M1.m` even though the superclass chain lacks it (the
+    /// flat predecessor walked the superclass only and reported).
+    #[test]
+    fn mixin_application_member_resolves() {
+        let report = report(
+            "class B {} mixin M1 { void m() {} } \
+             class C extends B with M1 {} \
+             void main() { C().m(); }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// Later applications win: with `M1.m: int` and `M2.m: String` fields,
+    /// the `m` read resolves M2's `String` — proven by the return-type
+    /// mismatch against an `int` host (`inheritance_manager3.dart:571-579`:
+    /// each mixin replaces the members of the interface).
+    #[test]
+    fn later_mixin_application_wins() {
+        let report = report(
+            "class B {} class int {} class String {} \
+             mixin M1 { int m = 1; } \
+             mixin M2 { String m = ''; } \
+             class C extends B with M1, M2 { int f() { return m; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["return_of_invalid_type"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'String' can't be returned from the method 'f' because it has a return type of 'int'."
+        );
+    }
+
+    /// With the later mixin lacking the member, the earlier one's surfaces
+    /// through the application chain (`M1` over `S`) — the read resolves
+    /// M1's `int` field, so the `int` host stays clean.
+    #[test]
+    fn earlier_mixin_member_surfaces_through_the_chain() {
+        let report = report(
+            "class B {} class int {} class String {} \
+             mixin M1 { int m = 1; } \
+             mixin M2 { void other() {} } \
+             class C extends B with M1, M2 { int f() { return m; } }",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// `super.member` walks the applied chain too: `super.h()` in
+    /// `class C extends B with M1` resolves M1's `h` (the official
+    /// superclass of `C` is the application `B&M1`,
+    /// `inheritance_override.dart:344-351`).
+    #[test]
+    fn super_walk_sees_the_stacked_chain() {
+        let report = report(
+            "class B {} mixin M1 { void h() {} } \
+             class C extends B with M1 { void f() { super.h(); } }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The override check sees the stacked winner: `C.m()` is arity-broken
+    /// against `M2.m(int)` (the interface winner per
+    /// `inheritance_manager3.dart:571-579`) — reported once for the stacked
+    /// superclass face (the same inherited entry, pointer-deduped). The
+    /// separate `B.m(int)` and `M2.m(int)` face entries are distinct
+    /// declarations and keep the oracle's per-superinterface loop shape
+    /// (#453), so the total stays at the incumbent two; `M1`'s own `m()` is
+    /// a valid override and never reports.
+    #[test]
+    fn override_check_reports_the_stacked_winner() {
+        let report = report(
+            "class int {} class B { void m(int x) {} } \
+             mixin M1 { void m() {} } \
+             mixin M2 { void m(int x) {} } \
+             class C extends B with M1, M2 { void m() {} }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_override", "invalid_override"],
+            "{:?}",
+            code_names(&report)
+        );
+        // The stacked face's report names the interface winner.
+        let stacked = report
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("M2.m"))
+            .expect("the stacked winner's report");
+        assert!(
+            stacked
+                .message
+                .starts_with("'C.m' ('void Function()') isn't a valid override of 'M2.m'"),
+            "{}",
+            stacked.message
+        );
+    }
 }
+
