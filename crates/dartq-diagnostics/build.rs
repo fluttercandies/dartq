@@ -8,8 +8,8 @@
 //! reproducible byte-for-byte.
 //!
 //! The table is also pinned against the oracle registry snapshot
-//! (`data/oracle-syntax-registry-3.13.1.txt`): every ParserErrorCode /
-//! ScannerErrorCode code the pinned 3.13.1 oracle can emit must exist in the
+//! (`data/oracle-syntax-registry-3.13.1.txt`): every `ParserErrorCode` /
+//! `ScannerErrorCode` code the pinned 3.13.1 oracle can emit must exist in the
 //! TSV unless it is an exempted measured-dead code — a missing name fails the
 //! build, so the gate's acceptance set can never silently shrink below the
 //! oracle's emit domain.
@@ -149,8 +149,8 @@ fn validate(rows: &[Row]) {
     );
 }
 
-/// Coverage pin against the pinned oracle registry: every ParserErrorCode /
-/// ScannerErrorCode code of analyzer-8.4.1 + _fe_analyzer_shared-91.0.0
+/// Coverage pin against the pinned oracle registry: every `ParserErrorCode` /
+/// `ScannerErrorCode` code of analyzer-8.4.1 + _fe_analyzer_shared-91.0.0
 /// (`data/oracle-syntax-registry-3.13.1.txt`) must exist in the TSV unless it
 /// is an exempted measured-dead code. A missing name means the gate's
 /// acceptance set would silently drop every oracle diagnostic carrying it; a
@@ -183,21 +183,22 @@ fn pin_to_oracle_registry(manifest_dir: &Path, rows: &[Row]) {
             continue;
         }
         assert!(
-            line.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            line.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
             "data/oracle-syntax-registry-3.13.1.txt:{}: expected a lowercase snake_case \
              code name, got {line:?}",
             no + 1
         );
-        if !exempted.remove(line) && !tsv_names.contains(line) {
-            panic!(
-                "data/oracle-syntax-registry-3.13.1.txt:{}: oracle registry code `{line}` \
-                 is missing from data/syntax-codes.tsv — the gate's acceptance set would \
-                 silently drop every oracle diagnostic carrying it; add the row (with its \
-                 source class and captured template) or extend EXEMPTED_REGISTRY_CODES \
-                 with a recorded rationale",
-                no + 1
-            );
-        }
+        let gated = exempted.remove(line) || tsv_names.contains(line);
+        assert!(
+            gated,
+            "data/oracle-syntax-registry-3.13.1.txt:{}: oracle registry code `{line}` \
+             is missing from data/syntax-codes.tsv — the gate's acceptance set would \
+             silently drop every oracle diagnostic carrying it; add the row (with its \
+             source class and captured template) or extend EXEMPTED_REGISTRY_CODES \
+             with a recorded rationale",
+            no + 1
+        );
     }
     if !exempted.is_empty() {
         let mut stale: Vec<&str> = exempted.into_iter().collect();
