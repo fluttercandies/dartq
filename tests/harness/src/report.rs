@@ -823,9 +823,10 @@ mod tests {
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
-        // Gate face: ERROR-only, both sides reduce to the one shared key -> pass
+        // Gate face: ERROR-only. Oracle keeps its one ERROR key; the dartq
+        // side has no ERROR tier (both its entries are WARNING) -> 0.
         assert_eq!(parsed["oracle_total"], 1);
-        assert_eq!(parsed["dartq_total"], 1);
+        assert_eq!(parsed["dartq_total"], 0);
         assert_eq!(parsed["passed"], true);
 
         // Pointer matches the persisted raw file

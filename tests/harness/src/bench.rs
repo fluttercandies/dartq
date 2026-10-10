@@ -25,6 +25,16 @@
 //!   with a pluggable [`Tokenizer`] (v1: the `chars-per-4` heuristic; a real
 //!   BPE such as cl100k slots in behind the same trait). Reports both totals
 //!   and the savings ratio.
+//! - `plugin-overhead`: the cost the plugin subsystem adds per analyze cycle
+//!   (M4, PRD §14) — per-cycle wall time of one feed+drain round trip
+//!   against a live plugin host (the `samples/compat` compatibility plugin,
+//!   launched through the daemon's `dart <entrypoint>` path) and the plugin
+//!   sidecar's peak RSS (the runtime's own monitor): the "with plugins" side
+//!   of the with/without comparison, since a run without plugins has no
+//!   sidecar process. Per-cycle time includes the runtime's reply-burst
+//!   settle window (the drain face's contract: the burst is handed over
+//!   whole, so each cycle pays one quiet window, `BURST_SETTLE` in
+//!   `dartq-plugin`).
 //!
 //! Every report carries `schema_version: 1` and its full input set (corpus
 //! dir, LOC definition, tokenizer id, sample counts, commands) for PRD §19.5
@@ -40,6 +50,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
+use dartq_plugin::{Manifest, PluginDiagnostic, PluginRuntime, SpawnSpec};
+use dartq_source::{FileId, FileTable};
 use serde::{Deserialize, Serialize};
 
 use crate::Outcome;
@@ -58,8 +71,23 @@ const DEFAULT_RSS_INTERVAL_MS: u64 = 50;
 /// `/bin/ps`, absolute: the sampler must not depend on PATH (a hijacked or
 /// missing ps would silently produce zero samples and a fake low peak).
 const PS: &str = "/bin/ps";
-const METRICS: [&str; 3] = ["rss-100k", "incremental-p95", "token-cost"];
+const METRICS: [&str; 4] = ["rss-100k", "incremental-p95", "token-cost", "plugin-overhead"];
 pub(crate) const SCHEMA_VERSION: u32 = 1;
+
+/// The plugin the `plugin-overhead` axis drives: the compatibility sample (a
+/// real plugin directory with its `dartq_plugin.json` manifest), launched
+/// through the same `dart <entrypoint>` path the daemon's discovery uses.
+const DEFAULT_PLUGIN_DIR: &str = "crates/dartq-plugin-host/samples/compat";
+/// Measured analyze cycles of feed + drain per run.
+const DEFAULT_PLUGIN_CYCLES: usize = 50;
+/// Measurement-validity drain budget for one feed+drain cycle: a warm plugin
+/// answers in milliseconds; missing it fails the metric instead of reporting
+/// numbers off a stalled host.
+const PLUGIN_DRAIN: Duration = Duration::from_secs(5);
+/// The synthesized engine batch: deterministic rows spread over a fixed file
+/// set (the plugin emits one finding per row on a `.dart` file).
+const PLUGIN_BATCH_ROWS: usize = 64;
+const PLUGIN_BATCH_FILES: usize = 8;
 
 /// LOC definition recorded verbatim in every report that divides by LOC.
 const LOC_DEFINITION: &str = "non-blank lines (at least one non-whitespace \
@@ -82,6 +110,11 @@ pub(crate) struct BenchOptions {
     /// incremental-p95: also capture one full `dart analyze` wall time per
     /// step into `oracle_duration_ms`.
     with_oracle: bool,
+    /// plugin-overhead: the plugin directory to drive (its
+    /// `dartq_plugin.json` manifest is loaded from it).
+    plugin_dir: PathBuf,
+    /// plugin-overhead: measured feed+drain cycles.
+    plugin_cycles: usize,
 }
 
 impl BenchOptions {
@@ -95,6 +128,8 @@ impl BenchOptions {
             oracle_dart: "dart".to_string(),
             rss_interval_ms: DEFAULT_RSS_INTERVAL_MS,
             with_oracle: false,
+            plugin_dir: PathBuf::from(DEFAULT_PLUGIN_DIR),
+            plugin_cycles: DEFAULT_PLUGIN_CYCLES,
         };
         let mut i = 0;
         while i < args.len() {
@@ -117,6 +152,16 @@ impl BenchOptions {
                         })?;
                 }
                 "--with-oracle" => opts.with_oracle = true,
+                "--plugin-dir" => opts.plugin_dir = crate::value(args, &mut i)?.into(),
+                "--plugin-cycles" => {
+                    opts.plugin_cycles = crate::value(args, &mut i)?
+                        .parse()
+                        .ok()
+                        .filter(|cycles| *cycles > 0)
+                        .ok_or_else(|| {
+                            Outcome::Error("--plugin-cycles must be an integer > 0".into())
+                        })?;
+                }
                 other => return Err(crate::unknown_flag(other, "bench")),
             }
             i += 1;
@@ -461,6 +506,35 @@ struct TokenMeta {
     oracle_cmd: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct PluginOverheadReport {
+    meta: PluginOverheadMeta,
+    /// One wall-time entry (ms) per measured feed+drain cycle, in run order.
+    round_trip_ms: Vec<f64>,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    /// The plugin sidecar process's peak resident set (the runtime's own
+    /// RSS monitor, `VmHWM`/`proc_pid_rusage`): the incremental memory cost
+    /// of having the plugin loaded — with no plugin loaded there is no
+    /// sidecar and the delta is zero.
+    plugin_peak_rss_kib: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct PluginOverheadMeta {
+    schema_version: u32,
+    metric: String,
+    epoch_seconds: u64,
+    /// The plugin directory driven (manifest + entrypoint live there).
+    plugin_dir: String,
+    cycles: usize,
+    batch_rows: usize,
+    batch_files: usize,
+    /// Measurement-validity drain budget per cycle.
+    drain_budget_ms: u64,
+}
+
 /// Unix epoch seconds (std-only reporting; no calendar dependency).
 fn epoch_seconds() -> u64 {
     SystemTime::now()
@@ -657,15 +731,23 @@ pub(crate) fn bench_entry(args: &[String]) -> Result<(String, bool), Outcome> {
             "--metric incremental-p95 requires --manifest PATH (the edit manifest)".into(),
         ));
     }
-    let corpus = crate::canonical_corpus(&opts.corpus_dir)?;
-    corpus::check_language_version(&corpus).map_err(Outcome::Error)?;
+    // plugin-overhead drives a plugin process, not the corpus: the corpus
+    // preflight runs only when a corpus metric was selected.
+    let corpus = if metrics.iter().any(|m| *m != "plugin-overhead") {
+        let corpus = crate::canonical_corpus(&opts.corpus_dir)?;
+        corpus::check_language_version(&corpus).map_err(Outcome::Error)?;
+        Some(corpus)
+    } else {
+        None
+    };
 
     let mut lines = Vec::new();
     for metric in metrics {
         let line = match metric {
-            "rss-100k" => metric_rss(&opts, &corpus)?,
-            "incremental-p95" => metric_incremental(&opts, &corpus)?,
-            "token-cost" => metric_tokens(&opts, &corpus)?,
+            "rss-100k" => metric_rss(&opts, corpus.as_ref().expect("preflighted"))?,
+            "incremental-p95" => metric_incremental(&opts, corpus.as_ref().expect("preflighted"))?,
+            "token-cost" => metric_tokens(&opts, corpus.as_ref().expect("preflighted"))?,
+            "plugin-overhead" => metric_plugin_overhead(&opts)?,
             other => return Err(Outcome::Error(format!("unhandled metric `{other}`"))),
         };
         lines.push(line);
@@ -901,6 +983,122 @@ fn metric_tokens(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> 
         tokenizer.id(),
         path.display()
     ))
+}
+
+/// `plugin-overhead`: the cost the plugin subsystem adds per analyze cycle —
+/// the wall time of one feed+drain round trip against a live plugin host
+/// (the `compat` sample by default), plus the sidecar process's peak RSS:
+/// the "with plugins" side of the with/without comparison, since a run
+/// without plugins has no sidecar and pays nothing.
+fn metric_plugin_overhead(opts: &BenchOptions) -> Result<String, Outcome> {
+    let manifest = Manifest::from_path(&opts.plugin_dir.join("dartq_plugin.json"))
+        .map_err(|e| Outcome::Error(format!("loading the plugin manifest: {e}")))?;
+    let mut runtime = PluginRuntime::spawn(SpawnSpec::dart(&opts.plugin_dir, manifest))
+        .map_err(|e| Outcome::Error(format!("spawning the plugin host: {e}")))?;
+
+    let (batch, files) = synthesized_batch();
+    // One unmeasured warmup cycle: the first JIT-compiled pass would skew
+    // the per-cycle distribution.
+    let expected_rows = format!(
+        "plugin emitted the wrong number of findings for a {PLUGIN_BATCH_ROWS}-row batch"
+    );
+    if drive_cycle(&mut runtime, &batch, &files)?.len() != PLUGIN_BATCH_ROWS {
+        return Err(Outcome::Error(expected_rows));
+    }
+
+    let mut round_trip_ms = Vec::with_capacity(opts.plugin_cycles);
+    for _ in 0..opts.plugin_cycles {
+        let started = Instant::now();
+        let rows = drive_cycle(&mut runtime, &batch, &files)?;
+        round_trip_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        if rows.len() != PLUGIN_BATCH_ROWS {
+            return Err(Outcome::Error(expected_rows));
+        }
+    }
+    let stats = runtime.stats();
+    runtime
+        .shutdown()
+        .map_err(|e| Outcome::Error(format!("plugin shutdown failed: {e}")))?;
+
+    let p50_ms = percentile(round_trip_ms.clone(), 50.0).unwrap_or_default();
+    let p95_ms = percentile(round_trip_ms.clone(), 95.0).unwrap_or_default();
+    let p99_ms = percentile(round_trip_ms.clone(), 99.0).unwrap_or_default();
+    let report = PluginOverheadReport {
+        meta: PluginOverheadMeta {
+            schema_version: SCHEMA_VERSION,
+            metric: "plugin-overhead".to_string(),
+            epoch_seconds: epoch_seconds(),
+            plugin_dir: opts.plugin_dir.display().to_string(),
+            cycles: opts.plugin_cycles,
+            batch_rows: PLUGIN_BATCH_ROWS,
+            batch_files: PLUGIN_BATCH_FILES,
+            drain_budget_ms: u64::try_from(PLUGIN_DRAIN.as_millis()).unwrap_or(u64::MAX),
+        },
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        round_trip_ms,
+        plugin_peak_rss_kib: stats.peak_rss_bytes / 1024,
+    };
+    let path = write_report("plugin-overhead", &opts.out, &report)?;
+    let p50 = report.p50_ms;
+    let p95 = report.p95_ms;
+    let p99 = report.p99_ms;
+    Ok(format!(
+        "plugin-overhead: {} feed+drain cycles over {} rows ({} files) | \
+         p50 {p50:.1}ms p95 {p95:.1}ms p99 {p99:.1}ms | plugin peak RSS {} KiB -> {}",
+        report.meta.cycles,
+        report.meta.batch_rows,
+        report.meta.batch_files,
+        report.plugin_peak_rss_kib,
+        path.display()
+    ))
+}
+
+/// One analyze cycle against the plugin: push the engine batch, wait for its
+/// findings. The drain budget is a measurement-validity gate — a warm plugin
+/// answers in milliseconds, so a miss fails the metric instead of reporting
+/// numbers off a stalled host.
+fn drive_cycle(
+    runtime: &mut PluginRuntime,
+    batch: &[Diagnostic],
+    files: &FileTable,
+) -> Result<Vec<PluginDiagnostic>, Outcome> {
+    runtime
+        .feed(batch, files)
+        .map_err(|e| Outcome::Error(format!("plugin feed failed: {e}")))?;
+    runtime
+        .wait_diagnostics(PLUGIN_DRAIN)
+        .map_err(|e| Outcome::Error(format!("plugin drain failed: {e}")))
+}
+
+/// The deterministic engine batch: [`PLUGIN_BATCH_ROWS`] diagnostics spread
+/// round-robin over [`PLUGIN_BATCH_FILES`] `.dart` files.
+fn synthesized_batch() -> (Vec<Diagnostic>, FileTable) {
+    let mut files = FileTable::new();
+    let paths: Vec<FileId> = (0..PLUGIN_BATCH_FILES)
+        .map(|i| {
+            files.intern(Path::new(&format!(
+                "lib/plugin_overhead_{i}.dart"
+            )))
+        })
+        .collect();
+    let batch = (0..PLUGIN_BATCH_ROWS)
+        .map(|i| {
+            Diagnostic::new(
+                Severity::Warning,
+                URI_DOES_NOT_EXIST,
+                "plugin overhead batch row",
+                paths[i % PLUGIN_BATCH_FILES],
+                SourceRange {
+                    offset: u32::try_from(i * 8).unwrap_or(u32::MAX),
+                    length: 4,
+                },
+                None,
+            )
+        })
+        .collect();
+    (batch, files)
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,12 +1390,16 @@ mod tests {
         assert_eq!(defaults.rss_interval_ms, DEFAULT_RSS_INTERVAL_MS);
         assert!(!defaults.with_oracle);
         assert!(defaults.manifest.is_none());
+        assert_eq!(defaults.plugin_dir, PathBuf::from(DEFAULT_PLUGIN_DIR));
+        assert_eq!(defaults.plugin_cycles, DEFAULT_PLUGIN_CYCLES);
 
         let opts = BenchOptions::parse(&args(&[
             "--metric",
             "RSS-100K",
             "--metric",
             "token-cost",
+            "--metric",
+            "PLUGIN-OVERHEAD",
             "--rss-interval-ms",
             "10",
             "--with-oracle",
@@ -1205,12 +1407,21 @@ mod tests {
             "m.json",
             "--out",
             "o",
+            "--plugin-dir",
+            "some/plugin",
+            "--plugin-cycles",
+            "7",
         ]))
         .expect("flags");
-        assert_eq!(opts.resolved_metrics(), vec!["rss-100k", "token-cost"]);
+        assert_eq!(
+            opts.resolved_metrics(),
+            vec!["rss-100k", "token-cost", "plugin-overhead"]
+        );
         assert_eq!(opts.rss_interval_ms, 10);
         assert!(opts.with_oracle);
         assert_eq!(opts.manifest, Some(PathBuf::from("m.json")));
+        assert_eq!(opts.plugin_dir, PathBuf::from("some/plugin"));
+        assert_eq!(opts.plugin_cycles, 7);
 
         assert!(
             BenchOptions::parse(&args(&["--metric", "nope"])).is_err(),
@@ -1218,6 +1429,8 @@ mod tests {
         );
         assert!(BenchOptions::parse(&args(&["--rss-interval-ms", "0"])).is_err());
         assert!(BenchOptions::parse(&args(&["--rss-interval-ms", "x"])).is_err());
+        assert!(BenchOptions::parse(&args(&["--plugin-cycles", "0"])).is_err());
+        assert!(BenchOptions::parse(&args(&["--plugin-cycles", "x"])).is_err());
         assert!(matches!(
             BenchOptions::parse(&args(&["--bogus"])),
             Err(Outcome::Error(msg)) if msg.contains("bench")
@@ -1338,6 +1551,42 @@ mod tests {
             value["savings_ratio"].is_null(),
             "empty oracle output -> undefined ratio"
         );
+
+        fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn plugin_overhead_report_round_trips_through_disk() {
+        let out = std::env::temp_dir().join(format!("dq_bench_plugin_{}", std::process::id()));
+        let report = PluginOverheadReport {
+            meta: PluginOverheadMeta {
+                schema_version: SCHEMA_VERSION,
+                metric: "plugin-overhead".to_string(),
+                epoch_seconds: 1_700_000_000,
+                plugin_dir: "crates/dartq-plugin-host/samples/compat".to_string(),
+                cycles: 50,
+                batch_rows: PLUGIN_BATCH_ROWS,
+                batch_files: PLUGIN_BATCH_FILES,
+                drain_budget_ms: 5_000,
+            },
+            round_trip_ms: vec![1.5, 2.5, 3.0],
+            p50_ms: 2.5,
+            p95_ms: 3.0,
+            p99_ms: 3.0,
+            plugin_peak_rss_kib: 48_000,
+        };
+
+        let path = write_report("plugin-overhead", &out, &report).expect("report");
+        assert_eq!(path, out.join("plugin-overhead").join("report.json"));
+
+        let text = fs::read_to_string(&path).expect("report file");
+        let parsed: PluginOverheadReport = serde_json::from_str(&text).expect("parse");
+        assert_eq!(parsed, report);
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["meta"]["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["meta"]["metric"], "plugin-overhead");
+        assert_eq!(value["round_trip_ms"].as_array().map(Vec::len), Some(3));
+        assert_eq!(value["plugin_peak_rss_kib"], 48_000);
 
         fs::remove_dir_all(&out).ok();
     }

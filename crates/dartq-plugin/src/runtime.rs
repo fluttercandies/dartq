@@ -101,6 +101,18 @@ const RSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `MAX_DIAGNOSTICS` and the scanner's per-file cap enforce.
 const MAX_PENDING_DIAGNOSTICS: usize = 10_000;
 
+/// Reply-burst settle window of the drain: after the first diagnostic of a
+/// reply arrives, [`PendingDiagnostics::wait_for_burst`] keeps absorbing
+/// rows this long of pipe quiet before handing the batch over. A plugin
+/// serves one analyze cycle with contiguous `notification/diagnostic`
+/// frames (the host loop writes them back-to-back), so without the window
+/// the drain races the reply and returns its first line while the rest is
+/// still in flight. The window is orders of magnitude above the
+/// sub-millisecond line gaps of a live burst and far below the daemon's
+/// per-cycle drain budget; the caller's deadline still caps the whole wait
+/// exactly.
+const BURST_SETTLE: Duration = Duration::from_millis(5);
+
 /// How a plugin process is launched and what budgets it runs under. The
 /// launch policy (the `dart` invocation) is the caller's; the runtime owns
 /// protocol, isolation, and restarts.
@@ -233,7 +245,7 @@ enum WriterCommand {
 }
 
 /// The per-generation diagnostic queue: the reader fills it, the handle
-/// drains it, and every push signals [`Self::wait_for_push`] so the handle
+/// drains it, and every push signals [`Self::wait_for_burst`] so the handle
 /// parks instead of polling.
 #[derive(Debug, Default)]
 struct PendingDiagnostics {
@@ -263,10 +275,12 @@ impl PendingDiagnostics {
         std::mem::take(&mut self.queue.lock().expect("pending diagnostics lock"))
     }
 
-    /// Parks until a diagnostic arrives or `deadline` passes (`None`). The
-    /// deadline bounds the whole wait exactly; a push wakes the waiter
-    /// immediately — there is no poll tick.
-    fn wait_for_push(&self, deadline: Instant) -> Option<Vec<PluginDiagnostic>> {
+    /// Parks until diagnostics arrived and the reply burst settled, or
+    /// `deadline` passes (`None`). A non-empty queue on entry skips the
+    /// first-row wait and only settles the burst. The deadline bounds the
+    /// whole wait exactly — the settle window never extends past it — and a
+    /// push wakes the waiter immediately; there is no poll tick.
+    fn wait_for_burst(&self, deadline: Instant) -> Option<Vec<PluginDiagnostic>> {
         let mut queue = self.queue.lock().expect("pending diagnostics lock");
         while queue.is_empty() {
             let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -275,6 +289,32 @@ impl PendingDiagnostics {
                 .wait_timeout(queue, remaining)
                 .expect("pending diagnostics lock");
             queue = woken;
+        }
+        // First row is in. The plugin answers one analyze cycle with
+        // contiguous notification frames; hold through a quiet window so
+        // the drain hands over the whole burst, never its first line.
+        loop {
+            let now = Instant::now();
+            let settle_end = deadline.min(now + BURST_SETTLE);
+            if now >= settle_end {
+                break;
+            }
+            let seen = queue.len();
+            let (woken, timed_out) = self
+                .signal
+                .wait_timeout(queue, settle_end - now)
+                .expect("pending diagnostics lock");
+            queue = woken;
+            if queue.len() > seen {
+                // More of the burst arrived (possibly while the notify was
+                // racing this wait): settle again from now.
+                continue;
+            }
+            if timed_out.timed_out() {
+                // Quiet for the whole window: the burst is complete.
+                break;
+            }
+            // Spurious wake: keep waiting within the same window.
         }
         Some(std::mem::take(&mut queue))
     }
@@ -407,11 +447,15 @@ impl PluginRuntime {
     }
 
     /// [`Self::take_diagnostics`] with a wait: parks on the reader's push
-    /// signal until at least one plugin diagnostic arrived or `timeout`
-    /// elapsed (empty result) — no poll tick, the deadline bounds the whole
-    /// wait. A child death during the wait restarts it, within budget: the
-    /// parked phase may run to the deadline on a dead child, and the final
-    /// alive gate performs the restart before the empty hand returns.
+    /// signal until diagnostics arrived, then holds through one
+    /// [`BURST_SETTLE`] quiet window so a synchronous reply — one analyze
+    /// cycle answered with contiguous `notification/diagnostic` frames —
+    /// drains as the whole burst, never as its first line. The caller's
+    /// deadline bounds the whole wait exactly (the daemon's per-cycle drain
+    /// budget stays exact); there is no poll tick. A child death during the
+    /// wait restarts it, within budget: the parked phase may run to the
+    /// deadline on a dead child, and the final alive gate performs the
+    /// restart before the empty hand returns.
     ///
     /// # Errors
     ///
@@ -420,18 +464,19 @@ impl PluginRuntime {
         &mut self,
         timeout: Duration,
     ) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
+        // Eager restart of a child that died since the last interaction, so
+        // the wait below runs against a live generation (the crash-path
+        // posture: restart at the caller's interaction, never lazily).
+        self.ensure_alive()?;
         let deadline = Instant::now() + timeout;
-        let drained = self.take_diagnostics()?;
-        if !drained.is_empty() {
-            return Ok(drained);
+        match self.pending.wait_for_burst(deadline) {
+            Some(batch) => Ok(batch),
+            // Deadline: one final alive-gated drain — a push racing the
+            // expiry is still honored, and a death during the wait gets its
+            // restart (or its error) here rather than at the next
+            // interaction.
+            None => self.take_diagnostics(),
         }
-        if let Some(batch) = self.pending.wait_for_push(deadline) {
-            return Ok(batch);
-        }
-        // Deadline: one final alive-gated drain — a push racing the expiry is
-        // still honored, and a death during the wait gets its restart (or its
-        // error) here rather than at the next interaction.
-        self.take_diagnostics()
     }
 
     /// Sends `request/fixes` for `file` at the given UTF-16 range and awaits
@@ -1276,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_push_wakes_on_the_reader_signal_not_the_deadline() {
+    fn wait_for_burst_wakes_on_the_reader_signal_not_the_deadline() {
         let pending = Arc::new(PendingDiagnostics::default());
         let reader = {
             let pending = Arc::clone(&pending);
@@ -1299,7 +1344,7 @@ mod tests {
         };
         let start = Instant::now();
         let batch = pending
-            .wait_for_push(start + Duration::from_secs(5))
+            .wait_for_burst(start + Duration::from_secs(5))
             .expect("the push woke the wait");
         assert!(
             start.elapsed() < Duration::from_secs(2),
@@ -1311,18 +1356,81 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_push_returns_none_at_the_deadline() {
+    fn wait_for_burst_returns_none_at_the_deadline() {
         let pending = PendingDiagnostics::default();
         let start = Instant::now();
         assert!(
             pending
-                .wait_for_push(start + Duration::from_millis(50))
+                .wait_for_burst(start + Duration::from_millis(50))
                 .is_none()
         );
         assert!(
             start.elapsed() >= Duration::from_millis(40),
             "the deadline bounds the wait"
         );
+    }
+
+    #[test]
+    fn wait_for_burst_drains_the_whole_reply_not_its_first_line() {
+        let pending = Arc::new(PendingDiagnostics::default());
+        let reader = {
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                pending.push(row("first")).expect("under the cap");
+                // Well inside the settle window: part of the same reply
+                // burst, exactly like the contiguous frames a live plugin
+                // writes back after serving one analyze cycle.
+                std::thread::sleep(BURST_SETTLE / 2);
+                pending.push(row("second")).expect("under the cap");
+            })
+        };
+        let batch = pending
+            .wait_for_burst(Instant::now() + Duration::from_secs(5))
+            .expect("the burst arrived");
+        assert_eq!(batch.len(), 2, "both rows of the burst, one drain");
+        assert_eq!(batch[0].message, "first");
+        assert_eq!(batch[1].message, "second");
+        reader.join().expect("reader joins");
+    }
+
+    #[test]
+    fn a_row_after_the_settle_window_lands_in_the_next_drain() {
+        let pending = Arc::new(PendingDiagnostics::default());
+        let reader = {
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                pending.push(row("first")).expect("under the cap");
+                // Far beyond the settle window: a separate reply the drain
+                // must not wait for.
+                std::thread::sleep(BURST_SETTLE * 4);
+                pending.push(row("late")).expect("under the cap");
+            })
+        };
+        let start = Instant::now();
+        let batch = pending
+            .wait_for_burst(start + Duration::from_secs(5))
+            .expect("the first burst arrived");
+        assert_eq!(batch.len(), 1, "the window closed on a quiet pipe");
+        assert_eq!(batch[0].message, "first");
+
+        let late = pending
+            .wait_for_burst(start + Duration::from_secs(5))
+            .expect("the later row arrives");
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].message, "late");
+        reader.join().expect("reader joins");
+    }
+
+    /// One queued diagnostic for the burst tests.
+    fn row(message: &str) -> PluginDiagnostic {
+        PluginDiagnostic {
+            file: "lib/main.dart".to_owned(),
+            severity: Severity::Warning,
+            code: "p/lint".to_owned(),
+            message: message.to_owned(),
+            offset: 0,
+            length: 0,
+        }
     }
 
     #[test]

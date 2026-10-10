@@ -27,6 +27,11 @@ contains no `Cargo.toml`, and the workspace member list in the root
   `registerFixForRule`).
 - `lib/src/host.dart`, `bin/dartq_plugin_host.dart` — the stdio main loop and
   the launchable entry point.
+- `bin/echo_plugin.dart`, `bin/live_plugin.dart`, `bin/fix_plugin.dart`,
+  `bin/slow_plugin.dart` — test fixtures the live suites spawn.
+- `samples/compat/` — the compatibility sample plugin, shaped like an
+  official `analysis_server_plugin` package; the porting guide (official-API
+  concept → dartq equivalent) lives in its `README.md`.
 
 ## Status
 

@@ -131,13 +131,14 @@ fn print_usage() {
 
   harness bench [--metric NAME]... [--corpus-dir DIR] [--out DIR]
                 [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
-                [--rss-interval-ms MS] [--with-oracle]
+                [--rss-interval-ms MS] [--with-oracle] [--plugin-dir DIR]
+                [--plugin-cycles N]
       §19.3 benchmark metric collectors (PRD §1.5), one JSON report per
       metric under <out>/<metric>/report.json (schema_version 1; every
       report records its inputs for reproducibility). --metric is
-      repeatable (rss-100k | incremental-p95 | token-cost); default = all
-      three, in that order. Default corpus: {DEFAULT_TARGET}; default
-      out: docs/audits/bench.
+      repeatable (rss-100k | incremental-p95 | token-cost |
+      plugin-overhead); default = all four, in that order. Default corpus:
+      {DEFAULT_TARGET}; default out: docs/audits/bench.
       rss-100k: peak tree-RSS of one full dartq analysis over the corpus
       (/bin/ps polling at --rss-interval-ms, default 50ms, process-group
       tree walk; an 8 GiB tree-RSS watchdog kills the sampled group),
@@ -156,6 +157,13 @@ fn print_usage() {
       --format=machine` stdout on the same corpus, tokenized with the
       chars-per-4 heuristic (pluggable tokenizer trait; cl100k slots in
       behind it); reports both totals and the savings ratio.
+      plugin-overhead: the cost the plugin subsystem adds per analyze cycle
+      — per-cycle wall time of one feed+drain round trip against a live
+      plugin host (--plugin-dir, default the samples/compat compatibility
+      plugin; --plugin-cycles measured cycles, default 50, plus one
+      unmeasured warmup), P50/P95/P99, and the plugin sidecar's peak RSS
+      (the with-plugins side of the with/without comparison: no plugin, no
+      sidecar). Needs `dart` on PATH and the samples' host package pub-getted.
       The collectors drive real analysis processes; run them in the serial
       verification phase only (memory-incident discipline).
       Exit codes: 0 = every requested metric produced a report, 2 = harness
