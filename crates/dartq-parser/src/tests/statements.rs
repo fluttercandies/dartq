@@ -384,6 +384,49 @@ fn catch_extra_parameters_report() {
 }
 
 #[test]
+fn catch_reserved_statement_start_double_catch_syntax() {
+    // `catch (assert)`: the reserved token is a statement start, so the
+    // official catchParameter template keeps it behind a synthetic name
+    // (identifier_context_impl.dart:36-38) — the scan then hits it again at
+    // the trace-name position: exactly 2x `catchSyntax`, and the
+    // extra-parameters report stays silent (the trace name is synthetic).
+    let c = parse("void f() { try {} catch (assert) {} }");
+    let codes = c.error_codes();
+    assert!(
+        codes.starts_with(&["catch_syntax".to_owned(), "catch_syntax".to_owned()]),
+        "2x catch_syntax expected: {:?}",
+        c.errors
+    );
+    assert!(
+        !codes.contains(&"catch_syntax_extra_parameters".to_owned()),
+        "{:?}",
+        c.errors
+    );
+}
+
+#[test]
+fn catch_reserved_word_becomes_the_name() {
+    // `catch (super)`: `super` is reserved but not a statement start, so the
+    // official template falls through to `return identifier`
+    // (identifier_context_impl.dart:44) — the token itself is the name after
+    // one `catchSyntax` report; the synthetic trace pass never runs (the
+    // next token is `)`).
+    let c = parse("void f() { try {} catch (super) {} }");
+    let codes = c.error_codes();
+    assert_eq!(
+        codes.iter().filter(|c| *c == "catch_syntax").count(),
+        1,
+        "exactly one catch_syntax: {:?}",
+        c.errors
+    );
+    assert!(
+        !codes.contains(&"catch_syntax_extra_parameters".to_owned()),
+        "{:?}",
+        c.errors
+    );
+}
+
+#[test]
 fn switch_garbage_reports_expected_case() {
     let c = parse("void f() { switch (x) { + } }");
     let codes = c.error_codes();

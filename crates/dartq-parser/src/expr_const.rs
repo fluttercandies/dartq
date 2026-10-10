@@ -542,7 +542,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                                     self.report(invalid_constant_pattern_generic(), lt);
                                 }
                                 self.listener.handle_type_argument_application(lt);
-                                end = self.span_of(self.peek_id() - 1);
+                                end = self.span_of(
+                                    self.cursor
+                                        .last_consumed_id()
+                                        .expect("type arguments parse before the end anchor"),
+                                );
                             }
                         }
                     }

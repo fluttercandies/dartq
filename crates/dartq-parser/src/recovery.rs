@@ -123,6 +123,28 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return span;
         }
         if is_identifier(peek.kind) {
+            // ExpressionIdentifierContext.ensureIdentifier
+            // (identifier_context_impl.dart:397-406): `await` followed by
+            // another identifier does not form a valid expression-name —
+            // report `unexpectedToken` on the `await` token itself and take
+            // the next token as the name (skipping the `await`).
+            if matches!(
+                context,
+                crate::listener::IdentifierContext::Expression
+                    | crate::listener::IdentifierContext::ExpressionContinuation
+            ) && peek.kind == TokenKind::Keyword(Keyword::Await)
+                && is_identifier(self.cursor.look_kind(1))
+            {
+                self.report(
+                    msg::unexpected_token(self.cursor.lexeme(peek.span.id)),
+                    peek.span,
+                );
+                self.cursor.advance(); // `await`
+                let id = self.cursor.advance(); // the name token
+                let span = self.span_of(id);
+                self.listener.handle_identifier(span, context);
+                return span;
+            }
             // Analyzer field/variable name check: a built-in keyword that
             // names a top-level declaration (`mixin`, `extension`, ...) is a
             // legal variable name only while the next token continues the
@@ -220,11 +242,11 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // a name. The cursor sits on the candidate.
         if !self.looks_like_statement_start_at(0) {
             if is_keyword_or_identifier(junk_kind) {
-                let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
+                let lexeme = self.cursor.lexeme(peek.span.id);
                 if is_continuation
                     || (!matches!(junk_kind, TokenKind::Eof) && lexeme != "as" && lexeme != "is")
                 {
-                    self.report(msg::expected_identifier_but_got_keyword(&lexeme), peek.span);
+                    self.report(msg::expected_identifier_but_got_keyword(lexeme), peek.span);
                     let id = self.cursor.advance();
                     let span = self.span_of(id);
                     self.listener.handle_identifier(span, context);
@@ -252,8 +274,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             {
                 // When in doubt, consume the token to ensure progress; the
                 // report anchors on it and the synthetic lands after.
-                let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
-                self.report(msg::expected_identifier(&lexeme), peek.span);
+                let lexeme = self.cursor.lexeme(peek.span.id);
+                self.report(msg::expected_identifier(lexeme), peek.span);
                 self.cursor.advance();
                 let id = self
                     .cursor
@@ -262,8 +284,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 return self.span_of(id);
             }
         }
-        let lexeme = self.cursor.lexeme(peek.span.id).to_owned();
-        self.report(msg::expected_identifier(&lexeme), peek.span);
+        let lexeme = self.cursor.lexeme(peek.span.id);
+        self.report(msg::expected_identifier(lexeme), peek.span);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
@@ -317,7 +339,12 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
 
     /// `IdentifierContext.catchParameter.ensureIdentifier`
     /// (`identifier_context_impl.dart:25`): the catch template reports
-    /// `catch_syntax` (not `missing_identifier`) for non-identifier junk.
+    /// `catch_syntax` (not `missing_identifier`) for non-identifier junk,
+    /// then routes exactly like the official template — statement starts /
+    /// `,` / `)` / EOF keep the token behind a synthetic name (:36-38); other
+    /// non-keyword junk does too ("consume in doubt", :39-42 — the rewriter
+    /// inserts before the token, keeping it in the stream); a reserved word
+    /// itself becomes the name after the report (:44 `return identifier`).
     pub(crate) fn ensure_catch_parameter(&mut self) -> TokenSpan {
         let peek = self.cursor.peek();
         if is_identifier(peek.kind) {
@@ -332,6 +359,19 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return span;
         }
         self.report(msg::catch_syntax(), peek.span);
+        if !self.looks_like_statement_start_at(0)
+            && !matches!(
+                peek.kind,
+                TokenKind::Comma | TokenKind::CloseParen | TokenKind::Eof
+            )
+            && is_keyword_or_identifier(peek.kind)
+        {
+            let id = self.cursor.advance();
+            let span = self.span_of(id);
+            self.listener
+                .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
+            return span;
+        }
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
@@ -520,8 +560,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         } else {
             follower
         };
-        let lexeme = self.cursor.lexeme(follower.id).to_owned();
-        self.report(msg::expected_block_body(kind, &lexeme), at);
+        let lexeme = self.cursor.lexeme(follower.id);
+        self.report(msg::expected_block_body(kind, lexeme), at);
         let offset = follower.range.offset;
         let open = self.synthetic(TokenKind::OpenCurly, offset);
         let close = self.synthetic(TokenKind::CloseCurly, offset);

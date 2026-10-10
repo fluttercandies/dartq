@@ -1486,13 +1486,6 @@ pub(crate) mod msg {
         )
     }
 
-    pub(crate) fn function_type_default_value() -> Message {
-        Message::new(
-            local_code("function_type_default_value", "FUNCTION_TYPE_DEFAULT_VALUE"),
-            "Can't have a default value in a function type.",
-        )
-    }
-
     pub(crate) fn empty_optional_parameter_list() -> Message {
         Message::new(
             local_code(

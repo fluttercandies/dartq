@@ -1538,8 +1538,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let open_group_synthetic = close_id.map_or(true, |close| self.cursor.resolve(close).1);
         let scan_mark = self.cursor.mark();
         self.cursor.advance(); // `(`
-        let name_synthetic = !self.peek_is_identifier();
-        let _ = self.ensure_catch_parameter();
+        // Synthetic-ness of the consumed name (official
+        // `exceptionName.isSynthetic`): the template may hand back the
+        // reserved word itself (identifier_context_impl.dart:44), which
+        // counts as a real name.
+        let name = self.ensure_catch_parameter();
+        let name_synthetic = self.cursor.resolve(name.id).1;
         if self.peek_kind() != TokenKind::CloseParen {
             let mut current_comma = None;
             if self.peek_kind() == TokenKind::Comma {
@@ -1560,8 +1564,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             }
             if let Some(comma_span) = current_comma {
-                let trace_synthetic = !self.peek_is_identifier();
-                let _ = self.ensure_catch_parameter();
+                let trace = self.ensure_catch_parameter();
+                let trace_synthetic = self.cursor.resolve(trace.id).1;
                 if self.peek_kind() != TokenKind::CloseParen {
                     let at = self.peek_span();
                     if !trace_synthetic {
@@ -1906,8 +1910,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             return (open, self.span_of(close_id));
         }
         let at = self.peek_span();
-        let lexeme = self.cursor.lexeme(at.id).to_owned();
-        self.report(msg::expected_function_body(&lexeme), at);
+        let lexeme = self.cursor.lexeme(at.id);
+        self.report(msg::expected_function_body(lexeme), at);
         let offset = at.range.offset;
         let open = self.synthetic(TokenKind::OpenCurly, offset);
         let close = self.synthetic(TokenKind::CloseCurly, offset);

@@ -361,17 +361,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             if dot.is_none() {
                 // Single identifier: wildcard / irrefutable-context variable.
-                let name = self.cursor.lexeme(first_identifier.id).to_owned();
+                // Borrow the source-tied lexeme (`TokenCursor::lexeme` hands
+                // out `&'s str`) — the checks below need no owned copy.
+                let name = self.cursor.lexeme(first_identifier.id);
                 if !context.is_refutable() || name == "_" {
                     self.is_last_pattern_allowed_inside_unary_pattern = true;
                     self.cursor.reset(probe);
                     return self.parse_variable_pattern(context, None);
                 }
-                if matches!(name.as_str(), "when" | "as") {
-                    self.report(
-                        msg::illegal_pattern_identifier_name(&name),
-                        first_identifier,
-                    );
+                if matches!(name, "when" | "as") {
+                    self.report(msg::illegal_pattern_identifier_name(name), first_identifier);
                 }
             }
             // Constant pattern: an identifier (possibly qualified). Re-parse
@@ -450,7 +449,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         } else {
             self.ensure_identifier(IdentifierContext::LocalVariableDeclaration)
         };
-        let variable_name = self.cursor.lexeme(name.id).to_owned();
+        let variable_name = self.cursor.lexeme(name.id);
 
         match context {
             PatternContext::Declaration => {
@@ -471,7 +470,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let display = if variable_name.is_empty() {
                         "(unnamed)"
                     } else {
-                        &variable_name
+                        variable_name
                     };
                     self.report(msg::pattern_assignment_declares_variable(display), name);
                 }
@@ -485,16 +484,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             self.listener.handle_wildcard_pattern(keyword, name);
         } else if in_assignment_pattern && is_bare_identifier {
-            if matches!(variable_name.as_str(), "when" | "as") {
+            if matches!(variable_name, "when" | "as") {
                 self.report(
-                    msg::illegal_pattern_assignment_variable_name(&variable_name),
+                    msg::illegal_pattern_assignment_variable_name(variable_name),
                     name,
                 );
             }
             self.listener.handle_assigned_variable_pattern(name);
         } else {
-            if matches!(variable_name.as_str(), "when" | "as") {
-                self.report(msg::illegal_pattern_variable_name(&variable_name), name);
+            if matches!(variable_name, "when" | "as") {
+                self.report(msg::illegal_pattern_variable_name(variable_name), name);
             }
             if is_bare_identifier {
                 self.listener.handle_no_type(name);
@@ -691,8 +690,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 was_record = true;
                 was_valid_record = true;
                 // Official `handleNoName(token)` (:12198): the payload is the
-                // token BEFORE the colon, not the colon itself.
-                let before = self.span_of(self.peek_id() - 1);
+                // token BEFORE the colon, not the colon itself — the cursor's
+                // last consumed token (queue-exact; `peek_id() - 1` breaks
+                // once recovery synthetics drain ahead of the colon).
+                let before = self.span_of(
+                    self.cursor
+                        .last_consumed_id()
+                        .expect("record-pattern fields parse after the `(` is consumed"),
+                );
                 self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();
@@ -766,8 +771,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             let mut colon: Option<TokenSpan> = None;
             if kind == TokenKind::Colon {
                 // Official `handleNoName(token)` (:12270): the token BEFORE
-                // the colon.
-                let before = self.span_of(self.peek_id() - 1);
+                // the colon — the cursor's last consumed token (queue-exact,
+                // see the record-pattern arm above).
+                let before = self.span_of(
+                    self.cursor
+                        .last_consumed_id()
+                        .expect("map-pattern entries parse after the `{` is consumed"),
+                );
                 self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();

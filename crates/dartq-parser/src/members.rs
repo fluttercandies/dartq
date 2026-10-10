@@ -2371,7 +2371,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// token run (the reduced stand-in for the official skipped expression
     /// parse; stops at `,` `;` `)` `]` `}` and EOF at depth zero).
     pub(crate) fn skip_expression_diet(&mut self) {
-        let before = self.cursor.progress();
         while !self.cursor.at_eof() {
             let kind = self.peek_kind();
             match kind {
@@ -2391,11 +2390,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 _ => {
                     self.cursor.advance();
                 }
-            }
-            if self.no_progress(before) {
-                // Cannot happen (advance always moves), but keep the guard
-                // symmetric with the other loops.
-                self.force_advance();
             }
         }
     }

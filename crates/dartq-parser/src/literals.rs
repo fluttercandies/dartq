@@ -37,6 +37,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// the per-state `parse`/`computeNext` steps). Returns the last consumed
     /// span and the accumulated `ifConditionDelta` (for the
     /// `expected_else_or_comma` recovery message).
+    ///
+    /// Each pending machine frame is one active nesting unit and obeys the
+    /// shared `MAX_DEPTH` gate (crate::parser::MAX_DEPTH) — the linearized counterpart of the official
+    /// `expressionDepth` counter (`parseExpression`, parser_impl.dart:6936):
+    /// past the cap the bailout latches with a single `stackOverflow` report
+    /// and the enclosing loops unwind on the bail checks.
     fn parse_collection_entry(
         &mut self,
         set_map: bool,
@@ -54,6 +60,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::If) => {
+                    if !self.enter_depth() {
+                        return (self.peek_span(), if_count);
+                    }
                     if_count += 1;
                     pending.push(Pending::If);
                     let if_kw = self.peek_span();
@@ -67,6 +76,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     || (kind == TokenKind::Keyword(Keyword::Await)
                         && self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::For)) =>
                 {
+                    if !self.enter_depth() {
+                        return (self.peek_span(), if_count);
+                    }
                     let await_kw = if kind == TokenKind::Keyword(Keyword::Await) {
                         let a = self.peek_span();
                         self.cursor.advance();
@@ -170,6 +182,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// control back to the element step for the else body.
     fn unwind_pending(&mut self, pending: &mut Vec<Pending>) -> Unwind {
         while let Some(frame) = pending.pop() {
+            // Every frame pushed under the depth gate leaves it here; the
+            // `else` continuation re-enters below.
+            self.leave_depth();
             match frame {
                 Pending::For { for_in } => {
                     if for_in {
@@ -184,6 +199,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         let else_kw = self.peek_span();
                         self.cursor.advance();
                         self.listener.handle_else_control_flow(else_kw);
+                        if !self.enter_depth() {
+                            return Unwind::Done(self.peek_span());
+                        }
                         pending.push(Pending::IfElse);
                         return Unwind::Else;
                     }

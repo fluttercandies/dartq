@@ -308,6 +308,18 @@ fn equality_cannot_chain_but_is_then_equality_can() {
 }
 
 #[test]
+fn await_before_identifier_in_name_position_reports_unexpected_token() {
+    // ExpressionIdentifierContext.ensureIdentifier
+    // (identifier_context_impl.dart:397-406): `await` followed by another
+    // identifier does not form a valid expression-name — the oracle reports
+    // `unexpectedToken` on the `await` token itself and the following token
+    // becomes the name. Differential-corpus face: `.await x` selectors and
+    // cascade sections (`..await x`) in expression-continuation position.
+    let c = parse("void f() { a..await b; }");
+    assert_eq!(c.codes(), ["unexpected_token"], "{:?}", c.errors);
+}
+
+#[test]
 fn conditional_parses_and_speculates_null_aware_index() {
     // `a ? [b] : c` — the conditional speculation wins over `?[`.
     let c = parse("void f() { x = a ? [b] : c; }");
@@ -519,6 +531,39 @@ fn collection_control_flow_nesting_closes_in_order() {
         ("end", "for_in_control_flow"),
         ("end", "if_control_flow"),
     ]);
+}
+
+#[test]
+fn deep_collection_control_flow_latches_stack_overflow() {
+    // 600-deep `if` elements inside one list literal: the pending machine
+    // frames obey the shared 500 nesting cap — the linearized counterpart of
+    // the official `expressionDepth` guard (parser_impl.dart:6939-6944),
+    // whose trip reports a single `stackOverflow`, skips to the group end,
+    // and splices a synthetic identifier (an event, not a diagnostic). The
+    // latch suppresses every later report, so the legal-descent face is
+    // exactly one code. (The leading `[` matters: an `if` at the initializer
+    // position is not an expression and would legitimately prepend
+    // missing_identifier/expected_token prologue codes in both parsers.)
+    let source: &'static str = Box::leak(
+        format!(
+            "void f() {{ var l = [{}1{}]; }}",
+            "if (b) [".repeat(600),
+            "]".repeat(600)
+        )
+        .into_boxed_str(),
+    );
+    let mut p = setup(source);
+    p.parse_unit();
+    assert!(
+        p.is_bailed(),
+        "the collection control-flow cap must latch the bailout"
+    );
+    assert_eq!(
+        p.listener.codes(),
+        ["stack_overflow"],
+        "exactly one stack_overflow report: {:?}",
+        p.listener.codes()
+    );
 }
 
 /// Collection for-element heads mirror the statement decision order

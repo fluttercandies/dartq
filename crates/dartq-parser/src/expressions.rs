@@ -561,7 +561,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return None;
         }
         let operator_span = self.peek_span();
-        let operator_lexeme = self.cursor.lexeme(operator_span.id).to_owned();
+        let operator_lexeme = self.cursor.lexeme(operator_span.id);
         for &replacement in candidates {
             let replacement_level = kind_precedence(replacement).expect("candidate operator");
             if current_level >= 0 && replacement_level as i16 > current_level {
@@ -596,7 +596,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if accepted {
                 self.report(
                     msg::binary_operator_written_out(
-                        &operator_lexeme,
+                        operator_lexeme,
                         replacement.fixed_lexeme().unwrap_or_default(),
                     ),
                     operator_span,
