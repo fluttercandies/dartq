@@ -512,24 +512,49 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                // Stack: [guard?, value]. The value's flow state is the
-                // guard-true branch.
+                // Official decision order (flow_analysis.dart:1776-1786):
+                // pattern → guard → `switch_endAlternative` → body. The
+                // parser delivers the guard after the pattern-close anchor
+                // and fires no guard events of its own there (official
+                // parser_impl.dart:12457-12466), so the guard's value
+                // arrives on the expression stack and `_popPattern`
+                // (flow_analysis.dart:9324-9332) runs here: the value's
+                // flow state is the guard-true branch and guard-false
+                // chains into the unmatched state the later alternatives
+                // branch from.
+                let mut guard_false = None;
                 if *has_guard {
                     let _value = self.exprs.pop();
                     let guard = self.exprs.pop();
                     if let Some(guard) = guard {
-                        let (if_true, _) = self.cond_split(&guard);
+                        let (if_true, if_false) = self.cond_split(&guard);
                         self.current = if_true;
+                        guard_false = Some(if_false);
                     }
                 } else {
                     let _value = self.exprs.pop();
                 }
-                let combined = self.current.clone();
                 if let Some(frame_index) = self.switch_frame() {
-                    let prior = match &mut self.stack[frame_index] {
-                        Frame::Switch { group_combined, .. } => group_combined.take(),
+                    let chained = match (&guard_false, &self.stack[frame_index]) {
+                        (Some(if_false), Frame::Switch { unmatched, .. }) => {
+                            Some(self.join(Some(unmatched.clone()), Some(if_false.clone())))
+                        }
                         _ => None,
                     };
+                    let prior = match &mut self.stack[frame_index] {
+                        Frame::Switch {
+                            unmatched,
+                            group_combined,
+                            ..
+                        } => {
+                            if let Some(chained) = chained {
+                                *unmatched = chained;
+                            }
+                            group_combined.take()
+                        }
+                        _ => None,
+                    };
+                    let combined = self.current.clone();
                     let joined = self.join(prior, Some(combined));
                     if let Frame::Switch { group_combined, .. } = &mut self.stack[frame_index] {
                         *group_combined = Some(joined);
@@ -559,6 +584,11 @@ impl<'o> Interp<'o> {
                 self.current = self
                     .join(combined.or(Some(previous.clone())), None)
                     .inherit_tested(&previous, &mut self.lists);
+                // Net one value for the consumer (crate contract, see
+                // `ListLitEnd`/`ExprBody`): without it `var y = switch
+                // (x) {...}` finds no rhs at `InitializerEnd` and `x =
+                // switch (x) {...}` pops the assignment target as rhs.
+                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             Ev::AssertBegin { span } => {
                 self.dead_code(*span);

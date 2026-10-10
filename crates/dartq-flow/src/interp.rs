@@ -1058,7 +1058,7 @@ impl<'o> Interp<'o> {
             // loop head. Replaying the marker would fire the statement-form
             // handler too: a second pop plus a stray non-collection frame.
             self.run_range(events, i + 1..parts, match_of);
-            self.for_in_parts_at(events, parts, end, true);
+            self.for_in_parts_at(events, i + 1, parts, end, true);
             self.run_range(events, parts + 1..end, match_of);
             self.loop_exit(true);
         }
@@ -1077,13 +1077,43 @@ impl<'o> Interp<'o> {
         let end = (i..events.len())
             .find(|&j| matches!(events[j], Ev::ForInEnd))
             .unwrap_or(events.len());
-        self.for_in_parts_at(events, i, end, false);
+        // The head starts right after the statement's `for` (no nested
+        // statement-for can sit inside the iterable expression). Without a
+        // `ForBegin` (synthetic fragments) there is no head to attribute.
+        let head_start = (0..i)
+            .rev()
+            .find(|&j| matches!(events[j], Ev::ForBegin { .. }))
+            .map_or(i, |j| j + 1);
+        self.for_in_parts_at(events, head_start, i, end, false);
     }
 
-    fn for_in_parts_at(&mut self, events: &[Ev], i: usize, end: usize, collection: bool) {
+    fn for_in_parts_at(
+        &mut self,
+        events: &[Ev],
+        head_start: usize,
+        i: usize,
+        end: usize,
+        collection: bool,
+    ) {
         // The iterable expression value is on the stack; it contributes no
         // promotion state.
         self.exprs.pop();
+        // A declared head's loop variable is initialized before the body
+        // (analyzer for_resolver.dart:222-226 `declare(initialized: true)`
+        // right before `forEach_bodyBegin`; for_each.dart
+        // `forEach_assigns_to_declared_var` expects no diagnostic). Its
+        // `VarDeclEnd` has already run (the declaration ends at the `in`),
+        // so the variable is resolved by name from the head's
+        // `InitializedIdent` — the first one, since the iterable's own
+        // declarations follow it. The identifier-head form's target was
+        // written at its Ident event; a pattern head declares its
+        // variables assigned on match.
+        if let Some(var) = events[head_start..i].iter().find_map(|ev| match ev {
+            Ev::InitializedIdent { name } => self.resolve(*name),
+            _ => None,
+        }) {
+            self.write_var(var, Ty::UNKNOWN, false);
+        }
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
         let body = match body_start {
             Some(start) => start..end,

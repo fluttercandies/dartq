@@ -146,7 +146,12 @@ impl<'o> Interp<'o> {
     }
 
     /// Closes the pattern context of a switch-expression alternative
-    /// (same chain semantics, no body lookahead).
+    /// (same chain semantics, no body lookahead). Only the unmatched
+    /// chain updates here: the alternative joins the group once, at
+    /// `SwitchExprCaseEnd`, with its final state — the alternative's
+    /// contribution is the guard-true state, never the pre-guard one
+    /// (official `switch_endAlternative`,
+    /// flow_analysis.dart:8008-8039).
     pub(crate) fn case_pattern_end_expr(&mut self) {
         let Some(pattern) = self.pattern.take() else {
             return;
@@ -157,21 +162,8 @@ impl<'o> Interp<'o> {
         };
         let unmatched = self.apply_pattern_exit(pattern, false);
         if let Some(frame_index) = self.switch_frame() {
-            let combined = self.current.clone();
-            let prior = match &mut self.stack[frame_index] {
-                Frame::Switch {
-                    unmatched: slot,
-                    group_combined,
-                    ..
-                } => {
-                    *slot = unmatched;
-                    group_combined.take()
-                }
-                _ => None,
-            };
-            let joined = self.join(prior, Some(combined));
-            if let Frame::Switch { group_combined, .. } = &mut self.stack[frame_index] {
-                *group_combined = Some(joined);
+            if let Frame::Switch { unmatched: slot, .. } = &mut self.stack[frame_index] {
+                *slot = unmatched;
             }
         }
     }

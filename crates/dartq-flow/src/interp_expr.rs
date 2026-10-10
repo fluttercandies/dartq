@@ -12,13 +12,7 @@ use crate::ty::{Base, Ty};
 impl<'o> Interp<'o> {
     /// Handles one expression-layer event; `false` means the event belongs
     /// to another layer.
-    pub(crate) fn expr_step(
-        &mut self,
-        ev: &Ev,
-        _events: &[Ev],
-        _i: usize,
-        _match_of: &[u32],
-    ) -> bool {
+    pub(crate) fn expr_step(&mut self, ev: &Ev, events: &[Ev], i: usize, _match_of: &[u32]) -> bool {
         match ev {
             Ev::Ident {
                 name,
@@ -27,6 +21,19 @@ impl<'o> Interp<'o> {
             } => {
                 use dartq_parser::IdentifierContext as Ctx;
                 match context {
+                    Ctx::Expression | Ctx::ExpressionContinuation
+                        if matches!(events.get(i + 1), Some(Ev::ForInExprBegin)) =>
+                    {
+                        // A for-in loop target (`for (i in xs)`) is the
+                        // write, not a read (analyzer for_resolver.dart
+                        // :237-241 `flow?.write` right before
+                        // `forEach_bodyBegin`); the write consumes the
+                        // reference, leaving the iterable as the head's
+                        // only value.
+                        if let Some(var) = self.resolve(*name) {
+                            self.write_var(var, Ty::UNKNOWN, false);
+                        }
+                    }
                     Ctx::Expression | Ctx::ExpressionContinuation => match self.resolve(*name) {
                         Some(var) => {
                             self.check_unassigned_read(*token, var);

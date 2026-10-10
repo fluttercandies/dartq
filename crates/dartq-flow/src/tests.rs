@@ -973,7 +973,6 @@ fn switch_statement_default_exhaustive_tail_dead() {
 /// switch (x) { 1 => 2 };` pop the assignment target as the right-hand
 /// side. Every other composite expression nets exactly one value for its
 /// consumer (see the `ListLitEnd`/`ExprBody` contracts in ev.rs).
-#[ignore = "defect: switch expression nets zero values (interp_stmt.rs SwitchExprCaseEnd pops, SwitchExprBlockEnd never pushes) — false-positive UnassignedRead on the initialized variable"]
 #[test]
 fn switch_expression_value_reaches_later_reads() {
     let source = "void f(int x) { var y = switch (x) { 1 => 2 }; y; }";
@@ -1412,12 +1411,8 @@ fn for_each_continue_paths_unassigned() {
 /// `declare(initialized: true)`; official corpus for_each.dart
 /// `forEach_assigns_to_declared_var`).
 ///
-/// Suspected defect (do not weaken): the loop variable is declared
-/// uninitialized (`InitializedIdent`, interp_stmt.rs) and
-/// `for_in_parts_at` (interp.rs) never writes it, so the body read emits a
-/// false-positive `UnassignedRead`. The identifier-head form
-/// (`for (i in xs)`) misses the same write.
-#[ignore = "defect: for-in never writes its loop variable (interp.rs for_in_parts_at) — false-positive UnassignedRead on body reads (oracle: for_each.dart forEach_assigns_to_declared_var)"]
+/// The identifier-head form (`for (i in xs)`) writes its target at the
+/// Ident event itself (for_resolver.dart:237-241 `flow?.write`).
 #[test]
 fn for_each_loop_variable_assigned_in_body() {
     let source = "void f(List<int> b) { for (var a in b) { a; } }";
