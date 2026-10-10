@@ -118,6 +118,64 @@ fn uri_resolution_is_pinned() {
 }
 
 #[test]
+fn structural_library_to_path_matches_the_string_form() {
+    let sdk = vendored_sdk();
+    let lib = sdk.dart_sdk_root().join("lib");
+
+    // The canonical join the string face parses back. The contract: for
+    // every input, `library_to_path(segment, library, part)` equals
+    // `uri_to_path(segment, join(library, part)).ok()`.
+    let join = |library: &str, part: &str| {
+        if part.is_empty() {
+            format!("dart:{library}")
+        } else {
+            format!("dart:{library}/{part}")
+        }
+    };
+
+    // Edge-shape table: (segment, library, part) against its string-form
+    // spelling — the pair splits exactly the way the string face (and the
+    // resolution composer) splits that spelling at its first `/`.
+    let rows: &[(&str, &str, &str, String)] = &[
+        ("vm", "core", "", join("core", "")), // library root
+        ("vm", "core", "int.dart", join("core", "int.dart")), // plain part
+        ("vm", "core", "/", join("core", "/")), // all-anchor part
+        ("vm", "core", "/etc/passwd", join("core", "/etc/passwd")), // absolute-shaped part
+        ("vm", "core", "../io/io.dart", join("core", "../io/io.dart")), // `..` climb kept
+        ("vm", "core", "a%20b.dart", join("core", "a%20b.dart")), // escapes stay intact
+        ("vm", "_internal", "", join("_internal", "")), // uri differs from name
+        ("dart2js", "html", "", join("html", "")), // segment scoping
+        ("vm", "html", "", join("html", "")), // unknown library
+        ("ghost", "core", "int.dart", join("core", "int.dart")), // unknown target
+    ];
+    for (segment, library, part, spelling) in rows {
+        assert_eq!(
+            sdk.library_to_path(segment, library, part),
+            sdk.uri_to_path(segment, spelling).ok(),
+            "structural != string for ({segment}, {library}, {part})"
+        );
+    }
+
+    // Spot pin that the table rows hit the real lookups: `_internal`'s
+    // entry uri differs from its name.
+    assert_eq!(
+        sdk.library_to_path("vm", "_internal", ""),
+        Some(lib.join("internal/internal.dart"))
+    );
+
+    // Authority form: `dart://x/core` yields the pair `("", "core")` — the
+    // empty first segment of the path. No SDK table lists an empty library,
+    // on either face, under either spelling that maps to the pair.
+    assert_eq!(sdk.library_to_path("vm", "", "core"), None);
+    assert_eq!(sdk.uri_to_path("vm", "dart://x/core").ok(), None);
+    assert_eq!(sdk.uri_to_path("vm", &join("", "core")).ok(), None);
+
+    // Bare scheme: empty everything, unknown on both faces.
+    assert_eq!(sdk.library_to_path("vm", "", ""), None);
+    assert_eq!(sdk.uri_to_path("vm", "dart:").ok(), None);
+}
+
+#[test]
 fn patch_and_support_values_match_the_real_file() {
     let sdk = vendored_sdk();
 

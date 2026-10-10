@@ -271,14 +271,14 @@ enum Composed {
         rel: Box<str>,
     },
     File(Box<str>),
-    /// A `dart:` URI: the library name split once from the parsed path (its
-    /// first segment; an authority form leaves it empty, and no SDK table
-    /// lists an empty library), plus the canonical `dart:` spelling the SDK
-    /// face parses back — the one string the [`SdkSnapshot`] interface
-    /// demands.
+    /// A `dart:` URI split at the library boundary: the path's first segment
+    /// (`core` for both `dart:core` and `dart:core/bool.dart`; an authority
+    /// form leaves it empty, which no SDK table lists) and the raw part
+    /// remainder — exactly the pair [`SdkSnapshot::library_to_path`]
+    /// consumes.
     Dart {
         library: Box<str>,
-        uri: Box<str>,
+        part: Box<str>,
     },
     DartExt,
     /// Any other absolute scheme (`data:`, `http:`, …): parses, resolves to
@@ -530,20 +530,22 @@ impl<'a> UriResolver<'a> {
                 target: ResolvedTarget::Missing,
                 code: Some(ResolutionCode::UseOfNativeExtension),
             },
-            Composed::Dart { library, uri } => match self.sdk.uri_to_path(&self.target, &uri) {
-                Ok(file) => UriResolution {
-                    uri: ResolvedUri::Dart { library, file },
-                    target: ResolvedTarget::External,
-                    code: None,
-                },
-                // Unknown dart: library (or target): source is null —
-                // `uri_does_not_exist` per §4.2.
-                Err(_) => UriResolution {
-                    uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
-                    target: ResolvedTarget::Missing,
-                    code: Some(ResolutionCode::UriDoesNotExist),
-                },
-            },
+            Composed::Dart { library, part } => {
+                match self.sdk.library_to_path(&self.target, &library, &part) {
+                    Some(file) => UriResolution {
+                        uri: ResolvedUri::Dart { library, file },
+                        target: ResolvedTarget::External,
+                        code: None,
+                    },
+                    // Unknown dart: library (or target): source is null —
+                    // `uri_does_not_exist` per §4.2.
+                    None => UriResolution {
+                        uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                        target: ResolvedTarget::Missing,
+                        code: Some(ResolutionCode::UriDoesNotExist),
+                    },
+                }
+            }
             Composed::Other => UriResolution {
                 uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
                 target: ResolvedTarget::Missing,
@@ -1032,17 +1034,13 @@ fn compose_absolute(raw: RawUri) -> Composed {
             // The library name is the path's first segment (`core` for both
             // `dart:core` and `dart:core/bool.dart`); an authority form
             // (`dart://x/core`) leaves it empty, which no SDK table lists.
-            // Split once here — `land` never re-parses the joined spelling,
-            // which survives only because the SDK face parses it.
-            let library = Box::from(match raw.path.split_once('/') {
-                Some((name, _)) => name,
-                None => raw.path.as_ref(),
-            });
-            let uri = Box::from(match raw.authority.as_deref().filter(|a| !a.is_empty()) {
-                Some(a) => format!("dart://{a}{}", raw.path),
-                None => format!("dart:{}", raw.path),
-            });
-            Composed::Dart { library, uri }
+            // One split, no re-join: the pair moves structurally into
+            // `land` and on to the SDK's `library_to_path`.
+            let (library, part) = match raw.path.split_once('/') {
+                Some((name, part)) => (Box::from(name), Box::from(part)),
+                None => (raw.path, Box::from("")),
+            };
+            Composed::Dart { library, part }
         }
         ("package", _) => {
             // A leading `/` (any authority, or `package:///x`) or a missing

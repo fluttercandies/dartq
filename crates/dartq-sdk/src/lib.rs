@@ -23,7 +23,9 @@
 //! - Queries mirror the compiler consumption surface, always scoped to a
 //!   target segment: [`SdkSnapshot::uri_to_path`] (including
 //!   `dart:lib/part.dart` resolution, with explicit errors instead of
-//!   silent `None`s), [`SdkSnapshot::target`], and
+//!   silent `None`s), its structural twin
+//!   [`SdkSnapshot::library_to_path`] over the split `(library, part)`
+//!   pair, [`SdkSnapshot::target`], and
 //!   [`SdkSnapshot::library_support_value`] for the
 //!   `dart.library.<name>` environment.
 //! - [`AllowedExperiments`] answers the experiment whitelist per SDK

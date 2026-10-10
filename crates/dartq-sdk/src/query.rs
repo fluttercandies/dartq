@@ -3,7 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::metadata::{SdkSnapshot, TargetLibraries};
+use crate::metadata::{SdkLibrary, SdkSnapshot, TargetLibraries};
 
 impl SdkSnapshot {
     /// The dart SDK root this snapshot was loaded from (the directory
@@ -41,6 +41,10 @@ impl SdkSnapshot {
     /// implementation details, kept as [`SdkLibrary::patches`](crate::SdkLibrary::patches)
     /// path lists only (`docs/facts/sdk-metadata.md` §6).
     ///
+    /// The structural twin [`SdkSnapshot::library_to_path`] consumes the
+    /// already-split `(library, part)` pair with byte-identical semantics;
+    /// this face parses and keeps the explicit per-cause errors.
+    ///
     /// # Errors
     ///
     /// [`SdkUriError::NotDartUri`] when `dart_uri` lacks the `dart:` prefix,
@@ -58,21 +62,48 @@ impl SdkSnapshot {
             Some((name, part)) => (name, part),
             None => (rest, ""),
         };
-        let libraries = &self
+        let library = &self
             .target(segment)
             .ok_or_else(|| SdkUriError::UnknownTarget {
                 target: segment.to_owned(),
             })?
             .libraries;
-        let library = libraries
+        let info = library
             .get(name)
             .ok_or_else(|| SdkUriError::UnknownLibrary {
                 target: segment.to_owned(),
                 library: name.to_owned(),
             })?;
+        Ok(self.library_file(info, part))
+    }
+
+    /// Resolves a `dart:` library from its already-split parts against
+    /// target segment `segment`: the face [`SdkSnapshot::uri_to_path`]
+    /// parses back out of the joined URI string, minus the round-trip.
+    /// Byte-identical to the string form — for every input,
+    /// `library_to_path(segment, library, part)` equals
+    /// `uri_to_path(segment, &join)` where `join` is `"dart:{library}"` for
+    /// an empty `part` and `"dart:{library}/{part}"` otherwise, with `None`
+    /// standing in for every error.
+    ///
+    /// `library` is a table name (`core`, `_internal`) — a name carrying a
+    /// `/` can never hit the table and always yields `None`, mirroring the
+    /// string form's first-segment split. `part` is the raw remainder after
+    /// that split, percent-escapes intact: the same analyzer string-concat
+    /// join applies, so an absolute-shaped part (`/etc/passwd`) stays under
+    /// the library directory and `..` climbs are kept.
+    #[must_use]
+    pub fn library_to_path(&self, segment: &str, library: &str, part: &str) -> Option<PathBuf> {
+        let info = self.target(segment)?.libraries.get(library)?;
+        Some(self.library_file(info, part))
+    }
+
+    /// The single path builder behind both faces: `<root>/lib/<library.uri>`
+    /// with `part` joined the analyzer's way.
+    fn library_file(&self, library: &SdkLibrary, part: &str) -> PathBuf {
         let lib_root = self.dart_sdk_root.join("lib");
         let library_file = lib_root.join(&library.uri);
-        Ok(match part {
+        match part {
             "" => library_file,
             part => {
                 // The analyzer builds part paths by string concat
@@ -91,7 +122,7 @@ impl SdkSnapshot {
                     .collect::<PathBuf>();
                 library_file.parent().unwrap_or(&lib_root).join(relative)
             }
-        })
+        }
     }
 
     /// The `dart.library.<library>` environment value for target segment
