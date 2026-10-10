@@ -40,12 +40,14 @@
 //! # Snapshot persistence (#306, #309)
 //!
 //! After overlay applies settle, the debounced sink saves one snapshot
-//! generation: 500 ms after the last apply, checked at turn boundaries (the
-//! loop is turn-based — the window elapses across the blocking receive, no
-//! timer thread), plus an unconditional flush at session end. Saves are
-//! accelerator semantics: failures log and continue. The generation payload
-//! itself waits on engine faces still missing (see the `session` module
-//! docs); until they land each flush logs the gap and writes nothing.
+//! generation: 500 ms after the last apply, checked at turn boundaries, plus
+//! an unconditional flush at session end. While the sink is dirty the main
+//! loop's receive is bounded by the window's remaining time, so an *idle*
+//! daemon wakes at the deadline to save instead of blocking forever — still
+//! no timer thread. Saves are accelerator semantics: failures log and
+//! continue. The generation payload itself waits on engine faces still
+//! missing (see the `session` module docs); until they land each flush logs
+//! the gap and writes nothing.
 //!
 //! # Transport
 //!
@@ -72,3 +74,98 @@ mod server;
 
 pub use server::{EXIT_CLEAN, EXIT_WITHOUT_SHUTDOWN, run};
 pub use session::{Publish, Session, SessionError, Turn};
+
+/// Test-only observability for the daemon's hot-path allocation discipline
+/// (#347): a counting wrapper over the system allocator plus counters on
+/// the conversion and flush paths. Everything here is compiled out outside
+/// `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// Diagnostic conversions this process performed (one per diagnostic
+    /// per read task — a second call site would double it).
+    static CONVERSIONS: AtomicUsize = AtomicUsize::new(0);
+    /// Snapshot-sink saves attempted (the idle deadline wake shows up here).
+    static FLUSHES: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        /// Only the measuring test's thread counts, so concurrent tests on
+        /// other threads (parallel harnesses) never pollute the numbers.
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static BULK_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Allocations at or above this size are bulk (whole-file texts);
+    /// diagnostic- and JSON-sized traffic stays orders of magnitude below.
+    const BULK_MIN: usize = 4096;
+
+    pub(crate) struct ProbeAllocator;
+
+    impl ProbeAllocator {
+        fn note_bulk(layout: Layout) {
+            ARMED.with(|armed| {
+                if armed.get() {
+                    BULK_BYTES.with(|total| total.set(total.get() + layout.size()));
+                }
+            });
+        }
+    }
+
+    unsafe impl GlobalAlloc for ProbeAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.size() >= BULK_MIN {
+                Self::note_bulk(layout);
+            }
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if layout.size() >= BULK_MIN {
+                Self::note_bulk(layout);
+            }
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: ProbeAllocator = ProbeAllocator;
+
+    pub(crate) fn count_conversion() {
+        CONVERSIONS.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn count_flush() {
+        FLUSHES.fetch_add(1, Relaxed);
+    }
+
+    /// Starts counting bulk allocations on the calling thread, resetting the
+    /// tally.
+    pub(crate) fn arm_bulk() {
+        BULK_BYTES.with(|total| total.set(0));
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// Stops counting and returns the bulk bytes seen since [`arm_bulk`].
+    pub(crate) fn bulk_bytes() -> usize {
+        ARMED.with(|armed| armed.set(false));
+        BULK_BYTES.with(Cell::take)
+    }
+
+    /// The counters since the last reset, for the measuring test's window.
+    pub(crate) fn counters() -> (usize, usize) {
+        (CONVERSIONS.load(Relaxed), FLUSHES.load(Relaxed))
+    }
+
+    pub(crate) fn reset_counters() {
+        CONVERSIONS.store(0, Relaxed);
+        FLUSHES.store(0, Relaxed);
+    }
+}

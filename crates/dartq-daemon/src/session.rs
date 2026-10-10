@@ -24,12 +24,12 @@
 //!
 //! # Snapshot persistence (#306)
 //!
-//! The sink is debounced by a last-apply timestamp checked at turn
-//! boundaries (the stdio loop is turn-based — the debounce window elapses
-//! across the blocking receive, so no timer thread exists) and flushed
-//! regardless of the window at session end. Save failures log and continue:
-//! the accelerator invariant makes an unwritten generation a future miss,
-//! never an error.
+//! The sink is debounced by a last-apply timestamp: while it is dirty, the
+//! main loop bounds its receive by the window's remaining time, so the save
+//! runs at the deadline even when the daemon then sits idle (and regardless
+//! of the window at session end). Save failures log and continue: the
+//! accelerator invariant makes an unwritten generation a future miss, never
+//! an error.
 
 use std::collections::hash_map::Entry;
 use std::fs;
@@ -52,9 +52,10 @@ use crate::lsp;
 use crate::uri;
 
 /// The debounce window between the last overlay apply and the snapshot
-/// generation save (#306): 500 ms, elapsed across the main loop's blocking
-/// receive — the stdio loop is turn-based, so no timer thread exists.
-const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
+/// generation save (#306): 500 ms. While a save is pending the main loop's
+/// idle receive is bounded by the window's remainder, so an idle daemon
+/// wakes to save — no timer thread.
+pub(crate) const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Session failures the server can only report, not fix.
 #[derive(Debug, Error)]
@@ -113,22 +114,33 @@ impl SnapshotSink {
         self.last_apply = Some(Instant::now());
     }
 
+    /// When the pending save comes due (`last_apply + window`); `None` when
+    /// the sink is clean, meaning the main loop's receive may block
+    /// indefinitely. `dirty` implies `last_apply` — both are set together
+    /// by [`Self::note_apply`] — so this is the single source of truth for
+    /// the window math, shared by the idle receive bound and `flush_if_due`.
+    fn deadline(&self) -> Option<Instant> {
+        self.last_apply
+            .filter(|_| self.dirty)
+            .map(|at| at + SNAPSHOT_DEBOUNCE)
+    }
+
     /// Saves when the debounce window has elapsed since the last apply;
     /// true when a save was attempted.
     fn flush_if_due(&mut self, now: Instant) -> bool {
-        let settled = self.dirty
-            && self
-                .last_apply
-                .is_some_and(|at| now.duration_since(at) >= SNAPSHOT_DEBOUNCE);
-        if !settled {
-            return false;
+        match self.deadline() {
+            Some(deadline) if now >= deadline => {
+                self.flush();
+                true
+            }
+            _ => false,
         }
-        self.flush();
-        true
     }
 
     fn flush(&mut self) {
         self.dirty = false;
+        #[cfg(test)]
+        crate::probe::count_flush();
         self.save_generation();
     }
 
@@ -269,7 +281,7 @@ impl Session {
             return false;
         };
         self.opened.insert(path.clone(), version);
-        self.staged.push(OverlayChange::Set {
+        self.stage(OverlayChange::Set {
             path,
             bytes: text.as_bytes().to_vec(),
         });
@@ -284,6 +296,11 @@ impl Session {
     /// never saved) stages a removal. Closing a document that was never
     /// opened is a no-op per LSP.
     ///
+    /// The on-disk read happens before any state mutation: on a read error
+    /// that is not `NotFound` the document stays open and any staged edits
+    /// stay queued — the overlay bookkeeping and the staged writes only ever
+    /// diverge from what a successful close would have done.
+    ///
     /// # Errors
     ///
     /// Disk read failure.
@@ -291,15 +308,19 @@ impl Session {
         let Some(path) = uri::to_path(uri) else {
             return Ok(false);
         };
-        if self.opened.remove(&path).is_none() {
+        if !self.opened.contains_key(&path) {
             return Ok(false);
         }
         match fs::read(&path) {
-            Ok(bytes) => self.staged.push(OverlayChange::Set { path, bytes }),
+            Ok(bytes) => {
+                self.opened.remove(&path);
+                self.stage(OverlayChange::Set { path, bytes });
+            }
             // Overlay-only buffer: dropping the overlay removes the file.
             // `UnknownPath` cannot happen — `open` interned the path.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.staged.push(OverlayChange::Remove { path });
+                self.opened.remove(&path);
+                self.stage(OverlayChange::Remove { path });
             }
             Err(error) => return Err(error),
         }
@@ -411,16 +432,23 @@ impl Session {
         }
     }
 
-    /// Turn-start debounce check; true when a save was attempted. The window
-    /// elapses across the main loop's blocking receive, so this runs once
-    /// per turn with the current instant.
+    /// Turn-start debounce check; true when a save was attempted.
     #[must_use]
     pub fn flush_if_due(&mut self, now: Instant) -> bool {
         self.snapshot.flush_if_due(now)
     }
 
-    /// One read task's execution: a fresh full analysis — publishes diffed
-    /// against the baseline, entries cloned for every attached request.
+    /// When the pending debounced save comes due: the main loop bounds its
+    /// idle receive by this, so a daemon left idle wakes at the deadline and
+    /// saves instead of blocking forever. `None` when the sink is clean —
+    /// the receive blocks until the next frame.
+    #[must_use]
+    pub fn flush_deadline(&self) -> Option<Instant> {
+        self.snapshot.deadline()
+    }
+
+    /// One read task's execution: a fresh full analysis — converted once,
+    /// then shared by the publish diff and every attached request's entries.
     fn read_turn(&mut self, turn: &mut Turn) {
         let pending = self
             .read
@@ -428,15 +456,25 @@ impl Session {
             .expect("a drain-live read task is still pending");
         match self.analyze() {
             Ok(diagnostics) => {
-                turn.publishes.extend(self.plan_publishes(&diagnostics));
-                let entries: Vec<lsp::AnalyzeEntry> = diagnostics
+                // The one conversion pass: the engine→LSP shape change is
+                // the expensive half (line-index math over the resident
+                // text), so the publish plan and the analyze entries both
+                // consume it instead of converting twice.
+                let converted: Vec<Option<lsp::Diagnostic>> = diagnostics
                     .iter()
-                    .filter_map(|diagnostic| {
-                        let converted = self.convert(diagnostic)?;
-                        let path = self.engine().file_table().path(diagnostic.file)?;
+                    .map(|diagnostic| self.convert(diagnostic))
+                    .collect();
+                turn.publishes
+                    .extend(self.plan_publishes(&diagnostics, &converted));
+                let entries: Vec<lsp::AnalyzeEntry> = diagnostics
+                    .into_iter()
+                    .zip(converted)
+                    .filter_map(|(engine_diag, converted)| {
+                        let diagnostic = converted?;
+                        let path = self.engine().file_table().path(engine_diag.file)?;
                         Some(lsp::AnalyzeEntry {
                             uri: uri::from_path(path),
-                            diagnostic: converted,
+                            diagnostic,
                         })
                     })
                     .collect();
@@ -456,6 +494,22 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Stages one overlay mutation on the queued write task, last-wins per
+    /// path: a batch's earlier ops for the same path are unobservable (ops
+    /// on distinct paths commute, and the overlay declares the end state),
+    /// so K batched edits of one file stage one text, not K full copies.
+    fn stage(&mut self, change: OverlayChange) {
+        let path = match &change {
+            OverlayChange::Set { path, .. } | OverlayChange::Remove { path } => path,
+        };
+        self.staged.retain(|staged| match staged {
+            OverlayChange::Set { path: old, .. } | OverlayChange::Remove { path: old } => {
+                old != path
+            }
+        });
+        self.staged.push(change);
     }
 
     fn ensure_write(&mut self) {
@@ -508,14 +562,22 @@ impl Session {
 
     /// Diffs the fresh diagnostic set against the published baseline and
     /// returns one [`Publish`] per changed file (empty set included — the
-    /// client clears its squiggles through it). Order is by URI, so the
-    /// push sequence is deterministic.
-    fn plan_publishes(&mut self, diagnostics: &[Diagnostic]) -> Vec<Publish> {
+    /// client clears its squiggles through it). Consumes the read task's
+    /// shared conversions rather than converting again. Order is by URI, so
+    /// the push sequence is deterministic.
+    fn plan_publishes(
+        &mut self,
+        diagnostics: &[Diagnostic],
+        converted: &[Option<lsp::Diagnostic>],
+    ) -> Vec<Publish> {
         let mut current: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>> =
             FxHashMap::default();
-        for diagnostic in diagnostics {
-            if let Some(converted) = self.convert(diagnostic) {
-                current.entry(diagnostic.file).or_default().push(converted);
+        for (diagnostic, converted) in diagnostics.iter().zip(converted) {
+            if let Some(converted) = converted {
+                current
+                    .entry(diagnostic.file)
+                    .or_default()
+                    .push(converted.clone());
             }
         }
         // Reconsider every diagnosed file plus every baseline file whose
@@ -558,12 +620,17 @@ impl Session {
         publishes
     }
 
-    /// Converts one engine diagnostic to the LSP shape. Returns `None` only
-    /// for a non-resident file, which the engine's "live libraries only"
-    /// contract excludes.
+    /// Converts one engine diagnostic to the LSP shape. The line index and
+    /// the resident text are borrowed, never cloned — a per-diagnostic
+    /// whole-file copy would make a read task O(D × file bytes). Returns
+    /// `None` only for a non-resident file, which the engine's "live
+    /// libraries only" contract excludes.
     fn convert(&self, diagnostic: &Diagnostic) -> Option<lsp::Diagnostic> {
+        #[cfg(test)]
+        crate::probe::count_conversion();
         let index = self.engine().line_index(diagnostic.file)?;
-        let text = self.text(diagnostic.file)?;
+        let bytes = self.engine().content(diagnostic.file)?;
+        let text = std::str::from_utf8(bytes).expect("engine content is valid UTF-8");
         // `line_col_utf16` answers the oracle's 1-based (line, column); LSP
         // positions are zero-based.
         let end_offset = diagnostic
@@ -571,8 +638,8 @@ impl Session {
             .offset
             .checked_add(diagnostic.range.length)
             .expect("diagnostic range overflows u32");
-        let (start_line, start_column) = index.line_col_utf16(&text, diagnostic.range.offset);
-        let (end_line, end_column) = index.line_col_utf16(&text, end_offset);
+        let (start_line, start_column) = index.line_col_utf16(text, diagnostic.range.offset);
+        let (end_line, end_column) = index.line_col_utf16(text, end_offset);
         let severity = match diagnostic.severity {
             Severity::Error => 1,
             Severity::Warning => 2,
@@ -594,17 +661,6 @@ impl Session {
             source: "dartq".into(),
             message: diagnostic.message.clone(),
         })
-    }
-
-    /// The resident text of a file. `set_content` is the only write path and
-    /// decodes lossily, so resident content is valid UTF-8 by construction.
-    fn text(&self, file: dartq_diagnostics::FileId) -> Option<String> {
-        let bytes = self.engine().content(file)?;
-        Some(
-            std::str::from_utf8(bytes)
-                .expect("engine content is valid UTF-8")
-                .to_owned(),
-        )
     }
 }
 
@@ -660,12 +716,49 @@ mod tests {
         assert!(!sink.dirty);
     }
 
+    /// The deadline is the single source of truth for the window: clean
+    /// sinks never bound the main loop's receive, dirty sinks do until the
+    /// flush lands (#347: an idle daemon saves at the deadline instead of
+    /// blocking forever with a pending save).
+    #[test]
+    fn flush_deadline_tracks_the_dirty_window() {
+        let mut sink = SnapshotSink {
+            store: None,
+            dirty: false,
+            last_apply: None,
+        };
+        assert!(
+            sink.deadline().is_none(),
+            "a clean sink never bounds the receive"
+        );
+
+        let applied = Instant::now();
+        sink.note_apply();
+        let deadline = sink.deadline().expect("a dirty sink bounds the receive");
+        assert!(deadline > applied, "the deadline lies past the apply");
+        assert!(
+            deadline <= applied + SNAPSHOT_DEBOUNCE + Duration::from_millis(50),
+            "the deadline is the apply instant plus the window"
+        );
+
+        sink.flush();
+        assert!(
+            sink.deadline().is_none(),
+            "flushed: the receive blocks freely again"
+        );
+    }
+
     use crate::test_fixtures::{BROKEN_MAIN, CLEAN_MAIN, Workspace, store_root};
     use dartq_snapshot::DEFAULT_CAPACITY_BYTES;
 
     /// A session over a throwaway workspace with a throwaway snapshot root.
     fn fixture(name: &str) -> (Workspace, Session) {
-        let workspace = Workspace::new(BROKEN_MAIN);
+        fixture_with(name, BROKEN_MAIN)
+    }
+
+    /// [`fixture`] over custom on-disk `lib/main.dart` content.
+    fn fixture_with(name: &str, main_dart: &str) -> (Workspace, Session) {
+        let workspace = Workspace::new(main_dart);
         let store = SnapshotStore::open(SnapshotConfig {
             root: Some(store_root(name)),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -838,5 +931,96 @@ mod tests {
         );
         assert_eq!(turn.answers[0].0, RequestId::Num(3));
         assert!(turn.answers[0].1.is_ok());
+    }
+
+    /// Staged edits merge last-wins per path (#347): three batched
+    /// `didChange` frames for one file stage ONE whole-text op, not three —
+    /// and the batch publishes exactly what a single edit would (the
+    /// terminal state is order-independent for distinct paths, so the
+    /// earlier same-path ops are unobservable).
+    #[test]
+    fn staged_edits_of_one_file_merge_last_wins() {
+        let (workspace, mut session) = fixture("staged-merge-unit");
+        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Three didChange frames land inside one batch window: three
+        // queue_edit calls before the drain.
+        assert!(session.queue_edit(&uri, "}\n", 2));
+        assert!(session.queue_edit(&uri, ")\n", 3));
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 4));
+        assert_eq!(
+            session.staged.len(),
+            1,
+            "same-path ops converge to the last text"
+        );
+
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "one batch, one push — as if a single clean edit arrived: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].version, Some(4));
+        assert!(turn.publishes[0].diagnostics.is_empty());
+
+        // The survivor is the LAST text: an earlier broken one winning
+        // would surface syntax diagnostics here.
+        session.queue_analyze(RequestId::Num(2));
+        let turn = session.service();
+        let entries = turn.answers[0].1.as_ref().expect("post-batch answer");
+        assert!(
+            entries.is_empty(),
+            "the last edit is the applied one: {entries:?}"
+        );
+    }
+
+    /// The read task converts each diagnostic exactly once (#347): the
+    /// publish plan and the analyze entries share one conversion pass (the
+    /// pre-#347 shape converted twice), and conversion borrows the resident
+    /// text — a per-diagnostic whole-file clone would register on the bulk
+    /// allocation probe.
+    #[test]
+    fn read_turn_converts_once_and_never_clones_file_text() {
+        // An 8 KiB broken file: the whole text is bulk-sized, so any
+        // per-diagnostic copy would show up in the probe.
+        let big_broken = format!("{BROKEN_MAIN}// {}\n", "x".repeat(8 * 1024));
+        let (_workspace, mut session) = fixture_with("convert-probe-unit", &big_broken);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        crate::probe::reset_counters();
+        session.queue_analyze(RequestId::Num(2));
+        let turn = session.service();
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers");
+        assert!(
+            !entries.is_empty(),
+            "the fixture must carry diagnostics for the probe"
+        );
+
+        let (conversions, _) = crate::probe::counters();
+        assert_eq!(
+            conversions,
+            entries.len(),
+            "one conversion per diagnostic — not one for the publish plan plus one for the \
+             entries"
+        );
+
+        // Direct conversion allocates nothing bulk-sized: the line index
+        // and the text are borrowed, never owned per diagnostic.
+        let diagnostics = session.analyze().expect("re-analysis");
+        crate::probe::arm_bulk();
+        for diagnostic in &diagnostics {
+            assert!(session.convert(diagnostic).is_some());
+        }
+        assert_eq!(
+            crate::probe::bulk_bytes(),
+            0,
+            "convert borrows the resident text; a whole-file clone would register"
+        );
     }
 }

@@ -5,16 +5,18 @@
 //!
 //! # Turn shape
 //!
-//! One turn = block on the next frame, then drain everything already queued
-//! into one batch (the rust-analyzer main-loop posture): N overlay edits and
-//! M requests staged by the batch execute at a single
-//! [`Session::service`] drain, in the scheduler's writer-priority order —
-//! every write applies before any read analyzes. The snapshot debounce is
-//! checked at the same turn boundary: its window elapses across the blocking
-//! receive, so the loop stays timer-free.
+//! One turn = block on the next frames, then drain everything already queued
+//! into one batch (the rust-analyzer main-loop posture): the reader forwards
+//! each buffered chunk as one item, so frames the client wrote together are
+//! one turn's intake. N overlay edits and M requests staged by the batch
+//! execute at a single [`Session::service`] drain, in the scheduler's
+//! writer-priority order — every write applies before any read analyzes. The
+//! snapshot debounce is checked at the same turn boundary; while a save is
+//! pending the receive is bounded by the window's remainder, so an idle
+//! daemon wakes at the deadline to save — still no timer thread.
 
-use std::io::{self, BufRead, Write};
-use std::sync::mpsc;
+use std::io::{self, BufReader, Read, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
 
@@ -53,20 +55,21 @@ enum Incoming {
 /// Returns after `exit` (possibly leaving the reader blocked on the next
 /// read — under a real process the caller exits immediately, which reaps
 /// it; the reader is joined only when it is known to have finished) or when
-/// the stream ends.
+/// the stream ends. Input buffering is the shell's policy: the reader
+/// thread wraps the stream so batch boundaries follow read granularity.
 ///
 /// # Errors
 ///
 /// Writing to the client failed (peer vanished mid-answer).
 pub fn run<R, W>(input: R, output: W, mut session: Session) -> io::Result<u8>
 where
-    R: BufRead + Send + 'static,
+    R: Read + Send + 'static,
     W: Write + 'static,
 {
-    let (sender, receiver) = mpsc::channel::<Incoming>();
+    let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
     let reader = thread::Builder::new()
         .name("dartq-daemon-reader".into())
-        .spawn(move || reader_loop(input, sender))?;
+        .spawn(move || reader_loop(BufReader::new(input), sender))?;
 
     let mut output = output;
     let mut lifecycle = Lifecycle::Uninitialized;
@@ -74,17 +77,39 @@ where
     let mut exit_code: Option<u8> = None;
 
     // Ends when the reader thread disconnects or a notification breaks out.
-    while let Ok(first) = receiver.recv() {
+    loop {
         // Turn start: the snapshot debounce window elapses across the
-        // blocking receive above, so the flush check happens before intake.
-        // (Only tests read the attempt outcome.)
+        // receive below — blocking or deadline-bounded — so the flush check
+        // happens before intake. (Only tests read the attempt outcome.)
         let _ = session.flush_if_due(Instant::now());
 
-        // The batch window: every frame already queued joins this turn's
-        // single drain (PRD §16.5 writer priority).
-        let mut batch = vec![first];
-        while let Ok(incoming) = receiver.try_recv() {
-            batch.push(incoming);
+        // While a save is pending, the receive is bounded by the window's
+        // remainder: an idle daemon wakes at the deadline and the turn-start
+        // check above saves, instead of blocking forever with the save
+        // queued. A clean sink blocks freely until the next frame. Either
+        // way the loop stays timer-free.
+        let first = match session.flush_deadline() {
+            None => match receiver.recv() {
+                Ok(first) => first,
+                Err(_) => break,
+            },
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match receiver.recv_timeout(remaining) {
+                    Ok(first) => first,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        };
+
+        // The batch window: the reader forwards each buffered chunk as one
+        // item (frames the client wrote together), and anything that landed
+        // in the channel since joins the same turn's single drain (PRD
+        // §16.5 writer priority).
+        let mut batch = first;
+        while let Ok(queued) = receiver.try_recv() {
+            batch.extend(queued);
         }
 
         let mut end = false;
@@ -156,43 +181,59 @@ where
 
 /// Reads frames until the stream or the channel ends. Takes the sender by
 /// value: it is the thread's single owner, even though `send` borrows.
+///
+/// Everything decoded from one buffered chunk is forwarded as one channel
+/// item: frames the client wrote together reach the main loop as one turn's
+/// batch, decided by the transport's read granularity instead of a race
+/// between this thread's per-frame sends and the main loop's drain.
 #[allow(clippy::needless_pass_by_value)]
-fn reader_loop(input: impl BufRead, sender: mpsc::Sender<Incoming>) {
-    let mut input = input;
+fn reader_loop<R: Read>(mut input: BufReader<R>, sender: mpsc::Sender<Vec<Incoming>>) {
     loop {
-        match codec::read_frame(&mut input) {
-            Ok(Some(body)) => {
-                let incoming = match serde_json::from_slice::<Value>(&body) {
-                    Ok(value) => match Message::from_value(value) {
-                        Ok(message) => Incoming::Message(message),
-                        Err(message) => Incoming::Unparsable {
-                            code: codes::INVALID_REQUEST,
-                            message,
-                        },
-                    },
-                    Err(error) => Incoming::Unparsable {
-                        code: codes::PARSE_ERROR,
-                        message: error.to_string(),
-                    },
-                };
-                if sender.send(incoming).is_err() {
-                    return;
+        let mut batch = Vec::new();
+        let end = loop {
+            match codec::read_frame(&mut input) {
+                Ok(Some(body)) => {
+                    batch.push(decode_body(&body));
+                    // An empty buffer means the next frame needs a fresh
+                    // read (it would block) — forward what this chunk held.
+                    if input.buffer().is_empty() {
+                        break None;
+                    }
+                }
+                Ok(None) => break Some(Incoming::Eof),
+                Err(FrameError::Io(error)) => {
+                    eprintln!("dartq-daemon: input stream failed: {error}");
+                    break Some(Incoming::Eof);
+                }
+                Err(FrameError::Protocol(message)) => {
+                    break Some(Incoming::Desynced(message));
                 }
             }
-            Ok(None) => {
-                let _ = sender.send(Incoming::Eof);
-                return;
-            }
-            Err(FrameError::Io(error)) => {
-                eprintln!("dartq-daemon: input stream failed: {error}");
-                let _ = sender.send(Incoming::Eof);
-                return;
-            }
-            Err(FrameError::Protocol(message)) => {
-                let _ = sender.send(Incoming::Desynced(message));
-                return;
-            }
+        };
+        if !batch.is_empty() && sender.send(batch).is_err() {
+            return;
         }
+        if let Some(end) = end {
+            let _ = sender.send(vec![end]);
+            return;
+        }
+    }
+}
+
+/// Decodes one well-framed body into what the main loop consumes.
+fn decode_body(body: &[u8]) -> Incoming {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => match Message::from_value(value) {
+            Ok(message) => Incoming::Message(message),
+            Err(message) => Incoming::Unparsable {
+                code: codes::INVALID_REQUEST,
+                message,
+            },
+        },
+        Err(error) => Incoming::Unparsable {
+            code: codes::PARSE_ERROR,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -393,6 +434,11 @@ fn write_message(output: &mut impl Write, message: &Message) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::jsonrpc::RequestId;
+    use crate::test_fixtures::{
+        self, BROKEN_MAIN, CLEAN_MAIN, notification, request, spawn, store_root,
+    };
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn initialize_capabilities_are_pinned() {
@@ -409,5 +455,49 @@ mod tests {
             "the experimental analyze request is announced"
         );
         assert_eq!(result["serverInfo"]["name"], "dartq");
+    }
+
+    /// An idle daemon with a pending save wakes at the debounce deadline and
+    /// saves without any further frame (#347): the bounded receive pays off.
+    /// The deadline save also leaves the sink clean, so the session-end
+    /// flush is a no-op.
+    #[test]
+    fn idle_server_flushes_at_the_deadline_without_frames() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let mut h = spawn(&workspace, &store_root("idle-flush-unit"));
+
+        h.step(&request(1, "initialize", json!({})), 1);
+        h.step(&notification("initialized", json!({})), 1);
+        // The edit dirties the snapshot sink at its drain; the probe settles
+        // the frame-less step.
+        h.step(
+            &notification(
+                "textDocument/didChange",
+                json!({"textDocument": {"uri": uri, "version": 2},
+                       "contentChanges": [{"text": CLEAN_MAIN}]}),
+            ),
+            0,
+        );
+
+        crate::probe::reset_counters();
+        // No frames at all: past the deadline the bounded receive wakes and
+        // the turn-start check saves.
+        thread::sleep(crate::session::SNAPSHOT_DEBOUNCE + Duration::from_millis(200));
+        assert_eq!(
+            crate::probe::counters().1,
+            1,
+            "the idle daemon saved at the deadline, with no frame to wake it"
+        );
+
+        // Session end: the deadline save cleaned the sink — no second save.
+        h.step(&request(2, "shutdown", json!(null)), 1);
+        let (code, _) = h.exit();
+        assert_eq!(code, EXIT_CLEAN);
+        assert_eq!(
+            crate::probe::counters().1,
+            1,
+            "the session-end flush is a no-op after the deadline save"
+        );
     }
 }
