@@ -35,11 +35,14 @@
 //! * The `dartq/*` command family (PRD §15.1 — the RPC faces 1:1 with the
 //!   CLI commands): `dartq/analyze` (the merged diagnostic set, LSP URIs),
 //!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/fix`, and
-//!   `dartq/compat` (CLI-mirror faces with canonical path labels). All are
-//!   announced under `capabilities.experimental`; all answers carry
-//!   `schema_version` and honor an optional `verbosity` (the canonical
-//!   tiers in dartq-schema's crate docs); all share their implementation
-//!   with the CLI through `dartq-commands`.
+//!   `dartq/compat` (CLI-mirror faces with canonical path labels), plus the
+//!   per-agent overlay faces `dartq/overlay.set` and `dartq/overlay.clear`
+//!   (PRD §16.3). All are announced under `capabilities.experimental`; all
+//!   answers carry `schema_version` and honor an optional `verbosity` (the
+//!   canonical tiers in dartq-schema's crate docs); the engine-view faces
+//!   additionally accept `agentId` (the analyzed overlay view) and `since`
+//!   (delta mode), with the per-face visibility contract documented in the
+//!   `commands` module.
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
 //!   notifications are ignored (both per LSP).
 //!
@@ -55,6 +58,15 @@
 //! missing (see the `session` module docs); until they land each flush logs
 //! the gap and writes nothing.
 //!
+//! # File watch (`--watch`, PRD §16.7 mode 3)
+//!
+//! The optional convenience layer: --watch polls the workspace on one
+//! bounded-interval thread (no OS-event substrate in the dependency tree —
+//! documented as such), debounces bursts, and feeds the debounced batches
+//! through the reader channel as didChange-equivalent overlay syncs at
+//! `Tier::Normal`. Watch events are hints; the analysis's content check
+//! stays the truth.
+//!
 //! # Transport
 //!
 //! Hand-written `Content-Length` framing ([`codec`]) — the shell layer has
@@ -68,6 +80,7 @@ pub mod jsonrpc;
 pub mod lsp;
 pub mod session;
 pub mod uri;
+mod watch;
 
 // Lets the shared integration fixture (tests/common) compile inside the
 // lib's own unit-test build too, where the crate is not an --extern.
@@ -81,6 +94,7 @@ mod server;
 
 pub use server::{EXIT_CLEAN, EXIT_WITHOUT_SHUTDOWN, run};
 pub use session::{Publish, Session, SessionError, Turn};
+pub use watch::WatchOptions;
 
 /// Test-only observability for the daemon's hot-path allocation discipline
 /// (#347): a counting wrapper over the system allocator plus counters on
@@ -90,7 +104,7 @@ pub use session::{Publish, Session, SessionError, Turn};
 pub(crate) mod probe {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
     /// Diagnostic conversions this process performed (one per diagnostic
     /// per read task — a second call site would double it).
@@ -174,5 +188,18 @@ pub(crate) mod probe {
     pub(crate) fn reset_counters() {
         CONVERSIONS.store(0, Relaxed);
         FLUSHES.store(0, Relaxed);
+    }
+
+    /// One-shot panic trigger for the containment test (a real engine panic
+    /// cannot be conjured deterministically from RPC input).
+    static READ_PANIC: AtomicBool = AtomicBool::new(false);
+
+    /// Arms the next read group's execution to panic once.
+    pub(crate) fn arm_read_panic() {
+        READ_PANIC.store(true, Relaxed);
+    }
+
+    pub(crate) fn take_read_panic() -> bool {
+        READ_PANIC.swap(false, Relaxed)
     }
 }

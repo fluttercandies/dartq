@@ -19,6 +19,9 @@ thiserror = { workspace = true }
 dartq-package = { path = "../dartq-package" }
 dartq-pub = { path = "../dartq-pub" }
 dartq-sdk = { path = "../dartq-sdk" }
+# The session-economics answers (query symbols/since) validate against the
+# published schema in the overlay-scenario test.
+dartq-schema = { path = "../dartq-schema" }
 
 [lints]
 workspace = true

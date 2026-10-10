@@ -234,6 +234,7 @@ dependencies = [
  "dartq-parser",
  "dartq-pub",
  "dartq-scanner",
+ "dartq-schema",
  "dartq-sdk",
  "dartq-source",
  "serde",
@@ -251,6 +252,7 @@ dependencies = [
  "dartq-engine",
  "dartq-package",
  "dartq-pub",
+ "dartq-schema",
  "dartq-sdk",
  "dartq-snapshot",
  "rustc-hash",
@@ -288,6 +290,7 @@ dependencies = [
  "dartq-source",
  "rayon",
  "rustc-hash",
+ "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
@@ -439,6 +442,8 @@ dependencies = [
  "dartq-source",
  "dartq-types",
  "rustc-hash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

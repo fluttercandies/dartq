@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -43,12 +43,13 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::discover::{DiscoverError, discover};
+use dartq_commands::layout::EngineLayout;
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{engine_config, open_engine};
 use dartq_diagnostics::{
     AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json, write_machine,
 };
-use dartq_engine::{DeclHit, RefHit};
+use dartq_engine::{CancellationToken, DeclHit, EngineEvent, RefHit};
 
 /// Process exit codes (engine-api-spec §4.2, pinned to analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210).
@@ -188,6 +189,12 @@ struct AnalyzeArgs {
     /// Write one metrics JSON object to PATH at exit (engine-api-spec §3).
     #[arg(long)]
     metrics_json: Option<PathBuf>,
+    /// Analyze PATH with the content of FILE instead of the on-disk bytes
+    /// (PRD §16.3): repeatable, relative PATH resolves against DIR, and
+    /// FILE `-` reads stdin. The engine-view faces only — `check` has no
+    /// engine to overlay.
+    #[arg(long = "overlay", value_name = "PATH=FILE")]
+    overlays: Vec<String>,
     /// Dart SDK root; defaults to $DART_SDK.
     #[arg(long)]
     sdk: Option<PathBuf>,
@@ -216,6 +223,12 @@ struct DaemonArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
+    /// Watch the package directory and re-analyze after changes settle
+    /// (PRD §16.7 mode 3). Poll-based — a bounded-interval walk with burst
+    /// debouncing — a convenience layer: explicit push and content
+    /// verification stay the truth.
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Args)]
@@ -408,8 +421,19 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 /// One analyze run over a real package directory: pub faces → engine →
 /// oracle-format output on `out`, metrics JSON at exit. The workspace
 /// assembly and the engine pass live in `dartq-commands`; this shell adds
-/// the crash tier, the writers, and the exit tier.
+/// the crash tier, the writers, and the exit tier. `--overlay` specs route
+/// to [`analyze_overlaid`] (the shared [`dartq_commands::analyze::run`]
+/// cannot express the overlay's discover → set-content → analyze order).
 fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
+    if args.overlays.is_empty() {
+        analyze_plain(args, out)
+    } else {
+        analyze_overlaid(args, out)
+    }
+}
+
+/// The plain path: the shared run, byte-pinned.
+fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
@@ -463,6 +487,164 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
 }
 
+/// The `--overlay` path (PRD §16.3): discovery runs first (it re-enqueues
+/// disk bytes for every discovered file and pending content ops are
+/// last-wins per path, so overlay content must enqueue after it), the
+/// overlay texts replace the on-disk bytes, one analyze pass runs, and the
+/// oracle display order is applied. The postlude mirrors
+/// `dartq_commands::analyze::run` (severity → path → offset → message; the
+/// shared run cannot express this order) and is pinned byte-exact by this
+/// face's overlay test.
+fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
+    let started = Instant::now();
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let overlays = match load_overlays(&args.overlays, &args.dir) {
+        Ok(overlays) => overlays,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let discovery_at = Instant::now();
+    let stats = match engine.discover_workspace() {
+        Ok(stats) => stats,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let discovery = discovery_at.elapsed();
+    for (path, bytes) in &overlays {
+        engine.set_content(path, bytes);
+    }
+
+    let analyze_at = Instant::now();
+    let mut analyzed = (0_usize, 0_usize);
+    let mut on_event = |event: EngineEvent| {
+        if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
+            if from_cache {
+                analyzed.1 += 1;
+            } else {
+                analyzed.0 += 1;
+            }
+        }
+    };
+    let mut diagnostics = match engine.analyze(&[], &mut on_event, &CancellationToken::default()) {
+        Ok(diagnostics) => diagnostics,
+        Err(_cancelled) => {
+            eprintln!("dartq: internal error: analysis cancelled");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let analysis = analyze_at.elapsed();
+    let layout = EngineLayout::over(&engine, diagnostics.iter().map(|d| d.file));
+    diagnostics.sort_by(|a, b| {
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then_with(|| {
+                path_key(layout.file_path(a.file)).cmp(&path_key(layout.file_path(b.file)))
+            })
+            .then_with(|| a.range.offset.cmp(&b.range.offset))
+            .then_with(|| a.message.cmp(&b.message))
+    });
+
+    let written = match args.format {
+        AnalyzeFormat::Machine => write_machine(
+            out,
+            &AnalysisOutput {
+                diagnostics: &diagnostics,
+                files: &layout,
+            },
+        ),
+        AnalyzeFormat::Human => write_human(out, &diagnostics, &layout),
+    };
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing diagnostics failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+
+    if let Some(metrics_path) = &args.metrics_json {
+        let metrics = RunMetrics {
+            files: stats.file_count,
+            loc: stats.loc_total,
+            diagnostics: diagnostics.len(),
+            discovery_ms: elapsed_ms(discovery),
+            analyze_ms: elapsed_ms(analysis),
+            total_ms: elapsed_ms(started.elapsed()),
+            libraries_analyzed: analyzed.0,
+            libraries_from_cache: analyzed.1,
+            max_rss_bytes: max_rss_bytes(),
+        };
+        if let Err(error) = write_metrics(metrics_path, &metrics) {
+            eprintln!("dartq: internal error: writing metrics failed: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    }
+    severity_exit(&diagnostics, !args.no_fatal_warnings, args.fatal_infos)
+}
+
+/// Decodes `--overlay PATH=FILE` specs: the analyzed path (relative specs
+/// resolve against the package directory — the CLI twin of the daemon's
+/// workspace-root resolution) plus the local file whose content replaces
+/// the on-disk bytes (`-` reads stdin, the AI-agent buffer case).
+fn load_overlays(specs: &[String], dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (path, file) = spec
+                .split_once('=')
+                .ok_or_else(|| format!("--overlay expects PATH=FILE, got `{spec}`"))?;
+            if path.is_empty() || file.is_empty() {
+                return Err(format!("--overlay expects PATH=FILE, got `{spec}`"));
+            }
+            let path = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                dir.join(path)
+            }
+            // The engine's discovery interns canonical package-root paths;
+            // the overlay must address the same identity (a non-canonical
+            // spelling would land on a phantom extra file). A path that
+            // does not exist yet (agent-introduced) keeps its spelling.
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(path));
+            let bytes = if file == "-" {
+                let mut bytes = Vec::new();
+                io::stdin()
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("reading overlay stdin failed: {error}"))?;
+                bytes
+            } else {
+                fs::read(file).map_err(|error| format!("reading overlay `{file}` failed: {error}"))?
+            };
+            Ok((path, bytes))
+        })
+        .collect()
+}
+
+/// The oracle display order's severity rank (DiagnosticWithPath.
+/// _severityPriority: Error first — the mirror of dartq-commands' private
+/// `severity_rank`).
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Info => 2,
+    }
+}
+
+/// Plain byte key of a path — the oracle's `filePath.compareTo` string order
+/// (the mirror of dartq-commands' private `path_key`).
+fn path_key(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
+}
+
 /// The LSP daemon face: assemble the engine context, hand it to the daemon
 /// session, and serve stdin/stdout until `shutdown`+`exit` or EOF. The
 /// workspace sweep (discovery + first analysis) runs inside the session at
@@ -486,10 +668,12 @@ fn daemon(args: &DaemonArgs) -> u8 {
     // The reader thread owns stdin; only the main loop writes stdout, so the
     // buffer needs no lock. The `Stdin` handle (not `StdinLock`) is what is
     // `Send`. On `exit` the reader may still be blocked on the next read —
-    // process exit reaps it.
+    // process exit reaps it. With `--watch`, the server also spawns its poll
+    // thread over the package directory (PRD §16.7 mode 3).
     let stdin = io::BufReader::new(io::stdin());
     let stdout = io::BufWriter::new(io::stdout().lock());
-    match dartq_daemon::run(stdin, stdout, session) {
+    let watch = args.watch.then(|| dartq_daemon::WatchOptions::new(args.dir.clone()));
+    match dartq_daemon::run(stdin, stdout, session, watch) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("dartq: internal error: daemon transport failed: {error}");
@@ -1115,6 +1299,7 @@ mod tests {
             "machine default"
         );
         assert!(args.metrics_json.is_none() && args.sdk.is_none());
+        assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
         assert_eq!(args.dir, PathBuf::from("/pkg"));
 
@@ -1123,6 +1308,9 @@ mod tests {
             "--format=human",
             "--metrics-json",
             "/tmp/m.json",
+            "--overlay",
+            "lib/a.dart=/tmp/a.dart",
+            "--overlay=lib/b.dart=/tmp/b.dart",
             "--sdk",
             "/sdk",
             "--no-fatal-warnings",
@@ -1137,6 +1325,14 @@ mod tests {
         assert!(matches!(args.format, AnalyzeFormat::Human));
         assert_eq!(args.metrics_json, Some(PathBuf::from("/tmp/m.json")));
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
+        assert_eq!(
+            args.overlays,
+            vec![
+                "lib/a.dart=/tmp/a.dart".to_owned(),
+                "lib/b.dart=/tmp/b.dart".to_owned(),
+            ],
+            "repeatable --overlay specs"
+        );
         assert!(args.no_fatal_warnings && args.fatal_infos);
     }
 
@@ -1189,6 +1385,7 @@ mod tests {
             dir: root.to_path_buf(),
             format,
             metrics_json,
+            overlays: Vec::new(),
             sdk: Some(root.join("sdk")),
             no_fatal_warnings: false,
             fatal_infos: false,
@@ -1291,6 +1488,86 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&no_config).ok();
+    }
+
+    /// The `--overlay` face (PRD §16.3): the analyzed file's content is
+    /// replaced by the local file's bytes — a clean overlay fixes the
+    /// broken fixture (exit 0, empty machine output), an overlay carrying
+    /// an error reports it against the analyzed path in exact oracle bytes
+    /// (the mirrored postlude's pin), and a missing local file is the usage
+    /// tier. The overlay path never rewrites the workspace on disk.
+    #[test]
+    fn analyze_overlay_replaces_content_for_one_run() {
+        let root = analyze_fixture("overlay", &[("lib/broken.dart", "void f() { x }\n")]);
+        // The overlay SOURCE files live outside the analyzed tree — a
+        // root-level `.dart` file would be discovered and analyzed itself.
+        let sources =
+            std::env::temp_dir().join(format!("dq_cli_overlay_src_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sources);
+        fs::create_dir_all(&sources).expect("mkdir");
+        let clean = sources.join("clean.dart");
+        fs::write(&clean, "var ok = 1;\n").expect("write");
+        let broken = sources.join("broken.dart");
+        fs::write(&broken, "void g() { y }\n").expect("write");
+
+        let target = root.join("lib/broken.dart");
+        // Clean overlay: the error is gone.
+        let fixed = AnalyzeArgs {
+            overlays: vec![format!("{}={}", target.display(), clean.display())],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&fixed, &mut Vec::new()), exit::CLEAN);
+
+        // The overlay never touches disk: the on-disk file stays broken.
+        assert_eq!(
+            fs::read_to_string(&target).expect("target intact"),
+            "void f() { x }\n"
+        );
+
+        // Broken overlay: the errors surface against the analyzed path in
+        // the oracle machine geometry (engine-canonical → oracle display
+        // order; `y` at UTF-16 offset 11 → line 1, column 12, length 1 —
+        // the semantic row precedes the syntax row at offset 13).
+        let mut out: Vec<u8> = Vec::new();
+        let broken_overlay = AnalyzeArgs {
+            overlays: vec![format!("{}={}", target.display(), broken.display())],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&broken_overlay, &mut out), exit::ERRORS);
+        assert_eq!(
+            String::from_utf8(out).expect("stdout is UTF-8"),
+            format!(
+                "ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'y'.\n\
+                 ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|14|1|Expected ';' after this.\n",
+                target.canonicalize().expect("root").display(),
+                target.canonicalize().expect("root").display()
+            ),
+            "the overlay path pins the mirrored oracle sort + writer bytes"
+        );
+
+        // Relative overlay spec resolves against the package dir.
+        let relative = AnalyzeArgs {
+            overlays: vec![format!("lib/broken.dart={}", clean.display())],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&relative, &mut Vec::new()), exit::CLEAN);
+
+        // Missing local file → usage tier.
+        let missing = AnalyzeArgs {
+            overlays: vec![format!("{}={}", target.display(), root.join("nope").display())],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&missing, &mut Vec::new()), exit::USAGE);
+
+        // Malformed spec → usage tier.
+        let malformed = AnalyzeArgs {
+            overlays: vec!["no-equals-sign".to_owned()],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&malformed, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&sources).ok();
     }
 
     // -----------------------------------------------------------------------
@@ -1594,5 +1871,26 @@ mod tests {
         assert!(args.full);
         assert_eq!(args.dir, PathBuf::from("/pkg"));
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
+    }
+
+    /// The daemon's `--watch` flag (PRD §16.7 mode 3): parseable, off by
+    /// default.
+    #[test]
+    fn daemon_watch_flag_parse() {
+        let parsed = parse_args_of(&["daemon", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Daemon(args) = parsed else {
+            panic!("expected daemon command")
+        };
+        assert!(!args.watch, "watch defaults off");
+
+        let parsed = parse_args_of(&["daemon", "--watch", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Daemon(args) = parsed else {
+            panic!("expected daemon command")
+        };
+        assert!(args.watch, "--watch parses");
     }
 }

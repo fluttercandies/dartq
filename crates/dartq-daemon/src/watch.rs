@@ -231,9 +231,16 @@ mod tests {
         let mut debounce = Debounce::default();
         let touch = |name: &str| vec![PathBuf::from(name)];
 
-        assert!(debounce.tick(touch("b.dart"), t0).is_none(), "no flush mid-burst");
+        assert!(
+            debounce.tick(touch("b.dart"), t0).is_none(),
+            "no flush mid-burst"
+        );
         assert!(debounce.tick(touch("a.dart"), t0 + POLL_INTERVAL).is_none());
-        assert!(debounce.tick(touch("b.dart"), t0 + 2 * POLL_INTERVAL).is_none());
+        assert!(
+            debounce
+                .tick(touch("b.dart"), t0 + 2 * POLL_INTERVAL)
+                .is_none()
+        );
 
         let batch = debounce
             .tick(Vec::new(), t0 + 3 * POLL_INTERVAL)
@@ -267,11 +274,7 @@ mod tests {
         let batch = debounce
             .tick(touch(4), t0 + MAX_HOLD)
             .expect("max hold forces the flush");
-        assert_eq!(
-            batch.len(),
-            5,
-            "everything accumulated so far: {batch:?}"
-        );
+        assert_eq!(batch.len(), 5, "everything accumulated so far: {batch:?}");
         assert!(
             debounce
                 .tick(touch(5), t0 + MAX_HOLD + POLL_INTERVAL)

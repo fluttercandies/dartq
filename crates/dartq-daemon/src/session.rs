@@ -1,8 +1,8 @@
 //! The session: one [`Runtime`] (the root analysis context) plus the
-//! open-document overlay, the publish-diff baseline, and the debounced
-//! snapshot sink. All engine and scheduler calls happen here, synchronously,
-//! on the main-loop thread (CPU-bound work, no lock contention by
-//! construction).
+//! open-document overlay, the per-agent overlays (PRD §16.3), the
+//! publish-diff baseline, the delta cursor, and the debounced snapshot
+//! sink. All engine and scheduler calls happen here, synchronously, on the
+//! main-loop thread (CPU-bound work, no lock contention by construction).
 //!
 //! # Task flow (PRD §16.5, §16.6)
 //!
@@ -22,6 +22,58 @@
 //! re-stamped with it so the publish diff still drains — an edit+cancel
 //! batch can never leave the client's diagnostics stale.
 //!
+//! # Agent views (PRD §16.3)
+//!
+//! `overlay.set`/`overlay.clear` stage per-agent `path → content` deltas on
+//! the session (bounded: cleared on teardown, capped count). A request
+//! carrying `agentId` must see that agent's view, so the drain partitions
+//! its read task's requests into view groups — base first (its analysis
+//! also feeds the publish diff; publishes never leak an agent view), then
+//! one group per agent in first-appearance order. Each group materializes
+//! its view onto the ONE shared engine: the group's overlay contents are
+//! `set_content` over the base (base bytes captured at wear time — the
+//! write task has already applied synchronously by then), analyzed once,
+//! and answered; the next group first restores the previous wear through
+//! the `worn` scratch. Every drain ends by restoring the base view, so
+//! between turns the engine is base-resident and captures never lie.
+//!
+//! The tradeoff is deliberate: per-agent engines would hold one full
+//! derived state (tokens, AST arenas, indexes — a small multiple of source
+//! bytes) per agent; materialization holds exactly one plus the sparse
+//! per-agent deltas, at the cost of re-analyzing the overlapped libraries
+//! per view switch — bounded by the overlay size, never the workspace.
+//!
+//! # Delta cursor (PRD §15.8)
+//!
+//! A per-session monotonic counter bumps once per applied content change
+//! (a base overlay apply, an `overlay.set`); the changed map records each
+//! explicitly written path's last-change cursor. `since:` answers filter
+//! rows by that table and echo the current cursor. Cascade-invalidated
+//! dependents are deliberately not marked: the changed set is the files
+//! the client wrote.
+//!
+//! # Store hygiene (daemon-audit findings 2, 5)
+//!
+//! The runtime's shared overlay store is garbage-collected at the turn
+//! boundary once a threshold of dead contents has accumulated
+//! ([`Runtime::sweep`] is O(live), so idle sessions pay nothing), and each
+//! scheduler task executes inside a `catch_unwind` boundary: a panicking
+//! engine turn answers its requests `INTERNAL_ERROR` and the session
+//! survives instead of taking the process down.
+//!
+//! # Tier mapping (PRD §16.5 — the one place it is defined)
+//!
+//! A task's [`Tier`] is fixed where it enters the scheduler, at enqueue: a
+//! read task is `Interactive` only when a `dartq/*` request created it (a
+//! client waits on the answer); everything else is `Normal` — overlay
+//! writes (client edits and watch syncs alike), the publish-carrying reads
+//! edits and watch changes enqueue, and the `initialized` sweep's first
+//! analysis. `Background` is the engine's slot for indexing/prewarm
+//! producers the daemon does not run yet. Tier never changes after enqueue:
+//! a request attaching to an already-queued read keeps that read's tier
+//! (drain order is unaffected while one read serves the whole turn anyway;
+//! the distinction bites across contexts).
+//!
 //! # Snapshot persistence (#306)
 //!
 //! The sink is debounced by a last-apply timestamp: while it is dirty, the
@@ -40,7 +92,7 @@ use std::time::{Duration, Instant};
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_engine::{
     CancellationToken, Cancelled, ContextConfig, ContextId, Engine, EngineConfig, EngineError,
-    OverlayChange, Runtime,
+    OverlayChange, Runtime, Tier,
 };
 use rustc_hash::FxHashMap;
 use thiserror::Error;
@@ -57,6 +109,44 @@ use crate::uri;
 /// idle receive is bounded by the window's remainder, so an idle daemon
 /// wakes to save — no timer thread.
 pub(crate) const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// The overlay-store GC threshold (daemon-audit finding 2): sweep once this
+/// many new shared-store contents have accumulated since the last sweep.
+/// Each content is one whole document text, so the garbage ceiling is
+/// threshold × file size; the sweep itself is O(live entries).
+const GC_CONTENTS_THRESHOLD: usize = 64;
+
+/// The live agent-overlay cap: `overlay.set` naming an agent beyond it is
+/// answered `INVALID_PARAMS` (clear one first). Teardown paths —
+/// `overlay.clear`, session end — evict deterministically; the cap only
+/// stops a client from growing the table without bound.
+const MAX_AGENTS: usize = 256;
+
+/// One agent's staged view (PRD §16.3): the files whose content the agent's
+/// requests see instead of the base view. Base bytes are never stored here —
+/// they are captured from the engine at wear time and restored through the
+/// turn's `worn` scratch, so a base edit between staging and analysis can
+/// never be served stale.
+#[derive(Default)]
+struct AgentOverlay {
+    files: FxHashMap<PathBuf, OverlayFile>,
+}
+
+struct OverlayFile {
+    bytes: Vec<u8>,
+    /// The session cursor at which this content was staged (the delta
+    /// answer's changed-file cursor for this agent's view of the path).
+    set_at: u64,
+}
+
+/// The base content a worn path must be restored to.
+#[derive(Clone)]
+enum WornBase {
+    /// The base bytes, captured post-write at wear time.
+    Content(Vec<u8>),
+    /// The path exists only in agent overlays; the base view lacks it.
+    Absent,
+}
 
 /// Session failures the server can only report, not fix.
 #[derive(Debug, Error)]
@@ -105,9 +195,11 @@ pub struct Turn {
 }
 
 /// A queued read task and the requests waiting on its answer. Reads coalesce:
-/// one analysis serves every attached request plus the publish diff.
+/// one analysis serves every attached request plus the publish diff. `tier`
+/// is the queued task's precedence, remembered so a cancel re-stamp keeps it.
 struct PendingRead {
     requests: Vec<(RequestId, Request)>,
+    tier: Tier,
 }
 
 /// Debounced snapshot persistence state: dirty since the last overlay apply,
@@ -186,8 +278,9 @@ impl SnapshotSink {
 }
 
 /// The daemon's analysis state: the runtime + root context, open (overlay)
-/// documents, the last published diagnostics per file, the staged-but-
-/// undrained task set, and the snapshot sink.
+/// documents, the per-agent overlay views, the last published diagnostics
+/// per file, the delta cursor, the staged-but-undrained task set, and the
+/// snapshot sink.
 pub struct Session {
     runtime: Runtime,
     /// The root context; the daemon is shell only and never closes it.
@@ -202,6 +295,28 @@ pub struct Session {
     /// Baseline for publish diffing: a push only goes out when a file's
     /// diagnostic set differs from what was last published for it.
     published: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>>,
+    /// Per-agent overlay views (PRD §16.3), keyed by `agentId`. Bounded:
+    /// cleared on `overlay.clear`/session end, capped at [`MAX_AGENTS`].
+    agents: FxHashMap<String, AgentOverlay>,
+    /// Paths currently deviating from the base view, with the base content
+    /// to restore. Within-turn scratch only: every drain ends by restoring
+    /// the base view, so between turns this is empty and wear-time captures
+    /// read a base-resident engine.
+    worn: Vec<(PathBuf, WornBase)>,
+    /// The delta cursor (PRD §15.8): monotonic per session, bumped once per
+    /// applied content change.
+    cursor: u64,
+    /// Each explicitly-written path's last-change cursor (base view).
+    changed: FxHashMap<PathBuf, u64>,
+    /// A base write applied this session whose publish diff has not drained
+    /// yet: forces the base analysis even when only agent requests ride the
+    /// read, so the diff still goes out.
+    publishes_due: bool,
+    /// The session symbol table (short-id economics, PRD §15.8).
+    symbols: commands::SymbolTable,
+    /// Shared-store contents at the last overlay-store sweep (the GC
+    /// watermark).
+    gc_watermark: usize,
     /// Staged overlay mutations riding the queued write task (empty ⇔ no
     /// write task queued — the two change together).
     staged: Vec<OverlayChange>,
@@ -265,6 +380,13 @@ impl Session {
             next_cookie: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
+            agents: FxHashMap::default(),
+            worn: Vec::new(),
+            cursor: 0,
+            changed: FxHashMap::default(),
+            publishes_due: false,
+            symbols: commands::SymbolTable::default(),
+            gc_watermark: 0,
             staged: Vec::new(),
             write: None,
             read: None,
@@ -286,7 +408,7 @@ impl Session {
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
         self.engine_mut().discover_workspace()?;
-        self.ensure_read();
+        self.ensure_read(Tier::Normal);
         Ok(())
     }
 
@@ -306,7 +428,7 @@ impl Session {
             bytes: text.as_bytes().to_vec(),
         });
         self.ensure_write();
-        self.ensure_read();
+        self.ensure_read(Tier::Normal);
         true
     }
 
@@ -345,8 +467,46 @@ impl Session {
             Err(error) => return Err(error),
         }
         self.ensure_write();
-        self.ensure_read();
+        self.ensure_read(Tier::Normal);
         Ok(true)
+    }
+
+    /// Watch-mode intake (`--watch`, PRD §16.7 mode 3): syncs each reported
+    /// path's on-disk bytes into the overlay — the didChange-equivalent the
+    /// change-detection discipline names — and co-queues the Normal-tier
+    /// read the publish push rides on. Watch files are not LSP-opened, so
+    /// their publishes carry no version; a file deleted since the event
+    /// stages a removal (an overlay-only drop: a base copy resurfaces, per
+    /// the overlay model). Per-path independence: an unreadable file is
+    /// logged and skipped — watch events are hints, and the analysis's
+    /// content check stays the truth (§16.7).
+    pub fn queue_disk_changes(&mut self, paths: &[PathBuf]) {
+        let mut synced = false;
+        for path in paths {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    self.stage(OverlayChange::Set {
+                        path: path.clone(),
+                        bytes,
+                    });
+                    synced = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.stage(OverlayChange::Remove { path: path.clone() });
+                    synced = true;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "dartq-daemon: watch sync skipped {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if synced {
+            self.ensure_write();
+            self.ensure_read(Tier::Normal);
+        }
     }
 
     /// A `dartq/*` request: attaches to the queued read task (or queues
@@ -355,10 +515,56 @@ impl Session {
     /// request's command shapes its own answer from the post-write state.
     /// Crate-internal: the wire face is [`crate::server`]'s method table.
     pub(crate) fn queue_command(&mut self, id: RequestId, request: Request) {
-        self.ensure_read();
+        self.ensure_read(Tier::Interactive);
         if let Some(pending) = self.read.as_mut() {
             pending.requests.push((id, request));
         }
+    }
+
+    /// `dartq/overlay.set`: stages (merging per path) one agent's content
+    /// deltas. Lazy — no analysis runs here; the next request naming the
+    /// agent materializes the view. Bumps the delta cursor once.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::InvalidParams`] when the agent would exceed
+    /// [`MAX_AGENTS`] (clear one first).
+    pub fn set_overlay(
+        &mut self,
+        agent: &str,
+        files: Vec<(PathBuf, Vec<u8>)>,
+    ) -> Result<(), SessionError> {
+        if !self.agents.contains_key(agent) && self.agents.len() >= MAX_AGENTS {
+            return Err(SessionError::InvalidParams(format!(
+                "too many live agent overlays ({MAX_AGENTS}); clear one first"
+            )));
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        let entry = self.agents.entry(agent.to_owned()).or_default();
+        self.cursor += 1;
+        for (path, bytes) in files {
+            entry.files.insert(
+                path,
+                OverlayFile {
+                    bytes,
+                    set_at: self.cursor,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `dartq/overlay.clear`: evicts the agent's staged view (idempotent).
+    pub fn clear_overlay(&mut self, agent: &str) {
+        self.agents.remove(agent);
+    }
+
+    /// Whether `agent` has a live overlay view (the server's queue-time
+    /// `agentId` validation).
+    pub(crate) fn has_agent(&self, agent: &str) -> bool {
+        self.agents.contains_key(agent)
     }
 
     /// The workspace root the session's context was assembled from.
@@ -387,11 +593,7 @@ impl Session {
         let Some(pending) = &self.read else {
             return;
         };
-        let Some(position) = pending
-            .requests
-            .iter()
-            .position(|(queued, _)| queued == id)
-        else {
+        let Some(position) = pending.requests.iter().position(|(queued, _)| queued == id) else {
             return;
         };
         let mut pending = self
@@ -401,11 +603,11 @@ impl Session {
         let (cancelled, _) = pending.requests.remove(position);
         self.cancelled.push(cancelled);
         let _ = self.runtime.cancel(self.context);
-        // Re-stamp the surviving work at the fresh epoch — the stale
-        // (superseded) tasks drop at the drain.
+        // Re-stamp the surviving work at the fresh epoch, keeping each
+        // task's tier — the stale (superseded) tasks drop at the drain.
         if let Some(cookie) = self.write.take() {
             self.runtime
-                .enqueue(self.context, true, cookie)
+                .enqueue(self.context, true, Tier::Normal, cookie)
                 .expect("the root context lives for the session; write re-stamp cannot fail");
             self.write = Some(cookie);
         }
@@ -413,22 +615,31 @@ impl Session {
         if !survivors.is_empty() || self.write.is_some() {
             let cookie = self.next_cookie();
             self.runtime
-                .enqueue(self.context, false, cookie)
+                .enqueue(self.context, false, pending.tier, cookie)
                 .expect("the root context lives for the session; read re-stamp cannot fail");
             self.read = Some(PendingRead {
                 requests: survivors,
+                tier: pending.tier,
             });
         }
     }
 
     /// The turn's drain point: pops the scheduler in writer-priority order,
-    /// applies every staged write, runs the coalesced read once, and drops
-    /// stale tasks — dropped requests answer [`SessionError::Cancelled`].
+    /// applies every staged write, runs the coalesced read once (partitioned
+    /// into per-view groups), and drops stale tasks — dropped requests
+    /// answer [`SessionError::Cancelled`]. Each task executes inside a
+    /// panic boundary (daemon-audit finding 5): a panicking engine turn
+    /// answers its requests `INTERNAL_ERROR` instead of killing the
+    /// process, and the turn ends with the base view restored and the
+    /// overlay store swept once its garbage crossed the threshold.
     ///
     /// # Panics
     ///
-    /// Never in practice: every drained task references the root context,
-    /// which lives for the session.
+    /// Never escapes: engine panics are caught at the task boundary.
+    /// Enqueue paths still `expect` the root context to live for the
+    /// session, which is a structural invariant, not input-dependent.
+    /// See the structural contract in the panics section above; the
+    /// returned [`Turn`] carries the drain's publishes and answers.
     #[must_use]
     pub fn service(&mut self) -> Turn {
         let report = self.runtime.drain();
@@ -444,14 +655,40 @@ impl Session {
             if task.write {
                 let changes = std::mem::take(&mut self.staged);
                 self.write = None;
-                self.runtime
-                    .apply_overlay(self.context, &changes, &mut |_| {})
-                    .expect("a drain-live write references the open root context");
-                self.snapshot.note_apply();
+                let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.runtime
+                        .apply_overlay(self.context, &changes, &mut |_| {})
+                        .expect("a drain-live write references the open root context")
+                }));
+                match applied {
+                    Ok(_) => {
+                        self.snapshot.note_apply();
+                        self.cursor += 1;
+                        for change in &changes {
+                            let path = match change {
+                                OverlayChange::Set { path, .. }
+                                | OverlayChange::Remove { path } => path,
+                            };
+                            self.changed.insert(path.clone(), self.cursor);
+                        }
+                        self.publishes_due = true;
+                    }
+                    Err(payload) => {
+                        eprintln!(
+                            "dartq-daemon: overlay apply panicked ({}); the write did not land",
+                            panic_message(&payload)
+                        );
+                    }
+                }
             } else {
                 self.read_turn(&mut turn);
             }
         }
+        // Between turns the engine is base-resident: agent wears never
+        // outlive the drain, so intake-time state reads and the next
+        // drain's wear-time captures never see a stale view.
+        self.restore_base_view();
+        self.gc_if_due();
         turn
     }
 
@@ -461,6 +698,12 @@ impl Session {
         if self.snapshot.dirty {
             self.snapshot.flush();
         }
+    }
+
+    /// The shared overlay store's live content count (the GC test's probe).
+    #[cfg(test)]
+    pub(crate) fn overlay_store_contents(&self) -> usize {
+        self.runtime.stored_contents()
     }
 
     /// Turn-start debounce check; true when a save was attempted.
@@ -478,60 +721,257 @@ impl Session {
         self.snapshot.deadline()
     }
 
-    /// One read task's execution: a fresh full analysis — converted once,
-    /// then shared by the publish diff, the `dartq/analyze` answers, and
-    /// every other attached `dartq/*` command (which run over the analyzed
-    /// state without re-driving the pass).
+    /// One read task's execution: the requests partition into per-view
+    /// groups (base first — its analysis also feeds the publish diff — then
+    /// one group per agent in first-appearance order), and each group
+    /// materializes its view onto the shared engine and analyzes once.
+    /// When a base write applied but no base request rides the read, a
+    /// zero-request base analysis still runs so the publish diff drains.
     fn read_turn(&mut self, turn: &mut Turn) {
         let pending = self
             .read
             .take()
             .expect("a drain-live read task is still pending");
-        match self.analyze() {
-            Ok(diagnostics) => {
-                // The one conversion pass: the engine→LSP shape change is
-                // the expensive half (line-index math over the resident
-                // text), so the publish plan and the analyze entries both
-                // consume it instead of converting twice.
-                let converted: Vec<Option<lsp::Diagnostic>> = diagnostics
-                    .iter()
-                    .map(|diagnostic| self.convert(diagnostic))
-                    .collect();
-                turn.publishes
-                    .extend(self.plan_publishes(&diagnostics, &converted));
-                let entries: Vec<lsp::AnalyzeEntry> = diagnostics
-                    .into_iter()
-                    .zip(converted)
-                    .filter_map(|(engine_diag, converted)| {
-                        let diagnostic = converted?;
-                        let path = self.engine().file_table().path(engine_diag.file)?;
-                        Some(lsp::AnalyzeEntry {
-                            uri: uri::from_path(path),
-                            diagnostic,
-                        })
-                    })
-                    .collect();
-                let drain = commands::Drain {
-                    engine: self.engine(),
-                    root: &self.workspace_root,
-                    entries: &entries,
-                };
-                for (id, request) in pending.requests {
-                    let answer = commands::answer(&drain, &request);
-                    turn.answers.push((id, answer));
-                }
+        let mut groups: Vec<(Option<String>, Vec<(RequestId, Request)>)> = Vec::new();
+        for (id, request) in pending.requests {
+            let agent = request.agent().map(str::to_owned);
+            match groups.iter_mut().find(|(group, _)| *group == agent) {
+                Some((_, requests)) => requests.push((id, request)),
+                None => groups.push((agent, vec![(id, request)])),
             }
-            // Known semantics until the M4 worker pool: in-flight
-            // cancellation is NOT wired — the token handed to `analyze` is
-            // never cancelled, and the epoch only drops *queued* tasks at
-            // the drain, before they execute. This arm exists for the
-            // engine's contract (`analyze` can fail cancelled); stale work
-            // never surfaces as a partial answer because it never starts.
+        }
+        // Base first (stable): its analysis runs on the base-resident engine
+        // and feeds the publish diff before any agent wear flips content.
+        groups.sort_by_key(|(agent, _)| agent.is_some());
+
+        // A read task that exists for its publish diff alone — the sweep's
+        // first analysis, a write-riding read whose requests all cancelled,
+        // or a base write whose riders all want agent views — still runs
+        // its base analysis once.
+        let has_base = groups.iter().any(|(agent, _)| agent.is_none());
+        if groups.is_empty() || (self.publishes_due && !has_base) {
+            self.publishes_due = false;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_group(None, Vec::new(), turn)
+            }));
+            if outcome.is_err() {
+                eprintln!("dartq-daemon: base analysis panicked; the publish diff did not drain");
+                self.restore_base_view();
+            }
+        }
+
+        let mut poisoned = false;
+        for (agent, requests) in groups {
+            let ids: Vec<RequestId> = requests.iter().map(|(id, _)| id.clone()).collect();
+            if poisoned {
+                self.answer_panicked(turn, ids);
+                continue;
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_group(agent.as_deref(), requests, turn)
+            }));
+            if let Err(payload) = outcome {
+                // The engine's state is untrustworthy after a panic: the
+                // remaining groups answer without analyzing, and the best-
+                // effort restore below (itself contained) hands the next
+                // turn the cleanest base view achievable.
+                poisoned = true;
+                eprintln!(
+                    "dartq-daemon: analysis panicked ({}); answering the group internal error",
+                    panic_message(&payload)
+                );
+                self.answer_panicked(turn, ids);
+                self.restore_base_view();
+            }
+        }
+    }
+
+    /// Answers ids `INTERNAL_ERROR` after a panicking turn (the catch
+    /// boundary's degraded answer; finding 5).
+    fn answer_panicked(&mut self, turn: &mut Turn, ids: Vec<RequestId>) {
+        for id in ids {
+            turn.answers.push((
+                id,
+                Err(SessionError::Internal(
+                    "internal error: analysis panicked".into(),
+                )),
+            ));
+        }
+    }
+
+    /// One view group's analysis and answers: `None` is the base view (its
+    /// analysis also drains the publish diff); `Some(agent)` wears that
+    /// agent's overlay before analyzing and never publishes.
+    fn run_group(
+        &mut self,
+        agent: Option<&str>,
+        requests: Vec<(RequestId, Request)>,
+        turn: &mut Turn,
+    ) {
+        #[cfg(test)]
+        if crate::probe::take_read_panic() {
+            panic!("test-armed read panic");
+        }
+        let mut overlay_paths: Vec<PathBuf> = Vec::new();
+        if let Some(agent) = agent {
+            if !self.has_agent(agent) {
+                // Cleared between intake and the drain: a cleared view is an
+                // unknown one — fail loud instead of silently answering base.
+                for (id, _) in requests {
+                    turn.answers.push((
+                        id,
+                        Err(SessionError::InvalidParams(format!(
+                            "unknown agentId: {agent}"
+                        ))),
+                    ));
+                }
+                return;
+            }
+            self.wear(agent);
+            overlay_paths = self.agents[agent].files.keys().cloned().collect();
+        } else {
+            // Structural guard: the base group analyzes the base-resident
+            // engine (a no-op whenever nothing is worn — the normal shape,
+            // since base groups sort first).
+            self.restore_base_view();
+        }
+
+        let diagnostics = match self.analyze() {
+            Ok(diagnostics) => diagnostics,
             Err(Cancelled) => {
-                for (id, _) in pending.requests {
+                for (id, _) in requests {
                     turn.answers.push((id, Err(SessionError::Cancelled)));
                 }
+                return;
             }
+        };
+        // The one conversion pass per group (the engine→LSP shape change is
+        // the expensive half — #347's convert-once discipline, per view):
+        // the publish plan and the analyze entries share it.
+        let converted: Vec<Option<lsp::Diagnostic>> = diagnostics
+            .iter()
+            .map(|diagnostic| self.convert(diagnostic))
+            .collect();
+        if agent.is_none() {
+            self.publishes_due = false;
+            turn.publishes
+                .extend(self.plan_publishes(&diagnostics, &converted));
+        }
+        let entries: Vec<lsp::AnalyzeEntry> = diagnostics
+            .iter()
+            .zip(converted)
+            .filter_map(|(engine_diag, converted)| {
+                let diagnostic = converted?;
+                let path = self.engine().file_table().path(engine_diag.file)?;
+                Some(lsp::AnalyzeEntry {
+                    uri: uri::from_path(path),
+                    diagnostic,
+                })
+            })
+            .collect();
+        let agent_changed: Option<Vec<(PathBuf, u64)>> = agent.map(|agent| {
+            self.agents[agent]
+                .files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.set_at))
+                .collect()
+        });
+        let changes = commands::Changes::new(&self.changed, agent_changed);
+        // Disjoint field borrows: runtime (read), workspace_root/changed
+        // (read), symbols (mutate).
+        let engine = self
+            .runtime
+            .context_state(self.context)
+            .expect("the root context lives for the session");
+        let mut drain = commands::Drain {
+            engine,
+            root: &self.workspace_root,
+            diagnostics: &diagnostics,
+            entries: &entries,
+            changes: &changes,
+            cursor: self.cursor,
+            overlay_paths: &overlay_paths,
+            symbols: &mut self.symbols,
+        };
+        for (id, request) in requests {
+            let answer = commands::answer(&mut drain, &request);
+            turn.answers.push((id, answer));
+        }
+    }
+
+    /// Restores the base view after agent wear: sets every worn path's base
+    /// content back (or removes an agent-introduced path) and applies the
+    /// barrier, so captures and publishes read a base-resident engine. The
+    /// cascade is invalidation only — the next analysis recomputes.
+    fn restore_base_view(&mut self) {
+        if self.worn.is_empty() {
+            return;
+        }
+        let worn = std::mem::take(&mut self.worn);
+        let engine = self.engine_mut();
+        for (path, base) in &worn {
+            match base {
+                WornBase::Content(bytes) => {
+                    engine.set_content(path, bytes);
+                }
+                // Reachable only on the post-panic unwind path (a panic
+                // between the wear's set_content and the intern completing);
+                // containment, not silence: the normal path cannot get here.
+                WornBase::Absent => {
+                    let _ = engine.remove_file(path);
+                }
+            }
+        }
+        engine.apply_pending(&mut |_| {});
+    }
+
+    /// Wears one agent's overlay onto the engine: restores whatever a
+    /// previous group of this turn left worn (the barrier makes the engine
+    /// base-resident again — captures below always read true base bytes,
+    /// never a previous agent's content), then captures each overlaid
+    /// path's base bytes and sets the agent's content. The pending ops
+    /// apply at the group's analyze.
+    fn wear(&mut self, agent: &str) {
+        self.restore_base_view();
+        let Some(overlay) = self.agents.get(agent) else {
+            return;
+        };
+        let mut worn: Vec<(PathBuf, WornBase)> = Vec::with_capacity(overlay.files.len());
+        // Disjoint field borrows: agents (read) and runtime (mutate).
+        let engine = self
+            .runtime
+            .context_state_mut(self.context)
+            .expect("the root context lives for the session");
+        for (path, file) in &overlay.files {
+            // Capture before this path's own set_content; earlier paths'
+            // ops only pend, so the resident content is still the base.
+            let base = match engine
+                .file_table()
+                .try_file_id(path)
+                .and_then(|file| engine.content(file))
+            {
+                Some(bytes) => WornBase::Content(bytes.to_vec()),
+                None => WornBase::Absent,
+            };
+            worn.push((path.clone(), base));
+            engine.set_content(path, &file.bytes);
+        }
+        self.worn = worn;
+    }
+
+    /// Sweeps the runtime's shared overlay store once the garbage since the
+    /// last sweep crossed the threshold (daemon-audit finding 2: without a
+    /// driver the store accumulates every distinct edit state for the
+    /// session's life). O(live), so idle sessions pay nothing.
+    fn gc_if_due(&mut self) {
+        if self
+            .runtime
+            .stored_contents()
+            .saturating_sub(self.gc_watermark)
+            >= GC_CONTENTS_THRESHOLD
+        {
+            self.runtime.sweep();
+            self.gc_watermark = self.runtime.stored_contents();
         }
     }
 
@@ -551,24 +991,30 @@ impl Session {
         self.staged.push(change);
     }
 
+    /// Every daemon write is `Normal` (see the module's tier mapping): a
+    /// write's tier only competes against other writes, and applying input
+    /// is never the request itself — the read it enables is.
     fn ensure_write(&mut self) {
         if self.write.is_none() {
             let cookie = self.next_cookie();
             self.runtime
-                .enqueue(self.context, true, cookie)
+                .enqueue(self.context, true, Tier::Normal, cookie)
                 .expect("the root context lives for the session");
             self.write = Some(cookie);
         }
     }
 
-    fn ensure_read(&mut self) {
+    /// Queues the read task at `tier` when none is queued (the tier mapping
+    /// lives in the module docs; callers pass it per intake path).
+    fn ensure_read(&mut self, tier: Tier) {
         if self.read.is_none() {
             let cookie = self.next_cookie();
             self.runtime
-                .enqueue(self.context, false, cookie)
+                .enqueue(self.context, false, tier, cookie)
                 .expect("the root context lives for the session");
             self.read = Some(PendingRead {
                 requests: Vec::new(),
+                tier,
             });
         }
     }
@@ -703,6 +1149,15 @@ impl Session {
     }
 }
 
+/// The message of a caught panic payload (for the containment log line).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("opaque panic payload")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,8 +1242,8 @@ mod tests {
         );
     }
 
-    use crate::test_fixtures::{BROKEN_MAIN, CLEAN_MAIN, Workspace, store_root};
     use crate::commands::Request;
+    use crate::test_fixtures::{BROKEN_MAIN, CLEAN_MAIN, Workspace, store_root};
     use dartq_commands::Verbosity;
     use dartq_snapshot::DEFAULT_CAPACITY_BYTES;
 
@@ -831,6 +1286,7 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
@@ -838,6 +1294,7 @@ mod tests {
             RequestId::Num(3),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         let turn = session.service();
@@ -850,9 +1307,7 @@ mod tests {
             [&RequestId::Num(2), &RequestId::Num(3)]
         );
         for (_, answer) in &turn.answers {
-            let entries = answer
-                .as_ref()
-                .expect("both requests answer")["diagnostics"]
+            let entries = answer.as_ref().expect("both requests answer")["diagnostics"]
                 .as_array()
                 .expect("diagnostics array");
             assert!(entries.is_empty(), "post-write view: {entries:?}");
@@ -879,6 +1334,7 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
@@ -908,6 +1364,7 @@ mod tests {
             RequestId::Num(3),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         let turn = session.service();
@@ -916,10 +1373,7 @@ mod tests {
             "no duplicate push: {:?}",
             turn.publishes
         );
-        let entries = turn.answers[0]
-            .1
-            .as_ref()
-            .expect("post-write answer")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("post-write answer")["diagnostics"]
             .as_array()
             .expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
@@ -941,12 +1395,14 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         session.cancel_request(&RequestId::Num(2));
@@ -967,10 +1423,7 @@ mod tests {
             "the cancelled id: {:?}",
             turn.answers[0]
         );
-        let entries = turn.answers[1]
-            .1
-            .as_ref()
-            .expect("survivor answers Ok")["diagnostics"]
+        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok")["diagnostics"]
             .as_array()
             .expect("diagnostics array");
         assert!(
@@ -996,6 +1449,7 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         session.cancel_request(&RequestId::Num(99));
@@ -1015,6 +1469,7 @@ mod tests {
             RequestId::Num(3),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         let turn = session.service();
@@ -1068,19 +1523,96 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0]
-            .1
-            .as_ref()
-            .expect("post-batch answer")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("post-batch answer")["diagnostics"]
             .as_array()
             .expect("diagnostics array");
         assert!(
             entries.is_empty(),
             "the last edit is the applied one: {entries:?}"
         );
+    }
+
+    /// Watch intake (`--watch`) is the didChange-equivalent: an on-disk
+    /// rewrite synced through [`Session::queue_disk_changes`] re-analyzes
+    /// and publishes the clean set — with **no version** (a watch file is
+    /// not an LSP-opened document) — and a vanished file stages a removal,
+    /// so the file drops out of the view and its diagnostics vanish
+    /// (absence semantics, as with a closed overlay-only buffer; the
+    /// analysis's content check stays the §16.7 truth). Nothing staged
+    /// (every path unreadable) enqueues nothing.
+    #[test]
+    fn watch_disk_changes_sync_analyze_and_remove() {
+        let (workspace, mut session) = fixture("watch-sync-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(turn.publishes.len(), 1, "the seeded error publishes");
+
+        // A disk rewrite the client never pushed: analyzed Normal-tier, no
+        // version on the push.
+        fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
+        session.queue_disk_changes(&[main.clone()]);
+        let turn = session.service();
+        assert_eq!(turn.publishes.len(), 1, "the clear push");
+        assert_eq!(
+            turn.publishes[0].version, None,
+            "watch files are not LSP-opened"
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+
+        // A file deleted since the event: the overlay drops it, the file's
+        // diagnostics vanish, and — the baseline already being empty — no
+        // push goes out.
+        fs::remove_file(&main).expect("delete on disk");
+        session.queue_disk_changes(&[main.clone()]);
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "an absent file has nothing to push: {:?}",
+            turn.publishes
+        );
+        // The removal really landed: a fresh request answers without the
+        // file's diagnostics.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        let entries = turn.answers[0].1.as_ref().expect("post-removal answer")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
+        assert!(
+            entries.iter().all(|entry| !entry["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("main.dart"))),
+            "the deleted file has no diagnostics: {entries:?}"
+        );
+
+        // An unreadable path stages nothing: no write, no read, no turn
+        // work (the next analysis still answers).
+        session.queue_disk_changes(&[workspace.path("lib/nope-beyond-workspace.rs")]);
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "nothing new to publish: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.answers.len(), 1, "only the request ran");
     }
 
     /// The read task converts each diagnostic exactly once (#347): the
@@ -1103,13 +1635,11 @@ mod tests {
             RequestId::Num(2),
             Request::Analyze {
                 verbosity: Verbosity::Compact,
+                agent: None,
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0]
-            .1
-            .as_ref()
-            .expect("analyze answers")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
             .as_array()
             .expect("diagnostics array");
         assert!(
@@ -1155,6 +1685,8 @@ mod tests {
             Request::Check {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
+                agent: None,
+                since: None,
             },
         );
         session.cancel_request(&RequestId::Num(2));
@@ -1190,6 +1722,8 @@ mod tests {
             Request::Check {
                 paths: vec![workspace.path("lib/nope.dart")],
                 verbosity: Verbosity::Compact,
+                agent: None,
+                since: None,
             },
         );
         let turn = session.service();
@@ -1208,6 +1742,8 @@ mod tests {
             Request::Check {
                 paths: vec![workspace.path("lib")],
                 verbosity: Verbosity::Compact,
+                agent: None,
+                since: None,
             },
         );
         let turn = session.service();
@@ -1216,5 +1752,451 @@ mod tests {
             "the session answers after a usage-tier failure: {:?}",
             turn.answers
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent views (PRD §16.3) + session economics (PRD §15.8)
+    // -----------------------------------------------------------------------
+
+    /// Agent B's overlay signature — a syntax error the base fixture never
+    /// produces.
+    const AGENT_B_MAIN: &str = "void b() { z }\n";
+    /// A syntactically broken replacement (the M0 disk pipeline reports it).
+    const SYNTAX_BROKEN: &str = "void f() { x }\n";
+
+    /// The codes of a check/analyze answer's rows.
+    fn answer_codes(answer: &Result<serde_json::Value, SessionError>) -> Vec<String> {
+        match answer {
+            Ok(value) => value["diagnostics"]
+                .as_array()
+                .expect("diagnostics array")
+                .iter()
+                .map(|row| row["code"].as_str().expect("code").to_owned())
+                .collect(),
+            Err(error) => panic!("expected diagnostics, got {error}"),
+        }
+    }
+
+    /// A `dartq/check` request over `paths` (the disk pipeline discovers
+    /// them; the agent view filters the engine set by them).
+    fn check_request(
+        id: i64,
+        paths: &[std::path::PathBuf],
+        agent: Option<&str>,
+        since: Option<u64>,
+    ) -> (RequestId, Request) {
+        (
+            RequestId::Num(id),
+            Request::Check {
+                paths: paths.to_vec(),
+                verbosity: Verbosity::Compact,
+                agent: agent.map(str::to_owned),
+                since,
+            },
+        )
+    }
+
+    /// The acceptance posture, at session level: two concurrent agent
+    /// overlays over one base produce isolated diagnostics, and the base
+    /// view is untouched by both.
+    #[test]
+    fn agent_views_stay_isolated_over_one_base() {
+        let (workspace, mut session) = fixture("agent-isolation-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage A");
+        session
+            .set_overlay("B", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .expect("stage B");
+
+        let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
+        let (id_b, b) = check_request(3, &[workspace.path("lib")], Some("B"), None);
+        let (id_base, base) = check_request(4, &[workspace.path("lib")], None, None);
+        session.queue_command(id_a, a);
+        session.queue_command(id_b, b);
+        session.queue_command(id_base, base);
+        session.queue_command(
+            RequestId::Num(5),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+
+        assert_eq!(turn.answers.len(), 4, "one answer per request");
+        let by_id = |wanted: i64| {
+            turn.answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .map(|(_, answer)| answer)
+                .expect("answer present")
+        };
+        assert!(
+            answer_codes(by_id(2)).is_empty(),
+            "agent A's view is clean: {:?}",
+            by_id(2)
+        );
+        assert_eq!(
+            answer_codes(by_id(3)),
+            ["undefined_identifier", "expected_token"],
+            "agent B sees only its own view's errors: {:?}",
+            by_id(3)
+        );
+        assert!(
+            answer_codes(by_id(4)).is_empty(),
+            "base check is the M0 disk pipeline (semantic error invisible): {:?}",
+            by_id(4)
+        );
+        assert_eq!(
+            answer_codes(by_id(5)),
+            ["uri_does_not_exist"],
+            "the base engine view is immune to both overlays: {:?}",
+            by_id(5)
+        );
+    }
+
+    /// Clearing evicts the agent (fail loud on a late request) and the
+    /// wear/restore cycle leaves the base view exactly as it was.
+    #[test]
+    fn overlay_clear_restores_the_base_view() {
+        let (workspace, mut session) = fixture("agent-clear-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage");
+
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: Some("A".into()),
+            },
+        );
+        let turn = session.service();
+        assert!(answer_codes(&turn.answers[0].1).is_empty(), "A is clean");
+
+        session.clear_overlay("A");
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: Some("A".into()),
+            },
+        );
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Err(SessionError::InvalidParams(message))
+                if message.contains("A")),
+            "a cleared agent answers INVALID_PARAMS: {:?}",
+            turn.answers[0]
+        );
+
+        // The base view survived the wear/restore cycle byte-for-byte: the
+        // seeded error is still the only diagnostic.
+        session.queue_command(
+            RequestId::Num(4),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            answer_codes(&turn.answers[0].1),
+            ["uri_does_not_exist"],
+            "the base view is uncorrupted: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// A base change under a live overlay stays fresh: the wear captures
+    /// base bytes at drain time (never at stage time), the overlay masks
+    /// the base edit for its agent, and clearing the overlay reveals the
+    /// edited base.
+    #[test]
+    fn base_change_under_a_live_overlay_stays_fresh() {
+        let (workspace, mut session) = fixture("agent-freshness-unit");
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main, SYNTAX_BROKEN.as_bytes().to_vec())])
+            .expect("stage");
+        // The base moves AFTER staging: the agent's capture must happen at
+        // wear time, so A keeps seeing its own text and the base moves on.
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Check {
+                paths: vec![workspace.path("lib")],
+                verbosity: Verbosity::Compact,
+                agent: Some("A".into()),
+                since: None,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            answer_codes(&turn.answers[0].1),
+            ["undefined_identifier", "expected_token"],
+            "the overlay masks the base edit: {:?}",
+            turn.answers[0]
+        );
+
+        // Clear: the edited base shows through — clean.
+        session.clear_overlay("A");
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Check {
+                paths: vec![workspace.path("lib")],
+                verbosity: Verbosity::Compact,
+                agent: None,
+                since: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            answer_codes(&turn.answers[0].1).is_empty(),
+            "the base edit was never clobbered by the wear/restore cycle: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// Delta mode (PRD §15.8): the cursor is per-session monotonic, a delta
+    /// answer keeps only rows whose file changed since the cursor, and the
+    /// answer echoes the session's current cursor for chaining.
+    #[test]
+    fn delta_cursor_filters_rows_and_echoes_the_current_cursor() {
+        let (workspace, mut session) = fixture("delta-cursor-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The edit moves the cursor to 1 and leaves rows behind: a disk
+        // rewrite synced through the watch intake (the base check face
+        // reads disk, so the rewrite must be on disk for the rows to
+        // exist; the sync marks the path changed in the same turn).
+        std::fs::write(workspace.path("lib/main.dart"), SYNTAX_BROKEN).expect("rewrite");
+        session.queue_disk_changes(&[workspace.path("lib/main.dart")]);
+
+        let (id_all, all) = check_request(2, &[workspace.path("lib")], None, Some(0));
+        session.queue_command(id_all, all);
+        let (id_current, current) = check_request(3, &[workspace.path("lib")], None, Some(1));
+        session.queue_command(id_current, current);
+        let (id_base, base) = check_request(4, &[workspace.path("lib")], None, None);
+        session.queue_command(id_base, base);
+        let turn = session.service();
+
+        let by_id = |wanted: i64| {
+            &turn
+                .answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .expect("answer present")
+                .1
+        };
+        // since=0: the edited file's row stays (the M0 disk pipeline's
+        // scan+parse row set); the cursor (1) echoes.
+        assert_eq!(answer_codes(by_id(2)), ["expected_token"], "{:?}", by_id(2));
+        assert_eq!(
+            by_id(2).as_ref().expect("ok")["since"],
+            1,
+            "the answer echoes the session's current cursor"
+        );
+        // since=1: the file's last change IS the cursor — nothing newer.
+        assert!(
+            answer_codes(by_id(3)).is_empty(),
+            "a delta at the current cursor is empty: {:?}",
+            by_id(3)
+        );
+        assert_eq!(by_id(3).as_ref().expect("ok")["since"], 1);
+        // No `since`: the full answer, no cursor field.
+        assert_eq!(answer_codes(by_id(4)), ["expected_token"]);
+        assert!(
+            by_id(4).as_ref().expect("ok").get("since").is_none(),
+            "a full answer carries no cursor"
+        );
+    }
+
+    /// A base write always drains its publish diff in the base view — even
+    /// when the only requests riding the read want an agent view (the
+    /// zero-request base analysis), and an agent view never publishes.
+    #[test]
+    fn base_publish_drains_when_only_agent_requests_ride_the_read() {
+        let (workspace, mut session) = fixture("agent-publish-unit");
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        // Agent A's overlay carries a syntax error; the base edit cleans
+        // the file. If the publish leaked A's view, the push would carry
+        // `expected_token` instead of the base clear.
+        session
+            .set_overlay("A", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .expect("stage");
+        let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
+        session.queue_command(id_a, a);
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        let turn = session.service();
+
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the base edit's clear push drains: {:?}",
+            turn.publishes
+        );
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the push is the base view, never the agent's rows: {:?}",
+            turn.publishes[0]
+        );
+        assert_eq!(
+            answer_codes(&turn.answers[0].1),
+            ["undefined_identifier", "expected_token"],
+            "agent A still answers its own (masking) view: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// A panicking read group (the containment boundary; daemon-audit
+    /// finding 5) answers its requests `INTERNAL_ERROR` instead of killing
+    /// the process, and the next turn answers normally — with the deferred
+    /// publish diff still draining.
+    #[test]
+    fn a_panicking_read_answers_internal_error_and_the_session_survives() {
+        let (workspace, mut session) = fixture("panic-boundary-unit");
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The panicked turn carries a real pending diff: the write applies
+        // (the diff becomes due), then the read group panics before it can
+        // plan the publishes.
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        crate::probe::arm_read_panic();
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the panicked read planned no publishes: {:?}",
+            turn.publishes
+        );
+        assert!(
+            matches!(&turn.answers[0].1, Err(SessionError::Internal(message))
+                if message.contains("panicked")),
+            "the boundary answers INTERNAL_ERROR: {:?}",
+            turn.answers[0]
+        );
+
+        // The next turn is healthy, and the publish diff the panicked read
+        // deferred still drains.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the deferred publish diff drains on recovery: {:?}",
+            turn.publishes
+        );
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the deferred push is the post-write base view: {:?}",
+            turn.publishes[0]
+        );
+        assert!(
+            matches!(&turn.answers[0].1, Ok(_)),
+            "the session survives the panic: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// The shared overlay store is swept at the turn boundary (daemon-audit
+    /// finding 2): N distinct edit states leave the store bounded, and
+    /// analysis answers stay correct after the sweeps.
+    #[test]
+    fn overlay_store_sweep_bounds_the_shared_store() {
+        let (workspace, mut session) = fixture("overlay-gc-unit");
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        for version in 0..(GC_CONTENTS_THRESHOLD * 2) {
+            assert!(session.queue_edit(
+                &uri,
+                &format!("void main() {{}} // v{version}\n"),
+                i64::try_from(version).expect("version") + 2,
+            ));
+            let _ = session.service();
+        }
+        let contents = session.overlay_store_contents();
+        assert!(
+            contents <= GC_CONTENTS_THRESHOLD + 4,
+            "the turn-boundary sweep bounds the store: {contents} contents after {} edits",
+            GC_CONTENTS_THRESHOLD * 2
+        );
+
+        // The sweeps never corrupted the analysis state.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert!(matches!(&turn.answers[0].1, Ok(_)));
+    }
+
+    /// The live-agent cap: one more overlay than the cap answers
+    /// INVALID_PARAMS until one is cleared.
+    #[test]
+    fn agent_overlay_count_is_capped() {
+        let (workspace, mut session) = fixture("agent-cap-unit");
+        let main = workspace.path("lib/main.dart");
+
+        for index in 0..MAX_AGENTS {
+            session
+                .set_overlay(
+                    &format!("agent-{index}"),
+                    vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())],
+                )
+                .expect("under the cap");
+        }
+        assert!(
+            session
+                .set_overlay(
+                    "overflow",
+                    vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())]
+                )
+                .is_err(),
+            "the cap rejects a new agent"
+        );
+        session.clear_overlay("agent-0");
+        session
+            .set_overlay("overflow", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("a cleared slot frees room");
     }
 }

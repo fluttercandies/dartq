@@ -16,6 +16,7 @@
 //! daemon wakes at the deadline to save — still no timer thread.
 
 use std::io::{self, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
@@ -27,6 +28,7 @@ use crate::commands;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::lsp::{self, PublishDiagnosticsParams};
 use crate::session::{Publish, Session, SessionError};
+use crate::watch::{WatchOptions, Watcher};
 
 /// Exit code for a clean session end: `shutdown` + `exit`, or the client
 /// simply closed the stream.
@@ -34,8 +36,9 @@ pub const EXIT_CLEAN: u8 = 0;
 /// Exit code for `exit` without a prior `shutdown` (LSP §lifeCycleMessages).
 pub const EXIT_WITHOUT_SHUTDOWN: u8 = 1;
 
-/// What the reader thread hands to the main loop.
-enum Incoming {
+/// What the reader thread hands to the main loop — plus the watch thread's
+/// debounced batches, which ride the same channel (one receiver, no select).
+pub(crate) enum Incoming {
     Message(Message),
     /// A well-framed body that is not valid JSON-RPC: answerable, and the
     /// stream stays in sync.
@@ -48,26 +51,44 @@ enum Incoming {
     Desynced(String),
     /// Clean end of stream.
     Eof,
+    /// `--watch` intake (PRD §16.7 mode 3): the debounced batch of paths
+    /// whose on-disk content changed or vanished since the last batch —
+    /// synced didChange-equivalent at the turn's drain.
+    Watch {
+        touched: Vec<PathBuf>,
+    },
 }
 
 /// Runs one LSP session to its end and returns the process exit code.
 ///
 /// Spawns the reader thread and runs the main loop on the current thread.
-/// Returns after `exit` (possibly leaving the reader blocked on the next
-/// read — under a real process the caller exits immediately, which reaps
-/// it; the reader is joined only when it is known to have finished) or when
-/// the stream ends. Input buffering is the shell's policy: the reader
-/// thread wraps the stream so batch boundaries follow read granularity.
+/// With `watch` set (PRD §16.7 mode 3) it also spawns the one watch thread,
+/// whose debounced batches ride the same channel; dropping the watcher at
+/// session end stops and joins it. Returns after `exit` (possibly leaving
+/// the reader blocked on the next read — under a real process the caller
+/// exits immediately, which reaps it; the reader is joined only when it is
+/// known to have finished) or when the stream ends. Input buffering is the
+/// shell's policy: the reader thread wraps the stream so batch boundaries
+/// follow read granularity.
 ///
 /// # Errors
 ///
 /// Writing to the client failed (peer vanished mid-answer).
-pub fn run<R, W>(input: R, output: W, mut session: Session) -> io::Result<u8>
+pub fn run<R, W>(
+    input: R,
+    output: W,
+    mut session: Session,
+    watch: Option<WatchOptions>,
+) -> io::Result<u8>
 where
     R: Read + Send + 'static,
     W: Write + 'static,
 {
     let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
+    // Held for the session's lifetime: dropping it at return stops and
+    // joins the watch thread. A send past a dead receiver ends the thread
+    // on its own, too.
+    let _watcher = watch.map(|options| Watcher::spawn(options, sender.clone()));
     let reader = thread::Builder::new()
         .name("dartq-daemon-reader".into())
         .spawn(move || reader_loop(BufReader::new(input), sender))?;
@@ -131,6 +152,7 @@ where
                     }
                 }
                 Incoming::Message(Message::Response(_)) => {} // clients never send these
+                Incoming::Watch { touched } => session.queue_disk_changes(&touched),
                 Incoming::Unparsable { code, message } => {
                     write_message(
                         &mut output,
@@ -271,6 +293,33 @@ fn handle_request(
             *lifecycle = Lifecycle::ShutDown;
             Some(Response::ok(id, Value::Null))
         }
+        // The overlay faces answer at intake: they mutate session
+        // bookkeeping (staging or evicting an agent view), never analyze —
+        // no scheduler task, no cancel surface.
+        (Lifecycle::Ready, "dartq/overlay.set") => {
+            let params = request.params.unwrap_or(Value::Null);
+            match commands::parse_overlay_set(&params, session.workspace_root()) {
+                Ok((agent, files)) => match session.set_overlay(&agent, files) {
+                    Ok(()) => Some(Response::ok(id, overlay_ack())),
+                    Err(error) => Some(Response::error(
+                        Some(id),
+                        codes::INVALID_PARAMS,
+                        error.to_string(),
+                    )),
+                },
+                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
+            }
+        }
+        (Lifecycle::Ready, "dartq/overlay.clear") => {
+            let params = request.params.unwrap_or(Value::Null);
+            match commands::parse_overlay_clear(&params) {
+                Ok(agent) => {
+                    session.clear_overlay(&agent);
+                    Some(Response::ok(id, overlay_ack()))
+                }
+                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
+            }
+        }
         (Lifecycle::Ready, method) if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
             // coalesced analysis runs once; the command answers from the
@@ -280,6 +329,17 @@ fn handle_request(
             let params = request.params.unwrap_or(Value::Null);
             match commands::parse(method, &params, session.workspace_root()) {
                 Ok(staged) => {
+                    // The agent view is validated at intake (fail loud on a
+                    // typo instead of silently answering the base view).
+                    if let Some(agent) = staged.agent() {
+                        if !session.has_agent(agent) {
+                            return Some(Response::error(
+                                Some(id),
+                                codes::INVALID_PARAMS,
+                                format!("unknown agentId: {agent}"),
+                            ));
+                        }
+                    }
                     session.queue_command(id, staged);
                     None
                 }
@@ -306,6 +366,13 @@ fn handle_request(
     }
 }
 
+/// The overlay faces' acknowledgment body: the contract version, no payload
+/// (the staging is the effect; the next request naming the agent observes
+/// it).
+fn overlay_ack() -> Value {
+    json!({ "schema_version": commands::SCHEMA_VERSION })
+}
+
 /// Answers `initialize` with the negotiated capability set: the LSP surface
 /// plus the stable `dartq/*` command family, announced as experimental so
 /// clients can opt in by name (PRD §15.1: the RPC faces 1:1 with the CLI
@@ -313,7 +380,12 @@ fn handle_request(
 fn initialize_response(id: jsonrpc::RequestId) -> Response {
     let dartq_capabilities = commands::METHODS
         .iter()
-        .map(|method| ((*method).to_string(), json!({ "schemaVersion": commands::SCHEMA_VERSION })))
+        .map(|method| {
+            (
+                (*method).to_string(),
+                json!({ "schemaVersion": commands::SCHEMA_VERSION }),
+            )
+        })
         .collect::<serde_json::Map<String, Value>>();
     Response::ok(
         id,
