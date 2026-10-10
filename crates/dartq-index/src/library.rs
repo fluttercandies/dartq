@@ -79,9 +79,14 @@ impl RefKind {
 }
 
 /// One resolved reference site: the use, its target declaration, and the
-/// relation kind.
+/// relation kind. The use site's file rides on the row (`file`): a library
+/// spans its defining unit plus parts, so the target pair alone cannot
+/// locate the use in a multi-file library (#361).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefRow {
+    /// The use site's file — the library member whose capture recorded the
+    /// row.
+    pub file: FileId,
     /// The target's declaring file.
     pub target_file: FileId,
     /// The target's lookup-spelling name.
@@ -139,10 +144,10 @@ pub struct SubtypeEdge {
 /// no partial index update).
 ///
 /// Invariants (the §5 sorted-column discipline): `refs` ascend by
-/// `(target, offset)` with [`Self::runs`] holding each distinct-target
-/// run's start — a CSR offsets array over the rows; `names` ascend by
-/// `(name, offset)`; `supers` ascend by `(subtype file, name)`. Every probe
-/// is a binary search plus an equal-run scan.
+/// `(target, use file, offset)` with [`Self::runs`] holding each
+/// distinct-target run's start — a CSR offsets array over the rows; `names`
+/// ascend by `(name, offset)`; `supers` ascend by `(subtype file, name)`.
+/// Every probe is a binary search plus an equal-run scan.
 #[derive(Debug, Default)]
 pub struct LibraryIndex {
     refs: Vec<RefRow>,
@@ -273,6 +278,7 @@ impl<'a> LibraryBuilder<'a> {
                     armed = None;
                     match self.resolve_bare(file, &capture.index, name) {
                         BareHit::Decl(target) => self.refs.push(RefRow {
+                            file,
                             target_file: target,
                             target_name: name,
                             kind,
@@ -295,6 +301,7 @@ impl<'a> LibraryBuilder<'a> {
                     match hit {
                         Some(Lookup::Found(NamespaceEntry::Decl(target))) => {
                             self.refs.push(RefRow {
+                                file,
                                 target_file: target,
                                 target_name: name,
                                 kind,
@@ -347,8 +354,12 @@ impl<'a> LibraryBuilder<'a> {
     pub fn finish(mut self) -> LibraryIndex {
         // Deterministic total orders (spec §12.4: queries merge name-keyed
         // and element-keyed data, so any nondeterminism leaks into output).
+        // The use `file` joins the key before the offset: a multi-file
+        // library's member captures can carry equal offsets, and the caller
+        // may add files in any order — the file breaks the tie
+        // deterministically.
         self.refs
-            .sort_by_key(|row| (row.target_file, row.target_name, row.range.offset));
+            .sort_by_key(|row| (row.target_file, row.target_name, row.file, row.range.offset));
         let mut runs = Vec::new();
         let mut prev: Option<(FileId, StringId)> = None;
         for (i, row) in self.refs.iter().enumerate() {
@@ -909,6 +920,80 @@ pub(crate) mod tests {
         let z = surface.unresolved(strings.intern("z")).collect::<Vec<_>>();
         assert_eq!(z.len(), 1);
         assert!(!z[0].qualified);
+    }
+
+    /// The use-file column (#361): a multi-file library folds its members'
+    /// captures into one surface, and every row carries the member file the
+    /// use site sits in — the target pair alone cannot locate it.
+    #[test]
+    fn use_file_tracks_the_member_file() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep = capture_one(strings, &mut files, "d.dart", "void gone() {}\n");
+        let primary = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart';\nvoid main() {\n  gone();\n}\n",
+        );
+        let part = capture_one(
+            strings,
+            &mut files,
+            "m_part.dart",
+            "part of 'm.dart';\nvoid helper() {\n  gone();\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        let lib_d = builder.intern("package:t/d.dart");
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
+        let file_p = files.try_file_id(Path::new("m_part.dart")).unwrap();
+        for (lib, file, cap) in [
+            (lib_m, file_m, &primary.index),
+            (lib_m, file_p, &part.index),
+            (lib_d, file_d, &dep.index),
+        ] {
+            for row in cap.decls() {
+                if row.is_library_face() {
+                    builder.declare(lib, row.name, file);
+                }
+            }
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_d),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        // One library, two members: the folding order is the builder's
+        // input order, and both members' uses resolve to the same target.
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&primary);
+        builder.add_file(&part);
+        let surface = builder.finish();
+
+        let gone: &[RefRow] = surface
+            .references_of(file_d, strings.intern("gone"))
+            .expect("both members' uses resolve");
+        assert_eq!(gone.len(), 2);
+        let members: Vec<(FileId, RefKind)> =
+            gone.iter().map(|row| (row.file, row.kind)).collect();
+        assert_eq!(
+            members,
+            vec![(file_m, RefKind::Invoked), (file_p, RefKind::Invoked)],
+            "each row names the member file its use site sits in"
+        );
+        assert!(
+            members.iter().all(|&(file, _)| file != file_d),
+            "the use file is the library member, never the target's file"
+        );
     }
 
     /// Whole-unit eviction: removing a file's or a library's surface drops

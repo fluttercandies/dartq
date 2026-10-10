@@ -64,6 +64,10 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "qualified": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
                     "length": { "type": "integer", "minimum": 0 },
+                    // Additive optional on frozen v1 (#361): the use-site
+                    // file of the row, present when the producer knows it.
+                    // Absent-tolerant — v1 producers never emit it.
+                    "file": { "type": "string" },
                 },
             }},
             // §15.8 session token economics (crate docs, "Token economics").
@@ -101,7 +105,7 @@ const QUERY_SESSION: &[&str] = &["symbols", "since"];
 const DECLARATION: &[&str] = &["file", "kind", "name", "line", "column", "length"];
 const DECLARATION_OPTIONAL: &[&str] = &["container"];
 const REFERENCE: &[&str] = &["target_file", "kind", "offset", "length"];
-const REFERENCE_OPTIONAL: &[&str] = &["qualified"];
+const REFERENCE_OPTIONAL: &[&str] = &["qualified", "file"];
 
 pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
@@ -141,6 +145,9 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
         non_negative(field(obj, "length", &p)?, &length)?;
         if let Some(qualified) = obj.get("qualified") {
             string(qualified, &join(&p, "qualified"))?;
+        }
+        if let Some(file) = obj.get("file") {
+            string(file, &join(&p, "file"))?;
         }
     }
     Ok(())

@@ -313,6 +313,46 @@ fn query_reference_without_offset_is_named() {
     assert_eq!(violation.found, "missing");
 }
 
+/// The reference row's optional `file` (the #361 use-file column, additive
+/// on frozen v1): present on rows whose producer knows the use file, absent
+/// on rows that do not — both valid, so v1 stays frozen.
+#[test]
+fn query_reference_use_file_is_optional() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_QUERY,
+        "name": "fb",
+        "declarations": [],
+        "references": [
+            {
+                "target_file": "/w/lib/a.dart",
+                "kind": "invoked",
+                "file": "/w/lib/p.dart",
+                "offset": 9,
+                "length": 4,
+            },
+            {"target_file": "/w/lib/a.dart", "kind": "read", "offset": 21, "length": 2},
+        ],
+    });
+    validate_ok(&doc.to_string(), Domain::Query);
+}
+
+/// Red line: a present `file` is a string — internal ids never cross the
+/// boundary (§15.7).
+#[test]
+fn query_reference_file_type_error_is_named() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_QUERY,
+        "name": "fb",
+        "declarations": [],
+        "references": [
+            {"target_file": "/w/lib/a.dart", "kind": "read", "file": 17, "offset": 9, "length": 4},
+        ],
+    });
+    let violation = violation_of(&doc.to_string(), Domain::Query);
+    assert_eq!(violation.path, "references[0].file");
+    assert_eq!(violation.expected, "a string");
+}
+
 /// Enum spellings are pinned to the writer's exhaustive tables
 /// (`decl_kind_name`, main.rs:1001-1017).
 #[test]

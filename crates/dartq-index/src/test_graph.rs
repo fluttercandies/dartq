@@ -15,11 +15,21 @@
 //!   is an edge (a test helper library a test imports *is* affected when
 //!   the test must rerun).
 //! * **Naming convention (fallback only)**: when no import resolves in the
-//!   analyzed set, `foo_test.dart` tests the library whose basename is
-//!   `foo.dart`. This covers the barrel-import shape, where the test
-//!   reaches the tested code through a package facade and no direct import
-//!   exists. It never runs when imports resolved: the import is the
-//!   stronger signal and the convention is only a guess about intent.
+//!   analyzed set, `foo_test.dart` tests the library whose defining file is
+//!   `foo.dart`. The convention's implied import is the relative shape
+//!   `'foo.dart'`, which the official resolver composes against the
+//!   importing file's directory (`_fe_analyzer_shared`
+//!   `util/resolve_relative_uri.dart` — RFC 3986 composition against the
+//!   base URI; dartq-resolution `uri.rs` mirrors the same rule) — so the
+//!   resolution order over same-basename candidates is fixed: the
+//!   **sibling** (same directory) resolves first and wins outright, else a
+//!   single remaining candidate resolves (the barrel-import shape, where
+//!   the test reaches the tested code through a package facade and no
+//!   direct import exists), else two or more candidates are a documented
+//!   ambiguity and gain no edges. The fallback never fans out to every
+//!   same-basename library (the ai-audit X1 over-report), and it never
+//!   runs when imports resolved: the import is the stronger signal and the
+//!   convention is only a guess about intent.
 //!
 //! # Identity and contracts
 //!
@@ -31,6 +41,7 @@
 //! one). Output is deterministic: `tests_of` rows ascend.
 
 use rustc_hash::FxHashMap;
+use std::path::Path;
 
 /// The basename suffix that marks a test file (PRD §15.4's fallback signal).
 const TEST_SUFFIX: &str = "_test.dart";
@@ -48,12 +59,14 @@ pub struct TestGraph {
 
 impl TestGraph {
     /// Derives the edges over `library_count` libraries: `imports_of(lib)`
-    /// yields the resolved import targets of `lib`, `basename_of(lib)` its
-    /// identity basename (`None` when the id holds no live library — dead
-    /// slots never gain edges). Both run once per library; order of the
-    /// calls is ascending id, so id-free stateful closures are safe. The
-    /// borrowed returns outlive the call through `'a` (the caller's table
-    /// lifetime).
+    /// yields the resolved import targets of `lib`, `identity_of(lib)` its
+    /// defining-file identity path (`None` when the id holds no live
+    /// library — dead slots never gain edges). Both take the id space in
+    /// ascending order, so id-free stateful closures are safe; the identity
+    /// of one id may be read twice (its own pass plus the fallback index's
+    /// lazy build). The borrowed returns outlive the call through `'a`
+    /// (the caller's table lifetime). The naming fallback reads the
+    /// directory and basename the identity path carries.
     ///
     /// # Panics
     ///
@@ -65,18 +78,24 @@ impl TestGraph {
     pub fn build<'a>(
         library_count: usize,
         mut imports_of: impl FnMut(u32) -> &'a [u32],
-        mut basename_of: impl FnMut(u32) -> Option<&'a str>,
+        mut identity_of: impl FnMut(u32) -> Option<&'a str>,
     ) -> Self {
         let count = u32::try_from(library_count).expect("more than u32::MAX libraries");
         // The basename index behind the naming fallback, built lazily: at
         // most one pass over the id space, paid only when some import-less
         // test needs the convention (an import-resolved workspace never
-        // does). Keys borrow the caller's table through 'a — no copies.
-        let mut by_basename: Option<FxHashMap<&'a str, Vec<u32>>> = None;
+        // does). Keys borrow the caller's table through 'a — no copies;
+        // values pair each candidate's defining directory with its id (the
+        // sibling rule resolves against the directory).
+        let mut by_basename: Option<FxHashMap<&'a str, Vec<(Option<&'a Path>, u32)>>> = None;
         // Per-tested-library rows, inverted from per-test edges.
         let mut rows: Vec<Vec<u32>> = vec![Vec::new(); library_count];
         for lib in 0..count {
-            let Some(basename) = basename_of(lib) else {
+            let Some(identity) = identity_of(lib) else {
+                continue;
+            };
+            let path = Path::new(identity);
+            let Some(basename) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
             };
             let Some(stem) = basename.strip_suffix(TEST_SUFFIX) else {
@@ -88,25 +107,50 @@ impl TestGraph {
             targets.sort_unstable();
             targets.dedup();
             if targets.is_empty() && !stem.is_empty() {
-                // Fallback only: the convention names the tested file when
-                // nothing resolved in the analyzed set — one hash lookup
-                // instead of scanning the whole id space per test.
-                let needle = format!("{stem}.dart");
                 let index = by_basename.get_or_insert_with(|| {
-                    let mut map: FxHashMap<&'a str, Vec<u32>> = FxHashMap::default();
+                    let mut map: FxHashMap<&'a str, Vec<(Option<&'a Path>, u32)>> =
+                        FxHashMap::default();
                     for other in 0..count {
-                        if let Some(name) = basename_of(other) {
-                            map.entry(name).or_default().push(other);
+                        if let Some(identity) = identity_of(other) {
+                            let path = Path::new(identity);
+                            if let Some(basename) =
+                                path.file_name().and_then(std::ffi::OsStr::to_str)
+                            {
+                                map.entry(basename)
+                                    .or_default()
+                                    .push((path.parent(), other));
+                            }
                         }
                     }
                     map
                 });
-                if let Some(named) = index.get(needle.as_str()) {
-                    for &other in named {
-                        if other != lib {
-                            targets.push(other);
-                        }
+                // The convention's implied import composes `'stem.dart'`
+                // against the test's own directory (the official relative-
+                // URI rule — see the module docs), so the sibling resolves
+                // first and wins outright; ids ascend in the vec, so the
+                // first sibling is the deterministic pick. Without a
+                // sibling, exactly one remaining candidate still resolves
+                // (the barrel shape); several are an ambiguity — no edge,
+                // never a fan-out.
+                let needle = format!("{stem}.dart");
+                let dir = path.parent();
+                let mut sibling = None;
+                let mut lone: Option<u32> = None;
+                let mut homonyms = false;
+                for &(candidate_dir, other) in index.get(needle.as_str()).into_iter().flatten() {
+                    if other == lib {
+                        continue;
                     }
+                    if candidate_dir == dir {
+                        sibling = Some(other);
+                        break;
+                    }
+                    if lone.replace(other).is_some() {
+                        homonyms = true;
+                    }
+                }
+                if let Some(other) = sibling.or_else(|| (!homonyms).then_some(lone).flatten()) {
+                    targets.push(other);
                 }
             }
             for target in targets {
@@ -221,6 +265,48 @@ mod tests {
             &[] as &[u32],
             "the fallback is suppressed"
         );
+    }
+
+    /// The sibling rule (X1 precision): two same-basename `a.dart` in
+    /// different directories and a sibling `test/a_test.dart` — the edge
+    /// lands on the directory pairing alone, never on both homonyms. The
+    /// resolved one wins; the fan-out is gone.
+    #[test]
+    fn sibling_wins_over_same_basename_elsewhere() {
+        let identities = ["lib/a.dart", "test/a.dart", "test/a_test.dart"];
+        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
+            Some(identities[lib as usize])
+        });
+        assert_eq!(graph.tests_of(1), &[2], "the sibling resolves");
+        assert_eq!(
+            graph.tests_of(0),
+            &[] as &[u32],
+            "the same-basename homonym gains nothing"
+        );
+    }
+
+    /// Deterministic ambiguity: no sibling, two same-basename candidates in
+    /// different directories — neither gains the edge (the X1 over-report
+    /// is the old all-candidates fan-out; the answer is now `none`).
+    #[test]
+    fn ambiguous_homonyms_gain_no_edge() {
+        let identities = ["lib1/a.dart", "lib2/a.dart", "test/a_test.dart"];
+        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
+            Some(identities[lib as usize])
+        });
+        assert_eq!(graph.tests_of(0), &[] as &[u32]);
+        assert_eq!(graph.tests_of(1), &[] as &[u32]);
+    }
+
+    /// A single non-sibling candidate still resolves (the barrel-facade
+    /// shape the fallback exists for): one `a.dart` anywhere, no sibling.
+    #[test]
+    fn unique_non_sibling_still_resolves() {
+        let identities = ["lib/a.dart", "test/a_test.dart"];
+        let graph = TestGraph::build(identities.len(), |_| &[] as &[u32], |lib| {
+            Some(identities[lib as usize])
+        });
+        assert_eq!(graph.tests_of(0), &[1], "the unique candidate resolves");
     }
 
     /// Non-test libraries never gain outbound edges regardless of imports,

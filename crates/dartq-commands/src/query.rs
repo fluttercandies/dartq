@@ -90,11 +90,14 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
 /// caller side; the caller is identified by its site span, not by a caller
 /// declaration row (the index has no caller-declaration column).
 ///
-/// The frozen v1 reference-row shape carries no use-file column — a gap
-/// shared with the `query symbol` REF rows: single-file libraries are
-/// unambiguous, while uses of one target from several member files leave
-/// the use file implicit in the row. Widening the row is an additive schema
-/// change owned by the schema/index lanes.
+/// The frozen v1 reference-row shape stayed frozen while gaining the
+/// use-file answer: the index row carries the member file (`dartq-index`
+/// `RefRow::file`, #361) and the schema declares `file` optional on
+/// reference rows (absent-tolerant, dartq-schema `query.rs`). The engine's
+/// public [`RefHit`] does not propagate the column yet — engine-lane seam —
+/// so this face's rows locate single-file uses exactly and multi-file
+/// library uses by span only; when `RefHit` grows the column,
+/// [`to_json`] emits the optional `file` field in one move.
 ///
 /// # Errors
 ///

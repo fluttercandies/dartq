@@ -110,28 +110,27 @@ pub fn impact_after_analysis(
         &csr.edges()[start..end]
     };
     let tests = TestGraph::build(count, neighbors, |library| {
-        idents[library as usize]
-            .as_ref()
-            .map(|(_, basename)| basename.as_str())
+        idents[library as usize].as_deref()
     });
     let change = LibraryChange::hypothetical(seed_library.index(), current);
     Ok(query::impact(
         count,
         neighbors,
-        |library| -> &str { &idents[library as usize].as_ref().expect("live library").0 },
+        |library| -> &str { idents[library as usize].as_deref().expect("live library") },
         &tests,
         &strings,
         &[change],
     ))
 }
 
-/// The stable label and the test-detection basename of one library, keyed
-/// by the engine library id (`None` on a dead slot).
-type Ident = (String, String);
-type IdentTable = Vec<Option<Ident>>;
+/// The stable label of one library, keyed by the engine library id (`None`
+/// on a dead slot). The label is the defining file's path; the test graph
+/// reads the same string's directory and basename for the `*_test.dart`
+/// convention (dartq-index's sibling rule).
+type IdentTable = Vec<Option<String>>;
 
-/// The stable label and the test-detection basename of every live library,
-/// indexed by the engine library id (dead slots hold `None`).
+/// The stable label of every live library, indexed by the engine library id
+/// (dead slots hold `None`).
 fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -> IdentTable {
     let mut idents: IdentTable = vec![None; libraries.len()];
     for (library, files) in libraries {
@@ -141,12 +140,7 @@ fn library_identities(engine: &Engine, libraries: &[(LibraryId, Vec<FileId>)]) -
         else {
             continue;
         };
-        idents[library.index() as usize] = Some((
-            path.display().to_string(),
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        ));
+        idents[library.index() as usize] = Some(path.display().to_string());
     }
     idents
 }
@@ -181,5 +175,49 @@ fn seed_snapshot(engine: &Engine, members: &[FileId], strings: &StringTable) -> 
     FileSnapshot {
         content_hash: content_hash(&folded),
         top_level_names: names.into_boxed_slice(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::{open_engine, test_fixture::workspace};
+
+    /// The naming-fallback precision (ai-audit X1) end-to-end over the real
+    /// engine: two same-basename `a.dart` in different directories plus a
+    /// sibling `test/a_test.dart` with no imports. The sibling seed sees
+    /// its test; the homonym seed gains nothing — the old workspace-wide
+    /// basename fan-out would have listed the test for both.
+    #[test]
+    fn test_fallback_resolves_the_sibling_only() {
+        let root = workspace(
+            "impact_sibling",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                ("lib/other/a.dart", "class B {}\n"),
+                ("test/a.dart", "class C {}\n"),
+                ("test/a_test.dart", "void main() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let sibling = root.join("test/a.dart");
+        let report = impact(&mut engine, &sibling).expect("sibling impact");
+        let tests: Vec<&str> = report
+            .affected_tests
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(tests.len(), 1, "the sibling test, and nothing else");
+        assert!(tests[0].ends_with("test/a_test.dart"));
+
+        let homonym = root.join("lib/other/a.dart");
+        let report = impact(&mut engine, &homonym).expect("homonym impact");
+        assert!(
+            report.affected_tests.is_empty(),
+            "no test edge reaches a same-basename homonym"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
