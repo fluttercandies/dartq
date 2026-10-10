@@ -212,7 +212,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::const_eval::{
     BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, IdentVerdict, UnOp, Verdict, eval,
-};use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
+};
+use crate::library::{ElementIndex, ScopedHit, lookup_scoped, resolve_container};
 use crate::model::{
     ArityViolation, Container, ContainerKind, FileElements, Formals, MemberEntry, MemberKind,
     MicroKind, TopDecl, Ty,
@@ -777,8 +778,6 @@ struct Engine<'a> {
     /// The `switch` keyword of the open switch statement/expression (the
     /// non-exhaustive anchor; the block events only carry the `{`).
     switch_kw_latch: Option<SourceRange>,
-    /// The pending object-pattern type name (the first identifier).
-    pending_object_ty: Option<StringId>,
     /// The row-stack mark where the current variable initializer's
     /// expression began (the initializer check reads it).
     init_mark: Option<usize>,
@@ -932,7 +931,6 @@ impl<'a> Engine<'a> {
             case_sink_open: false,
             pending_const: None,
             switch_kw_latch: None,
-            pending_object_ty: None,
             in_cascade: false,
             invokes: Vec::new(),
             pending_send: None,
@@ -2728,6 +2726,61 @@ impl<'a> Engine<'a> {
         space
     }
 
+    /// The name-level exhaustiveness world over this unit's element model.
+    /// `'a` (not `'_`): the world borrows only the engine's long-lived
+    /// index/string-table references, so it can outlive `&mut self` uses.
+    fn name_world(&self) -> NameWorld<'a> {
+        NameWorld {
+            index: self.index,
+            file: self.file,
+            strings: self.strings,
+            bool_id: self.intern("bool"),
+            unknowns: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Closes an object pattern (the parser fires `handle_object_pattern`
+    /// *after* the rest — fields and boundaries included): the row lowers
+    /// to the bare head type exactly when every field's drained restriction
+    /// covers its member's whole column ([`NameWorld::property_type`], the
+    /// member-table walk, superclass chain included). Any residual narrows
+    /// the row below the name level's expressible spaces, so the row is
+    /// the unknown space (the established under-report). `head` is `None`
+    /// for the unmodeled `Type.field` shorthand shapes.
+    fn close_object_fields(&mut self, head: Option<StringId>, fields: Vec<ObjectField>) {
+        let Some(ty) = head else {
+            self.pattern_leaf(Restriction::Unknown);
+            return;
+        };
+        let world = self.name_world();
+        let covered = fields.iter().all(|field| match field.leaves.as_slice() {
+            // A type-free sub-pattern (`var x`, `_`, the `:x` shorthand)
+            // covers the whole column.
+            [] => true,
+            // A conjunctive residual is not one name-level row.
+            [leaf] => match field.name {
+                Some(name) => {
+                    let Restriction::Named(lt, ln) = leaf else {
+                        return false;
+                    };
+                    world.member_column(ty, name).is_some_and(|column| {
+                        world.is_subtype_of(&column, &NameTy::Named(*lt, *ln))
+                    })
+                }
+                // Positional fields: the member table keeps no declaration
+                // order, so a constraining leaf is unattributable.
+                None => false,
+            },
+            _ => false,
+        });
+        let leaf = if covered {
+            Restriction::Named(ty, false)
+        } else {
+            Restriction::Unknown
+        };
+        self.pattern_leaf(leaf);
+    }
+
     /// Opens a switch context; the scrutinee's push-time row is the last
     /// one on the row stack when the block opens. No row — the shape a
     /// complex scrutinee leaves — latches `Ty::Unknown`, and
@@ -2746,7 +2799,7 @@ impl<'a> Engine<'a> {
             switch_kw: kw,
             scrutinee,
             cases: Vec::new(),
-            default_seen: false,
+            default_kw: None,
             pending_root: None,
         });
     }
@@ -2768,13 +2821,7 @@ impl<'a> Engine<'a> {
         if ctx.scrutinee == Ty::Unknown {
             return;
         }
-        let world = NameWorld {
-            index: self.index,
-            file: self.file,
-            strings: self.strings,
-            bool_id: self.intern("bool"),
-            unknowns: std::cell::Cell::new(0),
-        };
+        let world = self.name_world();
         let value = NameTy::from_semantic(ctx.scrutinee);
         let cases: Vec<Case<NameTy>> = ctx
             .cases
@@ -2809,20 +2856,20 @@ impl<'a> Engine<'a> {
         for anchor in unreachable {
             self.emit(SemanticCode::UnreachableSwitchCase, anchor, "", "");
         }
+        // A cross-file scrutinee name is opaque to the file-scoped
+        // world ([`NameWorld::name_resolvable`]): its sealedness and
+        // subclass set are unknowable in-file, so the covering verdict
+        // may be falsely negative and the expression face — always
+        // must-be-exhaustive — suppresses (under-report direction).
+        // The statement face is already gated on in-file sealed facts.
+        let expression_face_decides = match value {
+            NameTy::Named(name, _) => world.name_resolvable(name),
+            _ => true,
+        };
+        let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
+            || Self::is_always_exhaustive(&world, value);
         if let Exhaustiveness::NonExhaustive(_) = report.exhaustiveness {
-            // A cross-file scrutinee name is opaque to the file-scoped
-            // world ([`NameWorld::name_resolvable`]): its sealedness and
-            // subclass set are unknowable in-file, so the covering verdict
-            // may be falsely negative and the expression face — always
-            // must-be-exhaustive — suppresses (under-report direction).
-            // The statement face is already gated on in-file sealed facts.
-            let expression_face_decides = match value {
-                NameTy::Named(name, _) => world.name_resolvable(name),
-                _ => true,
-            };
-            let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
-                || Self::is_always_exhaustive(&world, value);
-            if must_be_exhaustive && !ctx.default_seen {
+            if must_be_exhaustive && ctx.default_kw.is_none() {
                 let code = if ctx.is_expression {
                     SemanticCode::NonExhaustiveSwitchExpression
                 } else {
@@ -2841,16 +2888,26 @@ impl<'a> Engine<'a> {
                     code.correction_message(&suggested),
                 ));
             }
+        } else if must_be_exhaustive && let Some(default_at) = ctx.default_kw {
+            // The cases already cover the scrutinee, so the `default`
+            // clause can never match (`nonExhaustiveness == null &&
+            // defaultNode != null && mustBeExhaustive`,
+            // constant_verifier.dart:1141-1148).
+            self.emit(SemanticCode::UnreachableSwitchDefault, default_at, "", "");
         }
     }
 
     /// `isAlwaysExhaustive` (type_system.dart:846-887) at name level:
     /// `bool`, `Null`, enums, and sealed classes split completely; nothing
-    /// else does (nullable types and `dynamic` need the null case).
+    /// else does. The official check reads the scrutinee type's *element*
+    /// face (`isDartCoreBool`/enum/`isSealed`) and is nullability-agnostic
+    /// — `S?` of a sealed `S` stays always-exhaustive, the null half being
+    /// the space model's nullable split rather than this gate (`dynamic`
+    /// has no element and stays `false`).
     fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
         match ty {
             NameTy::Null => true,
-            NameTy::Named(name, false) => world.is_sealed_name(name),
+            NameTy::Named(name, _) => world.is_sealed_name(name),
             _ => false,
         }
     }
@@ -3818,7 +3875,10 @@ impl ConstLookup for Engine<'_> {
         let ConstantValue::Type(container) = recv else {
             return Verdict::Constant;
         };
-        if let Some(c) = self.index.get(self.file).and_then(|f| f.container(*container))
+        if let Some(c) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(*container))
             && c.kind == ContainerKind::Enum
             && c.enum_constants.contains(&name)
         {
@@ -3901,7 +3961,9 @@ impl<'a> Engine<'a> {
             return;
         }
         let root = self.const_capture.close_initializer();
-        let verdict = root.as_ref().map_or(Verdict::Constant, |node| eval(node, self));
+        let verdict = root
+            .as_ref()
+            .map_or(Verdict::Constant, |node| eval(node, self));
         self.resolve_const_verdict(&verdict);
         if let Verdict::Value(value) = &verdict {
             let folded = self.folded_ty(value);
@@ -4039,7 +4101,9 @@ impl<'a> Engine<'a> {
     /// file declared arms the argument check (foreign and non-const
     /// targets defer — under-report).
     pub fn arm_const_ctor_gate(&mut self, head: Token) {
-        let gate = self.name_of(head).is_some_and(|name| self.const_ctor_target(name));
+        let gate = self
+            .name_of(head)
+            .is_some_and(|name| self.const_ctor_target(name));
         if let Some(slot) = self.arg_gates.last_mut() {
             // OR-in: an enum element's window pre-arms its gate (the
             // constant's own ctor reference names the constant, never the
@@ -4131,7 +4195,9 @@ impl<'a> Engine<'a> {
             return;
         };
         match parse_int_literal(text) {
-            Some(v) => self.const_capture.literal(token.range, ConstantValue::Int(v)),
+            Some(v) => self
+                .const_capture
+                .literal(token.range, ConstantValue::Int(v)),
             // Beyond i64: a valid constant of unobservable value — defer.
             None => self.const_capture.opaque_leaf(token.range),
         }
@@ -4143,14 +4209,17 @@ impl<'a> Engine<'a> {
         };
         let cleaned: String = text.chars().filter(|c| *c != '_').collect();
         match cleaned.parse::<f64>() {
-            Ok(v) => self.const_capture.literal(token.range, ConstantValue::Double(v)),
+            Ok(v) => self
+                .const_capture
+                .literal(token.range, ConstantValue::Double(v)),
             Err(_) => self.const_capture.opaque_leaf(token.range),
         }
     }
 
     pub fn const_bool_literal(&mut self, token: Token) {
         let value = self.text_of(token).is_some_and(|t| t == "true");
-        self.const_capture.literal(token.range, ConstantValue::Bool(value));
+        self.const_capture
+            .literal(token.range, ConstantValue::Bool(value));
     }
 
     pub fn const_null_literal(&mut self, token: Token) {
@@ -4180,12 +4249,14 @@ impl<'a> Engine<'a> {
 /// the literal defers to an opaque constant).
 fn parse_int_literal(text: &str) -> Option<i64> {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
-    let (radix, digits) =
-        if let Some(rest) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
-            (16, rest)
-        } else {
-            (10, cleaned.as_str())
-        };
+    let (radix, digits) = if let Some(rest) = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else {
+        (10, cleaned.as_str())
+    };
     i64::from_str_radix(digits, radix).ok()
 }
 
@@ -4581,10 +4652,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .begin_opaque_group();
+        self.engine.borrow_mut().const_capture.begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().push_executable_frame(instance);
     }
@@ -4920,7 +4988,9 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(operator) else {
             return;
         };
-        engine.const_capture.begin_binary(bin_op_of(text), operator.range);
+        engine
+            .const_capture
+            .begin_binary(bin_op_of(text), operator.range);
         if USER_OPERATORS.contains(&text) {
             let op = engine.intern(text);
             engine.mark_operator(op, operator.range);
@@ -4928,10 +4998,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_binary_expression(&mut self, _operator: Token, end: Token) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .end_binary(end.range);
+        self.engine.borrow_mut().const_capture.end_binary(end.range);
     }
 
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
@@ -4957,10 +5024,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_conditional_expression_colon(&mut self) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .conditional_colon();
+        self.engine.borrow_mut().const_capture.conditional_colon();
     }
 
     fn end_conditional_expression(&mut self, _question: Token, _colon: Token, end: Token) {
@@ -4971,10 +5035,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .parenthesized_begin();
+        self.engine.borrow_mut().const_capture.parenthesized_begin();
     }
 
     fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
@@ -5011,10 +5072,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_new_expression(&mut self, token: Token) {
         self.engine.borrow_mut().enter_ctor_pos();
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .begin_opaque_group();
+        self.engine.borrow_mut().const_capture.begin_opaque_group();
         let _ = token;
     }
 
@@ -5071,9 +5129,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // The creation's value joins the enclosing window —
                     // typed by its container when this file declared the
                     // const constructor (type folding), opaque otherwise.
-                    let ctor = closed
-                        .callee
-                        .is_some_and(|n| engine.const_ctor_target(n));
+                    let ctor = closed.callee.is_some_and(|n| engine.const_ctor_target(n));
                     let value = if ctor {
                         ConstantValue::Created(closed.callee.expect("checked above"))
                     } else {
@@ -5162,12 +5218,10 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_cascade(&mut self) {
         let mut engine = self.engine.borrow_mut();
         engine.in_cascade = false;
-        engine
-            .const_capture
-            .end_opaque_group(SourceRange {
-                offset: 0,
-                length: 0,
-            });
+        engine.const_capture.end_opaque_group(SourceRange {
+            offset: 0,
+            length: 0,
+        });
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
@@ -5222,6 +5276,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pattern_stack.push(PatternFrame {
             leaves: Vec::new(),
             or_ops: 0,
+            fields: Vec::new(),
         });
     }
 
@@ -5329,6 +5384,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pattern_leaf(leaf);
     }
 
+    /// Closes an object pattern. The parser fires this event *after* the
+    /// rest — the fields parsed and their `handle_pattern_field` boundaries
+    /// drained this pattern's own bracket frame — so the head name and the
+    /// drained buckets meet here: the row is the bare head type exactly
+    /// when every field's restriction covers its member's whole column.
     fn handle_object_pattern(
         &mut self,
         first_identifier: Token,
@@ -5338,20 +5398,36 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // `Type(...)` shapes: the first identifier is the type when no dot
         // follows; the `Type.field`/`:field` shorthands stay unmodeled.
-        engine.pending_object_ty = if dot.is_none() {
+        let head = if dot.is_none() {
             engine.name_of(first_identifier)
         } else {
             None
         };
+        let fields = engine
+            .pattern_stack
+            .last_mut()
+            .map_or(Vec::new(), |frame| std::mem::take(&mut frame.fields));
+        engine.close_object_fields(head, fields);
     }
 
-    fn handle_object_pattern_fields(&mut self, _count: usize, _begin: Token, _end: Token) {
+    fn handle_pattern_field(&mut self, colon: Option<Token>) {
         let mut engine = self.engine.borrow_mut();
-        let leaf = engine
-            .pending_object_ty
-            .take()
-            .map_or(Restriction::Unknown, |name| Restriction::Named(name, false));
-        engine.pattern_leaf(leaf);
+        // The field's sub-pattern just completed: its bracket merged into
+        // this pattern's own frame, so everything buffered since the last
+        // boundary is exactly this field's sub-restrictions. A type-free
+        // sub-pattern (`var x`, `_`) merges to the context space — it
+        // constrains no column, so it pools as no leaf. Record patterns
+        // fire the same boundary on their own frames; their buckets have
+        // no consumer and die with the bracket.
+        let name = colon.and_then(|token| engine.name_of(token));
+        let mut leaves = engine
+            .pattern_stack
+            .last_mut()
+            .map_or(Vec::new(), |frame| std::mem::take(&mut frame.leaves));
+        leaves.retain(|leaf| *leaf != Restriction::NamedContext);
+        if let Some(frame) = engine.pattern_stack.last_mut() {
+            frame.fields.push(ObjectField { name, leaves });
+        }
     }
 
     fn handle_declared_variable_pattern(
@@ -5466,10 +5542,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // open.
         let mut engine = self.engine.borrow_mut();
         engine.case_sink_open = false;
-        if default_kw.is_some()
-            && let Some(ctx) = engine.switches.last_mut()
+        if let Some(ctx) = engine.switches.last_mut()
+            && let Some(token) = default_kw
         {
-            ctx.default_seen = true;
+            ctx.default_kw = Some(token.range);
         }
     }
 
@@ -5698,16 +5774,14 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         use crate::const_eval::{InstanceKind, SetOrMap};
         let mut engine = self.engine.borrow_mut();
-        if let Some(shape) = engine
-            .const_capture
-            .literal_set_or_map(count, left.range, has_set_entry)
+        if let Some(shape) =
+            engine
+                .const_capture
+                .literal_set_or_map(count, left.range, has_set_entry)
         {
             match shape {
                 SetOrMap::Map(entries) => {
-                    let flat: Vec<_> = entries
-                        .into_iter()
-                        .flat_map(|(k, v)| [k, v])
-                        .collect();
+                    let flat: Vec<_> = entries.into_iter().flat_map(|(k, v)| [k, v]).collect();
                     engine.check_const_elements(SemanticCode::NonConstantMapElement, &flat);
                     engine
                         .const_capture
@@ -5724,7 +5798,13 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.push_value_row(right);
     }
 
-    fn handle_literal_map_entry(&mut self, colon: Token, _end: Token, _nk: Option<Token>, _nv: Option<Token>) {
+    fn handle_literal_map_entry(
+        &mut self,
+        colon: Token,
+        _end: Token,
+        _nk: Option<Token>,
+        _nv: Option<Token>,
+    ) {
         self.engine
             .borrow_mut()
             .const_capture
@@ -5835,10 +5915,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_await_expression(&mut self, token: Token) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .begin_opaque_group();
+        self.engine.borrow_mut().const_capture.begin_opaque_group();
         let _ = token;
     }
 
@@ -5925,7 +6002,10 @@ struct SwitchCtx {
     switch_kw: SourceRange,
     scrutinee: Ty,
     cases: Vec<NameCase>,
-    default_seen: bool,
+    /// The `default` clause's keyword anchor (the unreachable-default row's
+    /// token, `constant_verifier.dart:1141-1148`); `None` when the switch
+    /// has no default.
+    default_kw: Option<SourceRange>,
     /// The captured coverage of an in-flight switch-expression case (the
     /// space latches at the pattern's completion, the guard and anchor at
     /// the case's end). Statement cases capture in one step and leave this
@@ -5934,11 +6014,26 @@ struct SwitchCtx {
 }
 
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
-/// collected inside it and whether `||` joined any of them (an `||` union
-/// keeps its alternatives apart; everything else intersects).
+/// collected inside it, whether `||` joined any of them (an `||` union
+/// keeps its alternatives apart; everything else intersects), and the
+/// object-pattern field buckets the `handle_pattern_field` boundaries
+/// drained into it (the property columns of the official object-pattern
+/// space — frame-scoped, so a record pattern's unused buckets die with its
+/// own bracket).
 struct PatternFrame {
     leaves: Vec<Restriction>,
     or_ops: usize,
+    fields: Vec<ObjectField>,
+}
+
+/// One object-pattern field's drained sub-restrictions (empty for a
+/// type-free `var`/`_` sub-pattern, which covers the whole column).
+struct ObjectField {
+    /// The field's member name (`x` of `x: pattern`). `None` for
+    /// positional fields — the member table keeps no declaration order, so
+    /// their columns are unresolvable at name level.
+    name: Option<StringId>,
+    leaves: Vec<Restriction>,
 }
 
 /// The name-level coverage a pattern leaf contributes (the space-building
@@ -6113,6 +6208,13 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             // restriction, types.dart:52-56).
             (NameTy::EnumValue(en, c), NameTy::EnumValueOrNull(fn_, d)) => en == fn_ && c == d,
             (NameTy::BoolValue(v), NameTy::BoolOrNull(w)) => v == w,
+            // All non-nullable types are subtypes of Object
+            // (`NonNullableStaticType.isSubtypeOf`, static_type.dart
+            // :415-421).
+            (
+                NameTy::Named(_, false) | NameTy::EnumValue(..) | NameTy::BoolValue(_),
+                NameTy::TopNonNullable,
+            ) => true,
             // A constant's type is its enum, non-null.
             (NameTy::EnumValue(en, _), sup) => self.is_subtype_of(&NameTy::Named(*en, false), sup),
             // The restricted nullable inherits the value's type edges, but
@@ -6160,10 +6262,19 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         }
     }
 
-    fn property_type(&self, _ty: &NameTy, _key: &Key) -> Option<NameTy> {
-        // Records are not modeled at name level: record-pattern columns
-        // fall back to the nullable object (exhaustive.dart:396-406).
-        None
+    /// `getPropertyType` (static_type.dart:36-46): the declared type of
+    /// the instance member `key` names, or `None` when the world does not
+    /// know it (the checker's columns then fall back to the nullable
+    /// object, exhaustive.dart:396-406).
+    fn property_type(&self, ty: &NameTy, key: &Key) -> Option<NameTy> {
+        let NameTy::Named(name, _) = ty else {
+            return None;
+        };
+        let Key::Name(member) = key else {
+            // Record keys are not modeled at name level.
+            return None;
+        };
+        self.member_column(*name, self.strings.intern(member))
     }
 
     fn is_bottom(&self, ty: &NameTy) -> bool {
@@ -6198,6 +6309,31 @@ impl NameWorld<'_> {
     /// The unit's container record for `name`.
     fn container(&self, name: StringId) -> Option<&Container> {
         self.index.get(self.file).and_then(|f| f.container(name))
+    }
+
+    /// The declared type of the instance member `member` on `head`,
+    /// climbing the superclass chain (the official property lookup
+    /// includes inherited members): fields through
+    /// [`MemberEntry::var_ty`], getters through their return type. A name
+    /// taken by a method or setter is no property; a cyclic hierarchy
+    /// terminates on the visited set.
+    fn member_column(&self, head: StringId, member: StringId) -> Option<NameTy> {
+        let mut current = head;
+        let mut seen = rustc_hash::FxHashSet::default();
+        while seen.insert(current) {
+            let container = self.container(current)?;
+            if let Some(entry) = container.members.get(&member)
+                && !entry.is_static
+            {
+                return match entry.kind {
+                    MemberKind::Field => Some(NameTy::from_semantic(entry.var_ty)),
+                    MemberKind::Getter => Some(NameTy::from_semantic(entry.return_ty)),
+                    _ => None,
+                };
+            }
+            current = container.superclass?;
+        }
+        None
     }
 
     /// The unit's container names in declaration order.
@@ -8473,6 +8609,180 @@ mod tests {
         assert_eq!(report.diagnostics[0].range.offset, case_at);
     }
 
+    /// A `default` after total coverage is `unreachable_switch_default`
+    /// (`STATIC_WARNING`) at the `default` keyword — the case spaces
+    /// already cover the scrutinee and the enum face is always
+    /// mustBeExhaustive (`nonExhaustiveness == null && defaultNode != null
+    /// && mustBeExhaustive`, constant_verifier.dart:1141-1148).
+    #[test]
+    fn default_after_total_coverage_is_unreachable() {
+        let report = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; default: break; } }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["unreachable_switch_default"],
+            "{:?}",
+            code_names(&report)
+        );
+        let d = &report.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "This default clause is covered by the previous cases."
+        );
+        assert_eq!(d.severity, Severity::Warning);
+        let default_at = u32::try_from(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; ".len(),
+        )
+        .unwrap();
+        assert_eq!(d.range.offset, default_at);
+    }
+
+    /// A `default` covering a real gap stays reachable: the
+    /// unreachable-default report lives only in the covering search's
+    /// exhaustive branch (the `nonExhaustiveness != null` gate silences
+    /// the whole else arm), and a switch without a default that covers
+    /// stays silent.
+    #[test]
+    fn reachable_default_and_no_default_stay_silent() {
+        let covering_gap = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; default: break; } }",
+        );
+        assert_eq!(
+            covering_gap.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&covering_gap)
+        );
+        let no_default = report(
+            "enum Color { red, green, blue } void f(Color c) { switch (c) { case Color.red: break; case Color.green: break; case Color.blue: break; } }",
+        );
+        assert_eq!(
+            no_default.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&no_default)
+        );
+    }
+
+    /// A statement switch over a *nullable* sealed scrutinee is
+    /// mustBeExhaustive — the official check reads the scrutinee's element
+    /// face and is nullability-agnostic (type_system.dart:846-866,
+    /// `isAlwaysExhaustive(S?)` over a sealed `S`) — so the missing `null`
+    /// half reports; covering it silences.
+    #[test]
+    fn nullable_sealed_statement_switch_needs_null() {
+        let missing = report(
+            "sealed class S {} class A extends S {} class B extends S {} void f(S? s) { switch (s) { case A a: break; case B b: break; } }",
+        );
+        assert_eq!(
+            code_names(&missing),
+            ["non_exhaustive_switch_statement"],
+            "{:?}",
+            code_names(&missing)
+        );
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "The type 'S?' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'null'."
+        );
+
+        let with_null = report(
+            "sealed class S {} class A extends S {} class B extends S {} void f(S? s) { switch (s) { case A a: break; case B b: break; case null: break; } }",
+        );
+        assert_eq!(
+            with_null.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&with_null)
+        );
+    }
+
+    /// A nullable *non-sealed* scrutinee stays off the mustBeExhaustive
+    /// gate (the element is not sealed, type_system.dart:846-866): a
+    /// statement switch without a default emits nothing.
+    #[test]
+    fn nullable_non_sealed_statement_switch_stays_unconditional() {
+        let report = report("class C {} void f(C? c) { switch (c) { case C c: break; } }");
+        assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    }
+
+    /// `NonNullableStaticType.isSubtypeOf` (static_type.dart:415-421):
+    /// every non-nullable static type — named, enum constant, or bool
+    /// value — subtypes the non-nullable top; `Null` and the nullable
+    /// projections do not.
+    #[test]
+    fn non_nullable_types_subtype_the_non_nullable_top() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let index = ElementIndex::default();
+        let world = NameWorld {
+            index: &index,
+            file,
+            strings: &strings,
+            bool_id: strings.intern("bool"),
+            unknowns: std::cell::Cell::new(0),
+        };
+        let c = strings.intern("C");
+        let e = strings.intern("E");
+        assert!(world.is_subtype_of(&NameTy::Named(c, false), &NameTy::TopNonNullable));
+        assert!(world.is_subtype_of(&NameTy::EnumValue(e, c), &NameTy::TopNonNullable));
+        assert!(world.is_subtype_of(&NameTy::BoolValue(true), &NameTy::TopNonNullable));
+        assert!(!world.is_subtype_of(&NameTy::Null, &NameTy::TopNonNullable));
+        assert!(!world.is_subtype_of(&NameTy::Named(c, true), &NameTy::TopNonNullable));
+    }
+
+    /// An object pattern's typed field covers its column when the member's
+    /// declared type subtypes the field's type test
+    /// ([`NameWorld::property_type`], the member-table walk, climbed from
+    /// the subclass here): the row lowers to the bare head, so `A()` plus
+    /// `B(x: int _)` is exhaustive over the sealed pair. Pre-fix the field
+    /// leaf `and`-folded against the head into the unknown space and the
+    /// covering gap mis-reported.
+    ///
+    /// The genuinely non-exhaustive direction stays reported: a narrower
+    /// field test (`int` against `num`) does not cover the column, the row
+    /// stays unknown-shaped, and the gap names `B`.
+    #[test]
+    fn object_pattern_typed_field_covers_when_the_member_type_subtypes_it() {
+        let covered = report(
+            "class int {} sealed class S {} class A extends S {} sealed class Base extends S { int x = 0; } class B extends Base {} \
+             void f(S s) { var v = switch (s) { A() => 1, B(x: int _) => 2 }; }",
+        );
+        assert_eq!(covered.diagnostics.len(), 0, "{:?}", code_names(&covered));
+
+        let narrower = report(
+            "class int {} class num {} sealed class S {} class A extends S {} sealed class Base extends S { num x = 0; } class B extends Base {} \
+             void f(S s) { var v = switch (s) { A() => 1, B(x: int _) => 2 }; }",
+        );
+        assert_eq!(
+            code_names(&narrower),
+            ["non_exhaustive_switch_expression"],
+            "{:?}",
+            code_names(&narrower)
+        );
+    }
+
+    /// A type-free object field (`B(:var x)`) covers its column without
+    /// consulting the member table, and an unresolvable head
+    /// (`undefined_class`, the cross-file shape) keeps the whole row in
+    /// the unknown space — no new report beyond the name resolution one.
+    #[test]
+    fn object_pattern_type_free_field_and_opaque_head_stay_quiet() {
+        let type_free = report(
+            "sealed class S {} class A extends S {} class B extends S {} \
+             void f(S s) { var v = switch (s) { A() => 1, B(:var x) => 2 }; }",
+        );
+        assert_eq!(
+            type_free.diagnostics.len(),
+            0,
+            "{:?}",
+            code_names(&type_free)
+        );
+        let opaque = report("void f(S s) { var v = switch (s) { A() => 1, B(:var x) => 2 }; }");
+        assert_eq!(code_names(&opaque), ["undefined_class"]);
+    }
+
     // —— restricted nullable projections (the Null|value fold) ———————————
 
     /// `nullable` over a restricted value keeps the restriction: the
@@ -8703,11 +9013,7 @@ mod tests {
              const w = x; \
              void m() { C ok = x; }",
         );
-        assert!(
-            code_names(&rep).is_empty(),
-            "{:?}",
-            code_names(&rep)
-        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// A container without a const constructor and an unresolvable name
@@ -8778,7 +9084,9 @@ mod tests {
         );
         // Clean elements stay silent, including the fault-deciding lazy
         // shapes (`false && l` never evaluates its right operand).
-        let rep = report("void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }");
+        let rep = report(
+            "void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }",
+        );
         assert_eq!(rep.diagnostics.len(), 0, "{:?}", code_names(&rep));
     }
 
@@ -8871,11 +9179,7 @@ mod tests {
         // against a user class defers — outside the final-primitive
         // table).
         let rep = report("enum E { a, b } void m() { E ok = E.a; }");
-        assert!(
-            code_names(&rep).is_empty(),
-            "{:?}",
-            code_names(&rep)
-        );
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// Deferral shapes never fabricate a verdict: interpolation text,

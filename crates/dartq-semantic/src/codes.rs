@@ -191,6 +191,11 @@ pub enum SemanticCode {
     /// the `case` keyword of a statement case / the `=>` of an expression
     /// case, `constant_verifier.dart:1080-1088`).
     UnreachableSwitchCase,
+    /// `This default clause is covered by the previous cases.`
+    /// (`STATIC_WARNING`, at the `default` keyword: the case spaces
+    /// already cover the scrutinee and the switch is mustBeExhaustive,
+    /// `constant_verifier.dart:1141-1148`).
+    UnreachableSwitchDefault,
     // —— #279: the constant-evaluation family (all `COMPILE_TIME_ERROR`) ——
     /// `Const variables must be initialized with a constant value.` — a
     /// const variable/field initializer that is decidentally not constant
@@ -380,6 +385,9 @@ impl SemanticCode {
                 "NON_EXHAUSTIVE_SWITCH_EXPRESSION",
             ),
             Self::UnreachableSwitchCase => ("unreachable_switch_case", "UNREACHABLE_SWITCH_CASE"),
+            Self::UnreachableSwitchDefault => {
+                ("unreachable_switch_default", "UNREACHABLE_SWITCH_DEFAULT")
+            }
             Self::ConstInitializedWithNonConstantValue => (
                 "const_initialized_with_non_constant_value",
                 "CONST_INITIALIZED_WITH_NON_CONSTANT_VALUE",
@@ -442,9 +450,9 @@ impl SemanticCode {
     pub const fn dtype(self) -> DiagnosticType {
         match self {
             Self::WrongNumberOfParametersForSetter => DiagnosticType::SyntacticError,
-            Self::InvalidNullAwareOperator | Self::UnreachableSwitchCase => {
-                DiagnosticType::StaticWarning
-            }
+            Self::InvalidNullAwareOperator
+            | Self::UnreachableSwitchCase
+            | Self::UnreachableSwitchDefault => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -596,7 +604,9 @@ impl SemanticCode {
             }
             // One- and two-argument rows reused through `message3`.
             Self::WrongNumberOfParametersForOperatorMinus => self.message3(a0, "", ""),
-            Self::UnreachableSwitchCase => self.message3("", "", ""),
+            Self::UnreachableSwitchCase | Self::UnreachableSwitchDefault => {
+                self.message3("", "", "")
+            }
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
@@ -683,6 +693,11 @@ impl SemanticCode {
             // No-argument row (diagnostic.g.dart:17721).
             Self::UnreachableSwitchCase => {
                 "This case is covered by the previous cases.".to_string()
+            }
+            // No-argument row (the `unreachableSwitchDefault` row,
+            // constant_verifier.dart:1141-1148).
+            Self::UnreachableSwitchDefault => {
+                "This default clause is covered by the previous cases.".to_string()
             }
             // One- and two-placeholder rows: the extra placeholder is
             // ignored (the descriptor stays total over the frozen set).
@@ -886,6 +901,7 @@ mod tests {
             SemanticCode::NonExhaustiveSwitchStatement,
             SemanticCode::NonExhaustiveSwitchExpression,
             SemanticCode::UnreachableSwitchCase,
+            SemanticCode::UnreachableSwitchDefault,
             SemanticCode::ConstInitializedWithNonConstantValue,
             SemanticCode::ConstWithNonConstantArgument,
             SemanticCode::NonConstantListElement,
@@ -921,6 +937,10 @@ mod tests {
         );
         assert_eq!(
             SemanticCode::UnreachableSwitchCase.severity(),
+            Severity::Warning
+        );
+        assert_eq!(
+            SemanticCode::UnreachableSwitchDefault.severity(),
             Severity::Warning
         );
         assert_eq!(
@@ -1030,6 +1050,10 @@ mod tests {
             SemanticCode::InvalidNullAwareOperator.message("?.", "."),
             "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
         );
+        assert_eq!(
+            SemanticCode::UnreachableSwitchDefault.message("", ""),
+            "This default clause is covered by the previous cases."
+        );
     }
 
     /// The correction-carrying rows answer the verbatim oracle
@@ -1050,6 +1074,11 @@ mod tests {
             SemanticCode::UnreachableSwitchCase.correction_message(""),
             None,
             "the no-argument row declares no correction"
+        );
+        assert_eq!(
+            SemanticCode::UnreachableSwitchDefault.correction_message(""),
+            None,
+            "the unreachable-default row keeps the case row's slot parity"
         );
     }
 }

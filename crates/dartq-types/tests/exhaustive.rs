@@ -9,9 +9,9 @@ mod common;
 
 use common::named;
 use dartq_types::{
-    Case, CoreDecls, Exhaustiveness, Key, Report, Single, Space, TypeDeclId, TypeHierarchy, TypeId,
-    TypeParamId, TypeSystem, TypeTable, TypedModel, TypedNames, TypedTy, UninternedRecord,
-    UninternedType, compute,
+    Case, CoreDecls, Exhaustiveness, ExhaustivenessWorld, Key, Report, Single, Space, TypeDeclId,
+    TypeHierarchy, TypeId, TypeParamId, TypeSystem, TypeTable, TypedModel, TypedNames, TypedTy,
+    UninternedRecord, UninternedType, compute,
 };
 
 /// A sealed `Shape`/`Circle`/`Square` family, a three-constant `Color`
@@ -369,6 +369,28 @@ fn bool_switch_needs_both_values() {
         &[case_of(boolean, &model)],
     );
     assert!(matches!(report.exhaustiveness, Exhaustiveness::Exhaustive));
+}
+
+#[test]
+fn bool_is_sealed_and_expands_its_values_on_a_failed_filter() {
+    // BoolStaticType.isSealed (types/bool.dart:15-16): `true` and `false`
+    // are the only inhabitants, so a failed filter expands the sealed
+    // split — the witnesses are the two values, never the whole `bool`
+    // head (which no pattern-but-a-supertype can match).
+    let w = world();
+    let sys = w.system();
+    let model = TypedModel::with_names(&sys, names(&w));
+    let boolean = w.itf(w.boolean, false);
+    assert!(model.is_sealed(&model.static_type(boolean)));
+
+    let report = compute(
+        &model,
+        &model.static_type(boolean),
+        &[case_of(w.itf(w.color, false), &model)],
+    );
+    let mut texts = witnesses(&report, &model);
+    texts.sort();
+    assert_eq!(texts, ["false", "true"]);
 }
 
 #[test]

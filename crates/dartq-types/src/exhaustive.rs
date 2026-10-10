@@ -738,6 +738,10 @@ enum BaseKind {
     Sealed,
     /// `EnumStaticType` — `isSealed` with constant splitting.
     Enum,
+    /// `BoolStaticType` — `isSealed` with the `true`/`false` split
+    /// (types/bool.dart:15-16: `true` and `false` are the only
+    /// inhabitants).
+    Bool,
     /// `EnumElementStaticType` — unique per constant index.
     EnumValue(u32),
     /// `RecordStaticType`.
@@ -758,6 +762,7 @@ impl BaseTy {
             BaseKind::Plain
             | BaseKind::Sealed
             | BaseKind::Enum
+            | BaseKind::Bool
             | BaseKind::Record
             | BaseKind::FutureOr => None,
         }
@@ -855,9 +860,9 @@ impl<'a> TypedModel<'a> {
             TypeKind::FutureOr { .. } => Self::base(ty, BaseKind::FutureOr),
             TypeKind::Interface { decl, .. } => {
                 if self.is_bool_decl(decl) {
-                    // The `bool` type stays unrestricted; the value
-                    // restriction lives on the constants (types/bool.dart).
-                    return Self::base(ty, BaseKind::Plain);
+                    // `BoolStaticType` (types/bool.dart): sealed over its
+                    // two value constants.
+                    return Self::base(ty, BaseKind::Bool);
                 }
                 if self.sys.hierarchy().enum_constant_count(decl).is_some() {
                     return Self::base(ty, BaseKind::Enum);
@@ -1123,7 +1128,7 @@ impl ExhaustivenessWorld for TypedModel<'_> {
             TypedTy::Nullable(_) | TypedTy::TopNullable => true,
             TypedTy::Base(base) => matches!(
                 base.kind,
-                BaseKind::Sealed | BaseKind::Enum | BaseKind::FutureOr
+                BaseKind::Sealed | BaseKind::Enum | BaseKind::Bool | BaseKind::FutureOr
             ),
             _ => false,
         }
@@ -1179,8 +1184,9 @@ impl ExhaustivenessWorld for TypedModel<'_> {
                             .collect(),
                     }
                 }
-                // BoolStaticType (types/bool.dart).
-                BaseKind::Plain if self.is_bool_decl_of(base.ty) => vec![
+                // BoolStaticType (types/bool.dart:15-16): `true` and
+                // `false` are the only inhabitants.
+                BaseKind::Bool => vec![
                     Self::base(base.ty, BaseKind::BoolValue(true)),
                     Self::base(base.ty, BaseKind::BoolValue(false)),
                 ],
@@ -1307,12 +1313,6 @@ impl ExhaustivenessWorld for TypedModel<'_> {
 }
 
 impl TypedModel<'_> {
-    /// Whether `ty` instantiates the `bool` declaration (name-injected,
-    /// the same channel tests and production callers fill).
-    fn is_bool_decl_of(&self, ty: TypeId) -> bool {
-        matches!(self.sys.table().get(ty).kind(), TypeKind::Interface { decl, .. } if self.is_bool_decl(decl))
-    }
-
     /// The non-null subtype rule (static_type.dart:422-437 + the
     /// `isSubtypeOfInternal` restriction check, types.dart:52-56): a `Base`
     /// subtypes a nullable target by peeling nullability, and subtypes a

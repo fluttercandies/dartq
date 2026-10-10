@@ -204,7 +204,9 @@ pub enum Expr {
     },
     /// A string interpolation: only the `${...}` operands are captured —
     /// the text chunks are unobservable.
-    Interp { parts: Vec<Node> },
+    Interp {
+        parts: Vec<Node>,
+    },
     Adjacent(Vec<Node>),
     List(Vec<Node>),
     Set(Vec<Node>),
@@ -377,7 +379,7 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 match fold(part, lookup, depth) {
                     Verdict::Value(v) if v.is_bool_num_string_or_null() => {}
                     Verdict::Value(_) => {
-                        return Verdict::Fault(ConstFault::TypeBoolNumString, part.span)
+                        return Verdict::Fault(ConstFault::TypeBoolNumString, part.span);
                     }
                     other => return other,
                 }
@@ -479,12 +481,7 @@ fn primarily_identical(a: &ConstantValue, b: &ConstantValue) -> bool {
 /// failing element's verdict propagates with its own anchor (the
 /// variable-initializer site reports at the deepest non-const construct,
 /// `constant_verifier.dart` `_evaluateAndReportError`).
-fn eval_each(
-    parts: &[Node],
-    lookup: &dyn ConstLookup,
-    kind: InstanceKind,
-    depth: u32,
-) -> Verdict {
+fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth: u32) -> Verdict {
     for part in parts {
         if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_)) = fold(part, lookup, depth) {
             return other;
@@ -597,13 +594,13 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
             }
         }
         BitAnd | BitOr | BitXor => match (a, b) {
-            (ConstantValue::Bool(x), ConstantValue::Bool(y)) => Verdict::Value(
-                ConstantValue::Bool(match op {
+            (ConstantValue::Bool(x), ConstantValue::Bool(y)) => {
+                Verdict::Value(ConstantValue::Bool(match op {
                     BitAnd => x & y,
                     BitOr => x | y,
                     _ => x ^ y,
-                }),
-            ),
+                }))
+            }
             (ConstantValue::Int(_), ConstantValue::Int(_)) => {
                 let (ConstantValue::Int(x), ConstantValue::Int(y)) = (a, b) else {
                     unreachable!()
@@ -631,11 +628,7 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                         if *shift >= 1 << 31 {
                             return Verdict::Constant;
                         }
-                        if *shift >= 64 {
-                            0
-                        } else {
-                            x << *shift
-                        }
+                        if *shift >= 64 { 0 } else { x << *shift }
                     }
                     Shr => {
                         if *shift < 0 {
@@ -645,11 +638,7 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                             return Verdict::Constant;
                         }
                         if *shift >= 64 {
-                            if *x < 0 {
-                                -1
-                            } else {
-                                0
-                            }
+                            if *x < 0 { -1 } else { 0 }
                         } else {
                             x >> *shift
                         }
@@ -1101,7 +1090,13 @@ impl ConstCapture {
         if self.open() {
             let base = self.base();
             self.pop_clamped(base);
-            self.push(Node { expr: Expr::Other, span }, true);
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                true,
+            );
         }
     }
 
@@ -1129,7 +1124,13 @@ impl ConstCapture {
             (Some(r), Some(l)) => (r, l),
             (Some(r), None) => {
                 let span = r.span;
-                (r, Node { expr: Expr::Other, span })
+                (
+                    r,
+                    Node {
+                        expr: Expr::Other,
+                        span,
+                    },
+                )
             }
             (None, _) => return,
         };
@@ -1216,7 +1217,13 @@ impl ConstCapture {
         };
         if is_null_aware {
             self.pop_clamped(base);
-            self.push(Node { expr: Expr::Other, span: end }, true);
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span: end,
+                },
+                true,
+            );
             return;
         }
         let Some(recv) = self.pop_clamped(base) else {
@@ -1240,7 +1247,8 @@ impl ConstCapture {
 
     /// Wraps the top operand with every prefix operator whose operand
     /// just completed (latched at the current depth).
-    fn apply_unaries_at(&mut self, depth: u32) {        while self.pending_unary.last().is_some_and(|&(_, d)| d == depth) {
+    fn apply_unaries_at(&mut self, depth: u32) {
+        while self.pending_unary.last().is_some_and(|&(_, d)| d == depth) {
             let Some(mut node) = self.pop_clamped(self.base()) else {
                 self.pending_unary.pop();
                 continue;
@@ -1535,7 +1543,10 @@ impl ConstCapture {
         self.depth -= 1;
         let level = self.args.pop()?;
         let kind = self.windows.last().map(|w| w.kind);
-        let creation = matches!(kind, Some(WindowKind::EnumElement | WindowKind::CtorInvocation));
+        let creation = matches!(
+            kind,
+            Some(WindowKind::EnumElement | WindowKind::CtorInvocation)
+        );
         if creation && self.args.iter().all(|l| l.window_seq < level.window_seq) {
             let callee = level.callee.as_ref();
             let span = callee.map_or(ORIGIN, |c| c.span);
@@ -1602,14 +1613,26 @@ impl ConstCapture {
         let base = self.base();
         self.pop_clamped(base);
         self.pop_clamped(base);
-        self.push(Node { expr: Expr::Other, span }, true);
+        self.push(
+            Node {
+                expr: Expr::Other,
+                span,
+            },
+            true,
+        );
     }
 
     pub fn throw_expression(&mut self, span: SourceRange) {
         if self.open() {
             let base = self.base();
             self.pop_clamped(base);
-            self.push(Node { expr: Expr::Other, span }, true);
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                true,
+            );
         }
     }
 
@@ -1617,7 +1640,13 @@ impl ConstCapture {
         if self.open() {
             let base = self.base();
             self.pop_clamped(base);
-            self.push(Node { expr: Expr::Other, span }, true);
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                true,
+            );
         }
     }
 
@@ -1714,7 +1743,13 @@ impl ConstCapture {
         if let Some(mark) = self.opaque_marks.pop() {
             self.stack.truncate(mark);
         }
-        self.push(Node { expr: Expr::Other, span }, true);
+        self.push(
+            Node {
+                expr: Expr::Other,
+                span,
+            },
+            true,
+        );
     }
 
     // —— plumbing ————————————————————————————————————————————————————
@@ -1777,10 +1812,7 @@ mod tests {
         fn node(&self, expr: Expr, offset: u32) -> Node {
             Node {
                 expr,
-                span: SourceRange {
-                    offset,
-                    length: 1,
-                },
+                span: SourceRange { offset, length: 1 },
             }
         }
 
@@ -1858,11 +1890,7 @@ mod tests {
         );
         // Dart int arithmetic wraps at 64 bits (VM semantics).
         assert_eq!(
-            world.bin(
-                Mul,
-                ConstantValue::Int(i64::MAX),
-                ConstantValue::Int(2)
-            ),
+            world.bin(Mul, ConstantValue::Int(i64::MAX), ConstantValue::Int(2)),
             Verdict::Value(ConstantValue::Int(-2))
         );
         // `/` widens even for int/int (value.dart `divide`).
@@ -1920,11 +1948,7 @@ mod tests {
             Verdict::Value(ConstantValue::Int(-1))
         );
         assert_eq!(
-            world.bin(
-                Mod,
-                ConstantValue::Double(-5.0),
-                ConstantValue::Double(3.0)
-            ),
+            world.bin(Mod, ConstantValue::Double(-5.0), ConstantValue::Double(3.0)),
             Verdict::Value(ConstantValue::Double(1.0))
         );
     }
@@ -2046,7 +2070,11 @@ mod tests {
         let world = w();
         use BinOp::*;
         assert_eq!(
-            world.bin(BitAnd, ConstantValue::Bool(true), ConstantValue::Bool(false)),
+            world.bin(
+                BitAnd,
+                ConstantValue::Bool(true),
+                ConstantValue::Bool(false)
+            ),
             Verdict::Value(ConstantValue::Bool(false))
         );
         assert_eq!(
@@ -2211,16 +2239,16 @@ mod tests {
         let world = w();
         use BinOp::*;
         assert_eq!(
-            world.bin(
-                Mul,
-                ConstantValue::Str("ab".into()),
-                ConstantValue::Int(3)
-            ),
+            world.bin(Mul, ConstantValue::Str("ab".into()), ConstantValue::Int(3)),
             Verdict::Constant
         );
         // A non-int repeat count is still not a numeric fault.
         assert_eq!(
-            world.bin(Mul, ConstantValue::Str("a".into()), ConstantValue::Str("b".into())),
+            world.bin(
+                Mul,
+                ConstantValue::Str("a".into()),
+                ConstantValue::Str("b".into())
+            ),
             Verdict::Constant
         );
     }
@@ -2231,10 +2259,7 @@ mod tests {
     #[test]
     fn opaque_leaves_defer_through_enclosing_operators() {
         let world = w();
-        assert_eq!(
-            world.eval(&world.node(Expr::Opaque, 3)),
-            Verdict::Constant
-        );
+        assert_eq!(world.eval(&world.node(Expr::Opaque, 3)), Verdict::Constant);
         let add = world.node(
             Expr::Binary {
                 op: BinOp::Add,
@@ -2325,10 +2350,7 @@ mod tests {
             },
             7,
         );
-        assert_eq!(
-            world.eval(&same),
-            Verdict::Value(ConstantValue::Bool(true))
-        );
+        assert_eq!(world.eval(&same), Verdict::Value(ConstantValue::Bool(true)));
     }
 
     #[test]
