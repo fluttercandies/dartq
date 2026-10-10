@@ -14,11 +14,18 @@
 //! - [`library_graph`] — interned library nodes keyed by canonical URI,
 //!   import/export edges, and the eager export-scope fixpoint pinned to the
 //!   analyzer's worklist behavior (locals beat re-exports, conflicting
-//!   re-exports resolve first-come-wins).
+//!   re-exports resolve first-come-wins), plus the M2 cross-library
+//!   modifier facts (per-class declared modifiers and the
+//!   name → declaring-libraries index).
 //! - [`namespace`] — import-namespace and prefix-table construction with
 //!   build-time combinator filtering, and the `Found`/`Ambiguous`/`NotFound`
 //!   lookup face the `undefined_*` diagnostics consume.
 //! - [`codes`] — the frozen §4.2 resolution diagnostic code table.
+//! - [`modifiers`] — the M2 class-modifier decisions (ticket #281):
+//!   declaration-site combination legality, cross-library use-site
+//!   restrictions, the base/final subtype requirement, induced modifiers,
+//!   and the official diagnostic code descriptors — pure functions over
+//!   resolved facts, ready for the semantic layer to wire to diagnostics.
 //!
 //! The part/part-of family (`part_of_*`, `duplicate_part`) and its file-role
 //! graph remain ticket #119.
@@ -26,6 +33,7 @@
 pub mod codes;
 pub mod conditional;
 pub mod library_graph;
+pub mod modifiers;
 pub mod namespace;
 pub mod uri;
 
@@ -34,6 +42,15 @@ pub use conditional::{Configuration, SelectedUri, resolve_conditional};
 pub use library_graph::{
     CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
     LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
+};
+pub use modifiers::{
+    ClassModifiers, DeclKind, DeclarationViolation, ExplicitBaseFinal, ImplementsStep,
+    InducedModifier, LibraryFeatureFacts, ModifierCode, ModifierCodeInfo, ModifierHierarchy,
+    ModifierKeyword, Relation, SubtypeRestrictionInput, SuperFacts, base_implemented_candidate,
+    declaration_violations, final_extends_violation, final_implements_candidate,
+    final_mixin_constraint_violation, induced_modifier, interface_extends_violation,
+    may_ignore_class_modifiers, nearest_explicit_base_or_final, sealed_supertype_violation,
+    subtype_restriction_violation,
 };
 pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces};
 pub use uri::{

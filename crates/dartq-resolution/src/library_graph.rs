@@ -77,8 +77,10 @@
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
 
 use dartq_source::{FileId, StringId, StringTable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map;
+
+use crate::modifiers::ClassModifiers;
 
 /// An interned library node: the resolution layer's logical identity
 /// (spec §5; the engine's arena `LibraryId` is a separate, downstream type).
@@ -319,6 +321,9 @@ struct NodeBuilder {
     decls: Vec<(StringId, FileId)>,
     imports: Vec<ImportEdge>,
     exports: Vec<ExportEdge>,
+    /// Class declarations with their modifier flags, keyed by name — the
+    /// cross-library modifier facts ([`LibraryGraph::class_modifiers`]).
+    classes: Vec<(StringId, ClassModifiers)>,
 }
 
 impl<'t> LibraryGraphBuilder<'t> {
@@ -353,6 +358,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             decls: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            classes: Vec::new(),
         });
         id
     }
@@ -369,6 +375,24 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// are the semantic layer's diagnosis, not a namespace-shaping event.
     pub fn declare(&mut self, lib: LibraryId, name: StringId, file: FileId) {
         self.nodes[lib.index() as usize].decls.push((name, file));
+    }
+
+    /// Records one class declaration `name` of `lib` with its declared
+    /// modifier flags ([`ClassModifiers`]) — the M2 modifier facts the
+    /// cross-library restriction decisions consume. The name/file pair is
+    /// registered exactly like [`Self::declare`] (one call covers both
+    /// faces), so a class is never a namespace ghost.
+    pub fn declare_class(
+        &mut self,
+        lib: LibraryId,
+        name: StringId,
+        file: FileId,
+        modifiers: ClassModifiers,
+    ) {
+        self.declare(lib, name, file);
+        self.nodes[lib.index() as usize]
+            .classes
+            .push((name, modifiers));
     }
 
     /// Records `lib`'s resolved `import` directive, in source order.
@@ -505,16 +529,32 @@ impl<'t> LibraryGraphBuilder<'t> {
             }
         }
 
+        // The name → declaring-libraries inverted index over class
+        // declarations ([`LibraryGraph::declaring_libraries`]). Duplicates
+        // keep the first, matching [`LibraryGraphBuilder::declare`]'s
+        // first-wins contract.
+        let mut declarations: FxHashMap<StringId, Vec<LibraryId>> = FxHashMap::default();
         let nodes = nodes
             .into_iter()
             .zip(scopes)
             .zip(locals)
-            .map(|((node, export_scope), local_slots)| {
+            .enumerate()
+            .map(|(index, ((node, export_scope), local_slots))| {
                 let wildcard_prefix = node
                     .imports
                     .iter()
                     .any(|edge| edge.prefix == Some(underscore))
                     .then_some(underscore);
+                let lib = LibraryId::from_index(index);
+                let mut classes: FxHashMap<StringId, ClassModifiers> =
+                    FxHashMap::with_capacity_and_hasher(node.classes.len(), FxBuildHasher);
+                for (name, modifiers) in node.classes {
+                    classes.entry(name).or_insert(modifiers);
+                    let owners = declarations.entry(name).or_default();
+                    if !owners.contains(&lib) {
+                        owners.push(lib);
+                    }
+                }
                 LibraryNode {
                     uri: node.uri,
                     imports: node.imports,
@@ -522,10 +562,11 @@ impl<'t> LibraryGraphBuilder<'t> {
                     export_scope,
                     locals: local_slots,
                     wildcard_prefix,
+                    classes,
                 }
             })
             .collect();
-        LibraryGraph { nodes }
+        LibraryGraph { nodes, declarations }
     }
 }
 
@@ -608,6 +649,9 @@ fn apply_flow(
 /// identity string (the builder's interning map is discarded here).
 pub struct LibraryGraph {
     nodes: Vec<LibraryNode>,
+    /// Class-declaration name → declaring libraries, in library
+    /// registration order ([`LibraryGraph::declaring_libraries`]).
+    declarations: FxHashMap<StringId, Vec<LibraryId>>,
 }
 
 struct LibraryNode {
@@ -620,6 +664,9 @@ struct LibraryNode {
     locals: FxHashMap<StringId, LocalSlot>,
     /// The interned `_` when one of `imports` registers that prefix.
     wildcard_prefix: Option<StringId>,
+    /// Class declarations with their modifier flags
+    /// ([`LibraryGraph::class_modifiers`]).
+    classes: FxHashMap<StringId, ClassModifiers>,
 }
 
 impl LibraryGraph {
@@ -774,6 +821,28 @@ impl LibraryGraph {
     /// `element/scope.dart:486-494`).
     pub(crate) fn wildcard_prefix(&self, lib: LibraryId) -> Option<StringId> {
         self.nodes[lib.index() as usize].wildcard_prefix
+    }
+
+    /// The declared modifier flags of `lib`'s class `name` — the
+    /// declaration-side fact for the M2 cross-library restriction
+    /// decisions ([`crate::modifiers`]). `None` when `lib` does not
+    /// declare a class under that name (or registered only a
+    /// non-class declaration).
+    #[must_use]
+    pub fn class_modifiers(&self, lib: LibraryId, name: StringId) -> Option<ClassModifiers> {
+        self.nodes[lib.index() as usize].classes.get(&name).copied()
+    }
+
+    /// Every library that declares a *class* under `name`, in library
+    /// registration order. The ownership half of the cross-library
+    /// restriction facts: the semantic layer pairs a use site's library
+    /// with each candidate's home via this face (duplicates across
+    /// libraries are the ordinary ambiguity case — the same-library
+    /// flag is per candidate). `FxBuildHasher`-backed; one hash hit per
+    /// query.
+    #[must_use]
+    pub fn declaring_libraries(&self, name: StringId) -> &[LibraryId] {
+        self.declarations.get(&name).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -1581,5 +1650,61 @@ mod tests {
         let graph = LibraryGraphBuilder::new(&strings).finish();
         assert!(graph.is_empty());
         assert_eq!(graph.libraries().count(), 0);
+    }
+
+    // ---- cross-library modifier facts (ticket #281) ----
+
+    /// `declare_class` registers the name on both faces — the namespace
+    /// locals and the modifier map — and the inverted index answers
+    /// `declaring_libraries` in registration order; a duplicate class
+    /// name in one library keeps the first modifiers.
+    #[test]
+    fn class_modifier_facts_cover_declaration_and_ownership() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let lib_b = rig.builder.intern("package:b/b.dart");
+        let a_file = rig.file("a.dart");
+        let b_file = rig.file("b.dart");
+        let sealed = ClassModifiers {
+            kind: crate::modifiers::DeclKind::Class,
+            is_sealed: true,
+            ..ClassModifiers::default()
+        };
+        let plain = ClassModifiers::default();
+        rig.builder
+            .declare_class(a, rig.strings.intern("Shape"), a_file, sealed);
+        rig.builder
+            .declare_class(lib_b, rig.strings.intern("Shape"), b_file, plain);
+        rig.builder
+            .declare_class(lib_b, rig.strings.intern("Local"), b_file, plain);
+        // A duplicate registration keeps the first modifiers (the
+        // declare-side first-wins contract).
+        rig.builder.declare_class(
+            lib_b,
+            rig.strings.intern("Shape"),
+            b_file,
+            ClassModifiers {
+                is_base: true,
+                ..plain
+            },
+        );
+        let graph = rig.builder.finish();
+        // A class name is also a locals declaration (either face lookup
+        // hits).
+        assert!(matches!(
+            graph.local(a, rig.strings.intern("Shape")),
+            LocalLookup::Found(_)
+        ));
+        assert_eq!(graph.class_modifiers(a, rig.strings.intern("Shape")), Some(sealed));
+        assert_eq!(
+            graph.class_modifiers(lib_b, rig.strings.intern("Shape")),
+            Some(plain)
+        );
+        assert_eq!(graph.class_modifiers(a, rig.strings.intern("Local")), None);
+        assert_eq!(
+            graph.declaring_libraries(rig.strings.intern("Shape")),
+            &[a, lib_b]
+        );
+        assert!(graph.declaring_libraries(rig.strings.intern("Missing")).is_empty());
     }
 }
