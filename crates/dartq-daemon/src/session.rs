@@ -100,6 +100,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use dartq_commands::layout::{path_key, severity_rank};
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_engine::{
     CancellationToken, Cancelled, ContextConfig, ContextId, Engine, EngineConfig, EngineError,
@@ -895,11 +896,11 @@ impl Session {
                 .extend(self.plan_publishes(&diagnostics, &converted));
         }
         // dartq/analyze answers keep the CLI analyze face's printed order
-        // (severity-first before writing; the twin key lives in dartq-cli's
-        // analyze runner): severity, path bytes, offset, message — not the
-        // engine's canonical (file, offset) order the other faces mirror.
-        // The entries pair with their engine diagnostics for the sort key,
-        // then strip.
+        // (severity-first before writing; the shared key lives in
+        // dartq-commands' layout module): severity, path bytes, offset,
+        // message — not the engine's canonical (file, offset) order the
+        // other faces mirror. The entries pair with their engine
+        // diagnostics for the sort key, then strip.
         let mut paired: Vec<(&Diagnostic, &Path, lsp::AnalyzeEntry)> = diagnostics
             .iter()
             .zip(converted)
@@ -917,9 +918,9 @@ impl Session {
             })
             .collect();
         paired.sort_by(|(a, a_path, _), (b, b_path, _)| {
-            analyze_severity_rank(a.severity)
-                .cmp(&analyze_severity_rank(b.severity))
-                .then_with(|| analyze_path_key(a_path).cmp(analyze_path_key(b_path)))
+            severity_rank(a.severity)
+                .cmp(&severity_rank(b.severity))
+                .then_with(|| path_key(a_path).cmp(path_key(b_path)))
                 .then_with(|| a.range.offset.cmp(&b.range.offset))
                 .then_with(|| a.message.cmp(&b.message))
         });
@@ -1213,23 +1214,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("opaque panic payload")
-}
-
-/// The CLI analyze face's severity precedence (the twin of dartq-cli's
-/// `severity_rank`, which sorts its diagnostics before writing): errors,
-/// then warnings, then infos.
-fn analyze_severity_rank(severity: Severity) -> u8 {
-    match severity {
-        Severity::Error => 0,
-        Severity::Warning => 1,
-        Severity::Info => 2,
-    }
-}
-
-/// Plain byte key of a path — the twin of dartq-cli's `path_key` (the
-/// oracle's `filePath.compareTo` order) for the analyze answer's sort.
-fn analyze_path_key(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
 }
 
 #[cfg(test)]
@@ -1782,10 +1766,7 @@ mod tests {
             1,
             "main now carries the broken content's rows"
         );
-        assert!(
-            by_uri(&other).diagnostics.is_empty(),
-            "other is clean now"
-        );
+        assert!(by_uri(&other).diagnostics.is_empty(), "other is clean now");
     }
 
     /// Overlay precedence (the rule [`Session::queue_disk_changes`]
@@ -1841,8 +1822,7 @@ mod tests {
             turn.publishes
         );
         assert_eq!(
-            turn.publishes[0].diagnostics[0].code,
-            "uri_does_not_exist",
+            turn.publishes[0].diagnostics[0].code, "uri_does_not_exist",
             "close staged the on-disk bytes: {:?}",
             turn.publishes[0]
         );
@@ -1874,7 +1854,9 @@ mod tests {
                 .1
         };
         assert!(
-            answer_codes(by_id(4)).iter().any(|code| code == "expected_token"),
+            answer_codes(by_id(4))
+                .iter()
+                .any(|code| code == "expected_token"),
             "the base view tracks the disk through the sync: {:?}",
             by_id(4)
         );
