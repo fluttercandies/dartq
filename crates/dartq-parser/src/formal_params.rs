@@ -157,8 +157,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     /// The `parseFormalParametersRest` tail recovery: a scanner-synthetic
-    /// `)` is adopted (official `moveSynthetic`), `id id` reports a missing
-    /// comma and continues, everything else jumps to the group's closer.
+    /// `)` is relocated in front of the current token (official
+    /// `moveSynthetic`, :1977-1981 — the scanner already reported the
+    /// unmatched `(`; the enclosing parse, e.g. the enum body of
+    /// `enum E( {}`, resumes at the current token), `id id` reports a
+    /// missing comma and continues, everything else jumps to the group's
+    /// closer.
     fn recover_parameter_group_end(
         &mut self,
         begin: TokenSpan,
@@ -167,10 +171,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if let Some(close) = begin_group_close
             && self.cursor.resolve(close).1
         {
-            self.skip_to_token(close);
-            let end = self.peek_span();
-            self.cursor.advance();
-            return end;
+            let at = self.peek_span();
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::CloseParen, at.range.offset);
+            self.cursor.advance(); // the relocated closer
+            return self.span_of(id);
         }
         let next = self.cursor.peek();
         let next_next = self.cursor.look_kind(1);
@@ -474,10 +480,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let follower = self.cursor.look_kind(1);
                 let name = self.peek_span();
                 if follower == TokenKind::Lt {
+                    // `skip` is relative to the token *before* the `<` —
+                    // capture it before stepping onto the group.
+                    let before_lt = self.peek_id();
                     self.cursor.advance();
                     type_param = self.compute_type_param_or_arg_on_lt(false);
                     if !matches!(type_param, TypeParamOrArg::None) {
-                        let closer = type_param.skip(self.peek_id());
+                        let closer = type_param.skip(before_lt);
                         if self.kind_at(self.offset_of(closer) + 1) == TokenKind::OpenParen {
                             shape_matched = true;
                         }

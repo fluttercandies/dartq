@@ -240,27 +240,18 @@ fn enum_header_reserved_head_skip_refusal() {
     );
 }
 
-/// A typedef with no name at all: the 3.13 oracle recovers through the
-/// top-level-member message anchored on the offending token.
+/// A typedef with no name at all: the 3.13 oracle bails the whole typedef
+/// with `expectedToken(';')` anchored on the reserved type head
+/// (`typedef void = ...;`) and restarts the declaration parse at the `=`;
+/// the reparse yields the top-level-member and alias-shape reports.
 #[test]
 fn typedef_old_style_no_name() {
     assert_codes(
         "typedef void = void Function();\n",
-        // The `void` head at the RHS name position is a statement-start
-        // keyword: the official expression-identifier template inserts a
-        // synthetic (expectedIdentifier) instead of eating the keyword.
         &[
             "expected_executable",
             "expected_token",
-            "expected_token",
-            "missing_const_final_var_or_type",
-            "missing_const_final_var_or_type",
             "missing_function_body",
-            "missing_identifier",
-            "missing_identifier",
-            "missing_identifier",
-            "missing_identifier",
-            "missing_typedef_parameters",
         ],
         "typedef missing name",
     );

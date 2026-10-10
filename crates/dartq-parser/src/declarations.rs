@@ -232,8 +232,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
                 if next == TokenKind::Lt {
                     if self.peek_kind() == TokenKind::Keyword(Keyword::Extension) {
-                        // `extension<T> on ...` — the name is optional.
-                        if let Some(end_group) = self.angle_group_after(2)
+                        // `extension<T> on ...` — the name is optional
+                        // (official :771-782: `endGroup.next.isA(Keyword.ON)`).
+                        if let Some(end_group) = self.angle_group_after(1)
                             && self.kind_at_abs(end_group + 1) == TokenKind::Keyword(Keyword::On)
                         {
                             self.check_declaration();
@@ -617,34 +618,89 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 equals = Some(self.peek_span());
                 self.cursor.advance();
                 let type_info = self.compute_type(true, true);
+                // Recovery (:1543-1610): when the RHS type is not a function
+                // type, certain follower shapes splice in a missing
+                // `Function` — "<type> '(' ... ')';" assumes the type is the
+                // return type; "<typeArgs> '(' ... ')';" assumes the '<' opens
+                // the function's type parameters. Both report
+                // `expectedToken('Function')` on the inserted keyword.
+                let type_is_gft = matches!(
+                    &type_info,
+                    crate::types::TypeInfo::Complex(c) if c.gft_has_return_type.is_some()
+                );
+                let mut handled = false;
                 if matches!(type_info, crate::types::TypeInfo::NoType)
                     && self.peek_kind() == TokenKind::Lt
                     && let Some(end_group) = self.angle_group_after(0)
-                    && self.kind_at(end_group + 1) == TokenKind::Semicolon
                 {
-                    // Official :1596-1605: `typedef i = <...>;` — the type
-                    // arguments belong to a missing `Function`. The missing
-                    // parameter list is reported on the group's closer and
-                    // the alias parses as `Function<...>();`.
                     let closer = self.span_of(self.real_id(end_group));
-                    self.report(msg::missing_typedef_parameters(), closer);
-                    self.skip_to_token(self.real_id(end_group));
-                    self.cursor.advance(); // the closer
-                    let open = self.synthetic(TokenKind::OpenParen, closer.range.offset);
-                    let close = self.synthetic(TokenKind::CloseParen, closer.range.offset);
-                    self.listener.begin_formal_parameters(
-                        open,
-                        crate::listener::MemberKind::FunctionTypeAlias,
-                    );
-                    self.listener.end_formal_parameters(
-                        0,
-                        open,
-                        close,
-                        crate::listener::MemberKind::FunctionTypeAlias,
-                    );
-                    self.cursor.advance();
-                    self.cursor.advance();
-                } else {
+                    match self.kind_at(end_group + 1) {
+                        TokenKind::Semicolon => {
+                            // Official :1596-1605: `typedef i = <...>;` — the
+                            // type arguments belong to a missing `Function`.
+                            // The missing parameter list is reported on the
+                            // group's closer and the alias parses as
+                            // `Function<...>();`.
+                            self.report(msg::missing_typedef_parameters(), closer);
+                            self.skip_to_token(self.real_id(end_group));
+                            self.cursor.advance(); // the closer
+                            let open = self.synthetic(TokenKind::OpenParen, closer.range.offset);
+                            let close = self.synthetic(TokenKind::CloseParen, closer.range.offset);
+                            self.listener.begin_formal_parameters(
+                                open,
+                                crate::listener::MemberKind::FunctionTypeAlias,
+                            );
+                            self.listener.end_formal_parameters(
+                                0,
+                                open,
+                                close,
+                                crate::listener::MemberKind::FunctionTypeAlias,
+                            );
+                            self.cursor.advance();
+                            self.cursor.advance();
+                            handled = true;
+                        }
+                        TokenKind::OpenParen
+                            if let Some(paren_end) =
+                                self.cursor.table_matching_end(self.real_id(end_group + 1))
+                                && self.kind_at(self.offset_of(paren_end) + 1)
+                                    == TokenKind::Semicolon =>
+                        {
+                            // Official :1564-1610: `<typeArgs>(<params>);` —
+                            // insert the missing `Function` before the '<'.
+                            self.report(msg::expected_token("Function"), self.peek_span());
+                            self.skip_to_token(self.real_id(end_group));
+                            self.cursor.advance(); // the '>' closer
+                            self.parse_formal_parameters_required_opt(
+                                crate::listener::MemberKind::GeneralizedFunctionType,
+                            );
+                            handled = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if !handled && !type_is_gft {
+                    // Official :1543-1561: `<return type>? '(' ... ')';` —
+                    // assume the type is the return type of a missing
+                    // `Function`.
+                    let head_end = type_info.skip_type(self);
+                    let paren = self.offset_of(head_end) + 1;
+                    if self.kind_at(paren) == TokenKind::OpenParen
+                        && let Some(paren_end) = self.cursor.table_matching_end(self.real_id(paren))
+                        && self.kind_at(self.offset_of(paren_end) + 1) == TokenKind::Semicolon
+                    {
+                        self.report(
+                            msg::expected_token("Function"),
+                            self.span_of(self.real_id(paren)),
+                        );
+                        self.skip_to_token(self.real_id(paren));
+                        self.parse_formal_parameters_required_opt(
+                            crate::listener::MemberKind::GeneralizedFunctionType,
+                        );
+                        handled = true;
+                    }
+                }
+                if !handled {
                     type_info.ensure_type_or_void(self);
                 }
                 end = self.ensure_semicolon();
@@ -658,6 +714,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         } else {
             // Old style: `typedef <returnType> name <typeVars> (params);`
             type_info.parse_type(self);
+            if self.peek_kind() == TokenKind::Eq {
+                // `typedef void = ...;` — a reserved type head with the `=`
+                // at the name position bails the whole typedef: the oracle
+                // reports `expectedToken(';')` anchored on the type head and
+                // restarts the declaration parse at the `=` (the reparse
+                // yields the top-level-member / alias-shape errors).
+                let head_end = self
+                    .cursor
+                    .last_consumed_id()
+                    .map_or_else(|| self.peek_span(), |id| self.span_of(id));
+                self.report(msg::expected_token(";"), head_end);
+                self.listener
+                    .end_typedef(augment, typedef_keyword, None, head_end);
+                return;
+            }
             if self.peek_is_identifier() || self.peek_kind_ahead_is_paren_after_type() {
                 let _ = self.ensure_identifier(IdentifierContext::TypedefDeclaration);
             } else {
@@ -835,37 +906,63 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
     }
 
-    /// Official `parseEnumHeaderOpt` (with-clause, implements-clause, and
-    /// out-of-order recovery).
-    fn parse_enum_header_opt(&mut self, enum_keyword: TokenSpan) {
-        let _ = enum_keyword;
-        // `with` clause.
-        let mut saw_with = false;
-        if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
+    /// Official `parseEnumHeaderOpt` (`parser_impl.dart:2737-2832`): optional
+    /// with-clause, then optional implements-clause, with the bounded gunk
+    /// skip (`recoverySmallLookAheadSkipTokens`) and the duplicate/out-of-
+    /// order clause recoveries interleaved exactly as the official loop
+    /// orders them.
+    fn parse_enum_header_opt(&mut self, _enum_keyword: TokenSpan) {
+        const LOOK: [TokenKind; 3] = [
+            TokenKind::OpenCurly,
+            TokenKind::Keyword(Keyword::With),
+            TokenKind::Keyword(Keyword::Implements),
+        ];
+        // Gunk before any clause (:2744-2752).
+        if !LOOK.contains(&self.peek_kind()) {
+            self.skip_to_clause(&LOOK);
+        }
+        // With-clause opt (:2754).
+        let saw_with = if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
             self.parse_enum_with_clause();
-            saw_with = true;
+            true
         } else {
             self.listener.handle_enum_no_with_clause();
+            false
+        };
+        // Gunk / duplicate with-clauses before the implements clause
+        // (:2758-2773): a `with` here is a duplicate (multipleClauses); other
+        // gunk goes through the bounded skip.
+        while !self.cursor.at_eof()
+            && !matches!(
+                self.peek_kind(),
+                TokenKind::OpenCurly | TokenKind::Keyword(Keyword::Implements)
+            )
+        {
+            if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
+                self.report(msg::multiple_clauses("enum", "with"), self.peek_span());
+                self.parse_enum_with_clause_suppressed();
+                continue;
+            }
+            if !self.skip_to_clause(&LOOK) {
+                break;
+            }
         }
-        // Skip garbage between clauses (official recoverySmallLookAheadSkip
-        // reduced to a bounded skip of non-clause tokens).
-        let _ = self.skip_to_clause(&[
-            TokenKind::Keyword(Keyword::Implements),
-            TokenKind::OpenCurly,
-        ]);
-        // implements clause.
-        let mut saw_implements = false;
+        // Implements-clause opt (:2775).
         if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {
             self.parse_implements_opt();
-            saw_implements = true;
         } else {
             self.listener.handle_implements(None, 0);
         }
-        // Out-of-order extras.
-        while self.peek_kind() != TokenKind::OpenCurly && !self.cursor.at_eof() {
+        // Out-of-order and duplicate with/implements clauses, plus bounded
+        // gunk skips (:2777-2832). The with-kind report is multipleClauses
+        // once any with-clause has been seen, outOfOrderClauses before that;
+        // an implements token here is always a duplicate.
+        let mut has_with: Option<bool> = None;
+        while !self.cursor.at_eof() && self.peek_kind() != TokenKind::OpenCurly {
+            let hc = *has_with.get_or_insert(saw_with);
             if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
                 self.report(
-                    if saw_with {
+                    if hc {
                         msg::multiple_clauses("enum", "with")
                     } else {
                         msg::out_of_order_clauses("with", "implements")
@@ -873,18 +970,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     self.peek_span(),
                 );
                 self.parse_enum_with_clause_suppressed();
-                saw_with = true;
+                has_with = Some(true);
             } else if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {
                 self.report(
-                    if saw_implements {
-                        msg::multiple_implements()
-                    } else {
-                        msg::out_of_order_clauses("with", "implements")
-                    },
+                    msg::multiple_clauses("enum", "implements"),
                     self.peek_span(),
                 );
                 self.parse_implements_opt_suppressed();
-            } else {
+            } else if !self.skip_to_clause(&LOOK) {
                 break;
             }
         }
@@ -1816,7 +1909,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     } else if let Some(delim) = state.delimiter {
                         self.report(msg::expected_representation_field(), delim);
                     } else if state.fn_typed {
-                        self.report(msg::expected_representation_field(), begin);
+                        // The verifier's `expectedRepresentationField` for a
+                        // function-typed representation field only runs with
+                        // primary constructors disabled (the 3.13 oracle runs
+                        // the feature and accepts the declaring parameter).
+                        if !self.features.primary_constructors_enabled {
+                            self.report(msg::expected_representation_field(), begin);
+                        }
                     } else if let Some(m) = state.modifier {
                         let lexeme = self.cursor.lexeme(m.id);
                         if !self.features.primary_constructors_enabled || lexeme == "var" {

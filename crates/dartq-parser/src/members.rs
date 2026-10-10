@@ -486,6 +486,34 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         self.listener.end_member();
                         return;
                     }
+                    // Unnamed factory (`factory ()`) — primary-constructors
+                    // shape (official :5456-5477): only with a clean modifier
+                    // set (no consumed type, no covariant/late/static, no
+                    // abstract, `const` or no var/final modifier). Otherwise
+                    // fall through: `factory` used as an identifier.
+                    if follower == TokenKind::OpenParen
+                        && self.features.primary_constructors_enabled
+                        && crate::cursor::TokenCursor::progress_at(before_type)
+                            == crate::cursor::TokenCursor::progress_at(after_type)
+                        && mods.covariant.is_none()
+                        && mods.late_kw.is_none()
+                        && mods.static_kw.is_none()
+                        && mods.abstract_kw.is_none()
+                        && mods
+                            .var_final_or_const
+                            .is_none_or(|t| self.cursor.lexeme(t.id) == "const")
+                    {
+                        self.parse_factory_method(
+                            kind,
+                            mods.augment,
+                            mods.external,
+                            None,
+                            mods.var_final_or_const,
+                            false,
+                        );
+                        self.listener.end_member();
+                        return;
+                    }
                     // Fall through: `factory` used as an identifier.
                 }
                 TokenKind::Keyword(Keyword::Operator) => {

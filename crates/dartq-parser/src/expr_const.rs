@@ -445,6 +445,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener.end_new_expression(end);
                 self.parse_selector_chain(end, context)
             }
+            TokenKind::Keyword(Keyword::Switch) if self.features.patterns_enabled => {
+                // The official fallthrough runs the full expression engine
+                // (`parsePrecedenceExpression`, :11878-11890), so a `switch`
+                // expression is a syntactically valid constant-pattern
+                // operand; only the semantic layer rejects it.
+                let end = self.parse_switch_expression();
+                self.parse_selector_chain(end, context)
+            }
             TokenKind::OpenParen => {
                 let end = self.parse_parenthesized_or_record_literal(None);
                 self.parse_selector_chain(end, context)

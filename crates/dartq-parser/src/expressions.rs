@@ -339,27 +339,41 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 last_cascade = true;
                 left = self.parse_cascade_expression(left);
             } else if token_level == ASSIGNMENT_PRECEDENCE {
-                // AstBuilder assignment-target check (ast_builder.dart:4428):
-                // only identifiers, property accesses, and index expressions
-                // are assignable; any other LHS reports
-                // `illegal_assignment_to_non_assignable`.
-                // `Token.isOperator`-style proxy for AstBuilder
-                // `handleAssignment`'s assignability check (:5856): the LHS
-                // must end in an identifier (or `]` of an index target).
-                // The final LHS token's kind: a table id is read back by
-                // offset (a span id can alias an inserted token); an inserted
-                // (synthetic) token is read by id — its offset points at the
-                // real token it stands in for, never at itself.
-                let lhs_assignable = self.cursor.last_consumed_id().is_some_and(|id| {
-                    let kind = if (id as usize) < self.table.len() {
+                // AstBuilder assignment-target checks: `handleAssignment-
+                // Expression` (ast_builder.dart:3825-3841) reports
+                // `missingAssignableSelector` for a non-assignable LHS in an
+                // ordinary assignment (a bare `super`); a bare `this` counts
+                // as assignable (no report). The statement-level
+                // `illegalAssignmentToNonAssignable` (:4420-4433) and the
+                // postfix variant (:5849-5860) keep their own shapes.
+                // `Token.isOperator`-style proxy for the assignability check
+                // (:5856): the LHS must end in an identifier (or `]` of an
+                // index target). The final LHS token's kind: a table id is
+                // read back by offset (a span id can alias an inserted
+                // token); an inserted (synthetic) token is read by id — its
+                // offset points at the real token it stands in for, never at
+                // itself.
+                let lhs_last = self.cursor.last_consumed_id().map(|id| {
+                    if (id as usize) < self.table.len() {
                         self.kind_at(self.offset_of(id))
                     } else {
                         self.cursor.resolve(id).0
-                    };
-                    matches!(kind, TokenKind::Identifier | TokenKind::CloseSquare)
+                    }
                 });
-                if !lhs_assignable {
-                    self.report(msg::illegal_assignment_to_non_assignable(), left);
+                match lhs_last {
+                    // `this` ends in a selector-able expression per the
+                    // official `_isAssignable` and is silently accepted.
+                    Some(
+                        TokenKind::Identifier
+                        | TokenKind::CloseSquare
+                        | TokenKind::Keyword(Keyword::This),
+                    ) => {}
+                    Some(TokenKind::Keyword(Keyword::Super)) => {
+                        self.report(msg::missing_assignable_selector(), left);
+                    }
+                    _ => {
+                        self.report(msg::illegal_assignment_to_non_assignable(), left);
+                    }
                 }
                 // Right associative: recurse at the same level (:6671-6691).
                 // The `>>=`-without-triple-shift recovery is dead at the pin
@@ -1726,7 +1740,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     ) -> bool {
         self.listener.begin_for_control_flow(await_kw, for_kw);
         let left_paren = if self.peek_kind() == TokenKind::OpenParen {
-            self.peek_span()
+            let paren = self.peek_span();
+            // Official `parseForLoopPartsStart` consumes the `(` before the
+            // initializer (mirrors the statement-side copy in
+            // `parse_for_statement`).
+            self.cursor.advance();
+            paren
         } else {
             // Official parseForLoopPartsStart recovery: a fully synthetic
             // `(...)` group plus a synthetic variable declaration (mirrors
@@ -1815,7 +1834,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseSwitchExpression`: the condition, the case block, and
     /// the `pattern [when] => expression` cases with the comma/semicolon
     /// recovery family.
-    fn parse_switch_expression(&mut self) -> TokenSpan {
+    pub(crate) fn parse_switch_expression(&mut self) -> TokenSpan {
         let switch_kw = self.peek_span();
         self.cursor.advance();
         let saved = self.may_parse_function_expressions;

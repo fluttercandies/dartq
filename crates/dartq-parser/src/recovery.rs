@@ -313,10 +313,21 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // Where does the group actually close?
         if let Some(close_id) = self.cursor.table_matching_end(open.id) {
             let (_, synthetic) = self.cursor.resolve(close_id);
-            if !synthetic {
+            if synthetic {
+                // Scanner-synthesized closer parked at the wrong spot (EOF
+                // for an unclosed `(`): relocate it in front of the current
+                // token (official `moveSynthetic`, :5035-5037) — the scan
+                // already reported the unclosed group, and the enclosing
+                // parse resumes at the current token.
                 let at = self.peek_span();
-                self.report(msg::expected_but_got(")"), at);
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::CloseParen, at.range.offset);
+                self.cursor.advance();
+                return self.span_of(id);
             }
+            let at = self.peek_span();
+            self.report(msg::expected_but_got(")"), at);
             self.skip_to_token(close_id);
             let close = self.peek_span();
             self.cursor.advance();

@@ -512,6 +512,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         n += 1;
                     }
                 }
+                // `void Function(...)` — a generalized function type with a
+                // `void` return type (the official group scan walks this via
+                // the full `computeType`, `type_info_impl.dart:1356`).
+                if self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+                    let fn_len = self.skip_type_len(offset + n);
+                    if fn_len > 0 {
+                        n += fn_len;
+                    }
+                }
                 n
             }
             TokenKind::OpenParen => {
