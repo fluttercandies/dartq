@@ -9,19 +9,25 @@
 //! re-walks the workspace every [`POLL_INTERVAL`] (reusing
 //! `dartq_commands::discover` for exact walk-rule parity with the CLI's
 //! discovery), fingerprints each `.dart` file by `(mtime, len)`, and diffs
-//! against the previous tick. A burst coalesces through the [`Debounce`]
+//! the walk against the previous tick — the tick's walk *is* the on-disk
+//! set, so the diff reports content changes, files that appeared, and files
+//! that vanished (re-discovery: what the session's `queue_disk_changes`
+//! turns into the same set the sweep's discovery takes, or a removal).
+//! A burst coalesces through the [`Debounce`]
 //! state machine until a changeless tick (the quiet period is one poll
 //! interval) or the max-hold deadline, then one batch of touched paths goes
 //! to the main loop over the reader channel — which enqueues the
-//! didChange-equivalent overlay syncs at `Tier::Normal`.
+//! didChange-equivalent overlay syncs at `Tier::Normal`. Overlay precedence
+//! is decided at that intake, not here: client-opened documents keep their
+//! content over the disk (see `Session::queue_disk_changes`).
 //!
 //! Bounded by construction: the thread's state is one fingerprint map plus
-//! the pending set, both replaced/drained per tick — no per-event
-//! accumulation, no timer thread, no unbounded queue (the channel item is
-//! one batch). Watch events are hints, not facts: a deleted file whose base
-//! copy the engine holds resurfaces on overlay removal, and a failed read is
-//! logged and skipped — the next analysis's content check is authoritative
-//! (§16.7).
+//! the pending set, both replaced/drained per tick — one walk plus one diff
+//! per interval, no per-event accumulation, no timer thread, no unbounded
+//! queue (the channel item is one batch). Watch events are hints, not
+//! facts: a deleted file whose base copy the engine holds resurfaces on
+//! overlay removal, and a failed read is logged and skipped — the next
+//! analysis's content check is authoritative (§16.7).
 
 use std::fs;
 use std::path::PathBuf;
@@ -353,5 +359,55 @@ mod tests {
             "the watch thread exited on stop"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Re-discovery rides the real thread: a file created after the
+    /// baseline scan surfaces as a touched path (the batch that makes the
+    /// session stage the set discovery takes), and its later deletion
+    /// surfaces too (the removal batch). Together with the session-level
+    /// sync tests this closes the chain "new files enter analysis, removals
+    /// drop".
+    #[test]
+    fn watch_thread_reports_creations_and_deletions() {
+        let (root, _main) = workspace("thread-rediscover");
+        let (sender, receiver) = mpsc::channel::<Vec<Incoming>>();
+        let watcher = Watcher::spawn(
+            WatchOptions {
+                root: root.clone(),
+                poll_interval: Duration::from_millis(25),
+            },
+            sender,
+        );
+
+        // Let the baseline scan settle, then create and delete a file —
+        // each event is one debounced Watch batch.
+        thread::sleep(Duration::from_millis(120));
+        let extra = root.join("lib/extra.dart");
+        fs::write(&extra, "var b = 2;\n").expect("create");
+        let created = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the creation surfaced within the window");
+        assert_eq!(
+            watch_paths(created),
+            vec![extra.clone()],
+            "the new file is the batch"
+        );
+
+        fs::remove_file(&extra).expect("delete");
+        let deleted = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the deletion surfaced within the window");
+        assert_eq!(watch_paths(deleted), vec![extra], "the removal is the batch");
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Unwraps a channel item into its touched-path batch.
+    fn watch_paths(item: Vec<Incoming>) -> Vec<PathBuf> {
+        match item.as_slice() {
+            [Incoming::Watch { touched }] => touched.clone(),
+            _ => panic!("watch intake is one Watch item"),
+        }
     }
 }

@@ -472,17 +472,35 @@ impl Session {
     }
 
     /// Watch-mode intake (`--watch`, PRD §16.7 mode 3): syncs each reported
-    /// path's on-disk bytes into the overlay — the didChange-equivalent the
-    /// change-detection discipline names — and co-queues the Normal-tier
-    /// read the publish push rides on. Watch files are not LSP-opened, so
-    /// their publishes carry no version; a file deleted since the event
-    /// stages a removal (an overlay-only drop: a base copy resurfaces, per
-    /// the overlay model). Per-path independence: an unreadable file is
-    /// logged and skipped — watch events are hints, and the analysis's
-    /// content check stays the truth (§16.7).
+    /// path's on-disk bytes into the base view — the didChange-equivalent
+    /// the change-detection discipline names — and co-queues the Normal-tier
+    /// read the publish push rides on. The watcher's walk is the on-disk
+    /// truth, so a path that is new or changed queues the same set the
+    /// sweep's discovery takes (new files enter the analysis) and a vanished
+    /// path queues a removal (the file drops out of the view).
+    ///
+    /// # Overlay precedence
+    ///
+    /// A client-opened document ([`Self::queue_edit`], tracked in `opened`)
+    /// owns its content until `didClose`: a watch sync never clobbers it.
+    /// Concretely, a touched-on-disk path with client content is skipped
+    /// entirely, and a deleted one stays as overlay-only content — the open
+    /// buffer survives until `didClose`, which re-syncs the disk state
+    /// (staging the removal when the file never came back). Agent overlays
+    /// need no guard here: their views materialize at wear time over
+    /// whatever the base holds, so agent content wins its own view while
+    /// the base keeps tracking the disk.
+    ///
+    /// Watch files are not LSP-opened, so their publishes carry no version.
+    /// Per-path independence: an unreadable file is logged and skipped —
+    /// watch events are hints, and the analysis's content check stays the
+    /// truth (§16.7).
     pub fn queue_disk_changes(&mut self, paths: &[PathBuf]) {
         let mut synced = false;
         for path in paths {
+            if self.opened.contains_key(path) {
+                continue;
+            }
             match fs::read(path) {
                 Ok(bytes) => {
                     self.stage(OverlayChange::Set {
@@ -1590,7 +1608,7 @@ mod tests {
             .as_array()
             .expect("diagnostics array");
         assert!(
-            entries.iter().all(|entry| !entry["file"]
+            entries.iter().all(|entry| !entry["uri"]
                 .as_str()
                 .is_some_and(|file| file.ends_with("main.dart"))),
             "the deleted file has no diagnostics: {entries:?}"
@@ -1613,6 +1631,202 @@ mod tests {
             turn.publishes
         );
         assert_eq!(turn.answers.len(), 1, "only the request ran");
+    }
+
+    /// Re-discovery, additions: a file created after `initialized` and
+    /// synced through [`Session::queue_disk_changes`] enters the analysis —
+    /// the sync stages the same set the sweep's discovery takes, so the new
+    /// file's own diagnostics surface (publish and analyze entries). The
+    /// disk view is not frozen at the sweep.
+    #[test]
+    fn watch_sync_brings_new_files_into_analysis() {
+        let (workspace, mut session) = fixture("watch-new-file-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        let extra = workspace.path("lib/extra.dart");
+        fs::write(&extra, "import 'also_missing.dart';\nvoid main() {}\n").expect("create");
+        session.queue_disk_changes(&[extra.clone()]);
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "only the new file pushes: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].uri, uri::from_path(&extra));
+        assert!(
+            !turn.publishes[0].diagnostics.is_empty(),
+            "the new file was analyzed, not merely interned"
+        );
+
+        // The file is resident: a fresh analyze answers its rows too.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics array");
+        assert!(
+            entries.iter().any(|entry| entry["uri"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("extra.dart"))),
+            "the new file's rows are in the merged view: {entries:?}"
+        );
+    }
+
+    /// Re-discovery under a wholesale change (the git branch-switch shape):
+    /// two files swap contents between two ticks, and one sync batch
+    /// re-analyzes both — each file's published set is its new content's,
+    /// never the swept stale one.
+    #[test]
+    fn watch_sync_reanalyzes_a_branch_switch_swap() {
+        let (workspace, mut session) = fixture_with("watch-swap-unit", CLEAN_MAIN);
+        let main = workspace.path("lib/main.dart");
+        let other = workspace.path("lib/other.dart");
+        fs::write(&other, BROKEN_MAIN).expect("seed other");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "only the seeded error pushes: {:?}",
+            turn.publishes
+        );
+
+        // The swap: both contents move in one event burst (the watcher's
+        // debounce delivers both paths in one batch).
+        fs::write(&main, BROKEN_MAIN).expect("main takes the broken content");
+        fs::write(&other, CLEAN_MAIN).expect("other takes the clean content");
+        session.queue_disk_changes(&[main.clone(), other.clone()]);
+        let turn = session.service();
+
+        assert_eq!(
+            turn.publishes.len(),
+            2,
+            "both files re-analyzed: {:?}",
+            turn.publishes
+        );
+        let by_uri = |path: &PathBuf| {
+            let uri = uri::from_path(path);
+            turn.publishes
+                .iter()
+                .find(|push| push.uri == uri)
+                .unwrap_or_else(|| panic!("no push for {uri}"))
+        };
+        assert_eq!(
+            by_uri(&main).diagnostics.len(),
+            1,
+            "main now carries the broken content's rows"
+        );
+        assert!(
+            by_uri(&other).diagnostics.is_empty(),
+            "other is clean now"
+        );
+    }
+
+    /// Overlay precedence (the rule [`Session::queue_disk_changes`]
+    /// documents): a client-opened document owns its content until
+    /// `didClose` — a disk rewrite under it never reaches the analysis —
+    /// and an agent overlay masks the base regardless of disk traffic (the
+    /// base keeps tracking the disk; the agent's view stays its own).
+    #[test]
+    fn watch_sync_never_clobbers_overlay_content() {
+        let (workspace, mut session) = fixture("watch-overlay-precedence-unit");
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // A client-opened document: the disk rewrite under the open buffer
+        // is skipped entirely — no clobber push, and the base still holds
+        // the client's text.
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 1));
+        let _ = session.service();
+        fs::write(&main, BROKEN_MAIN).expect("disk rewrite under the open buffer");
+        session.queue_disk_changes(&[main.clone()]);
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the disk rewrite did not clobber the open document: {:?}",
+            turn.publishes
+        );
+        assert!(
+            answer_codes(&turn.answers[0].1).is_empty(),
+            "the base view still holds the client's text: {:?}",
+            turn.answers[0]
+        );
+
+        // didClose re-syncs the disk state: the rewrite shows up now (a
+        // write-only turn — the answers list is empty, the push is the
+        // evidence).
+        session.queue_close(&uri).expect("close");
+        let turn = session.service();
+        assert!(turn.answers.is_empty(), "no requests rode the close");
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the close surfaces the disk state: {:?}",
+            turn.publishes
+        );
+        assert_eq!(
+            turn.publishes[0].diagnostics[0].code,
+            "uri_does_not_exist",
+            "close staged the on-disk bytes: {:?}",
+            turn.publishes[0]
+        );
+
+        // An agent overlay: the base tracks the disk through the sync (the
+        // path is not client-opened), while the agent's view keeps its own
+        // content — disk traffic never leaks into it.
+        session
+            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage A");
+        fs::write(&main, SYNTAX_BROKEN).expect("another disk rewrite");
+        session.queue_disk_changes(&[main.clone()]);
+        let (id_a, a) = check_request(3, &[workspace.path("lib")], Some("A"), None);
+        session.queue_command(id_a, a);
+        session.queue_command(
+            RequestId::Num(4),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+            },
+        );
+        let turn = session.service();
+        let by_id = |wanted: i64| {
+            &turn
+                .answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .expect("answer present")
+                .1
+        };
+        assert!(
+            answer_codes(by_id(4)).iter().any(|code| code == "expected_token"),
+            "the base view tracks the disk through the sync: {:?}",
+            by_id(4)
+        );
+        assert!(
+            answer_codes(by_id(3)).is_empty(),
+            "agent A's view is untouched by the disk traffic: {:?}",
+            by_id(3)
+        );
     }
 
     /// The read task converts each diagnostic exactly once (#347): the
