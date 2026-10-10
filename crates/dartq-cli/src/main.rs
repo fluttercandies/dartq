@@ -1,7 +1,8 @@
 //! dartq CLI — `dartq check` (the M0 differential face), `dartq analyze`
 //! (the M1 engine face), the `dartq query` index faces (`symbol` /
-//! `references` / `callers`, PRD §20.3 + §15.2), `dartq index` (the
-//! §15.1 index build), and `dartq version`.
+//! `references` / `callers`, PRD §20.3 + §15.2), `dartq explain` (the
+//! §15.3 one-stop AI report), `dartq index` (the §15.1 index build), and
+//! `dartq version`.
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
 //! the daemon RPC faces share, PRD §15.1); this binary adds only argument
@@ -43,6 +44,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::discover::{DiscoverError, discover};
+use dartq_commands::explain::ExplainError;
 use dartq_commands::layout::EngineLayout;
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{engine_config, open_engine};
@@ -102,6 +104,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Index(index_args)),
         }) => index::run_entry(&index_args),
+        Ok(Cli {
+            command: Some(Command::Explain(explain_args)),
+        }) => explain_entry(&explain_args),
         // Bare `dartq` and `dartq version` land here; `--version` short-
         // circuits in `try_parse_from` as a DisplayVersion error (routed to
         // stdout + exit 0 by the arm below).
@@ -140,6 +145,9 @@ enum Command {
     /// Serve the LSP daemon over stdin/stdout (one client; overlay + full
     /// diagnostics, PRD §16.3).
     Daemon(DaemonArgs),
+    /// Assemble the §15.3 one-stop AI report for one symbol over the
+    /// analyzed workspace.
+    Explain(ExplainArgs),
     /// Emit or apply anchored fix patches (PRD §15.6); `--dry-run` only
     /// outputs them.
     Fix(fix::FixArgs),
@@ -229,6 +237,55 @@ struct DaemonArgs {
     /// verification stay the truth.
     #[arg(long)]
     watch: bool,
+}
+
+#[derive(Args)]
+struct ExplainArgs {
+    /// The symbol name to explain.
+    symbol: String,
+    /// Package directory holding pubspec.yaml and
+    /// `.dart_tool/package_config.json`; defaults to the current directory.
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    #[arg(long, value_enum, default_value_t = ExplainFormat::Json)]
+    format: ExplainFormat,
+    /// Dart SDK root; defaults to $DART_SDK.
+    #[arg(long)]
+    sdk: Option<PathBuf>,
+    /// Report detail tier (the schema's verbosity table; `compact` by
+    /// default, `minimal` swaps the section arrays for `counts`).
+    #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
+    verbosity: Verbosity,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExplainFormat {
+    /// Single-line JSON report — the §15.3 contract's only format (the
+    /// report is schema-valid at birth; this flag spells it).
+    Json,
+}
+
+/// The report detail tier (dartq-commands [`Verbosity`]'s spelling for the
+/// CLI; the canonical semantics live in dartq-schema's crate docs).
+#[derive(Clone, Copy, ValueEnum)]
+enum Verbosity {
+    /// Red-line fields only: the symbol plus the declaration locators, the
+    /// section arrays swapped for `counts`.
+    Minimal,
+    /// Every section as an array, empty sections included (the default).
+    Compact,
+    /// Compact (the canonical tables list no explain-only extras).
+    Full,
+}
+
+impl Verbosity {
+    fn into_commands(self) -> dartq_commands::Verbosity {
+        match self {
+            Self::Minimal => dartq_commands::Verbosity::Minimal,
+            Self::Compact => dartq_commands::Verbosity::Compact,
+            Self::Full => dartq_commands::Verbosity::Full,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -885,6 +942,67 @@ fn write_query_machine(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// dartq explain — the §15.3 AI report face
+// ---------------------------------------------------------------------------
+
+/// `dartq explain` — crash tier like the other engine faces: a panic aborts
+/// with exit 4 and stdout kept empty, because [`explain_run`] writes only
+/// after the report fully succeeded.
+fn explain_entry(args: &ExplainArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        explain_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One explain run: the workspace assembly, the collector-installed engine,
+/// and the report assembly all live in `dartq_commands::explain` (the one
+/// implementation the daemon's `dartq/explain` shares); this shell adds the
+/// crash tier, the tier mapping, and the JSON output. The report is
+/// schema-valid at birth (validated against `Domain::Explain` where it is
+/// built); an unknown symbol is the report's own empty seam report, not an
+/// error — printed as-is, exit 0. Exit tiers: workspace/engine assembly is
+/// the usage tier, discovery/cancellation the internal tier.
+fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
+    let report = match dartq_commands::explain::explain(
+        &args.dir,
+        args.sdk.as_deref(),
+        &args.symbol,
+        args.verbosity.into_commands(),
+    ) {
+        Ok(report) => report,
+        Err(error @ (ExplainError::Workspace(_) | ExplainError::Engine(_))) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+
+    let written = out
+        .write_all(
+            serde_json::to_string(&report)
+                .expect("the validated report serializes")
+                .as_bytes(),
+        )
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    if let Err(error) = written {
+        eprintln!("dartq: internal error: writing the explain report failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
 /// One JSON object at exit (engine-api-spec §3, benchmark-harness-spec §2.4).
 /// A failed write is an internal error (4) at the call site, never silent —
 /// a run without its metrics file would corrupt benchmark data.
@@ -993,6 +1111,8 @@ mod tests {
             &["query", "references"][..],
             &["query", "callers"][..],
             &["query", "bogus"][..],
+            &["explain"][..],
+            &["explain", "--format=machine", "Dog"][..],
         ] {
             assert!(parse_args_of(args).is_err(), "must reject {args:?}");
         }
@@ -1849,6 +1969,189 @@ mod tests {
         // Usage tier: missing directory.
         let missing = symbol_args(&root.join("nope"), QueryFormat::Machine, "Foo");
         assert_eq!(query_callers_run(&missing, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // dartq explain
+    // -----------------------------------------------------------------------
+
+    /// The explain command face: symbol positional, default dir, flag
+    /// spellings (`-v`/`--verbosity`, `--format=json`). Malformed spellings
+    /// are covered by `usage_errors`.
+    #[test]
+    fn explain_args_parse() {
+        let parsed = parse_args_of(&["explain", "Dog"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert_eq!(args.symbol, "Dog");
+        assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
+        assert!(args.sdk.is_none());
+        assert!(matches!(args.format, ExplainFormat::Json), "json default");
+        assert!(matches!(args.verbosity, Verbosity::Compact), "compact default");
+
+        let parsed = parse_args_of(&[
+            "explain",
+            "--format=json",
+            "--sdk",
+            "/sdk",
+            "-v",
+            "full",
+            "Dog",
+            "/pkg",
+        ])
+        .expect("parse")
+        .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert_eq!(args.symbol, "Dog");
+        assert_eq!(args.dir, PathBuf::from("/pkg"));
+        assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
+        assert!(matches!(args.verbosity, Verbosity::Full), "-v full parses");
+        assert!(matches!(args.format, ExplainFormat::Json));
+
+        let parsed = parse_args_of(&["explain", "--verbosity", "minimal", "Dog"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert!(matches!(args.verbosity, Verbosity::Minimal));
+    }
+
+    /// The explain fixture: one import chain plus its test — the same shape
+    /// the dartq-commands explain tests pin, over the analyze faces' pub
+    /// workspace + stub SDK.
+    const EXPLAIN_ANIMAL: &str = "class Animal {\n  void breathe() {}\n}\n";
+    const EXPLAIN_DOG: &str =
+        "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n";
+    const EXPLAIN_MAIN: &str =
+        "import 'dog.dart';\nvoid main() {\n  var d = Dog();\n  d.bark();\n}\n";
+    const EXPLAIN_TEST: &str =
+        "import 'package:fixture/dog.dart';\nvoid main() {\n  var d = Dog();\n}\n";
+
+    /// The name token's start offset in `source` (ASCII sources, so byte
+    /// offset = UTF-16 offset).
+    fn explain_offset(source: &str, needle: &str) -> u32 {
+        source.find(needle).unwrap_or_else(|| panic!("{needle} in source")) as u32
+    }
+
+    fn explain_args(root: &Path, verbosity: Verbosity, symbol: &str) -> ExplainArgs {
+        ExplainArgs {
+            symbol: symbol.to_owned(),
+            dir: root.to_path_buf(),
+            format: ExplainFormat::Json,
+            sdk: Some(root.join("sdk")),
+            verbosity,
+        }
+    }
+
+    /// End to end over a real temp workspace: the compact report carries
+    /// every section the substrate reaches (the validated-at-birth JSON the
+    /// daemon face mirrors field for field), `minimal` swaps the arrays for
+    /// `counts`, an unknown symbol prints the seam report at exit 0, and a
+    /// missing directory is the usage tier.
+    #[test]
+    fn explain_end_to_end_pins_the_validated_report() {
+        let root = analyze_fixture(
+            "explain",
+            &[
+                ("lib/animal.dart", EXPLAIN_ANIMAL),
+                ("lib/dog.dart", EXPLAIN_DOG),
+                ("lib/main.dart", EXPLAIN_MAIN),
+                ("test/dog_test.dart", EXPLAIN_TEST),
+            ],
+        );
+        let canonical = root.canonicalize().expect("root");
+        let animal = canonical.join("lib/animal.dart").display().to_string();
+        let dog = canonical.join("lib/dog.dart").display().to_string();
+        let main = canonical.join("lib/main.dart").display().to_string();
+        let dog_test = canonical.join("test/dog_test.dart").display().to_string();
+
+        // Compact: the full section set.
+        let mut out: Vec<u8> = Vec::new();
+        let code = explain_run(
+            &explain_args(&root, Verbosity::Compact, "Dog"),
+            &mut out,
+        );
+        assert_eq!(code, exit::CLEAN);
+        let line = String::from_utf8(out).expect("UTF-8");
+        assert!(line.ends_with('\n') && line.lines().count() == 1, "one JSON line");
+        let json: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("the report parses");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["symbol"], "Dog");
+        assert_eq!(
+            json["declaration"],
+            serde_json::json!({
+                "file": dog,
+                "name": "Dog",
+                "kind": "class",
+                "range": [
+                    explain_offset(EXPLAIN_DOG, "Dog"),
+                    explain_offset(EXPLAIN_DOG, "Dog") + 3,
+                ],
+            })
+        );
+        assert_eq!(
+            json["inheritance"],
+            serde_json::json!([{ "name": "Animal", "file": animal }])
+        );
+        assert_eq!(
+            json["methods"],
+            serde_json::json!([{
+                "name": "bark",
+                "kind": "method",
+                "range": [
+                    explain_offset(EXPLAIN_DOG, "bark"),
+                    explain_offset(EXPLAIN_DOG, "bark") + 4,
+                ],
+            }])
+        );
+        let references = json["references"].as_array().expect("references");
+        assert_eq!(references.len(), 2, "the main use plus the test use");
+        assert_eq!(references[0]["file"], main);
+        assert_eq!(references[0]["kind"], "invoked");
+        assert_eq!(references[1]["file"], dog_test);
+        assert_eq!(
+            json["dependencies"],
+            serde_json::json!([{ "path": main }, { "path": dog_test }])
+        );
+        assert_eq!(json["affected_tests"], serde_json::json!([{ "path": dog_test }]));
+
+        // Minimal: the declaration locators stay, the arrays swap for counts.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            explain_run(&explain_args(&root, Verbosity::Minimal, "Dog"), &mut out),
+            exit::CLEAN
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert_eq!(json["declaration"]["name"], "Dog", "the red line stays");
+        assert!(json.get("references").is_none(), "arrays drop");
+        assert_eq!(json["counts"]["references"], 2);
+        assert_eq!(json["counts"]["affected_tests"], 1);
+
+        // Unknown symbol: the empty seam report, printed as-is at exit 0.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            explain_run(&explain_args(&root, Verbosity::Compact, "Nope"), &mut out),
+            exit::CLEAN
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert_eq!(json["symbol"], "Nope");
+        assert!(json.get("declaration").is_none());
+        assert_eq!(json["references"], serde_json::json!([]));
+
+        // Usage tier: a missing directory.
+        let missing = explain_args(&root.join("nope"), Verbosity::Compact, "Dog");
+        assert_eq!(explain_run(&missing, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
     }

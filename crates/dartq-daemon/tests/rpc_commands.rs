@@ -288,6 +288,204 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
+/// The seeded workspace of the explain face: the dog import chain plus its
+/// package-URI test — clean under the stub SDK, so the sweep publishes
+/// nothing.
+fn seeded_explain_workspace() -> Workspace {
+    let workspace = Workspace::new(CLEAN_MAIN);
+    fs::write(
+        workspace.path("lib/animal.dart"),
+        "class Animal {\n  void breathe() {}\n}\n",
+    )
+    .expect("write animal.dart");
+    fs::write(
+        workspace.path("lib/dog.dart"),
+        "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n",
+    )
+    .expect("write dog.dart");
+    fs::write(workspace.path("lib/main.dart"), "import 'dog.dart';\nvoid main() {\n  var d = Dog();\n  d.bark();\n}\n")
+        .expect("write main.dart");
+    fs::create_dir_all(workspace.path("test")).expect("test dir");
+    fs::write(
+        workspace.path("test/dog_test.dart"),
+        "import 'package:fixture/dog.dart';\nvoid main() {\n  var d = Dog();\n}\n",
+    )
+    .expect("write dog_test.dart");
+    workspace
+}
+
+/// dartq/explain: the §15.3 report over the fixture symbol, section for
+/// section (the same content the CLI's report pins — the faces share one
+/// implementation), the `since` delta filtering the use/import/test rows
+/// while the declaration-site sections stay, and the minimal tier's
+/// `counts` swap. An `agentId` is rejected: the face answers the disk view
+/// (the `dartq/compat` posture — the report's harvest rides the semantic
+/// fan-out, which the session engine runs over recomputed libraries only).
+#[test]
+fn dartq_explain_answers_the_report() {
+    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let workspace = seeded_explain_workspace();
+    let animal = workspace.path("lib/animal.dart");
+    let dog = workspace.path("lib/dog.dart");
+    let main = workspace.path("lib/main.dart");
+    let dog_test = workspace.path("test/dog_test.dart");
+    let dog_source = "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n";
+    let dog_at = dog_source.find("Dog").expect("Dog in source") as u64;
+    let bark_at = dog_source.find("bark").expect("bark in source") as u64;
+    let mut h = spawn(&workspace, &store_root("rpc-explain"));
+    handshake(&mut h, 0);
+
+    h.step(
+        &request(
+            2,
+            "dartq/explain",
+            json!({ "symbol": "Dog", "sdk": workspace.path("sdk") }),
+        ),
+        0,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["symbol"], "Dog");
+    assert_eq!(
+        result["declaration"],
+        json!({
+            "file": dog.display().to_string(),
+            "name": "Dog",
+            "kind": "class",
+            "range": [dog_at, dog_at + 3],
+        })
+    );
+    assert_eq!(
+        result["inheritance"],
+        json!([{ "name": "Animal", "file": animal.display().to_string() }])
+    );
+    assert_eq!(
+        result["methods"],
+        json!([{ "name": "bark", "kind": "method", "range": [bark_at, bark_at + 4] }])
+    );
+    let references = result["references"].as_array().expect("references");
+    assert_eq!(references.len(), 2, "the main use plus the test use");
+    assert_eq!(references[0]["file"], main.display().to_string());
+    assert_eq!(references[0]["kind"], "invoked");
+    assert_eq!(references[1]["file"], dog_test.display().to_string());
+    assert_eq!(
+        result["dependencies"],
+        json!([
+            { "path": main.display().to_string() },
+            { "path": dog_test.display().to_string() },
+        ])
+    );
+    assert_eq!(
+        result["affected_tests"],
+        json!([{ "path": dog_test.display().to_string() }])
+    );
+
+    // Delta mode: nothing was written through this session, so the
+    // use/import/test rows all filter out while the declaration-site
+    // sections stay, and the answer echoes the current cursor.
+    h.step(
+        &request(
+            3,
+            "dartq/explain",
+            json!({ "symbol": "Dog", "sdk": workspace.path("sdk"), "since": 0 }),
+        ),
+        0,
+    );
+    let result = answer_result(&h, 3);
+    assert_eq!(result["since"], 0, "the cursor echoes");
+    assert_eq!(
+        result["declaration"]["name"],
+        "Dog",
+        "the red line stays in delta answers"
+    );
+    assert_eq!(result["inheritance"].as_array().expect("array").len(), 1);
+    assert!(
+        result["references"].as_array().expect("array").is_empty()
+            && result["dependencies"].as_array().expect("array").is_empty()
+            && result["affected_tests"].as_array().expect("array").is_empty(),
+        "no file changed since the cursor: {result}"
+    );
+
+    // The minimal tier: declaration locators plus the counts object.
+    h.step(
+        &request(
+            4,
+            "dartq/explain",
+            json!({
+                "symbol": "Dog",
+                "sdk": workspace.path("sdk"),
+                "verbosity": "minimal",
+            }),
+        ),
+        0,
+    );
+    let result = answer_result(&h, 4);
+    assert_eq!(result["declaration"]["name"], "Dog", "the red line stays");
+    assert!(result.get("references").is_none(), "arrays drop");
+    assert_eq!(result["counts"]["references"], 2);
+    assert_eq!(result["counts"]["affected_tests"], 1);
+
+    // The view selector is rejected loudly, never answered as the disk view.
+    h.step(
+        &request(
+            5,
+            "dartq/explain",
+            json!({ "symbol": "Dog", "agentId": "A" }),
+        ),
+        0,
+    );
+    let error = answer_error(&h, 5);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("agentId"),
+        "the rejection names the field: {error}"
+    );
+
+    // The overlay-session suite's green lifecycle: shutdown answers, then
+    // exit is the clean end (a bare `exit` is EXIT_WITHOUT_SHUTDOWN).
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// dartq/explain intake validation: a missing or empty `symbol` answers
+/// `INVALID_PARAMS` and the session stays healthy.
+#[test]
+fn dartq_explain_rejects_a_bad_symbol() {
+    let _guard = WORKSPACE.lock().expect("workspace lock");
+    let workspace = seeded_explain_workspace();
+    let mut h = spawn(&workspace, &store_root("rpc-explain-usage"));
+    handshake(&mut h, 0);
+
+    for (id, params) in [
+        (2, json!({ "symbol": "" })),
+        (3, json!({})),
+        (4, json!({ "symbol": 7 })),
+    ] {
+        h.step(&request(id, "dartq/explain", params), 0);
+        let error = answer_error(&h, id);
+        assert_eq!(error["code"], -32602, "INVALID_PARAMS for id {id}: {error}");
+    }
+
+    // The session is unharmed: the next request answers normally.
+    h.step(
+        &request(
+            5,
+            "dartq/explain",
+            json!({ "symbol": "Dog", "sdk": workspace.path("sdk") }),
+        ),
+        0,
+    );
+    assert_eq!(answer_result(&h, 5)["symbol"], "Dog");
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
 /// dartq/compat vs the CLI matrix: per-SDK verdict rows in axis order,
 /// incompatible axes as data under a clean exit — the CLI compat test's
 /// fixture shape driven over RPC.

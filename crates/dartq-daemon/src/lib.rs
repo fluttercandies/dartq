@@ -34,15 +34,15 @@
 //!   `RequestCancelled` (-32800) with no result.
 //! * The `dartq/*` command family (PRD §15.1 — the RPC faces 1:1 with the
 //!   CLI commands): `dartq/analyze` (the merged diagnostic set, LSP URIs),
-//!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/fix`, and
-//!   `dartq/compat` (CLI-mirror faces with canonical path labels), plus the
-//!   per-agent overlay faces `dartq/overlay.set` and `dartq/overlay.clear`
-//!   (PRD §16.3). All are announced under `capabilities.experimental`; all
-//!   answers carry `schema_version` and honor an optional `verbosity` (the
-//!   canonical tiers in dartq-schema's crate docs); the engine-view faces
-//!   additionally accept `agentId` (the analyzed overlay view) and `since`
-//!   (delta mode), with the per-face visibility contract documented in the
-//!   `commands` module.
+//!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/explain`,
+//!   `dartq/fix`, and `dartq/compat` (CLI-mirror faces with canonical path
+//!   labels), plus the per-agent overlay faces `dartq/overlay.set` and
+//!   `dartq/overlay.clear` (PRD §16.3). All are announced under
+//!   `capabilities.experimental`; all answers carry `schema_version` and
+//!   honor an optional `verbosity` (the canonical tiers in dartq-schema's
+//!   crate docs); the engine-view faces additionally accept `agentId` (the
+//!   analyzed overlay view) and `since` (delta mode), with the per-face
+//!   visibility contract documented in the `commands` module.
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
 //!   notifications are ignored (both per LSP).
 //!

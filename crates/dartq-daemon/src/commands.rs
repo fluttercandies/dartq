@@ -37,6 +37,16 @@
 //! | `dartq/compat`  | disk, always — it rebuilds one engine per axis   |
 //! |                 | over the on-disk base (`agentId`/`since`         |
 //! |                 | rejected)                                        |
+//! | `dartq/explain` | disk, always — it rebuilds one engine over the   |
+//! |                 | on-disk base per query (the `dartq/compat`       |
+//! |                 | posture: the report's harvest rides the semantic |
+//! |                 | fan-out, which the session engine runs over the  |
+//! |                 | recomputed libraries only, so a warm session     |
+//! |                 | answer would silently miss declarations).        |
+//! |                 | `agentId` is rejected; `since` applies as delta  |
+//! |                 | economics — it filters the report's              |
+//! |                 | use/import/test rows by the session's            |
+//! |                 | written-file cursors, it does not select a view  |
 //!
 //! # Session economics (PRD §15.8)
 //!
@@ -58,16 +68,22 @@
 //!   (dartq-schema's validator) to `label|name` symbol references — a
 //!   different value domain than the file paths these rows repeat — so
 //!   emission there waits for the schema/index lanes' symbol-path rows; the
-//!   field stays absent-tolerant until then.
+//!   field stays absent-tolerant until then. Full-tier `dartq/explain`
+//!   substitutes its path-valued report rows the same way: the §15.3 schema
+//!   declares `symbols` as the id → path table, absent-tolerant, so the
+//!   economics apply verbatim (compact explains stay byte-identical to the
+//!   CLI's report).
 //!
 //! # Path labels
 //!
-//! The CLI-mirror faces (`check`, `query`, `impact`, `fix`, `compat`) keep
-//! the CLI's canonical path labels; the LSP-native `dartq/analyze` keeps
-//! document URIs. Relative request paths resolve against the session's
-//! workspace root (the CLI resolves them against the process cwd). The
-//! CLI's `$DART_SDK` fallback has no daemon equivalent: `dartq/compat`
-//! requires explicit `sdk_roots`.
+//! The CLI-mirror faces (`check`, `query`, `impact`, `explain`, `fix`,
+//! `compat`) keep the CLI's canonical path labels; the LSP-native
+//! `dartq/analyze` keeps document URIs. Relative request paths resolve
+//! against the session's workspace root (the CLI resolves them against the
+//! process cwd). The CLI's `$DART_SDK` fallback has no daemon equivalent:
+//! `dartq/compat` requires explicit `sdk_roots`, and `dartq/explain` takes
+//! an optional `sdk` root per query (absent falls back to `$DART_SDK`, the
+//! CLI's default).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -75,6 +91,7 @@ use std::path::{Path, PathBuf};
 use dartq_commands::analyze::AnalyzeError;
 use dartq_commands::compat::CompatError;
 use dartq_commands::discover::{self, DiscoverError};
+use dartq_commands::explain::{ExplainError, explain as explain_core};
 use dartq_commands::fix::{FileFixes, SCHEMA_VERSION as FIX_SCHEMA_VERSION};
 use dartq_commands::layout::EngineLayout;
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
@@ -96,13 +113,14 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// in `initialize`'s answer. The two `dartq/overlay.*` faces answer at
 /// intake (the server intercepts them before the scheduler queue); the rest
 /// ride the session's read task.
-pub(crate) const METHODS: [&str; 8] = [
+pub(crate) const METHODS: [&str; 9] = [
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
     "dartq/impact",
     "dartq/fix",
     "dartq/compat",
+    "dartq/explain",
     "dartq/overlay.set",
     "dartq/overlay.clear",
 ];
@@ -133,6 +151,15 @@ pub(crate) enum Request {
         agent: Option<String>,
         since: Option<u64>,
     },
+    /// The §15.3 report over a per-query disk engine (the visibility
+    /// table's `dartq/explain` row): no `agent` field by construction, and
+    /// `sdk` because the daemon retains no SDK root.
+    Explain {
+        symbol: String,
+        verbosity: Verbosity,
+        since: Option<u64>,
+        sdk: Option<PathBuf>,
+    },
     Fix {
         paths: Vec<PathBuf>,
         verbosity: Verbosity,
@@ -154,7 +181,7 @@ impl Request {
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
-            Self::Fix { .. } | Self::Compat { .. } => None,
+            Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
     }
 }
@@ -195,6 +222,15 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         path: PathBuf,
         #[serde(default)]
         verbosity: Verbosity,
+    }
+    #[derive(Deserialize)]
+    struct ExplainParams {
+        symbol: String,
+        #[serde(default)]
+        verbosity: Verbosity,
+        /// The per-query SDK root; the daemon retains none (the CLI's
+        /// `$DART_SDK` fallback applies when absent).
+        sdk: Option<PathBuf>,
     }
     #[derive(Deserialize)]
     struct CompatParams {
@@ -260,6 +296,31 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 verbosity: decoded.verbosity,
                 agent,
                 since,
+            })
+        }
+        "dartq/explain" => {
+            // Delta economics without a view selector: `since` filters the
+            // report's rows (see `explain_answer`), but an `agentId` would
+            // silently answer a different view than the face's disk
+            // contract — the fix/compat rule, minus `since`.
+            let (agent, since) = session_fields(params)?;
+            if agent.is_some() {
+                return Err(
+                    "dartq/explain answers the disk view; agentId applies to the engine-view \
+                     faces (analyze/check/query/impact)"
+                        .into(),
+                );
+            }
+            let decoded =
+                serde_json::from_value::<ExplainParams>(params.clone()).map_err(invalid)?;
+            if decoded.symbol.is_empty() {
+                return Err("symbol must be a non-empty string".into());
+            }
+            Ok(Request::Explain {
+                symbol: decoded.symbol,
+                verbosity: decoded.verbosity,
+                since,
+                sdk: decoded.sdk,
             })
         }
         "dartq/compat" => {
@@ -583,6 +644,12 @@ pub(crate) fn answer(drain: &mut Drain<'_>, request: &Request) -> Result<Value, 
             since,
             ..
         } => impact_answer(drain, target, *verbosity, *since),
+        Request::Explain {
+            symbol,
+            verbosity,
+            since,
+            sdk,
+        } => explain_answer(drain, symbol, *verbosity, *since, sdk.as_deref()),
         Request::Fix { paths, verbosity } => fix_answer(paths, *verbosity),
         Request::Compat {
             target,
@@ -888,6 +955,70 @@ fn impact_answer(
         value["since"] = json!(drain.cursor);
     }
     Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// dartq/explain — the §15.3 AI report (disk view, the compat posture)
+// ---------------------------------------------------------------------------
+
+/// The explain report's path-valued array fields (the short-id economics'
+/// substitution spots; full tier only). `declaration.file` names one file —
+/// a single occurrence never pays its preamble, so it stays spelled out.
+const EXPLAIN_SPOTS: &[(&str, &str)] = &[
+    ("inheritance", "file"),
+    ("references", "file"),
+    ("dependencies", "path"),
+    ("affected_tests", "path"),
+];
+
+/// The report for `symbol` over a per-query engine rebuilt on the on-disk
+/// base (the visibility table's `dartq/explain` row): the harvest the
+/// assembler joins rides the semantic fan-out, which a warm session engine
+/// runs over the recomputed libraries only — a session-engine answer would
+/// silently miss declarations on every no-op analysis. Tier semantics are
+/// the schema's (minimal keeps the declaration locators and swaps the
+/// arrays for `counts`; full adds the short-id economics); a delta answer
+/// filters the sections that name use/import/test files by the session's
+/// written-file cursors and echoes the current cursor. The report is born
+/// schema-valid (validated against `Domain::Explain` where it is built).
+///
+/// # Errors
+///
+/// Workspace or SDK assembly failure is the usage tier (`InvalidParams`);
+/// discovery failure or cancellation the internal tier.
+fn explain_answer(
+    drain: &mut Drain<'_>,
+    symbol: &str,
+    verbosity: Verbosity,
+    since: Option<u64>,
+    sdk: Option<&Path>,
+) -> Result<Value, SessionError> {
+    let mut report = explain_core(drain.root, sdk, symbol, verbosity).map_err(|error| match error {
+        ExplainError::Workspace(_) | ExplainError::Engine(_) => {
+            SessionError::InvalidParams(error.to_string())
+        }
+        ExplainError::Analyze(_) => SessionError::Internal(error.to_string()),
+    })?;
+    if let Some(since) = since {
+        // Delta mode (the impact face's mapping over the report's own
+        // sections): a use/import/test row stays when its file changed in
+        // this session after the cursor. The declaration-site sections
+        // (`declaration`, `inheritance`, `interfaces`, `constructors`,
+        // `methods`) describe the symbol itself and stay — the red line
+        // never drops.
+        let changed = |path: &str| drain.changes.changed_since(Path::new(path), since);
+        for section in ["references", "dependencies", "affected_tests"] {
+            if let Some(rows) = report.get_mut(section).and_then(Value::as_array_mut) {
+                rows.retain(|row| {
+                    row["file"]
+                        .as_str()
+                        .or_else(|| row["path"].as_str())
+                        .is_none_or(changed)
+                });
+            }
+        }
+    }
+    Ok(session_answer(report, verbosity, since, drain, EXPLAIN_SPOTS))
 }
 
 // ---------------------------------------------------------------------------
