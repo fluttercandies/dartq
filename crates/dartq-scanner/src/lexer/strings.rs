@@ -103,8 +103,8 @@ impl Lexer<'_> {
                         // propagated out through one body per level. Then
                         // report Eof so `run` closes the still-open SII
                         // groups (synthetic `}` innermost first).
-                        while let Some(f) = suspended.pop() {
-                            self.unterminated(f.quote, f.raw, f.triple);
+                        while suspended.pop().is_some() {
+                            self.unterminated();
                         }
                         return Flow::Eof;
                     }
@@ -156,7 +156,7 @@ impl Lexer<'_> {
     fn scan_single_line(&mut self, f: &mut StringFrame) -> StringBody {
         loop {
             let Some(c) = self.peek() else {
-                self.unterminated(f.quote, false, false);
+                self.unterminated();
                 return StringBody::Done;
             };
             match c {
@@ -167,7 +167,16 @@ impl Lexer<'_> {
                 }
                 '\\' => {
                     self.bump();
-                    self.bump(); // the escaped character (EOF reports unterminated on the next iteration)
+                    // The escaped character is checked for LF/CR after the
+                    // backslash advance (official abstract_scanner.dart
+                    // tokenizeSingleLineString): an escaped newline still
+                    // terminates the string. EOF reports unterminated on the
+                    // next iteration.
+                    if matches!(self.peek(), Some('\n' | '\r')) {
+                        self.unterminated();
+                        return StringBody::Done;
+                    }
+                    self.bump();
                 }
                 '$' => {
                     if self.scan_dollar(f) {
@@ -175,7 +184,7 @@ impl Lexer<'_> {
                     }
                 }
                 '\n' | '\r' => {
-                    self.unterminated(f.quote, false, false);
+                    self.unterminated();
                     return StringBody::Done;
                 }
                 _ => {
@@ -191,7 +200,7 @@ impl Lexer<'_> {
         loop {
             match self.peek() {
                 None | Some('\n' | '\r') => {
-                    self.unterminated(f.quote, true, false);
+                    self.unterminated();
                     return StringBody::Done;
                 }
                 Some(c) if c == f.quote => {
@@ -211,7 +220,7 @@ impl Lexer<'_> {
     fn scan_multiline(&mut self, f: &mut StringFrame) -> StringBody {
         loop {
             let Some(c) = self.peek() else {
-                self.unterminated(f.quote, f.raw, true);
+                self.unterminated();
                 return StringBody::Done;
             };
             if !f.raw && c == '$' {
@@ -236,7 +245,7 @@ impl Lexer<'_> {
             if !f.raw && c == '\\' {
                 self.bump();
                 if self.peek().is_none() {
-                    self.unterminated(f.quote, f.raw, true);
+                    self.unterminated();
                     return StringBody::Done;
                 }
                 self.bump();
@@ -328,27 +337,14 @@ impl Lexer<'_> {
     /// Unterminated string: a synthetic empty STRING segment (pinned where
     /// scanning stopped) + diagnostic (pinned to the last UTF-16 unit:
     /// official `UnterminatedString` + analyzer-side `endOffset-1`, `length 1`).
-    fn unterminated(&mut self, quote: char, raw: bool, multiline: bool) {
+    /// The registry-true message carries no opener/close placeholder.
+    fn unterminated(&mut self) {
         let stop = self.pos;
         self.emit_synthetic(TokenKind::String, stop, 0);
-        let close = if multiline {
-            quote_triple(quote)
-        } else {
-            quote.to_string()
-        };
-        let open = if raw {
-            format!("r{close}")
-        } else {
-            close.clone()
-        };
         self.diag_pin_last_unit(
             UNTERMINATED_STRING_LITERAL,
-            || msg::unterminated_string(&open, &close),
+            || msg::UNTERMINATED_STRING.to_owned(),
             stop,
         );
     }
-}
-
-fn quote_triple(quote: char) -> String {
-    quote.to_string().repeat(3)
 }

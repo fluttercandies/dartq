@@ -19,6 +19,10 @@ fn int_separator_errors() {
     let r = scan_src("1_");
     assert_kinds(&r, &[K::Int]);
     assert_codes(&r, &["unexpected_separator_in_number"]);
+    assert_eq!(
+        r.diagnostics[0].message,
+        "Digit separators ('_') in a number literal can only be placed between two digits."
+    );
     // Consecutive separators `1__2`: a following digit resets prev_sep; the official
     // scanner does not report (tokenizeNumber only checks previousWasSeparator at
     // the e/./end checkpoints).
@@ -38,6 +42,7 @@ fn hex_forms() {
     assert_kinds(&r, &[K::Hexadecimal]);
     assert!(r.tokens.first().is_synthetic());
     assert_codes(&r, &["missing_hex_digit"]);
+    assert_eq!(r.diagnostics[0].message, "Hexadecimal digit expected.");
     // Diagnostic pinned to the last character `x` (offset 1).
     assert_eq!(r.diagnostics[0].range.offset, 1);
     assert_eq!(r.diagnostics[0].range.length, 1);
@@ -62,6 +67,7 @@ fn missing_exponent() {
     assert_kinds(&r, &[K::Double]);
     assert!(r.tokens.first().is_synthetic());
     assert_codes(&r, &["missing_digit"]);
+    assert_eq!(r.diagnostics[0].message, "Decimal digit expected.");
     assert_eq!(r.diagnostics[0].range.offset, 1);
     // `1e+` likewise.
     let r = scan_src("1e+");
@@ -142,8 +148,35 @@ fn unterminated_single_line() {
     assert_codes(&r, &["unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 3);
     assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[0].message, "Unterminated string literal.");
     // EOL terminates scanning; the second line's `c` and the lone `'` are separate tokens — the latter is also unterminated.
     let r = scan_src("'ab\nc'");
+    assert_codes(
+        &r,
+        &["unterminated_string_literal", "unterminated_string_literal"],
+    );
+    assert_kinds(&r, &[K::String, K::Identifier, K::String]);
+}
+
+#[test]
+fn escaped_newline_terminates_single_line() {
+    // The official scanner checks LF/CR after the backslash advance
+    // (abstract_scanner.dart tokenizeSingleLineString): `'a\` + EOL does NOT
+    // continue the string. The first diagnostic pins to the backslash (last
+    // unit before the EOL); after the EOL `b` scans as code and the dangling
+    // `'` is a second unterminated string (same shape as the plain-EOL case).
+    let r = scan_src("'a\\\nb'");
+    assert_codes(
+        &r,
+        &["unterminated_string_literal", "unterminated_string_literal"],
+    );
+    assert_kinds(&r, &[K::String, K::Identifier, K::String]);
+    assert!(r.tokens.first().is_synthetic());
+    assert_eq!(r.diagnostics[0].range.offset, 2);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[0].message, "Unterminated string literal.");
+    // A CR line break terminates the same way.
+    let r = scan_src("'a\\\rb'");
     assert_codes(
         &r,
         &["unterminated_string_literal", "unterminated_string_literal"],
@@ -454,18 +487,13 @@ fn nested_unterminated_diagnostic_order() {
         assert_eq!(d.range.offset, 8);
         assert_eq!(d.range.length, 1);
     }
-    // The openers differ, so the message order identifies the levels: the
-    // inner `"` string is reported before the outer `'` string.
-    assert!(
-        r.diagnostics[0].message.contains("starting with \""),
-        "{}",
-        r.diagnostics[0].message
-    );
-    assert!(
-        r.diagnostics[1].message.contains("starting with '"),
-        "{}",
-        r.diagnostics[1].message
-    );
+    // The registry-true message carries no opener placeholder, so both levels
+    // emit the identical text (the oracle does the same); emission order
+    // (inner first) stays pinned by the codes above and `diag::finish`'s
+    // stable sort.
+    for d in &r.diagnostics[..2] {
+        assert_eq!(d.message, "Unterminated string literal.");
+    }
     // Both expected_token pins sit AT the eof position (zero-width).
     for d in &r.diagnostics[2..] {
         assert_eq!(d.range.offset, 9);

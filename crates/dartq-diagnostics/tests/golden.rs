@@ -279,6 +279,9 @@ fn machine_escapes_newline_and_carriage_return() {
 
 #[test]
 fn machine_escapes_file_path_field() {
+    // Fixture path spells /tmp but `FileTable::intern` canonicalizes the
+    // existing ancestor to /private/tmp (macOS symlink, same spelling the
+    // other fixtures use); the assertion pins the ESCAPING of `|` and `\`.
     let mut files = Fixture::default();
     let f = files.add(r"/tmp/a|b\c.dart", "x\n");
     let d = diagnostic(
@@ -292,7 +295,7 @@ fn machine_escapes_file_path_field() {
         },
     );
     let out = machine(&files.output(&[d]));
-    assert!(out.contains(r"|/tmp/a\|b\\c.dart|"), "{out}");
+    assert!(out.contains(r"|/private/tmp/a\|b\\c.dart|"), "{out}");
 }
 
 #[test]

@@ -299,13 +299,22 @@ fn double_triple_shift_runs() {
 
 #[test]
 fn unsupported_operators() {
-    // `===`/`!==`: token emitted as-is + unsupported_operator (official UnsupportedOperator).
+    // `===`/`!==`: token emitted as-is + unsupported_operator (official UnsupportedOperator);
+    // the message is the registry template with the lexeme filled in.
     let r = scan_src("a === b");
     assert_kinds(&r, &[K::Identifier, K::EqEqEq, K::Identifier]);
     assert_codes(&r, &["unsupported_operator"]);
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The '===' operator is not supported."
+    );
     let r = scan_src("a !== b");
     assert_kinds(&r, &[K::Identifier, K::BangEqEq, K::Identifier]);
     assert_codes(&r, &["unsupported_operator"]);
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The '!==' operator is not supported."
+    );
 }
 
 #[test]

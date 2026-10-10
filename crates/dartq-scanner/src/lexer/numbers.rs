@@ -196,7 +196,7 @@ impl Lexer<'_> {
                                     let at = self.pin_back(self.pos - 1).max(start);
                                     self.diag(
                                         MISSING_DIGIT,
-                                        || msg::MISSING_EXPONENT.to_owned(),
+                                        || msg::MISSING_DIGIT.to_owned(),
                                         at,
                                         at + 1,
                                     );
@@ -221,7 +221,7 @@ impl Lexer<'_> {
     fn separator_diag(&mut self, start: usize) {
         self.diag(
             UNEXPECTED_SEPARATOR_IN_NUMBER,
-            || msg::SEPARATOR_IN_NUMBER.to_owned(),
+            || msg::UNEXPECTED_SEPARATOR_IN_NUMBER.to_owned(),
             start,
             start + 1,
         );

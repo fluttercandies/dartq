@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, Severity};
+use dartq_diagnostics::{CodeInfo, Diagnostic, Severity};
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
@@ -444,7 +444,7 @@ pub(crate) fn scan_unit(
                 .language_version_override_span
                 .expect("scanner records the comment span with every override");
             warnings.push(Diagnostic::new(
-                severity_of(code.dtype),
+                code.dtype.severity(),
                 code,
                 format!(
                     "The language version override can't specify a version greater than \
@@ -522,16 +522,6 @@ fn resolve_unit(facts: &mut UnitFacts, file: FileId, resolver: &mut UriResolver<
     }
 }
 
-/// Severity from a registry-true family (the `dtype_matches_oracle_severity`
-/// invariant: `COMPILE_TIME_ERROR` rows are oracle-ERROR, `STATIC_WARNING`
-/// rows oracle-WARNING).
-fn severity_of(dtype: DiagnosticType) -> Severity {
-    match dtype {
-        DiagnosticType::StaticWarning => Severity::Warning,
-        _ => Severity::Error,
-    }
-}
-
 /// Whether `template` carries any `{N}` placeholder with `N` above zero —
 /// the single-argument `replace("{0}", …)` emit would leave such a template
 /// partially literal (audit #269 F5).
@@ -575,7 +565,7 @@ pub(crate) fn uri_diagnostic(
         info.name
     );
     Diagnostic::new(
-        severity_of(info.dtype),
+        info.dtype.severity(),
         CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
         info.message.replace("{0}", uri),
         file,

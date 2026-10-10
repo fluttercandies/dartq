@@ -51,7 +51,7 @@ impl Lexer<'_> {
                 self.emit_fixed(TokenKind::EqEqEq, start);
                 self.diag(
                     crate::diag::UNSUPPORTED_OPERATOR,
-                    || msg::UNSUPPORTED_OPERATOR.to_owned(),
+                    || msg::unsupported_operator("==="),
                     start,
                     start + 1,
                 );
@@ -78,7 +78,7 @@ impl Lexer<'_> {
                 self.emit_fixed(TokenKind::BangEqEq, start);
                 self.diag(
                     crate::diag::UNSUPPORTED_OPERATOR,
-                    || msg::UNSUPPORTED_NEQ.to_owned(),
+                    || msg::unsupported_operator("!=="),
                     start,
                     start + 1,
                 );

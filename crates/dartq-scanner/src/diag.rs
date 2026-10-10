@@ -136,8 +136,11 @@ pub(crate) fn is_unicode_space(ch: char) -> bool {
     )
 }
 
-/// Official `messages.yaml` template texts (differential testing compares
-/// only `(code, file)`; message wording stays close to the official text).
+/// Scanner diagnostic message texts. The oracle's MESSAGE field is the
+/// analyzer-side text each error token translates to
+/// (`translate_error_token.dart` → analyzer diagnostic registry, locked
+/// verbatim in `dartq-diagnostics` `data/syntax-codes.tsv`); these texts
+/// mirror it, pinned by the scanner's message probe tests.
 pub(crate) mod msg {
     pub fn illegal_character(ch: char) -> String {
         let cp = ch as u32;
@@ -169,17 +172,17 @@ pub(crate) mod msg {
         format!("Expected to find '{lexeme}'.")
     }
 
-    pub fn unterminated_string(open: &str, close: &str) -> String {
-        format!("String starting with {open} must end with {close}.")
-    }
-
+    pub const UNTERMINATED_STRING: &str = "Unterminated string literal.";
     pub const UNTERMINATED_COMMENT: &str = "Unterminated multi-line comment.";
-    pub const MISSING_HEX_DIGIT: &str = "A hex digit (0-9, a-f, or A-F) is expected after '0x'.";
-    pub const MISSING_EXPONENT: &str =
-        "Numbers in exponential notation have to have digits after the 'e'.";
-    pub const SEPARATOR_IN_NUMBER: &str =
-        "Separator '_' is not allowed in the middle, the beginning, or the end of a number.";
-    pub const UNSUPPORTED_OPERATOR: &str = "The '===' is not a valid operator.";
+    pub const MISSING_DIGIT: &str = "Decimal digit expected.";
+    pub const MISSING_HEX_DIGIT: &str = "Hexadecimal digit expected.";
+    pub const UNEXPECTED_SEPARATOR_IN_NUMBER: &str =
+        "Digit separators ('_') in a number literal can only be placed between two digits.";
     pub const MISSING_IDENTIFIER: &str = "Expected an identifier.";
-    pub const UNSUPPORTED_NEQ: &str = "The '!==' is not a valid operator.";
+
+    /// The `unsupported_operator` registry template with `{0}` filled by the
+    /// unsupported lexeme (both `===` and `!==` route here).
+    pub fn unsupported_operator(lexeme: &str) -> String {
+        format!("The '{lexeme}' operator is not supported.")
+    }
 }
