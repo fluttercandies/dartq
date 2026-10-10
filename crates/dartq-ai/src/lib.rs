@@ -9,6 +9,10 @@
 //!   their signature verdicts, the reverse-dependency closure tagged
 //!   content-only vs semantic, the test-graph join, and the environment
 //!   matrix (v1: one always-compatible context).
+//! * [`rev_import_graph`] — the reversed import graph as one shared CSR
+//!   build (`impact`'s inversion, reused by the amortized batch queries
+//!   and the T8 explain stage).
 
 pub mod compatibility;
 pub mod impact;
+pub mod rev_import_graph;

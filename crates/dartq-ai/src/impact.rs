@@ -22,7 +22,8 @@
 //!
 //! The rust-analyzer reverse-dependency posture (`base-db/src/input.rs`
 //! `transitive_rev_deps`): the import graph is inverted once per query —
-//! a flat CSR array pair, no per-node heap rows — and a worklist drains
+//! [`RevImportGraph`], the shared flat-CSR build the amortized batch
+//! queries and the T8 explain stage reuse — and a worklist drains
 //! the importers. The visited and direct-semantic marks
 //! are dense `Vec<bool>`s over the id space — O(1) probes, no hashing
 //! (library ids are a dense arena space, so a hashed set would only add
@@ -43,6 +44,8 @@ use serde::{Deserialize, Serialize};
 
 use dartq_index::TestGraph;
 use dartq_source::{StringId, StringTable};
+
+use crate::rev_import_graph::RevImportGraph;
 
 /// The report contract version (PRD §15.7): breaking output changes bump
 /// the major.
@@ -235,17 +238,19 @@ fn diff_names(before: &[StringId], after: &[StringId]) -> Vec<StringId> {
 ///
 /// # Panics
 ///
-/// Panics when the library count exceeds [`u32::MAX`] — the tables are
-/// sized by input, so a four-billion-library workspace is a program bug to
-/// surface, not truncate (the dartq-index "surface, never clamp" contract
-/// this query shares).
+/// Panics when the library count exceeds [`u32::MAX`] — the inverted graph
+/// ([`RevImportGraph::build`]) and the mark tables are sized by input, so
+/// a four-billion-library workspace is a program bug to surface, not
+/// truncate (the dartq-index "surface, never clamp" contract this query
+/// shares).
 ///
 /// Panics on out-of-contract caller data too: a [`LibraryChange`] id or an
 /// `imports_of` target at or beyond `library_count` stops on the array
-/// bounds check (debug builds assert first, naming the offending id), and
-/// a snapshot whose `top_level_names` are not ascending and deduplicated
-/// is rejected in every build — the merge walks behind the verdicts would
-/// silently mis-diff it otherwise.
+/// bounds check (debug builds assert first, naming the offending id — the
+/// import target in [`RevImportGraph::build`]), and a snapshot whose
+/// `top_level_names` are not ascending and deduplicated is rejected in
+/// every build — the merge walks behind the verdicts would silently
+/// mis-diff it otherwise.
 #[must_use]
 pub fn impact<'a>(
     library_count: usize,
@@ -268,35 +273,13 @@ pub fn impact<'a>(
         );
     }
 
-    // The inverted graph, built once (the rust-analyzer posture) as flat
-    // CSR — two counting passes over the id space, one allocation per
-    // array; the ascending fill keeps each row's importers ascending.
-    // Edge `importer → imported` inverts to `importers_of(imported)`.
+    // The inverted graph, built once (the rust-analyzer posture) via the
+    // shared CSR build — the amortized batch queries and the T8 explain
+    // stage reuse the same one. Edge `importer → imported` inverts to
+    // `importers_of(imported)`.
     let count = u32::try_from(library_count).expect("more than u32::MAX libraries");
-    let mut offsets = vec![0u32; library_count + 1];
-    for lib in 0..count {
-        for &target in imports_of(lib) {
-            debug_assert!(
-                target < count,
-                "import target {target} out of range 0..{count}"
-            );
-            offsets[target as usize + 1] += 1;
-        }
-    }
-    for i in 1..offsets.len() {
-        offsets[i] += offsets[i - 1];
-    }
-    let mut edges = vec![0u32; offsets[library_count] as usize];
-    let mut fill: Vec<u32> = offsets[..library_count].to_vec();
-    for lib in 0..count {
-        for &target in imports_of(lib) {
-            let slot = fill[target as usize] as usize;
-            edges[slot] = lib;
-            fill[target as usize] += 1;
-        }
-    }
-    let importers_of =
-        |lib: usize| -> &[u32] { &edges[offsets[lib] as usize..offsets[lib + 1] as usize] };
+    let graph = RevImportGraph::build(library_count, imports_of);
+    let importers_of = |lib: usize| graph.importers_of(lib);
 
     // Seed marks, then the direct-semantic marks: the first hop out of an
     // API-changing library. Transitively reached importers stay
