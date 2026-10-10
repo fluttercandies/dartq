@@ -247,7 +247,7 @@ protocol and is not part of the Cargo workspace.
 and dartq over the same corpora and compares results as `(code, file)`
 entry sets (Jaccard). Corpora live in `tests/corpus/`: `m0` (assembled
 analyzer-suite cases), `m0-syntax` (syntax-broken files), and the syntax
-gate's code list `syntax-codes.txt` (262 codes, the scanner/parser subset
+gate's code list `syntax-codes.txt` (255 codes, the scanner/parser subset
 of `crates/dartq-diagnostics/data/syntax-codes.tsv`).
 
 Current measured baseline (oracle: `dart analyze` 3.13.1, `--e2e-oracle`
@@ -259,9 +259,13 @@ self-check, both sides the analyzer — Jaccard 1.000 across all runs):
 | syntax | `m0-syntax` | codes ∩ ERROR | 272 | 2144 | 1.000 |
 | full | `m0` + `m0-syntax` | all | 439 | 6873 | 1.000 |
 
-The M0 gate is the syntax-caliber run against the real dartq side; the
-gate passes at ERROR-tier Jaccard ≥ 0.99 (baseline: 539 entries /
-2144 instances):
+The M0 gate is the syntax-caliber run against the real dartq side,
+passing at ERROR-tier Jaccard ≥ 0.99. Honest state of the recorded
+evidence: the latest real-side gate run on disk
+(`docs/audits/gate-m0/gate-caliber-r5`) failed at Jaccard 0.620 over a
+corpus shape that has since been reorganized, so no current-tree gate
+evidence exists yet — the ≥ 0.99 passing baseline is to be
+re-established by the upcoming acceptance runs:
 
 ```bash
 cargo test -p harness          # harness unit tests
@@ -284,6 +288,15 @@ Preflight requires every corpus package to carry a
 `.dart_tool/package_config.json` with `languageVersion >= 3.13`.
 `--oracle-dart`, `--type-filter`, and `--threshold` are also available; see
 `cargo run -p harness -- --help`.
+
+The M1 gate is the frozen-code semantic run over `tests/corpus/m1-semantic`
+(`tests/harness/m1_codes.txt`, ERROR tier, bar 0.95 — deliberately below
+the M0 0.99), driven by `scripts/m1-gate.sh`. Honest state of the recorded
+evidence: the latest run on disk (`docs/audits/gate-m1/r2`) failed at
+Jaccard 0.8235 over a 34-entry corpus — five dartq misses in the
+`wrong_number_of_type_arguments` family plus one dartq-only attribution —
+so the ≥ 0.95 passing baseline is likewise to be re-established by the
+next gate run.
 
 ## Oracle Baseline
 
