@@ -21,6 +21,8 @@
 //! * [`impact`] — the §15.4 impact report.
 //! * [`compat`] — the §15.5 per-SDK compatibility matrix.
 //! * [`fix`] — the §15.6 anchored patch substrate.
+//! * [`lints`] — the lint face's mount (PRD §13): enable-set resolution
+//!   from the merged analysis options and lint rows as engine diagnostics.
 //!
 //! [`EngineConfig`]: dartq_engine::EngineConfig
 
@@ -34,6 +36,7 @@ pub mod fix;
 pub mod impact;
 pub mod index;
 pub mod layout;
+pub mod lints;
 pub mod query;
 pub mod workspace;
 
