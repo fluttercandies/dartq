@@ -1867,7 +1867,7 @@ mod can_be_subtype_tests {
     /// Renders a corpus type for law-violation messages: fixture decl names
     /// over the kind structure, with the `?` projection — so a failing pair
     /// reads `FutureOr<int?>` instead of `TypeId(24)`.
-    fn describe(sys: &TypeSystem, id: TypeId) -> String {
+    fn describe(sys: &TypeSystem<'_>, id: TypeId) -> String {
         let ty = sys.table().get(id);
         let text = match ty.kind() {
             TypeKind::Never => "Never".to_string(),
