@@ -112,3 +112,48 @@ fn query_drops_removed_files() {
     assert!(answer.decls.is_empty(), "{answer:?}");
     assert!(answer.refs.is_empty(), "{answer:?}");
 }
+
+/// The use-file column (#361): one library spans its defining unit plus a
+/// part, and the use sits in the part — the hit's `file` must name the
+/// library member the use site sits in, never the target's file and never
+/// another member of the same library.
+#[test]
+fn query_use_file_is_the_library_member() {
+    const PARTED_MAIN: &str = "import 'greeter.dart';\npart 'extra.dart';\n";
+    const PART_EXTRA: &str = "part of 'main.dart';\nvoid extra() {\n  greet();\n}\n";
+
+    let fixture = Fixture::new(&[
+        ("lib/main.dart", PARTED_MAIN),
+        ("lib/greeter.dart", GREETER),
+        ("lib/extra.dart", PART_EXTRA),
+    ]);
+    let mut engine = fixture.engine();
+    for (relative, source) in [
+        ("lib/main.dart", PARTED_MAIN),
+        ("lib/greeter.dart", GREETER),
+        ("lib/extra.dart", PART_EXTRA),
+    ] {
+        engine.set_content(fixture.path(relative).as_path(), source.as_bytes());
+    }
+    analyze(&mut engine);
+
+    let answer = engine.query_symbols("greet");
+    assert_eq!(answer.decls.len(), 1, "{answer:?}");
+    let decl = answer.decls[0];
+    assert_eq!(answer.refs.len(), 1, "{answer:?}");
+    let hit = answer.refs[0];
+    assert_eq!(
+        hit.target_file, decl.file,
+        "the target pair still names the declaring file"
+    );
+    assert_eq!(
+        engine
+            .file_table()
+            .path(hit.file)
+            .and_then(|path| path.to_str())
+            .map(str::to_owned)
+            .as_deref(),
+        fixture.path("lib/extra.dart").to_str(),
+        "the use file is the part member, not the target and not the defining unit",
+    );
+}

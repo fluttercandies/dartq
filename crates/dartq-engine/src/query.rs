@@ -66,14 +66,16 @@ pub struct DeclHit<'a> {
 pub struct RefHit {
     /// The referenced declaration's file.
     pub target_file: FileId,
+    /// The use site's file — the library member whose capture recorded the
+    /// row: a library spans its defining unit plus parts, so the target
+    /// pair alone cannot locate the use (dartq-index `RefRow::file`).
+    pub file: FileId,
     /// The relation kind of the use.
     pub kind: RefKind,
     /// The use is explicitly qualified (`p.x`) and cannot be shadowed by a
     /// local declaration.
     pub qualified: bool,
-    /// The use site's span (UTF-16). The index row shape carries no
-    /// use-file column (dartq-index `RefRow`), so the span is the only
-    /// position signal.
+    /// The use site's span (UTF-16).
     pub range: SourceRange,
 }
 
@@ -125,6 +127,7 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
         })
         .map(|row: &RefRow| RefHit {
             target_file: row.target_file,
+            file: row.file,
             kind: row.kind,
             qualified: row.qualified,
             range: row.range,

@@ -72,6 +72,12 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
         crate::layout::path_key(layout.file_path(a.target_file))
             .cmp(crate::layout::path_key(layout.file_path(b.target_file)))
             .then_with(|| a.range.offset.cmp(&b.range.offset))
+            // Use-file tiebreak: members of one library can carry equal
+            // offsets, and the emitted `file` is part of the row's identity.
+            .then_with(|| {
+                crate::layout::path_key(layout.file_path(a.file))
+                    .cmp(crate::layout::path_key(layout.file_path(b.file)))
+            })
     });
     SymbolRun { decls, refs, layout }
 }
@@ -92,12 +98,9 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
 ///
 /// The frozen v1 reference-row shape stayed frozen while gaining the
 /// use-file answer: the index row carries the member file (`dartq-index`
-/// `RefRow::file`, #361) and the schema declares `file` optional on
-/// reference rows (absent-tolerant, dartq-schema `query.rs`). The engine's
-/// public [`RefHit`] does not propagate the column yet — engine-lane seam —
-/// so this face's rows locate single-file uses exactly and multi-file
-/// library uses by span only; when `RefHit` grows the column,
-/// [`to_json`] emits the optional `file` field in one move.
+/// `RefRow::file`, #361), [`RefHit`] propagates it, and [`to_json`] emits
+/// it as the optional `file` string the schema accepts on reference rows
+/// (dartq-schema `query.rs`).
 ///
 /// # Errors
 ///
@@ -146,6 +149,7 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
             json!({
                 "target_file": run.layout.file_path(reference.target_file).display().to_string(),
                 "kind": ref_kind_name(reference.kind),
+                "file": run.layout.file_path(reference.file).display().to_string(),
                 "qualified": reference.qualified,
                 "offset": reference.range.offset,
                 "length": reference.range.length,
@@ -285,6 +289,27 @@ mod tests {
         assert_eq!(run.refs.len(), 1);
         assert_eq!(run.refs[0].kind, RefKind::Invoked);
         assert_eq!(run.refs[0].range.offset, 50);
+
+        // The use-file column rides the emitted rows: `file` is the use
+        // site's member path (b.dart, c.dart), distinct from the target's
+        // (a.dart) — the frozen-v1 schema's optional reference-row string.
+        let run = symbol(&mut engine, "Foo").expect("query");
+        let json = to_json(&run, "Foo");
+        let root = root.canonicalize().expect("root");
+        let use_files: Vec<Option<&str>> = json["references"]
+            .as_array()
+            .expect("references array")
+            .iter()
+            .map(|row| row["file"].as_str())
+            .collect();
+        assert_eq!(
+            use_files,
+            vec![
+                root.join("lib/b.dart").to_str(),
+                root.join("lib/c.dart").to_str(),
+            ],
+            "each row names the member file its use site sits in"
+        );
 
         fs_remove(&root);
     }
