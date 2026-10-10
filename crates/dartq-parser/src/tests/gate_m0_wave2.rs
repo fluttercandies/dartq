@@ -132,7 +132,14 @@ fn dot_access_operand_missing_identifier() {
 // —— patterns / records ——————————————————————————————————————————————————
 
 /// Reserved words in pattern-element position report the missing identifier
-/// and continue (official pattern-element `ensureIdentifier`).
+/// and continue (official pattern-element `ensureIdentifier`). The
+/// delimited loops then recover per the official decision order: the list
+/// loop's per-iteration no-progress skip consumes the blocker; the
+/// parenthesized loop leaves it for `ensureCloseParen` (expected `)` at the
+/// blocker, parser_impl.dart:12229-12231 + :5028); the map loop's
+/// stale-`next` skip leaves the first entry's blocker for the `,`
+/// recovery, which re-parses it as the next key (official
+/// syntheticIdentifier_inside* corpus).
 #[test]
 fn pattern_reserved_element_positions() {
     assert_codes(
@@ -142,12 +149,18 @@ fn pattern_reserved_element_positions() {
     );
     assert_codes(
         "void f(Object? x) {\n  switch (x) {\n    case {0: if}:\n  }\n}\n",
-        &["missing_identifier"],
+        &[
+            "expected_token",
+            "expected_token",
+            "missing_identifier",
+            "missing_identifier",
+            "missing_identifier",
+        ],
         "map pattern value",
     );
     assert_codes(
         "void f(Object? x) {\n  switch (x) {\n    case (if):\n  }\n}\n",
-        &["missing_identifier"],
+        &["expected_token", "missing_identifier"],
         "record pattern field",
     );
 }
@@ -192,20 +205,28 @@ fn pattern_rhs_reserved_head() {
 /// `const (...) = x;` re-enters the statement parse at the `const`
 /// (official `parseExpressionStatement(start)`), so the parenthesized
 /// operand is a const literal, not a pattern assignment — the assignment
-/// target check (`AstBuilder.handleAssignment`) then reports.
+/// target check (`AstBuilder.handleAssignmentExpression`,
+/// ast_builder.dart:3831-3837) reports `missingAssignableSelector` for the
+/// non-assignable const record on top of the statement-level
+/// `illegalAssignmentToNonAssignable` (oracle:
+/// patterns/patternVariableDeclarationStatement_disallowsConst.dart).
 #[test]
 fn const_statement_assignment_targets() {
     assert_codes(
         "void f() { const (_) = x; }\n",
         &[
             "illegal_assignment_to_non_assignable",
+            "missing_assignable_selector",
             "record_literal_one_positional_no_trailing_comma",
         ],
         "const parenthesized assignment",
     );
     assert_codes(
         "void f() { const (a, b) = x; }\n",
-        &["illegal_assignment_to_non_assignable"],
+        &[
+            "illegal_assignment_to_non_assignable",
+            "missing_assignable_selector",
+        ],
         "const record assignment",
     );
 }

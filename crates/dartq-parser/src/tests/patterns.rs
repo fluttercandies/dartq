@@ -135,3 +135,91 @@ fn patterns_disabled_reports_experiment() {
         vec!["experiment_not_enabled".to_string()]
     );
 }
+
+// —— keyword blocker inside delimited patterns (#461) ——————————————————————
+//
+// A reserved word (`if`) cannot start a pattern operand. The official
+// recovery reports `missingIdentifier` on it and leaves it unconsumed; the
+// enclosing delimited loop then either skips it (list, whose official loop
+// has the per-iteration no-progress skip) or reports the missing delimiter
+// at it (parenthesized/record/map). Oracle:
+// `pkg/front_end/parser_testcases/patterns/syntheticIdentifier_*.dart`.
+
+/// Sorted code multiset of one pattern-entry parse.
+fn sorted_pattern_codes(source: &'static str) -> Vec<String> {
+    let mut p = setup(source);
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    let mut codes = p.listener.error_codes();
+    codes.sort();
+    codes
+}
+
+#[test]
+fn keyword_blocker_inside_list_pattern_skips() {
+    // The list loop's no-progress skip consumes the blocker, so `]` closes
+    // cleanly: exactly one missing_identifier (official
+    // syntheticIdentifier_insideListPattern: one problem).
+    assert_eq!(
+        sorted_pattern_codes("[if]"),
+        ["missing_identifier"],
+        "list blocker"
+    );
+}
+
+#[test]
+fn keyword_blocker_inside_parenthesized_pattern_reports_closer() {
+    // The parenthesized loop has no no-progress skip (official
+    // parseParenthesizedPatternOrRecordPattern :12229-12231): the blocker
+    // survives to ensureCloseParen, which reports `expected ')'` at it and
+    // jumps to the group's real closer (official
+    // syntheticIdentifier_insideParenthesizedPattern: two problems).
+    let mut p = setup("(if)");
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    p.listener
+        .assert_sequence(&[("handle", "parenthesized_pattern")]);
+    assert_eq!(
+        sorted_pattern_codes("(if)"),
+        ["expected_token", "missing_identifier"],
+        "parenthesized blocker"
+    );
+}
+
+#[test]
+fn keyword_blocker_inside_record_pattern_reports_closer() {
+    // Same shape as the parenthesized blocker, as the second record field
+    // (official syntheticIdentifier_insideRecordPattern: missing_identifier
+    // + `expected ')'` before it, record with 2 fields).
+    let mut p = setup("(_, if)");
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    p.listener
+        .assert_sequence(&[("handle", "record_pattern")]);
+    assert_eq!(
+        sorted_pattern_codes("(_, if)"),
+        ["expected_token", "missing_identifier"],
+        "record blocker"
+    );
+}
+
+#[test]
+fn keyword_blocker_inside_map_pattern_spawns_entry_recovery() {
+    // The map loop's stale-`next` skip leaves the FIRST entry's blocker for
+    // the `,` recovery: the blocker is re-parsed as the next key (`:` then
+    // fails), skipped as the second value, and `}` closes. Official
+    // syntheticIdentifier_insideMapPattern: 3 x missing_identifier +
+    // `expected ','` + `expected ':'`.
+    let mut p = setup("{0: if}");
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    p.listener
+        .assert_sequence(&[("handle", "map_pattern")]);
+    assert_eq!(
+        sorted_pattern_codes("{0: if}"),
+        [
+            "expected_token",
+            "expected_token",
+            "missing_identifier",
+            "missing_identifier",
+            "missing_identifier"
+        ],
+        "map blocker"
+    );
+}

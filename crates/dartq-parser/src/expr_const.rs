@@ -891,12 +891,21 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         end
                     } else {
                         // Recovery: an incomplete dot shorthand like
-                        // `C c = const .` (official comment).
+                        // `C c = const .` (official comment). The `.` is
+                        // consumed first (official `parseConstDotShorthand`:
+                        // `ensureIdentifier(., expressionContinuation)`
+                        // blames the FOLLOWER — the intertwined expect
+                        // reports "Expected an identifier, but got ';'" at
+                        // the `;`, which survives as the declaration
+                        // terminator), and the synthetic identifier is the
+                        // shorthand's operand/end.
                         let dot = self.peek_span();
-                        let _ = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                        self.cursor.advance();
+                        let end =
+                            self.ensure_identifier(IdentifierContext::ExpressionContinuation);
                         self.listener.handle_dot_shorthand_head(dot);
                         self.listener.handle_dot_shorthand_context(dot);
-                        self.peek_span()
+                        end
                     };
                     self.listener.end_const_dot_shorthand(const_keyword);
                     return end;

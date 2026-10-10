@@ -762,3 +762,169 @@ fn token_kind_smoke() {
     assert_eq!(TokenKind::Comma.fixed_lexeme(), Some(","));
     let _ = IdentifierContext::Expression;
 }
+
+// —— oracle recovery pins (#461, r5 oracle-only families) ——————————————————
+//
+// Each pin reproduces one whole-unit corpus file whose oracle code list the
+// r5 differential run caught dartq missing or diverging on; the expected
+// multisets are the oracle outputs recorded in
+// docs/audits/gate-m0/gate-caliber-r5/report.json, cross-checked against the
+// official parser testcases under .third/dart-sdk/pkg/front_end/parser_testcases.
+
+/// Sorted code multiset of one whole-unit parse (scanner-clean inputs).
+fn sorted_unit_codes(source: &'static str) -> Vec<String> {
+    let mut codes = parse(source).codes().to_vec();
+    codes.sort();
+    codes
+}
+
+/// Sorted diagnostic multiset (scanner + parser) of one whole-unit parse,
+/// for inputs the scanner itself flags (the unterminated-interpolation
+/// re-scan reports its own `expected_token` for the blamed `${`).
+fn sorted_unit_codes_with_scanner(source: &'static str) -> Vec<String> {
+    let config = dartq_scanner::ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: true,
+    };
+    let mut files = dartq_source::FileTable::new();
+    let file = files.intern(std::path::Path::new("test.dart"));
+    let result = dartq_scanner::scan(source, config, file);
+    let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+    let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let mut codes: Vec<String> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name.to_owned())
+        .collect();
+    let features =
+        crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
+            dartq_language::LanguageVersion::new(3, 13),
+        ));
+    let mut p = Parser::new(text, table, features, ExprLog::default());
+    p.parse_unit();
+    codes.extend(p.listener.codes().iter().cloned());
+    codes.sort();
+    codes
+}
+
+#[test]
+fn cascade_question_type_args_lands_four_code_shape() {
+    // `a?<Foo>(b);` (oracle nnbd/issue_40267_method_call_with_type_arguments):
+    // the `?` opens a conditional whose then-branch parses `<Foo>` as
+    // generic function-expression type variables; `(b)` closes and the `;`
+    // is its body (unexpected_token from the suffix body check +
+    // missing_function_body from the empty body, both consumed by the
+    // function expression), the `}` stands in for the missing `:` colon and
+    // else operand (missing_identifier), and the statement terminator
+    // reports once more (official parser_testcases
+    // nnbd/issue_40267_method_call_with_type_arguments.dart.expect:
+    // 5 problems = expected_token x2, missing_function_body,
+    // missing_identifier, unexpected_token).
+    assert_eq!(
+        sorted_unit_codes("f() {\n  var a, b;\n\n  a?.call<Foo>(b);\n  a?<Foo>(b);\n}\n"),
+        [
+            "expected_token",
+            "expected_token",
+            "missing_function_body",
+            "missing_identifier",
+            "unexpected_token"
+        ],
+        "cascade ?<Foo>(b) four-code shape"
+    );
+}
+
+#[test]
+fn const_record_lhs_reports_missing_selector() {
+    // `const (_) = x;` (oracle patterns/
+    // patternVariableDeclarationStatement_disallowsConst): the const
+    // expression is a one-field record literal (trailing-comma report), and
+    // handleAssignmentExpression reports missingAssignableSelector at the
+    // `const` head (ast_builder.dart:3831-3837) on top of the
+    // statement-level illegalAssignmentToNonAssignable rider.
+    assert_eq!(
+        sorted_unit_codes("f(x) {\n  const (_) = x;\n}\n"),
+        [
+            "illegal_assignment_to_non_assignable",
+            "missing_assignable_selector",
+            "record_literal_one_positional_no_trailing_comma"
+        ],
+        "const (_) = x selector decision"
+    );
+}
+
+#[test]
+fn const_dot_shorthand_incomplete_member_recovers() {
+    // `Color c = const .;` (oracle dot_shorthands/const_no_identifier_recovery):
+    // the member after `.` is missing; the official reports one
+    // missing_identifier at the follower and the `;` survives as the
+    // variable-declaration terminator (CFE intertwined expect: report
+    // ExpectedIdentifier -> handleIdentifier -> handleDotShorthandHead ->
+    // endConstDotShorthand, `;` unconsumed).
+    assert_eq!(
+        sorted_unit_codes(
+            "class Color {\n  final int x;\n  const Color.red(this.x);\n}\nvoid main() {\n  Color c = const .;\n}\n"
+        ),
+        ["missing_identifier"],
+        "const dot-shorthand without a member"
+    );
+}
+
+#[test]
+fn keyword_blocker_inside_switch_expression_case() {
+    // `switch (x) {if}` (oracle patterns/syntheticIdentifier_insideSwitchExpression):
+    // the case pattern, the `=>` and the case body each meet the reserved
+    // `if` without consuming it — missing_identifier x2, then the arrow and
+    // the case separator report expected_token ('=>' and '}').
+    assert_eq!(
+        sorted_unit_codes("void f(Object? x) => switch (x) {if};\n"),
+        [
+            "expected_token",
+            "expected_token",
+            "missing_identifier",
+            "missing_identifier"
+        ],
+        "switch-expression case blocker"
+    );
+}
+
+#[test]
+fn typing_inside_interpolation_content_recovers() {
+    // `${` typed mid-string (oracle error_recovery/with_outline/
+    // typing_string_interpolation_1): the scanner's two-pass re-scan turns
+    // the group's content back into string body closed by the inner quote
+    // and reports the blamed `${` (scanner expected_token for the synthetic
+    // `}`); the parser meets the content token where an identifier belongs
+    // and reports exactly one missing_identifier (CFE intertwined expect
+    // :204), then consumes the content as the string part — no
+    // expected-`}` parser report and no member-lane cascade.
+    assert_eq!(
+        sorted_unit_codes_with_scanner(
+            "class A {\n  method1() {}\n  method2() {}\n}\n\nclass B {\n  method1(String foo) {\n    // was:\n    // print(\"hello world\");\n    // but then we started typing inside the quotes:\n    print(\"${foo.length hello world\");\n  }\n\n  method2() {}\n}\n\nclass C {\n  method1() {}\n  method2() {}\n}\n"
+        ),
+        ["expected_token", "missing_identifier"],
+        "typing inside a one-line interpolation"
+    );
+}
+
+#[test]
+fn typing_inside_interpolation_multiline_content_recovers() {
+    // typing_string_interpolation_2: the re-scanned body hits the newline
+    // (a single-line string ends there), so the scanner adds its
+    // unterminated-string report; the parser must still land the
+    // missing_identifier on the content and must NOT cascade into the
+    // member lane (the r5 run showed named_function_expression /
+    // class_in_class noise before the two-pass carve landed).
+    let codes = sorted_unit_codes_with_scanner(
+        "class A {\n  method1() {}\n  method2() {}\n}\n\nclass B {\n  method1(String foo) {\n    // was:\n    // print(\"hello world\");\n    // but then we started typing inside the quotes:\n    print(\"${foo.\n    length hello world\");\n  }\n\n  method2() {}\n}\n\nclass C {\n  method1() {}\n  method2() {}\n}\n",
+    );
+    assert!(
+        codes.contains(&"missing_identifier".to_owned()),
+        "missing_identifier must land on the content: {codes:?}"
+    );
+    for junk in ["named_function_expression", "class_in_class"] {
+        assert!(
+            !codes.contains(&junk.to_owned()),
+            "{junk} must not cascade: {codes:?}"
+        );
+    }
+}

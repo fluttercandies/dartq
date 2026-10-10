@@ -589,11 +589,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// Official `parseMapPatternSuffix` (`parser_impl.dart:12087`). Cursor at
     /// `{`.
+    ///
+    /// The entry's no-progress skip mirrors the official
+    /// `identical(next, token.next)` check: `next` is the loop's stale
+    /// follower pointer (refreshed at the loop bottom, initialized to the
+    /// first key), not the current pattern head. So the FIRST entry's
+    /// unconsumed blocker survives to the `,`/`}` recovery (which inserts a
+    /// comma and re-parses it as the next key), while later entries — whose
+    /// stale `next` was refreshed onto the blocker — skip it.
     fn parse_map_pattern_suffix(&mut self, context: PatternContext) -> TokenSpan {
         let left = self.peek_span();
         self.cursor.advance();
         let mut count = 0usize;
         let end;
+        let mut stale_next = self.peek_id();
         loop {
             if self.is_bailed() {
                 // Terminal bailout: unwind without consumption (see
@@ -619,15 +628,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // entry: expression `:` pattern
                 self.parse_constant_expression(ConstantPatternContext::None);
                 let colon = self.expect_lexeme_but_got(":");
+                let value_head = self.peek_id();
                 let before = self.cursor.progress();
                 self.parse_pattern(context);
-                if self.no_progress(before) {
+                if self.no_progress(before) && value_head == stale_next {
                     self.force_advance();
                 }
                 self.listener
                     .handle_map_pattern_entry(colon, self.peek_span());
             }
             count += 1;
+            stale_next = self.peek_id();
             match self.peek_kind() {
                 TokenKind::Comma => {
                     self.cursor.advance();
@@ -696,11 +707,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.cursor.advance();
                 was_valid_record = true;
             }
-            let before = self.cursor.progress();
+            // No no-progress skip here (official :12229-12231 has none): a
+            // sub-pattern that consumes nothing (a keyword head) is left in
+            // place so the `ensureCloseParen` below reports `expectedButGot
+            // (')')` at it and jumps to the group's real closer.
             self.parse_pattern(context);
-            if self.no_progress(before) {
-                self.force_advance();
-            }
             if was_record || colon.is_some() {
                 self.listener.handle_pattern_field(colon);
             }

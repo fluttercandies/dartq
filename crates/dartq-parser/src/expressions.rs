@@ -340,12 +340,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 left = self.parse_cascade_expression(left);
             } else if token_level == ASSIGNMENT_PRECEDENCE {
                 // AstBuilder assignment-target checks: `handleAssignment-
-                // Expression` (ast_builder.dart:3825-3841) reports
-                // `missingAssignableSelector` for a non-assignable LHS in an
-                // ordinary assignment (a bare `super`); a bare `this` counts
-                // as assignable (no report). The statement-level
-                // `illegalAssignmentToNonAssignable` (:4420-4433) and the
-                // postfix variant (:5849-5860) keep their own shapes.
+                // Expression` (ast_builder.dart:3824-3841) reports
+                // `missingAssignableSelector` for EVERY non-assignable LHS
+                // (a bare `super`, a record literal, a `null` literal, ...);
+                // a bare `this` is not assignable there either
+                // (`_isAssignable`, ast_builder.dart:6607-6620, admits only
+                // names, property/index extractions and dot shorthands).
+                // `illegalAssignmentToNonAssignable` is the statement-level
+                // rider on the invalid assignment target
+                // (`endExpressionStatement`, ast_builder.dart:4405-4433);
+                // dartq pins it on this arm because the statement layer has
+                // no separate target re-check. The statement-level
+                // postfix variant (:5849-5860) keeps its own shape.
                 // `Token.isOperator`-style proxy for the assignability check
                 // (:5856): the LHS must end in an identifier (or `]` of an
                 // index target). The final LHS token's kind: a table id is
@@ -362,7 +368,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 });
                 match lhs_last {
                     // `this` ends in a selector-able expression per the
-                    // official `_isAssignable` and is silently accepted.
+                    // initializer recovery shapes (`this = 0` is rewritten
+                    // to `<synthetic> = this . <synthetic>` by the
+                    // initializer lane), so a real `this`-ending target only
+                    // occurs through selector chains ending in a name.
                     Some(
                         TokenKind::Identifier
                         | TokenKind::CloseSquare
@@ -372,6 +381,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.report(msg::missing_assignable_selector(), left);
                     }
                     _ => {
+                        self.report(msg::missing_assignable_selector(), left);
                         self.report(msg::illegal_assignment_to_non_assignable(), left);
                     }
                 }
