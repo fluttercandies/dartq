@@ -83,6 +83,13 @@ pub enum Ev {
         /// time.
         base: crate::ty::Base,
         nullable: bool,
+        /// Whether the type spelled type arguments (`List<int>`): the
+        /// recorder records only the bare name, so a promotion tested
+        /// against this type must not surface as a fact carrying the
+        /// erased spelling (#611). Latched from the parser's
+        /// `end_type_arguments` / `handle_no_type_arguments`, which fire
+        /// immediately before the row (`type_info_impl.dart:1158/1191`).
+        had_type_args: bool,
     },
     NoType,
     FunctionType,

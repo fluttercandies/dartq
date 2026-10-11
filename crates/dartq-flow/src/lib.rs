@@ -31,7 +31,8 @@
 //! # What the engine reports
 //!
 //! [`FlowFact`]s per executable, in source order: dead code (statements
-//! entered while unreachable) and reads of definitely-unassigned locals.
+//! entered while unreachable), reads of definitely-unassigned locals, and
+//! reads whose flow-promoted type differs from the declared one.
 //! Promotion state is internal; it is consumed here for the facts above
 //! and exposed to later milestones through the query face.
 //!

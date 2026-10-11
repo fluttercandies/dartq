@@ -31,6 +31,17 @@ pub struct Flow<'t> {
     source: &'t str,
     /// Lexeme to interned name id (dense `u32` for the interpreter).
     names: FxHashMap<Box<str>, u32>,
+    /// Interned name ids to their lexemes — the mirror of `names` in id
+    /// order (dense, one push per intern), so a later stage can recover
+    /// `Base::Name(id)` spellings through [`Flow::name_lexeme`].
+    names_by_id: Vec<Box<str>>,
+    /// Whether the type currently being parsed spelled type arguments:
+    /// `end_type_arguments` sets it, `handle_no_type_arguments` clears
+    /// it, and both fire immediately before the type's own row (official
+    /// `parseArguments`, `type_info_impl.dart:1158/1191`). Stamped on the
+    /// row so promotions tested against arg-bearing types can be kept
+    /// out of the fact face (#611).
+    type_had_args: bool,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -59,6 +70,8 @@ impl<'t> Flow<'t> {
             tokens,
             source,
             names: FxHashMap::default(),
+            names_by_id: Vec::new(),
+            type_had_args: false,
             pending_label_ref: None,
             pending_labels: Vec::new(),
             buffer: None,
@@ -83,7 +96,9 @@ impl<'t> Flow<'t> {
                 return id;
             }
             let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
-            self.names.insert(lexeme.into(), id);
+            let key: Box<str> = lexeme.into();
+            self.names_by_id.push(key.clone());
+            self.names.insert(key, id);
             return id;
         }
         // Parser-inserted synthetic tokens key on the token handle.
@@ -92,8 +107,19 @@ impl<'t> Flow<'t> {
             return id;
         }
         let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
+        self.names_by_id.push(key.clone());
         self.names.insert(key, id);
         id
+    }
+
+    /// The lexeme of an interned name id — the recovery face turning
+    /// `Base::Name(id)` (and event name ids) back into their source
+    /// spelling. Ids are dense by construction; synthetic tokens read as
+    /// their `#<handle>` placeholder.
+    #[must_use]
+    pub fn name_lexeme(&self, id: u32) -> &str {
+        let index = id as usize;
+        &self.names_by_id[index]
     }
 
     /// Takes the pending label reference if one is set (break/continue
@@ -110,9 +136,9 @@ impl<'t> Flow<'t> {
     pub fn take_facts(&mut self) -> Vec<FlowFact> {
         let mut facts = std::mem::take(&mut self.facts);
         facts.sort_by_key(|fact| match fact {
-            FlowFact::DeadCode { span } | FlowFact::UnassignedRead { span, .. } => {
-                span.range.offset
-            }
+            FlowFact::DeadCode { span }
+            | FlowFact::UnassignedRead { span, .. }
+            | FlowFact::PromotedRead { span, .. } => span.range.offset,
         });
         facts
     }
@@ -493,7 +519,16 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::Type {
             base,
             nullable: question.is_some(),
+            had_type_args: self.type_had_args,
         });
+    }
+
+    fn handle_no_type_arguments(&mut self, _token: Token) {
+        self.type_had_args = false;
+    }
+
+    fn end_type_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
+        self.type_had_args = true;
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {

@@ -39,6 +39,50 @@ fn facts_of(source: &str) -> Vec<FlowFact> {
     flow.0.borrow_mut().take_facts()
 }
 
+/// Parses with the recorder attached and returns the live recorder (for
+/// the name-recovery face) alongside the taken facts.
+fn analyze(source: &str) -> (SharedFlow<'_>, Vec<FlowFact>) {
+    let result = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+    );
+    assert!(result.diagnostics.is_empty(), "{source:?}");
+    let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
+    let flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+        tokens, source,
+    ))));
+    let mut parser = dartq_parser::Parser::new(
+        source,
+        tokens,
+        features,
+        SharedFlow(std::rc::Rc::clone(&flow.0)),
+    );
+    parser.parse_unit();
+    drop(parser);
+    let facts = flow.0.borrow_mut().take_facts();
+    (flow, facts)
+}
+
+/// Promoted-read facts of a source: the promoted type of each read whose
+/// flow type differs from its declared type (offset-sorted by
+/// `take_facts`).
+fn promoted_tys(source: &str) -> Vec<crate::ty::Ty> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { ty, .. } => Some(ty),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Offsets (UTF-16 == ASCII here) of dead-code facts, rendered as the
 /// dead source text for readable assertions.
 fn dead_snippets(source: &str) -> Vec<String> {
@@ -50,7 +94,7 @@ fn dead_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            FlowFact::UnassignedRead { .. } => None,
+            FlowFact::UnassignedRead { .. } | FlowFact::PromotedRead { .. } => None,
         })
         .collect()
 }
@@ -65,7 +109,7 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            FlowFact::DeadCode { .. } => None,
+            FlowFact::DeadCode { .. } | FlowFact::PromotedRead { .. } => None,
         })
         .collect()
 }
@@ -83,6 +127,7 @@ fn named_ty(name: u32, nullable: bool) -> crate::ev::Ev {
     crate::ev::Ev::Type {
         base: crate::ty::Base::Name(name),
         nullable,
+        had_type_args: false,
     }
 }
 
@@ -378,11 +423,147 @@ fn initialized_local_read_assigned() {
 
 /// official `type_promotion/data/null_check.dart` shape: an `!= null` test
 /// flows promotion into the then-branch; with the name-level seam this
-/// must not crash and must not produce false dead code.
+/// must not crash and must not produce false dead code. The promoted read
+/// surfaces as its own fact — a nullability promotion carries no type
+/// arguments, so it stays in scope (#611 gate).
 #[test]
-fn null_check_promotion_no_facts() {
+fn null_check_promotion_emits_read_fact() {
     let source = "void f(int? x) { if (x != null) { x; } }";
-    assert!(facts_of(source).is_empty());
+    let promoted = promoted_tys(source);
+    assert_eq!(promoted.len(), 1);
+    assert!(matches!(promoted[0].base, crate::ty::Base::Name(_)));
+    assert!(!promoted[0].nullable);
+}
+
+// —— promotion facts (PromotedRead) ————————————————————————————————————————
+
+/// (a) An `x is T`-promoted read emits `PromotedRead` carrying the
+/// promoted type; the condition's own read (pre-promotion) emits nothing.
+#[test]
+fn promoted_read_emits_the_promoted_type() {
+    let source = "void f(num x) { if (x is int) { x; } }";
+    let (flow, facts) = analyze(source);
+    let promoted: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { ty, .. } => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1, "{facts:?}");
+    assert!(!promoted[0].nullable);
+    let crate::ty::Base::Name(id) = promoted[0].base else {
+        panic!("expected a named promotion, got {:?}", promoted[0]);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+}
+
+/// (b) Unpromoted and demoted reads emit nothing: without a promotion the
+/// chain head is the declared type, and a write drops the chain back to
+/// it (`take_facts` bounds the face to real promotions).
+#[test]
+fn unpromoted_and_demoted_reads_emit_nothing() {
+    // No promotion ever applied.
+    let plain = "void f(int x) { x; }";
+    assert!(facts_of(plain).is_empty());
+    // Promoted, then written (demoted): the read after the write sees
+    // the declared type again. The write target's own facts retract with
+    // the assignment (the identifier is the write).
+    let demoted = "void f(int? x) { if (x is int) { x = null; x; } }";
+    assert!(facts_of(demoted).is_empty());
+}
+
+/// (c) The #611 suppression gate: a promotion whose tested type spelled
+/// type arguments presents as a bare name at this seam, so its reads stay
+/// out of the fact face; the arg-free twin (`x is List`) and nullability
+/// promotions stay in scope.
+#[test]
+fn arg_bearing_promotions_suppressed_arg_free_emitted() {
+    // `x is List<int>`: real promotion, erased arguments — suppressed.
+    let arg_bearing = "void f(List? x) { if (x is List<int>) { x; } }";
+    assert!(facts_of(arg_bearing).is_empty(), "{arg_bearing}");
+    // `x is List`: the same promotion shape, no arguments — emitted.
+    let arg_free = "void f(List? x) { if (x is List) { x; } }";
+    let promoted = promoted_tys(arg_free);
+    assert_eq!(promoted.len(), 1);
+    assert!(matches!(promoted[0].base, crate::ty::Base::Name(_)));
+    assert!(!promoted[0].nullable);
+    // A multi-argument tested type suppresses too (same latch).
+    let multi = "void f(Map? x) { if (x is Map<String, int>) { x; } }";
+    assert!(facts_of(multi).is_empty());
+}
+
+/// (d) The name-recovery face: `Base::Name(id)` round-trips through
+/// `name_lexeme` to its source spelling, and ids are dense (every id
+/// below a fact's id resolves).
+#[test]
+fn name_lexeme_recovers_interned_spellings() {
+    let source = "void f(num x) { if (x is int) { x; } }";
+    let (flow, facts) = analyze(source);
+    let promoted: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { ty, .. } => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1);
+    let crate::ty::Base::Name(id) = promoted[0].base else {
+        panic!("expected a named promotion, got {:?}", promoted[0]);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+    for lower in 0..id {
+        assert!(
+            !flow.0.borrow().name_lexeme(lower).is_empty(),
+            "id {lower} below {id} must resolve (dense ids)"
+        );
+    }
+}
+
+/// (e) `take_facts` stays offset-sorted with the new variant mixed in
+/// (the sort arm covers all three fact kinds).
+#[test]
+fn take_facts_stays_offset_sorted_with_promotion_reads() {
+    let source = "void f() { return; 1; } void g(num x) { if (x is int) { x; } }";
+    let facts = facts_of(source);
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    assert!(matches!(facts[0], FlowFact::DeadCode { .. }));
+    assert!(matches!(facts[1], FlowFact::PromotedRead { .. }));
+    let offsets: Vec<u32> = facts
+        .iter()
+        .map(|fact| match fact {
+            FlowFact::DeadCode { span }
+            | FlowFact::UnassignedRead { span, .. }
+            | FlowFact::PromotedRead { span, .. } => span.range.offset,
+        })
+        .collect();
+    assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+/// The plain-assignment target retraction covers `PromotedRead` too: a
+/// target read inside a promoted branch emits the promotion fact (the
+/// read runs before the assignment), but the identifier is the write —
+/// both of its facts (the definitely-unassigned row and the promoted
+/// row) must be retracted with it. The condition's own read survives
+/// legitimately: `x` is still definitely unassigned there, which is the
+/// official `not_assigned_potentially_non_nullable_local_variable` shape,
+/// and its span is the condition's, not the target's — outside the
+/// retraction's span key.
+#[test]
+fn plain_assign_target_retracts_its_promoted_read() {
+    let source = "void f() { String? x; if (x is String) { x = 'a'; } }";
+    let facts = facts_of(source);
+    let target_offset = source.find("x = 'a'").expect("target in source") as u32;
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    match &facts[0] {
+        FlowFact::UnassignedRead { span, .. } => {
+            assert!(
+                span.range.offset < target_offset,
+                "the survivor must be the condition read, not the target: {facts:?}"
+            );
+        }
+        other => panic!("expected only the condition's unassigned read, got {other:?}"),
+    }
 }
 
 /// Boolean short-circuit join: `a && b` merges the false arms.
@@ -554,11 +735,15 @@ fn arrow_body_nets_one_value() {
 /// `suspension` demotes only inside a local function (official
 /// `_enclosingFunctionExpressionInfoStack` non-empty): an await directly
 /// in an async method body demotes nothing, so a promotion from the
-/// condition survives the await without crashing.
+/// condition survives the await without crashing — and the promoted read
+/// after the await still surfaces as a fact.
 #[test]
 fn await_in_plain_async_method_demotes_nothing() {
     let source = "void f(int? x, Future g()) async { if (x != null) { await g(); x; } }";
-    assert!(facts_of(source).is_empty());
+    let promoted = promoted_tys(source);
+    assert_eq!(promoted.len(), 1);
+    assert!(matches!(promoted[0].base, crate::ty::Base::Name(_)));
+    assert!(!promoted[0].nullable);
 }
 
 /// `joinPromotedTypes` is the order-preserving intersection (official

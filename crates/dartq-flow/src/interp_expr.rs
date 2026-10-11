@@ -51,6 +51,28 @@ impl Interp<'_> {
                             self.record_read(var);
                             let model = self.current.model(var);
                             let ty = self.promoted_type_of(var, &model);
+                            let declared = self
+                                .vars
+                                .get(var as usize)
+                                .map_or(Ty::UNKNOWN, |meta| meta.ty);
+                            // Promotion fact (bounded to real promotions:
+                            // `promoted_type_of` returns the declared type
+                            // when unpromoted, so only a chain head emits).
+                            // Arg-bearing promotions are suppressed (the
+                            // recorder erased their type arguments, #611),
+                            // and dead reads carry no row (their
+                            // unreachable region is already reported as
+                            // dead code). Invariant with the plain-assign
+                            // retraction below: an assignment TARGET read
+                            // under an active promotion emits here, so the
+                            // retraction removes this fact too — the
+                            // target identifier is a write, not a read.
+                            if self.reachable()
+                                && ty != declared
+                                && !self.arg_promotions.contains(&var)
+                            {
+                                self.emit(FlowFact::PromotedRead { span: *token, ty });
+                            }
                             let mut expr = Expr::of_reference(var, ty);
                             expr.read_span = Some(*token);
                             self.exprs.push(expr);
@@ -63,11 +85,22 @@ impl Interp<'_> {
                     _ => {}
                 }
             }
-            Ev::Type { base, nullable } => {
+            Ev::Type {
+                base,
+                nullable,
+                had_type_args,
+            } => {
                 let ty = Ty {
                     base: *base,
                     nullable: *nullable,
                 };
+                // Route the arg-bearing latch beside the type: only the
+                // test/cast sinks promote from a row (#611).
+                if self.in_type_test {
+                    self.tested_had_args = *had_type_args;
+                } else if self.in_as_cast {
+                    self.as_cast_had_args = *had_type_args;
+                }
                 self.sink_type(ty);
             }
             Ev::NoType | Ev::FunctionType => self.sink_type(Ty::UNKNOWN),
@@ -259,6 +292,12 @@ impl Interp<'_> {
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, tested);
+                    // A real promotion from an arg-bearing tested type is
+                    // bare-named at this seam: latch the variable so its
+                    // reads stay out of the fact face (#611).
+                    if self.tested_had_args && promoted.is_some() {
+                        self.mark_arg_promotion(var);
+                    }
                     let (matched, unmatched) = self.branch_type_test(var, tested, promoted);
                     let (if_true, if_false) = if is_not {
                         (unmatched, matched)
@@ -301,6 +340,9 @@ impl Interp<'_> {
                         .and_then(|p| p.pending_decls.last().copied())
                         && let Some(var) = self.resolve(name)
                     {
+                        if self.as_cast_had_args {
+                            self.mark_arg_promotion(var);
+                        }
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
@@ -315,6 +357,10 @@ impl Interp<'_> {
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, cast_ty);
                     if let Some(promoted) = promoted {
+                        // Arg-bearing cast promotion: latch (#611).
+                        if self.as_cast_had_args {
+                            self.mark_arg_promotion(var);
+                        }
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
@@ -333,10 +379,19 @@ impl Interp<'_> {
                     let written = if *plain { rhs.ty } else { Ty::UNKNOWN };
                     if let Some(span) = target.read_span {
                         // A plain assignment's target identifier is the
-                        // write, not a read: retract its fact.
+                        // write, not a read: retract its facts. Both read
+                        // facts can coexist at this span — the target read
+                        // may run under an active promotion (writing
+                        // inside a promoted branch) and may be definitely
+                        // unassigned.
                         if *plain {
                             self.facts.retain(|fact| {
-                                !matches!(fact, FlowFact::UnassignedRead { span: s, .. } if *s == span)
+                                !matches!(
+                                    fact,
+                                    FlowFact::UnassignedRead { span: s, .. }
+                                        | FlowFact::PromotedRead { span: s, .. }
+                                        if *s == span
+                                )
                             });
                         }
                     }

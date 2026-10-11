@@ -2,6 +2,8 @@
 
 use dartq_parser::TokenSpan;
 
+use crate::ty::Ty;
+
 /// One flow-analysis fact about an executable body, in source order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowFact {
@@ -28,5 +30,19 @@ pub enum FlowFact {
         is_final: bool,
         /// The variable's declared type, when the declaration carried one.
         declared_type: Option<dartq_source::SourceRange>,
+    },
+    /// A read of a local variable (or parameter) whose flow-promoted type
+    /// differs from its declared type — the promotion facts a type-check
+    /// consumer needs to see the promoted type at the read. Emitted only
+    /// for real promotions (unpromoted and demoted reads carry no row),
+    /// and suppressed when the promotion's tested type carried type
+    /// arguments (the recorder erases them, so the fact would present the
+    /// promotion as a bare named type and a consumer could wrongly clean
+    /// rows against arg-bearing targets — #611).
+    PromotedRead {
+        /// Span of the read's identifier token.
+        span: TokenSpan,
+        /// The promoted type on this control-flow path (chain head).
+        ty: Ty,
     },
 }
