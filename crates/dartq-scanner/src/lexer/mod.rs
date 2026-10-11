@@ -1090,7 +1090,8 @@ impl<'s> Lexer<'s> {
                 continue;
             };
             let utf16 = self.utf16_value;
-            let close_idx = self.tokens.len() as u32;
+            // Full-stream index: record_end subtracts token_base itself.
+            let close_idx = self.token_base + self.tokens.len() as u32;
             self.tokens
                 .push(Token::new(close_kind, eof as u32, 0, utf16).synthetic());
             self.end_of.push(crate::token::NO_END);
