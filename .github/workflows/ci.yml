@@ -1,0 +1,72 @@
+# Minimal release-grade CI.
+#
+# scripts/ci.sh (per-crate serial fmt + clippy) is fully subsumed by the
+# workspace-wide steps of the `rust` job, so it is not re-run here. The
+# `gates` job runs the Dart differential gates (m0 / m1 / lints), which
+# scripts/ci.sh deliberately excludes, reproducing their local oracle
+# assumptions on the runner:
+#   - The gates resolve the oracle at $FVM_HOME/default/bin/cache/dart-sdk
+#     (fvm layout, default FVM_HOME=~/fvm); setup-dart's SDK is symlinked
+#     into that shape.
+#   - The gate bars are calibrated against the Dart 3.13.1 oracle of record
+#     (a different banner is a WARN in the scripts but can legitimately
+#     shift the code set), so the SDK is pinned instead of tracking stable.
+#   - Corpus .dart_tool/ directories are gitignored, so the four gate
+#     corpora are pub-getted from a clean clone.
+#   - Each gate's default command expects ./target/{release,debug}/dartq and
+#     ./target/{release,debug}/harness; both profiles are built.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.1
+      - name: Lay out the fvm-style oracle home
+        run: |
+          sdk_root="$(dirname "$(dirname "$(command -v dart)")")"
+          mkdir -p "$HOME/fvm/default/bin/cache"
+          ln -s "$sdk_root" "$HOME/fvm/default/bin/cache/dart-sdk"
+      - name: Pub-get the gate corpora
+        run: |
+          for corpus in m0 m0-syntax m1-semantic lints; do
+            (cd "tests/corpus/$corpus" && dart pub get)
+          done
+      - name: Build dartq and harness
+        run: |
+          cargo build -p dartq-cli --release
+          cargo build -p harness --release
+          cargo build -p dartq-cli
+          cargo build -p harness
+      - name: M0 differential gate
+        run: bash scripts/m0-gate.sh --label ci
+      - name: M1 differential gate
+        run: bash scripts/m1-gate.sh --label ci
+      - name: Lint differential gate
+        run: bash scripts/lint-gate.sh --label ci
