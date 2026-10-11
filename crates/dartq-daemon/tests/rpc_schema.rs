@@ -13,9 +13,7 @@
 //! document (the daemon envelope is the JSONL batch convention).
 //! `dartq/check`, `dartq/analyze`, `dartq/index`, and `dartq/assists` carry
 //! the `schema_version` stamp with no published domain yet — the stamp-only
-//! pin below documents that gap, as does the fix writer's undeclared
-//! provenance surface (`edits[].source` at every tier, `edits[].message` at
-//! full).
+//! pin below documents that gap (#632).
 
 mod common;
 
@@ -396,24 +394,25 @@ fn dartq_explain_answers_validate_at_every_tier() {
 
 /// dartq/fix's per-file documents are the `Domain::FixPatch` payloads (the
 /// daemon envelope is the batch convention, one stamp of its own plus one
-/// per document). The live writer's provenance tag (`edits[].source`, every
-/// tier) and the full tier's human-name row (`edits[].message`) are
-/// undeclared in the frozen schema — the discovered #623 gap, pinned here
-/// at its exact violation path. Stripping exactly those fields validates,
-/// proving the break has no other source. (Follow-up ticket: declare the
-/// provenance surface additively or move it off the machine document.)
+/// per document). Since #631 declared the provenance surface — `source`
+/// required at every tier, `message`/`priority`/`rule` full-only — the live
+/// documents validate outright at every tier; `stale` remains the only
+/// absence-tolerant edit field. The builtin row carries the `builtin-lint`
+/// tag, and the full tier adds its rule id and human message (a plugin
+/// row's `message` + `priority` ride the same full-only rule; the
+/// live-plugin dispatch is the ignored serial test's scene).
 #[test]
-fn dartq_fix_documents_pin_the_undeclared_provenance_fields() {
+fn dartq_fix_documents_validate_with_their_provenance() {
     let workspace = Workspace::new(CLEAN_MAIN);
     let fixable = workspace.root.join("fixable.dart");
     fs::write(&fixable, "void f() { var a = new B(); }\n").expect("write fixable");
     let mut h = spawn(&workspace, &store_root("schema-fix"));
     handshake(&mut h, 0);
 
-    for (id, tier, undeclared) in [
-        (2, Verbosity::Minimal, "edits[0].source"),
-        (3, Verbosity::Compact, "edits[0].source"),
-        (4, Verbosity::Full, "edits[0].message"),
+    for (id, tier) in [
+        (2, Verbosity::Minimal),
+        (3, Verbosity::Compact),
+        (4, Verbosity::Full),
     ] {
         h.step(
             &request(
@@ -429,30 +428,28 @@ fn dartq_fix_documents_pin_the_undeclared_provenance_fields() {
         let result = answer_result(&h, id);
         let files = result["files"].as_array().expect("files array");
         assert_eq!(files.len(), 1, "the fixable file's document: {result}");
-        let document = serde_json::to_string(&files[0]).expect("patch document serializes");
-        let violation = validate(&document, Domain::FixPatch)
-            .expect_err("the provenance surface is undeclared (the #623 gap)");
-        assert_eq!(violation.path, undeclared, "at tier {tier}: {violation}");
-        assert_eq!(
-            serde_json::to_string(&result)
-                .expect("response serializes")
-                .matches("\"schema_version\"")
-                .count(),
-            2,
-            "one envelope stamp plus the document's own: {result}"
-        );
+        assert_valid_at_tier(&files[0], Domain::FixPatch, tier);
+        assert_eq!(stamp_count(&result), 2, "envelope plus document: {result}");
 
-        // Without exactly those fields the document validates whole: the
-        // break is the undeclared surface alone, not the row shapes.
-        let mut stripped = files[0].clone();
-        for edit in stripped["edits"].as_array_mut().expect("edits") {
-            let row = edit.as_object_mut().expect("edit row");
-            row.remove("source");
-            if tier == Verbosity::Full {
-                row.remove("message");
-            }
+        let edit = &files[0]["edits"][0];
+        assert_eq!(
+            edit["source"], "builtin-lint",
+            "the provenance tag rides every tier: {edit}"
+        );
+        if tier == Verbosity::Full {
+            assert_eq!(edit["rule"], "unnecessary_new", "the rule id: {edit}");
+            assert!(
+                !edit["message"].as_str().expect("message").is_empty(),
+                "the human message: {edit}"
+            );
+        } else {
+            assert!(
+                edit.get("rule").is_none()
+                    && edit.get("message").is_none()
+                    && edit.get("priority").is_none(),
+                "message/priority/rule are full-only: {edit}"
+            );
         }
-        assert_valid_at_tier(&stripped, Domain::FixPatch, tier);
     }
 
     h.step(&request(9, "shutdown", json!(null)), 1);
