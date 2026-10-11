@@ -279,6 +279,7 @@ dependencies = [
  "blake3",
  "dartq-semantic",
  "dartq-source",
+ "rustc-hash",
  "serde",
  "serde_json",
 ]
@@ -300,6 +301,7 @@ dependencies = [
  "dartq-semantic",
  "dartq-snapshot",
  "dartq-source",
+ "libc",
  "rayon",
  "rustc-hash",
  "serde",
@@ -339,6 +341,7 @@ dependencies = [
 name = "dartq-language"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash",
  "serde",
  "serde_yaml",
  "thiserror",
@@ -383,6 +386,7 @@ dependencies = [
  "dartq-diagnostics",
  "dartq-source",
  "memchr",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",
