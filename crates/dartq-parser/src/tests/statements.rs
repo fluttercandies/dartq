@@ -327,10 +327,7 @@ fn expression_statement_recovery_is_bounded() {
     // reports expected_but_got at the `}`. Exactly two diagnostics; the
     // recovery stays bounded.
     let c = parse("void f() { + }");
-    assert_eq!(
-        c.error_codes(),
-        ["missing_identifier", "expected_token"]
-    );
+    assert_eq!(c.error_codes(), ["missing_identifier", "expected_token"]);
     c.assert_sequence(&[
         ("begin", "block_function_body"),
         ("end", "block_function_body"),
@@ -594,4 +591,25 @@ fn expression_statement_missing_semicolon_matches_oracle() {
     assert_eq!(c.errors[0].1, 11);
     assert_eq!(c.errors[0].2, 12);
     assert_eq!(c.texts[0], "Expected to find ';'.");
+}
+
+// —— statement-position as/is rescue ————————————————————————————————————
+
+#[test]
+fn statement_as_is_rescue_keeps_the_leading_operand() {
+    // Official gate (`parser_impl.dart:10026-10046`): `beforeType ==
+    // start` + built-in `as`/`is` with a follower that is not `=`/`;`/`,`
+    // re-parses from the statement's first token
+    // (`parseExpressionStatement(start)`), so `x as int;` is a full
+    // `x as int` expression statement — the operand tentatively consumed
+    // as the type is re-read, not dropped (a dropped read surfaces
+    // downstream as an unused_local_variable false positive plus
+    // undefined_identifier false positives).
+    let c = parse("void f() { x as int; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("handle", "expression_statement")]);
+
+    let c = parse("void f() { x is int; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("handle", "expression_statement")]);
 }

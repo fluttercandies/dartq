@@ -600,7 +600,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             return ExprStmtOrDecl::Parsed;
         }
 
-        // Built-in `as`/`is` leading an expression (`as foo;`).
+        // Built-in `as`/`is` after an operand-shaped head (`x as int;`):
+        // official gate `beforeType == start` + built-in `as`/`is` with a
+        // follower that is not `=`/`;`/`,`.
         if matches!(
             self.peek_kind(),
             TokenKind::Keyword(Keyword::As | Keyword::Is)
@@ -614,6 +616,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     return ExprStmtOrDecl::NotDecl;
                 }
                 if !for_parts {
+                    // Official rescue (`parser_impl.dart:10026-10046`):
+                    // `return parseExpressionStatement(start)` — re-parse
+                    // from the statement's first token, so the operand
+                    // tentatively consumed as the type is re-read as part
+                    // of the expression instead of being dropped.
+                    self.cursor.reset(before_type);
                     self.parse_expression_statement();
                     return ExprStmtOrDecl::Parsed;
                 }
@@ -1829,8 +1837,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     return self.finish_expression_function_body(arrow, of_function_expression);
                 }
                 // Stray keyword/identifier before `=>` (user is typing).
-                if is_keyword_or_identifier(next)
-                    && self.cursor.look_kind(1) == TokenKind::Function
+                if is_keyword_or_identifier(next) && self.cursor.look_kind(1) == TokenKind::Function
                 {
                     let at = self.peek_span();
                     self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
