@@ -73,8 +73,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             state.delimiter = Some(span);
                         }
                     }
-                    let after = self.parse_optional_positional_parameters(kind);
-                    end = self.ensure_close_paren(after);
+                    // Official two-token shape `ensureCloseParen(token, begin)`
+                    // (:1951): the report anchors on the token after the
+                    // group, but the jump target is the LIST's `(` endGroup —
+                    // staying in-list across any junk (including whole
+                    // malformed groups that follow) instead of synthesizing
+                    // a `)` that orphans the rest of the list.
+                    self.parse_optional_positional_parameters(kind);
+                    end = self.ensure_close_paren(begin);
                     break;
                 }
                 TokenKind::OpenCurly => {
@@ -86,8 +92,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             state.delimiter = Some(span);
                         }
                     }
-                    let after = self.parse_optional_named_parameters(kind);
-                    end = self.ensure_close_paren(after);
+                    // `ensureCloseParen(token, begin)` (:1956) — jump to the
+                    // list `(` endGroup, same rationale as the `[` arm.
+                    self.parse_optional_named_parameters(kind);
+                    end = self.ensure_close_paren(begin);
                     break;
                 }
                 TokenKind::Index => {
@@ -115,7 +123,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         kind,
                     );
                     self.cursor.advance(); // synthetic `]`
-                    end = self.ensure_close_paren(at);
+                    // `ensureCloseParen(token, begin)` (:1962) — same list-open
+                    // jump target as the `[`/`{` arms.
+                    end = self.ensure_close_paren(begin);
                     break;
                 }
                 _ => {}

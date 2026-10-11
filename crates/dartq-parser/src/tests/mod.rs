@@ -14,6 +14,7 @@ mod gate_m0;
 mod gate_m0_wave1;
 mod gate_m0_wave2;
 mod gate_m0_wave3;
+mod gate_m0_wave4;
 mod goldens;
 mod patterns;
 
