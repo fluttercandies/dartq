@@ -390,8 +390,9 @@ impl AnalyzeClock {
         );
     }
 
-    /// Closes the demand: diagnostics arrived (the reader) or the generation
-    /// died (the kill paths and the monitor's own kill).
+    /// Closes the demand: diagnostics arrived (the reader), the stream ended
+    /// (the reader's exit — nothing can follow), or the generation was killed
+    /// (the kill paths and the monitor's own kill).
     fn close(&self) {
         self.open_at_millis.store(Self::CLOSED, Ordering::Relaxed);
     }
@@ -1108,6 +1109,13 @@ fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> JoinHandle<()> {
                 &h.stats,
                 &h.clock,
             );
+            // The stream is over: no diagnostic can ever arrive on this
+            // generation, so the demand's clock closes here — the natural
+            // -death twin of the kill paths. Left open, a caller that idles
+            // past the callback budget hands the monitor an open clock on a
+            // corpse and its budget arm fires, overwriting the death reason
+            // recorded below.
+            h.clock.close();
             h.alive.store(false, Ordering::Relaxed);
             if let Err(reason) = outcome {
                 // First-writer-wins on the death slot: every deterministic
@@ -1319,11 +1327,21 @@ fn spawn_monitor(
                 if let Some(open_for) = h.clock.open_for(created)
                     && open_for > callback_timeout
                 {
-                    *h.death.lock().expect("death lock") = Some(format!(
-                        "no diagnostics were produced within the {} ms \
-                         analyze callback budget",
-                        callback_timeout.as_millis()
-                    ));
+                    // First-writer-wins on the death slot, as in the reader's
+                    // EOF: between the clock read above and this lock a
+                    // genuine death may already have recorded its cause. This
+                    // arm then only finishes the corpse (the kill below is a
+                    // no-op reap) and must not re-attribute the death to the
+                    // budget.
+                    let mut slot = h.death.lock().expect("death lock");
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "no diagnostics were produced within the {} ms \
+                             analyze callback budget",
+                            callback_timeout.as_millis()
+                        ));
+                    }
+                    drop(slot);
                     h.alive.store(false, Ordering::Relaxed);
                     if let Some(mut child) = child.lock().expect("child lock").take() {
                         kill_and_reap(&mut child);
