@@ -2006,14 +2006,14 @@ fn dead_interval_switch_members_report_per_group() {
 
 /// official `test_doWhile_break_outerLabel` shape: a labeled statement
 /// ends without a covering close, so the interval anchored inside runs
-/// through the label's closing brace to the enclosing close. The
-/// recorded anchor is the statement past the labels (official
-/// `beginLabeledStatement(next, …)`), so the `L: ` prefix sits outside
-/// the row.
+/// through the label's closing brace to the enclosing close. The anchor
+/// is the FIRST LABEL token (official `firstDead.firstToken`,
+/// dead_code_verifier.dart:253 — the AST node starts at `L`), so the
+/// `L: ` prefix sits inside the row (#641).
 #[test]
 fn dead_interval_labeled_statement_runs_to_the_tail() {
     let source = "void f(bool c) { return; L: while (c) { continue L; } 1; }";
-    assert_eq!(dead_snippets(source), ["while (c) { continue L; } 1;"]);
+    assert_eq!(dead_snippets(source), ["L: while (c) { continue L; } 1;"]);
 }
 
 /// A dead local declaration as the covering list's last statement: the
@@ -2106,12 +2106,11 @@ fn dead_interval_switch_without_members_runs_to_the_brace() {
 /// official row anchor of a dead labeled statement: the LABELED
 /// STATEMENT's first token — the label (`a`) — because
 /// `firstDead.firstToken` reads the AST node (dead_code_verifier.dart
-/// `_visitNode`/`flowEnd` :325-332), while fasta's
-/// `beginLabeledStatement(next, …)` (parser_impl.dart:6909) delivers the
-/// statement PAST the labels as the event marker. Our recorder anchors
-/// on the event token, so the `a: ` prefix is expected OUTSIDE the row
-/// today — this pin states the official extent.
-#[ignore = "adjudicated: official row starts at the first label (dead_code_verifier.dart:325-332); production fix ticketed #641, lands after the parser lane settles"]
+/// :253/:325-332), while fasta's `beginLabeledStatement(next, …)`
+/// (parser_impl.dart:6909) delivers the statement PAST the labels as the
+/// event marker. The recorder latches the first label-declaration token
+/// and anchors `LabeledBegin` on it, so the `a: ` prefix is INSIDE the
+/// row. #641.
 #[test]
 fn dead_interval_labeled_statement_starts_at_the_label() {
     let source = "void f(bool c) { return; a: while (c) {} }";

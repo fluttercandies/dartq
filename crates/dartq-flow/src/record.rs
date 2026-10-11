@@ -49,6 +49,12 @@ pub struct Flow<'t> {
     /// statement begin, or a switch case begin — case labels are counted
     /// on `CaseBegin` and never attach to a labeled statement).
     pending_labels: Vec<u32>,
+    /// The FIRST label-declaration token since the last consuming event.
+    /// `beginLabeledStatement` carries the statement past the labels
+    /// (official fasta shape), but the official dead row anchors at the
+    /// labeled statement's `firstToken` — the first label
+    /// (dead_code_verifier.dart:253) — so the begin latches this.
+    pending_label_token: Option<Token>,
     /// Recording buffer of the outermost active executable, if any.
     buffer: Option<Vec<Ev>>,
     /// Open `Ev::Block` event indices, for end-of-block span widening.
@@ -74,6 +80,7 @@ impl<'t> Flow<'t> {
             type_had_args: false,
             pending_label_ref: None,
             pending_labels: Vec::new(),
+            pending_label_token: None,
             buffer: None,
             block_events: Vec::new(),
             do_body_end: None,
@@ -783,9 +790,15 @@ impl ParserListener for Flow<'_> {
         // `getLabelTarget` scans every label of the labeled statement).
         let labels = std::mem::take(&mut self.pending_labels);
         let first = labels.first().copied();
+        // The event token is the statement PAST the labels (official fasta
+        // shape); the dead row anchors at the labeled statement's own
+        // `firstToken` — the first label (dead_code_verifier.dart:253) —
+        // so the latched label token wins when one was seen. No latch
+        // (recovered label without a name) falls back to the event token.
+        let anchor = self.pending_label_token.take().unwrap_or(token);
         self.record(Ev::LabeledBegin {
             label: first,
-            span: token,
+            span: anchor,
         });
         for id in labels.into_iter().skip(1) {
             self.record(Ev::LabelDecl { id });
@@ -854,6 +867,7 @@ impl ParserListener for Flow<'_> {
         // Case labels are counted on `CaseBegin`; drop their name
         // captures so they can never attach to a later labeled statement.
         self.pending_labels.clear();
+        self.pending_label_token = None;
         self.record(Ev::CaseBegin {
             label_count,
             expression_count,
@@ -953,6 +967,9 @@ impl ParserListener for Flow<'_> {
                 // consumed by the enclosing construct's begin event.
                 let id = self.name(token);
                 self.pending_labels.push(id);
+                if self.pending_label_token.is_none() {
+                    self.pending_label_token = Some(token);
+                }
             }
             _ => {}
         }
