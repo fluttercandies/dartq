@@ -563,11 +563,13 @@ void main() {}
                 Severity::Warning,
                 "STATIC_WARNING rows are oracle-WARNING"
             );
-            assert_eq!(
-                diagnostic.code.dtype,
-                DiagnosticType::StaticWarning
-            );
-            (diagnostic.range.offset, diagnostic.range.length, diagnostic.code.name, diagnostic.message.clone())
+            assert_eq!(diagnostic.code.dtype, DiagnosticType::StaticWarning);
+            (
+                diagnostic.range.offset,
+                diagnostic.range.length,
+                diagnostic.code.name,
+                diagnostic.message.clone(),
+            )
         })
         .collect();
 

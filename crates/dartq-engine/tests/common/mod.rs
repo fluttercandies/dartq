@@ -171,6 +171,7 @@ impl EventLog {
             dartq_engine::EngineEvent::CascadeInvalidated { libraries } => {
                 self.cascades.push(libraries);
             }
+            dartq_engine::EngineEvent::MemoryDegrade { .. } => {}
         }
     }
 }

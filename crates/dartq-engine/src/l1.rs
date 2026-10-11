@@ -117,6 +117,9 @@ pub(crate) fn apply(
         changed: changed_files.clone(),
         removed: removed.clone(),
     });
+    if let Some(sink) = state.trace.as_mut() {
+        sink.overlay_applied(changed_files.len(), removed.len());
+    }
 
     // Steps 2–3: facts recompute for gate-passing files (parallel scan/parse/
     // collect, sequential URI resolution), then residency update. The
@@ -153,6 +156,11 @@ pub(crate) fn apply(
             file: *file,
             gate: *gate,
         });
+        if let Some(sink) = state.trace.as_mut()
+            && let Some(path) = state.files.path(*file)
+        {
+            sink.file_revalidated(&path.to_string_lossy(), *gate);
+        }
     }
 
     // The L2 classification: a file whose API signature moved (or that is
@@ -196,6 +204,21 @@ pub(crate) fn apply(
     on_event(EngineEvent::CascadeInvalidated {
         libraries: invalidated.clone(),
     });
+    if state.trace.is_some() {
+        let libraries: Vec<String> = invalidated
+            .iter()
+            .filter_map(|library| {
+                state
+                    .libraries
+                    .info(*library)
+                    .and_then(|info| state.files.path(info.defining))
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        if let Some(sink) = state.trace.as_mut() {
+            sink.cascade_invalidated(&libraries);
+        }
+    }
     // Amortized store collection: this apply's replaced and removed
     // residency contents are the new dead candidates (gate hits carry none
     // — their put deduplicated); facts-cache evictions tallied themselves
@@ -833,8 +856,7 @@ pub(crate) fn combinator_diagnostic(
     Diagnostic::new(
         info.dtype.severity(),
         CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
-        info
-            .message
+        info.message
             .replace("{0}", library_uri)
             .replace("{1}", name),
         file,

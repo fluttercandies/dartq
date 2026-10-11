@@ -530,6 +530,9 @@ impl RawLog {
     fn sink(&mut self) -> impl FnMut(EngineEvent) + '_ {
         move |event| {
             self.events.push(match event {
+                // A budget tier firing is not part of the incremental
+                // contract (this suite never arms a budget) — skipped.
+                EngineEvent::MemoryDegrade { .. } => return,
                 EngineEvent::OverlayApplied { changed, removed } => {
                     RawEvent::Overlay { changed, removed }
                 }

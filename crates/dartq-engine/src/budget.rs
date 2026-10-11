@@ -66,6 +66,15 @@ impl Tier {
             Self::AstCold => "AST cold regions swapped out",
         }
     }
+
+    /// The machine key the §17.4 trace face carries (`MemoryDegrade.tier`).
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::LazyParse => "lazy_parse",
+            Self::SemanticSlices => "semantic_slices",
+            Self::AstCold => "ast_cold",
+        }
+    }
 }
 
 /// The budget state: the limit plus how far the ladder has descended.
