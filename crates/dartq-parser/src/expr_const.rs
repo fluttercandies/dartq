@@ -88,6 +88,12 @@ pub(crate) fn is_user_definable_operator(kind: TokenKind) -> bool {
     )
 }
 
+/// `_isNewOrIdentifier` (`parser_impl.dart:4090`): `new` names the unnamed
+/// constructor and reads as an identifier in constructor-name positions.
+fn is_new_or_identifier(kind: TokenKind) -> bool {
+    crate::recovery::is_identifier(kind) || kind == TokenKind::Keyword(Keyword::New)
+}
+
 // —— registry-backed messages ——————————————————————————————————————————
 // The shared `msg` module lives in message.rs (another lane's file); these
 // templates follow the same `_fe_analyzer_shared` texts against the same
@@ -169,6 +175,29 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         let mut context = context;
         let mut left = self.parse_pattern_unary(context);
+        // Method type arguments the operand left unconsumed (official
+        // `parsePrecedenceExpression` :7129-7147): `parseSend` discards a
+        // `<...>` group that does not open an invocation, and this level
+        // consumes it — a non-`(` follower is a generic tear-off, which a
+        // constant-pattern context reports once
+        // (`invalidConstantPatternGeneric`); the group never reaches the
+        // binary loop, so no comparison chain is minted.
+        if self.peek_kind() == TokenKind::Lt {
+            let lt = self.peek_span();
+            let candidate = self.compute_type_param_or_arg_on_lt(false);
+            if !matches!(candidate, crate::types::TypeParamOrArg::None) {
+                let _ = candidate.parse_arguments(self);
+                if self.peek_kind() != TokenKind::OpenParen {
+                    if context != ConstantPatternContext::None {
+                        self.report(invalid_constant_pattern_generic(), lt);
+                    }
+                    self.listener.handle_type_argument_application(lt);
+                }
+                // The selector level continues past the group
+                // (`C<int>.new`, official :7825-7841).
+                left = self.parse_selector_chain(left, context);
+            }
+        }
         // `lastBinaryExpressionLevel` (`parser_impl.dart:7263`): the level of
         // the previous plain binary at the equality/relational tiers, used to
         // reject `a == b == c` chains. Only the plain-binary arm reads or
@@ -519,7 +548,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 TokenKind::Period | TokenKind::QuestionPeriod => {
                     let is_null_aware = self.peek_kind() == TokenKind::QuestionPeriod;
                     self.cursor.advance();
-                    let name = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                    // `_tryRewriteNewToIdentifier` (parser_impl.dart:4105):
+                    // in a continuation context `new` after `.` names the
+                    // unnamed constructor and is rewritten to an identifier
+                    // with no report.
+                    let name = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
+                        let span = self.peek_span();
+                        self.cursor.advance();
+                        self.listener
+                            .handle_identifier(span, IdentifierContext::ExpressionContinuation);
+                        span
+                    } else {
+                        self.ensure_identifier(IdentifierContext::ExpressionContinuation)
+                    };
                     self.listener.handle_dot_access(name, name, is_null_aware);
                     end = name;
                     // Method type arguments after the name, optionally behind
@@ -586,28 +627,66 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.cursor.advance();
         self.listener
             .handle_identifier(begin, IdentifierContext::Expression);
-        // Type arguments directly followed by `(`.
+        // The name's `<...>` group has three official outcomes
+        // (`parseUnaryExpression` :7995-8013 + `parseSend` :9396-9412):
+        // `.` + (`new`|identifier) + `(` routes to the constructor-reference
+        // form (`C<int>.new(...)`), a direct `(` keeps the group for the
+        // invocation, and anything else leaves `<` in the stream for the
+        // precedence level (the generic tear-off `C<int>`).
         if self.peek_kind() == TokenKind::Lt {
-            let type_param = self.compute_type_param_or_arg(false);
-            if !matches!(type_param, crate::types::TypeParamOrArg::None) {
-                let mark = self.cursor.mark();
-                let open = self.peek_span();
-                type_param.parse_arguments(self);
-                if self.peek_kind() == TokenKind::OpenParen {
-                    self.listener.handle_type_argument_application(open);
-                    let end = self.parse_arguments();
-                    return end;
+            let candidate = self.compute_type_param_or_arg_on_lt(false);
+            if !matches!(candidate, crate::types::TypeParamOrArg::None) {
+                let follower = self.type_arg_follower(&candidate, self.cursor.real_pos());
+                if follower == TokenKind::Period {
+                    // `parseImplicitCreationExpression` (:9009) →
+                    // `parseConstructorReference` (:6414) with the
+                    // precomputed group: type arguments, then the
+                    // constructor name (`new` reads as the identifier via
+                    // the parser-level `ensureIdentifier` rewrite
+                    // :4076-4083), then the invocation arguments. The
+                    // probe's `.` can never be a compound-closer remainder,
+                    // so the tokens past the group sit at fixed offsets.
+                    let after = candidate.skip(begin.id);
+                    if is_new_or_identifier(self.kind_at(self.offset_of(after) + 2))
+                        && self.kind_at(self.offset_of(after) + 3) == TokenKind::OpenParen
+                    {
+                        let open_angle = self.peek_span();
+                        self.listener.begin_implicit_creation_expression(begin);
+                        let _ = candidate.parse_arguments(self);
+                        self.cursor.advance(); // `.`
+                        let _ = self.ensure_identifier(
+                            IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments,
+                        );
+                        let end = self.parse_arguments();
+                        self.listener
+                            .end_implicit_creation_expression(begin, open_angle);
+                        return end;
+                    }
+                } else if follower == TokenKind::OpenParen && !candidate.recovered() {
+                    let _ = candidate.parse_arguments(self);
+                    return self.parse_arguments();
                 }
-                self.cursor.reset(mark);
             }
         }
-        if self.peek_kind() == TokenKind::OpenParen {
-            return self.parse_arguments();
+        // The explicit-const gate (:9413-9423): only `.`/`(`/`<` can still
+        // complete a const constructor invocation; any other follower
+        // reports the const-prefix error once (a bare `const value`).
+        if context == ConstantPatternContext::Explicit
+            && !matches!(
+                self.peek_kind(),
+                TokenKind::Period | TokenKind::OpenParen | TokenKind::Lt
+            )
+        {
+            let at = self.span_of(
+                self.cursor
+                    .last_consumed_id()
+                    .expect("constant-pattern send parses after its head identifier"),
+            );
+            self.report(msg::invalid_constant_const_prefix(), at);
         }
         let next = self.peek_span();
         self.listener
             .handle_send_without_arguments(begin, begin, next);
-        let _ = context;
         begin
     }
 
