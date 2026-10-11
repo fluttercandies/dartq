@@ -10,12 +10,12 @@
 //! list (console + `dartq_panic_files` in the attribution report).
 //!
 //! Mechanics: probe subsets via symlink farms in a temp session dir (the
-//! `.dart` payload is symlinked, never copied; the two-file package
-//! scaffolding is copied so tooling writes cannot leak into the real corpus).
-//! Probe subsets are strictly smaller than their parent set, so the walk
-//! structurally terminates; a rerun budget (`2 * ceil(log2(N)) + 4`) fuses
-//! runaway attribution into a PARTIAL result. POSIX-only (symlink farms);
-//! Windows is out of scope.
+//! `.dart` payload is symlinked, never copied; the package scaffolding —
+//! pubspec, package config, pubspec lock — is copied so tooling writes cannot
+//! leak into the real corpus). Probe subsets are strictly smaller than their
+//! parent set, so the walk structurally terminates; a rerun budget
+//! (`2 * ceil(log2(N)) + 4`) fuses runaway attribution into a PARTIAL result.
+//! POSIX-only (symlink farms); Windows is out of scope.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -268,10 +268,17 @@ fn ceil_log2(n: usize) -> u32 {
 
 /// Materialize a probe subset at `dest`: the `.dart` payload as symlinks into
 /// the real corpus (zero content copying), the package scaffolding (pubspec +
-/// package config) copied so tooling writes cannot leak into the real corpus.
+/// package config + pubspec lock) copied so tooling writes cannot leak into
+/// the real corpus — and so dartq's workspace resolution answers here exactly
+/// as it answers on the corpus (a probe without the lock trips dartq's usage
+/// exit instead of the signature under attribution, #567).
 fn build_subset(corpus_root: &Path, files: &[PathBuf], dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("creating {}: {e}", dest.display()))?;
-    for scaffold in ["pubspec.yaml", ".dart_tool/package_config.json"] {
+    for scaffold in [
+        "pubspec.yaml",
+        ".dart_tool/package_config.json",
+        "pubspec.lock",
+    ] {
         let src = corpus_root.join(scaffold);
         if src.is_file() {
             let target = dest.join(scaffold);
@@ -546,6 +553,69 @@ mod tests {
             attribution.entries,
             vec![(Some("b".to_string()), "lib/y.dart".to_string())]
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The probe project carries the corpus's package scaffolding, the
+    /// pubspec lock included (#567): the r3 gate's probes lacked the lock and
+    /// dartq answered its usage exit (64, "no pubspec.lock") instead of the
+    /// panic signature, so every probe failed off-signature and the
+    /// attribution chain died. The scaffold batch is copy-if-present: a
+    /// corpus without a lock still builds a probe (and the lock rides as a
+    /// copy, never a symlink — tooling writes must not leak into the corpus).
+    #[test]
+    fn probe_subset_carries_the_package_scaffolding_including_the_lock() {
+        let root = std::env::temp_dir().join(format!("dq_bisect_scaffold_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        let corpus = write_corpus(
+            &root.join("corpus"),
+            &["a", "b"],
+            &[
+                ("pubspec.yaml", SCAFFOLD_PUBSPEC),
+                (".dart_tool/package_config.json", SCAFFOLD_CONFIG),
+                ("pubspec.lock", "packages:\n  c:\n    dependency: direct\n"),
+            ],
+        );
+        let dest = root.join("probe_0");
+        build_subset(&corpus, &[PathBuf::from("lib/a.dart")], &dest).expect("subset builds");
+
+        for scaffold in [
+            "pubspec.yaml",
+            ".dart_tool/package_config.json",
+            "pubspec.lock",
+        ] {
+            assert!(
+                dest.join(scaffold).is_file(),
+                "the probe carries {scaffold}"
+            );
+        }
+        // The scaffolding rides as copies, the payload as symlinks.
+        let lock = fs::symlink_metadata(dest.join("pubspec.lock")).expect("lock");
+        assert!(!lock.file_type().is_symlink(), "the lock is a copy");
+        let payload = fs::symlink_metadata(dest.join("lib/a.dart")).expect("payload");
+        assert!(
+            payload.file_type().is_symlink(),
+            "dart files stay symlinked"
+        );
+
+        // A corpus that has not had `dart pub get` run in it (no lock yet)
+        // still builds: every present scaffold copies, the absent lock is
+        // simply skipped.
+        let bare = write_corpus(
+            &root.join("bare"),
+            &["a"],
+            &[
+                ("pubspec.yaml", SCAFFOLD_PUBSPEC),
+                (".dart_tool/package_config.json", SCAFFOLD_CONFIG),
+            ],
+        );
+        let bare_dest = root.join("probe_bare");
+        build_subset(&bare, &[PathBuf::from("lib/a.dart")], &bare_dest)
+            .expect("bare subset builds");
+        assert!(bare_dest.join("pubspec.yaml").is_file());
+        assert!(bare_dest.join(".dart_tool/package_config.json").is_file());
+        assert!(!bare_dest.join("pubspec.lock").exists());
 
         fs::remove_dir_all(&root).ok();
     }
