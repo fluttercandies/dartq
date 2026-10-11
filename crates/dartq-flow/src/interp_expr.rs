@@ -284,22 +284,23 @@ impl<'o> Interp<'o> {
                     // A cast pattern (`p as T`; parser patterns.rs:176-187
                     // reuses the as-operator events): the primary pattern is
                     // not an expression, so nothing landed on the expr
-                    // stack. The cast refines the pattern's declared
-                    // variable on the matched path
-                    // (shared_type_analyzer.dart:145-152).
+                    // stack. The cast is a type assertion on the matched
+                    // path: the declared variable refines to the cast type
+                    // directly (shared_type_analyzer.dart:145-152) — it is
+                    // not a promotion candidate and must not run through
+                    // the promotion gate.
                     if let Some((name, _)) = self
                         .pattern
                         .as_ref()
                         .and_then(|p| p.pending_decls.last().copied())
                         && let Some(var) = self.resolve(name)
-                        && let Some(promoted) = self.promotion_candidate(var, cast_ty)
                     {
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some(promoted),
+                            Some(cast_ty),
                         );
                     }
                     return true;
@@ -542,13 +543,17 @@ impl<'o> Interp<'o> {
     /// The promotion target for a type check (official
     /// `tryPromoteForTypeCheck`'s true branch,
     /// flow_analysis.dart:4137-4145): the tested type factored against
-    /// every existing promotion, then the promotion-step gate (official
-    /// `tryPromoteToType` + `isValidPromotionStep`,
-    /// flow_analysis.dart:7229-7246, sound arm — `sound-flow-analysis` is
-    /// enabled-by-default and expired, `experiments/flags.dart:309-315`):
-    /// a bottom candidate (`x is int` twice factors to `Never`) and a
-    /// candidate the current type already subsumes (`x is int?` on
-    /// `int x`) are not steps. `None` when no step exists.
+    /// every existing promotion. A bottom candidate (`x is int` twice
+    /// factors to `Never`) and a candidate the current type already
+    /// subsumes (`x is int?` on `int x`) are not steps (official
+    /// `isValidPromotionStep`); anything else is the step. The official
+    /// `tryPromoteToType` further gates on `tested <: current`
+    /// (flow_analysis.dart:7229-7246) — a question the name-level seam
+    /// cannot decide (`int <: num` and `String <: num` are both false
+    /// without a class hierarchy) and the oracle pins require the
+    /// promotion on (`num n`, `is int`), so the undecided case promotes
+    /// optimistically; a resolved back-end re-tightens the gate through
+    /// [`crate::ty::TypeOps::try_promote_to`].
     fn promotion_candidate(&mut self, var: u32, tested: Ty) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,

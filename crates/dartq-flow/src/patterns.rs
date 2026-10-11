@@ -85,9 +85,14 @@ impl<'o> Interp<'o> {
                 // Pattern variables are assigned exactly when the pattern
                 // matched — declared initialized on the matched path
                 // (official `declare(initialized: true)` on the pattern's
-                // component scope).
+                // component scope). The annotation arrives as `Type`/`NoType`
+                // events immediately ahead of this event
+                // (parse_variable_pattern's `parse_type`); it is the
+                // variable's declared type (official `declare` carries it):
+                // the unmatched-branch factoring reads it, and a resolved
+                // back-end's promotion gate keys on it.
                 let meta = VarMeta {
-                    ty: Ty::UNKNOWN,
+                    ty: self.pending_ty.take().unwrap_or(Ty::UNKNOWN),
                     late: false,
                     is_final: *is_final,
                     decl_span: None,
@@ -102,7 +107,13 @@ impl<'o> Interp<'o> {
                     self.pending_writes.push(var);
                 }
             }
-            Ev::Wildcard { .. } => {}
+            Ev::Wildcard { .. } => {
+                // A typed wildcard (`num _`) parses its annotation but
+                // declares nothing: drop the pending type so it cannot
+                // leak into the next consumer (`Formal`,
+                // `DeclaredVarPattern`).
+                self.pending_ty = None;
+            }
             Ev::GuardBegin => {
                 // Snapshot the pre-guard state: the guard's own events run
                 // on `current` next and leave it on the guard-true arm, so

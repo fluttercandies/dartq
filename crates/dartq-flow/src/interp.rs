@@ -324,12 +324,15 @@ pub(crate) struct Interp<'o> {
     pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
     pub(crate) anywhere: Effects,
-    /// The unreachable reach node a dead-code row was already emitted
-    /// for. Descendant constructs inside the same dead region stay on
-    /// that node, so their rows are implied — official dead_code
-    /// reports one diagnostic per outermost dead statement and does
-    /// not descend.
-    dead_region: Option<u32>,
+    /// The replay-frame depth a dead-code row was last emitted at.
+    /// Constructs nested inside the reported statement run strictly
+    /// deeper, so their rows are implied — official dead_code folds a
+    /// dead compound into one diagnostic and does not descend
+    /// (`dead_code_verifier.dart` `_firstDead`). Sequential statements
+    /// at the reporting depth are separate dead statements and each
+    /// report (official dead_code per statement); any reachable
+    /// statement resets the memory.
+    dead_region: Option<usize>,
 
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
@@ -343,6 +346,7 @@ struct Snapshot {
     scopes_len: usize,
     vars_len: usize,
     facts_len: usize,
+    dead_region: Option<usize>,
 }
 
 impl<'o> Interp<'o> {
@@ -525,15 +529,19 @@ impl<'o> Interp<'o> {
     }
 
     pub(crate) fn dead_code(&mut self, span: TokenSpan) {
-        // One row per dead region: constructs inside an already-marked
-        // dead region keep the same unreachable reach node, so their
-        // unreachability is implied by the outermost row (official
-        // dead_code emits per outermost dead statement). A revived
-        // region re-enters with a fresh reach node and reports again.
-        if !self.reachable() && self.dead_region != Some(self.current.reach) {
-            self.dead_region = Some(self.current.reach);
-            self.emit(FlowFact::DeadCode { span });
+        if self.reachable() {
+            self.dead_region = None;
+            return;
         }
+        // Inside the statement a row was already reported for: implied.
+        if self
+            .dead_region
+            .is_some_and(|depth| self.stack.len() > depth)
+        {
+            return;
+        }
+        self.dead_region = Some(self.stack.len());
+        self.emit(FlowFact::DeadCode { span });
     }
 
     /// Reads of definitely-unassigned locals (official `isUnassigned`).
@@ -570,6 +578,7 @@ impl<'o> Interp<'o> {
             scopes_len: self.scopes.len(),
             vars_len: self.vars.len(),
             facts_len: self.facts.len(),
+            dead_region: self.dead_region,
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
@@ -592,6 +601,7 @@ impl<'o> Interp<'o> {
         self.vars.truncate(s.vars_len);
         self.facts.truncate(s.facts_len);
         self.current = s.current;
+        self.dead_region = s.dead_region;
         self.collect = outer;
         frames.into_iter().next().unwrap_or_default()
     }
