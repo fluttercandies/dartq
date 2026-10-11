@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Fault-tolerant recursive-descent parser for Dart: token table in, parser listener events out, with recovery mirroring the official parser."
 repository.workspace = true
 readme = "README.md"
+categories = ["parser-implementations"]
 keywords = ["dart", "parser", "recursive-descent"]
 
 [dependencies]

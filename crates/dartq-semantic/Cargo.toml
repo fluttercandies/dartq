@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Semantic element model for Dart: per-unit declarations, per-library member enumeration and lookup, reference diagnosis, and the API signature hash."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart", "analyzer", "semantics"]
 
 [dependencies]

@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Built-in Dart lint rules: the syntax-visible slice of the package:lints recommended and core sets, with ignore-comment suppression."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart", "linter", "lints", "static-analysis"]
 
 [dependencies]

@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "The dartq analysis engine: one context, two-phase content updates, topologically ordered recompute, and merged syntax and semantic diagnostics."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart", "analyzer", "incremental", "analysis"]
 
 [dependencies]

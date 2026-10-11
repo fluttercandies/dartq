@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Diagnostic data model and oracle-exact output writers for Dart analysis results."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart", "diagnostics"]
 
 [dependencies]

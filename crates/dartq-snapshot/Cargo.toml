@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "Persistent snapshot substrate for dartq's cold-start path: content-addressed analysis state on disk."
 repository.workspace = true
 readme = "README.md"
+keywords = ["dart", "snapshot", "persistence", "cold-start"]
+categories = ["development-tools"]
 
 [dependencies]
 blake3 = { workspace = true }

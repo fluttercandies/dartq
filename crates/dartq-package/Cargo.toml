@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Typed package identity model for Dart analysis, composed on top of pub's parsed resolution artifacts."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart"]
 
 [dependencies]

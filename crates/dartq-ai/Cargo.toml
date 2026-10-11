@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "Agent-facing analysis queries for dartq: symbols, impact, explain, compatibility, and fix."
 repository.workspace = true
 readme = "README.md"
+keywords = ["dart", "analyzer", "static-analysis"]
+categories = ["development-tools"]
 
 [dependencies]
 blake3 = { workspace = true }

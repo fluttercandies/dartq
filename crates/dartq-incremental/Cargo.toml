@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "Invalidation engine for incremental Dart analysis, built on signature hashes and dependency fingerprints."
 repository.workspace = true
 readme = "README.md"
+keywords = ["dart", "incremental", "invalidation"]
+categories = ["development-tools"]
 # Namespace placeholder — the implementation lives in `dartq-engine`; not for publish.
 publish = false
 

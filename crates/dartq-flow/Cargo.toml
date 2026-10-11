@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Dart flow analysis: type promotion and demotion, definite assignment, and reachability."
 repository.workspace = true
 readme = "README.md"
+categories = ["development-tools"]
 keywords = ["dart", "flow-analysis"]
 
 [dependencies]
