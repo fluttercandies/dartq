@@ -72,6 +72,8 @@
 //!   posture as `FileLayoutProvider`) rather than failing a whole batch.
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -97,6 +99,21 @@ use crate::stats::{PluginStats, PluginStatsSnapshot};
 
 /// How often the isolation monitor samples the child's RSS.
 const RSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Teardown join bound: how long a generation teardown waits for the reader
+/// or writer after the kill before detaching it. After a kill the threads
+/// unwind in microseconds (the Unix group kill closes every pipe write end,
+/// so the reader's `fill_buf` returns EOF immediately); the bound only binds
+/// when a descendant escaped the group (its own `setsid`, or a non-Unix
+/// target where only the direct child dies) and still holds the write end —
+/// one second of detach-latency there beats an unbounded hang, and it sits
+/// two orders below the smallest budget the teardown runs inside.
+const TEARDOWN_JOIN_BOUND: Duration = Duration::from_secs(1);
+
+/// Poll step while waiting out [`TEARDOWN_JOIN_BOUND`] (std has no timed
+/// join; `is_finished` + sleep bounds the wait without consuming the
+/// handle).
+const JOIN_POLL: Duration = Duration::from_millis(5);
 
 /// Pending-diagnostics fuse: a plugin that queues more than this many
 /// un-drained diagnostics is torn down as a protocol violation instead of
@@ -758,6 +775,13 @@ impl PluginRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(self.spec.stderr.stdio());
+        // Unix: the child leads its own process group (pgid == its pid), so
+        // every kill below can signal the whole group. A plugin that spawns
+        // descendants inheriting its stdout would otherwise keep the pipe's
+        // write end open past a direct kill — no EOF, and the generation's
+        // reader stays parked in `fill_buf` forever.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().map_err(|source| RuntimeError::Spawn {
             program: self.spec.program.clone(),
             source,
@@ -847,15 +871,23 @@ impl PluginRuntime {
     /// the generation being replaced. Must run before a new launch overwrites
     /// the per-generation fields. The writer's command channel is dropped
     /// first so a parked writer exits even when the kill cannot unblock it.
+    ///
+    /// The joins are bounded: the kill closes the pipes deterministically
+    /// (on Unix the group kill reaches descendants that inherited them), but
+    /// a descendant that escaped the group keeps the write end open and the
+    /// reader parked with no EOF. Waiting unbounded would turn a budgeted
+    /// enforcement kill into a permanent hang (§14.3); past the bound the
+    /// thread is detached and the relaunch proceeds — see [`join_bounded`]
+    /// for why detaching is safe.
     fn teardown_generation(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         self.commands = None;
         self.kill_child();
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            join_bounded(reader);
         }
         if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
+            join_bounded(writer);
         }
         // Monitors exit within one poll tick; they hold only their own
         // generation's Arcs and are detached here.
@@ -876,10 +908,10 @@ impl PluginRuntime {
         }
     }
 
-    /// Kills the child and reaps it (kill on an exited child is a no-op
-    /// error; the `wait` is what prevents zombies). Also flips `alive`: the
-    /// killer knows the death deterministically, the reader's EOF only later
-    /// — and a write into the dead child's pipe must never be attempted.
+    /// Kills the child and reaps it (the `wait` is what prevents zombies).
+    /// Also flips `alive`: the killer knows the death deterministically, the
+    /// reader's EOF only later — and a write into the dead child's pipe must
+    /// never be attempted.
     fn kill_child(&mut self) {
         // The demand ends with the generation: a killed child can no longer
         // produce diagnostics, and a stale-open clock must not outlive it.
@@ -887,8 +919,7 @@ impl PluginRuntime {
         self.alive.store(false, Ordering::Relaxed);
         let child = self.child.lock().expect("child lock").take();
         if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
         }
     }
 
@@ -963,6 +994,55 @@ impl Drop for PluginRuntime {
         self.kill_child();
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+/// Kills one generation's child and reaps it. On Unix the child leads its
+/// own process group (spawned with `process_group(0)`), so the negative-pid
+/// `SIGKILL` takes its descendants down with it — a descendant that
+/// inherited the child's stdout would otherwise hold the pipe's write end
+/// open past a direct kill, leaving the generation's reader parked in
+/// `fill_buf` with no EOF. The direct kill stays as the fallback everywhere
+/// (and is a no-op once the group kill already landed); the `wait` reaps the
+/// child so nothing leaks. Shared by every kill site — the handle-side
+/// `kill_child` and the monitor's budget arms — so no enforcement path can
+/// leave a survivor holding the pipes.
+fn kill_and_reap(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // A real pid fits `pid_t` (i32) on every supported Unix.
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // Safety: `kill(2)` only signals; the negative pid targets the
+            // child's own process group, never ours.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Joins `handle`, giving the worker [`TEARDOWN_JOIN_BOUND`] to exit; past
+/// the bound the handle is dropped and the thread detaches. Detaching is
+/// safe because every worker holds only its generation's
+/// [`GenerationHandles`] Arcs, and [`PluginRuntime::launch_once`] replaces
+/// all of them with fresh state before the next generation interacts: a
+/// detached reader/writer unwinds on its own copies when its pipe closes,
+/// and its late `Dead` event lands in the old generation's event channel —
+/// whose receiver is dropped by the relaunch — or fails harmlessly. The one
+/// cross-generation Arc (`stats`) is append-only atomics, so a late byte
+/// count from the dying generation is correct accounting, not corruption.
+/// The cost of a detached thread is bounded by the surviving descendant's
+/// lifetime: one parked thread and one pipe fd.
+fn join_bounded(handle: JoinHandle<()>) {
+    let deadline = Instant::now() + TEARDOWN_JOIN_BOUND;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return; // detach: the thread winds down on its own Arcs
+        }
+        std::thread::sleep(JOIN_POLL);
+    }
+    let _ = handle.join();
 }
 
 // --- threads ---
@@ -1155,8 +1235,7 @@ fn spawn_monitor(
                     ));
                     h.alive.store(false, Ordering::Relaxed);
                     if let Some(mut child) = child.lock().expect("child lock").take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_and_reap(&mut child);
                     }
                     h.clock.close();
                     break;
@@ -1178,8 +1257,7 @@ fn spawn_monitor(
                             ));
                             h.alive.store(false, Ordering::Relaxed);
                             if let Some(mut child) = child.lock().expect("child lock").take() {
-                                let _ = child.kill();
-                                let _ = child.wait();
+                                kill_and_reap(&mut child);
                             }
                             break;
                         }

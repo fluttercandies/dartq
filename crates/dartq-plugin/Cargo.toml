@@ -13,6 +13,9 @@ readme = "README.md"
 # `FileTable` resolves FileIds to the wire's path strings.
 dartq-diagnostics = { workspace = true }
 dartq-source = { workspace = true }
+# Process-group kill on Unix: an enforcement kill must take descendants that
+# inherited the child's pipes down with the child (PRD §14.3 isolation).
+libc = { workspace = true }
 memchr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
