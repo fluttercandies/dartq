@@ -6405,8 +6405,8 @@ impl<'a> Engine<'a> {
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
         };
-        let (shape, callee_name) = match self.rows.get(callee) {
-            Some(row) => (row.shape.clone(), row.name),
+        let (shape, callee_name, qualified) = match self.rows.get(callee) {
+            Some(row) => (row.shape.clone(), row.name, row.qualified),
             None => return,
         };
         let (resolved, defined) = match &shape {
@@ -6417,12 +6417,35 @@ impl<'a> Engine<'a> {
             // callee is a property access; both stay unresolved, mirroring
             // the arity path's filter.
             RowShape::Bare(_) => {
-                let decl = self
-                    .top_level_decl(callee_name)
-                    .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some());
-                let defined =
-                    decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
-                (decl.is_some(), defined)
+                // An invoked qualified selector (`c.m(b: 1)`) reaches its
+                // labels before the receiver merge: the parser fires the dot
+                // event after the send, so the latched row is still the
+                // selector's placeholder — the `qualified` plain row sitting
+                // directly on its receiver. Classify that pair now; the
+                // deferred merge needs the stack untouched.
+                if matches!(shape, RowShape::Bare(BareInfo::Plain { .. })) && qualified {
+                    let recv = match callee
+                        .checked_sub(1)
+                        .and_then(|i| self.rows.get(i))
+                        .map(|below| below.shape.clone())
+                    {
+                        Some(RowShape::Bare(info)) => Engine::receiver_of_bare(info),
+                        Some(RowShape::Receiver(recv)) => recv,
+                        _ => Receiver::Unknown,
+                    };
+                    let formals = self.member_formals_full(&recv, callee_name);
+                    (
+                        formals.is_some(),
+                        formals.is_some_and(|f| f.named.iter().any(|entry| entry.name == name)),
+                    )
+                } else {
+                    let decl = self
+                        .top_level_decl(callee_name)
+                        .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some());
+                    let defined =
+                        decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
+                    (decl.is_some(), defined)
+                }
             }
             RowShape::Member { recv } => {
                 let formals = self.member_formals_full(recv, callee_name);
@@ -12130,6 +12153,35 @@ mod tests {
             .filter(|row| row.use_kind == NameUse::NamedArgument)
             .collect();
         assert_eq!(named.len(), 2, "both labels feed the §8 table");
+    }
+
+    /// The membership test also covers an invoked qualified selector:
+    /// `c.m(b: 1)` against a method whose formals are positional-only
+    /// resolves `m` through the typed receiver's member formals and reports
+    /// `undefined_named_parameter` at the label (`type_analyzer.dart:5820`).
+    ///
+    /// Hand-trace: the parser fires the dot event for an invoked selector
+    /// after the send, so the label sees the callee row still as the
+    /// selector's placeholder sitting on its receiver row — the check
+    /// classifies the pair (`receiver_of_bare` → `Receiver::Typed{C}`) and
+    /// walks `C.m`'s formals (positional `a`, no named entry) → resolved,
+    /// not defined → emit at the `b` label.
+    #[test]
+    fn named_argument_miss_reports_on_member_callee() {
+        let report = report("class C { var m(var a) => a; } void use(C c) { c.m(b: 1); }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_named_parameter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The named parameter 'b' isn't defined."
+        );
+        // The label's own span: the `b` in `c.m(b: 1)` (offset 51, length 1).
+        assert_eq!(report.diagnostics[0].range.offset, 51);
+        assert_eq!(report.diagnostics[0].range.length, 1);
     }
 
     /// The named-argument membership test runs only against a real
