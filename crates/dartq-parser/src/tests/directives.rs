@@ -426,6 +426,34 @@ fn deferred_recovery_trio_matches_oracle() {
 }
 
 #[test]
+fn deferred_with_prefix_is_silent() {
+    // The still-valid control: `deferred as p` parses entirely in the
+    // primary `parseImportPrefixOpt` (:938) — recovery never runs and no
+    // deferred face fires.
+    assert!(error_codes("import 'x.dart' deferred as p;").is_empty());
+}
+
+#[test]
+fn deferred_face_decision_order_matches_oracle() {
+    // Multiple faces on one import follow the official do-loop order: the
+    // deferred block (:1055-1070) precedes the `as` block (:1071-1082) in
+    // every iteration. The primary `as p` sets hasPrefix, so the first
+    // recovery `deferred as q` reports deferredAfterPrefix then
+    // duplicatePrefix; the trailing bare `deferred` (special case
+    // :1057-1062, recorded via the recovery listener) reports
+    // duplicateDeferred. hasPrefix stays true, so
+    // missingPrefixInDeferredImport never fires.
+    assert_eq!(
+        error_codes("import 'a.dart' as p deferred as q deferred;"),
+        [
+            "deferred_after_prefix",
+            "duplicate_prefix",
+            "duplicate_deferred"
+        ]
+    );
+}
+
+#[test]
 fn unexpected_token_before_clause_is_skipped() {
     // `skipUnexpectedTokenOpt` (:5148): a stray identifier followed by a
     // clause keyword is reported and skipped.

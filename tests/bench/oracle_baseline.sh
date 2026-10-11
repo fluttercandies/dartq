@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# oracle_baseline.sh — repeatable `dart analyze` oracle baseline benchmark (goal #102).
+# oracle_baseline.sh — repeatable cold/hot analysis baseline benchmark (goal
+# #102; generalized for the A7 dartq-side leg, #798).
 #
 # Measures wall-clock time and peak RSS of `dart analyze --format=machine <dir>`
 # over N rounds (default 5), plus corpus scale (files / LOC / bytes).
@@ -11,20 +12,76 @@
 #   so cold vs hot captures analyzer-internal cost + VM startup, not disk cache state.
 #   Rounds 2..N are "hot" (same session, warm file cache).
 # - Single-instance discipline: rounds run strictly sequentially; do not run this
-#   script concurrently with another `dart analyze` process (noisy numbers).
+#   script concurrently with another analysis process on either side (noisy numbers).
 # - The script never runs `pub get`; the target directory must already have a
 #   package context (or none — dart analyze also works without one, see
 #   docs/facts/oracle-machine-format.md §3).
 #
-# Usage: oracle_baseline.sh <target-dir> [rounds]
+# Usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd "<command>"]
+#
+#   --cmd "<command>"  run <command> instead of the default `dart analyze
+#                      --format=machine` (the A7 dartq-side leg). One argument,
+#                      shell-word-split; the target dir is appended as the final
+#                      argument. The summary then records "cmd" (verbatim) and
+#                      "tool_version" (the command's binary `--version` banner —
+#                      one spawn per invocation, never per round) in place of
+#                      the "dart" field; every other field is unchanged, so a
+#                      --cmd leg and the default leg share one JSON schema
+#                      apart from that descriptor swap.
+#   --label <name>     summary "target" name (default: the target dir basename).
 set -uo pipefail
 
-DIR="${1:?usage: oracle_baseline.sh <target-dir> [rounds]}"
-ROUNDS="${2:-5}"
-LABEL="$(basename "$DIR")"
+DIR=""
+ROUNDS=""
+LABEL=""
+CMD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --label)
+    [ $# -ge 2 ] || { echo "error: --label needs a value" >&2; exit 2; }
+    LABEL="$2"
+    shift
+    ;;
+  --cmd)
+    [ $# -ge 2 ] || { echo "error: --cmd needs a value" >&2; exit 2; }
+    CMD="$2"
+    shift
+    ;;
+  -h | --help)
+    sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    if [ -z "$DIR" ]; then
+      DIR="$1"
+    elif [ -z "$ROUNDS" ]; then
+      ROUNDS="$1"
+    else
+      echo "error: unexpected argument: $1" >&2
+      exit 2
+    fi
+    shift
+    ;;
+  esac
+done
+DIR="${DIR:?usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd \"<command>\"]}"
+ROUNDS="${ROUNDS:-5}"
+LABEL="${LABEL:-$(basename "$DIR")}"
 
 [ -d "$DIR" ] || { echo "error: not a directory: $DIR" >&2; exit 2; }
-command -v dart >/dev/null || { echo "error: dart not on PATH" >&2; exit 2; }
+
+# The timed command: default `dart analyze --format=machine <dir>` (argv
+# identical to the pre-#798 shape), or the --cmd words with the target dir
+# appended. Word-splitting via eval handles quoted paths in the command.
+if [ -z "$CMD" ]; then
+  command -v dart >/dev/null || { echo "error: dart not on PATH" >&2; exit 2; }
+  RUN_WORDS=(dart analyze --format=machine "$DIR")
+else
+  eval "RUN_WORDS=($CMD)" 2>/dev/null || { echo "error: cannot parse --cmd: $CMD" >&2; exit 2; }
+  [ "${#RUN_WORDS[@]}" -ge 1 ] || { echo "error: --cmd is empty" >&2; exit 2; }
+  command -v "${RUN_WORDS[0]}" >/dev/null 2>&1 ||
+    { echo "error: --cmd binary not found or not executable: ${RUN_WORDS[0]}" >&2; exit 2; }
+fi
 
 # --- corpus scale -----------------------------------------------------------
 FILES=$(find "$DIR" -name '*.dart' | wc -l | tr -d ' ')
@@ -37,7 +94,16 @@ elif [ -f "$DIR/pubspec.yaml" ]; then CONTEXT="pubspec_only"
 else CONTEXT="none"; fi
 
 # --- environment descriptor -------------------------------------------------
-DART_VER=$(dart --version 2>&1)
+# The tool version: the default leg records the dart banner ("dart" field);
+# a --cmd leg records the command's own binary banner ("tool_version") — one
+# spawn per invocation either way, never per round.
+DART_VER=""
+TOOL_VER=""
+if [ -z "$CMD" ]; then
+  DART_VER=$(dart --version 2>&1)
+else
+  TOOL_VER=$("${RUN_WORDS[0]}" --version 2>&1)
+fi
 OS_VER=$(sw_vers -productVersion)
 ARCH=$(uname -m)
 CHIP=$(sysctl -n machdep.cpu.brand_string)
@@ -57,7 +123,7 @@ json_escape() { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; 
 for i in $(seq 1 "$ROUNDS"); do
   PHASE=$([ "$i" -eq 1 ] && echo cold || echo hot)
   set +e
-  /usr/bin/time -l -o "$WORK/time.$i" dart analyze --format=machine "$DIR" \
+  /usr/bin/time -l -o "$WORK/time.$i" "${RUN_WORDS[@]}" \
     >"$WORK/out.$i" 2>"$WORK/err.$i" </dev/null
   CODE=$?
   set -e
@@ -84,7 +150,17 @@ HOT_MEDIAN=$(echo "$HOT_SORTED" | awk -v n="$HOT_N" 'NR == int((n + 1) / 2) {pri
 RSS_MEDIAN=$(echo "$RSS_ALL" | sort -n | awk -v n="$ROUNDS" 'NR == int((n + 1) / 2) {print; exit}')
 DIAGS1=$(wc -l <"$WORK/out.1" | tr -d ' ')
 
-printf '{"record":"summary","target":"%s","context":"%s","files":%s,"loc":%s,"bytes":%s,"rounds":%d,"cold_real_ms":%s,"hot_min_ms":%s,"hot_median_ms":%s,"maxrss_median_bytes":%s,"diag_lines_round1":%s,"dart":"%s","os":"macOS %s","arch":"%s","chip":"%s","cores":%s,"ram_bytes":%s,"utc":"%s"}\n' \
-  "$LABEL" "$CONTEXT" "$FILES" "$LOC" "$BYTES" "$ROUNDS" \
-  "$COLD_MS" "$HOT_MIN" "$HOT_MEDIAN" "$RSS_MEDIAN" "$DIAGS1" \
-  "$(json_escape "$DART_VER")" "$OS_VER" "$ARCH" "$(json_escape "$CHIP")" "$CORES" "$RAM_BYTES" "$STAMP"
+# Default leg: the pre-#798 summary shape, byte-identical.
+if [ -z "$CMD" ]; then
+  printf '{"record":"summary","target":"%s","context":"%s","files":%s,"loc":%s,"bytes":%s,"rounds":%d,"cold_real_ms":%s,"hot_min_ms":%s,"hot_median_ms":%s,"maxrss_median_bytes":%s,"diag_lines_round1":%s,"dart":"%s","os":"macOS %s","arch":"%s","chip":"%s","cores":%s,"ram_bytes":%s,"utc":"%s"}\n' \
+    "$LABEL" "$CONTEXT" "$FILES" "$LOC" "$BYTES" "$ROUNDS" \
+    "$COLD_MS" "$HOT_MIN" "$HOT_MEDIAN" "$RSS_MEDIAN" "$DIAGS1" \
+    "$(json_escape "$DART_VER")" "$OS_VER" "$ARCH" "$(json_escape "$CHIP")" "$CORES" "$RAM_BYTES" "$STAMP"
+# --cmd leg: the command text verbatim + its tool banner in place of "dart";
+# every other field identical, so the mega A7 legs share one schema.
+else
+  printf '{"record":"summary","target":"%s","context":"%s","files":%s,"loc":%s,"bytes":%s,"rounds":%d,"cold_real_ms":%s,"hot_min_ms":%s,"hot_median_ms":%s,"maxrss_median_bytes":%s,"diag_lines_round1":%s,"cmd":"%s","tool_version":"%s","os":"macOS %s","arch":"%s","chip":"%s","cores":%s,"ram_bytes":%s,"utc":"%s"}\n' \
+    "$LABEL" "$CONTEXT" "$FILES" "$LOC" "$BYTES" "$ROUNDS" \
+    "$COLD_MS" "$HOT_MIN" "$HOT_MEDIAN" "$RSS_MEDIAN" "$DIAGS1" \
+    "$(json_escape "$CMD")" "$(json_escape "$TOOL_VER")" "$OS_VER" "$ARCH" "$(json_escape "$CHIP")" "$CORES" "$RAM_BYTES" "$STAMP"
+fi

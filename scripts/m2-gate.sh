@@ -27,7 +27,9 @@
 #   --dry-run       resolve every path, print the plan and the exact harness
 #                   command, execute nothing (no dart, no harness).
 #   --label L       report directory name under docs/audits/gate-m2/.
-#                   Default: M2_LABEL env, else m2-r1.
+#                   Default: M2_LABEL env, else m2-r1. An existing report
+#                   directory is refused — a rerun never overwrites recorded
+#                   evidence.
 #   --allow-vacuous forwarded to the harness and honored here: accept a run
 #                   whose oracle side has no WARNING-tier entries post-filter.
 #                   Without it such a run is a gate error — the WARNING tier
@@ -131,6 +133,10 @@ fi
 
 # --- plan --------------------------------------------------------------------
 outdir="$OUT_ROOT/$label"
+if [ -e "$outdir" ]; then
+  echo "m2-gate: $outdir already exists — refusing to overwrite recorded gate evidence (set a new M2_LABEL)" >&2
+  exit 2
+fi
 echo "== m2-gate plan"
 printf '  %-16s %s\n' "corpus" "$CORPUS"
 printf '  %-16s %s (WARNING tier, bar %s)\n' "codes" "$CODES_FILE" "$THRESHOLD"

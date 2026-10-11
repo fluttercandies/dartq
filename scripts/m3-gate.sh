@@ -20,10 +20,11 @@
 # Usage:
 #   scripts/m3-gate.sh [--dry-run]
 #
-# Environment overrides: FVM_HOME (default ~/fvm), DARTQ_CMD (the dartq
-# side of the harness), M3_LABEL (report directory name under
-# docs/audits/gate-m3/, default m3-r1; an existing report directory is
-# refused — a rerun never overwrites recorded evidence).
+# Environment overrides: FVM_HOME (default ~/fvm; the default install's Dart
+# version banner is checked on the run path, a mismatch is a WARN, not
+# fatal), DARTQ_CMD (the dartq side of the harness), M3_LABEL (report
+# directory name under docs/audits/gate-m3/, default m3-r1; an existing
+# report directory is refused — a rerun never overwrites recorded evidence).
 #
 # Exit codes: 0 gate met (WARNING-tier Jaccard >= 0.95); 1 below the bar;
 # 2 usage or environment error, or the harness's own error tier (dartq
@@ -35,6 +36,7 @@ cd "$(dirname "$0")/.." || exit 2
 CORPUS="tests/corpus/m3-unused"
 CODES_FILE="tests/harness/m3_unused_codes.txt"
 THRESHOLD="0.95"
+EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-m3"
 HARNESS="./target/debug/harness"
 label="${M3_LABEL:-m3-r1}"
@@ -73,6 +75,14 @@ echo "== oracle=$sdk_root/bin/dart dartq=$DARTQ_CMD report=$outdir"
 if [ "$dry_run" = 1 ]; then
   echo "== dry run: paths resolved, nothing executed"
   exit 0
+fi
+
+# Oracle version banner (run path only; the report meta records the real
+# banner either way, and M3 semantics are pinned to the 3.13.1 caliber —
+# a different oracle can legitimately emit a different code set).
+found="$("$sdk_root/bin/dart" --version 2>&1 | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
+if [ "$found" != "$EXPECTED_VERSION" ]; then
+  echo "m3-gate: WARN expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}'"
 fi
 
 # --- run the gate ------------------------------------------------------------
