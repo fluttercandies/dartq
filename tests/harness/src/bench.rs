@@ -1,4 +1,4 @@
-//! §19.3 benchmark metric substrate (M3 gate arbiter tooling): three
+//! §19.3 benchmark metric substrate (M3 gate arbiter tooling): five
 //! process-level collectors as the `harness bench` subcommand — no criterion,
 //! the metrics are end-to-end process measurements, not micro-benchmarks.
 //!
@@ -35,6 +35,12 @@
 //!   settle window (the drain face's contract: the burst is handed over
 //!   whole, so each cycle pays one quiet window, `BURST_SETTLE` in
 //!   `dartq-plugin`).
+//! - `cold`: one cold full-analysis wall time per side over the same corpus
+//!   (the dartq run through the same sampled spawn as `rss-100k`, the oracle
+//!   as one full `dart analyze`) and the oracle/dartq ratio — the charter's
+//!   cold-analysis face. Single run per side and no warmup, by definition;
+//!   at small corpora the times are process-boot dominated, so every report
+//!   carries a `note` caveat: small-corpus ratios are not milestone evidence.
 //!
 //! Every report carries `schema_version: 1` and its full input set (corpus
 //! dir, LOC definition, tokenizer id, sample counts, commands) for PRD §19.5
@@ -71,7 +77,13 @@ const DEFAULT_RSS_INTERVAL_MS: u64 = 50;
 /// `/bin/ps`, absolute: the sampler must not depend on PATH (a hijacked or
 /// missing ps would silently produce zero samples and a fake low peak).
 const PS: &str = "/bin/ps";
-const METRICS: [&str; 4] = ["rss-100k", "incremental-p95", "token-cost", "plugin-overhead"];
+const METRICS: [&str; 5] = [
+    "rss-100k",
+    "incremental-p95",
+    "token-cost",
+    "plugin-overhead",
+    "cold",
+];
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// The plugin the `plugin-overhead` axis drives: the compatibility sample (a
@@ -93,12 +105,19 @@ const PLUGIN_BATCH_FILES: usize = 8;
 const LOC_DEFINITION: &str = "non-blank lines (at least one non-whitespace \
 character) across .dart files under the corpus dir, .dart_tool excluded";
 
+/// Methodology caveat recorded verbatim in every `cold` report (the report
+/// must carry its own validity boundary — a ratio read without the note
+/// invites small-corpus numbers to be cited as milestone evidence).
+const COLD_NOTE: &str = "single cold run per side; at small corpora elapsed \
+time is dominated by process boot (cargo/dart VM startup), not analysis \
+throughput — cite only large-corpus ratios as milestone evidence";
+
 // ---------------------------------------------------------------------------
 // CLI options
 // ---------------------------------------------------------------------------
 
 pub(crate) struct BenchOptions {
-    /// Selected metrics; empty = all three, in canonical order.
+    /// Selected metrics; empty = all of them, in canonical order.
     metrics: Vec<&'static str>,
     corpus_dir: PathBuf,
     out: PathBuf,
@@ -170,7 +189,7 @@ impl BenchOptions {
     }
 
     /// The resolved run order: selected metrics in selection order, or all
-    /// three when `--metric` was not given.
+    /// of them when `--metric` was not given.
     fn resolved_metrics(&self) -> Vec<&'static str> {
         if self.metrics.is_empty() {
             METRICS.to_vec()
@@ -434,6 +453,8 @@ struct RssReport {
     malformed_samples: usize,
     peak_rss_kib: u64,
     rss_per_100k_loc_kib: f64,
+    /// Wall-clock time of the same run (spawn → exit, output consumed).
+    elapsed_ms: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -507,6 +528,37 @@ struct TokenMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ColdReport {
+    meta: ColdMeta,
+    file_count: usize,
+    loc: u64,
+    /// One cold dartq run: full-analysis wall time (spawn → exit, output
+    /// consumed), process boot included.
+    dartq_elapsed_ms: f64,
+    /// One cold `dart analyze` over the same corpus, timed the same way.
+    oracle_elapsed_ms: f64,
+    /// `oracle_elapsed_ms / dartq_elapsed_ms` — the charter's cold face
+    /// (≤ 0.5 means dartq cold is at least 2x faster); null when the dartq
+    /// side elapsed zero (undefined division; unreachable for a real process
+    /// run).
+    cold_ratio: Option<f64>,
+    /// Methodology caveat recorded verbatim ([`COLD_NOTE`]): single run per
+    /// side, process-boot dominated at small corpora.
+    note: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ColdMeta {
+    schema_version: u32,
+    metric: String,
+    corpus_dir: String,
+    dartq_cmd: String,
+    epoch_seconds: u64,
+    loc_definition: String,
+    oracle_cmd: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct PluginOverheadReport {
     meta: PluginOverheadMeta,
     /// One wall-time entry (ms) per measured feed+drain cycle, in run order.
@@ -567,19 +619,24 @@ fn write_report<T: Serialize>(
 
 /// One RSS-sampled driver run (stdout is discarded — the metric reads only
 /// the exit tier and stderr; the capture files exist to keep pipe buffers
-/// from blocking a verbose driver).
+/// from blocking a verbose driver). Also carries the run's wall-clock elapsed
+/// (the `cold` metric's dartq-side time base).
 struct SampledRun {
     status: std::process::ExitStatus,
     stderr: Vec<u8>,
     peak_rss_kib: u64,
     samples: usize,
     malformed_samples: usize,
+    /// Wall-clock spawn → exit, stderr consumed (f64 ms, the file's duration
+    /// convention).
+    elapsed_ms: f64,
 }
 
 /// Run `program` to completion while sampling its process-group tree RSS
 /// every `interval`: same spawn/kill skeleton as [`crate::oracle::run_captured`]
 /// (own process group via setpgid, temp-file capture, wall-clock budget, group
-/// kill on timeout) plus the ps polling loop and the 8 GiB watchdog.
+/// kill on timeout) plus the ps polling loop, the 8 GiB watchdog, and the
+/// wall-clock elapsed time.
 #[cfg(unix)]
 fn run_sampled(
     name: &str,
@@ -610,6 +667,7 @@ fn run_sampled(
             Ok(())
         });
     }
+    let started = Instant::now();
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("[{name}] failed to launch `{program}`: {e}"))?;
@@ -672,12 +730,15 @@ fn run_sampled(
             "[{name}] `{program}` exited before any RSS sample could be taken"
         ));
     }
+    let stderr = capture.stderr_bytes();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(SampledRun {
         status,
-        stderr: capture.stderr_bytes(),
+        stderr,
         peak_rss_kib,
         samples,
         malformed_samples,
+        elapsed_ms,
     })
 }
 
@@ -748,6 +809,7 @@ pub(crate) fn bench_entry(args: &[String]) -> Result<(String, bool), Outcome> {
             "incremental-p95" => metric_incremental(&opts, corpus.as_ref().expect("preflighted"))?,
             "token-cost" => metric_tokens(&opts, corpus.as_ref().expect("preflighted"))?,
             "plugin-overhead" => metric_plugin_overhead(&opts)?,
+            "cold" => metric_cold(&opts, corpus.as_ref().expect("preflighted"))?,
             other => return Err(Outcome::Error(format!("unhandled metric `{other}`"))),
         };
         lines.push(line);
@@ -797,6 +859,7 @@ fn metric_rss(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> {
         malformed_samples: run.malformed_samples,
         peak_rss_kib: run.peak_rss_kib,
         rss_per_100k_loc_kib: per_100k,
+        elapsed_ms: run.elapsed_ms,
     };
     let path = write_report("rss-100k", &opts.out, &report)?;
     Ok(format!(
@@ -999,9 +1062,8 @@ fn metric_plugin_overhead(opts: &BenchOptions) -> Result<String, Outcome> {
     let (batch, files) = synthesized_batch();
     // One unmeasured warmup cycle: the first JIT-compiled pass would skew
     // the per-cycle distribution.
-    let expected_rows = format!(
-        "plugin emitted the wrong number of findings for a {PLUGIN_BATCH_ROWS}-row batch"
-    );
+    let expected_rows =
+        format!("plugin emitted the wrong number of findings for a {PLUGIN_BATCH_ROWS}-row batch");
     if drive_cycle(&mut runtime, &batch, &files)?.len() != PLUGIN_BATCH_ROWS {
         return Err(Outcome::Error(expected_rows));
     }
@@ -1077,11 +1139,7 @@ fn drive_cycle(
 fn synthesized_batch() -> (Vec<Diagnostic>, FileTable) {
     let mut files = FileTable::new();
     let paths: Vec<FileId> = (0..PLUGIN_BATCH_FILES)
-        .map(|i| {
-            files.intern(Path::new(&format!(
-                "lib/plugin_overhead_{i}.dart"
-            )))
-        })
+        .map(|i| files.intern(Path::new(&format!("lib/plugin_overhead_{i}.dart"))))
         .collect();
     let batch = (0..PLUGIN_BATCH_ROWS)
         .map(|i| {
@@ -1099,6 +1157,77 @@ fn synthesized_batch() -> (Vec<Diagnostic>, FileTable) {
         })
         .collect();
     (batch, files)
+}
+
+/// `cold`: one cold full-analysis wall time per side over the same corpus —
+/// the dartq run through the sampled spawn (watchdog attached, ≥ 1 RSS sample
+/// required by [`run_sampled`]), the oracle through the incremental metric's
+/// timed-oracle helper — plus the oracle/dartq ratio. One run per side and no
+/// warmup: the metric is deliberately the cold-process measurement (see the
+/// `note` field on the report before citing ratios).
+#[cfg(unix)]
+fn metric_cold(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> {
+    let loc = count_loc(corpus).map_err(Outcome::Error)?;
+    let driver = DartqDriver::from_template(&opts.dartq_cmd);
+    let (program, args) = driver.command(corpus);
+    let timeout = driver_timeout_from_env().map_err(Outcome::Error)?;
+
+    let dartq = run_sampled(
+        "bench-cold-dartq",
+        program,
+        &args,
+        timeout,
+        Duration::from_millis(opts.rss_interval_ms),
+    )
+    .map_err(Outcome::Error)?;
+    validate_exit("bench-cold-dartq", program, dartq.status, &dartq.stderr)
+        .map_err(Outcome::Error)?;
+    let oracle_elapsed_ms =
+        timed_oracle_run("bench-cold-oracle", &opts.oracle_dart, corpus, timeout)
+            .map_err(Outcome::Error)?;
+
+    let cold_ratio = (dartq.elapsed_ms > 0.0).then(|| oracle_elapsed_ms / dartq.elapsed_ms);
+    let report = ColdReport {
+        meta: ColdMeta {
+            schema_version: SCHEMA_VERSION,
+            metric: "cold".to_string(),
+            corpus_dir: corpus.display().to_string(),
+            dartq_cmd: opts.dartq_cmd.clone(),
+            epoch_seconds: epoch_seconds(),
+            loc_definition: LOC_DEFINITION.to_string(),
+            oracle_cmd: format!(
+                "{} analyze --format=machine --no-fatal-warnings",
+                opts.oracle_dart
+            ),
+        },
+        file_count: loc.files,
+        loc: loc.loc,
+        dartq_elapsed_ms: dartq.elapsed_ms,
+        oracle_elapsed_ms,
+        cold_ratio,
+        note: COLD_NOTE.to_string(),
+    };
+    let path = write_report("cold", &opts.out, &report)?;
+    let ratio = report.cold_ratio.map_or_else(
+        || "undefined (zero dartq elapsed)".to_string(),
+        |r| format!("{r:.2}"),
+    );
+    Ok(format!(
+        "cold: dartq {:.1}ms vs oracle {:.1}ms over {} LOC ({} files) -> \
+         oracle/dartq {ratio} -> {}",
+        report.dartq_elapsed_ms,
+        report.oracle_elapsed_ms,
+        report.loc,
+        report.file_count,
+        path.display()
+    ))
+}
+
+#[cfg(not(unix))]
+fn metric_cold(_opts: &BenchOptions, _corpus: &Path) -> Result<String, Outcome> {
+    Err(Outcome::Error(
+        "cold sampling requires a POSIX host (process-group ps sampling)".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1594,7 @@ mod tests {
             malformed_samples: 1,
             peak_rss_kib: 2048,
             rss_per_100k_loc_kib: 2048.0,
+            elapsed_ms: 812.5,
         };
         let incremental = IncrementalReport {
             meta: IncrementalMeta {
@@ -1510,10 +1640,28 @@ mod tests {
             oracle_tokens: 0,
             savings_ratio: None,
         };
+        let cold = ColdReport {
+            meta: ColdMeta {
+                schema_version: SCHEMA_VERSION,
+                metric: "cold".to_string(),
+                corpus_dir: "/corpus".to_string(),
+                dartq_cmd: "dartq check".to_string(),
+                epoch_seconds: 1_700_000_000,
+                loc_definition: LOC_DEFINITION.to_string(),
+                oracle_cmd: "dart analyze --format=machine --no-fatal-warnings".to_string(),
+            },
+            file_count: 2,
+            loc: 100_000,
+            dartq_elapsed_ms: 40.0,
+            oracle_elapsed_ms: 120.0,
+            cold_ratio: Some(3.0),
+            note: COLD_NOTE.to_string(),
+        };
 
         let rss_path = write_report("rss-100k", &out, &rss).expect("rss report");
         let inc_path = write_report("incremental-p95", &out, &incremental).expect("inc report");
         let tok_path = write_report("token-cost", &out, &tokens).expect("tok report");
+        let cold_path = write_report("cold", &out, &cold).expect("cold report");
         assert_eq!(rss_path, out.join("rss-100k").join("report.json"));
 
         // rss-100k: typed round trip + the recorded inputs
@@ -1530,6 +1678,7 @@ mod tests {
             value["meta"]["watchdog_threshold_kib"],
             WATCHDOG_THRESHOLD_KIB
         );
+        assert_eq!(value["elapsed_ms"], 812.5, "the run's wall clock rides too");
 
         // incremental-p95: typed round trip + the oracle column's null face
         let text = fs::read_to_string(&inc_path).expect("report file");
@@ -1551,6 +1700,15 @@ mod tests {
             value["savings_ratio"].is_null(),
             "empty oracle output -> undefined ratio"
         );
+
+        // cold: typed round trip + the methodology note riding the report
+        let text = fs::read_to_string(&cold_path).expect("report file");
+        let parsed: ColdReport = serde_json::from_str(&text).expect("cold parse");
+        assert_eq!(parsed, cold);
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["meta"]["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["cold_ratio"], 3.0);
+        assert_eq!(value["note"], COLD_NOTE);
 
         fs::remove_dir_all(&out).ok();
     }

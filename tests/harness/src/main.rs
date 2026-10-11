@@ -16,6 +16,7 @@ mod oracle;
 mod replay;
 mod replay_edit;
 mod report;
+mod repro;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,7 @@ fn dispatch(args: &[String]) -> Result<(String, bool), Outcome> {
         Some("run") => run_compare(&args[1..]),
         Some("bench") => bench::bench_entry(&args[1..]),
         Some("replay") => replay::replay_entry(&args[1..]),
+        Some("repro") => repro::repro_entry(&args[1..]),
         Some("--help" | "-h" | "help") | None => {
             print_usage();
             Ok((String::new(), true))
@@ -73,6 +75,9 @@ fn dispatch(args: &[String]) -> Result<(String, bool), Outcome> {
     }
 }
 
+// The usage text is one literal block; splitting it would fragment the
+// exact output the CLI contract pins.
+#[expect(clippy::too_many_lines, reason = "see above")]
 fn print_usage() {
     println!(
         "usage:
@@ -155,6 +160,21 @@ fn print_usage() {
       <out>/<label>/{{report.json,report.md}}. Exit codes: 0 all steps
       equal, 1 any mismatch, 2 harness error.
 
+  harness repro --corpus-dir DIR --dartq-cmd TEMPLATE [--runs N] [--out DIR]
+      PRD §19.5 reproducibility: run the dartq side N times (default 2) over
+      the corpus with fresh processes — the same template resolution the run
+      face uses — normalize each run's machine rows through the differential
+      face's normalizer (corpus-relative paths, lowercased codes,
+      order-normalized), and byte-compare every run against run 1. Report:
+      <out>/repro-report.json, whose `output_digest` is the run-1 normalized
+      digest — distinct from the `output_sha256` scripts/repro-tuple.sh seals
+      (the script hashes the raw output file, this the normalized comparison
+      form) — so CI asserts same tuple ⇒ same digest across runs and
+      machines. Exit codes: 0
+      byte-identical, 1 divergence (first divergent row in the summary), 2
+      harness error. Runs real dartq processes; serial verification phase
+      only.
+
   harness bench [--metric NAME]... [--corpus-dir DIR] [--out DIR]
                 [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
                 [--rss-interval-ms MS] [--with-oracle] [--plugin-dir DIR]
@@ -163,8 +183,8 @@ fn print_usage() {
       metric under <out>/<metric>/report.json (schema_version 1; every
       report records its inputs for reproducibility). --metric is
       repeatable (rss-100k | incremental-p95 | token-cost |
-      plugin-overhead); default = all four, in that order. Default corpus:
-      {DEFAULT_TARGET}; default out: docs/audits/bench.
+      plugin-overhead | cold); default = all five, in that order. Default
+      corpus: {DEFAULT_TARGET}; default out: docs/audits/bench.
       rss-100k: peak tree-RSS of one full dartq analysis over the corpus
       (/bin/ps polling at --rss-interval-ms, default 50ms, process-group
       tree walk; an 8 GiB tree-RSS watchdog kills the sampled group),
@@ -190,6 +210,12 @@ fn print_usage() {
       unmeasured warmup), P50/P95/P99, and the plugin sidecar's peak RSS
       (the with-plugins side of the with/without comparison: no plugin, no
       sidecar). Needs `dart` on PATH and the samples' host package pub-getted.
+      cold: one cold full-analysis wall time per side over the same corpus —
+      the dartq run under the same sampled spawn as rss-100k (watchdog
+      attached), the oracle as one full `dart analyze` — plus the oracle/dartq
+      ratio (the cold-analysis charter face). Single run per side: at small
+      corpora the times are process-boot dominated and the report carries a
+      caveat note; cite only large-corpus ratios as milestone evidence.
       The collectors drive real analysis processes; run them in the serial
       verification phase only (memory-incident discipline).
       Exit codes: 0 = every requested metric produced a report, 2 = harness
@@ -327,16 +353,18 @@ impl RunOptions {
     }
 }
 
+// Subcommand dispatcher: one arm per face, mirroring the CLI surface.
+#[expect(clippy::too_many_lines, reason = "see above")]
 fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let opts = RunOptions::parse(args)?;
     // --list-known is an offline triage face: it reads the exemption table
     // and the persisted cases, runs no analysis, and needs no corpus.
     if opts.list_known {
-        let cases_dir = opts.persist_regressions.clone().unwrap_or_else(|| {
-            PathBuf::from(report::REGRESSIONS_ROOT).join(report::CASES_DIR)
-        });
-        let known_path =
-            PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
+        let cases_dir = opts
+            .persist_regressions
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(report::REGRESSIONS_ROOT).join(report::CASES_DIR));
+        let known_path = PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
         let summary = report::list_known(&known_path, &cases_dir).map_err(Outcome::Error)?;
         return Ok((summary, true));
     }
@@ -418,8 +446,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     // persist dir — known divergences suppressed via the exemption table.
     let persist_note = match &opts.persist_regressions {
         Some(dir) => {
-            let known_path =
-                PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
+            let known_path = PathBuf::from(report::REGRESSIONS_ROOT).join(report::KNOWN_DIFFS_FILE);
             let known = report::load_known_diffs(&known_path).map_err(Outcome::Error)?;
             let captured_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -445,7 +472,11 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
                 dir.display(),
                 stats.files_exempt,
                 stats.entries_exempt,
-                if stats.entries_exempt == 1 { "y" } else { "ies" },
+                if stats.entries_exempt == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
                 stats.files_skipped,
             )
         }
@@ -737,7 +768,7 @@ fn check_oracle_vacuity(
     let error_tier_empty = oracle_side
         .per_severity
         .get(&Severity::Error)
-        .is_none_or(|entries| entries.is_empty());
+        .is_none_or(BTreeSet::is_empty);
     if !error_tier_empty {
         return Ok(());
     }
@@ -1041,6 +1072,244 @@ mod tests {
             gate_codes.is_subset(&tsv_codes),
             "gate codes must all exist in the authoritative TSV"
         );
+    }
+
+    /// Derivation pin: the M1 gate codes file (`tests/harness/m1_codes.txt`)
+    /// must equal its documented derivation (file header, PRD section 20.3 M1
+    /// row): the `undefined_*` and `wrong_number_of_*` wildcard families expanded
+    /// over the SDK main unified registry (.third/dart-sdk pkg/analyzer
+    /// lib/src/diagnostic/diagnostic.g.dart, `name:` literals), unioned with
+    /// the explicit picks (`uri_does_not_exist`, `duplicate_definition`, the
+    /// static-nullability four), plus `undefined_annotation`, minus
+    /// `undefined_lint` (an analysis-options code, not a Dart-language
+    /// diagnostic; present in the registry, so the exclusion is load-bearing).
+    ///
+    /// The analyzer-8.4.1 side of the header's union contributes exactly one
+    /// gate code (`undefined_annotation`, `lib/src/error/codes.g.dart`); it is
+    /// pinned as a frozen const because a published package version is
+    /// immutable — re-reading it at test time detects nothing — and no
+    /// workspace lockfile pins 8.4.1 into pub-cache, so a live read would be
+    /// a spurious environmental failure. The SDK main registry is the live
+    /// drift surface: a .third re-clone that adds or removes a wildcard
+    /// family member fails this pin and forces a conscious re-freeze.
+    /// `wrong_number_of_type_arguments_method` exists only in analyzer-8.4.1,
+    /// never in the SDK main registry, and is intentionally not gated; the
+    /// SDK-main-anchored derivation needs no exclusion for it.
+    #[test]
+    fn m1_codes_file_matches_derivation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness lives at <repo>/tests/harness");
+        let registry = std::fs::read_to_string(
+            root.join(".third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
+        )
+        .expect("SDK main diagnostic registry present (.third/dart-sdk checkout)");
+        let txt = std::fs::read_to_string(root.join("tests/harness/m1_codes.txt"))
+            .expect("gate codes file present");
+        let gate_codes = parse_codes_file(&txt).expect("gate file parses");
+
+        // `name: 'snake_case',` at line start; `uniqueName:` never matches
+        // because the anchor sits directly after leading whitespace.
+        let registry_codes: BTreeSet<String> = registry
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("name: '")?;
+                rest.strip_suffix("',")
+            })
+            .map(str::to_string)
+            .collect();
+        let mut expected: BTreeSet<String> = BTreeSet::new();
+        for prefix in ["undefined_", "wrong_number_of_"] {
+            expected.extend(
+                registry_codes
+                    .iter()
+                    .filter(|code| code.starts_with(prefix))
+                    .cloned(),
+            );
+        }
+        expected.extend(
+            [
+                "uri_does_not_exist",
+                "duplicate_definition",
+                "invalid_assignment",
+                "argument_type_not_assignable",
+                "return_of_invalid_type",
+                "invalid_null_aware_operator",
+                // Frozen analyzer-8.4.1-only addition (see doc above).
+                "undefined_annotation",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        expected.remove("undefined_lint");
+
+        assert_eq!(gate_codes.len(), 36, "M1 gate freezes 36 codes");
+        // 36 raw data lines (comments/blanks excluded): a duplicated line
+        // would hide in the set comparison but still be drift.
+        assert_eq!(
+            txt.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .count(),
+            36
+        );
+        assert_eq!(
+            gate_codes, expected,
+            "gate file = documented M1 derivation over the SDK main registry"
+        );
+    }
+
+    /// Derivation pin: the M2 WARNING-tier gate codes file
+    /// (`tests/harness/m2_warning_codes.txt`) must equal its documented
+    /// derivation (file header, PRD section 20.3 M2 row): the SDK main
+    /// unified registry's WARNING severity family (`type:
+    /// DiagnosticType.STATIC_WARNING`, what `dart analyze --format=machine`
+    /// reports as WARNING) intersected with the per-bucket freeze list
+    /// (M1 frozen-set continuation, flow/null-safety soundness,
+    /// patterns/records/switch exhaustiveness, class modifiers, const and
+    /// literal semantics, combinator duplicates, override semantics).
+    /// Unlike the M1 pin, the derivation pairs each `name:` literal with
+    /// the following `type:` line: severity is per-entry, not per-name
+    /// (`multiple_combinators` is registered under two types; it is
+    /// excluded by the tooling family either way). Three long-named
+    /// entries wrap the `name:` value onto the next line and are skipped
+    /// by the line-anchored parse; all three are COMPILE_TIME_ERROR, so
+    /// the WARNING family is unaffected.
+    #[test]
+    fn m2_warning_codes_file_matches_derivation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness lives at <repo>/tests/harness");
+        let registry = std::fs::read_to_string(
+            root.join(".third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
+        )
+        .expect("SDK main diagnostic registry present (.third/dart-sdk checkout)");
+        let txt = std::fs::read_to_string(root.join("tests/harness/m2_warning_codes.txt"))
+            .expect("gate codes file present");
+        let gate_codes = parse_codes_file(&txt).expect("gate file parses");
+
+        // Pair each `name: 'snake_case',` (line-anchored) with the next
+        // `type: DiagnosticType.X,` line; collect the STATIC_WARNING names.
+        let mut pending: Option<String> = None;
+        let mut warning_family: BTreeSet<String> = BTreeSet::new();
+        for line in registry.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("name: '") {
+                pending = rest.strip_suffix("',").map(str::to_string);
+            } else if let Some(rest) = trimmed.strip_prefix("type: DiagnosticType.") {
+                if let Some(name) = pending.take() {
+                    if rest.strip_suffix(',') == Some("STATIC_WARNING") {
+                        warning_family.insert(name);
+                    }
+                }
+            }
+        }
+        let frozen: BTreeSet<String> = [
+            // (a) M1 frozen-set continuation
+            "invalid_null_aware_operator",
+            "undefined_hidden_name",
+            "undefined_referenced_parameter",
+            "undefined_shown_name",
+            // (b) flow analysis & null-safety soundness
+            "body_might_complete_normally_nullable",
+            "cast_from_null_always_fails",
+            "cast_from_nullable_always_fails",
+            "dead_code",
+            "dead_code_catch_following_catch",
+            "dead_code_on_catch_subtype",
+            "dead_null_aware_expression",
+            "null_argument_to_non_null_type",
+            "null_check_always_fails",
+            "nullable_type_in_catch_clause",
+            "receiver_of_type_never",
+            "type_check_with_null",
+            "unnecessary_cast",
+            "unnecessary_nan_comparison",
+            "unnecessary_non_null_assertion",
+            "unnecessary_null_comparison",
+            "unnecessary_question_mark",
+            "unnecessary_type_check",
+            // (c) patterns / records / switch exhaustiveness & reachability
+            "constant_pattern_never_matches_value_type",
+            "missing_enum_constant_in_switch",
+            "pattern_never_matches_value_type",
+            "unreachable_switch_case",
+            "unreachable_switch_default",
+            "unnecessary_cast_pattern",
+            "unnecessary_null_assert_pattern",
+            "unnecessary_null_check_pattern",
+            "unnecessary_wildcard_pattern",
+            // (d) class modifiers / sealed
+            "mixin_on_sealed_class",
+            "subtype_of_sealed_class",
+            // (e) const & literal semantics
+            "equal_elements_in_set",
+            "equal_keys_in_map",
+            "non_const_call_to_literal_constructor",
+            // (f) import/export combinator duplicates
+            "duplicate_export",
+            "duplicate_hidden_name",
+            "duplicate_import",
+            "duplicate_shown_name",
+            // (g) override & interface-member semantics
+            "non_nullable_equals_parameter",
+            "override_on_non_overriding_member",
+            "unnecessary_no_such_method",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            frozen.len(),
+            43,
+            "the documented bucket freeze holds 43 codes"
+        );
+        // Registry drift in the removing direction (a frozen name re-typed
+        // or dropped from the STATIC_WARNING family) shrinks the
+        // intersection and fails here before the set comparison.
+        let expected: BTreeSet<String> = frozen.intersection(&warning_family).cloned().collect();
+        assert_eq!(
+            expected.len(),
+            43,
+            "every frozen bucket member must still be STATIC_WARNING in the registry"
+        );
+        assert_eq!(gate_codes.len(), 43, "M2 WARNING tier freezes 43 codes");
+        // 43 raw data lines (comments/blanks excluded): a duplicated line
+        // would hide in the set comparison but still be drift.
+        assert_eq!(
+            txt.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .count(),
+            43
+        );
+        assert_eq!(
+            gate_codes, expected,
+            "gate file = documented M2 WARNING derivation over the SDK main registry"
+        );
+        // Load-bearing exclusions: family members kept out on purpose
+        // (file-header exclusion families). `undefined_lint` is the M1
+        // precedent (analysis-options code); `unused_import` is
+        // WARNING-severity yet M3 usage analysis; `strict_raw_type` is
+        // opt-in via analysis options; `multiple_combinators` is the
+        // dual-type ambiguity case.
+        for excluded in [
+            "undefined_lint",
+            "unused_import",
+            "strict_raw_type",
+            "multiple_combinators",
+        ] {
+            assert!(
+                warning_family.contains(excluded),
+                "{excluded} must still be in the WARNING family for this guard to be load-bearing"
+            );
+            assert!(
+                !gate_codes.contains(excluded),
+                "{excluded} must stay excluded from the M2 WARNING tier"
+            );
+        }
     }
 
     /// Core codes-filter semantics: out-of-set entries are dropped on both sides --
