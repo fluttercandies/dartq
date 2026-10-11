@@ -182,6 +182,14 @@ impl FrameDecoder {
     /// Blank lines are skipped; a `'\r'` before `'\n'` is stripped so CRLF
     /// streams decode identically.
     ///
+    /// The scan touches only the bytes each call adds: the tail a call leaves
+    /// behind is provably newline-free (its scan ran to the last `'\n'` and
+    /// drained through it), and a single-byte delimiter carries no
+    /// cross-chunk state. A stream that never terminates a frame therefore
+    /// costs one linear pass in total, not one pass over the whole buffer per
+    /// push — a newline-free flood trips the size guard at pipe speed instead
+    /// of pinning the reader in quadratic rescans.
+    ///
     /// # Errors
     ///
     /// Returns the first [`ProtocolError`] any decoded line fails with. On
@@ -194,12 +202,17 @@ impl FrameDecoder {
                 limit: MAX_FRAME_SIZE,
             });
         }
+        let scanned_from = self.buf.len();
         self.buf.extend_from_slice(bytes);
 
         let mut frames = Vec::new();
+        // `consumed` is the drain cursor (where the next line starts — the
+        // first line may begin in a previous call's tail); `scan_from` is the
+        // scan cursor (new bytes only, advanced past every newline found).
         let mut consumed = 0;
-        while let Some(offset) = memchr(b'\n', &self.buf[consumed..]) {
-            let end = consumed + offset;
+        let mut scan_from = scanned_from;
+        while let Some(offset) = memchr(b'\n', &self.buf[scan_from..]) {
+            let end = scan_from + offset;
             let line = &self.buf[consumed..end];
             let line = if line.last() == Some(&b'\r') {
                 &line[..line.len() - 1]
@@ -207,6 +220,7 @@ impl FrameDecoder {
                 line
             };
             consumed = end + 1;
+            scan_from = end + 1;
             if !line.is_empty() {
                 match decode_line(line) {
                     Ok(frame) => frames.push(frame),
@@ -325,6 +339,46 @@ mod tests {
         }
         assert_eq!(frames, vec![sample_request(), sample_notification()]);
         assert!(decoder.buf.is_empty(), "no partial frame must remain");
+    }
+
+    #[test]
+    fn chunked_push_decodes_identically_to_a_single_push() {
+        // The incremental-scan contract: chunk boundaries (including splits
+        // inside a frame's JSON and a '\r' split from its '\n') never change
+        // what decodes. The newline-free tails riding between chunks are what
+        // the scan must not revisit per push.
+        let a = encode_frame(&sample_request()).expect("encode");
+        let b = encode_frame(&sample_notification()).expect("encode");
+        let mut stream = a.clone();
+        stream.push(b'\n');
+        let a_terminated = stream.len();
+        stream.extend_from_slice(&b);
+        stream.push(b'\r'); // CRLF terminator, split from its '\n' below
+        stream.push(b'\n');
+
+        // Split points: inside A's JSON, past A's '\n', inside B's JSON, and
+        // between the '\r' and the '\n'.
+        let splits = [
+            a.len() / 2,
+            a_terminated,
+            a_terminated + b.len() / 2,
+            stream.len() - 1,
+        ];
+        let mut chunked = FrameDecoder::default();
+        let mut frames = Vec::new();
+        let mut start = 0;
+        for stop in splits {
+            frames.extend(chunked.push(&stream[start..stop]).expect("chunk push"));
+            start = stop;
+        }
+        frames.extend(chunked.push(&stream[start..]).expect("final push"));
+
+        let whole = FrameDecoder::default().push(&stream).expect("whole push");
+        assert_eq!(frames, whole, "chunking must not change what decodes");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], sample_request());
+        assert_eq!(frames[1], sample_notification());
+        assert!(!chunked.has_partial(), "the stream terminated cleanly");
     }
 
     #[test]
