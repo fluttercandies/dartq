@@ -129,6 +129,15 @@
 //!   it). Each rule module spells out its over/under-report faces; the
 //!   registry now covers the full `package:lints` core+recommended union
 //!   (89 specs).
+//! - diagnostic-mirror tranche (1, #570): `unnecessary_type_check` — the
+//!   analyzer STATIC_WARNING family (`_checkAllTypeChecks`,
+//!   best_practices_verifier.dart:987-1041; the rule file left the linter
+//!   in the Dart 3.15 main re-pin) ported as the lint-tier face over the
+//!   written-type operand face (scalar literals, `this`, the same-class
+//!   field; the promotion face stays with the semantic tier's always-on
+//!   producer). Registered under a new [`Group::Diagnostic`] — not a
+//!   `package:lints` member, excluded from the default posture, opt-in by
+//!   name (90 specs).
 //!
 //! With this tranche every `package:lints` member has a terminal state:
 //! implemented (84), or documented-blocked with the exact resolution fact it

@@ -106,6 +106,13 @@ const OFFICIAL_RECOMMENDED: &[&str] = &[
     "use_super_parameters",
 ];
 
+/// The analyzer-diagnostic mirrors — not `package:lints` members. The
+/// diagnostic registry carries the machine name
+/// (`pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`,
+/// `unnecessary_type_check_true` / `unnecessary_type_check_false`); the
+/// linter-side rule file left the tree in the Dart 3.15 main re-pin.
+const OFFICIAL_DIAGNOSTIC_MIRRORS: &[&str] = &["unnecessary_type_check"];
+
 #[test]
 fn rule_names_are_unique() {
     let mut seen: Vec<&str> = Vec::with_capacity(RULES.len());
@@ -127,6 +134,7 @@ fn every_rule_is_in_its_official_set() {
         let official = match spec.group {
             Group::Core => OFFICIAL_CORE,
             Group::Recommended => OFFICIAL_RECOMMENDED,
+            Group::Diagnostic => OFFICIAL_DIAGNOSTIC_MIRRORS,
         };
         assert!(
             official.contains(&spec.name),
@@ -164,12 +172,12 @@ fn registry_fits_the_enable_set_word_count() {
     );
 }
 
-/// The slice pin: 77 rules through #478 plus the 12 #586 standard-set
-/// completions make 89 — the full `package:lints` union (34 core + 55
-/// recommended-only), with no member left blocked or documented-out.
+/// The slice pin: 89 `package:lints` members through #586 (34 core + 55
+/// recommended-only, no member left blocked or documented-out) plus the
+/// #570 diagnostic mirror make 90.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 89);
+    assert_eq!(RULES.len(), 90);
 }
 
 /// The two camelCase registry spellings are the yaml/LintNames forms

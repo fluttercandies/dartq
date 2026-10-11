@@ -846,7 +846,7 @@ pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<Typ
 }
 
 /// The face of one written type row.
-fn type_face<'a>(c: &'a Check<'_>, row: u32) -> TypeFace<'a> {
+pub(crate) fn type_face<'a>(c: &'a Check<'_>, row: u32) -> TypeFace<'a> {
     match c.kind(row) {
         NodeKind::VoidType => TypeFace {
             name: None,

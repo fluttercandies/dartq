@@ -64,10 +64,9 @@ use dartq_pub::pubspec_facts::scan as scan_pubspec;
 use dartq_pub::{Pubspec, pubspec_facts::Scalar};
 use dartq_source::{FileId, LineIndex};
 
-/// The whole `package:lints` slice: every registered rule ships in core or
-/// recommended (recommended includes core), so the default posture is the
-/// full registry, enabled by group so a future rule outside the sets
-/// cannot silently join it.
+/// The default posture: the `package:lints` slice (core + recommended,
+/// recommended includes core), enabled by group so a rule outside the sets
+/// — a diagnostic mirror — cannot silently join it.
 fn default_set() -> EnableSet {
     let mut set = EnableSet::none();
     for (index, spec) in RULES.iter().enumerate() {
@@ -473,8 +472,8 @@ mod tests {
 
     use super::*;
 
-    /// Every registered rule ships in the `package:lints` slice, so the
-    /// no-options default is the full registry.
+    /// The no-options default is the `package:lints` slice — 34 core + 55
+    /// recommended-only; diagnostic mirrors join only by name.
     #[test]
     fn absent_options_default_to_the_package_lints_slice() {
         assert_eq!(
@@ -482,12 +481,16 @@ mod tests {
                 .iter()
                 .filter(|spec| matches!(spec.group, Group::Core | Group::Recommended))
                 .count(),
-            RULES.len(),
-            "a rule outside both sets changes the default posture",
+            89,
+            "the package:lints slice size changed",
         );
         let set = enable_set(None);
-        for index in 0..RULES.len() {
-            assert!(set.is_enabled(RuleId(index as u16)));
+        for (index, spec) in RULES.iter().enumerate() {
+            assert_eq!(
+                set.is_enabled(RuleId(index as u16)),
+                matches!(spec.group, Group::Core | Group::Recommended),
+                "the default posture is exactly the package:lints slice",
+            );
         }
     }
 

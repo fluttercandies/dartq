@@ -137,6 +137,211 @@ pub(crate) mod prefer_is_not_operator {
     }
 }
 
+pub(crate) mod unnecessary_type_check {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::slice::{access_run, statement_run};
+    use crate::rules::{
+        TypeFace, class_declaration_name, last_child, type_face, type_face_of_field,
+    };
+
+    /// Official: the `unnecessary_type_check` diagnostic — an `x is T` whose
+    /// answer the static types fix at a constant reports at the check
+    /// (`_checkAllTypeChecks`,
+    /// `pkg/analyzer/lib/src/error/best_practices_verifier.dart:987-1041`).
+    /// The rule file left the linter in the Dart 3.15 main re-pin (no
+    /// `pkg/linter/lib/src/rules/unnecessary_type_check.dart`); the templates
+    /// live in `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`
+    /// (`unnecessaryTypeCheckTrue` / `unnecessaryTypeCheckFalse`, one
+    /// registry name across the polarity pair). dartq splits the same way:
+    /// the semantic tier owns the always-on diagnostic, this is its
+    /// lint-tier face — [`Group::Diagnostic`], opt-in by name, never in the
+    /// default posture.
+    ///
+    /// Gates (producer order): `x is dynamic` is constant whichever the
+    /// operand — reports before every other gate (:1010-1015); `is Null` is
+    /// the separate `type_check_with_null` family except the `null` literal
+    /// itself, whose check is constant (`Null <: Null`, :1017-1036);
+    /// otherwise a provable subtype (`isSubtypeOf(leftType, rightType)`)
+    /// reports, `is!` carrying the complement's polarity. The
+    /// subtype-negative verdict never reports (`null is int` stays silent).
+    ///
+    /// Approximations (documented): the operand face is the syntax-knowable
+    /// slice — scalar literals, the `null` literal (`Null`), `this` (the
+    /// enclosing class-like name), and the same-class instance field (bare
+    /// or `this.`-qualified, the void_checks field face; a bare name
+    /// shadowed by a local over-reports — the user-shadowed family). The
+    /// check face is the written type row; the name-level subtype relation
+    /// is same-name (type arguments equal name+nullable — the
+    /// invariance-safe shape, covariant matches under-report) plus the
+    /// built-in lattice edges `int`/`double` → `num` and every named type →
+    /// `Object`, nullability gating first (`T?` never subtypes a
+    /// non-nullable check). Faces from parameters, locals, and imports are
+    /// invisible (under-report) — the promotion face the oracle flags
+    /// (`n is! int` after a promotion) needs flow analysis and stays with
+    /// the semantic tier, as do initializer positions whose run carries
+    /// declaration rows. An unresolved operand under the `dynamic` gate
+    /// reports where the official's InvalidType gate (:1008-1010) stays
+    /// silent (over-report, the erroneous family).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_type_check",
+        group: Group::Diagnostic,
+        problem: "Unnecessary type check; the result is always 'true'.",
+        correction: CORRECTION,
+        kinds: &[NodeKind::IsExpression],
+        check,
+    };
+
+    /// The `is!` polarity template (`unnecessaryTypeCheckFalse`).
+    const FALSE_PROBLEM: &str = "Unnecessary type check; the result is always 'false'.";
+    const CORRECTION: &str = "Try correcting the type check, or removing the type check.";
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let negated = c.payload(node).first().copied().unwrap_or(0) != 0;
+        // The check face: the type rows tile inside the window (opened at
+        // the operator), the `Type` row sealing last.
+        let Some(type_row) = last_child(c, node) else {
+            return;
+        };
+        let check_face = type_face(c, type_row);
+        // `is CannotResolveType` — the InvalidType gate's clean shape is a
+        // faceless row (function types).
+        let Some(check_name) = check_face.name else {
+            return;
+        };
+        // The operand rows: the tested expression tiles before the `is`
+        // byte in the parent window (the validated read in
+        // unnecessary_to_list_in_spreads), bounded at the enclosing block's
+        // last statement row. Also the report anchor — the official
+        // `.at(node)` covers the operand, which the arena node (span-only
+        // from the operator) does not.
+        let Some(operand) = operand_rows(c) else {
+            return;
+        };
+        let range = c.utf16_span(operand[0]).start..c.utf16_span(node).end;
+        // `x is dynamic` — constant whichever the operand.
+        if check_name == "dynamic" {
+            report(c, range, negated);
+            return;
+        }
+        // `is Null` — the constant `null is Null` reports; every other
+        // shape belongs to the type_check_with_null family (not this
+        // rule), judged syntactically on the operand's tail row.
+        if check_name == "Null" {
+            if matches!(operand.last(), Some(&row) if c.kind(row) == NodeKind::LiteralNull) {
+                report(c, range, negated);
+            }
+            return;
+        }
+        // The subtype arm: a provable subtype is constant-true. One
+        // trailing `(...)` wrapper unwraps (the wrapper is not the
+        // official's `NullLiteral`, so the `is Null` arm above stays
+        // pre-unwrap).
+        let mut rows = operand;
+        if let Some(&last) = rows.last()
+            && c.kind(last) == NodeKind::ParenthesizedExpression
+        {
+            rows.pop();
+            rows.extend(c.collect_direct(last));
+        }
+        let Some(face) = operand_face(c, &rows) else {
+            return;
+        };
+        if name_subtype(&face, &check_face) {
+            report(c, range, negated);
+        }
+    }
+
+    fn report(c: &mut Check<'_>, range: core::ops::Range<u32>, negated: bool) {
+        if negated {
+            c.report_texts(range, FALSE_PROBLEM, CORRECTION, &[]);
+        } else {
+            c.report(range, &[]);
+        }
+    }
+
+    /// The operand rows in the parent window: the siblings tiling before
+    /// the node, bounded at the last statement row.
+    fn operand_rows(c: &Check<'_>) -> Option<Vec<u32>> {
+        let node = c.node();
+        let is_byte = c.byte_span(node).start;
+        let parent = c.ancestor(1)?;
+        let kids = c.collect_direct(parent);
+        let pos = kids.iter().position(|&kid| kid == node)?;
+        let rows: Vec<u32> = statement_run(c, &kids[..pos])
+            .into_iter()
+            .filter(|&kid| c.byte_span(kid).end <= is_byte)
+            .collect();
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    /// The operand's written-type face over the access run (the childless
+    /// access markers and the bare-name send group stripped): a scalar
+    /// literal, `this` (the enclosing class-like name), or the same-class
+    /// instance field — bare `<field>` or `this.<field>`.
+    fn operand_face<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<TypeFace<'a>> {
+        let named = |name: &'a str| TypeFace {
+            name: Some(name),
+            nullable: false,
+            is_void: false,
+            is_future_or_void: false,
+            is_function_type: false,
+            type_arguments: Vec::new(),
+        };
+        match access_run(c, rows).as_slice() {
+            [single] => match c.kind(*single) {
+                NodeKind::LiteralInt => Some(named("int")),
+                NodeKind::LiteralDouble => Some(named("double")),
+                NodeKind::StringLiteral => Some(named("String")),
+                NodeKind::LiteralBool => Some(named("bool")),
+                NodeKind::LiteralNull => Some(named("Null")),
+                NodeKind::ThisExpression => {
+                    let class_row = c.path.iter().rev().find_map(|&a| {
+                        matches!(
+                            c.kind(a),
+                            NodeKind::ClassDeclaration
+                                | NodeKind::MixinDeclaration
+                                | NodeKind::EnumDeclaration
+                                | NodeKind::ExtensionDeclaration
+                        )
+                        .then_some(a)
+                    })?;
+                    Some(named(class_declaration_name(c, class_row)?))
+                }
+                NodeKind::Identifier => type_face_of_field(c, c.lexeme(c.head_token(*single))),
+                _ => None,
+            },
+            [target, name]
+                if c.kind(*target) == NodeKind::ThisExpression
+                    && c.kind(*name) == NodeKind::Identifier =>
+            {
+                type_face_of_field(c, c.lexeme(c.head_token(*name)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The name-level subtype relation on the written faces: nullability
+    /// gates first, then the same-name arm (type arguments equal) and the
+    /// built-in lattice edges.
+    fn name_subtype(operand: &TypeFace<'_>, check: &TypeFace<'_>) -> bool {
+        let (Some(operand_name), Some(check_name)) = (operand.name, check.name) else {
+            return false;
+        };
+        if operand.nullable && !check.nullable {
+            return false;
+        }
+        if operand_name == check_name {
+            return operand.type_arguments == check.type_arguments;
+        }
+        match check_name {
+            "Object" => true,
+            "num" => operand_name == "int" || operand_name == "double",
+            _ => false,
+        }
+    }
+}
+
 pub(crate) mod prefer_adjacent_string_concatenation {
     use super::{Check, Group, NodeKind, RuleSpec};
 
@@ -5714,5 +5919,172 @@ mod tests {
             f.run(&one_rule("invalid_runtime_check_with_js_interop_types"))
                 .is_empty()
         );
+    }
+
+    // —— unnecessary_type_check (`_checkAllTypeChecks`,
+    // best_practices_verifier.dart:987-1041) ————————————————
+
+    /// A scalar literal against its own type is constant-true (`1 is int`)
+    /// — the whole check reports, anchored at the operand head.
+    #[test]
+    fn type_check_reports_scalar_true() {
+        let f = Fixture::parse("void f() { 1 is int; }");
+        let lints = f.run(&one_rule("unnecessary_type_check"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type check; the result is always 'true'."
+        );
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "1", 0))
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try correcting the type check, or removing the type check.")
+        );
+    }
+
+    /// The `is!` polarity carries the complement template.
+    #[test]
+    fn type_check_reports_scalar_false_polarity() {
+        let f = Fixture::parse("void f() { 1 is! int; }");
+        let lints = f.run(&one_rule("unnecessary_type_check"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type check; the result is always 'false'."
+        );
+    }
+
+    /// `x is dynamic` is constant whichever the operand (the DynamicType
+    /// arm fires before every other gate).
+    #[test]
+    fn type_check_reports_dynamic() {
+        let f = Fixture::parse("void f() { b is dynamic; }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("void f() { b is! dynamic; }");
+        let lints = f.run(&one_rule("unnecessary_type_check"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type check; the result is always 'false'."
+        );
+    }
+
+    /// An operand without a written face stays silent on the subtype arm
+    /// (unresolved names, parameters, member chains — under-report).
+    #[test]
+    fn type_check_faceless_operands_pass() {
+        for source in [
+            "void f() { b is int; }",
+            "void f(b) { b is! int; }",
+            "void f() { a.b is int; }",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("unnecessary_type_check")).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// A same-class field against its written type is constant-true, bare
+    /// or `this.`-qualified; an unrelated check stays silent.
+    #[test]
+    fn type_check_field_face() {
+        let f = Fixture::parse("class C { int x; void m() { x is int; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("class C { int x; void m() { this.x is int; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("class C { int x; void m() { x is String; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+        let f = Fixture::parse("class C { void m() { this.q is int; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    /// Nullability gates the same-name arm: `int? x; x is int` is not
+    /// constant (the operand may be null), the widening `x is int?` is.
+    #[test]
+    fn type_check_nullability_gates() {
+        let f = Fixture::parse("class C { int? x; void m() { x is int; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+        let f = Fixture::parse("class C { int x; void m() { x is int?; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+    }
+
+    /// `this is C` — the receiver's class against its own name.
+    #[test]
+    fn type_check_reports_this_face() {
+        let f = Fixture::parse("class C { void m() { this is C; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+    }
+
+    /// The built-in lattice edges: `int` → `num`, everything → `Object`.
+    #[test]
+    fn type_check_reports_lattice_edges() {
+        let f = Fixture::parse("void f() { 1 is num; }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("void f() { 'a' is Object; }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("void f() { 1 is double; }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    /// `null is Null` is the constant arm (both polarities); `null is int`
+    /// never reports (no subtype-negative verdict) and a `Null`-typed
+    /// field belongs to the type_check_with_null family, not this rule.
+    #[test]
+    fn type_check_null_faces() {
+        let f = Fixture::parse("void f() { null is Null; }");
+        let lints = f.run(&one_rule("unnecessary_type_check"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type check; the result is always 'true'."
+        );
+        let f = Fixture::parse("void f() { null is! Null; }");
+        let lints = f.run(&one_rule("unnecessary_type_check"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type check; the result is always 'false'."
+        );
+        let f = Fixture::parse("void f() { null is int; }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+        let f = Fixture::parse("class C { Null n; void m() { n is Null; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    /// A dynamic-typed field subtypes only `Object` (and `dynamic`).
+    #[test]
+    fn type_check_dynamic_field_face() {
+        let f = Fixture::parse("class C { dynamic d; void m() { d is Object; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("class C { dynamic d; void m() { d is int; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    /// Type arguments must match name+nullable: `List<int> xs; xs is
+    /// List<int>` reports, the mismatched target stays silent (the official
+    /// judges the full types; the invariance-safe face under-reports the
+    /// covariant matches).
+    #[test]
+    fn type_check_generic_args_gate() {
+        let f = Fixture::parse("class C { List<int> xs; void m() { xs is List<int>; } }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("class C { List<int> xs; void m() { xs is List<String>; } }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    /// A parenthesized operand unwraps on the subtype arm but stays
+    /// syntactic on the `is Null` arm — `(null) is Null` is the official's
+    /// `type_check_with_null` family, not the constant.
+    #[test]
+    fn type_check_parenthesized_operand() {
+        let f = Fixture::parse("void f() { (1) is int; }");
+        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
+        let f = Fixture::parse("void f() { (null) is Null; }");
+        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
     }
 }

@@ -41,7 +41,7 @@ pub(crate) fn owner_slice(c: &Check<'_>) -> Option<(Vec<u32>, usize)> {
 /// in the enclosing block, so everything up to it belongs to earlier
 /// statements). Runs with no statement row keep every piece (the
 /// initializer / argument single-expression parents).
-fn statement_run(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
+pub(crate) fn statement_run(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
     let start = run
         .iter()
         .rposition(|&row| crate::rules::is_statement_row(c, row))

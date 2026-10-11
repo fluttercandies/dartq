@@ -19,6 +19,12 @@ pub enum Group {
     Core,
     /// `.third/lints/lib/recommended.yaml` — core plus idiom/style rules.
     Recommended,
+    /// A lint-tier mirror of an analyzer diagnostic that is not a
+    /// `package:lints` member. Excluded from the default posture (the
+    /// default enable set is the `package:lints` slice); the rule joins a
+    /// run only by explicit name (`analysis_options` `linter.rules` or a
+    /// caller-built [`EnableSet`]).
+    Diagnostic,
 }
 
 /// Index into [`RULES`]. Stable within one build of this crate; the machine
@@ -70,9 +76,10 @@ impl core::fmt::Debug for RuleSpec {
 }
 
 /// All rules through the #586 standard-set completion (the full
-/// `package:lints` union: 34 core + 55 recommended-only). Order is registry
-/// order ([`RuleId`] assignment), grouped core-first then alphabetically
-/// within each group — keep the pin test in `tests/registry_pin.rs` in sync.
+/// `package:lints` union: 34 core + 55 recommended-only) plus the #570
+/// diagnostic mirror. Order is registry order ([`RuleId`] assignment),
+/// grouped core-first then alphabetically within each group, the mirror
+/// section last — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
@@ -165,6 +172,9 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::declarations::use_function_type_syntax_for_parameters::SPEC,
     &crate::rules::names::use_super_parameters::SPEC,
     &crate::rules::flow::use_rethrow_when_possible::SPEC,
+    // —— diagnostic mirrors (analyzer diagnostics outside `package:lints`;
+    // never in the default posture, opt-in by name) ——
+    &crate::rules::expressions::unnecessary_type_check::SPEC,
 ];
 
 /// The rule with machine name `name` (linear scan; a one-per-run lookup, not
