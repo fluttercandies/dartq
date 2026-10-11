@@ -314,7 +314,11 @@ pub struct PersistedCombinator {
     pub hide: bool,
     /// The clause's names as written: written order, duplicates preserved
     /// (the stored clause sets are sorted and deduplicated, so this
-    /// sequence can only come from [`Combinators::written`]).
+    /// sequence can only come from [`Combinators::written`]). One payload
+    /// element is exactly one source clause (#719): the clause boundary is
+    /// observable (`Combinators::written_shapes_equal`'s duplicate-directive
+    /// identity and the duplicate-combinator check's per-clause seen-set),
+    /// so adjacent same-kind clauses stay separate elements.
     pub names: Vec<String>,
     /// UTF-16 span per written name, index-locked to [`Self::names`] —
     /// the cold capture's report anchors (#539), rebuilt through
@@ -442,7 +446,7 @@ impl PersistedDirective {
             code: directive.code.map(PersistedResolutionCode::of),
             prefix: directive.prefix.map(|id| strings.resolve(id).to_owned()),
             deferred: directive.deferred,
-            combinators: written_clauses(directive.combinators.written(), strings),
+            combinators: written_clauses(directive.combinators.written_with_clauses(), strings),
             name: directive.name.as_ref().map(|name| name.to_string()),
             configurations: directive
                 .configurations
@@ -648,24 +652,29 @@ impl<'a> Files<'a> {
     }
 }
 
-/// The written combinator clauses in payload form (#539): the directive's
-/// written token sequence — what the cold capture (l1.rs
-/// `walk_import_export` → `Combinators::with_spans`) recorded — grouped
-/// into consecutive same-kind runs, written order and duplicates preserved,
-/// each token with its captured span. The stored clause name sets cannot be
-/// projected directly: they are expanded (sorted, deduplicated, `name=`
-/// setter spellings appended), so the written surface only exists on
-/// [`Combinators::written`]. Adjacent same-kind clauses merge into one run
-/// — invisible outside `Combinators` (every query face keys on kind plus
-/// membership, and restore rebuilds the identical written sequence).
+/// The written combinator clauses in payload form (#539, #719): the
+/// directive's written token sequence — what the cold capture (l1.rs
+/// `walk_import_export` → `Combinators::with_spans`) recorded — split into
+/// one payload element per source clause, written order and duplicates
+/// preserved, each token with its captured span. The stored clause name
+/// sets cannot be projected directly: they are expanded (sorted,
+/// deduplicated, `name=` setter spellings appended), so the written surface
+/// only exists on [`Combinators::written_with_clauses`] — and its clause
+/// index must ride: W3 made clause boundaries observable
+/// ([`Combinators::written_shapes_equal`]'s duplicate-directive identity
+/// and the duplicate-combinator check's per-clause seen-set), so merging
+/// adjacent same-kind clauses (`hide a hide a` → one `hide a, a`) would
+/// make a warm start answer those queries differently from the cold
+/// capture.
 fn written_clauses(
-    written: impl Iterator<Item = (StringId, bool, SourceRange)>,
+    written: impl Iterator<Item = (StringId, bool, SourceRange, u32)>,
     strings: &StringTable,
 ) -> Vec<PersistedCombinator> {
     let mut clauses: Vec<PersistedCombinator> = Vec::new();
-    for (name, hidden, span) in written {
+    let mut current = None;
+    for (name, hidden, span, id) in written {
         match clauses.last_mut() {
-            Some(clause) if clause.hide == hidden => {
+            Some(clause) if current == Some(id) => {
                 clause.names.push(strings.resolve(name).to_owned());
                 clause.name_spans.push(PersistedRange::of(span));
             }
@@ -675,6 +684,7 @@ fn written_clauses(
                 name_spans: vec![PersistedRange::of(span)],
             }),
         }
+        current = Some(id);
     }
     clauses
 }
@@ -1765,6 +1775,284 @@ mod tests {
             "the recompute (the version miss's outcome) yields the spanned \
              written sequence"
         );
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// The source the `clause_boundaries_survive_the_payload` round-trip
+    /// helper analyzes (one import; the combinators ride the fixture
+    /// directives, not this text).
+    const CLAUSE_ROUND_TRIP_SOURCE: &str = "import 'package:other/other.dart';\n";
+
+    /// Round-trips one import directive whose combinators are `clauses`
+    /// (each: hidden flag, name texts, per-name spans) through the payload,
+    /// returning the cold and the restored `Combinators` plus the payload's
+    /// JSON encoding. Each call builds fresh tables, and the cold capture
+    /// and the restore intern the identical name set in the identical
+    /// order, so [`Combinators::written_shapes_equal`]'s interned-id
+    /// comparison is exact across the pair.
+    fn clause_round_trip(
+        clauses: &[(bool, &[&str], &[SourceRange])],
+    ) -> (Combinators, Combinators, String) {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let target = files.intern(Path::new("/w/lib/other.dart"));
+        let to_clauses = || {
+            clauses
+                .iter()
+                .map(|(hidden, names, spans)| {
+                    let names: Box<[StringId]> =
+                        names.iter().map(|name| strings.intern(name)).collect();
+                    let clause = if *hidden {
+                        CombinatorClause::Hide(names)
+                    } else {
+                        CombinatorClause::Show(names)
+                    };
+                    (clause, spans.to_vec().into_boxed_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+        let cold = Combinators::with_spans(to_clauses(), &strings);
+        let facts = UnitFacts {
+            content: content_hash(CLAUSE_ROUND_TRIP_SOURCE.as_bytes()),
+            api_signature: ApiSignature::from_bytes([5; 16]),
+            directives: vec![DirectiveFacts {
+                kind: DirectiveKind::Import,
+                uri: Some("package:other/other.dart".into()),
+                uri_span: SourceRange {
+                    offset: 7,
+                    length: 26,
+                },
+                target: ResolvedTarget::Resolved(target),
+                code: None,
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::with_spans(to_clauses(), &strings),
+                name: None,
+                configurations: Box::default(),
+                configuration_spans: Box::default(),
+            }],
+            elements: Arc::new(dartq_semantic::FileElements::default()),
+            diagnostics: Vec::new(),
+            line_index: LineIndex::new(CLAUSE_ROUND_TRIP_SOURCE),
+        };
+
+        let payload = PersistedFacts::of(&facts, &strings, &files);
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let decoded: PersistedFacts = serde_json::from_str(&json).expect("deserialize");
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = decoded.materialize(
+            CLAUSE_ROUND_TRIP_SOURCE,
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
+        let warm = restored
+            .directives
+            .into_iter()
+            .next()
+            .expect("one directive")
+            .combinators;
+        (cold, warm, json)
+    }
+
+    /// Clause boundaries survive the payload (#719): `hide alpha hide alpha`
+    /// (two clauses) and `hide alpha, alpha` (one clause) — likewise
+    /// `show alpha show beta` and `show alpha, beta` — serialize to
+    /// different payloads and restore to `Combinators` whose written shapes
+    /// match only their own cold face (`written_shapes_equal` compares
+    /// clause ids, the per-clause seen-set boundary of the
+    /// duplicate-combinator check). The pre-#719 merged-run payload
+    /// collapsed both spellings of each pair, so a warm start over-reported
+    /// duplicate combinators and equated the paired imports.
+    #[test]
+    fn clause_boundaries_survive_the_payload() {
+        let span = |offset, length| SourceRange { offset, length };
+
+        let (hide_split, hide_split_warm, hide_split_json) = clause_round_trip(&[
+            (true, &["alpha"], &[span(39, 5)]),
+            (true, &["alpha"], &[span(57, 5)]),
+        ]);
+        let (hide_grouped, hide_grouped_warm, hide_grouped_json) =
+            clause_round_trip(&[(true, &["alpha", "alpha"], &[span(39, 5), span(57, 5)])]);
+
+        assert_ne!(
+            hide_split_json, hide_grouped_json,
+            "one payload element per source clause: the two spellings must \
+             not collapse into the same bytes"
+        );
+        assert!(
+            !hide_split.written_shapes_equal(&hide_grouped),
+            "fixture sanity: the cold faces are different shapes"
+        );
+        assert!(
+            hide_split_warm.written_shapes_equal(&hide_split),
+            "the warm face reproduces the cold two-clause shape"
+        );
+        assert!(
+            hide_grouped_warm.written_shapes_equal(&hide_grouped),
+            "the warm face reproduces the cold one-clause shape"
+        );
+        assert!(
+            !hide_split_warm.written_shapes_equal(&hide_grouped)
+                && !hide_grouped_warm.written_shapes_equal(&hide_split)
+                && !hide_split_warm.written_shapes_equal(&hide_grouped_warm),
+            "`hide alpha hide alpha` and `hide alpha, alpha` stay different \
+             shapes across the round trip, in both directions"
+        );
+
+        let (show_split, show_split_warm, _) = clause_round_trip(&[
+            (false, &["alpha"], &[span(39, 5)]),
+            (false, &["beta"], &[span(57, 4)]),
+        ]);
+        let (show_grouped, show_grouped_warm, _) =
+            clause_round_trip(&[(false, &["alpha", "beta"], &[span(39, 5), span(57, 4)])]);
+
+        assert!(
+            !show_split.written_shapes_equal(&show_grouped),
+            "fixture sanity: `show alpha show beta` and `show alpha, beta` \
+             are different cold shapes"
+        );
+        assert!(
+            show_split_warm.written_shapes_equal(&show_split)
+                && show_grouped_warm.written_shapes_equal(&show_grouped),
+            "each warm show face reproduces its own cold clause structure"
+        );
+        assert!(
+            !show_split_warm.written_shapes_equal(&show_grouped)
+                && !show_grouped_warm.written_shapes_equal(&show_split)
+                && !show_split_warm.written_shapes_equal(&show_grouped_warm),
+            "`show alpha show beta` and `show alpha, beta` stay different \
+             shapes across the round trip — the duplicate-directive identity \
+             must not equate them after a warm start"
+        );
+    }
+
+    /// The full warm-start seam for the clause-boundary invariant (#719):
+    /// for a file whose imports stress adjacent same-kind clauses
+    /// (`hide alpha hide alpha`; `show alpha show beta` next to
+    /// `show alpha, beta`), the warm facts reproduce the cold combinator
+    /// shapes on every directive and the cold diagnostics — no
+    /// duplicate-combinator and no duplicate-import report on either side.
+    /// The merged-run payload collapsed the boundaries, so a warm start
+    /// over-reported the duplicates and equated the paired imports.
+    #[test]
+    fn warm_start_reproduces_cold_clause_boundary_faces() {
+        let config_dir = graph_config_dir();
+        let root = config_dir.parent().expect("fixture root").to_path_buf();
+        let main_path = root.join("lib/main.dart");
+        let other_path = root.join("lib/other.dart");
+        let main_src = concat!(
+            "import 'other.dart' hide alpha hide alpha;\n",
+            "import 'other.dart' show alpha show beta;\n",
+            "import 'other.dart' show alpha, beta;\n",
+            "void main() { alpha(); beta(); }\n",
+        );
+        let other_src = "int alpha() => 1;\nint beta() => 2;\n";
+
+        let pub_config = Arc::new(PackageConfig::parse(GRAPH_CONFIG).expect("valid config"));
+        let build_engine = || {
+            Engine::new(EngineConfig {
+                store: memory_store(),
+                sdk: sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES),
+                packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
+                pub_config: Arc::clone(&pub_config),
+                config_dir: config_dir.clone(),
+                semdiag: None,
+                target: "vm".to_owned(),
+                declared_variables: FxHashMap::default(),
+            })
+            .expect("engine")
+        };
+        let mut cold = build_engine();
+        let main_cold = cold.set_content(&main_path, main_src.as_bytes());
+        let _ = cold.set_content(&other_path, other_src.as_bytes());
+        let mut on_event = |_event: EngineEvent| {};
+        let cancel = CancellationToken::new();
+        cold.analyze(&[], &mut on_event, &cancel).expect("analyze");
+        assert!(
+            cold.file_facts(main_cold)
+                .expect("resident")
+                .diagnostics
+                .is_empty(),
+            "fixture sanity: the oracle-clean file analyzes clean cold"
+        );
+
+        let cache = snapshot_cache_dir();
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(cache.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        assert_eq!(
+            cold.save_facts_snapshot(&store).expect("save"),
+            2,
+            "one entry per distinct content"
+        );
+        let header = cold.snapshot_header();
+
+        // A fresh process's world: fresh engine, load, ingest, re-apply —
+        // every main.dart content hits its snapshot entry.
+        let mut warm = build_engine();
+        let snapshot = store.load::<PersistedFacts>(&header).expect("generation");
+        assert_eq!(warm.ingest_facts_snapshot(snapshot), 2);
+        let main_warm = warm.set_content(&main_path, main_src.as_bytes());
+        let _ = warm.set_content(&other_path, other_src.as_bytes());
+        warm.analyze(&[], &mut on_event, &cancel).expect("analyze");
+        assert!(
+            warm.state.warm_start.is_empty(),
+            "single-shot staging: both matched entries consumed"
+        );
+
+        let cold_facts = cold.file_facts(main_cold).expect("resident");
+        let warm_facts = warm.file_facts(main_warm).expect("resident");
+        assert!(
+            warm_facts.diagnostics.is_empty(),
+            "the warm start must not report duplicate combinators or a \
+             duplicate import — got {:?}",
+            warm_facts
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cold_facts.directives.len(),
+            warm_facts.directives.len(),
+            "the same directive list"
+        );
+        for (index, (cold_directive, warm_directive)) in cold_facts
+            .directives
+            .iter()
+            .zip(warm_facts.directives.iter())
+            .enumerate()
+        {
+            // The shapes compare through each engine's own string table:
+            // `written_shapes_equal` compares interned name ids, which are
+            // engine-local by design — the cold batch's parallel scan
+            // (l1.rs `par_iter`) interns across files in a nondeterministic
+            // order, and its only product caller (pipeline.rs's
+            // duplicate-directive identity) compares within one engine. The
+            // projection compares what the invariant pins: name text,
+            // hidden flag, captured span, and clause id per written token.
+            let shape = |directive: &DirectiveFacts, strings: &StringTable| {
+                directive
+                    .combinators
+                    .written_with_clauses()
+                    .map(|(name, hidden, span, clause)| {
+                        (strings.resolve(name).to_owned(), hidden, span, clause)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                shape(cold_directive, &cold.state.strings),
+                shape(warm_directive, &warm.state.strings),
+                "directive #{index}: the warm written combinator shape \
+                 diverges from the cold capture"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&cache);
     }

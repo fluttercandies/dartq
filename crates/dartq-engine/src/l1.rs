@@ -15,6 +15,7 @@ use dartq_resolution::{
     UriResolver, resolve_conditional,
 };
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
+use dartq_sdk::AllowedExperiments;
 use dartq_snapshot::EntryKey;
 use dartq_source::{ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of};
 use rayon::prelude::*;
@@ -22,8 +23,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::event::{EngineEvent, RevalidateGate};
 use crate::state::{
-    DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, LibraryId,
-    LibraryInfo, PendingChange, ScannedFace, UnitFacts,
+    DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, FeatureGrants,
+    LibraryId, LibraryInfo, PendingChange, ScannedFace, UnitFacts,
 };
 
 /// The outcome of one apply (engine-api-spec §1.2 `AffectedReport` payload).
@@ -286,7 +287,7 @@ fn recompute_facts(
     // slot materializes its own face.
     let mut warm: Vec<(usize, FactsKey)> = Vec::new();
     for (index, (_, content, _)) in changed.iter().enumerate() {
-        let key = facts_key(&state.packages, &state.files, changed[index].0, *content);
+        let key = facts_key(&state.grants(), changed[index].0, *content);
         if let Some(facts) = state.cached_facts(key) {
             hits.push((index, facts));
         } else if state.warm_start.contains_key(&snapshot_key(key)) {
@@ -312,6 +313,7 @@ fn recompute_facts(
                 sources[*index],
                 versions[*index],
                 &state.strings,
+                &state.grants(),
             );
             (*index, *key, facts, face)
         })
@@ -541,21 +543,41 @@ pub(crate) fn language_version_for(
         .unwrap_or(DEFAULT_LANGUAGE_VERSION)
 }
 
+/// The borrowed per-file grant faces: everything the feature-set merge
+/// consults, bundled so the per-file lanes pass one reference instead of
+/// four disjoint state fields ([`EngineState::grants`] builds it).
+pub(crate) struct Grants<'a> {
+    /// The memoized grant tables and SDK-library reverse map.
+    pub grants: &'a FeatureGrants,
+    /// The SDK's parsed `allowed_experiments.json`.
+    pub experiments: &'a AllowedExperiments,
+    /// File → owning package attribution.
+    pub packages: &'a IdentityTable,
+    /// Interned paths.
+    pub files: &'a FileTable,
+}
+
+impl Grants<'_> {
+    /// The feature set `file` analyzes under at `version` — the version
+    /// baseline with the owner's allowed-experiment grants merged in (audit
+    /// #708 P2-1). A no-grant engine returns the baseline unchanged, so the
+    /// empty-whitelist corpora stay byte-identical to the pre-grant face.
+    pub(crate) fn granted(&self, file: FileId, version: LanguageVersion) -> FeatureSet {
+        self.grants
+            .granted(self.experiments, self.packages, self.files, file, version)
+    }
+}
+
 /// The facts/scanned cache key of a resident file: the `AstKey` triple
-/// (PRD §5.3) derived from the file's content and its package-derived
-/// feature fingerprint. The single derivation both the apply recompute and
+/// (PRD §5.3) derived from the file's content and its granted feature
+/// fingerprint. The single derivation both the apply recompute and
 /// the drained consumers share, so a cache entry is always found under the
 /// key it was stored under.
-pub(crate) fn facts_key(
-    packages: &IdentityTable,
-    files: &FileTable,
-    file: FileId,
-    content: ContentId,
-) -> FactsKey {
-    let version = language_version_for(packages, files, file);
+pub(crate) fn facts_key(grants: &Grants<'_>, file: FileId, content: ContentId) -> FactsKey {
+    let version = language_version_for(grants.packages, grants.files, file);
     FactsKey {
         content,
-        feature_fingerprint: FeatureSet::for_language_version(version).fingerprint(),
+        feature_fingerprint: grants.granted(file, version).fingerprint(),
         semantic_version: FACTS_SEMANTIC_VERSION,
     }
 }
@@ -571,8 +593,9 @@ fn compute_unit(
     text: &str,
     version: LanguageVersion,
     strings: &StringTable,
+    grants: &Grants<'_>,
 ) -> (UnitFacts, ScannedFace) {
-    let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file);
+    let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file, grants);
     diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
     // The single allocation of the element model: every later consumer
     // (duplicate bake, api signature, facts clones, the semdiag fold)
@@ -649,19 +672,27 @@ fn directive_face(text: &str, tokens: &TokenTable, region_end: usize) -> Vec<u8>
 /// re-derives the config and rescans; the scanner reports only the last
 /// header-window match, so at most one rescan settles).
 ///
+/// The feature set carries the file's allowed-experiment grants on top of
+/// the version baseline (official `feature_set_provider.dart:58-77`), and
+/// the override re-gates the same grants at the override version
+/// (`scanner.dart:127`, `featureSetForOverriding.restrictToVersion`) — not
+/// a bare re-derivation, so a package's whitelist survives its own
+/// `// @dart` pin-down.
+///
 /// An override above the latest known version is officially rejected, not
 /// clamped (official scanner `_languageVersionChanged`): the
 /// `invalid_language_version_override` STATIC_WARNING pins at the comment
 /// lexeme and the override is dropped (`_overrideVersion = null`) — the
-/// feature set stays the package/default-derived one and no rescan runs.
-/// The warning rides back for the diagnostics face to bake; the
+/// feature set stays the granted package/default-derived one and no rescan
+/// runs. The warning rides back for the diagnostics face to bake; the
 /// index-capture face drops it (it produces no diagnostics).
 pub(crate) fn scan_unit(
     text: &str,
     version: LanguageVersion,
     file: FileId,
+    grants: &Grants<'_>,
 ) -> (FeatureSet, ScanResult, Vec<Diagnostic>) {
-    let mut feature_set = FeatureSet::for_language_version(version);
+    let mut feature_set = grants.granted(file, version);
     let mut scanned = scan(text, scan_config(feature_set), file);
     let mut warnings = Vec::new();
     if let Some(over) = scanned.language_version_override {
@@ -687,7 +718,7 @@ pub(crate) fn scan_unit(
                 None,
             ));
         } else if over != version {
-            feature_set = FeatureSet::for_language_version(over);
+            feature_set = grants.granted(file, over);
             scanned = scan(text, scan_config(feature_set), file);
         }
     }
@@ -2529,6 +2560,18 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::new_inner(false)
+        }
+
+        /// The same workspace with `enhanced-parts` granted to package `t`
+        /// and to the SDK's default library set, at language version 3.7 —
+        /// above the experiment's 3.6 release, so the grant sticks at the
+        /// package version (audit #708 P2-1).
+        fn new_with_grants() -> Self {
+            Self::new_inner(true)
+        }
+
+        fn new_inner(granted: bool) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let root = std::env::temp_dir().join(format!(
                 "dartq-engine-l1-{}-{}",
@@ -2536,6 +2579,21 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = std::fs::remove_dir_all(&root);
+            let (sdk_constraint, sdk_floor, config_version, experiments_json) = if granted {
+                (
+                    "^3.7.0",
+                    "3.7.0",
+                    "3.7",
+                    r#"{"version": 1, "experimentSets": {"sdkExperiments": ["enhanced-parts"]}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {"t": {"experimentSet": "sdkExperiments"}}}"#,
+                )
+            } else {
+                (
+                    "^3.5.0",
+                    "3.5.0",
+                    "3.5",
+                    r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+                )
+            };
             let write = |relative: &str, content: &str| {
                 let path = root.join(relative);
                 std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
@@ -2543,15 +2601,17 @@ mod tests {
             };
             write(
                 "pubspec.yaml",
-                "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+                &format!("name: t\nversion: 0.1.0\nenvironment:\n  sdk: {sdk_constraint}\n"),
             );
             write(
                 "pubspec.lock",
-                "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+                &format!("packages: {{}}\nsdks:\n  dart: \">={sdk_floor} <4.0.0\"\n"),
             );
             write(
                 ".dart_tool/package_config.json",
-                r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+                &format!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "t", "rootUri": "../", "languageVersion": "{config_version}"}}], "generator": "pub"}}"#
+                ),
             );
             write("sdk/version", "3.13.1\n");
             write(
@@ -2560,7 +2620,7 @@ mod tests {
             );
             write(
                 "sdk/lib/_internal/allowed_experiments.json",
-                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+                experiments_json,
             );
             // Canonicalize before the pub faces resolve it (the #287
             // spelling universe — macOS /var vs /private/var).
@@ -2573,11 +2633,14 @@ mod tests {
                 )
                 .expect("valid config"),
             );
-            let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
-                .expect("valid lock");
-            let root_pubspec =
-                Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
-                    .expect("valid pubspec");
+            let lock = LockFile::parse(&format!(
+                "packages: {{}}\nsdks:\n  dart: \">={sdk_floor} <4.0.0\"\n"
+            ))
+            .expect("valid lock");
+            let root_pubspec = Pubspec::parse(&format!(
+                "name: t\nversion: 0.1.0\nenvironment:\n  sdk: {sdk_constraint}\n"
+            ))
+            .expect("valid pubspec");
             let graph = build_graph(
                 &config,
                 &lock,
@@ -2805,8 +2868,11 @@ mod tests {
     #[test]
     fn directive_face_is_length_prefixed() {
         let text = "import 'a.dart';\n";
-        let file = FileTable::new().intern(Path::new("/face.dart"));
-        let (_, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file);
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/face.dart"));
+        let grants = state.grants();
+        let (_, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         assert!(warnings.is_empty());
         let strings = StringTable::new();
         let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
@@ -2827,8 +2893,11 @@ mod tests {
     #[test]
     fn control_character_lexeme_does_not_alias_the_separator_join() {
         let text = "import 'a\u{1}b.dart';\n";
-        let file = FileTable::new().intern(Path::new("/face.dart"));
-        let (_, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file);
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/face.dart"));
+        let grants = state.grants();
+        let (_, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         let strings = StringTable::new();
         let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
         let face = directive_face(text, &scanned.tokens, region_end);
@@ -2844,6 +2913,116 @@ mod tests {
         assert_eq!(
             face, expected,
             "the raw byte rides inside its framed lexeme"
+        );
+    }
+
+    /// Allowed-experiment grants merge into the per-file feature set (audit
+    /// #708 P2-1; oracle `feature_set_provider.dart:58-77`): the package's
+    /// whitelist rides the version baseline, an SDK-owned file reads its
+    /// library's grant even under a package root, an unattributed file
+    /// stays on the plain baseline, the memo returns the identical set on
+    /// repeat derivation (and the facts key carries the granted
+    /// fingerprint), and a `// @dart` override re-gates the same grants at
+    /// the override version (`scanner.dart:127`) instead of dropping them.
+    #[test]
+    fn experiment_grants_merge_and_memoize_identity() {
+        let fixture = Fixture::new_with_grants();
+        let mut state = fixture.state();
+        let file = set(
+            &mut state,
+            &fixture.root.join("lib/granted.dart"),
+            "var x = 1;\n",
+        );
+        // Under the SDK tree but inside the workspace root: the dart: branch
+        // of the oracle wins over the package walk.
+        let sdk_file = set(
+            &mut state,
+            &fixture.root.join("sdk/lib/core/bool.dart"),
+            "var s = 1;\n",
+        );
+        // Outside every package: the unattributed baseline.
+        let outside = set(
+            &mut state,
+            &fixture.root.parent().expect("temp parent").join("out.dart"),
+            "var o = 1;\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let version = language_version_for(&state.packages, &state.files, file);
+        assert_eq!(version, LanguageVersion { major: 3, minor: 7 });
+        let merged = state.grants().granted(file, version);
+        assert!(
+            merged.is_enabled(Feature::EnhancedParts),
+            "the package grant sticks at 3.7 (release 3.6)"
+        );
+
+        let sdk_version = language_version_for(&state.packages, &state.files, sdk_file);
+        let sdk_features = state.grants().granted(sdk_file, sdk_version);
+        assert!(
+            sdk_features.is_enabled(Feature::EnhancedParts),
+            "the sdk-default grant reaches an SDK library file"
+        );
+
+        let outside_features = state.grants().granted(outside, DEFAULT_LANGUAGE_VERSION);
+        assert!(
+            !outside_features.is_enabled(Feature::EnhancedParts),
+            "no owner, no grant"
+        );
+
+        // Memo identity: the repeat derivation of the same (owner, version)
+        // is the identical set.
+        assert_eq!(state.grants().granted(file, version), merged);
+
+        // The facts key carries the granted fingerprint, so the cached and
+        // re-derived faces cannot alias across the lanes.
+        let content = state.residency[&file].content;
+        let key = facts_key(&state.grants(), file, content);
+        assert_eq!(key.feature_fingerprint, merged.fingerprint());
+
+        // The override re-gates the grants (`restrictToVersion`), it does
+        // not re-derive a bare baseline: enabled above the release, and a
+        // pin below it lands exactly on the plain pinned baseline.
+        let (upgraded, _, warnings) = scan_unit(
+            "// @dart = 3.8\nvar y = 2;\n",
+            version,
+            file,
+            &state.grants(),
+        );
+        assert!(warnings.is_empty());
+        assert!(upgraded.is_enabled(Feature::EnhancedParts));
+        let (pinned, _, _) = scan_unit(
+            "// @dart = 3.5\nvar z = 3;\n",
+            version,
+            file,
+            &state.grants(),
+        );
+        assert_eq!(
+            pinned.fingerprint(),
+            FeatureSet::for_language_version(LanguageVersion { major: 3, minor: 5 }).fingerprint(),
+            "pinned below the 3.6 release: the plain 3.5 baseline"
+        );
+        assert_ne!(
+            upgraded.fingerprint(),
+            pinned.fingerprint(),
+            "the grant re-gates at the override version"
+        );
+    }
+
+    /// The no-grant fixture stays exactly on the version baseline — the
+    /// zero-behavior-change guarantee the empty-whitelist differential
+    /// depends on.
+    #[test]
+    fn empty_grants_leave_the_plain_baseline() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = set(&mut state, &fixture.root.join("lib/a.dart"), "var x = 1;\n");
+        apply(&mut state, &mut |_| {});
+        let version = language_version_for(&state.packages, &state.files, file);
+        let granted = state.grants().granted(file, version);
+        assert_eq!(
+            granted.fingerprint(),
+            FeatureSet::for_language_version(version).fingerprint(),
+            "no grant set anywhere in the fixture: baseline byte-for-byte"
         );
     }
 

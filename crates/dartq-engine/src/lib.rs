@@ -78,7 +78,7 @@ pub use event::{EngineEvent, RevalidateGate};
 pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
 pub use scheduler::{DrainReport, Task, Tier};
 pub use state::persist::PersistedFacts;
-pub use state::{DirectiveFacts, DirectiveKind, LibraryId, ScannedFace, UnitFacts};
+pub use state::{DirectiveFacts, DirectiveKind, FeatureGrants, LibraryId, ScannedFace, UnitFacts};
 
 /// The default SDK target segment (`libraries.json` panel) `dart:` URI
 /// resolution dispatches against — the `dart analyze` posture. Every
@@ -848,12 +848,7 @@ impl Engine {
         let mut claimed: FxHashSet<EntryKey> = FxHashSet::default();
         for file in files {
             let facts = &self.state.residency[&file];
-            let key = l1::facts_key(
-                &self.state.packages,
-                &self.state.files,
-                file,
-                facts.content(),
-            );
+            let key = l1::facts_key(&self.state.grants(), file, facts.content());
             let key = EntryKey {
                 content_hash: *key.content.as_bytes(),
                 feature_fingerprint: key.feature_fingerprint,
@@ -978,6 +973,10 @@ pub struct LibraryView<'a> {
     pub packages: &'a PackageTable,
     /// The interned paths (file → path for the package attribution).
     pub file_table: &'a FileTable,
+    /// The memoized per-file experiment grants (audit #708 P2-1): a local
+    /// re-scan on a scanned-face miss merges the same whitelist the apply
+    /// recompute did, so the re-derived face is identical.
+    pub grants: &'a FeatureGrants,
     /// The import namespaces of the current graph (built once per graph
     /// generation).
     pub namespaces: &'a dartq_resolution::Namespaces,

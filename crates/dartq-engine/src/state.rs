@@ -6,11 +6,11 @@ pub mod persist;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use dartq_diagnostics::Diagnostic;
 use dartq_index::{FileCapture, LibraryIndex};
-use dartq_language::FeatureSet;
+use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_pub::PackageConfig;
 use dartq_resolution::{
@@ -18,7 +18,7 @@ use dartq_resolution::{
     UriResolver,
 };
 use dartq_scanner::TokenTable;
-use dartq_sdk::SdkSnapshot;
+use dartq_sdk::{AllowedExperiments, SdkSnapshot};
 use dartq_semantic::FileElements;
 use dartq_source::{
     ContentId, FileId, FileTable, LineIndex, SourceRange, SourceStore, StringId, StringTable,
@@ -51,6 +51,13 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// per written token, at its captured span); v6 payloads restore span-less
 /// through the span-less constructor, so a warm start would regress the
 /// reports to offset-0 anchors and lose written order and duplicates.
+/// v8: combinators persist one payload element per source clause (#719) —
+/// the written tokens carry their clause boundary
+/// ([`Combinators::written_with_clauses`]) because W3 made boundaries
+/// observable (`written_shapes_equal`'s duplicate-directive identity and
+/// the duplicate-combinator check's per-clause seen-set); v7 payloads
+/// merged adjacent same-kind clauses, so a warm start would over-report
+/// duplicate combinators and equate `show a show b` with `show a, b`.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -67,7 +74,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// already forced through a compile review by the exhaustive `of`/`restore`
 /// matches; they change the on-disk schema all the same, so they bump this
 /// version too.)
-const FACTS_SHAPE_VERSION: u32 = 7;
+const FACTS_SHAPE_VERSION: u32 = 8;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
@@ -267,6 +274,158 @@ pub struct ScannedFace {
     pub features: FeatureSet,
 }
 
+/// The file-side owner of allowed-experiment grants — a package name from
+/// the pub config, or a `dart:` library name from the SDK's target table.
+/// The two namespaces are distinct in `allowed_experiments.json`
+/// (`packages` vs `sdk.libraries`), so one enum keeps a package named
+/// `core` from reading the library's grant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GrantOwner {
+    Package(Box<str>),
+    SdkLibrary(Box<str>),
+}
+
+/// The per-file allowed-experiment authorization, merged into every file's
+/// derived [`FeatureSet`] (audit #708 P2-1).
+///
+/// The oracle derives each file's feature set over its version *and* the
+/// SDK's experiment whitelist: `dart:` libraries get
+/// `AllowedExperiments.forSdkLibrary` grants and package files get
+/// `forPackage` grants on top of the version baseline
+/// (`feature_set_provider.dart:58-77`); a `// @dart` override re-gates the
+/// same grants at the override version (`scanner.dart:127`,
+/// `featureSetForOverriding.restrictToVersion`). The grants ride the SDK
+/// snapshot fingerprint, so a snapshot change already forks identities —
+/// this state only memoizes the per-owner derivation.
+///
+/// Structure:
+///
+/// - `any` gates the whole query: when no owner the engine can attribute
+///   carries a non-empty grant set (every current corpus), the merge is a
+///   literal no-op — one branch, then the plain version baseline. This is
+///   what keeps the empty-grant differential flat by construction.
+/// - `sdk_library_dirs` is the reverse of `SdkSnapshot::uri_to_path`: each
+///   target library's directory (`<root>/lib/<dirname(uri)>`) maps to its
+///   name, so a file attributed by its disk path — the engine keeps no
+///   `dart:` URIs — recovers the owning library exactly when the path was
+///   produced by a `dart:` resolution.
+/// - `memo` is the `(owner, version) -> FeatureSet` cache the per-file
+///   lanes share: one derivation per distinct pair per engine, O(1) lookups
+///   after first touch. `Mutex`-guarded because the lanes read `&state` on
+///   rayon workers (the [`StringTable`] interning-lock precedent); the
+///   critical section is a hash lookup.
+pub struct FeatureGrants {
+    any: bool,
+    sdk_lib_root: Box<Path>,
+    sdk_library_dirs: FxHashMap<Box<Path>, Box<str>>,
+    memo: Mutex<FxHashMap<(GrantOwner, LanguageVersion), FeatureSet>>,
+}
+
+impl FeatureGrants {
+    /// Derives the grant faces from the loaded SDK snapshot, the target
+    /// segment, and the package table. Only owners that can actually win a
+    /// file's attribution are scanned: the table's packages and the target
+    /// segment's libraries (a grant for an unknown package or another
+    /// segment can never fire).
+    pub(crate) fn new(sdk: &SdkSnapshot, target: &str, packages: &IdentityTable) -> Self {
+        let lib_root: Box<Path> = Box::from(sdk.dart_sdk_root().join("lib"));
+        let mut sdk_library_dirs = FxHashMap::default();
+        let mut any = false;
+        if let Some(segment) = sdk.target(target) {
+            for (name, library) in &segment.libraries {
+                if !sdk.platform_metadata.for_sdk_library(name).is_empty() {
+                    any = true;
+                }
+                // The library's directory: `<lib>/<dirname(uri)>` — the
+                // join always has a parent (`uri` is non-empty and relative).
+                let dir = lib_root
+                    .join(&library.uri)
+                    .parent()
+                    .expect("library path under lib/ always has a directory")
+                    .to_path_buf();
+                sdk_library_dirs.insert(Box::from(dir), Box::from(name.as_str()));
+            }
+        }
+        any |= packages.iter().any(|package| {
+            sdk.platform_metadata
+                .for_package(package.name.as_str())
+                .is_some_and(|set| !set.is_empty())
+        });
+        Self {
+            any,
+            sdk_lib_root: lib_root,
+            sdk_library_dirs,
+            memo: Mutex::new(FxHashMap::default()),
+        }
+    }
+
+    /// The feature set `file` analyzes under at `version`: the version
+    /// baseline with the owning owner's whitelist grants merged in.
+    ///
+    /// An unattributable file (no package, not under the SDK's `lib/`) and
+    /// a no-grant engine both get the plain baseline. An SDK whitelist
+    /// naming an experiment the vendored feature registry does not know is
+    /// a version skew that must surface (`UnknownExperiments`), not
+    /// silently disable the grant — it fails loudly here, once per
+    /// unresolvable `(owner, version)`.
+    pub(crate) fn granted(
+        &self,
+        experiments: &AllowedExperiments,
+        packages: &IdentityTable,
+        files: &FileTable,
+        file: FileId,
+        version: LanguageVersion,
+    ) -> FeatureSet {
+        if !self.any {
+            return FeatureSet::for_language_version(version);
+        }
+        let Some(owner) = self.owner_for(packages, files, file) else {
+            return FeatureSet::for_language_version(version);
+        };
+        let mut memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(set) = memo.get(&(owner.clone(), version)) {
+            return *set;
+        }
+        let set = match &owner {
+            GrantOwner::Package(name) => experiments.feature_set_for_package(name, version),
+            GrantOwner::SdkLibrary(name) => experiments.feature_set_for_sdk_library(name, version),
+        }
+        .unwrap_or_else(|unknown| {
+            panic!("allowed-experiments grant for `{owner:?}` cannot be applied: {unknown}")
+        });
+        memo.insert((owner, version), set);
+        set
+    }
+
+    /// The grant owner of `file`: an SDK library when the path lies under
+    /// the SDK's `lib/` (walked up to the nearest library directory — the
+    /// exact inverse of `SdkSnapshot::uri_to_path`, so parts attribute to
+    /// their `dart:` library), else the containing package. The SDK branch
+    /// runs first because the oracle attributes `dart:`-URI files before
+    /// any package lookup (`feature_set_provider.dart:58-69`); an SDK tree
+    /// nested under a package root is still dart:-owned.
+    fn owner_for(
+        &self,
+        packages: &IdentityTable,
+        files: &FileTable,
+        file: FileId,
+    ) -> Option<GrantOwner> {
+        let path = files.path(file)?;
+        if path.starts_with(self.sdk_lib_root.as_ref()) {
+            let mut dir = path.parent();
+            while let Some(candidate) = dir {
+                if let Some(name) = self.sdk_library_dirs.get(candidate) {
+                    return Some(GrantOwner::SdkLibrary(name.clone()));
+                }
+                dir = candidate.parent();
+            }
+        }
+        packages
+            .containing(path)
+            .map(|identity| GrantOwner::Package(Box::from(identity.name.as_str())))
+    }
+}
+
 /// One library of the analysis set: a defining file plus its parts in
 /// `part`-directive order (res-spec §2.6 — the library content identity
 /// folds the member contents in exactly this order).
@@ -447,8 +606,9 @@ impl LibraryTable {
 /// exclusivity on the `Engine` makes the enqueue→apply→analyze order total,
 /// so neither the overlay nor the store need interior mutability: the store
 /// is owned outright (reads take `&self`, `put` runs inside apply), and the
-/// only lock in the crate is the [`StringTable`]'s own interning lock
-/// (worker threads intern names during the parallel recompute).
+/// only locks in the crate are the [`StringTable`]'s interning lock and the
+/// [`FeatureGrants`] memo (worker threads share both during the parallel
+/// recompute).
 pub(crate) struct EngineState {
     /// Package identity table over one resolution (PRD §8).
     pub packages: IdentityTable,
@@ -457,6 +617,10 @@ pub(crate) struct EngineState {
     pub uri_packages: UriPackageTable,
     /// SDK snapshot; `dart:` targets resolve against [`Self::target`].
     pub sdk: SdkSnapshot,
+    /// Memoized per-file experiment grants (audit #708 P2-1): the
+    /// allowed-experiments authorization merged into every file's derived
+    /// feature set. See [`FeatureGrants`].
+    pub feature_grants: FeatureGrants,
     /// The SDK target segment (the `libraries.json` panel — `vm`, `js`, …)
     /// `dart:` URI resolution dispatches against. A context dimension
     /// (#483): `EngineConfig::target` carries it, `"vm"` by default (the
@@ -629,6 +793,8 @@ impl EngineState {
         declared_variables: FxHashMap<String, String>,
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
+        // The grant faces read the tables before they move into the state.
+        let feature_grants = FeatureGrants::new(&sdk, &target, &packages);
         // Options are a context field: the include chains merge once here,
         // keyed by governing directory — package roots plus the nested
         // options directories inside them (cold path, workspace-assembly
@@ -645,6 +811,7 @@ impl EngineState {
             packages,
             uri_packages,
             sdk,
+            feature_grants,
             target,
             declared_variables,
             store,
@@ -677,6 +844,18 @@ impl EngineState {
             trace: None,
             l3: None,
         })
+    }
+
+    /// The borrowed per-file grant faces (`l1::Grants`): everything the
+    /// feature-set merge consults, in one disjoint-field borrow. Every
+    /// per-file lane builds this once per item.
+    pub(crate) fn grants(&self) -> crate::l1::Grants<'_> {
+        crate::l1::Grants {
+            grants: &self.feature_grants,
+            experiments: &self.sdk.platform_metadata,
+            packages: &self.packages,
+            files: &self.files,
+        }
     }
 
     /// Fact-cache lookup.

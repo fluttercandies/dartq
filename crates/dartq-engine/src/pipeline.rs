@@ -18,7 +18,7 @@ use dartq_resolution::{
     ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
 use dartq_semantic::MicroKind;
-use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable};
+use dartq_source::{FileId, FileTable, SourceRange, StringTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -318,24 +318,15 @@ fn diagnose_library(
         // :85-98/:58-70 visit the import/export directives alike): every
         // written `show`/`hide` token the resolved target's export scope
         // defines under neither spelling reports at the token, unless the
-        // directive has no resolved target — the oracle's
-        // nonexistent-library gate (:63/:91; the missing target is the
-        // reported root cause and replaces the combinator symptom). Each
-        // clause kind picks its code face (`hide` →
-        // `undefined_hidden_name`, `show` → `undefined_shown_name`), and
-        // each clause's in-clause repeats of a target-defined name report
-        // `duplicate_hidden_name`/`duplicate_shown_name` at the repeat
-        // token (`imports_verifier.dart:328-358`, after the undefined rows
-        // the same directive yielded — the oracle's generate-after-visit
-        // order, library_analyzer.dart:503-505).
-        // Alongside, the import/export duplicate walk
-        // (`imports_verifier.dart:361-390` `_duplicates`): directives of
-        // one unit resolving to the same library, syntactically identical
-        // except the URI, report `duplicate_import`/`duplicate_export` at
-        // each repeat's URI — every consecutive identical run after its
-        // first, the adjacency of the URI-sorted pair walk. Grouped per
-        // compilation unit (the `_duplicates` lists are per
-        // `addImports(unit)` call).
+        // directive has no resolved library — the oracle's nonexistent-
+        // library gate (:63/:91; the missing target is the reported root
+        // cause and replaces the combinator symptom). Each clause kind
+        // picks its code face (`hide` → `undefined_hidden_name`, `show` →
+        // `undefined_shown_name`). These undefined rows are the
+        // DeadCodeVerifier's, which the oracle runs ahead of the
+        // imports-verification gate (library_analyzer.dart:462) — they
+        // report regardless of it; the gate suppresses only the
+        // ImportsVerifier faces, emitted after the semantic pass below.
         for directive in &facts.directives {
             // A directive that resolved to a file which has since left
             // residency points outside the analyzed world (the graph layer
@@ -358,20 +349,24 @@ fn diagnose_library(
             if matches!(
                 directive.kind,
                 DirectiveKind::Import | DirectiveKind::Export
-            ) {
-                if directive.combinators.written().next().is_some()
-                    && let Some((target, library_uri)) =
-                        combinator_check_target(state, resolved, directive)
+            ) && directive.combinators.written().next().is_some()
+                && let Some(target) = directive_graph_target(state, resolved, directive)
+            {
+                for found in resolved
+                    .graph
+                    .undefined_combinator_names(Some(target), &directive.combinators)
                 {
-                    for found in resolved
-                        .graph
-                        .undefined_combinator_names(Some(target), &directive.combinators)
+                    let info = if found.hidden {
+                        UNDEFINED_HIDDEN_NAME
+                    } else {
+                        UNDEFINED_SHOWN_NAME
+                    };
+                    // The `{0}` library spelling materializes only for a
+                    // row actually reported — an all-defined directive
+                    // formats nothing on the hot path.
+                    if let Some(library_uri) =
+                        directive_library_uri(state, resolved, target, directive)
                     {
-                        let info = if found.hidden {
-                            UNDEFINED_HIDDEN_NAME
-                        } else {
-                            UNDEFINED_SHOWN_NAME
-                        };
                         out.push(l1::combinator_diagnostic(
                             info,
                             &library_uri,
@@ -380,35 +375,8 @@ fn diagnose_library(
                             *file,
                         ));
                     }
-                    for found in resolved
-                        .graph
-                        .duplicate_combinator_names(Some(target), &directive.combinators)
-                    {
-                        let info = if found.hidden {
-                            DUPLICATE_HIDDEN_NAME
-                        } else {
-                            DUPLICATE_SHOWN_NAME
-                        };
-                        out.push(l1::duplicate_diagnostic(info, found.span, *file));
-                    }
                 }
             }
-        }
-        // The import/export duplicate walk (the oracle's generate order puts
-        // these after the undefined rows too, library_analyzer.dart:503-505;
-        // the canonical sort fixes the exact slot either way).
-        for (is_import, span) in duplicate_directives(&facts.directives, |directive| {
-            directive_graph_target(state, resolved, directive)
-        }) {
-            out.push(l1::duplicate_diagnostic(
-                if is_import {
-                    DUPLICATE_IMPORT
-                } else {
-                    DUPLICATE_EXPORT
-                },
-                span,
-                *file,
-            ));
         }
     }
     if let Some(diagnoser) = semdiag {
@@ -431,6 +399,7 @@ fn diagnose_library(
             store: state.store.as_ref(),
             packages: &state.packages,
             file_table: &state.files,
+            grants: &state.feature_grants,
             namespaces,
             // The defining file's strict modes govern the fold (#588 item
             // 4): the `analyzer.language.strict-*` flags resolved through
@@ -440,6 +409,62 @@ fn diagnose_library(
         };
         diagnoser.diagnose_library(view, &mut out);
     }
+    // The imports-verification faces (library_analyzer.dart:501-509): the
+    // whole ImportsVerifier — duplicate imports/exports and duplicate
+    // shown/hidden names alike — runs only when no member file reported a
+    // resolution-level root cause (`_hasDiagnosticReportedThatPreventsImportWarnings`,
+    // :605-633). Its verify-errors loop completes over every file before
+    // any warnings run, so the gate reads the whole library — the rows
+    // accumulated above. Without it, every resolution-broken library grows
+    // duplicate-import noise on top of the root causes.
+    if !suppresses_import_verification(&out) {
+        for file in &members {
+            let facts = &state.residency[file];
+            // In-clause repeats of a target-defined name report
+            // `duplicate_hidden_name`/`duplicate_shown_name` at the repeat
+            // token (`imports_verifier.dart:328-358`) — inside the gated
+            // ImportsVerifier (`addImports` runs behind the same check).
+            for directive in &facts.directives {
+                if matches!(
+                    directive.kind,
+                    DirectiveKind::Import | DirectiveKind::Export
+                ) && directive.combinators.written().next().is_some()
+                    && let Some(target) = directive_graph_target(state, resolved, directive)
+                {
+                    for found in resolved
+                        .graph
+                        .duplicate_combinator_names(Some(target), &directive.combinators)
+                    {
+                        let info = if found.hidden {
+                            DUPLICATE_HIDDEN_NAME
+                        } else {
+                            DUPLICATE_SHOWN_NAME
+                        };
+                        out.push(l1::duplicate_diagnostic(info, found.span, *file));
+                    }
+                }
+            }
+            // The import/export duplicate walk (`imports_verifier.dart:361-390`
+            // `_duplicates`): the unit's registered directives grouped by
+            // resolved library (the URI sort's grouping), each group's
+            // shape-identical neighbors reporting at the later repeat's URI.
+            for (is_import, span) in duplicate_directives(
+                &facts.directives,
+                |directive| duplicate_target(state, resolved, directive).is_some(),
+                |a, b| duplicate_target(state, resolved, a) == duplicate_target(state, resolved, b),
+            ) {
+                out.push(l1::duplicate_diagnostic(
+                    if is_import {
+                        DUPLICATE_IMPORT
+                    } else {
+                        DUPLICATE_EXPORT
+                    },
+                    span,
+                    *file,
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -447,7 +472,7 @@ fn diagnose_library(
 /// recompute stored it under ([`l1::facts_key`]).
 fn scanned_face(state: &EngineState, file: FileId) -> Option<Arc<ScannedFace>> {
     let facts = state.residency.get(&file)?;
-    let key = l1::facts_key(&state.packages, &state.files, file, facts.content);
+    let key = l1::facts_key(&state.grants(), file, facts.content);
     state.cached_scanned(key)
 }
 
@@ -499,7 +524,7 @@ fn drain_captures(state: &mut EngineState) {
             let facts = &state.residency[&file];
             let bytes = state.store.get(facts.content).expect("resident content");
             let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
-            let key = l1::facts_key(&state.packages, &state.files, file, facts.content);
+            let key = l1::facts_key(&state.grants(), file, facts.content);
             if let Some(face) = state.cached_scanned(key) {
                 (
                     file,
@@ -508,7 +533,7 @@ fn drain_captures(state: &mut EngineState) {
                 )
             } else {
                 let version = l1::language_version_for(&state.packages, &state.files, file);
-                let (feature_set, scanned, _) = l1::scan_unit(text, version, file);
+                let (feature_set, scanned, _) = l1::scan_unit(text, version, file, &state.grants());
                 let face = ScannedFace {
                     tokens: scanned.tokens,
                     features: feature_set,
@@ -819,12 +844,14 @@ fn graph_target(
     }
 }
 
-/// The resolved-library gate of one import/export directive — the graph
-/// target without the `{0}` message spelling (which only the undefined-
-/// combinator rows render). This is the oracle's `addImports` registration
-/// gate (`imports_verifier.dart:62-88`): a directive whose target has no
-/// library joins neither the duplicate-combinator walk nor the
-/// import/export duplicate groups, so both faces gate on it.
+/// The resolved-library gate of one import/export directive for the
+/// combinator walks — the graph target without the `{0}` message spelling
+/// (which only the undefined rows render). This is the oracle's
+/// dead-code gate (`dead_code_verifier.dart:63`/:91, `library != null &&
+/// !isOriginNotExistingFile`): a directive with no resolved library — or
+/// one whose file target left the analyzed world — joins neither the
+/// undefined nor the duplicate combinator walk. (The import/export
+/// duplicate walk gates separately, see [`duplicate_target`].)
 fn directive_graph_target(
     state: &EngineState,
     resolved: &ResolvedGraph,
@@ -842,94 +869,190 @@ fn directive_graph_target(
     }
 }
 
-/// The duplicate-directive identity of one import/export: the `as` prefix
-/// and the written combinator shape — `areSyntacticallyIdenticalExceptUri`
-/// except the URI (`ast.dart:29097`: prefix lexeme equality, per-combinator
-/// name lists lexeme-compared in written order; `deferred` and `if`
-/// configurations are not part of the identity).
-struct DirectiveShape<'a> {
-    prefix: Option<StringId>,
-    combinators: &'a Combinators,
+/// The duplicate-walk identity of one import/export directive — the
+/// `addImports` registration gate plus the `libraryUriStr` grouping key
+/// (`imports_verifier.dart:59-97`, `:401`). Imports register only behind a
+/// resolved library — a nonexistent-file target is skipped outright
+/// (:68-70) — while an export registers behind any non-null library
+/// (:75-83), a nonexistent file included: `isOriginNotExistingFile` does
+/// not gate exports, so `export 'gone.dart'; export 'gone.dart';` groups
+/// where the import pair does not. The key is the resolved library
+/// identity, never the written spelling and never an SDK name-table entry:
+/// analysis-set targets key by their owning library's node, `dart:`
+/// externals by the URI face itself and a nonexistent export file by its
+/// interned file (the oracle builds one library per missing file, keyed by
+/// its absolute URI — the interned file is that identity) — so
+/// `dart:async` needs no face-table hit to group.
+#[derive(PartialEq, Eq)]
+enum DuplicateTarget<'a> {
+    /// An analysis-set library — the owning library's graph node.
+    Library(dartq_resolution::LibraryId),
+    /// An external `dart:` face — the URI text itself.
+    Uri(&'a str),
+    /// A nonexistent-file export target — the interned file.
+    File(FileId),
+}
+
+/// The registration gate plus identity of one directive for the
+/// import/export duplicate walk — `Some` registers, equality groups — see
+/// the enum for the oracle anchors.
+fn duplicate_target<'a>(
+    state: &EngineState,
+    resolved: &ResolvedGraph,
+    directive: &'a DirectiveFacts,
+) -> Option<DuplicateTarget<'a>> {
+    match directive.target {
+        ResolvedTarget::Resolved(file) => {
+            match graph_target(state, &resolved.graph_ids, directive.target) {
+                Some(node) => Some(DuplicateTarget::Library(node)),
+                // Outside the analyzed world (absent on disk, or removed
+                // since parse — the oracle re-resolves to a library flagged
+                // `isOriginNotExistingFile` either way): imports skip it,
+                // exports still register.
+                None => match directive.kind {
+                    DirectiveKind::Export => Some(DuplicateTarget::File(file)),
+                    _ => None,
+                },
+            }
+        }
+        ResolvedTarget::External => directive.uri.as_deref().map(DuplicateTarget::Uri),
+        // No library at all (unknown `dart:` name, unresolvable text) —
+        // null `importedLibrary`/`exportedLibrary`, neither family
+        // registers (`imports_verifier.dart:63-67`/:75-79).
+        ResolvedTarget::Missing => None,
+    }
 }
 
 /// The import/export duplicate walk over one compilation unit's directives
-/// (`imports_verifier.dart:361-390` `_duplicates`): a consecutive-pair
-/// sliding window — each directive compares against the previous one of its
-/// family's written sequence, and the cursor advances unconditionally
-/// (`currentDirective = nextDirective`) — so same-library directives with
-/// the same [`DirectiveShape`] report at each repeat's URI span, while a
-/// directive with a different resolved target or shape in between breaks
-/// the identical run and a later repeat starts a fresh, silent run.
-/// Imports and exports are separate windows (the oracle's separate
-/// `_duplicates` lists, `imports_verifier.dart:87-90`). `target_of` is the
-/// `addImports` registration gate (`imports_verifier.dart:62-88`): a
-/// directive whose target has no library joins no window and leaves it
-/// untouched. The target key is the resolved library — two spellings of one
-/// library group together, the oracle's `libraryUriStr` comparison.
-/// Returns `(is_import, uri_span)` per duplicate, in written order.
-fn duplicate_directives<'a>(
-    directives: &'a [DirectiveFacts],
-    mut target_of: impl FnMut(&DirectiveFacts) -> Option<dartq_resolution::LibraryId>,
+/// (`imports_verifier.dart:361-390` `_duplicates`): the oracle sorts the
+/// unit's registered directives by resolved library URI and slides a pair
+/// window over the sorted list — grouping by `same_target` here mirrors
+/// that sort, each group keeping written order (the tie order the oracle's
+/// sort preserves at directive-list sizes). Within a group, neighbors whose
+/// shapes are identical — the `as` prefix and the written combinator
+/// clauses, `areSyntacticallyIdenticalExceptUri`
+/// (`ast.dart:29097`); `deferred` is not part of the identity — report
+/// `duplicate_import`/`duplicate_export` at the later directive's URI span
+/// (:377-384, the pair's larger offset; inside a written-order group that
+/// is always the next directive), so adjacent and interleaved duplicates
+/// alike report at every repeat but the group's first. Imports and exports
+/// form separate groups (the oracle's separate `_duplicates` lists,
+/// :87-96). `registered` is the `addImports` registration gate
+/// ([`duplicate_target`]); `same_target` the `libraryUriStr` equality
+/// (:372), evaluated against the group's first member — target equality is
+/// transitive, so the URI sort groups no differently. Returns
+/// `(is_import, uri_span)` per duplicate.
+fn duplicate_directives(
+    directives: &[DirectiveFacts],
+    mut registered: impl FnMut(&DirectiveFacts) -> bool,
+    mut same_target: impl FnMut(&DirectiveFacts, &DirectiveFacts) -> bool,
 ) -> Vec<(bool, SourceRange)> {
-    let mut duplicates = Vec::new();
-    // One window per family: imports and exports never see each other.
-    let mut previous: [Option<(dartq_resolution::LibraryId, DirectiveShape<'_>)>; 2] = [None, None];
-    for directive in directives {
-        let (family, is_import) = match directive.kind {
-            DirectiveKind::Import => (0, true),
-            DirectiveKind::Export => (1, false),
+    /// One same-target family group: member indices in written order, the
+    /// first member standing for the group's target.
+    struct Group {
+        is_import: bool,
+        exemplar: usize,
+        members: Vec<usize>,
+    }
+
+    let mut groups: Vec<Group> = Vec::new();
+    for (index, directive) in directives.iter().enumerate() {
+        let is_import = match directive.kind {
+            DirectiveKind::Import => true,
+            DirectiveKind::Export => false,
             DirectiveKind::Part | DirectiveKind::PartOf | DirectiveKind::Library => continue,
         };
-        let Some(target) = target_of(directive) else {
+        if !registered(directive) {
             continue;
-        };
-        let shape = DirectiveShape {
-            prefix: directive.prefix,
-            combinators: &directive.combinators,
-        };
-        if let Some((previous_target, previous_shape)) = &previous[family] {
-            if *previous_target == target
-                && previous_shape.prefix == shape.prefix
-                && previous_shape
-                    .combinators
-                    .written_shapes_equal(shape.combinators)
-            {
-                duplicates.push((is_import, directive.uri_span));
-            }
         }
-        // Unconditional advance (`imports_verifier.dart:380`): the next pair
-        // is always this directive vs the following one.
-        previous[family] = Some((target, shape));
+        let slot = groups.iter_mut().position(|group| {
+            group.is_import == is_import && same_target(&directives[group.exemplar], directive)
+        });
+        match slot {
+            Some(slot) => groups[slot].members.push(index),
+            None => groups.push(Group {
+                is_import,
+                exemplar: index,
+                members: vec![index],
+            }),
+        }
+    }
+
+    let mut duplicates = Vec::new();
+    for group in &groups {
+        let mut previous = &directives[group.members[0]];
+        for &index in &group.members[1..] {
+            let next = &directives[index];
+            if previous.prefix == next.prefix
+                && previous.combinators.written_shapes_equal(&next.combinators)
+            {
+                duplicates.push((group.is_import, next.uri_span));
+            }
+            // Unconditional advance (`imports_verifier.dart:386`): the next
+            // pair is this directive vs the following one.
+            previous = next;
+        }
     }
     duplicates
 }
 
-/// The combinator-check face of one import/export directive: its resolved
-/// graph target paired with the `{0}` message spelling of that target (the
-/// oracle's ``${library.uri}``, dead_code_verifier.dart:156) — `dart:<name>`
+/// The `{0}` message spelling of one directive's resolved library — the
+/// oracle's ``${library.uri}`` (dead_code_verifier.dart:156) — `dart:<name>`
 /// for the synthetic SDK faces, the defining file's absolute `file:///` URI
 /// for analysis-set libraries (the oracle's corpus-run spelling; the same
 /// decision dartq-resolution's `undefined_combinator_names` doc pins).
-/// `None` for an edgeless directive — the oracle's nonexistent-library gate
-/// (dead_code_verifier.dart:63/:91): the missing target is the reported root
-/// cause and replaces the combinator symptom.
-fn combinator_check_target(
+/// Materialized only when an undefined-combinator row is actually reported;
+/// `None` for an edgeless directive — unreachable behind the
+/// [`directive_graph_target`] gate.
+fn directive_library_uri(
     state: &EngineState,
     resolved: &ResolvedGraph,
+    node: dartq_resolution::LibraryId,
     directive: &DirectiveFacts,
-) -> Option<(dartq_resolution::LibraryId, String)> {
-    let node = directive_graph_target(state, resolved, directive)?;
-    let library_uri = match directive.target {
+) -> Option<String> {
+    match directive.target {
         ResolvedTarget::Resolved(file) => {
             let library = state.library_of_file.get(&file).copied()?;
             let info = state.libraries.info(library)?;
             let path = state.files.path(info.defining)?;
-            format!("file://{}", path.display())
+            Some(format!("file://{}", path.display()))
         }
-        ResolvedTarget::External => resolved.graph.uri(node).to_owned(),
-        ResolvedTarget::Missing => return None,
-    };
-    Some((node, library_uri))
+        ResolvedTarget::External => Some(resolved.graph.uri(node).to_owned()),
+        ResolvedTarget::Missing => None,
+    }
+}
+
+/// The diagnostic codes whose presence anywhere in the library suppresses
+/// the entire imports verification (`library_analyzer.dart:605-633`
+/// `_hasDiagnosticReportedThatPreventsImportWarnings`, Dart 3.15 main,
+/// list verbatim): the resolution-level breakage they flag replaces the
+/// derived import warnings with the root causes.
+const IMPORT_VERIFICATION_SUPPRESSING: &[&str] = &[
+    "ambiguous_import",
+    "const_with_non_type",
+    "deprecated_export_use",
+    "extends_non_class",
+    "implements_non_class",
+    "mixin_of_non_class",
+    "new_with_non_type",
+    "not_a_type",
+    "prefix_identifier_not_followed_by_dot",
+    "undefined_annotation",
+    "undefined_class",
+    "undefined_function",
+    "undefined_identifier",
+    "undefined_prefixed_name",
+];
+
+/// Whether any of the library's accumulated diagnostics carries a
+/// suppressing code: the oracle collects every member file's reported codes
+/// and skips the ImportsVerifier when one joins the set — its verify-errors
+/// pass completes over all files before any warnings run, so a whole-
+/// library scan is the same decision.
+fn suppresses_import_verification(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| IMPORT_VERIFICATION_SUPPRESSING.contains(&diagnostic.code.name))
 }
 
 /// Topological order over the dirty set: dependencies (import targets)
@@ -1158,7 +1281,7 @@ mod tests {
 
     use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
     use dartq_resolution::CombinatorClause;
-    use dartq_source::{FileTable, SourceRange};
+    use dartq_source::{FileTable, SourceRange, StringId};
 
     use super::*;
 
@@ -1245,25 +1368,31 @@ mod tests {
         }
     }
 
-    /// Repeat directives of one resolved target group and report at each
-    /// repeat's URI (`imports_verifier.dart:361-390`): two plain imports of
-    /// dart:math report the 2nd; the import and export sequences group
-    /// independently (separate `_duplicates` lists); a different-target
-    /// directive in between breaks the identical run (adjacency —
-    /// `currentDirective = nextDirective` runs unconditionally), while a
-    /// consecutive identical pair still reports.
+    /// Directives grouped by resolved target report at each repeat but the
+    /// group's first (`imports_verifier.dart:361-390` `_duplicates` sorts by
+    /// `libraryUriStr` before the window, so written-order adjacency is not
+    /// required): two identical imports report the 2nd; an interleaved
+    /// `math, io, math` still reports the later `math` (the URI sort lines
+    /// the math pair up); a three-run reports at both repeats; the import
+    /// and export sequences group independently (separate `_duplicates`
+    /// lists); and mixed shapes inside one group stay silent (the window
+    /// compares neighbors in written order).
     #[test]
-    fn duplicate_directives_report_per_target_group_adjacency() {
+    fn duplicate_directives_report_per_target_group_after_uri_sort() {
         let strings = StringTable::new();
-        let mut builder = LibraryGraphBuilder::new(&strings);
-        let math = builder.intern("dart:math");
-        let io = builder.intern("dart:io");
-        let target_of = |directive: &DirectiveFacts| match directive.uri.as_deref() {
-            Some("math") => Some(math),
-            Some("io") => Some(io),
+        // The resolved-library face of a synthetic directive (`libraryUriStr`).
+        let face = |directive: &DirectiveFacts| match directive.uri.as_deref() {
+            Some("math") | Some("math.dart") => Some("dart:math"),
+            Some("io") => Some("dart:io"),
             _ => None,
         };
-
+        let duplicates = |directives: Vec<DirectiveFacts>| {
+            duplicate_directives(
+                &directives,
+                |directive| face(directive).is_some(),
+                |a, b| face(a) == face(b),
+            )
+        };
         let plain = |offset, uri| {
             import_like(
                 DirectiveKind::Import,
@@ -1274,35 +1403,29 @@ mod tests {
                 Combinators::unfiltered(),
             )
         };
-        let duplicates =
-            |directives: Vec<DirectiveFacts>| duplicate_directives(&directives, target_of);
+        let at = |offset, length| SourceRange { offset, length };
 
         // Two identical imports: the 2nd reports, at its own URI.
         assert_eq!(
             duplicates(vec![plain(8, "math"), plain(40, "math")]),
-            [(
-                true,
-                SourceRange {
-                    offset: 40,
-                    length: 4
-                }
-            )]
+            [(true, at(40, 4))]
         );
-        // A different target in between breaks the run: [math, io, math]
-        // reports nothing (the walk's consecutive pairs are (math, io),
-        // (io, math) — neither identical).
-        assert!(duplicates(vec![plain(8, "math"), plain(40, "io"), plain(72, "math")]).is_empty());
-        // A consecutive identical pair after the break reports:
-        // [io, math, math] → the 3rd directive.
+        // Interleaved targets still group: the URI sort lines the math pair
+        // up, so [math, io, math] reports at the later math — the later
+        // offset of the pair (imports_verifier.dart:377-384).
+        assert_eq!(
+            duplicates(vec![plain(8, "math"), plain(40, "io"), plain(72, "math")]),
+            [(true, at(72, 4))]
+        );
+        // [io, math, math]: the math pair reports the 3rd directive.
         assert_eq!(
             duplicates(vec![plain(8, "io"), plain(40, "math"), plain(72, "math")]),
-            [(
-                true,
-                SourceRange {
-                    offset: 72,
-                    length: 4
-                }
-            )]
+            [(true, at(72, 4))]
+        );
+        // A three-run slides: the 2nd and the 3rd both report.
+        assert_eq!(
+            duplicates(vec![plain(8, "math"), plain(40, "math"), plain(72, "math")]),
+            [(true, at(40, 4)), (true, at(72, 4))]
         );
         // The export list is independent: one import + one identical export
         // of the same target never group across families.
@@ -1339,31 +1462,60 @@ mod tests {
                     Combinators::unfiltered()
                 ),
             ]),
-            [(
+            [(false, at(40, 4))]
+        );
+        // Mixed shapes inside one group: the written-order window compares
+        // neighbors, and [show, plain, show] has no identical pair.
+        let shown = |offset| {
+            import_like(
+                DirectiveKind::Import,
+                offset,
+                "math",
+                None,
                 false,
-                SourceRange {
-                    offset: 40,
-                    length: 4
-                }
-            )]
+                Combinators::new(
+                    [CombinatorClause::Show(Box::from([strings.intern("max")]))],
+                    &strings,
+                ),
+            )
+        };
+        assert!(
+            duplicates(vec![shown(8), plain(40, "math"), shown(72)]).is_empty(),
+            "shape runs interleaved never report"
         );
     }
 
-    /// The duplicate identity is shape, not just target
+    /// The duplicate identity is shape plus resolved target
     /// (`areSyntacticallyIdenticalExceptUri`, `ast.dart:29097`): a prefix
     /// difference or a combinator-shape difference keeps two same-library
     /// imports silent, while a `deferred` difference does not (not part of
     /// the identity), and two spellings resolving to one library group —
     /// the oracle compares the resolved `libraryUriStr`, not the URI text.
+    /// A nonexistent-file export registers by its file identity where an
+    /// import does not (`imports_verifier.dart:68-70` vs :75-83).
     #[test]
     fn duplicate_identity_is_shape_and_resolved_target() {
         let strings = StringTable::new();
-        let mut builder = LibraryGraphBuilder::new(&strings);
-        let math = builder.intern("dart:math");
-        // Two spellings, one resolved library.
-        let target_of = |directive: &DirectiveFacts| match directive.uri.as_deref() {
-            Some("math") | Some("math.dart") => Some(math),
+        let mut files = FileTable::new();
+        let gone = files.intern(Path::new("/w/gone.dart"));
+        // The resolved-library identity of a synthetic directive, as
+        // `duplicate_target` classifies it: two spellings, one resolved
+        // library; and the F5 asymmetry — only the export of a missing file
+        // carries a group identity (its interned file standing for the
+        // library URI the oracle builds for it).
+        let identity = |directive: &DirectiveFacts| match directive.uri.as_deref() {
+            Some("math") | Some("math.dart") => Some((0, 0)),
+            Some("gone") if matches!(directive.kind, DirectiveKind::Export) => {
+                Some((1, gone.index()))
+            }
             _ => None,
+        };
+        let duplicates = |directives: Vec<DirectiveFacts>| {
+            duplicate_directives(
+                &directives,
+                |directive| identity(directive).is_some(),
+                |a, b| identity(a) == identity(b),
+            )
         };
 
         let prefixed = import_like(
@@ -1382,7 +1534,7 @@ mod tests {
             false,
             Combinators::unfiltered(),
         );
-        assert!(duplicate_directives(&[plain.clone(), prefixed], target_of).is_empty());
+        assert!(duplicates(vec![plain.clone(), prefixed]).is_empty());
 
         // Combinator shape counts: `show max` vs plain is not a duplicate;
         // `show max` vs `show max` is.
@@ -1399,9 +1551,9 @@ mod tests {
                 ),
             )
         };
-        assert!(duplicate_directives(&[plain.clone(), shown()], target_of).is_empty());
+        assert!(duplicates(vec![plain.clone(), shown()]).is_empty());
         assert_eq!(
-            duplicate_directives(&[shown(), shown()], target_of).len(),
+            duplicates(vec![shown(), shown()]).len(),
             1,
             "identical shapes report"
         );
@@ -1418,7 +1570,7 @@ mod tests {
             Combinators::unfiltered(),
         );
         assert_eq!(
-            duplicate_directives(&[plain, deferred], target_of).len(),
+            duplicates(vec![plain, deferred]).len(),
             1,
             "deferred vs non-deferred identical shape reports"
         );
@@ -1442,15 +1594,20 @@ mod tests {
             Combinators::unfiltered(),
         );
         assert_eq!(
-            duplicate_directives(&[plain_math, other_spelling], target_of).len(),
+            duplicates(vec![plain_math, other_spelling]).len(),
             1,
             "one library under two spellings groups"
         );
 
-        // Unresolved targets join no group (`addImports` skips them,
-        // imports_verifier.dart:63-67/:75-82).
-        let missing = DirectiveFacts {
-            target: ResolvedTarget::Missing,
+        // Unregistered targets join no group (`addImports` skips them — for
+        // imports a nonexistent file too, imports_verifier.dart:68-70).
+        let missing_import = || DirectiveFacts {
+            kind: DirectiveKind::Import,
+            uri: Some("gone".into()),
+            uri_span: SourceRange {
+                offset: 8,
+                length: 4,
+            },
             ..import_like(
                 DirectiveKind::Import,
                 8,
@@ -1460,7 +1617,32 @@ mod tests {
                 Combinators::unfiltered(),
             )
         };
-        assert!(duplicate_directives(&[missing.clone(), missing], target_of).is_empty());
+        assert!(duplicates(vec![missing_import(), missing_import()]).is_empty());
+
+        // The same missing file exported twice groups by the file identity
+        // (:75-83 — exports know no `isOriginNotExistingFile` skip).
+        let gone_export = |offset| DirectiveFacts {
+            kind: DirectiveKind::Export,
+            ..import_like(
+                DirectiveKind::Export,
+                offset,
+                "gone",
+                None,
+                false,
+                Combinators::unfiltered(),
+            )
+        };
+        assert_eq!(
+            duplicates(vec![gone_export(8), gone_export(40)]),
+            [(
+                false,
+                SourceRange {
+                    offset: 40,
+                    length: 4
+                }
+            )],
+            "nonexistent-file exports register"
+        );
     }
 
     /// The merge must reproduce the retired full sort byte for byte: paths

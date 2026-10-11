@@ -97,7 +97,13 @@ impl SemanticDiagnoser for Diagnoser {
                 (face.features, &face.tokens)
             } else {
                 let version = l1::language_version_for(library.packages, library.file_table, file);
-                let (feature_set, face, _) = l1::scan_unit(text, version, file);
+                let grants = l1::Grants {
+                    grants: library.grants,
+                    experiments: &library.sdk.platform_metadata,
+                    packages: library.packages,
+                    files: library.file_table,
+                };
+                let (feature_set, face, _) = l1::scan_unit(text, version, file, &grants);
                 local = face;
                 (feature_set, &local.tokens)
             };
