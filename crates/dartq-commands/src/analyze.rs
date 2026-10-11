@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             broken_hits,
             vec![
-                (11, "Expected ';' after this.".to_owned()),
+                (11, "Expected to find ';'.".to_owned()),
                 (11, "Undefined name 'y'.".to_owned()),
             ],
             "oracle order inside one library: severity, path, offset, message"

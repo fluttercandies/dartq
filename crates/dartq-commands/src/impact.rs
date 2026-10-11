@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
 use dartq_diagnostics::CodeRegistry;
 use dartq_engine::state::persist::PersistedFacts;
-use dartq_engine::{Engine, LibraryId, UnitFacts};
+use dartq_engine::{CsrGraph, Engine, LibraryId, UnitFacts};
 use dartq_index::TestGraph;
 use dartq_semantic::MicroKind;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
@@ -123,17 +123,17 @@ pub fn impact_after_analysis_with_persisted_facts(
         return Err(ImpactError::NotAnalyzed(canonical));
     };
 
-    // Library identities and the seed's member list.
-    let csr = engine.library_import_graph();
-    let count = csr.nodes();
+    // Library identities and the seed's member list: one `libraries` fetch
+    // feeds both the member lookup and the substrate's labels. Borrowed,
+    // not cloned: the list only feeds the immutable surface fold below,
+    // and `libraries` outlives every use in this function.
     let libraries = engine.libraries();
     let seed_library_index = seed_library.index() as usize;
     let members = libraries
         .iter()
         .find(|(library, _)| library.index() as usize == seed_library_index)
-        .map(|(_, files)| files.clone())
+        .map(|(_, files)| files.as_slice())
         .expect("live seed library");
-    let idents = library_identities(engine, &libraries);
 
     // One intern table for the whole answer: the engine's own — resident
     // facts' `StringId`s are native to it, and materializing a payload
@@ -141,51 +141,105 @@ pub fn impact_after_analysis_with_persisted_facts(
     // documented query posture: the only side effect is interning).
     let strings = engine.strings();
     let mut restored = FileTable::new();
-    let current = library_surface(engine, &members, strings, persisted, &mut restored);
+    let current = library_surface(engine, members, strings, persisted, &mut restored);
 
     // The substrate over the engine's faces, then the query.
-    let neighbors = |library: u32| -> &[u32] {
-        let start = csr.offsets()[library as usize] as usize;
-        let end = csr.offsets()[library as usize + 1] as usize;
-        &csr.edges()[start..end]
-    };
-    let tests = TestGraph::build(count, neighbors, |library| {
-        idents[library as usize].as_deref()
-    });
+    let substrate = impact_substrate(engine, &libraries);
     let change = LibraryChange::hypothetical(seed_library.index(), current);
     Ok(query::impact(
-        count,
-        neighbors,
-        |library| -> &str { idents[library as usize].as_deref().expect("live library") },
-        &tests,
+        substrate.node_count(),
+        |library| substrate.neighbors(library),
+        |library| substrate.label(library),
+        &substrate.tests,
         strings,
         &[change],
     ))
 }
 
-/// The stable label of one library, keyed by the engine library id (`None`
-/// on a dead slot). The label is the defining file's path; the test graph
-/// reads the same string's directory and basename for the `*_test.dart`
-/// convention (dartq-index's sibling rule).
-pub(crate) type IdentTable = Vec<Option<String>>;
+/// The graph substrate both graph faces read, built once per call (#558):
+/// the engine's import CSR projection, the arena-spaced identity labels,
+/// and the test graph joined over them.
+pub(crate) struct Substrate<'a> {
+    csr: CsrGraph,
+    /// The defining-file label of every arena slot, `None` on a dead slot —
+    /// sized by [`CsrGraph::nodes`] (the arena's slot count), never by the
+    /// live-library count: the consumers iterate the CSR's node space,
+    /// which includes retired slots, so a live-count-sized table indexes
+    /// out of bounds on the first retirement (#558 P1).
+    idents: Vec<Option<&'a str>>,
+    tests: TestGraph,
+}
 
-/// The stable label of every live library, indexed by the engine library id
-/// (dead slots hold `None`).
-pub(crate) fn library_identities(
-    engine: &Engine,
+/// Assembles the substrate over `engine`'s faces and the already-fetched
+/// `libraries` (the faces pass the same fetch they need for their own
+/// member lookups — no second `Engine::libraries` build).
+///
+/// The labels borrow the engine's file table (`&str`, no per-library
+/// allocation); a path that is not UTF-8 labels empty — it cannot ride the
+/// JSON faces' string columns anyway, and the retired lossy spelling's
+/// replacement characters surfaced no better.
+pub(crate) fn impact_substrate<'a>(
+    engine: &'a Engine,
     libraries: &[(LibraryId, Vec<FileId>)],
-) -> IdentTable {
-    let mut idents: IdentTable = vec![None; libraries.len()];
+) -> Substrate<'a> {
+    let csr = engine.library_import_graph();
+    let count = csr.nodes();
+    let mut idents: Vec<Option<&'a str>> = vec![None; count];
     for (library, files) in libraries {
-        let Some(path) = files
+        if let Some(label) = files
             .first()
             .and_then(|&file| engine.file_table().path(file))
-        else {
-            continue;
-        };
-        idents[library.index() as usize] = Some(path.display().to_string());
+            .and_then(std::path::Path::to_str)
+        {
+            idents[library.index() as usize] = Some(label);
+        }
     }
-    idents
+    let neighbors = |library: u32| -> &[u32] {
+        let start = csr.offsets()[library as usize] as usize;
+        let end = csr.offsets()[library as usize + 1] as usize;
+        &csr.edges()[start..end]
+    };
+    // Dead slots carry no identity and gain no test edges — the convention
+    // fallback reads the identity path, and `None` skips the slot.
+    let tests = TestGraph::build(count, neighbors, |library| idents[library as usize]);
+    Substrate { csr, idents, tests }
+}
+
+impl<'a> Substrate<'a> {
+    /// The node count: the engine library arena's slot count, dead slots
+    /// included (the CSR's node space).
+    #[must_use]
+    pub(crate) fn node_count(&self) -> usize {
+        self.csr.nodes()
+    }
+
+    /// The resolved import targets of `library` (library ids, not slots).
+    #[must_use]
+    pub(crate) fn neighbors(&self, library: u32) -> &[u32] {
+        let start = self.csr.offsets()[library as usize] as usize;
+        let end = self.csr.offsets()[library as usize + 1] as usize;
+        &self.csr.edges()[start..end]
+    }
+
+    /// The defining-file label of `library`.
+    ///
+    /// Dead slots never reach here — the label consumers are flood-joined:
+    /// a retired slot projects no edges, so it appears in no importer row
+    /// (`RevImportGraph` inverts `neighbors`, and nothing lists a slot with
+    /// an empty row as an importer), builds no test edge (`TestGraph::build`
+    /// skips identity-less slots), and holds no hit (hits enumerate the live
+    /// libraries). A label demand on a dead slot is a caller bug and
+    /// surfaces as one.
+    #[must_use]
+    pub(crate) fn label(&self, library: u32) -> &'a str {
+        self.idents[library as usize].expect("live library")
+    }
+
+    /// The joined test graph (the `AffectedTests` join's read side).
+    #[must_use]
+    pub(crate) fn tests(&self) -> &TestGraph {
+        &self.tests
+    }
 }
 
 /// The folded surface of one library over its member files: blake3 over the
@@ -286,6 +340,81 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+
+    /// A retired library slot is invisible to the report (#558): removing a
+    /// file retires its library at the next apply, so the arena's slot
+    /// count rises above the live count — the substrate's label table is
+    /// arena-sized, and the dead slot holds no edges, no test identity, and
+    /// no hit. Under the retired live-count sizing this test panicked
+    /// (index out of bounds in `TestGraph::build`, the first consumer that
+    /// walks the full node space).
+    #[test]
+    fn retired_library_slots_are_invisible_to_the_report() {
+        let root = workspace(
+            "impact_retired",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nclass B {}\n"),
+                ("test/a_test.dart", "import 'a.dart';\nvoid main() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let baseline = impact(&mut engine, &target).expect("seeded impact");
+        assert!(
+            baseline
+                .affected
+                .iter()
+                .any(|row| row.path.ends_with("b.dart")),
+            "b imports a: {:?}",
+            baseline.affected
+        );
+
+        // The removal retires b's library when `impact`'s prelude applies:
+        // the disk file must leave FIRST — the prelude drives residency
+        // from discovery, and a still-present file is re-settled (the
+        // pending overlay is keyed by file, so a discovery Set replaces
+        // the Remove and the library never retires — the #558 fixture
+        // defect). With the file gone, the pending Remove survives the
+        // apply.
+        std::fs::remove_file(root.join("lib/b.dart")).expect("delete b.dart");
+        engine
+            .remove_file(&root.join("lib/b.dart"))
+            .expect("remove");
+        let after = impact(&mut engine, &target).expect("post-retirement impact");
+        // The state guard: the retirement must actually have happened —
+        // live libraries below the arena's slot count is the exact shape
+        // the substrate's arena sizing exists for. Without this, a silent
+        // no-op retirement passes the row assertions vacuously.
+        assert_eq!(
+            engine.libraries().len(),
+            2,
+            "a and the test library stay live"
+        );
+        assert_eq!(
+            engine.library_import_graph().nodes(),
+            3,
+            "b's arena slot stays retired-but-counted"
+        );
+        assert!(
+            !after
+                .affected
+                .iter()
+                .any(|row| row.path.ends_with("b.dart")),
+            "the retired library is gone: {:?}",
+            after.affected
+        );
+        assert!(
+            after
+                .affected_tests
+                .iter()
+                .any(|row| row.path.ends_with("a_test.dart")),
+            "the live test edge survives: {:?}",
+            after.affected_tests
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// The scan configuration of every non-version-gated capture face (the
     /// workspace default: triple shift and augmentations on) — the payload

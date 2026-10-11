@@ -30,14 +30,14 @@ use std::path::Path;
 use dartq_ai::explain::{self as query, SymbolDeclHit};
 use dartq_ai::rev_import_graph::RevImportGraph;
 use dartq_engine::Engine;
-use dartq_index::{RefRow, TargetRef, TestGraph};
+use dartq_index::{RefRow, TargetRef};
 use dartq_source::FileId;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::Verbosity;
 use crate::analyze::{AnalyzeError, prelude};
-use crate::impact::library_identities;
+use crate::impact::impact_substrate;
 use crate::workspace::{WorkspaceError, engine_config};
 
 /// Why an explain run aborts: workspace problems are the CLI's usage tier,
@@ -140,20 +140,11 @@ fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value 
         }
     }
 
-    // The graph faces over the engine's import CSR — the substrate
-    // `impact` reads (one build each per call).
-    let csr = engine.library_import_graph();
-    let count = csr.nodes();
-    let idents = library_identities(engine, &libraries);
-    let neighbors = |library: u32| -> &[u32] {
-        let start = csr.offsets()[library as usize] as usize;
-        let end = csr.offsets()[library as usize + 1] as usize;
-        &csr.edges()[start..end]
-    };
-    let importers = RevImportGraph::build(count, &neighbors);
-    let tests = TestGraph::build(count, &neighbors, |library| {
-        idents[library as usize].as_deref()
-    });
+    // The graph faces over the engine's import CSR — the shared substrate
+    // `impact` reads (one build each per call, #558).
+    let substrate = impact_substrate(engine, &libraries);
+    let count = substrate.node_count();
+    let importers = RevImportGraph::build(count, |library| substrate.neighbors(library));
 
     // Stable path text for every file id the answer carries (internal ids
     // never leave the engine boundary).
@@ -169,14 +160,18 @@ fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value 
     }));
     ids.sort_unstable();
     ids.dedup();
-    let file_labels: Vec<String> = ids
+    // Borrowed, not owned: the labels read straight out of the engine's
+    // file table (`&str`) — same convention as the substrate's identity
+    // labels, where a path that is not UTF-8 labels empty (it cannot ride
+    // the JSON faces' string columns anyway).
+    let file_labels: Vec<&str> = ids
         .iter()
         .map(|&file| {
             file_table
                 .path(file)
                 .expect("answer file")
-                .display()
-                .to_string()
+                .to_str()
+                .unwrap_or_default()
         })
         .collect();
 
@@ -196,12 +191,12 @@ fn explain_answer(engine: &Engine, symbol: &str, verbosity: Verbosity) -> Value 
                 .map_or(&[][..], |targets| targets.as_slice())
         },
         &importers,
-        |library| idents[library as usize].as_deref().expect("live library"),
+        |library| substrate.label(library),
         |file| {
             let index = ids.binary_search(&file).expect("answer file label");
             &file_labels[index]
         },
-        &tests,
+        &substrate.tests(),
         engine.strings(),
     );
     // One serialization into the answer `Value`, then one serialization of
@@ -235,6 +230,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::workspace::open_engine;
     use crate::workspace::test_fixture::workspace;
 
     /// One import chain plus its test: `animal.dart` declares `Animal`
@@ -256,6 +252,68 @@ mod tests {
                 ("test/dog_test.dart", TEST),
             ],
         )
+    }
+
+    /// The retired-slot twin on the explain face (#558): removing a file
+    /// retires its library, the arena's slot count rises above the live
+    /// count, and the substrate's label table answers anyway — the dead
+    /// slot is flood-unreachable (the `Substrate::label` proof). Under the
+    /// retired live-count sizing this panicked in `TestGraph::build`.
+    #[test]
+    fn explain_answers_after_a_library_retires() {
+        let root = workspace(
+            "explain_retired",
+            &[
+                ("lib/animal.dart", ANIMAL),
+                ("lib/dog.dart", DOG),
+                (
+                    "test/animal_test.dart",
+                    "import 'package:fixture/animal.dart';\nvoid main() {}\n",
+                ),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        prelude(&mut engine).expect("analyze");
+
+        // Retire dog's library; animal's and the test's stay live. The
+        // disk file must leave FIRST — the prelude drives residency from
+        // discovery, and a still-present file is re-settled (the pending
+        // overlay is keyed by file, so a discovery Set replaces the Remove
+        // and the library never retires — the #558 fixture defect).
+        std::fs::remove_file(root.join("lib/dog.dart")).expect("delete dog.dart");
+        engine
+            .remove_file(&root.join("lib/dog.dart"))
+            .expect("remove");
+        prelude(&mut engine).expect("re-analyze");
+        // The state guard: the retirement must actually have happened —
+        // live libraries below the arena's slot count is the exact shape
+        // the substrate's arena sizing exists for (a silent no-op
+        // retirement would fail the dependency assertion vacuously).
+        assert_eq!(
+            engine.libraries().len(),
+            2,
+            "animal and the test library stay live"
+        );
+        assert_eq!(
+            engine.library_import_graph().nodes(),
+            3,
+            "dog's arena slot stays retired-but-counted"
+        );
+
+        let json = explain_answer(&engine, "Animal", Verbosity::Compact);
+        assert_eq!(json["symbol"], "Animal");
+        // The dependency rows enumerate the live importers only: dog's
+        // library retired, the test library's row survives — the dead
+        // slot's name (and its row) are gone, never a mislabel.
+        let root = root.canonicalize().expect("canonical root");
+        let animal_test = root.join("test/animal_test.dart").display().to_string();
+        assert_eq!(
+            json["dependencies"],
+            json!([{ "path": animal_test }]),
+            "the retired importer's row is gone, the live one intact"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The name token's start offset in `source` (ASCII sources, so byte

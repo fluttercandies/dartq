@@ -106,10 +106,14 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
         let dir = canonical.parent().expect("canonical path has a parent");
         diags.extend(analyze_file(&source, dir, file));
     }
+    // The canonical order leads on the printed path's bytes (the oracle
+    // sorts path-first), not the intern slot: the intern order follows the
+    // discovery set's raw spellings, so under a symlinked duplicate the
+    // deduped file's slot can precede a lexically smaller real path while
+    // its canonical name sorts after (#558).
     diags.sort_by(|a, b| {
-        a.file
-            .index()
-            .cmp(&b.file.index())
+        crate::layout::path_key(files_state.file_path(a.file))
+            .cmp(crate::layout::path_key(files_state.file_path(b.file)))
             .then_with(|| a.range.offset.cmp(&b.range.offset))
             .then_with(|| a.code.machine.cmp(b.code.machine))
             .then_with(|| a.message.cmp(&b.message))
@@ -123,6 +127,14 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
 /// Canonical absolute path (the oracle prints symlink-resolved paths) plus
 /// strict UTF-8 source. A read/decode failure is an error, never a silently
 /// skipped file — lossy output would be format drift downstream.
+///
+/// The dedup key is the canonical path **string** — the oracle's own key
+/// (context_root.dart:119-129 canonicalize), which the differential harness
+/// mirrors on both sides. A samefile-style `(st_dev, st_ino)` identity
+/// would diverge from the oracle on the case-insensitive volumes (macOS
+/// APFS, Windows NTFS) where case-mismatched spellings of one file
+/// canonicalize to two strings and legitimately double-emit, oracle alike —
+/// the documented residual, kept for parity (#558).
 ///
 /// Exactly one leading UTF-8 BOM is dropped (oracle read-layer parity: the
 /// analyzer read path strips it before scanning; spans are relative to the
@@ -843,6 +855,54 @@ mod tests {
         // interpolated and percent-encoded URIs, and the scheme-carrying
         // `dart:`/`package:` imports all stay silent.
         assert_eq!(run.diagnostics().len(), 4);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The canonical order leads on the printed path's bytes, not the
+    /// intern slot (#558): the symlink `a.dart → z.dart` dedups `z.dart`
+    /// into the first intern slot (raw set order a, b, z), yet `b.dart`
+    /// must sort before it by path bytes. Under the retired slot-id key
+    /// the rows emitted z-before-b — the machine face's byte-parity
+    /// contract broken.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_order_sorts_by_printed_path_under_symlink_dedup() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("dq_cmd_order_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("z.dart"), "void f() { x }\n").expect("write z");
+        fs::write(root.join("b.dart"), "void g() { y }\n").expect("write b");
+        symlink(root.join("z.dart"), root.join("a.dart")).expect("link");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        let run = analyze_files(&files).expect("check core");
+        let paths: Vec<&str> = run
+            .diagnostics()
+            .iter()
+            .map(|d| {
+                run.output()
+                    .files
+                    .file_path(d.file)
+                    .to_str()
+                    .expect("utf-8 fixture path")
+            })
+            .collect();
+        assert_eq!(paths.len(), 2, "both real files analyzed: {paths:?}");
+        let b_at = paths
+            .iter()
+            .position(|p| p.ends_with("b.dart"))
+            .expect("b row");
+        let z_at = paths
+            .iter()
+            .position(|p| p.ends_with("z.dart"))
+            .expect("z row");
+        assert!(
+            b_at < z_at,
+            "path-byte order: b.dart before z.dart, got {paths:?}"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

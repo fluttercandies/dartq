@@ -73,7 +73,13 @@ pub fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
-/// Plain byte key of a path — the oracle's `filePath.compareTo` string order.
+/// Plain byte key of a path — the oracle's `filePath.compareTo` string
+/// order, with one spelling-level caveat: Dart's `compareTo` orders by UTF-16
+/// code units while this key orders by UTF-8 bytes, and the two diverge for
+/// astral-plane characters vs U+E000–U+FFFF (surrogate code units sort below
+/// the BMP-high range, UTF-8 bytes above). That can only permute the ORDER of
+/// same-severity diagnostics, never membership; the differential harness
+/// compares set keys (code, file), so the divergence is gate-invisible.
 #[must_use]
 pub fn path_key(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()

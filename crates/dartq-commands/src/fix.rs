@@ -246,9 +246,7 @@ impl PluginHosts {
     /// callers that resolved their plugin posture before reaching here).
     #[must_use]
     pub fn empty() -> Self {
-        Self {
-            hosts: Vec::new(),
-        }
+        Self { hosts: Vec::new() }
     }
 
     /// True when no plugin was discovered — the faces skip their dispatch
@@ -625,7 +623,13 @@ pub fn from_plugin(
                 if offset.checked_add(length)? > len16 {
                     return None;
                 }
-                edits.push(anchored_edit(text, lines, offset, length, &edit.replacement));
+                edits.push(anchored_edit(
+                    text,
+                    lines,
+                    offset,
+                    length,
+                    &edit.replacement,
+                ));
             }
             Some(PluginFix {
                 plugin: plugin.to_owned(),
@@ -723,7 +727,10 @@ fn anchor_json(anchor: &Anchor) -> serde_json::Map<String, serde_json::Value> {
     json.insert("line".into(), anchor.line.into());
     json.insert("column".into(), anchor.column.into());
     if !anchor.context_before.is_empty() {
-        json.insert("context_before".into(), anchor.context_before.clone().into());
+        json.insert(
+            "context_before".into(),
+            anchor.context_before.clone().into(),
+        );
     }
     if !anchor.context_after.is_empty() {
         json.insert("context_after".into(), anchor.context_after.clone().into());
@@ -828,14 +835,16 @@ pub fn assists_json(answer: &AssistAnswer, verbosity: Verbosity) -> serde_json::
         "assists": assists,
     });
     if !answer.errors.is_empty() {
-        document["errors"] = serde_json::json!(answer
-            .errors
-            .iter()
-            .map(|error| serde_json::json!({
-                "plugin": error.plugin,
-                "message": error.message,
-            }))
-            .collect::<Vec<_>>());
+        document["errors"] = serde_json::json!(
+            answer
+                .errors
+                .iter()
+                .map(|error| serde_json::json!({
+                    "plugin": error.plugin,
+                    "message": error.message,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
     document
 }
@@ -1000,10 +1009,17 @@ mod tests {
         assert_eq!(doc["file"], "/abs/t.dart");
 
         let edits = doc["edits"].as_array().expect("edits array");
-        assert_eq!(edits.len(), 2, "the built-in row first, then the plugin row");
+        assert_eq!(
+            edits.len(),
+            2,
+            "the built-in row first, then the plugin row"
+        );
         for (edit, expected_source) in edits.iter().zip(["builtin-lint", "live"]) {
             let keys: Vec<_> = edit.as_object().expect("edit object").keys().collect();
-            assert_eq!(keys, ["anchor", "length", "offset", "replacement", "source"]);
+            assert_eq!(
+                keys,
+                ["anchor", "length", "offset", "replacement", "source"]
+            );
             assert_eq!(edit["source"], expected_source);
         }
         assert_eq!(edits[0]["offset"], 19);
@@ -1039,7 +1055,18 @@ mod tests {
             .expect("edit object")
             .keys()
             .collect();
-        assert_eq!(builtin, ["anchor", "length", "message", "offset", "replacement", "rule", "source"]);
+        assert_eq!(
+            builtin,
+            [
+                "anchor",
+                "length",
+                "message",
+                "offset",
+                "replacement",
+                "rule",
+                "source"
+            ]
+        );
         assert_eq!(full["edits"][0]["rule"], "unnecessary_new");
         let plugin_row: Vec<_> = full["edits"][1]
             .as_object()
@@ -1048,7 +1075,15 @@ mod tests {
             .collect();
         assert_eq!(
             plugin_row,
-            ["anchor", "length", "message", "offset", "priority", "replacement", "source"]
+            [
+                "anchor",
+                "length",
+                "message",
+                "offset",
+                "priority",
+                "replacement",
+                "source"
+            ]
         );
         assert_eq!(full["edits"][1]["message"], "insert const");
         assert_eq!(full["edits"][1]["priority"], 1);
@@ -1109,15 +1144,17 @@ mod tests {
         FixesReply {
             fixes: changes
                 .iter()
-                .map(|(priority, message, offset, length, replacement)| PrioritizedChange {
-                    priority: *priority,
-                    message: (*message).to_owned(),
-                    edits: vec![SourceEdit {
-                        offset: *offset,
-                        length: *length,
-                        replacement: (*replacement).to_owned(),
-                    }],
-                })
+                .map(
+                    |(priority, message, offset, length, replacement)| PrioritizedChange {
+                        priority: *priority,
+                        message: (*message).to_owned(),
+                        edits: vec![SourceEdit {
+                            offset: *offset,
+                            length: *length,
+                            replacement: (*replacement).to_owned(),
+                        }],
+                    },
+                )
                 .collect(),
         }
     }
@@ -1152,7 +1189,11 @@ mod tests {
         ]);
         let fixes = from_plugin("live", &reply, source, &lines);
         let titles: Vec<&str> = fixes.iter().map(|fix| fix.message.as_str()).collect();
-        assert_eq!(titles, ["first", "first tie", "second"], "stable priority sort");
+        assert_eq!(
+            titles,
+            ["first", "first tie", "second"],
+            "stable priority sort"
+        );
         assert!(fixes.iter().all(|fix| fix.plugin == "live"));
         assert_eq!(fixes[0].priority, 1);
 
@@ -1168,7 +1209,10 @@ mod tests {
 
         let (patched, outcomes) = apply(
             source,
-            &fixes.iter().flat_map(|fix| fix.edits.iter().cloned()).collect::<Vec<_>>(),
+            &fixes
+                .iter()
+                .flat_map(|fix| fix.edits.iter().cloned())
+                .collect::<Vec<_>>(),
         );
         assert_eq!(outcomes, &[EditOutcome::Applied; 3]);
         assert_eq!(patched, "aaa a = 1;\nccc B = 2;\n");
@@ -1187,9 +1231,17 @@ mod tests {
                     priority: 1,
                     message: "spills past the end".to_owned(),
                     edits: vec![
-                        SourceEdit { offset: 0, length: 3, replacement: "x".to_owned() },
+                        SourceEdit {
+                            offset: 0,
+                            length: 3,
+                            replacement: "x".to_owned(),
+                        },
                         // 8 + 10 runs past the file's UTF-16 length.
-                        SourceEdit { offset: 8, length: 10, replacement: "y".to_owned() },
+                        SourceEdit {
+                            offset: 8,
+                            length: 10,
+                            replacement: "y".to_owned(),
+                        },
                     ],
                 },
                 PrioritizedChange {
@@ -1204,13 +1256,21 @@ mod tests {
                 PrioritizedChange {
                     priority: 3,
                     message: "in range".to_owned(),
-                    edits: vec![SourceEdit { offset: 4, length: 1, replacement: "=".to_owned() }],
+                    edits: vec![SourceEdit {
+                        offset: 4,
+                        length: 1,
+                        replacement: "=".to_owned(),
+                    }],
                 },
             ],
         };
         let fixes = from_plugin("live", &reply, source, &lines);
         let titles: Vec<&str> = fixes.iter().map(|fix| fix.message.as_str()).collect();
-        assert_eq!(titles, ["in range"], "the two broken changes dropped atomically");
+        assert_eq!(
+            titles,
+            ["in range"],
+            "the two broken changes dropped atomically"
+        );
     }
 
     /// The anchor-stale contract holds for plugin rows exactly as for the
@@ -1232,7 +1292,10 @@ mod tests {
         let drifted = format!("// header overlay\n{source}");
         let (patched, outcomes) = apply(&drifted, std::slice::from_ref(&edit));
         assert_eq!(outcomes, &[EditOutcome::Applied]);
-        assert_eq!(patched, "// header overlay\nvoid f() { var a = const B(); }\n");
+        assert_eq!(
+            patched,
+            "// header overlay\nvoid f() { var a = const B(); }\n"
+        );
 
         // The construct is gone: stale, and the buffer is untouched.
         let (patched, outcomes) = apply("void f() { var a = B(); }\n", std::slice::from_ref(&edit));
@@ -1320,7 +1383,11 @@ mod tests {
             .expect("edit row")
             .keys()
             .collect();
-        assert_eq!(keys, ["length", "offset", "replacement", "source"], "anchor drops");
+        assert_eq!(
+            keys,
+            ["length", "offset", "replacement", "source"],
+            "anchor drops"
+        );
 
         let mut clean = answer.clone();
         clean.errors.clear();
