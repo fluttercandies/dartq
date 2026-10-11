@@ -499,6 +499,72 @@ fn colon_on_required_positional_reports_named_parameter_outside_group() {
 }
 
 #[test]
+fn atomic_empty_bracket_group_reports_empty_optional_parameter_list() {
+    // The scanner keeps `[]` as one INDEX token; the official
+    // `parseFormalParametersRest` `[]`-token arm (parser_impl.dart:1963-1967)
+    // splits it into `[` + `]` (`rewriteSquareBrackets` :5117 — `[` at the
+    // `[]` offset, `]` at +1) and enters `parseOptionalPositionalParameters`,
+    // whose `parameterCount == 0` arm (:2452-2462) reports
+    // `emptyOptionalParameterList` at the synthetic `]` and feeds a
+    // zero-length synthetic identifier to the parameter parse. Registry row
+    // (`emptyOptionalParameterList`): problem + correction verbatim.
+    let c = parse("void f([]) {}");
+    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.errors[0].1, 8); // synthetic `]` = `[]` offset + 1
+    assert_eq!(c.errors[0].2, 9);
+    assert_eq!(&c.texts, &["Optional parameter lists cannot be empty."]);
+    assert_eq!(
+        &c.corrections,
+        &[Some(
+            "Try adding an optional parameter to the list.".to_string()
+        )]
+    );
+
+    // The arm fires after a comma too: one row, anchored the same way.
+    let c = parse("void f(int x, []) {}");
+    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.errors[0].1, 15);
+    assert_eq!(c.errors[0].2, 16);
+
+    // Well-formed formals stay silent.
+    let c = parse("void f(int x) {}");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+}
+
+#[test]
+fn spaced_empty_bracket_group_reports_empty_optional_parameter_list() {
+    // The real-`]` sibling of the `[]`-token arm above: a spaced empty
+    // optional list `void f([ ]) {}` walks `parseOptionalPositionalParameters`
+    // normally and takes its `parameterCount == 0` arm
+    // (parser_impl.dart:2452-2462), whose `rewriteAndRecover` (:5112)
+    // reports `emptyOptionalParameterList` on the real `]` (its own offset,
+    // width 1) and splices a zero-length synthetic identifier before it for
+    // `parseFormalParameter` (:2459) to consume silently. Same registry row,
+    // so problem + correction verbatim.
+    let c = parse("void f([ ]) {}");
+    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.errors[0].1, 9); // the real `]` = `[` offset + 2
+    assert_eq!(c.errors[0].2, 10);
+    assert_eq!(&c.texts, &["Optional parameter lists cannot be empty."]);
+    assert_eq!(
+        &c.corrections,
+        &[Some(
+            "Try adding an optional parameter to the list.".to_string()
+        )]
+    );
+
+    // The arm fires after a comma too: one row, anchored the same way.
+    let c = parse("void f(int x, [ ]) {}");
+    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.errors[0].1, 16); // the real `]` = `[` offset + 2
+    assert_eq!(c.errors[0].2, 17);
+
+    // A well-formed optional formal stays silent.
+    let c = parse("void f([x]) {}");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+}
+
+#[test]
 fn required_modifier_walk_matches_official_order() {
     // `required` on a non-named formal reports `extraneous_modifier` once at
     // the first token after the walk (modifier_context.dart:212-221); a

@@ -11,6 +11,7 @@
 //! official parses them with the full expression engine).
 
 use dartq_scanner::{Keyword, TokenKind};
+use dartq_source::SourceRange;
 
 use crate::listener::{FormalParameterKind, IdentifierContext, MemberKind, ParserListener};
 use crate::message::msg;
@@ -103,17 +104,38 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     // scanner keeps Index unsplit; official
                     // `rewriteSquareBrackets`).
                     let at = self.peek_span();
-                    // `[]` is atomic: consume it, queue the synthetic `]`
-                    // plus the empty-parameter identifier, and parse that.
+                    // `[]` is atomic: consume it, then queue the split
+                    // faces — the identifier FIRST, so it is the current
+                    // token when `parse_formal_parameter` runs. Official
+                    // `rewriteAndRecover` (:2452-2462) inserts the
+                    // zero-length identifier into the stream SILENTLY and
+                    // `parseFormalParameter` consumes it as the formal's
+                    // name; advancing past it here would feed the split `]`
+                    // to the name step instead (`missing_identifier` and a
+                    // derailed list).
                     self.cursor.advance();
-                    let name_id = self
-                        .cursor
+                    self.cursor
                         .insert_synthetic(TokenKind::Identifier, at.range.offset + 1);
-                    self.cursor.advance();
-                    let _ = name_id;
                     let close_id = self
                         .cursor
                         .insert_synthetic(TokenKind::CloseSquare, at.range.offset + 1);
+                    // The split group is always empty, so
+                    // `parseOptionalPositionalParameters` takes its
+                    // `parameterCount == 0` arm (:2452-2462): report at the
+                    // split `]` (`rewriteAndRecover` anchors on
+                    // `token.next!`) before the parameter parse. The
+                    // official split face is a real width-1 token
+                    // (`rewriteSquareBrackets` :5134-5140), so the anchor
+                    // spans one unit even though the queued `]` handle is a
+                    // zero-width recovery synthetic.
+                    let close_span = TokenSpan::new(
+                        close_id,
+                        SourceRange {
+                            offset: at.range.offset + 1,
+                            length: 1,
+                        },
+                    );
+                    self.report(msg::empty_optional_parameter_list(), close_span);
                     self.parse_formal_parameter(FormalParameterKind::OptionalPositional, kind);
                     self.listener.begin_optional_formal_parameters(at);
                     self.listener.end_optional_formal_parameters(
@@ -234,11 +256,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if parameter_count == 0 {
             let at = self.peek_span();
             self.report(msg::empty_optional_parameter_list(), at);
-            let id = self
-                .cursor
+            // Queue the zero-length name and leave it current: official
+            // `rewriteAndRecover` (:5112) reports on the old next (this `]`)
+            // and splices the synthetic in front of it, then
+            // `parseFormalParameter` (:2459) starts at the synthetic and
+            // consumes it silently as the formal's name. Advancing past it
+            // here would feed the `]` to the name step instead
+            // (`missing_identifier` and a derailed list) — same shape as the
+            // `[]`-token arm above.
+            self.cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
-            self.cursor.advance();
-            let _ = id; // synthetic name of the synthesized parameter
             self.parse_formal_parameter(FormalParameterKind::OptionalPositional, kind);
         }
         self.cursor.advance(); // `]`

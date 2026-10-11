@@ -1536,12 +1536,13 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn empty_optional_parameter_list() -> Message {
-        Message::new(
+        Message::with_correction(
             local_code(
                 "empty_optional_parameter_list",
                 "EMPTY_OPTIONAL_PARAMETER_LIST",
             ),
             "Optional parameter lists cannot be empty.",
+            "Try adding an optional parameter to the list.",
         )
     }
 
