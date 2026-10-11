@@ -21,10 +21,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::machine::{MachineDiag, Severity};
-use dartq_source::{utf16_len_of, utf16_offset_to_byte, LineIndex};
+use dartq_source::{LineIndex, utf16_len_of, utf16_offset_to_byte};
 
 /// One replay step: replace `length` UTF-16 code units starting at 1-based
 /// (`line`, `column`) with `new_text` (empty = deletion, `length` 0 = pure
@@ -44,7 +44,7 @@ pub(crate) struct Edit {
 
 /// Per-line scalar UTF-16 offsets and content lengths (terminators
 /// excluded). Terminator set matches the engine's line index: `\n`,
-/// `\r\n`, and lone `\r` (dartq-source source_range tests pin that set).
+/// `\r\n`, and lone `\r` (`dartq-source` `source_range` tests pin that set).
 #[derive(Debug, Clone)]
 pub(crate) struct LineTable {
     /// Scalar UTF-16 offset of each line start; `starts[0] == 0`.
@@ -78,7 +78,9 @@ pub(crate) fn line_table(text: &str) -> LineTable {
                 }
                 content = 0;
             }
-            other => content += other.len_utf16() as u32,
+            other => {
+                content += u32::try_from(other.len_utf16()).expect("utf16 length fits u32");
+            }
         }
     }
     content_lens.push(content);
@@ -106,7 +108,9 @@ pub(crate) fn edit_span_utf16(source: &str, edit: &Edit) -> Result<(u32, u32), S
     if edit.column - 1 > content {
         return Err(format!(
             "column {} exceeds line {} content length {}",
-            edit.column, edit.line, content + 1
+            edit.column,
+            edit.line,
+            content + 1
         ));
     }
     let start = table.starts[(edit.line - 1) as usize] + (edit.column - 1);
@@ -163,7 +167,7 @@ fn parse_edit(value: &Value) -> Result<Edit, String> {
     };
     let file = field("file")?
         .as_str()
-        .ok_or_else(|| "`file` must be a string")?
+        .ok_or("`file` must be a string")?
         .to_owned();
     checked_rel_path(&file)?;
     let number = |name: &str| -> Result<u32, String> {
@@ -179,7 +183,7 @@ fn parse_edit(value: &Value) -> Result<Edit, String> {
         length: number("length")?,
         new_text: field("new_text")?
             .as_str()
-            .ok_or_else(|| "`new_text` must be a string")?
+            .ok_or("`new_text` must be a string")?
             .to_owned(),
     };
     if edit.line == 0 || edit.column == 0 {
@@ -310,12 +314,10 @@ pub(crate) fn canonical_from_lsp(entry: &Value) -> Result<(PathBuf, CanonicalDia
         let character = container
             .get("character")
             .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                format!("analyze entry `{at}.character` missing or not a number")
-            })?;
+            .ok_or_else(|| format!("analyze entry `{at}.character` missing or not a number"))?;
         let line = u32::try_from(line).map_err(|_| format!("`{at}.line` exceeds u32"))?;
-        let character = u32::try_from(character)
-            .map_err(|_| format!("`{at}.character` exceeds u32"))?;
+        let character =
+            u32::try_from(character).map_err(|_| format!("`{at}.character` exceeds u32"))?;
         Ok((line, character))
     };
     let range = object
@@ -344,7 +346,7 @@ pub(crate) fn canonical_from_lsp(entry: &Value) -> Result<(PathBuf, CanonicalDia
         path,
         CanonicalDiag {
             code: string_field("code")?.to_lowercase(),
-            severity: severity as u8,
+            severity: u8::try_from(severity).expect("checked 1..=3 above"),
             start_line,
             start_col,
             end_line,
@@ -418,13 +420,16 @@ mod tests {
             let table = line_table(&source);
             let index = LineIndex::new(&source);
             for (line_no, &start) in table.starts.iter().enumerate() {
-                let content = table.content_lens[line_no] as u32;
+                let content = table.content_lens[line_no];
                 for column in 1..=content + 1 {
                     let scalar = start + column - 1;
                     let (engine_line, engine_col) = index.line_col_utf16(&source, scalar);
                     assert_eq!(
                         (engine_line, engine_col),
-                        (line_no as u32 + 1, column),
+                        (
+                            u32::try_from(line_no + 1).expect("table rows fit u32"),
+                            column,
+                        ),
                         "engine index disagrees with the walk at scalar {scalar} of {source:?}"
                     );
                 }
@@ -485,7 +490,10 @@ mod tests {
     #[test]
     fn apply_edit_rejects_out_of_range_coordinates() {
         let text = "ab\n";
-        assert!(apply_edit(text, &edit("f", 0, 1, 0, "x")).is_err(), "line 0");
+        assert!(
+            apply_edit(text, &edit("f", 0, 1, 0, "x")).is_err(),
+            "line 0"
+        );
         assert!(apply_edit(text, &edit("f", 1, 0, 0, "x")).is_err(), "col 0");
         assert!(
             apply_edit(text, &edit("f", 5, 1, 0, "x")).is_err(),
@@ -520,15 +528,19 @@ mod tests {
             "{\"file\":\"a.dart\",\"line\":1,\"column\":1,\"length\":0}",
             "{not json}",
         ] {
-            assert!(
-                parse_edits(bad).is_err(),
-                "must reject: {bad}"
-            );
+            assert!(parse_edits(bad).is_err(), "must reject: {bad}");
         }
         assert!(parse_edits("").expect("empty file").is_empty());
     }
 
-    fn machine_diag(code: &str, file: &str, line: u32, col: u32, length: u32, message: &str) -> MachineDiag {
+    fn machine_diag(
+        code: &str,
+        file: &str,
+        line: u32,
+        col: u32,
+        length: u32,
+        message: &str,
+    ) -> MachineDiag {
         MachineDiag {
             severity: Severity::Error,
             dtype: "SYNTACTIC_ERROR".into(),
@@ -580,10 +592,22 @@ mod tests {
                 .expect("canonical")
                 .1
         };
-        assert_ne!(base.key(), lsp_for(8, 1, "Expected ';'.").key(), "end drift");
-        assert_ne!(base.key(), lsp_for(7, 2, "Expected ';'.").key(), "severity drift");
+        assert_ne!(
+            base.key(),
+            lsp_for(8, 1, "Expected ';'.").key(),
+            "end drift"
+        );
+        assert_ne!(
+            base.key(),
+            lsp_for(7, 2, "Expected ';'.").key(),
+            "severity drift"
+        );
         assert_ne!(base.key(), lsp_for(7, 1, "Other.").key(), "message drift");
-        assert_eq!(base.key(), lsp_for(7, 1, "Expected ';'.").key(), "equal faces");
+        assert_eq!(
+            base.key(),
+            lsp_for(7, 1, "Expected ';'.").key(),
+            "equal faces"
+        );
     }
 
     #[test]
@@ -591,13 +615,14 @@ mod tests {
         // A diagnostic whose length crosses the `\n`: end position is on
         // the next line, computed by the engine index (not scalar math).
         let source = "ab\ncd\n";
-        let diag = canonical_from_machine(
-            &machine_diag("X", "/c/a.dart", 1, 2, 3, "m"),
-            source,
-        )
-        .expect("canonical");
+        let diag = canonical_from_machine(&machine_diag("X", "/c/a.dart", 1, 2, 3, "m"), source)
+            .expect("canonical");
         assert_eq!((diag.start_line, diag.start_col), (0, 1));
-        assert_eq!((diag.end_line, diag.end_col), (1, 1), "`b\\nc` ends on line 2 col 1 zero-based");
+        assert_eq!(
+            (diag.end_line, diag.end_col),
+            (1, 1),
+            "`b\\nc` ends on line 2 col 1 zero-based"
+        );
     }
 
     #[test]
@@ -616,14 +641,14 @@ mod tests {
 
     /// The machine parser the batch side reuses must accept the canonical
     /// output shape this module normalizes (guards an accidental drift in
-    /// the shared crate::machine dependency).
+    /// the shared `crate::machine` dependency).
     #[test]
     fn machine_side_parses_through_the_shared_parser() {
         let line = "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|2|5|3|Expected to find ';'.";
         let diags = crate::machine::parse_output(line, OutputFormat::Machine).expect("parses");
         assert_eq!(diags.len(), 1);
-        let canonical = canonical_from_machine(&diags[0], "int a = 1;\nint b = 2;\n")
-            .expect("canonical");
+        let canonical =
+            canonical_from_machine(&diags[0], "int a = 1;\nint b = 2;\n").expect("canonical");
         assert_eq!(canonical.code, "expected_token");
     }
 }

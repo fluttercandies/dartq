@@ -1,6 +1,8 @@
-//! Differential report output: JSON (full diff entries, for regression analysis) + Markdown (summary, <= 100 lines)
-//! + raw per-side machine outputs (`raw-outputs.json`, written on every gate run: both sides' complete
-//! parsed diagnostics, all severities, unfiltered — the post-hoc attribution data plane).
+//! Differential report output: JSON (full diff entries, for regression
+//! analysis) + Markdown (summary, <= 100 lines) + raw per-side machine
+//! outputs (`raw-outputs.json`, written on every gate run: both sides'
+//! complete parsed diagnostics, all severities, unfiltered — the post-hoc
+//! attribution data plane).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -703,14 +705,14 @@ fn markdown(
         meta.threshold,
         verdict.token()
     );
-    let asymmetry = if deltas.oracle_instances != deltas.dartq_instances {
+    let asymmetry = if deltas.oracle_instances == deltas.dartq_instances {
+        String::new()
+    } else {
         format!(
             "; instance totals differ: oracle {}, dartq {}, paired {} \
              (surplus instances stay unpaired)",
             deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances
         )
-    } else {
-        String::new()
     };
     let _ = writeln!(
         md,
@@ -796,8 +798,8 @@ pub(crate) fn load_known_diffs(path: &Path) -> Result<Vec<KnownDiff>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
-    let table: KnownDiffsFile = serde_json::from_str(&text)
-        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    let table: KnownDiffsFile =
+        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     Ok(table.entries)
 }
 
@@ -914,27 +916,30 @@ pub(crate) fn persist_regressions(
         // files with readable source — replay's edit schema requires
         // corpus-relative paths.
         let mut replay_command = Vec::new();
-        if let Some(text) = &source {
-            if !Path::new(&rel).is_absolute() {
-                write_edits_file(opts.dir, &hash, &rel, text)?;
-                replay_command = vec![
-                    "target/debug/harness".to_string(),
-                    "replay".to_string(),
-                    "--corpus-dir".to_string(),
-                    dir.display().to_string(),
-                    "--edits".to_string(),
-                    opts.dir.join(format!("{hash}.edits.jsonl")).display().to_string(),
-                    "--dartq-cmd".to_string(),
-                    opts.dartq_cmd.to_string(),
-                    "--daemon-cmd".to_string(),
-                    daemon_template(opts.dartq_cmd),
-                ];
-            }
+        if let Some(text) = &source
+            && !Path::new(&rel).is_absolute()
+        {
+            write_edits_file(opts.dir, &hash, &rel, text)?;
+            replay_command = vec![
+                "target/debug/harness".to_string(),
+                "replay".to_string(),
+                "--corpus-dir".to_string(),
+                dir.display().to_string(),
+                "--edits".to_string(),
+                opts.dir
+                    .join(format!("{hash}.edits.jsonl"))
+                    .display()
+                    .to_string(),
+                "--dartq-cmd".to_string(),
+                opts.dartq_cmd.to_string(),
+                "--daemon-cmd".to_string(),
+                daemon_template(opts.dartq_cmd),
+            ];
         }
 
         let case = RegressionCase {
             schema: CASE_SCHEMA.to_string(),
-            file: rel.to_string(),
+            file: rel.clone(),
             corpus: raw.corpora[section]
                 .0
                 .clone()
@@ -998,13 +1003,8 @@ fn side_case_rows(diags: &[MachineDiag], dir: &Path, rel: &str) -> Vec<CaseRow> 
         })
         .collect();
     rows.sort_by(|a, b| {
-        (&a.code, a.line, a.column, a.length, &a.message).cmp(&(
-            &b.code,
-            b.line,
-            b.column,
-            b.length,
-            &b.message,
-        ))
+        (&a.code, a.line, a.column, a.length, &a.message)
+            .cmp(&(&b.code, b.line, b.column, b.length, &b.message))
     });
     rows
 }
@@ -1046,7 +1046,12 @@ fn hash8(file_key: &str) -> String {
 fn daemon_template(dartq_cmd: &str) -> String {
     let mut parts = dartq_cmd.split_whitespace();
     let program = parts.next().unwrap_or_default().to_string();
-    let mut argv = vec![program, "daemon".to_string(), "--dir".to_string(), "{dir}".to_string()];
+    let mut argv = vec![
+        program,
+        "daemon".to_string(),
+        "--dir".to_string(),
+        "{dir}".to_string(),
+    ];
     for arg in parts {
         if matches!(arg, "analyze" | "check" | "--format=machine") {
             continue;
@@ -1069,8 +1074,7 @@ fn write_edits_file(dir: &Path, hash: &str, rel: &str, source: &str) -> Result<(
         "new_text": source,
     });
     let path = dir.join(format!("{hash}.edits.jsonl"));
-    fs::write(&path, format!("{step}\n"))
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+    fs::write(&path, format!("{step}\n")).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// `--list-known`: the exemption table with liveness evidence from the
@@ -1131,11 +1135,17 @@ pub(crate) fn list_known(known_path: &Path, cases_dir: &Path) -> Result<String, 
             }
             (None, false) => {
                 stale += 1;
-                lines.push(format!("STALE        {} {}  (no persisted case matches; prunable)", k.code, k.file));
+                lines.push(format!(
+                    "STALE        {} {}  (no persisted case matches; prunable)",
+                    k.code, k.file
+                ));
             }
             (None, true) => {
                 no_evidence += 1;
-                lines.push(format!("NO-EVIDENCE  {} {}  (no persisted cases yet)", k.code, k.file));
+                lines.push(format!(
+                    "NO-EVIDENCE  {} {}  (no persisted cases yet)",
+                    k.code, k.file
+                ));
             }
         }
     }
@@ -1161,7 +1171,17 @@ mod tests {
     use crate::machine::{MachineDiag, Severity};
     use std::path::PathBuf;
 
+    /// File-name extension as `&str` — the case-sensitive comparison domain
+    /// the gate's file-name assertions need (`Path::extension`, never
+    /// `ends_with`).
+    fn file_ext(n: &str) -> Option<&str> {
+        Path::new(n).extension().and_then(std::ffi::OsStr::to_str)
+    }
+
     #[test]
+    // Long scenario pin: the 100-line Markdown budget is asserted against a
+    // full report build, not a fixture.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn writes_json_and_md_within_line_budget() {
         let oracle: Vec<MachineDiag> = (0..30)
             .map(|i| MachineDiag {
@@ -1362,6 +1382,9 @@ mod tests {
     /// the entry-key code/file form (joinable against the report faces) with
     /// verbatim severity, message and location.
     #[test]
+    // Long scenario pin: raw outputs must carry every severity through the
+    // error-only gate; the fixture setup is the bulk of the length.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn raw_outputs_keep_every_severity_unfiltered_on_error_only_gate() {
         let root = std::env::temp_dir().join(format!("dq_raw_{}", std::process::id()));
         let lib = root.join("lib");
@@ -1387,12 +1410,32 @@ mod tests {
         // Oracle: one diagnostic per severity tier; dartq: two warnings, one
         // sharing the oracle's (code, file) key, one dartq-only.
         let oracle = vec![
-            diag(Severity::Error, "EXPECTED_TOKEN", "a.dart", "Expected to find ';'."),
-            diag(Severity::Warning, "UNUSED_LOCAL_VARIABLE", "a.dart", "The value of the local variable 'x' isn't used."),
-            diag(Severity::Info, "PREFER_SINGLE_QUOTES", "b.dart", "Unnecessary use of double quotes."),
+            diag(
+                Severity::Error,
+                "EXPECTED_TOKEN",
+                "a.dart",
+                "Expected to find ';'.",
+            ),
+            diag(
+                Severity::Warning,
+                "UNUSED_LOCAL_VARIABLE",
+                "a.dart",
+                "The value of the local variable 'x' isn't used.",
+            ),
+            diag(
+                Severity::Info,
+                "PREFER_SINGLE_QUOTES",
+                "b.dart",
+                "Unnecessary use of double quotes.",
+            ),
         ];
         let dartq = vec![
-            diag(Severity::Warning, "unused_local_variable", "a.dart", "The value of the local variable 'x' isn't used."),
+            diag(
+                Severity::Warning,
+                "unused_local_variable",
+                "a.dart",
+                "The value of the local variable 'x' isn't used.",
+            ),
             diag(Severity::Warning, "DEAD_CODE", "b.dart", "Dead code."),
         ];
         // ERROR-only gate: the filters drop the WARNING/INFO tiers from the
@@ -1422,7 +1465,8 @@ mod tests {
             oracle: &oracle_lists,
             dartq: &dartq_lists,
         };
-        let (json_path, _) = write_reports(&cmp, &meta, Verdict::Pass, &raw, &out).expect("reports");
+        let (json_path, _) =
+            write_reports(&cmp, &meta, Verdict::Pass, &raw, &out).expect("reports");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&json_path).expect("json")).expect("valid");
@@ -1480,7 +1524,10 @@ mod tests {
         );
 
         // Corpus section header: canonical dir, single-corpus label = null
-        assert_eq!(raw["oracle"]["corpora"][0]["dir"], root_canon.display().to_string());
+        assert_eq!(
+            raw["oracle"]["corpora"][0]["dir"],
+            root_canon.display().to_string()
+        );
         assert!(raw["oracle"]["corpora"][0]["label"].is_null());
 
         fs::remove_dir_all(&root).ok();
@@ -1664,7 +1711,10 @@ mod tests {
             length: 1,
             message: message.into(),
         };
-        let oracle = vec![diag("EXPECTED_TOKEN", 1, "Expected to find ';'."), diag("UNDEFINED_CLASS", 2, "Undefined class 'B'.")];
+        let oracle = vec![
+            diag("EXPECTED_TOKEN", 1, "Expected to find ';'."),
+            diag("UNDEFINED_CLASS", 2, "Undefined class 'B'."),
+        ];
         let dartq = vec![diag("expected_token", 1, "Expected to find ';'.")];
         let cmp = compare(
             &build_side_labeled(&oracle, &root_canon, None, |_| true),
@@ -1706,10 +1756,22 @@ mod tests {
         };
 
         for _ in 0..2 {
-            let opts = persist_opts(&out, &[], Path::new("docs/audits/x/report.json"), 1_700_000_000);
+            let opts = persist_opts(
+                &out,
+                &[],
+                Path::new("docs/audits/x/report.json"),
+                1_700_000_000,
+            );
             let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
             assert_eq!(stats.files_persisted, 1);
-            assert_eq!((stats.files_exempt, stats.entries_exempt, stats.files_skipped), (0, 0, 0));
+            assert_eq!(
+                (
+                    stats.files_exempt,
+                    stats.entries_exempt,
+                    stats.files_skipped
+                ),
+                (0, 0, 0)
+            );
         }
 
         let mut names: Vec<String> = fs::read_dir(&out)
@@ -1717,12 +1779,21 @@ mod tests {
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names.len(), 2, "exactly <hash>.json + <hash>.edits.jsonl: {names:?}");
+        assert_eq!(
+            names.len(),
+            2,
+            "exactly <hash>.json + <hash>.edits.jsonl: {names:?}"
+        );
         assert!(
-            names.iter().all(|n| n.ends_with(".json") || n.ends_with(".edits.jsonl")),
+            names
+                .iter()
+                .all(|n| file_ext(n) == Some("json") || file_ext(n) == Some("jsonl")),
             "{names:?}"
         );
-        let stem = names.iter().find(|n| n.ends_with(".json")).expect("case file");
+        let stem = names
+            .iter()
+            .find(|n| file_ext(n) == Some("json"))
+            .expect("case file");
         assert_eq!(stem.len(), "abcdefgh.json".len(), "hash8 stem: {stem}");
         // Byte-determinism at a fixed captured_at: re-reading and re-persisting
         // produced identical case bytes.
@@ -1736,7 +1807,7 @@ mod tests {
     }
 
     /// Case schema shape: both sides' verbatim rows (dartq side empty for the
-    /// missing entry), inline source, run meta, and a replay_command whose
+    /// missing entry), inline source, run meta, and a `replay_command` whose
     /// edits file parses through the replay edit schema.
     #[test]
     fn persisted_case_carries_schema_rows_source_and_replay_argv() {
@@ -1764,7 +1835,10 @@ mod tests {
         assert_eq!(parsed["file"], "lib/a.dart");
         assert_eq!(parsed["captured_at"], 42);
         assert_eq!(parsed["source"], "int a = 1;\nint b = 2;\n");
-        assert_eq!(parsed["source_run"]["dartq_cmd"], "./target/debug/dartq analyze --format=machine --sdk /sdk");
+        assert_eq!(
+            parsed["source_run"]["dartq_cmd"],
+            "./target/debug/dartq analyze --format=machine --sdk /sdk"
+        );
         assert_eq!(parsed["source_run"]["report"], "docs/audits/x/report.json");
         // Oracle rows verbatim and sorted; dartq side empty (its only entry matched)
         let oracle_rows = parsed["oracle"].as_array().expect("oracle rows");
@@ -1782,17 +1856,25 @@ mod tests {
             .collect();
         assert_eq!(argv[0], "target/debug/harness");
         assert_eq!(argv[1], "replay");
-        assert!(argv.windows(2).any(|w| w[0] == "--corpus-dir" && w[1] == root.display().to_string()));
-        let edits_index = argv.iter().position(|a| *a == "--edits").expect("--edits present");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--corpus-dir" && w[1] == root.display().to_string())
+        );
+        let edits_index = argv
+            .iter()
+            .position(|a| *a == "--edits")
+            .expect("--edits present");
         let edits_path = PathBuf::from(argv[edits_index + 1]);
-        let edits = crate::replay_edit::parse_edits(
-            &fs::read_to_string(&edits_path).expect("edits file"),
-        )
-        .expect("edits parse through the replay schema");
+        let edits =
+            crate::replay_edit::parse_edits(&fs::read_to_string(&edits_path).expect("edits file"))
+                .expect("edits parse through the replay schema");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].file, "lib/a.dart");
         assert_eq!(edits[0].new_text, "int a = 1;\nint b = 2;\n");
-        let daemon_index = argv.iter().position(|a| *a == "--daemon-cmd").expect("--daemon-cmd");
+        let daemon_index = argv
+            .iter()
+            .position(|a| *a == "--daemon-cmd")
+            .expect("--daemon-cmd");
         assert_eq!(
             argv[daemon_index + 1],
             "./target/debug/dartq daemon --dir {dir} --sdk /sdk",
@@ -1804,7 +1886,7 @@ mod tests {
     }
 
     /// Exemption table: a matching (code, file) entry suppresses the case;
-    /// a non-matching message_pattern does not.
+    /// a non-matching `message_pattern` does not.
     #[test]
     fn known_diffs_suppress_persistence() {
         let (root, cmp, oracle, dartq) = persist_fixture();
@@ -1832,7 +1914,11 @@ mod tests {
         let opts = persist_opts(&out, &known, Path::new("r.json"), 1);
         let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
         assert_eq!(
-            (stats.files_persisted, stats.files_exempt, stats.entries_exempt),
+            (
+                stats.files_persisted,
+                stats.files_exempt,
+                stats.entries_exempt
+            ),
             (0, 1, 1),
             "fully exempt file writes nothing"
         );
@@ -1879,12 +1965,18 @@ mod tests {
                 },
             ],
         };
-        fs::write(&known_path, serde_json::to_string_pretty(&table).expect("table"))
-            .expect("write table");
+        fs::write(
+            &known_path,
+            serde_json::to_string_pretty(&table).expect("table"),
+        )
+        .expect("write table");
 
         // No cases yet: NO-EVIDENCE for both.
         let summary = list_known(&known_path, &cases).expect("list");
-        assert!(summary.contains("2 entries (0 active, 0 stale, 2 no-evidence)"), "{summary}");
+        assert!(
+            summary.contains("2 entries (0 active, 0 stale, 2 no-evidence)"),
+            "{summary}"
+        );
 
         // Persist a case carrying undefined_class on lib/a.dart: that entry
         // turns ACTIVE, the other stays STALE (evidence exists, none matches).
@@ -1900,9 +1992,18 @@ mod tests {
         let opts = persist_opts(&cases, &[], Path::new("r.json"), 1);
         persist_regressions(&cmp, &raw, &opts).expect("persist");
         let summary = list_known(&known_path, &cases).expect("list");
-        assert!(summary.contains("2 entries (1 active, 1 stale, 0 no-evidence)"), "{summary}");
-        assert!(summary.contains("ACTIVE       undefined_class lib/a.dart"), "{summary}");
-        assert!(summary.contains("STALE        expected_token lib/gone.dart"), "{summary}");
+        assert!(
+            summary.contains("2 entries (1 active, 1 stale, 0 no-evidence)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("ACTIVE       undefined_class lib/a.dart"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("STALE        expected_token lib/gone.dart"),
+            "{summary}"
+        );
 
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&root).ok();
@@ -1913,18 +2014,25 @@ mod tests {
     #[test]
     fn load_known_diffs_missing_is_empty_malformed_is_error() {
         let missing = Path::new("/nonexistent/dq/known-diffs.json");
-        assert!(load_known_diffs(missing).expect("missing -> empty").is_empty());
+        assert!(
+            load_known_diffs(missing)
+                .expect("missing -> empty")
+                .is_empty()
+        );
 
         let dir = std::env::temp_dir().join(format!("dq_persist_load_{}", std::process::id()));
         fs::create_dir_all(&dir).expect("dir");
         let bad = dir.join("known-diffs.json");
         fs::write(&bad, "{not json").expect("bad table");
-        assert!(load_known_diffs(&bad).is_err(), "malformed table must error");
+        assert!(
+            load_known_diffs(&bad).is_err(),
+            "malformed table must error"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
     /// Position-delta channel over a single-corpus fixture, exercised the same
-    /// way write_reports drives it: compare the post-filter sides, feed the raw
+    /// way `write_reports` drives it: compare the post-filter sides, feed the raw
     /// per-corpus lists as the position data plane.
     fn deltas_for(oracle: Vec<MachineDiag>, dartq: Vec<MachineDiag>) -> JsonPositionDeltas {
         let cmp = compare(
@@ -1965,7 +2073,11 @@ mod tests {
         assert_eq!(deltas.entries_with_nonzero_delta, 1);
         assert_eq!(deltas.nonzero_instances, 3);
         assert_eq!(
-            (deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances),
+            (
+                deltas.oracle_instances,
+                deltas.dartq_instances,
+                deltas.paired_instances
+            ),
             (3, 3, 3),
             "equal totals: every instance paired"
         );
@@ -2002,7 +2114,11 @@ mod tests {
         assert_eq!(deltas.nonzero_instances, 1);
         assert_eq!(deltas.sample.len(), 1);
         assert_eq!(
-            (deltas.oracle_instances, deltas.dartq_instances, deltas.paired_instances),
+            (
+                deltas.oracle_instances,
+                deltas.dartq_instances,
+                deltas.paired_instances
+            ),
             (2, 1, 1),
             "asymmetric totals: min-zip pairs one row, the surplus oracle instance stays unpaired"
         );

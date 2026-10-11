@@ -579,7 +579,7 @@ mod tests {
         assert!(!dist.files_by_type["COMPILE_TIME_ERROR"].contains_key("a.dart"));
     }
 
-    /// files_by_code counts distinct (code, file) entries: the same key in two
+    /// `files_by_code` counts distinct (code, file) entries: the same key in two
     /// severity tiers (one analyzer emitting a code under different severities)
     /// must count its file once, while per-tier instance counts stay tier-scoped.
     #[test]

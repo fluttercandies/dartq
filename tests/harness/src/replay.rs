@@ -16,6 +16,7 @@
 //! crash mid-replay leaves the workspace untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,9 +27,7 @@ use serde_json::{Value, json};
 
 use crate::machine::{MachineDiag, OutputFormat};
 use crate::oracle::{TempCapture, driver_timeout_from_env, kill_driver, stderr_tail};
-use crate::{
-    Outcome, canonical_corpus, dartq::DartqProbe, replay_edit,
-};
+use crate::{Outcome, canonical_corpus, dartq::DartqProbe, replay_edit};
 
 /// LSP frames are JSON bodies; 256 MiB is the daemon codec's own cap.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -57,7 +56,7 @@ pub(crate) fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, St
         }
         let line = String::from_utf8(line)
             .map_err(|_| "frame header is not UTF-8".to_string())?
-            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .trim_end_matches(['\n', '\r'])
             .to_owned();
         if line.is_empty() {
             break;
@@ -76,8 +75,7 @@ pub(crate) fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, St
         }
         // Other headers (Content-Type) are legal and ignored.
     }
-    let len =
-        content_length.ok_or_else(|| "frame has no Content-Length header".to_string())?;
+    let len = content_length.ok_or_else(|| "frame has no Content-Length header".to_string())?;
     let mut body = vec![0u8; len];
     reader
         .read_exact(&mut body)
@@ -98,7 +96,7 @@ pub(crate) fn path_to_uri(path: &Path) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
                 uri.push(*byte as char);
             }
-            other => uri.push_str(&format!("%{other:02X}")),
+            other => write!(uri, "%{other:02X}").expect("string write"),
         }
     }
     uri
@@ -162,16 +160,13 @@ impl DaemonClient {
             loop {
                 // Any decode/IO failure ends the stream: callers report the
                 // closed stdout rather than a half-frame.
-                match read_frame(&mut reader) {
-                    Ok(Some(frame)) => {
-                        if tx.send(Some(frame)).is_err() {
-                            break;
-                        }
-                    }
-                    _ => {
-                        let _ = tx.send(None);
+                if let Ok(Some(frame)) = read_frame(&mut reader) {
+                    if tx.send(Some(frame)).is_err() {
                         break;
                     }
+                } else {
+                    let _ = tx.send(None);
+                    break;
                 }
             }
         });
@@ -214,9 +209,7 @@ impl DaemonClient {
                         .map_err(|e| format!("daemon sent a non-JSON frame: {e}"))?;
                     if value.get("id").and_then(Value::as_u64) == Some(id) {
                         if let Some(err) = value.get("error") {
-                            return Err(format!(
-                                "daemon returned an error for `{method}`: {err}"
-                            ));
+                            return Err(format!("daemon returned an error for `{method}`: {err}"));
                         }
                         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                     }
@@ -307,14 +300,14 @@ impl Drop for DaemonClient {
 type WorkspaceDiags = Vec<(String, replay_edit::CanonicalDiag)>;
 
 fn relative_key(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).display().to_string()
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 /// Normalizes a `dartq/analyze` result (the incremental face).
-fn normalize_lsp_workspace(
-    result: &Value,
-    corpus_root: &Path,
-) -> Result<WorkspaceDiags, String> {
+fn normalize_lsp_workspace(result: &Value, corpus_root: &Path) -> Result<WorkspaceDiags, String> {
     let entries = result
         .get("diagnostics")
         .and_then(Value::as_array)
@@ -378,10 +371,7 @@ fn canonical_lines(mut diags: WorkspaceDiags) -> Vec<String> {
 
 /// First divergence between the two sorted planes, as `(incremental,
 /// full)` excerpts; `None` = equal.
-fn first_difference(
-    incremental: &[String],
-    full: &[String],
-) -> Option<(String, String)> {
+fn first_difference(incremental: &[String], full: &[String]) -> Option<(String, String)> {
     let pos = incremental
         .iter()
         .zip(full.iter())
@@ -391,7 +381,10 @@ fn first_difference(
         None
     } else {
         Some((
-            incremental.get(pos).cloned().unwrap_or_else(|| "<absent>".into()),
+            incremental
+                .get(pos)
+                .cloned()
+                .unwrap_or_else(|| "<absent>".into()),
             full.get(pos).cloned().unwrap_or_else(|| "<absent>".into()),
         ))
     }
@@ -434,7 +427,9 @@ impl Default for ReplayOptions {
 fn value_arg<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str, Outcome> {
     *i += 1;
     args.get(*i).map(String::as_str).ok_or_else(|| {
-        Outcome::Error(format!("--{flag} needs a value; see `harness replay --help`"))
+        Outcome::Error(format!(
+            "--{flag} needs a value; see `harness replay --help`"
+        ))
     })
 }
 
@@ -498,6 +493,25 @@ const USAGE: &str = r#"usage:
 /// corpus assembler). Returns the canonicalized copy root so machine-side
 /// path stripping stays prefix-stable.
 fn materialize_copy(corpus: &Path) -> Result<PathBuf, String> {
+    fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dst).map_err(|e| format!("creating {}: {e}", dst.display()))?;
+        for entry in
+            std::fs::read_dir(src).map_err(|e| format!("reading {}: {e}", src.display()))?
+        {
+            let entry = entry.map_err(|e| format!("reading {}: {e}", src.display()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
+            let target = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else if !file_type.is_symlink() {
+                std::fs::copy(entry.path(), &target)
+                    .map_err(|e| format!("copying {}: {e}", entry.path().display()))?;
+            }
+        }
+        Ok(())
+    }
     let dir = std::env::temp_dir().join(format!(
         "dq_replay_{}_{}",
         std::process::id(),
@@ -509,27 +523,6 @@ fn materialize_copy(corpus: &Path) -> Result<PathBuf, String> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| format!("clearing stale replay copy {}: {e}", dir.display()))?;
-    }
-    fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(dst)
-            .map_err(|e| format!("creating {}: {e}", dst.display()))?;
-        for entry in std::fs::read_dir(src).map_err(|e| format!("reading {}: {e}", src.display()))? {
-            let entry =
-                entry.map_err(|e| format!("reading {}: {e}", src.display()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
-            let target = dst.join(entry.file_name());
-            if file_type.is_dir() {
-                copy_tree(&entry.path(), &target)?;
-            } else if file_type.is_symlink() {
-                continue;
-            } else {
-                std::fs::copy(entry.path(), &target)
-                    .map_err(|e| format!("copying {}: {e}", entry.path().display()))?;
-            }
-        }
-        Ok(())
     }
     copy_tree(corpus, &dir)?;
     dir.canonicalize()
@@ -584,41 +577,50 @@ fn write_report(
     .map_err(|e| format!("writing {}: {e}", json_path.display()))?;
 
     let mut md = String::new();
-    md.push_str(&format!(
-        "# harness replay — {}\n\ncorpus: {}\n\nverdict: {} ({equal_steps}/{} steps equal)\n\n| step | edit | equal | incremental | full |\n| --- | --- | --- | --- | --- |\n",
+    writeln!(
+        md,
+        "# harness replay — {}\n\ncorpus: {}\n\nverdict: {} ({equal_steps}/{} steps equal)\n\n| step | edit | equal | incremental | full |\n| --- | --- | --- | --- | --- |",
         opts.label,
         opts.corpus_dir.display(),
         if all_equal { "PASS" } else { "FAIL" },
         steps.len(),
-    ));
+    )
+    .expect("string write");
     for step in steps {
-        md.push_str(&format!(
-            "| {} | `{}:{}` | {} | {} | {} |\n",
+        writeln!(
+            md,
+            "| {} | `{}:{}` | {} | {} | {} |",
             step.index,
             step.file,
             step.line,
             if step.equal { "yes" } else { "**no**" },
             step.incremental_count,
             step.full_count,
-        ));
+        )
+        .expect("string write");
     }
     if !all_equal {
         md.push_str("\n## Mismatches\n");
         for step in steps.iter().filter(|s| !s.equal) {
-            md.push_str(&format!(
-                "\n### step {} — {}:{}+{}\n\n- incremental: `{}`\n- full: `{}`\n",
+            writeln!(
+                md,
+                "\n### step {} — {}:{}+{}\n\n- incremental: `{}`\n- full: `{}`",
                 step.index,
                 step.file,
                 step.line,
                 step.length,
-                step.first_diff.as_ref().map_or("<absent>", |(i, _)| i.as_str()),
-                step.first_diff.as_ref().map_or("<absent>", |(_, f)| f.as_str()),
-            ));
+                step.first_diff
+                    .as_ref()
+                    .map_or("<absent>", |(i, _)| i.as_str()),
+                step.first_diff
+                    .as_ref()
+                    .map_or("<absent>", |(_, f)| f.as_str()),
+            )
+            .expect("string write");
         }
     }
     let md_path = dir.join("report.md");
-    std::fs::write(&md_path, md)
-        .map_err(|e| format!("writing {}: {e}", md_path.display()))?;
+    std::fs::write(&md_path, md).map_err(|e| format!("writing {}: {e}", md_path.display()))?;
     Ok(dir)
 }
 
@@ -631,8 +633,7 @@ fn resolve_template(template: &str, dir: &Path) -> (String, Vec<String>) {
     let args: Vec<String> = parts.collect();
     let dir_str = dir.display().to_string();
     let has_placeholder = args.iter().any(|a| a.contains("{dir}"));
-    let mut resolved: Vec<String> =
-        args.iter().map(|a| a.replace("{dir}", &dir_str)).collect();
+    let mut resolved: Vec<String> = args.iter().map(|a| a.replace("{dir}", &dir_str)).collect();
     if !has_placeholder {
         resolved.push(dir_str);
     }
@@ -658,9 +659,8 @@ fn run_steps(
         // the on-disk bytes), then the whole-text didChange.
         if !opened.contains(&edit.file) {
             let path = corpus.join(&edit.file);
-            let text = std::fs::read_to_string(&path).map_err(|e| {
-                format!("step {step_no}: reading {}: {e}", path.display())
-            })?;
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("step {step_no}: reading {}: {e}", path.display()))?;
             version += 1;
             daemon.notify(
                 "textDocument/didOpen",
@@ -688,17 +688,14 @@ fn run_steps(
         texts.insert(edit.file.clone(), new_text);
 
         // Incremental face: the post-edit whole-workspace pull.
-        let incremental = normalize_lsp_workspace(
-            &daemon.call("dartq/analyze", &json!({}))?,
-            corpus,
-        )?;
+        let incremental =
+            normalize_lsp_workspace(&daemon.call("dartq/analyze", &json!({}))?, corpus)?;
 
         // Full-recompute face: the same bytes on the materialized copy,
         // analyzed fresh by the batch driver.
         let copy_file = copy.join(&edit.file);
-        std::fs::write(&copy_file, &texts[&edit.file]).map_err(|e| {
-            format!("step {step_no}: writing {}: {e}", copy_file.display())
-        })?;
+        std::fs::write(&copy_file, &texts[&edit.file])
+            .map_err(|e| format!("step {step_no}: writing {}: {e}", copy_file.display()))?;
         let diags = match batch.probe(copy, OutputFormat::Machine) {
             DartqProbe::Measured(diags) => diags,
             DartqProbe::Panic => {
@@ -749,10 +746,16 @@ pub(crate) fn replay_entry(args: &[String]) -> Result<(String, bool), Outcome> {
     let opts = parse_options(args)?;
     let corpus = canonical_corpus(&opts.corpus_dir)?;
     let edits_text = std::fs::read_to_string(&opts.edits_path).map_err(|e| {
-        Outcome::Error(format!("reading --edits {}: {e}", opts.edits_path.display()))
+        Outcome::Error(format!(
+            "reading --edits {}: {e}",
+            opts.edits_path.display()
+        ))
     })?;
     let edits = replay_edit::parse_edits(&edits_text).map_err(|e| {
-        Outcome::Error(format!("parsing --edits {}: {e}", opts.edits_path.display()))
+        Outcome::Error(format!(
+            "parsing --edits {}: {e}",
+            opts.edits_path.display()
+        ))
     })?;
     if edits.is_empty() {
         return Err(Outcome::Error(format!(
@@ -812,19 +815,23 @@ mod tests {
     fn frames_reject_malformed_input() {
         let mut reader = std::io::Cursor::new(b"Content-Type: text\r\n\r\n{}".to_vec());
         assert!(
-            read_frame(&mut reader).unwrap_err().contains("Content-Length"),
+            read_frame(&mut reader)
+                .unwrap_err()
+                .contains("Content-Length"),
             "a frame without Content-Length must be rejected"
         );
-        let mut reader =
-            std::io::Cursor::new(b"Content-Length: 100\r\n\r\nshort".to_vec());
+        let mut reader = std::io::Cursor::new(b"Content-Length: 100\r\n\r\nshort".to_vec());
         assert!(
-            read_frame(&mut reader).unwrap_err().contains("reading frame body"),
+            read_frame(&mut reader)
+                .unwrap_err()
+                .contains("reading frame body"),
             "a truncated body must be rejected"
         );
-        let mut reader =
-            std::io::Cursor::new(b"Content-Length: nope\r\n\r\n".to_vec());
+        let mut reader = std::io::Cursor::new(b"Content-Length: nope\r\n\r\n".to_vec());
         assert!(
-            read_frame(&mut reader).unwrap_err().contains("invalid Content-Length"),
+            read_frame(&mut reader)
+                .unwrap_err()
+                .contains("invalid Content-Length"),
             "a non-numeric length must be rejected"
         );
     }
@@ -859,8 +866,7 @@ mod tests {
                 {"uri": "file:///elsewhere/pub/cache/x.dart", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "code": "Some_Code", "source": "dartq", "message": "m"},
             ],
         });
-        let diags = normalize_lsp_workspace(&result, Path::new("/corpus"))
-            .expect("normalizes");
+        let diags = normalize_lsp_workspace(&result, Path::new("/corpus")).expect("normalizes");
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].0, "lib/a.dart", "in-corpus path becomes relative");
         assert_eq!(
@@ -907,24 +913,24 @@ mod tests {
     fn first_difference_reports_both_sides_or_none() {
         assert_eq!(first_difference(&["a".into()], &["a".into()]), None);
         assert_eq!(first_difference(&[], &[]), None);
-        let (inc, full) = first_difference(
-            &["a".into(), "b".into()],
-            &["a".into(), "c".into()],
-        )
-        .expect("differs");
+        let (inc, full) = first_difference(&["a".into(), "b".into()], &["a".into(), "c".into()])
+            .expect("differs");
         assert_eq!((inc.as_str(), full.as_str()), ("b", "c"));
-        let (inc, full) =
-            first_difference(&["a".into()], &[]).expect("length divergence");
+        let (inc, full) = first_difference(&["a".into()], &[]).expect("length divergence");
         assert_eq!((inc.as_str(), full.as_str()), ("a", "<absent>"));
     }
 
     #[test]
     fn options_parse_flags_and_defaults() {
         let parsed = parse_options(&[
-            "--corpus-dir".into(), "c".into(),
-            "--edits".into(), "e.jsonl".into(),
-            "--dartq-cmd".into(), "dq analyze".into(),
-            "--daemon-cmd".into(), "dq daemon".into(),
+            "--corpus-dir".into(),
+            "c".into(),
+            "--edits".into(),
+            "e.jsonl".into(),
+            "--dartq-cmd".into(),
+            "dq analyze".into(),
+            "--daemon-cmd".into(),
+            "dq daemon".into(),
         ])
         .expect("parses");
         assert_eq!(parsed.label, "replay-r1", "default label");
