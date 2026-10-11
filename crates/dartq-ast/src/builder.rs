@@ -415,16 +415,15 @@ impl AstBuilder {
             self.mark_error();
             return;
         }
-        let start = match payload_start {
-            Some(start) => start,
-            None => {
-                let start = self.reserve_payload(payload_len(kind) as usize);
-                self.open
-                    .last_mut()
-                    .expect("patch without an open node")
-                    .payload_start = Some(start);
-                start
-            }
+        let start = if let Some(start) = payload_start {
+            start
+        } else {
+            let start = self.reserve_payload(payload_len(kind) as usize);
+            self.open
+                .last_mut()
+                .expect("patch without an open node")
+                .payload_start = Some(start);
+            start
         };
         let slot = start as usize + field;
         let old = self.pool[slot];

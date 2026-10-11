@@ -509,6 +509,7 @@ fn payload_width_lockstep() {
 
 #[test]
 fn leaf_shape_width_lockstep() {
+    use NodeKind::*;
     // Fielded is exactly "has payload words"; TokenLeaf kinds are width 0
     // (their token lives in header.first_token); SpanOnly covers the rest of
     // the width-0 set (#151).
@@ -526,7 +527,6 @@ fn leaf_shape_width_lockstep() {
         }
     }
     // Spot checks across the three shapes.
-    use NodeKind::*;
     assert_eq!(leaf_shape(LiteralInt), LeafShape::TokenLeaf);
     assert_eq!(leaf_shape(ThisExpression), LeafShape::TokenLeaf);
     assert_eq!(leaf_shape(StringLiteral), LeafShape::SpanOnly);
@@ -1057,10 +1057,7 @@ fn begin_adopting_adopts_completed_sibling_subtrees() {
     b.end(NodeKind::BinaryExpression, 5);
     b.end(NodeKind::CompilationUnit, 5);
     let ast = b.finish();
-    let binary = ast
-        .root()
-        .map(|root| root - 1)
-        .expect("non-empty");
+    let binary = ast.root().map(|root| root - 1).expect("non-empty");
     assert_eq!(ast.kind(binary), NodeKind::BinaryExpression);
     // The adopted Block subtree is the leading child; the LiteralInt the
     // second.

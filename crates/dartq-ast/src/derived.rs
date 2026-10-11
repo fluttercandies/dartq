@@ -57,7 +57,7 @@ pub fn first_modifier(ast: &SyntaxTable, id: u32) -> Option<TokenRef> {
 /// (type_info_impl.dart:229-234, 329-334, assert QUESTION then pass),
 /// `ComplexTypeInfo.parseType` (683-691, consume the `?` only when part of
 /// the type; pass it as the final token) — and null otherwise
-/// (type_info_impl.dart:199, 297, 393: extents ending on identifier or `>`).
+/// (`type_info_impl.dart:199`, 297, 393: extents ending on identifier or `>`).
 /// The same holds for the sibling kinds that keep their `?` word:
 /// `endFunctionType` (707-723) and `endRecordType`
 /// (parser_impl.dart:1829-1845). Inner nullability (`List<int?>`) ends the
@@ -96,7 +96,7 @@ pub fn last_token(tokens: &TokenTable, ast: &SyntaxTable, id: u32) -> Option<Tok
 /// where the grammar lets nothing else start the node with that token, which
 /// holds for each row (map §3): e.g. `CatchClause` starts with `on` iff the
 /// `on` form was parsed (`handleCatchBlock(onKeyword, ..)`,
-/// parser_impl.dart:10861).
+/// `parser_impl.dart:10861`).
 #[must_use]
 pub fn head_is(tokens: &TokenTable, ast: &SyntaxTable, id: u32, keyword: Keyword) -> bool {
     token_at(tokens, ast.token_range(id).start) == Some(TokenKind::Keyword(keyword))

@@ -11,8 +11,8 @@
 //! Every node pays only for the payload width its kind declares; words
 //! derivable from the row's own tokens (span head, closing `;`/bracket,
 //! head-when-present keyword, nullable `?`, `ModSet` first token) are not
-//! stored at all — the derived-field accessors recompute them (map §1, #151
-//! + #174). Parents are not stored but derived by a short forward walk.
+//! stored at all — the derived-field accessors recompute them (map §1,
+//! #151 + #174). Parents are not stored but derived by a short forward walk.
 //! Targets pinned by the spec and asserted at compile time and by the corpus
 //! metrics test: 24 B header, ≤30 B average per node, ≤1.5 MB of AST per MB
 //! of source.

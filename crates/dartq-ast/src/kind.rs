@@ -309,7 +309,7 @@ pub(crate) mod flags {
 /// tolerated outlier of the ≤30 B/node average (layout spec §1.5).
 ///
 /// Width 0 by shape: fieldless kinds, the ~64 #151 span-head eliminations
-/// (map §1), and the #174 eliminations `TopLevelFields` (ModSet),
+/// (map §1), and the #174 eliminations `TopLevelFields` (`ModSet`),
 /// `Type` (`?`), `MapPattern`/`ListPattern` (braces), `NativeFunctionBody`
 /// (native + `;`), `ConstantPattern` (`const`).
 ///
@@ -328,16 +328,17 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // arrow/end plus async/star back-filled from AsyncModifierHandle —
         // no derivable word (collapse map §3.9 ExpressionFunctionBodyHandle
         // row and §6 fat-10 table: 4 words).
-        ClassDeclaration
-        | NamedMixinApplication
-        | Method
-        | Constructor
-        | ExpressionBody => 4,
         // ForParts/ForInParts: the `for` token is the span head (map §3.4:
         // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived;
         // lparen/left_sep/right_sep + update_count, and
         // await/lparen/pattern_kw/in, remain (width 5→4).
-        ForParts | ForInParts => 4,
+        ClassDeclaration
+        | NamedMixinApplication
+        | Method
+        | Constructor
+        | ExpressionBody
+        | ForParts
+        | ForInParts => 4,
         MixinDeclaration
         | ExtensionTypeDeclaration
         | EnumDeclaration
@@ -668,8 +669,7 @@ pub(crate) fn accepts_begin(end: NodeKind, open: NodeKind) -> bool {
         | (InvalidAwaitExpression, AwaitExpression | InvalidAwaitExpression)
         | (InvalidYieldStatement, YieldStatement | InvalidYieldStatement)
         // #12/#13: canonical open flipped to the wider RecordLiteral (#151).
-        | (ParenthesizedExpression, RecordLiteral)
-        | (RecordLiteral, RecordLiteral) => true,
+        | (ParenthesizedExpression | RecordLiteral, RecordLiteral) => true,
         (end, open) => end == open,
     }
 }
