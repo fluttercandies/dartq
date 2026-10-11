@@ -148,7 +148,7 @@ struct WrittenName {
 pub struct Combinators {
     clauses: Box<[CombinatorClause]>,
     written: Box<[WrittenName]>,
-    setters: Box<[(StringId, StringId)]>,
+    setters: FxHashMap<StringId, StringId>,
 }
 
 impl Combinators {
@@ -231,7 +231,7 @@ impl Combinators {
         Self {
             clauses: Box::new([]),
             written: Box::new([]),
-            setters: Box::new([]),
+            setters: FxHashMap::default(),
         }
     }
 
@@ -255,18 +255,19 @@ impl Combinators {
                 }
             })
             .collect();
-        let mut setters: Vec<(StringId, StringId)> = Vec::new();
+        let mut setters: FxHashMap<StringId, StringId> = FxHashMap::default();
         for token in &written {
-            if setters.iter().any(|(bare, _)| *bare == token.name) {
-                continue;
+            // Vacant-only intern: duplicate written tokens hash-hit the map
+            // instead of paying another format + intern.
+            if let hash_map::Entry::Vacant(slot) = setters.entry(token.name) {
+                let setter = strings.intern(&format!("{}=", strings.resolve(token.name)));
+                slot.insert(setter);
             }
-            let setter = strings.intern(&format!("{}=", strings.resolve(token.name)));
-            setters.push((token.name, setter));
         }
         Self {
             clauses,
             written,
-            setters: setters.into_boxed_slice(),
+            setters,
         }
     }
 
@@ -281,6 +282,23 @@ impl Combinators {
         self.written
             .iter()
             .map(|token| (token.name, token.hidden, token.span))
+    }
+
+    /// [`Self::written`] with each token's clause index — `(name, hidden,
+    /// span, clause)` per token, in written order, duplicates preserved.
+    /// The facts-snapshot projection face (#719): clause boundaries are
+    /// observable ([`Self::clauses_written`]'s per-clause duplicate-combinator
+    /// seen-set and [`Self::written_shapes_equal`]'s clause identity), and
+    /// adjacent same-kind clauses are indistinguishable on the bare
+    /// [`Self::written`] face, so the snapshot must carry the boundary for a
+    /// warm start to rebuild a `Combinators` that answers those queries
+    /// identically to the cold capture.
+    pub fn written_with_clauses(
+        &self,
+    ) -> impl Iterator<Item = (StringId, bool, SourceRange, u32)> + '_ {
+        self.written
+            .iter()
+            .map(|token| (token.name, token.hidden, token.span, token.clause))
     }
 
     /// The written tokens grouped by clause, in source order — the
@@ -317,10 +335,7 @@ impl Combinators {
     /// setter probe face, so the query pays no string work. `setters`
     /// derives from the written tokens, so every written name is present.
     pub(crate) fn setter_spelling(&self, name: StringId) -> Option<StringId> {
-        self.setters
-            .iter()
-            .find(|(bare, _)| *bare == name)
-            .map(|(_, setter)| *setter)
+        self.setters.get(&name).copied()
     }
 
     /// Whether `name` survives this directive's combinators, applied in
@@ -722,10 +737,13 @@ impl<'t> LibraryGraphBuilder<'t> {
                     FxHashMap::with_capacity_and_hasher(node.classes.len(), FxBuildHasher);
                 for (name, modifiers) in node.classes {
                     classes.entry(name).or_insert(modifiers);
-                    let owners = declarations.entry(name).or_default();
-                    if !owners.contains(&lib) {
-                        owners.push(lib);
-                    }
+                }
+                // The entry insert above collapsed same-library duplicates, so
+                // each (name, lib) pair reaches the inverted index exactly once
+                // — no membership probe — and owners stay in registration
+                // order (nodes are visited in `enumerate` order).
+                for &name in classes.keys() {
+                    declarations.entry(name).or_default().push(lib);
                 }
                 LibraryNode {
                     uri: node.uri,
