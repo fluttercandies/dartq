@@ -74,8 +74,10 @@ impl CheckRun {
 }
 
 /// Runs the M0 pipeline over a discovered file set (see
-/// [`crate::discover::discover`]). A read/decode failure aborts the run —
-/// a partial diagnostic set must never masquerade as a valid result.
+/// [`crate::discover::discover`]). A read failure aborts the run — a partial
+/// diagnostic set must never masquerade as a valid result; an undecodable
+/// file is not a partial result but the oracle's own empty-content face
+/// (see [`read_source`]).
 ///
 /// Duplicate spellings are analyzed once: the discovery set's dedup is
 /// component-wise, so a file whose spellings differ as component vectors (a
@@ -125,8 +127,15 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
 }
 
 /// Canonical absolute path (the oracle prints symlink-resolved paths) plus
-/// strict UTF-8 source. A read/decode failure is an error, never a silently
-/// skipped file — lossy output would be format drift downstream.
+/// the source text. A read failure is an error, never a silently skipped
+/// file.
+///
+/// A UTF-8 decode failure is not an error: the oracle read layer
+/// (analyzer `file_content_cache.dart:44-62`) decodes strictly inside a
+/// catch-all and lands the file as empty content with `exists = false` —
+/// it contributes no diagnostics and the run continues over its siblings.
+/// Lossy decode would scan U+FFFD debris the oracle never sees; aborting
+/// the run would fault a whole corpus on one fixture.
 ///
 /// The dedup key is the canonical path **string** — the oracle's own key
 /// (context_root.dart:119-129 canonicalize), which the differential harness
@@ -142,10 +151,10 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
 ///
 /// # Errors
 ///
-/// Canonicalization, read, or UTF-8 decode failure.
+/// Canonicalization or read failure.
 pub fn read_source(path: &Path) -> io::Result<(PathBuf, String)> {
     let canonical = path.canonicalize()?;
-    let mut source = fs::read_to_string(&canonical)?;
+    let mut source = String::from_utf8(fs::read(&canonical)?).unwrap_or_default();
     if source.starts_with('\u{FEFF}') {
         source.drain(..'\u{FEFF}'.len_utf8());
     }
@@ -742,6 +751,42 @@ mod tests {
         assert!(only.is_empty(), "BOM-only file strips to the empty string");
         let (_, plain) = read_source(&root.join("plain.dart")).expect("read");
         assert_eq!(plain, "var x;");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The oracle read layer over an undecodable file
+    /// (file_content_cache.dart:44-62): strict decode inside a catch-all —
+    /// the file lands as empty content, contributes no diagnostics, and the
+    /// run continues for its siblings. Before the pin, the decode failure
+    /// aborted the whole run (`analyze_files` errored).
+    #[test]
+    fn analyze_files_survives_non_utf8_file() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!("dq_cmd_enc_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("broken.dart"), "void f() { x }\n").expect("write broken");
+        // Deliberate invalid UTF-8 bytes inside a comment — the corpus
+        // fixture blindspot_encoding.dart's shape (0xFF 0xFE).
+        let mut file = fs::File::create(root.join("encoding.dart")).expect("create");
+        file.write_all(b"// invalid: \xff\xfe\nvoid f() {}\n")
+            .expect("write raw bytes");
+        drop(file);
+
+        let (_, source) = read_source(&root.join("encoding.dart")).expect("read");
+        assert!(source.is_empty(), "undecodable file reads as empty content");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        let run = analyze_files(&files).expect("the run completes over the undecodable file");
+        assert_eq!(run.file_count(), 2, "both files analyzed");
+        assert_eq!(
+            run.diagnostics().len(),
+            1,
+            "only broken.dart's syntax row; encoding.dart contributes none: {:?}",
+            run.diagnostics()
+        );
+        assert_eq!(run.diagnostics()[0].code.name, "expected_token");
 
         fs::remove_dir_all(&root).ok();
     }
