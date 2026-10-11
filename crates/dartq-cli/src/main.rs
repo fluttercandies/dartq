@@ -1936,10 +1936,12 @@ mod tests {
         }
     }
 
-    /// End to end over a real temp workspace: the class plus its two bare
-    /// cross-file uses in machine bytes (target file, then offset order), a
-    /// member hit with its container name, the JSON face, the empty-result
-    /// edge (exit 0, no rows), and the usage tier.
+    /// End to end over a real temp workspace: the class plus its cross-file
+    /// uses (two bare, one import-prefixed) in machine bytes (target file,
+    /// then offset order), a member hit with its container name, the JSON
+    /// face (the `qualified` column: omitted on bare rows, `p.Foo` on the
+    /// prefixed row), the empty-result edge (exit 0, no rows), and the
+    /// usage tier.
     #[test]
     fn query_symbol_end_to_end() {
         let root = analyze_fixture(
@@ -1953,13 +1955,19 @@ mod tests {
                     "lib/b.dart",
                     "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  foo();\n}\n",
                 ),
+                (
+                    "lib/c.dart",
+                    "import 'a.dart' as p;\n\nvoid from_c() {\n  p.Foo();\n}\n",
+                ),
             ],
         );
         let a = root.canonicalize().expect("root").join("lib/a.dart");
         let b = root.canonicalize().expect("root").join("lib/b.dart");
+        let c = root.canonicalize().expect("root").join("lib/c.dart");
 
         // `Foo? f` types a reference; `Foo()` is an implicit-creation
-        // invocation; both target a.dart unqualified, use sites in b.dart.
+        // invocation; both target a.dart unqualified, use sites in b.dart;
+        // c.dart's `p.Foo()` arrives through the armed `p` prefix.
         let mut out: Vec<u8> = Vec::new();
         let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out);
         assert_eq!(code, exit::CLEAN);
@@ -1968,12 +1976,15 @@ mod tests {
             format!(
                 "DECL|{}|-|class|Foo|1|7|3\n\
                  REF|{}|reference|false|33|3|{}\n\
-                 REF|{}|invoked|false|42|3|{}\n",
+                 REF|{}|invoked|false|42|3|{}\n\
+                 REF|{}|invoked|true|43|3|{}\n",
                 a.display(),
                 a.display(),
                 b.display(),
                 a.display(),
-                b.display()
+                b.display(),
+                a.display(),
+                c.display()
             )
         );
 
@@ -1999,16 +2010,23 @@ mod tests {
         assert!(json["declarations"][0]["container"].is_null());
         assert_eq!(json["declarations"][0]["line"], 1);
         assert_eq!(json["declarations"][0]["column"], 7);
-        assert_eq!(json["references"].as_array().expect("array").len(), 2);
+        assert_eq!(json["references"].as_array().expect("array").len(), 3);
         assert_eq!(json["references"][0]["kind"], "reference");
         assert_eq!(
             json["references"][0]["target_file"],
             a.display().to_string()
         );
-        assert_eq!(json["references"][0]["qualified"], false);
+        // The qualified-name column rides armed-prefix rows only: bare rows
+        // keep the key omitted (the schema's optional string), the prefixed
+        // `p.Foo()` row carries the exact spelling.
+        assert!(json["references"][0].get("qualified").is_none());
         assert_eq!(json["references"][0]["offset"], 33);
         assert_eq!(json["references"][1]["kind"], "invoked");
         assert_eq!(json["references"][1]["offset"], 42);
+        assert!(json["references"][1].get("qualified").is_none());
+        assert_eq!(json["references"][2]["kind"], "invoked");
+        assert_eq!(json["references"][2]["offset"], 43);
+        assert_eq!(json["references"][2]["qualified"], "p.Foo");
 
         // Zero results: exit 0, machine prints the empty set.
         let mut out: Vec<u8> = Vec::new();

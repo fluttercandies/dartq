@@ -630,6 +630,7 @@ mod tests {
             kind,
             range: SourceRange { offset, length: 3 },
             qualified: false,
+            qualifier: None,
         }
     }
 
