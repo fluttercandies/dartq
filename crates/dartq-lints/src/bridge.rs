@@ -212,11 +212,7 @@ impl AstListener {
 
     /// Parser-side token id → unified-table index (see `base`).
     fn t(&self, id: u32) -> u32 {
-        if id >= self.base {
-            id - 1
-        } else {
-            id
-        }
+        if id >= self.base { id - 1 } else { id }
     }
 
     /// Consumes the listener into the sealed table.
@@ -255,7 +251,6 @@ impl AstListener {
     fn set_mods(&mut self, bits: u16) {
         self.b.set_modifiers(bits);
     }
-
 
     /// Emits the `RecoverDeclarationHeader` sentinel: a zero-width Fielded
     /// node at the current position (a recovery-pass marker, no extent of
@@ -317,7 +312,12 @@ impl ParserListener for AstListener {
         self.begin(NodeKind::LibraryName, token);
     }
 
-    fn end_library_name(&mut self, _library_keyword: TokenSpan, semicolon: TokenSpan, has_name: bool) {
+    fn end_library_name(
+        &mut self,
+        _library_keyword: TokenSpan,
+        semicolon: TokenSpan,
+        has_name: bool,
+    ) {
         self.b.patch(0, u32::from(has_name));
         self.end_incl(NodeKind::LibraryName, semicolon);
     }
@@ -369,7 +369,8 @@ impl ParserListener for AstListener {
             Some(semicolon) => {
                 self.b.begin(NodeKind::RecoverImport, self.t(semicolon.id));
                 self.b.patch(0, self.t(semicolon.id));
-                self.b.end(NodeKind::RecoverImport, self.t(semicolon.id) + 1);
+                self.b
+                    .end(NodeKind::RecoverImport, self.t(semicolon.id) + 1);
             }
             None => {
                 let anchor = self.b.last_end_token().expect("recover import anchor");
@@ -415,8 +416,11 @@ impl ParserListener for AstListener {
     fn handle_dotted_name(&mut self, count: usize, first_identifier: TokenSpan) {
         // The chain's Identifiers completed before the event (children of the
         // enclosing directive); adopt them (collapse map §3.1 DottedName row).
-        self.b
-            .begin_adopting(NodeKind::DottedName, self.t(first_identifier.id), count as u32);
+        self.b.begin_adopting(
+            NodeKind::DottedName,
+            self.t(first_identifier.id),
+            count as u32,
+        );
         self.end_last(NodeKind::DottedName);
     }
 
@@ -513,8 +517,12 @@ impl ParserListener for AstListener {
         // `Type` is width-0 (the `?` derives from the span tail, #174); the
         // extent includes the question mark when present.
         match question {
-            Some(q) => self.b.leaf_span(NodeKind::Type, self.t(name.id), self.t(q.id) + 1),
-            None => self.b.leaf_span(NodeKind::Type, self.t(name.id), self.t(name.id) + 1),
+            Some(q) => self
+                .b
+                .leaf_span(NodeKind::Type, self.t(name.id), self.t(q.id) + 1),
+            None => self
+                .b
+                .leaf_span(NodeKind::Type, self.t(name.id), self.t(name.id) + 1),
         }
     }
 
@@ -600,8 +608,10 @@ impl ParserListener for AstListener {
     }
 
     fn begin_record_type_entry(&mut self) {
-        self.b
-            .begin(NodeKind::RecordTypeEntry, self.b.last_end_token().unwrap_or(0));
+        self.b.begin(
+            NodeKind::RecordTypeEntry,
+            self.b.last_end_token().unwrap_or(0),
+        );
     }
 
     fn end_record_type_entry(&mut self) {
@@ -640,11 +650,18 @@ impl ParserListener for AstListener {
         // recovery channel (collapse map §3.8 D3).
     }
 
-    fn handle_experiment_not_enabled(&mut self, flag: ExperimentalFlag, begin: TokenSpan, end: TokenSpan) {
+    fn handle_experiment_not_enabled(
+        &mut self,
+        flag: ExperimentalFlag,
+        begin: TokenSpan,
+        end: TokenSpan,
+    ) {
         let _ = end;
-        self.b.begin(NodeKind::ExperimentNotEnabled, self.t(begin.id));
+        self.b
+            .begin(NodeKind::ExperimentNotEnabled, self.t(begin.id));
         self.b.patch(0, flag as u32);
-        self.b.end(NodeKind::ExperimentNotEnabled, self.t(begin.id) + 1);
+        self.b
+            .end(NodeKind::ExperimentNotEnabled, self.t(begin.id) + 1);
     }
 
     // —— declarations (top-level dispatch, #18) ——————————————————————————
@@ -659,8 +676,11 @@ impl ParserListener for AstListener {
     }
 
     fn handle_invalid_top_level_declaration(&mut self, end: TokenSpan) {
-        self.b
-            .leaf_span(NodeKind::InvalidTopLevelDeclaration, self.t(end.id), self.t(end.id) + 1);
+        self.b.leaf_span(
+            NodeKind::InvalidTopLevelDeclaration,
+            self.t(end.id),
+            self.t(end.id) + 1,
+        );
     }
 
     fn begin_uncategorized_top_level_declaration(&mut self, token: TokenSpan) {
@@ -754,7 +774,8 @@ impl ParserListener for AstListener {
     }
 
     fn handle_invalid_member(&mut self, end: TokenSpan) {
-        self.b.leaf_span(NodeKind::InvalidMember, self.t(end.id), self.t(end.id) + 1);
+        self.b
+            .leaf_span(NodeKind::InvalidMember, self.t(end.id), self.t(end.id) + 1);
     }
 
     fn begin_fields(
@@ -917,7 +938,13 @@ impl ParserListener for AstListener {
         self.b.patch(0, kind as u32);
     }
 
-    fn end_factory(&mut self, _kind: DeclarationKind, _begin: TokenSpan, factory: TokenSpan, end: TokenSpan) {
+    fn end_factory(
+        &mut self,
+        _kind: DeclarationKind,
+        _begin: TokenSpan,
+        factory: TokenSpan,
+        end: TokenSpan,
+    ) {
         self.b.patch(1, self.t(factory.id));
         self.end_incl(NodeKind::Factory, end);
     }
@@ -995,7 +1022,12 @@ impl ParserListener for AstListener {
         self.b.leaf(NodeKind::EmptyBody, self.t(token.id));
     }
 
-    fn handle_function_body_skipped(&mut self, begin: TokenSpan, end: TokenSpan, is_expression_body: bool) {
+    fn handle_function_body_skipped(
+        &mut self,
+        begin: TokenSpan,
+        end: TokenSpan,
+        is_expression_body: bool,
+    ) {
         self.b.begin(NodeKind::SkippedBody, self.t(begin.id));
         self.b.patch(0, u32::from(is_expression_body));
         self.b.end(NodeKind::SkippedBody, self.t(end.id) + 1);
@@ -1031,15 +1063,27 @@ impl ParserListener for AstListener {
         // Childless Handle; the name string completed before the event
         // (preceding sibling), the span covers it.
         let end = self.b.last_end_token().unwrap_or(self.t(native.id) + 1);
-        self.b.leaf_span(NodeKind::NativeClause, self.t(native.id), end.max(self.t(native.id) + 1));
+        self.b.leaf_span(
+            NodeKind::NativeClause,
+            self.t(native.id),
+            end.max(self.t(native.id) + 1),
+        );
     }
 
     fn handle_native_function_body_skipped(&mut self, native: TokenSpan, semicolon: TokenSpan) {
-        self.b.leaf_span(NodeKind::NativeFunctionBody, self.t(native.id), self.t(semicolon.id) + 1);
+        self.b.leaf_span(
+            NodeKind::NativeFunctionBody,
+            self.t(native.id),
+            self.t(semicolon.id) + 1,
+        );
     }
 
     fn handle_native_function_body_ignored(&mut self, native: TokenSpan, next: TokenSpan) {
-        self.b.leaf_span(NodeKind::NativeFunctionBody, self.t(native.id), self.t(next.id));
+        self.b.leaf_span(
+            NodeKind::NativeFunctionBody,
+            self.t(native.id),
+            self.t(next.id),
+        );
     }
 
     // —— declaration headers —————————————————————————————————————————————
@@ -1091,7 +1135,12 @@ impl ParserListener for AstListener {
         }
     }
 
-    fn handle_class_header(&mut self, _begin: TokenSpan, class: TokenSpan, _native: Option<TokenSpan>) {
+    fn handle_class_header(
+        &mut self,
+        _begin: TokenSpan,
+        class: TokenSpan,
+        _native: Option<TokenSpan>,
+    ) {
         // Word 0 of `ClassDeclaration` is the `class` keyword (the native
         // clause rides its own event).
         if self.class_decl == ClassDecl::Class {
@@ -1347,7 +1396,8 @@ impl ParserListener for AstListener {
         self.b.patch(0, self.t(begin.id));
         self.patch_token(1, augment);
         let end = self.b.last_end_token().unwrap_or(self.t(begin.id) + 1);
-        self.b.end(NodeKind::EnumElement, end.max(self.t(begin.id) + 1));
+        self.b
+            .end(NodeKind::EnumElement, end.max(self.t(begin.id) + 1));
     }
 
     fn handle_no_enum_body(&mut self, _semicolon: TokenSpan) {
@@ -1483,9 +1533,11 @@ impl ParserListener for AstListener {
         token: TokenSpan,
         const_keyword: Option<TokenSpan>,
     ) {
-        self.b.begin(NodeKind::NoPrimaryConstructor, self.t(token.id));
+        self.b
+            .begin(NodeKind::NoPrimaryConstructor, self.t(token.id));
         self.patch_token(0, const_keyword);
-        self.b.end(NodeKind::NoPrimaryConstructor, self.t(token.id) + 1);
+        self.b
+            .end(NodeKind::NoPrimaryConstructor, self.t(token.id) + 1);
     }
 
     // —— formal parameters ——————————————————————————————————————————————
@@ -1543,7 +1595,11 @@ impl ParserListener for AstListener {
         self.begin(NodeKind::FunctionTypedFormalParameter, token);
     }
 
-    fn end_function_typed_formal_parameter(&mut self, _token: TokenSpan, question: Option<TokenSpan>) {
+    fn end_function_typed_formal_parameter(
+        &mut self,
+        _token: TokenSpan,
+        question: Option<TokenSpan>,
+    ) {
         self.patch_token(0, question);
         self.end_last(NodeKind::FunctionTypedFormalParameter);
     }
@@ -1596,11 +1652,7 @@ impl ParserListener for AstListener {
         // =init None derivable (D1).
     }
 
-    fn handle_no_formal_parameters(
-        &mut self,
-        token: TokenSpan,
-        _kind: dartq_parser::MemberKind,
-    ) {
+    fn handle_no_formal_parameters(&mut self, token: TokenSpan, _kind: dartq_parser::MemberKind) {
         self.b.leaf(NodeKind::NoFormalParameters, self.t(token.id));
     }
 
@@ -1609,14 +1661,24 @@ impl ParserListener for AstListener {
         self.begin(NodeKind::Block, token);
     }
 
-    fn end_block(&mut self, _count: usize, _begin: TokenSpan, end: TokenSpan, _kind: dartq_parser::BlockKind) {
+    fn end_block(
+        &mut self,
+        _count: usize,
+        _begin: TokenSpan,
+        end: TokenSpan,
+        _kind: dartq_parser::BlockKind,
+    ) {
         // The `}` was consumed by the parser before the event — inclusive.
         self.end_incl(NodeKind::Block, end);
     }
 
     fn handle_expression_statement(&mut self, begin: TokenSpan, end: TokenSpan) {
         // Span-only leaf covering the statement through its `;`.
-        self.b.leaf_span(NodeKind::ExpressionStatement, self.t(begin.id), self.t(end.id) + 1);
+        self.b.leaf_span(
+            NodeKind::ExpressionStatement,
+            self.t(begin.id),
+            self.t(end.id) + 1,
+        );
     }
 
     fn handle_empty_statement(&mut self, token: TokenSpan) {
@@ -1624,8 +1686,11 @@ impl ParserListener for AstListener {
     }
 
     fn handle_invalid_statement(&mut self, begin: TokenSpan) {
-        self.b
-            .leaf_span(NodeKind::InvalidStatement, self.t(begin.id), self.t(begin.id) + 1);
+        self.b.leaf_span(
+            NodeKind::InvalidStatement,
+            self.t(begin.id),
+            self.t(begin.id) + 1,
+        );
     }
 
     fn begin_if_statement(&mut self, token: TokenSpan) {
@@ -1668,7 +1733,11 @@ impl ParserListener for AstListener {
         // ForIn vs ForParts is pinned by the parts variant itself (D1).
     }
 
-    fn handle_for_initializer_local_variable_declaration(&mut self, _token: TokenSpan, _for_in: bool) {
+    fn handle_for_initializer_local_variable_declaration(
+        &mut self,
+        _token: TokenSpan,
+        _for_in: bool,
+    ) {
         // See handle_for_initializer_expression_statement (D1).
     }
 
@@ -1707,8 +1776,12 @@ impl ParserListener for AstListener {
         self.b.patch(2, self.t(right_separator.id));
         self.b
             .patch(3, expression_count.min(u32::MAX as usize) as u32);
-        let end = self.b.last_end_token().unwrap_or(self.t(right_separator.id) + 1);
-        self.b.end(NodeKind::ForParts, end.max(self.t(right_separator.id) + 1));
+        let end = self
+            .b
+            .last_end_token()
+            .unwrap_or(self.t(right_separator.id) + 1);
+        self.b
+            .end(NodeKind::ForParts, end.max(self.t(right_separator.id) + 1));
     }
 
     fn begin_for_in_body(&mut self, _token: TokenSpan) {
@@ -1741,7 +1814,8 @@ impl ParserListener for AstListener {
         self.patch_token(2, pattern_keyword);
         self.b.patch(3, self.t(in_kw.id));
         let end = self.b.last_end_token().unwrap_or(self.t(in_kw.id) + 1);
-        self.b.end(NodeKind::ForInParts, end.max(self.t(in_kw.id) + 1));
+        self.b
+            .end(NodeKind::ForInParts, end.max(self.t(in_kw.id) + 1));
     }
 
     fn begin_for_in_expression(&mut self, _token: TokenSpan) {
@@ -1803,7 +1877,12 @@ impl ParserListener for AstListener {
         self.end_incl(NodeKind::YieldStatement, end);
     }
 
-    fn end_invalid_yield_statement(&mut self, _begin: TokenSpan, star: Option<TokenSpan>, end: TokenSpan) {
+    fn end_invalid_yield_statement(
+        &mut self,
+        _begin: TokenSpan,
+        star: Option<TokenSpan>,
+        end: TokenSpan,
+    ) {
         // The error code is resolution-domain, not an AST fact (§2 #11).
         self.patch_token(0, star);
         self.end_incl(NodeKind::InvalidYieldStatement, end);
@@ -1839,7 +1918,12 @@ impl ParserListener for AstListener {
         self.begin(NodeKind::FunctionName, token);
     }
 
-    fn end_function_name(&mut self, _begin: TokenSpan, name_end: TokenSpan, is_function_expression: bool) {
+    fn end_function_name(
+        &mut self,
+        _begin: TokenSpan,
+        name_end: TokenSpan,
+        is_function_expression: bool,
+    ) {
         self.b.patch(0, u32::from(is_function_expression));
         // `name_end` is the token after the name (peek) — exclusive.
         self.end_at(NodeKind::FunctionName, self.t(name_end.id));
@@ -1972,8 +2056,11 @@ impl ParserListener for AstListener {
         _expression_count: usize,
         token: TokenSpan,
     ) {
-        self.b
-            .begin_with_first_child(NodeKind::SwitchCase, self.t(token.id), self.switch_material_start);
+        self.b.begin_with_first_child(
+            NodeKind::SwitchCase,
+            self.t(token.id),
+            self.switch_material_start,
+        );
     }
 
     fn end_switch_case(
@@ -2015,7 +2102,12 @@ impl ParserListener for AstListener {
         self.b.end(NodeKind::Break, self.t(break_kw.id) + 1);
     }
 
-    fn handle_continue_statement(&mut self, has_target: bool, continue_kw: TokenSpan, end: TokenSpan) {
+    fn handle_continue_statement(
+        &mut self,
+        has_target: bool,
+        continue_kw: TokenSpan,
+        end: TokenSpan,
+    ) {
         let _ = end;
         self.b.begin(NodeKind::Continue, self.t(continue_kw.id));
         self.b.patch(0, u32::from(has_target));
@@ -2064,7 +2156,8 @@ impl ParserListener for AstListener {
     ) {
         // The condition/pattern completed before the event; adopt it as the
         // only child (`ParenthesizedCondition` delimits the condition segment).
-        self.b.begin_adopting(NodeKind::ParenthesizedCondition, self.t(begin.id), 1);
+        self.b
+            .begin_adopting(NodeKind::ParenthesizedCondition, self.t(begin.id), 1);
         self.patch_token(0, case_kw);
         self.patch_token(1, when);
         self.end_last(NodeKind::ParenthesizedCondition);
@@ -2084,9 +2177,11 @@ impl ParserListener for AstListener {
         equals: TokenSpan,
         semicolon: TokenSpan,
     ) {
-        self.b.begin(NodeKind::PatternVarDeclStatement, self.t(keyword.id));
+        self.b
+            .begin(NodeKind::PatternVarDeclStatement, self.t(keyword.id));
         self.b.patch(0, self.t(equals.id));
-        self.b.end(NodeKind::PatternVarDeclStatement, self.t(semicolon.id) + 1);
+        self.b
+            .end(NodeKind::PatternVarDeclStatement, self.t(semicolon.id) + 1);
     }
 
     // —— expressions ————————————————————————————————————————————————————
@@ -2178,7 +2273,8 @@ impl ParserListener for AstListener {
         // head token.
         let first = self.b.last_first_token().expect("binary left operand");
         let start = self.b.last_subtree_start().expect("binary left operand");
-        self.b.begin_with_first_child(NodeKind::BinaryExpression, first, start);
+        self.b
+            .begin_with_first_child(NodeKind::BinaryExpression, first, start);
     }
 
     fn end_binary_expression(&mut self, operator: TokenSpan, end: TokenSpan) {
@@ -2268,7 +2364,12 @@ impl ParserListener for AstListener {
         self.end_incl(NodeKind::ParenthesizedExpression, end);
     }
 
-    fn end_record_literal(&mut self, end: TokenSpan, _count: usize, const_keyword: Option<TokenSpan>) {
+    fn end_record_literal(
+        &mut self,
+        end: TokenSpan,
+        _count: usize,
+        const_keyword: Option<TokenSpan>,
+    ) {
         self.patch_token(0, const_keyword);
         self.end_incl(NodeKind::RecordLiteral, end);
     }
@@ -2317,12 +2418,19 @@ impl ParserListener for AstListener {
     }
 
     fn handle_send(&mut self, begin: TokenSpan, end: TokenSpan) {
-        self.b.leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
+        self.b
+            .leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
     }
 
-    fn handle_send_without_arguments(&mut self, begin: TokenSpan, end: TokenSpan, _next: TokenSpan) {
+    fn handle_send_without_arguments(
+        &mut self,
+        begin: TokenSpan,
+        end: TokenSpan,
+        _next: TokenSpan,
+    ) {
         // Merged into `Send` (argument presence reads from the children).
-        self.b.leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
+        self.b
+            .leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
     }
 
     fn handle_dot_access(&mut self, token: TokenSpan, end: TokenSpan, is_null_aware: bool) {
@@ -2356,7 +2464,8 @@ impl ParserListener for AstListener {
         &mut self,
         token: TokenSpan,
     ) {
-        self.b.leaf(NodeKind::NoCtorRefContinuation, self.t(token.id));
+        self.b
+            .leaf(NodeKind::NoCtorRefContinuation, self.t(token.id));
     }
 
     fn end_constructor_reference(
@@ -2396,7 +2505,8 @@ impl ParserListener for AstListener {
         // Both operands completed before the event (operands×2).
         let first = self.b.last_first_token().expect("assignment lhs");
         let start = self.b.last_subtree_start().expect("assignment lhs");
-        self.b.begin_with_first_child(NodeKind::Assignment, first, start);
+        self.b
+            .begin_with_first_child(NodeKind::Assignment, first, start);
         self.b.patch(0, self.t(operator.id));
         self.b.end(NodeKind::Assignment, self.t(end.id) + 1);
     }
@@ -2501,16 +2611,21 @@ impl ParserListener for AstListener {
     }
 
     fn handle_invalid_type_arguments(&mut self, token: TokenSpan) {
-        self.b.leaf(NodeKind::InvalidTypeArguments, self.t(token.id));
+        self.b
+            .leaf(NodeKind::InvalidTypeArguments, self.t(token.id));
     }
 
     fn handle_pattern_assignment(&mut self, equals: TokenSpan) {
         // Childless Handle over the `=` (the pattern precedes, the assigned
         // expression follows as siblings).
-        let first = self.b.last_first_token().expect("pattern assignment anchor");
+        let first = self
+            .b
+            .last_first_token()
+            .expect("pattern assignment anchor");
         self.b.begin(NodeKind::PatternAssignment, first);
         self.b.patch(0, self.t(equals.id));
-        self.b.end(NodeKind::PatternAssignment, self.t(equals.id) + 1);
+        self.b
+            .end(NodeKind::PatternAssignment, self.t(equals.id) + 1);
     }
 
     fn begin_is_operator_type(&mut self, operator: TokenSpan) {
@@ -2554,7 +2669,8 @@ impl ParserListener for AstListener {
         let first = self.b.last_first_token().expect("type application anchor");
         self.b.begin(NodeKind::TypeApplication, first);
         self.b.patch(0, self.t(open_angle.id));
-        self.b.end(NodeKind::TypeApplication, self.t(open_angle.id) + 1);
+        self.b
+            .end(NodeKind::TypeApplication, self.t(open_angle.id) + 1);
     }
 
     // —— patterns ——————————————————————————————————————————————————————
@@ -2579,8 +2695,12 @@ impl ParserListener for AstListener {
         let head = pending.or(const_keyword.map(|t| self.t(t.id)));
         match head {
             Some(head) => {
-                let start = self.b.last_subtree_start().expect("constant pattern operand");
-                self.b.begin_with_first_child(NodeKind::ConstantPattern, head, start);
+                let start = self
+                    .b
+                    .last_subtree_start()
+                    .expect("constant pattern operand");
+                self.b
+                    .begin_with_first_child(NodeKind::ConstantPattern, head, start);
             }
             None => {
                 let first = self.b.last_first_token().expect("constant pattern operand");
@@ -2592,7 +2712,10 @@ impl ParserListener for AstListener {
 
     fn handle_relational_pattern(&mut self, operator: TokenSpan) {
         // Fires after the operand parsed (childless Handle; `op` word).
-        let first = self.b.last_first_token().expect("relational pattern anchor");
+        let first = self
+            .b
+            .last_first_token()
+            .expect("relational pattern anchor");
         self.b.begin(NodeKind::RelationalPattern, first);
         self.b.patch(0, self.t(operator.id));
         self.end_last(NodeKind::RelationalPattern);
@@ -2617,7 +2740,8 @@ impl ParserListener for AstListener {
         // The left operand completed before the event (operands×2).
         let first = self.b.last_first_token().expect("binary pattern lhs");
         let start = self.b.last_subtree_start().expect("binary pattern lhs");
-        self.b.begin_with_first_child(NodeKind::BinaryPattern, first, start);
+        self.b
+            .begin_with_first_child(NodeKind::BinaryPattern, first, start);
     }
 
     fn end_binary_pattern(&mut self, operator: TokenSpan) {
@@ -2628,11 +2752,13 @@ impl ParserListener for AstListener {
     fn handle_list_pattern(&mut self, _count: usize, left: TokenSpan, right: TokenSpan) {
         // Brackets are the span endpoints (#174); elements are preceding
         // siblings (childless Handle).
-        self.b.leaf_span(NodeKind::ListPattern, self.t(left.id), self.t(right.id) + 1);
+        self.b
+            .leaf_span(NodeKind::ListPattern, self.t(left.id), self.t(right.id) + 1);
     }
 
     fn handle_map_pattern(&mut self, _count: usize, left: TokenSpan, right: TokenSpan) {
-        self.b.leaf_span(NodeKind::MapPattern, self.t(left.id), self.t(right.id) + 1);
+        self.b
+            .leaf_span(NodeKind::MapPattern, self.t(left.id), self.t(right.id) + 1);
     }
 
     fn handle_map_pattern_entry(&mut self, colon: TokenSpan, end: TokenSpan) {
@@ -2708,11 +2834,13 @@ impl ParserListener for AstListener {
         let head = keyword.unwrap_or(wildcard);
         self.b.begin(NodeKind::WildcardPattern, self.t(head.id));
         self.b.patch(0, self.t(wildcard.id));
-        self.b.end(NodeKind::WildcardPattern, self.t(wildcard.id) + 1);
+        self.b
+            .end(NodeKind::WildcardPattern, self.t(wildcard.id) + 1);
     }
 
     fn handle_assigned_variable_pattern(&mut self, variable: TokenSpan) {
-        self.b.leaf(NodeKind::AssignedVariablePattern, self.t(variable.id));
+        self.b
+            .leaf(NodeKind::AssignedVariablePattern, self.t(variable.id));
     }
 
     fn handle_declared_variable_pattern(
@@ -2722,9 +2850,11 @@ impl ParserListener for AstListener {
         _in_assignment_pattern: bool,
     ) {
         let head = keyword.unwrap_or(variable);
-        self.b.begin(NodeKind::DeclaredVariablePattern, self.t(head.id));
+        self.b
+            .begin(NodeKind::DeclaredVariablePattern, self.t(head.id));
         self.b.patch(0, self.t(variable.id));
-        self.b.end(NodeKind::DeclaredVariablePattern, self.t(variable.id) + 1);
+        self.b
+            .end(NodeKind::DeclaredVariablePattern, self.t(variable.id) + 1);
     }
 
     // —— collection control-flow elements ————————————————————————————————
@@ -2816,7 +2946,12 @@ impl ParserListener for AstListener {
     }
 
     // —— recovery ——————————————————————————————————————————————————————
-    fn handle_recoverable_error(&mut self, _message: dartq_parser::Message, start: TokenSpan, _end: TokenSpan) {
+    fn handle_recoverable_error(
+        &mut self,
+        _message: dartq_parser::Message,
+        start: TokenSpan,
+        _end: TokenSpan,
+    ) {
         // Diagnostics flow through the parser's own channel; the bridge
         // emits the official `RecoverableError` sentinel node and marks the
         // error bit on the enclosing nodes (collapse map §3.9 — the
@@ -2825,8 +2960,6 @@ impl ParserListener for AstListener {
         self.b.mark_error();
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -2887,7 +3020,10 @@ mod tests {
             ("class C { }\n", "empty class"),
             ("class C { void m() { } }\n", "class+method"),
             ("var g = () {};\n", "fn literal"),
-            ("void f() { List<List<int>> x = const []; }\n", "generic local"),
+            (
+                "void f() { List<List<int>> x = const []; }\n",
+                "generic local",
+            ),
             ("void f() { print(1); }\n", "send"),
         ] {
             let parsed = parse_unit(source, Features::default());
@@ -2905,7 +3041,10 @@ mod tests {
         // face must read pattern variables through it.
         let source = "void f(Object o) {\n  if (o case Rect(w: var BadName)) print(1);\n}\n";
         let kinds: Vec<NodeKind> = walk(source).into_iter().map(|(kind, _)| kind).collect();
-        assert!(kinds.contains(&NodeKind::ObjectPattern), "object pattern produced");
+        assert!(
+            kinds.contains(&NodeKind::ObjectPattern),
+            "object pattern produced"
+        );
         assert!(kinds.contains(&NodeKind::PatternField), "field produced");
         let hits = hits(source, "non_constant_identifier_names");
         assert_eq!(hits.len(), 1, "pattern variable name checked");
@@ -2949,10 +3088,13 @@ mod tests {
             NodeKind::ClassDeclaration,
             NodeKind::DeclarationBody,
             NodeKind::Method,
-            NodeKind::BlockBody, // the method's `{ ... }` body
+            NodeKind::BlockBody,  // the method's `{ ... }` body
             NodeKind::Identifier, // the method name and more
         ] {
-            assert!(kinds.contains(&expected), "{expected:?} missing from the walk");
+            assert!(
+                kinds.contains(&expected),
+                "{expected:?} missing from the walk"
+            );
         }
         // `empty_catches` stays quiet on catch-free code (smoke over the
         // statement layer through the same tree).

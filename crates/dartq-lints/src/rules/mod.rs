@@ -61,6 +61,17 @@ pub(crate) fn last_child(c: &Check<'_>, id: u32) -> Option<u32> {
     (window.start < window.end).then(|| window.end - 1)
 }
 
+/// The rows whose parent pointer is `owner` — the full child set when the
+/// container's completion window opens after earlier members filled (the
+/// production `DeclarationBody` begins at the first non-field member, so a
+/// leading field's rows predate its window and the parent pointer is the
+/// only link back).
+pub(crate) fn rows_with_parent(c: &Check<'_>, owner: u32) -> Vec<u32> {
+    (0..c.unit.ast.len() as u32)
+        .filter(|&row| c.unit.ast.parent(row) == Some(owner))
+        .collect()
+}
+
 /// The name-bearing direct child (Identifier or OperatorName) of a member
 /// declaration node — operators name through [`NodeKind::OperatorName`],
 /// everything else through an `Identifier` (collapse map §3.3/§3.5).
@@ -69,6 +80,42 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
         .iter()
         .copied()
         .find(|&child| matches!(c.kind(child), NodeKind::Identifier | NodeKind::OperatorName))
+}
+
+/// The name token of an [`NodeKind::InitializedIdentifier`] row: the
+/// production row is width-0 at the name (bridge.rs
+/// `begin_initialized_identifier` begins at the name — the name is the span
+/// head), so the token itself answers; hand-built tables nest an
+/// `Identifier` row and keep the same span head. `None` when the head is
+/// not an identifier (recovery shapes).
+pub(crate) fn initialized_identifier_name(c: &Check<'_>, var: u32) -> Option<u32> {
+    let head = c.head_token(var);
+    let token = c.unit.tokens.get(head as usize)?;
+    (token.kind == dartq_scanner::TokenKind::Identifier).then_some(head)
+}
+
+/// The `var`/`final`/`const` keyword of a [`NodeKind::VariablesDeclaration`]
+/// row. Real parses store only `late` in payload word 0 — the bridge drops
+/// `varFinalOrConst` and the row's span starts at the name — so on the real
+/// face the keyword precedes the type spelling and is recovered with a
+/// bounded backward token walk stopped by statement boundaries; hand-built
+/// tables may carry the keyword itself in word 0.
+pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u32> {
+    let stored = c.payload(row).first().copied().unwrap_or(NONE_TOKEN);
+    if stored != NONE_TOKEN && matches!(c.lexeme(stored), "var" | "final" | "const") {
+        return Some(stored);
+    }
+    let mut token = c.head_token(row);
+    for _ in 0..256 {
+        token = token.checked_sub(1)?;
+        match c.lexeme(token) {
+            "var" | "final" | "const" => return Some(token),
+            // `late` belongs to the same declaration's modifiers.
+            ";" | "{" | "}" => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The type node directly before the name among the declaration's direct

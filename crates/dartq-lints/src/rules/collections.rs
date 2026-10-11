@@ -47,28 +47,48 @@ fn invocation_parts(c: &Check<'_>, kids: &[u32], pos: usize) -> Option<(u32, u32
 /// marker; later sections follow it (or a DotAccess-led index section with
 /// no marker at all, which is never a send-led first section).
 fn is_first_section(c: &Check<'_>, kids: &[u32], pos: usize) -> bool {
-    match kids.iter().position(|&kid| c.kind(kid) == NodeKind::CascadeAccess) {
+    match kids
+        .iter()
+        .position(|&kid| c.kind(kid) == NodeKind::CascadeAccess)
+    {
         Some(marker) => pos < marker,
         None => false,
     }
 }
 
-/// The syntactic const-context approximation (the official
-/// `target.inConstantContext` is constant-evaluated): an explicit `const`
-/// wrapper or a `const` variable declaration on the ancestor path.
+/// The official const-context walk (`constantContext`, analyzer
+/// `ast.dart:17859`): climb the parent chain — a `VariableDeclarationList`
+/// with the `const` keyword decides, const-carrying literal/creation rows
+/// decide, plain expression parents pass through, anything else stops. The
+/// production tiling relocates declaration rows past the statement
+/// container (a cascade initializer's pieces tile at the container and the
+/// declaration leaks beside them), so an exhausted path falls back to the
+/// container's sibling declaration whose span contains the expression.
 fn in_const_context(c: &Check<'_>, above: usize) -> bool {
-    (0..above).any(|depth| match c.ancestor(depth) {
-        Some(a) => match c.kind(a) {
-            NodeKind::ConstExpression | NodeKind::ConstLiteral => true,
-            NodeKind::VariablesDeclaration => c
-                .payload(a)
-                .first()
-                .copied()
-                .is_some_and(|kw| kw != crate::rules::NONE_TOKEN && c.lexeme(kw) == "const"),
-            _ => false,
-        },
-        None => false,
-    })
+    let send_span = c.byte_span(c.node());
+    let const_kw = |row: u32| {
+        crate::rules::variables_declaration_keyword(c, row)
+            .is_some_and(|kw| c.lexeme(kw) == "const")
+    };
+    for depth in 0..above {
+        match c.ancestor(depth) {
+            Some(ancestor) => match c.kind(ancestor) {
+                NodeKind::ConstExpression | NodeKind::ConstLiteral => return true,
+                NodeKind::VariablesDeclaration => return const_kw(ancestor),
+                NodeKind::BlockBody | NodeKind::Block => {
+                    return c.collect_direct(ancestor).into_iter().any(|row| {
+                        c.kind(row) == NodeKind::VariablesDeclaration && const_kw(row) && {
+                            let span = c.byte_span(row);
+                            span.start <= send_span.start && send_span.end <= span.end
+                        }
+                    });
+                }
+                _ => {}
+            },
+            None => return false,
+        }
+    }
+    false
 }
 
 /// The shared gate: a first cascaded `add`/`addAll` section with one
@@ -96,13 +116,24 @@ fn cascaded_add(c: &Check<'_>, name: &str) -> Option<(u32, u32)> {
         return None;
     }
     // Exactly one argument (:28-29).
-    (slice::arguments(c, &c.collect_direct(args)).len() == 1).then_some((method, args))
+    let count = slice::arguments(c, &c.collect_direct(args)).len();
+    if count != 1 {
+        return None;
+    }
+    Some((method, args))
 }
 
-/// Whether the first argument is a list literal: a leading type-argument
-/// piece may tile beside the literal, and a named argument is a
-/// `NamedExpression` — never a literal (the official
-/// `arguments.first is! ListLiteral`).
+/// Whether the first argument is a list literal: the argument's subtree
+/// root trails its piece group's leaked interior rows (separator-less
+/// argument lists; completion order puts every strict container after the
+/// rows it contains), with a leading type-argument wrapper possibly before
+/// them — the root is the OUTERMOST run piece whose span contains the head
+/// piece's span, i.e. the last match in completion order (a reverse walk):
+/// an inner match would be an interior wrapper (`(…)` around the literal,
+/// an index access on the literal's element), not the argument itself. The
+/// head piece matches only itself, so an empty walk falls back to it
+/// (root-leading tiling). A named argument is a `NamedExpression` — never
+/// a literal (the official `arguments.first is! ListLiteral`).
 fn first_argument_list_literal(c: &Check<'_>, args: u32) -> bool {
     let pieces = c.collect_direct(args);
     let groups = slice::arguments(c, &pieces);
@@ -110,18 +141,31 @@ fn first_argument_list_literal(c: &Check<'_>, args: u32) -> bool {
         return false;
     };
     let group = &pieces[first.clone()];
-    match group {
-        [only] => c.kind(*only) == NodeKind::ListLiteral,
-        [tyargs, only]
+    let rest = match group {
+        [tyargs, rest @ ..]
             if matches!(
                 c.kind(*tyargs),
                 NodeKind::NoTypeArguments | NodeKind::TypeArguments
             ) =>
         {
-            c.kind(*only) == NodeKind::ListLiteral
+            rest
         }
-        _ => false,
-    }
+        _ => group,
+    };
+    let Some(&run_head) = rest.first() else {
+        return false;
+    };
+    let head_span = c.byte_span(run_head);
+    let head = rest
+        .iter()
+        .copied()
+        .rev()
+        .find(|&piece| {
+            let span = c.byte_span(piece);
+            span.start <= head_span.start && head_span.end <= span.end
+        })
+        .unwrap_or(run_head);
+    c.kind(head) == NodeKind::ListLiteral
 }
 
 pub(crate) mod prefer_inlined_adds {
@@ -143,15 +187,14 @@ pub(crate) mod prefer_inlined_adds {
     };
 
     fn check(c: &mut Check<'_>) {
-        let Some((method, args)) =
-            cascaded_add(c, "add").or_else(|| cascaded_add(c, "addAll"))
+        let Some((method, args)) = cascaded_add(c, "add").or_else(|| cascaded_add(c, "addAll"))
         else {
             return;
         };
         let add_all = c.lexeme(c.head_token(method)) == "addAll";
         if add_all && !first_argument_list_literal(c, args) {
-            // A list-literal argument is inlined here; anything else is the
-            // spread rule's finding (:53-55).
+            // A list-literal argument is inlined here; anything else is
+            // the spread rule's finding (:53-55).
             return;
         }
         let range = c.utf16_span(method);
@@ -197,8 +240,8 @@ pub(crate) mod prefer_spread_collections {
         let Some((method, args)) = cascaded_add(c, "addAll") else {
             return;
         };
-        // `target.inConstantContext` (:46-49) — syntactic approximation on
-        // the ancestor path.
+        // `target.inConstantContext` (:46-49) — the official
+        // `constantContext` walk, mirrored in [`in_const_context`].
         if in_const_context(c, c.path.len()) {
             return;
         }
@@ -360,9 +403,7 @@ pub(crate) mod prefer_collection_literals {
             (Some(_), Some(args)) if selector == "from" || selector == "of" => {
                 named_face(c, decls, kids, head, args)
             }
-            (Some(access), Some(_)) if selector == "toSet" => {
-                to_set_face(c, kids, head, access)
-            }
+            (Some(access), Some(_)) if selector == "toSet" => to_set_face(c, kids, head, access),
             _ => false,
         }
     }
@@ -547,16 +588,19 @@ pub(crate) mod unnecessary_to_list_in_spreads {
 
 pub(crate) mod prefer_iterable_where_type {
     use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::{NONE_TOKEN, first_child};
+    use crate::rules::{NONE_TOKEN, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_iterable_whereType.dart:31-83`
     /// — `x.where((e) => e is T)` (or the single-return block form) reports
     /// at the method name.
     ///
-    /// Approximation (documented): the receiver type check
-    /// (`implementsInterface('Iterable')`, :48-49) is dropped — the
-    /// `prefer_contains` precedent — so a user class with a `where` method
-    /// over-reports. Message: `diagnostic.g.dart` `preferIterableWheretype`.
+    /// The receiver type check (`implementsInterface('Iterable')`, :48-49)
+    /// reads through the shared literal face
+    /// ([`slice::receiver_implements_any`]) — collection literals decide (a
+    /// map literal stays silent like the official `Iterable`-only gate), an
+    /// opaque receiver keeps the documented presumption (a user class with a
+    /// `where` member over-reports). Message: `diagnostic.g.dart`
+    /// `preferIterableWheretype`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_iterable_whereType",
         group: Group::Core,
@@ -567,43 +611,44 @@ pub(crate) mod prefer_iterable_where_type {
     };
 
     fn check(c: &mut Check<'_>) {
-        let node = c.node();
-        let kids = c.collect_direct(node);
-        let Some(args_pos) = kids
-            .iter()
-            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments | NodeKind::NoArguments))
-        else {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
             return;
         };
-        // `node.methodName.name != 'where'` with a target bails (:47).
-        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+        // The member face proves a target (a bare `where(f)` has none,
+        // :47-49): the send parts' selector identifier carries the check
+        // (a statement-position call may tile without the marker row).
+        let _ = slice::access_marker(c, &kids, pos, NodeKind::DotAccess);
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
             return;
         };
-        let name = match c.kind(*callee) {
-            NodeKind::DotAccess | NodeKind::Qualified => {
-                let access = c.collect_direct(*callee);
-                match access.last().copied() {
-                    Some(name)
-                        if c.kind(name) == NodeKind::Identifier
-                            && c.lexeme(c.head_token(name)) == "where" =>
-                    {
-                        name
-                    }
-                    _ => return,
-                }
-            }
-            _ => return,
-        };
-        // `args.length != 1` bails (:50-51).
-        let args = c.collect_direct(kids[args_pos]);
-        if args.len() != 1 {
+        let name = kids[head];
+        // `node.methodName.name != 'where'` bails (:47-48).
+        if c.kind(name) != NodeKind::Identifier || c.lexeme(c.head_token(name)) != "where" {
             return;
         }
-        // `arg is FunctionExpression` (:52).
-        if c.kind(args[0]) != NodeKind::FunctionExpression {
+        // The receiver type check (:48-49).
+        if !slice::receiver_implements_any(c, &kids, head, slice::ITERABLE) {
             return;
         }
-        if !is_type_test_closure(c, args[0]) {
+        // `args.length != 1` bails (:50-51); `arg is FunctionExpression`
+        // (:52) — the argument list's subtree roots lead with the call's
+        // type-argument wrapper (an empty `NoTypeVariables` row on the
+        // common shape), so the sole argument is the single root after it.
+        let Some(arguments) = arguments else {
+            return;
+        };
+        let mut args = c.collect_direct(arguments);
+        args.retain(|&root| {
+            !matches!(
+                c.kind(root),
+                NodeKind::NoTypeVariables | NodeKind::TypeVariables
+            )
+        });
+        if args.len() != 1 || c.kind(args[0]) != NodeKind::FunctionExpression {
+            return;
+        }
+        let closure = args[0];
+        if !is_type_test_closure(c, closure) {
             return;
         }
         let range = c.utf16_span(name);
@@ -612,83 +657,81 @@ pub(crate) mod prefer_iterable_where_type {
 
     /// The closure shape (:53-81): one parameter, an expression body (or a
     /// single-return block body) whose unparenthesized expression is `e is T`
-    /// (no `is!`) with the parameter as the tested expression.
+    /// (no `is!`) with the parameter as the tested expression. The container
+    /// windows read as raw row ranges (descendants included): the
+    /// `IsExpression` window opens at the operator, so the tested expression
+    /// tiles BEFORE it and the type sits inside — the tested rows are the
+    /// container rows ending at the `is` token.
     fn is_type_test_closure(c: &Check<'_>, closure: u32) -> bool {
         let kids = c.collect_direct(closure);
-        let params = kids
+        let Some(&params) = kids
             .iter()
-            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters);
-        let Some(params) = params else {
+            .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
             return false;
         };
-        if c.collect_direct(*params).len() != 1 {
+        // One parameter: exactly one `FormalParameter` container row in the
+        // flattened parameter window.
+        let parameters: Vec<u32> = c
+            .collect_direct(params)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::FormalParameter)
+            .collect();
+        if parameters.len() != 1 {
             return false;
         }
-        let param_name = parameter_name(c, c.collect_direct(*params)[0]);
-        let Some(param_name) = param_name else {
-            #[cfg(test)]
-            eprintln!(
-                "DBG param_name=None params_kids={:?}",
-                c.collect_direct(
-                    c.collect_direct(closure)
-                        .iter()
-                        .copied()
-                        .find(|&k| c.kind(k) == NodeKind::FormalParameters)
-                        .unwrap()
-                )
-            );
+        let Some(param_name) = parameter_name(c, parameters[0]) else {
             return false;
         };
-        let body = kids
+        // `hasSingleExpressionBody`: an expression body, or one `return`
+        // statement. The body rows tile under the closure between the
+        // parameter subtree and the body root — the `ExpressionBody` row's
+        // own window is empty (it pins the `=>` token) and a statement row
+        // is a childless span leaf, so neither carries the pieces.
+        let Some(body_root) = kids
             .iter()
-            .find(|&&kid| c.kind(kid) == NodeKind::ExpressionBody)
-            .copied();
-        let expression = if let Some(body) = body {
-            first_child(c, body)
-        } else {
-            // `hasSingleExpressionBody`: one `return` statement.
-            let body = kids
-                .iter()
-                .find(|&&kid| c.kind(kid) == NodeKind::BlockBody)
-                .copied();
-            let Some(body) = body else {
-                return false;
-            };
-            // The statements live under the body's `Block` child.
-            let Some(block) = c
-                .collect_direct(body)
-                .into_iter()
-                .find(|&kid| c.kind(kid) == NodeKind::Block)
-            else {
-                return false;
-            };
-            let statements = c.collect_direct(block);
-            if statements.len() != 1 || c.kind(statements[0]) != NodeKind::ReturnStatement {
-                return false;
+            .copied()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::ExpressionBody | NodeKind::BlockBody))
+        else {
+            return false;
+        };
+        let mut rows: Vec<u32> = (params + 1..body_root).collect();
+        if c.kind(body_root) == NodeKind::BlockBody {
+            // The sole statement is the block slice's tail: the return's
+            // statement leaf completes last.
+            match rows.last() {
+                Some(&last) if c.kind(last) == NodeKind::ReturnStatement => {}
+                _ => return false,
             }
-            first_child(c, statements[0])
-        };
-        let Some(expression) = expression else {
+            rows.pop();
+        }
+        // `(e) => e is int` / `(e) { return e is int; }`: the `IsExpression`
+        // closes last in the scan window (a `(...)` wrapper around it just
+        // follows).
+        let Some(&expression) = rows
+            .iter()
+            .rev()
+            .find(|&&row| c.kind(row) == NodeKind::IsExpression)
+        else {
             return false;
         };
-        let mut expression = expression;
-        while c.kind(expression) == NodeKind::ParenthesizedExpression {
-            let Some(inner) = first_child(c, expression) else {
-                return false;
-            };
-            expression = inner;
-        }
-        if c.kind(expression) != NodeKind::IsExpression {
-            return false;
-        }
         // `expression.notOperator == null` (:71).
         if c.payload(expression).first().copied().unwrap_or(0) != 0 {
             return false;
         }
-        let Some(tested) = first_child(c, expression) else {
-            return false;
-        };
-        c.kind(tested) == NodeKind::Identifier && c.lexeme(c.head_token(tested)) == param_name
+        // The tested expression tiles before the `is` token (the type rows
+        // start after it); a single trailing `(...)` wrapper unwraps.
+        let is_byte = c.byte_span(expression).start;
+        let tested_end = rows.partition_point(|&row| c.byte_span(row).end <= is_byte);
+        let mut tested = &rows[..tested_end];
+        if let Some(&last) = tested.last()
+            && c.kind(last) == NodeKind::ParenthesizedExpression
+        {
+            tested = &tested[..tested.len() - 1];
+        }
+        tested.len() == 1
+            && c.kind(tested[0]) == NodeKind::Identifier
+            && c.lexeme(c.head_token(tested[0])) == param_name
     }
 
     /// A simple formal parameter's name (`FormalParameter` payload word 1,
@@ -828,7 +871,7 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
 mod tests {
     use dartq_ast::NodeKind;
 
-    use crate::testsupport::{Fixture, NONE, identifier, one_rule, unit_of, utf16_at};
+    use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
 
     /// `[]..addAll([1, 2]);` — a cascaded list-literal addAll reports with
     /// the multiple template (`test/rules/prefer_inlined_adds_test.dart`),
@@ -857,7 +900,10 @@ mod tests {
             lints[0].message,
             "The addition of a list item could be inlined."
         );
-        assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+        // The report anchors at the method name (`add` — token 7; the
+        // scanner emits the `[]` operator as one token, so token 6 is the
+        // cascade `..`).
+        assert_eq!(lints[0].range.start, utf16_at(&f, 7));
     }
 
     /// A non-first section is skipped (`sections.first == invocation`).
@@ -1083,105 +1129,44 @@ mod tests {
 
     /// `test/rules/prefer_iterable_whereType_test.dart` `test_whereType` —
     /// `x.where((e) => e is int)` reports at the method name.
+    /// Production-bridge fixture.
     #[test]
     fn where_type_reports_a_type_test_closure() {
-        let source = "x.where((e) => e is int);";
-        // x0 .1 where2 (3 (4 e5 )6 =>7 e8 is9 int10 )11 ;12
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::Send, 0);
-                b.begin(NodeKind::DotAccess, 0);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                identifier(b, 0, 1);
-                identifier(b, 2, 3);
-                b.end(NodeKind::DotAccess, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.begin(NodeKind::FunctionExpression, 4);
-                b.begin(NodeKind::FormalParameters, 4);
-                b.begin(NodeKind::FormalParameter, 4);
-                b.patch(0, NONE);
-                b.patch(1, 5);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.patch(4, 0);
-                identifier(b, 5, 6);
-                b.end(NodeKind::FormalParameter, 7);
-                b.end(NodeKind::FormalParameters, 7);
-                b.begin(NodeKind::ExpressionBody, 7);
-                b.patch(0, 7);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::IsExpression, 8);
-                b.patch(0, 0);
-                identifier(b, 8, 9);
-                b.leaf_span(NodeKind::Type, 10, 11);
-                b.end(NodeKind::IsExpression, 11);
-                b.end(NodeKind::ExpressionBody, 11);
-                b.end(NodeKind::FunctionExpression, 12);
-                b.end(NodeKind::Arguments, 12);
-                b.end(NodeKind::Send, 12);
-                b.end(NodeKind::ExpressionStatement, 13);
-            }),
-        );
+        let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int); }");
         let lints = f.run(&one_rule("prefer_iterable_whereType"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
             "Use 'whereType' to filter elements by type."
         );
-        assert_eq!(lints[0].range.start, utf16_at(&f, 2));
+        let name = tok(&f.source, &f.tokens, "where", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, name));
+        assert_eq!(lints[0].range.end, utf16_at(&f, name) + 5);
     }
 
     /// An `is!` closure and a foreign-parameter test pass (:71-79).
     #[test]
     fn where_type_not_is_and_foreign_param_pass() {
-        let source = "x.where((e) => e is! int);";
-        // x0 .1 where2 (3 (4 e5 )6 =>7 e8 is!9 int10 )11 ;12
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::Send, 0);
-                b.begin(NodeKind::DotAccess, 0);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                identifier(b, 0, 1);
-                identifier(b, 2, 3);
-                b.end(NodeKind::DotAccess, 3);
-                b.begin(NodeKind::Arguments, 3);
-                b.begin(NodeKind::FunctionExpression, 4);
-                b.begin(NodeKind::FormalParameters, 4);
-                b.begin(NodeKind::FormalParameter, 4);
-                b.patch(0, NONE);
-                b.patch(1, 5);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.patch(4, 0);
-                identifier(b, 5, 6);
-                b.end(NodeKind::FormalParameter, 7);
-                b.end(NodeKind::FormalParameters, 7);
-                b.begin(NodeKind::ExpressionBody, 7);
-                b.patch(0, 7);
-                b.patch(1, NONE);
-                b.patch(2, NONE);
-                b.patch(3, NONE);
-                b.begin(NodeKind::IsExpression, 8);
-                b.patch(0, 1);
-                identifier(b, 8, 9);
-                b.leaf_span(NodeKind::Type, 10, 11);
-                b.end(NodeKind::IsExpression, 11);
-                b.end(NodeKind::ExpressionBody, 11);
-                b.end(NodeKind::FunctionExpression, 12);
-                b.end(NodeKind::Arguments, 12);
-                b.end(NodeKind::Send, 12);
-                b.end(NodeKind::ExpressionStatement, 13);
-            }),
-        );
+        let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is! int); }");
         assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+
+        let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => f(e) is int); }");
+        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+    }
+
+    /// Two arguments and a bare untargeted `where` pass (:47-51), and the
+    /// restored receiver face keeps a map literal silent like the official
+    /// `Iterable`-only gate (:48-49).
+    #[test]
+    fn where_type_argument_and_receiver_faces_pass() {
+        let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int, 1); }");
+        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+
+        let f = Fixture::parse("void f() { var x = ({'k': 1}).where((e) => e is int); }");
+        assert!(
+            f.run(&one_rule("prefer_iterable_whereType")).is_empty(),
+            "a map literal is outside Iterable"
+        );
     }
 
     // —— prefer_for_elements_to_map_fromIterable ———————————————————————————

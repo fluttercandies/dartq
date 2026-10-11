@@ -184,10 +184,9 @@ pub(crate) mod unintended_html_in_doc_comment {
                 // Raw content emptiness; the builder counts a `/**` opening
                 // line as empty so an indented block can start on the next
                 // line (:298-302).
-                let empty = content.is_empty()
-                    || (block_form && line_index == 0 && content == "/**");
-                let indent =
-                    content.len() - content.trim_start_matches([' ', '\t']).len();
+                let empty =
+                    content.is_empty() || (block_form && line_index == 0 && content == "/**");
+                let indent = content.len() - content.trim_start_matches([' ', '\t']).len();
                 if fenced {
                     // Every line of a fenced block is code, the closing
                     // fence line included; the block leaves

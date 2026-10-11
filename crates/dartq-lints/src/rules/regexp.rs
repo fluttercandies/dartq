@@ -728,8 +728,7 @@ impl Scan {
                     self.pos += 1;
                 }
                 let group = usize::try_from(group).ok()?;
-                (group >= 1 && self.groups.get(group - 1) == Some(&true))
-                    .then_some(Escape::Char(0))
+                (group >= 1 && self.groups.get(group - 1) == Some(&true)).then_some(Escape::Char(0))
             }
             'd' | 'D' | 's' | 'S' | 'w' | 'W' => Some(Escape::Set),
             'p' | 'P' => {
@@ -779,8 +778,20 @@ impl Scan {
                 if self.unicode
                     && !matches!(
                         ch,
-                        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
-                            | '{' | '}' | '|' | '/'
+                        '^' | '$'
+                            | '\\'
+                            | '.'
+                            | '*'
+                            | '+'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '|'
+                            | '/'
                     )
                 {
                     None

@@ -156,6 +156,9 @@ mod parse_tests {
         let fixture = Fixture::parse("void f() {\n  if (b) ; else ;\n}\n");
         let lints = fixture.run(&one_rule("avoid_empty_else"));
         assert_eq!(lints.len(), 1, "the else `;` reports through the bridge");
-        assert_eq!(lints[0].rule, rule_by_name("avoid_empty_else").expect("wired"));
+        assert_eq!(
+            lints[0].rule,
+            rule_by_name("avoid_empty_else").expect("wired")
+        );
     }
 }

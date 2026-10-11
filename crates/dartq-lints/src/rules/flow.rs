@@ -372,12 +372,12 @@ pub(crate) mod no_duplicate_case_values {
     fn const_value(c: &Check<'_>, expression: u32) -> Option<ConstValue> {
         match c.kind(expression) {
             NodeKind::LiteralNull => Some(ConstValue::Null),
-            NodeKind::LiteralBool => {
-                Some(ConstValue::Bool(c.lexeme(c.head_token(expression)) == "true"))
-            }
-            NodeKind::LiteralInt => Some(ConstValue::Int(int_literal(c.lexeme(
-                c.head_token(expression),
-            ))?)),
+            NodeKind::LiteralBool => Some(ConstValue::Bool(
+                c.lexeme(c.head_token(expression)) == "true",
+            )),
+            NodeKind::LiteralInt => Some(ConstValue::Int(int_literal(
+                c.lexeme(c.head_token(expression)),
+            )?)),
             NodeKind::StringLiteral => string_literal(c, expression),
             NodeKind::ConstantPattern | NodeKind::ParenthesizedExpression => {
                 const_value(c, first_child(c, expression)?)
@@ -449,7 +449,9 @@ pub(crate) mod no_duplicate_case_values {
             Some("0x" | "0X") => (&text[2..], 16),
             _ => (&text[..], 10),
         };
-        u64::from_str_radix(digits, radix).ok().map(|value| value as i64)
+        u64::from_str_radix(digits, radix)
+            .ok()
+            .map(|value| value as i64)
     }
 
     /// The value of one string literal: a single-token span (adjacent
@@ -645,8 +647,7 @@ pub(crate) mod use_rethrow_when_possible {
                     // The function name binds from its declaration on; the
                     // parameters scope the whole body.
                     let names_decl = member_name(c, ancestor).is_some_and(|decl| {
-                        c.lexeme(c.head_token(decl)) == name
-                            && c.byte_span(decl).start < use_start
+                        c.lexeme(c.head_token(decl)) == name && c.byte_span(decl).start < use_start
                     });
                     if names_decl || parameter_names(c, ancestor).contains(&name) {
                         return true;
@@ -710,9 +711,8 @@ pub(crate) mod use_rethrow_when_possible {
             c.kind(decl) == NodeKind::VariablesDeclaration
                 && c.collect_direct(decl).into_iter().any(|var| {
                     c.kind(var) == NodeKind::InitializedIdentifier
-                        && member_name(c, var).is_some_and(|var_name| {
-                            c.lexeme(c.head_token(var_name)) == name
-                        })
+                        && member_name(c, var)
+                            .is_some_and(|var_name| c.lexeme(c.head_token(var_name)) == name)
                 })
         })
     }
@@ -839,17 +839,19 @@ pub(crate) mod type_literal_in_constant_pattern {
     /// and for a `Type`-typed matched value (:50-59, the raw-type
     /// exemption); `case int:`-style built-in names report.
     ///
-    /// Approximation (documented): the type-literal test
+    /// Approximations (documented): the type-literal test
     /// (`expression.staticType.isDartCoreType`, :61-63) is a resolution
     /// question. The lexical face reports a bare identifier whose lexeme is
     /// a built-in Dart type name — a set that can never be a type literal
     /// miss (`int`, `String`, ...), while the over-report faces stay inside
     /// the user-shadowed family: a user constant named like a built-in type
-    /// (`const String = 'x'; case String:`) and the `Type`-typed matched
-    /// value exemption (`Type t = ...; switch (t) { case int: }`) both
-    /// over-report. User type literals (`case MyType:` — indistinguishable
-    /// from a capitalized constant without resolution) under-report. Message:
-    /// `diagnostic.g.dart` `typeLiteralInConstantPattern`.
+    /// (`const String = 'x'; case String:`) over-reports, and user type
+    /// literals (`case MyType:` — indistinguishable from a capitalized
+    /// constant without resolution) under-report. The `Type`-matched-value
+    /// exemption (:50-59) reads through the syntactic face below; a
+    /// type-parameter scrutinee (`T case int`) and an object-pattern field
+    /// face (`A(type: int)`) stay over-reports. Message: `diagnostic.g.dart`
+    /// `typeLiteralInConstantPattern`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "type_literal_in_constant_pattern",
         group: Group::Core,
@@ -903,14 +905,107 @@ pub(crate) mod type_literal_in_constant_pattern {
         let Some(expression) = super::first_child(c, node) else {
             return;
         };
-        if c.kind(expression) != NodeKind::Identifier {
+        // The bare constant parses as a tear-off send group — the pattern
+        // adopts the childless `Send` leaf (span = the identifier; the
+        // `Identifier` / `NoTypeArguments` leaves precede it as owner
+        // siblings), so the constant name reads off the send's span head.
+        if !matches!(
+            c.kind(expression),
+            NodeKind::Identifier | NodeKind::Send | NodeKind::DotAccess
+        ) {
             return;
         }
         if !is_builtin_type_name(c.lexeme(c.head_token(expression))) {
             return;
         }
+        // OK to use raw types if the matched value is of type `Type`
+        // (:50-59).
+        if matched_value_is_type(c) {
+            return;
+        }
         let range = c.utf16_span(node);
         c.report(range, &[]);
+    }
+
+    /// The `Type`-matched-value exemption (:50-59): the enclosing match's
+    /// scrutinee proves a `Type` matched value. The syntactic face: a
+    /// `.runtimeType` tail is always `Type`, and a bare-identifier scrutinee
+    /// resolves its written type through the same-file face — the
+    /// `Type`-typed parameter / local / field / top-level shapes
+    /// (`type_literal_in_constant_pattern_test.dart`
+    /// `test_constType_matchType`).
+    fn matched_value_is_type(c: &Check<'_>) -> bool {
+        for (depth, &ancestor) in c.path.iter().enumerate().rev() {
+            // The scrutinee piece run: if-case (the condition container
+            // holds the scrutinee itself), a switch statement case, a
+            // switch expression case.
+            let scrutinee = match c.kind(ancestor) {
+                NodeKind::ParenthesizedCondition => {
+                    // The condition's pieces leak past the container to the
+                    // enclosing statement: the scrutinee is the container's
+                    // parent's direct rows before the container row, ending
+                    // before the pattern starts. (The path step after the
+                    // container is the container's child on the path — the
+                    // pattern itself — so the owner sits one step before
+                    // it.) The boundary reads the pattern's own head row
+                    // (the container's adopted child when present) — the
+                    // container's span can anchor wider than the constant.
+                    let Some(&outer) = depth.checked_sub(1).and_then(|i| c.path.get(i)) else {
+                        return false;
+                    };
+                    let pattern_window = c.children(c.node());
+                    let pattern_start = if pattern_window.start < pattern_window.end {
+                        c.byte_span(pattern_window.start).start
+                    } else {
+                        c.byte_span(c.node()).start
+                    };
+                    c.collect_direct(outer)
+                        .into_iter()
+                        .take_while(|&kid| kid != ancestor)
+                        .filter(|&kid| c.byte_span(kid).end <= pattern_start)
+                        .collect()
+                }
+                NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
+                    let boundary = if c.kind(ancestor) == NodeKind::SwitchCase {
+                        NodeKind::SwitchBlock
+                    } else {
+                        NodeKind::SwitchExpressionBlock
+                    };
+                    let Some(root_index) = depth.checked_sub(2) else {
+                        return false;
+                    };
+                    let root = c.path[root_index];
+                    let kids = c.collect_direct(root);
+                    let Some(boundary_pos) = kids.iter().position(|&kid| c.kind(kid) == boundary)
+                    else {
+                        return false;
+                    };
+                    kids[..boundary_pos].to_vec()
+                }
+                _ => continue,
+            };
+            // A `.runtimeType` tail is always `Type`.
+            if let Some(&tail) = scrutinee.last()
+                && c.kind(tail) == NodeKind::DotAccess
+                && c.lexeme(c.head_token(tail)) == "runtimeType"
+            {
+                return true;
+            }
+            // A bare-identifier scrutinee resolves through the same-file
+            // written-type face.
+            if let Some(&head) = scrutinee.first()
+                && c.kind(head) == NodeKind::Identifier
+                && crate::rules::expressions::same_file::written_type(
+                    c,
+                    head,
+                    c.lexeme(c.head_token(head)),
+                ) == Some("Type")
+            {
+                return true;
+            }
+            return false;
+        }
+        false
     }
 }
 
@@ -1267,7 +1362,7 @@ pub(crate) mod exhaustive_cases {
 mod tests {
     use dartq_ast::NodeKind;
 
-    use crate::testsupport::{Fixture, NONE, identifier, one_rule, unit_of, utf16_at};
+    use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
 
     /// `test/rules/curly_braces_in_flow_control_structures_test.dart`
     /// `test_if_multiline` — a multi-line arm without a block reports.
@@ -2563,6 +2658,58 @@ mod tests {
         assert!(
             f.run(&one_rule("type_literal_in_constant_pattern"))
                 .is_empty()
+        );
+    }
+
+    /// Production-bridge face: the if-case `case int` reports over the
+    /// pattern (`test/rules/type_literal_in_constant_pattern_test.dart`
+    /// core-type case).
+    #[test]
+    fn type_literal_if_case_reports_the_pattern() {
+        let f = Fixture::parse("void f(Object x) { if (x case int) {} }");
+        let lints = f.run(&one_rule("type_literal_in_constant_pattern"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use 'TypeName _' instead of a type literal."
+        );
+        let int = tok(&f.source, &f.tokens, "int", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, int));
+        assert_eq!(lints[0].range.end, utf16_at(&f, int) + 3);
+    }
+
+    /// The `Type`-matched-value exemption (:50-59) through the syntactic
+    /// face on real parses: a `Type`-typed parameter, a `Type`-typed local,
+    /// a `.runtimeType` scrutinee, and a const-marked pattern all stay
+    /// silent (`test_constType_matchType`).
+    #[test]
+    fn type_literal_type_matched_value_passes() {
+        let f = Fixture::parse("void f(Type x) { if (x case int) {} }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty(),
+            "the matched value is the Type-typed parameter"
+        );
+
+        let f = Fixture::parse("void f() { Type t = int; if (t case int) {} }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty(),
+            "the matched value is the Type-typed local"
+        );
+
+        let f = Fixture::parse("void f(Object x) { if (x.runtimeType case int) {} }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty(),
+            "a .runtimeType scrutinee is always Type"
+        );
+
+        let f = Fixture::parse("void f(Object x) { if (x case const (int)) {} }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty(),
+            "a const-marked pattern bails (:45-47)"
         );
     }
 }
