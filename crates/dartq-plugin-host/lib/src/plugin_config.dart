@@ -107,7 +107,8 @@ class PluginConfig {
     final timeouts = _parseTimeouts(manifest['timeouts']);
 
     final memoryBudgetMb = manifest['memory_budget_mb'];
-    if (memoryBudgetMb != null && (memoryBudgetMb is! int || memoryBudgetMb <= 0)) {
+    if (memoryBudgetMb != null &&
+        (memoryBudgetMb is! int || memoryBudgetMb <= 0)) {
       throw const PluginConfigException(
         'manifest field `memory_budget_mb` must be a positive integer',
       );
@@ -119,8 +120,9 @@ class PluginConfig {
       entrypoint: entrypoint,
       capabilities: capabilities,
       timeouts: timeouts,
-      memoryBudgetMb:
-          memoryBudgetMb is int ? memoryBudgetMb : defaultMemoryBudgetMb,
+      memoryBudgetMb: memoryBudgetMb is int
+          ? memoryBudgetMb
+          : defaultMemoryBudgetMb,
     );
   }
 

@@ -44,7 +44,9 @@ Future<void> main() async {
       PrioritizedChange(
         priority: 1,
         message: 'insert const',
-        edits: [SourceEdit(offset: offset, length: length, replacement: 'const ')],
+        edits: [
+          SourceEdit(offset: offset, length: length, replacement: 'const '),
+        ],
       ),
     ],
   );

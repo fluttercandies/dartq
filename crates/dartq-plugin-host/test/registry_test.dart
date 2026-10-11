@@ -28,8 +28,10 @@ void main() {
       registry.registerFixForRule('my_plugin/avoid_print', _otherGenerator);
       registry.registerFixForRule('my_plugin/avoid_sync_io', _otherGenerator);
 
-      expect(registry.fixesByRule['my_plugin/avoid_sync_io'],
-          [_generator, _otherGenerator]);
+      expect(registry.fixesByRule['my_plugin/avoid_sync_io'], [
+        _generator,
+        _otherGenerator,
+      ]);
       expect(registry.fixesByRule['my_plugin/avoid_print'], [_otherGenerator]);
     });
 

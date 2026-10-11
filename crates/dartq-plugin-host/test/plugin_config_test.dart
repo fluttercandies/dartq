@@ -10,17 +10,13 @@ import 'package:dartq_plugin_host/dartq_plugin_host.dart';
 import 'package:test/test.dart';
 
 Map<String, Object?> _fullManifest() => {
-      'name': 'my_plugin',
-      'version': '0.1.0',
-      'entrypoint': 'bin/plugin.dart',
-      'capabilities': ['lint', 'fix', 'mystery_future_cap'],
-      'timeouts': {
-        'callback_ms': 8000,
-        'request_ms': 20000,
-        'request_retries': 5,
-      },
-      'memory_budget_mb': 256,
-    };
+  'name': 'my_plugin',
+  'version': '0.1.0',
+  'entrypoint': 'bin/plugin.dart',
+  'capabilities': ['lint', 'fix', 'mystery_future_cap'],
+  'timeouts': {'callback_ms': 8000, 'request_ms': 20000, 'request_retries': 5},
+  'memory_budget_mb': 256,
+};
 
 PluginConfigException _configError(Map<String, Object?> manifest) {
   try {
@@ -50,11 +46,14 @@ void main() {
       expect(config.capabilities.contains(Capability.lint), isTrue);
       expect(config.capabilities.contains(Capability.fix), isTrue);
       expect(config.capabilities.contains(Capability.assist), isFalse);
-      expect(config.timeouts, const PluginTimeouts(
-        callbackMs: 8000,
-        requestMs: 20000,
-        requestRetries: 5,
-      ));
+      expect(
+        config.timeouts,
+        const PluginTimeouts(
+          callbackMs: 8000,
+          requestMs: 20000,
+          requestRetries: 5,
+        ),
+      );
       expect(config.memoryBudgetMb, 256);
     });
 
@@ -72,8 +71,11 @@ void main() {
     test('missing required fields are named in the typed error', () {
       for (final field in ['name', 'version', 'entrypoint']) {
         final manifest = _fullManifest()..remove(field);
-        expect(_configError(manifest).message, 'manifest field `$field` is required',
-            reason: 'field: $field');
+        expect(
+          _configError(manifest).message,
+          'manifest field `$field` is required',
+          reason: 'field: $field',
+        );
       }
     });
 
@@ -159,8 +161,10 @@ void main() {
 
     test('exception toString has the typed prefix', () {
       const error = PluginConfigException('manifest field `name` is required');
-      expect(error.toString(),
-          'PluginConfigException: manifest field `name` is required');
+      expect(
+        error.toString(),
+        'PluginConfigException: manifest field `name` is required',
+      );
     });
   });
 }

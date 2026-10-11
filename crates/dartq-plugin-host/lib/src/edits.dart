@@ -94,4 +94,5 @@ abstract interface class Producer {
 }
 
 /// Signature a plugin registers for assists and rule fixes.
-typedef ProducerGenerator = FutureOr<Producer> Function(ProducerContext context);
+typedef ProducerGenerator =
+    FutureOr<Producer> Function(ProducerContext context);

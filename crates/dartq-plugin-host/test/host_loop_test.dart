@@ -72,7 +72,10 @@ void main() {
 
     test('serves multiple frames delivered in one chunk', () async {
       final sent = await _serve([
-        [..._frame(initialize), ..._frame(PluginFrame.request(2, methodShutdown))],
+        [
+          ..._frame(initialize),
+          ..._frame(PluginFrame.request(2, methodShutdown)),
+        ],
       ]);
       expect(sent, hasLength(2));
       expect(decodeFrame(sent[1]).method, methodShutdown);
@@ -83,7 +86,9 @@ void main() {
         ..._frame(initialize),
         ..._frame(PluginFrame.request(2, methodShutdown)),
       ];
-      final sent = await _serve([for (final byte in bytes) [byte]]);
+      final sent = await _serve([
+        for (final byte in bytes) [byte],
+      ]);
       expect(sent, hasLength(2));
       expect(decodeFrame(sent[0]).id, 1);
       expect(decodeFrame(sent[1]).id, 2);
@@ -101,11 +106,13 @@ void main() {
       await controller.close();
       await expectLater(
         done,
-        throwsA(isA<PluginProtocolException>().having(
-          (error) => error.message,
-          'message',
-          contains('not valid UTF-8'),
-        )),
+        throwsA(
+          isA<PluginProtocolException>().having(
+            (error) => error.message,
+            'message',
+            contains('not valid UTF-8'),
+          ),
+        ),
       );
       expect(sent, isEmpty);
     });
@@ -137,11 +144,13 @@ void main() {
       await controller.close();
       await expectLater(
         done,
-        throwsA(isA<PluginProtocolException>().having(
-          (error) => error.message,
-          'message',
-          'frame exceeds the $maxFrameBytes-byte frame limit',
-        )),
+        throwsA(
+          isA<PluginProtocolException>().having(
+            (error) => error.message,
+            'message',
+            'frame exceeds the $maxFrameBytes-byte frame limit',
+          ),
+        ),
       );
       expect(sent, isEmpty);
     });
@@ -163,11 +172,13 @@ void main() {
       await controller.close();
       await expectLater(
         done,
-        throwsA(isA<PluginProtocolException>().having(
-          (error) => error.message,
-          'message',
-          contains('frame exceeds'),
-        )),
+        throwsA(
+          isA<PluginProtocolException>().having(
+            (error) => error.message,
+            'message',
+            contains('frame exceeds'),
+          ),
+        ),
       );
 
       // Content of maxFrameBytes-1 plus its newline is exactly the bound, so
@@ -185,11 +196,13 @@ void main() {
       await controllerAtBound.close();
       await expectLater(
         atBound,
-        throwsA(isA<PluginProtocolException>().having(
-          (error) => error.message,
-          'message',
-          contains('not valid JSON'),
-        )),
+        throwsA(
+          isA<PluginProtocolException>().having(
+            (error) => error.message,
+            'message',
+            contains('not valid JSON'),
+          ),
+        ),
       );
     });
   });
@@ -197,21 +210,26 @@ void main() {
   group('outbound flush ordering', () {
     test('replies and plugin-emitted diagnostics reach the sink in serve '
         'order', () async {
-      final sent = await _serve([
-        _frame(initialize),
-        _frame(PluginFrame.notification(methodEngineDiagnostics, {
-          'diagnostics': [],
-        })),
-      ], onEngineDiagnostics: (batch) {
-        return const [
-          PluginDiagnostic(
-            file: 'a.dart',
-            severity: Severity.warning,
-            code: 'p/rule',
-            message: 'found one',
+      final sent = await _serve(
+        [
+          _frame(initialize),
+          _frame(
+            PluginFrame.notification(methodEngineDiagnostics, {
+              'diagnostics': [],
+            }),
           ),
-        ];
-      });
+        ],
+        onEngineDiagnostics: (batch) {
+          return const [
+            PluginDiagnostic(
+              file: 'a.dart',
+              severity: Severity.warning,
+              code: 'p/rule',
+              message: 'found one',
+            ),
+          ];
+        },
+      );
 
       expect(sent, hasLength(2));
       final reply = decodeFrame(sent[0]);
@@ -220,12 +238,15 @@ void main() {
       final diagnostic = decodeFrame(sent[1]);
       expect(diagnostic.isNotification, isTrue);
       expect(diagnostic.method, methodDiagnosticNotification);
-      expect(diagnostic.params, const PluginDiagnostic(
-        file: 'a.dart',
-        severity: Severity.warning,
-        code: 'p/rule',
-        message: 'found one',
-      ).toJson());
+      expect(
+        diagnostic.params,
+        const PluginDiagnostic(
+          file: 'a.dart',
+          severity: Severity.warning,
+          code: 'p/rule',
+          message: 'found one',
+        ).toJson(),
+      );
     });
   });
 

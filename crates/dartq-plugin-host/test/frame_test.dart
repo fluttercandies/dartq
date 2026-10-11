@@ -122,7 +122,11 @@ void main() {
     test('valid JSON of the wrong shape is rejected', () {
       for (final line in ['[1,2,3]', '"hello"', '42', 'null', 'true']) {
         final error = _decodeError(line);
-        expect(error.message, 'frame must be a JSON object', reason: 'input: $line');
+        expect(
+          error.message,
+          'frame must be a JSON object',
+          reason: 'input: $line',
+        );
       }
     });
 
@@ -144,8 +148,11 @@ void main() {
 
     test('foreign schema_version is rejected with both versions named', () {
       final error = _decodeError('{"schema_version":2,"method":"x"}');
-      expect(error.message, 'unsupported schema_version 2; '
-          'this build speaks version 1');
+      expect(
+        error.message,
+        'unsupported schema_version 2; '
+        'this build speaks version 1',
+      );
     });
 
     test('non-integer id is rejected', () {
@@ -162,8 +169,14 @@ void main() {
     test('missing, empty, or non-string method is rejected', () {
       final expected = 'frame `method` must be a non-empty string';
       expect(_decodeError('{"schema_version":1}').message, expected);
-      expect(_decodeError('{"schema_version":1,"method":""}').message, expected);
-      expect(_decodeError('{"schema_version":1,"method":42}').message, expected);
+      expect(
+        _decodeError('{"schema_version":1,"method":""}').message,
+        expected,
+      );
+      expect(
+        _decodeError('{"schema_version":1,"method":42}').message,
+        expected,
+      );
     });
 
     test('non-object params is rejected', () {

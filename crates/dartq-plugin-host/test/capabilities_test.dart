@@ -54,33 +54,50 @@ void main() {
       expect(set.contains(Capability.fix), isFalse);
     });
 
-    test('parse of a non-list value is the empty set, matching the Rust codec',
-        () {
-      for (final value in [null, 'lint', 42, {'lint': true}]) {
-        final set = CapabilitySet.parse(value);
-        expect(set.isEmpty, isTrue, reason: 'input: $value');
-      }
-    });
+    test(
+      'parse of a non-list value is the empty set, matching the Rust codec',
+      () {
+        for (final value in [
+          null,
+          'lint',
+          42,
+          {'lint': true},
+        ]) {
+          final set = CapabilitySet.parse(value);
+          expect(set.isEmpty, isTrue, reason: 'input: $value');
+        }
+      },
+    );
 
     test('intersect keeps only capabilities present in both sets', () {
-      final both = CapabilitySet([Capability.lint, Capability.fix])
-          .intersect(CapabilitySet([Capability.fix, Capability.assist]));
+      final both = CapabilitySet([
+        Capability.lint,
+        Capability.fix,
+      ]).intersect(CapabilitySet([Capability.fix, Capability.assist]));
       expect(both.names(), ['fix']);
 
-      final disjoint =
-          CapabilitySet([Capability.lint]).intersect(CapabilitySet([Capability.fix]));
+      final disjoint = CapabilitySet([
+        Capability.lint,
+      ]).intersect(CapabilitySet([Capability.fix]));
       expect(disjoint.isEmpty, isTrue);
 
-      final nothing =
-          CapabilitySet([Capability.lint]).intersect(CapabilitySet.empty());
+      final nothing = CapabilitySet([
+        Capability.lint,
+      ]).intersect(CapabilitySet.empty());
       expect(nothing.isEmpty, isTrue);
     });
 
-    test('names are listed in protocol order regardless of insertion order',
-        () {
-      final set = CapabilitySet([Capability.assist, Capability.lint, Capability.fix]);
-      expect(set.names(), ['lint', 'fix', 'assist']);
-    });
+    test(
+      'names are listed in protocol order regardless of insertion order',
+      () {
+        final set = CapabilitySet([
+          Capability.assist,
+          Capability.lint,
+          Capability.fix,
+        ]);
+        expect(set.names(), ['lint', 'fix', 'assist']);
+      },
+    );
 
     test('value equality ignores construction order', () {
       final a = CapabilitySet([Capability.lint, Capability.fix]);
@@ -93,7 +110,10 @@ void main() {
     });
 
     test('toString renders the wire names', () {
-      expect(CapabilitySet([Capability.lint]).toString(), 'CapabilitySet(lint)');
+      expect(
+        CapabilitySet([Capability.lint]).toString(),
+        'CapabilitySet(lint)',
+      );
     });
   });
 }
