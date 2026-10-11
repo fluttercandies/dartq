@@ -1,0 +1,19 @@
+name: corpus_complex
+description: >-
+  Super-complex-project corpus (PRD section 19 deliverable): a single coherent
+  Dart package simulating a realistically complex warehouse inventory and
+  order-processing domain. Exercises the Dart 3.13 language surface at depth
+  (sealed hierarchies, deep generics, extension types, records, the full
+  pattern grammar, promotion chains, const evaluation, class modifiers,
+  primary constructors, dot shorthands) across ~50 clean modules plus a set of
+  broken_* fixtures carrying intentional diagnostics. Coverage matrix and the
+  diagnostic convention live in README.md.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  stock_policy:
+    path: packages/stock_policy
