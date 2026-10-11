@@ -29,7 +29,7 @@ use crate::version::LanguageVersion;
 ///
 /// A package without a `workspace:` field is a valid layout with no
 /// members (a "single-package workspace").
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WorkspaceLayout {
     /// Directory of the workspace root pubspec (the first one walking up
     /// with an unspecified `resolution`).
@@ -37,6 +37,10 @@ pub struct WorkspaceLayout {
     /// Transitive member directories in DFS declaration order, excluding
     /// the root itself.
     pub members: Vec<PathBuf>,
+    /// The parsed member pubspecs, parallel to `members`: discovery loads
+    /// and validates every member pubspec, so the parse is carried instead
+    /// of dropped for consumers to re-read the same files.
+    pub member_pubspecs: Vec<Pubspec>,
 }
 
 /// Finds the workspace root for `from` and the transitive member set.
@@ -92,7 +96,7 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                 if first_key != inclusion_key(&dir)
                     && !members
                         .iter()
-                        .any(|member| inclusion_key(member) == first_key)
+                        .any(|(member, _)| inclusion_key(member) == first_key)
                 {
                     return Err(PubError::Workspace(format!(
                         "Found a pubspec.yaml at {}. But it has resolution `{}`. \
@@ -101,7 +105,13 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                         first_resolution.as_str()
                     )));
                 }
-                return Ok(WorkspaceLayout { root: dir, members });
+                let (members, member_pubspecs): (Vec<PathBuf>, Vec<Pubspec>) =
+                    members.into_iter().unzip();
+                return Ok(WorkspaceLayout {
+                    root: dir,
+                    members,
+                    member_pubspecs,
+                });
             }
         }
         match dir.parent() {
@@ -138,7 +148,8 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, PubError> {
     Pubspec::parse_with_overrides(&text, overrides.as_deref())
 }
 
-/// Member directories named by `spec.workspace`, expanded transitively:
+/// Members named by `spec.workspace`, expanded transitively, each with its
+/// parsed pubspec:
 /// DFS with a stack so that popping yields root-first, declared-order
 /// traversal (package.dart:69-79). Entries containing glob wildcards are
 /// expanded by filesystem listing (pub's semantics: matches without a
@@ -158,7 +169,7 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, PubError> {
 /// comparing, package.dart:496,513): two lexically distinct spellings that
 /// resolve to one directory collide. Discovery itself stays lexical — only
 /// the inclusion map's keys are canonical.
-fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError> {
+fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<(PathBuf, Pubspec)>, PubError> {
     let mut members = Vec::new();
     // Included member directory -> the pubspec directory that included it.
     // Keys are canonical (`inclusion_key`), values lexically normalized.
@@ -225,7 +236,6 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
             )));
         }
         names_seen.insert(child_spec.name.clone(), dir.clone());
-        members.push(dir.clone());
         loaded.push((
             child_spec.name.clone(),
             dir.clone(),
@@ -234,13 +244,15 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
         let child_language_version =
             LanguageVersion::from_sdk_constraint(child_spec.environment.sdk.as_ref());
         expand_entries(&dir, &child_spec, child_language_version, &mut stack)?;
+        members.push((dir, child_spec));
     }
 
     // validateWorkspace skips the override and stray-pubspec checks on a
     // single-package workspace (package.dart:487).
     if !members.is_empty() {
         check_overrides(&loaded, &names_seen)?;
-        check_stray_pubspecs(root, &members, &included_from)?;
+        let member_dirs: Vec<PathBuf> = members.iter().map(|(dir, _)| dir.clone()).collect();
+        check_stray_pubspecs(root, &member_dirs, &included_from)?;
     }
     Ok(members)
 }

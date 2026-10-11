@@ -912,7 +912,8 @@ dev_dependencies:
         let non_string_key = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      1: foo\n";
         let err = Pubspec::parse(non_string_key).expect_err("int key");
         assert!(
-            err.to_string().contains("Unknown key \"1\" in description."),
+            err.to_string()
+                .contains("Unknown key \"1\" in description."),
             "unexpected error: {err}"
         );
         let unknown_source = "name: a\ndependencies:\n  x:\n    cvs: whatever\n";
@@ -947,17 +948,21 @@ dev_dependencies:
         // description construction, including the string shorthand form.
         let injection = "name: a\ndependencies:\n  x:\n    git: --upload-pack=evil\n";
         assert_eq!(
-            Pubspec::parse(injection).expect_err("injection").to_string(),
+            Pubspec::parse(injection)
+                .expect_err("injection")
+                .to_string(),
             "pubspec.yaml: \"--upload-pack=evil\" is not a valid Git URL."
         );
-        let ext = "name: a\ndependencies:\n  x:\n    git:\n      url: ext::sh -c touch /tmp/pwned @\n";
+        let ext =
+            "name: a\ndependencies:\n  x:\n    git:\n      url: ext::sh -c touch /tmp/pwned @\n";
         assert_eq!(
             Pubspec::parse(ext).expect_err("ext scheme").to_string(),
             "pubspec.yaml: \"ext::sh -c touch /tmp/pwned @\" is not a valid Git URL."
         );
         // git.dart:270-275: the path must be a relative URL inside the
         // repository.
-        let escape = "name: a\ndependencies:\n  x:\n    git:\n      url: /r\n      path: ../outside\n";
+        let escape =
+            "name: a\ndependencies:\n  x:\n    git:\n      url: /r\n      path: ../outside\n";
         assert_eq!(
             Pubspec::parse(escape).expect_err("escape").to_string(),
             "pubspec.yaml: The 'path' field of the description must not reach outside the repository."

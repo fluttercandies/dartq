@@ -224,7 +224,12 @@ printf '  %-16s %s (bar %s)\n' "warning_jaccard" "$jac" "$THRESHOLD"
 printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-if awk -v j="$jac" -v t="$THRESHOLD" 'BEGIN { exit !(j + 0 >= t + 0) }'; then
+# Exact decision on the raw counts: i/u >= 0.95 with u = intersection +
+# oracle-only + dartq-only (the Jaccard union) is 20*i >= 19*u — integer,
+# no rounding. The 3-decimal `jac` above is display-only: a true Jaccard in
+# [0.9495, 0.95) rounds to 0.95 and must not pass.
+union=$((inter + oonly + donly))
+if [ "$((20 * inter))" -ge "$((19 * union))" ]; then
   echo "m2-gate: VERDICT PASS (WARNING-tier Jaccard meets the $THRESHOLD bar)"
   exit 0
 fi

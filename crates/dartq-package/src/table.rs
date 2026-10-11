@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use dartq_pub::{PackageConfig, PubError, ResolvedPackageGraph, normalize};
+use dartq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
 use dartq_source::normalize_path;
 use rustc_hash::FxHashMap;
 
@@ -27,9 +27,12 @@ use crate::name::PackageName;
 /// The identity view of one resolution: every package that has a
 /// `package_config.json` entry, keyed by canonical name.
 ///
-/// A successful [`PackageTable::build`] always contains the resolution's
-/// root package — it errors with [`crate::PackageError::MissingFromConfig`]
-/// otherwise — so a built table is never empty.
+/// The resolution's root is carried by name ([`PackageTable::root`]) even
+/// when the config does not cover it — a stale config never aborts the
+/// build (config as written; the stale-config advisory reports the
+/// finding) — so [`PackageTable::get`] on the root name answers `None`
+/// exactly when the config lacks the entry (pub-written configs always
+/// have it).
 #[derive(Debug)]
 pub struct PackageTable {
     packages: BTreeMap<PackageName, PackageIdentity>,
@@ -105,20 +108,22 @@ impl PackageTable {
     /// One more root invariant is enforced here: two entries must not
     /// resolve to the same normalized root
     /// ([`crate::PackageError::DuplicateRoot`] — file→package attribution
-    /// could not pick an owner). The walk's inclusive bound additionally
-    /// requires the workspace root (the `config_dir` parent) to be itself a
-    /// config root — pub always writes the root package's `rootUri` so —
-    /// and a divergent hand-config violating that is rejected at build
-    /// rather than mis-attributing the bound's own tree.
+    /// could not pick an owner). The attribution walk's inclusive bound is
+    /// the workspace root (the `config_dir` parent) whether or not it is
+    /// itself a config root: pub always writes the root package's
+    /// `rootUri` so, and a divergent hand-config merely degrades
+    /// attribution — the bound's own tree falls through to the fallback
+    /// tier instead of being rejected at build (config as written; the
+    /// stale-config advisory reports the finding).
     ///
     /// # Errors
     ///
     /// Returns [`crate::PackageError`] when the artifacts disagree (a config
-    /// entry without a graph instance, the root or a workspace member
-    /// without a config entry), when [`PackageConfig::resolve`] rejects the
-    /// config (duplicate names, grammar, subtree, relative dir), when two
-    /// entries resolve to the same normalized root, or when the workspace
-    /// root is not one of the config roots.
+    /// entry without a graph instance, or a workspace member without a
+    /// config entry in a hand-assembled graph), when
+    /// [`PackageConfig::resolve`] rejects the config (duplicate names,
+    /// grammar, subtree, relative dir), or when two entries resolve to the
+    /// same normalized root.
     pub fn build(
         config: &PackageConfig,
         graph: &ResolvedPackageGraph,
@@ -180,11 +185,10 @@ impl PackageTable {
         }
 
         let root_name = PackageName::new(&graph.root.0)?;
-        if !packages.contains_key(&root_name) {
-            return Err(crate::PackageError::MissingFromConfig {
-                name: root_name.to_string(),
-            });
-        }
+        // Carried by name even when the config does not cover it (config as
+        // written): `get(root())` answers `None`, consumers' `if let Some`
+        // degrade, and the membership finding rides the graph's advisory
+        // channel — never a build error.
         let workspace_members = match &graph.workspace_members {
             None => None,
             Some(members) => {
@@ -225,18 +229,10 @@ impl PackageTable {
         // `config_dir` would otherwise strand the bound mid-chain or fence
         // off the roots entirely).
         let workspace_root = normalize_path(config_dir.parent().unwrap_or(config_dir));
-        // Pub always writes the root package's `rootUri` onto the
-        // `config_dir` parent, so the walk's inclusive bound is a config
-        // root; a hand-config diverging from that is rejected at build
-        // instead of mis-attributing the bound's own tree.
-        if !by_root.contains_key(&workspace_root) {
-            return Err(crate::PackageError::Pub(PubError::PackageConfig(format!(
-                "workspace root `{root}` must be one of the config roots: \
-                     the attribution walk treats it as the inclusive bound and \
-                     the root package's owner",
-                root = workspace_root.display()
-            ))));
-        }
+        // The bound stays the workspace root whether or not it is itself a
+        // config root (pub always writes it so; a divergent hand-config
+        // degrades — the bound's own tree walks unowned and falls through
+        // to the fallback tier below).
 
         Ok(PackageTable {
             packages,
@@ -336,7 +332,8 @@ impl PackageTable {
                 break;
             }
             // The bound is inclusive: the workspace root itself is checked
-            // (it is the root package's member root), its parent is not.
+            // (it is a config root in every pub-written layout), its parent
+            // is not.
             if !(dir == self.workspace_root || dir.starts_with(&self.workspace_root)) {
                 break;
             }
@@ -408,9 +405,10 @@ impl PackageTable {
         self.packages.values()
     }
 
-    /// Number of packages. A successful build always contains the root
-    /// package, so there is deliberately no `is_empty` query — the answer
-    /// would be a constant `false`.
+    /// Number of packages — the config's entry count, never mutated after
+    /// build. There is deliberately no `is_empty` query: emptiness is a
+    /// config-shape fact the caller already knows, not a table state worth
+    /// an API.
     #[allow(clippy::len_without_is_empty)]
     #[must_use]
     pub fn len(&self) -> usize {
@@ -437,7 +435,7 @@ impl PackageTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dartq_pub::{LockFile, Pubspec, build_graph};
+    use dartq_pub::{LockFile, Pubspec, StaleReason, build_graph};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -628,19 +626,53 @@ sdks:
         ));
     }
 
+    /// Config as written: a graph built against a config that covers
+    /// neither the root nor the declared member still builds its table —
+    /// the root is carried by name with no entry, the member is filtered
+    /// at the graph level, and the config's own entries attribute.
     #[test]
-    fn graph_root_or_member_without_config_entry_is_an_error() {
-        let full = PackageConfig::parse(CONFIG).expect("valid config");
-        let graph = graph_for(&full);
-        // Same graph (root `app`, member `local_dep`), config without both.
+    fn root_or_member_missing_from_config_degrades() {
         let bare = PackageConfig::parse(
-            r#"{"configVersion": 2, "packages": [{"name": "hosted_dep", "rootUri": "../"}]}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "hosted_dep", "rootUri": "../hosted"}]}"#,
         )
         .expect("valid config");
-        assert!(matches!(
-            PackageTable::build(&bare, &graph, Path::new("/proj/.dart_tool")),
-            Err(crate::PackageError::MissingFromConfig { name }) if name == "app"
-        ));
+        let lock = LockFile::parse(LOCK).expect("valid lock");
+        let graph = build_graph(
+            &bare,
+            &lock,
+            &root_pubspec(),
+            &BTreeMap::new(),
+            Some(&["local_dep".to_owned()]),
+            Path::new("/proj/.dart_tool"),
+        )
+        .expect("graph");
+        // Both membership findings ride the graph for the advisory.
+        assert_eq!(
+            graph.membership_findings,
+            vec![
+                StaleReason::RootMissingFromConfig { name: "app".into() },
+                StaleReason::MemberMissingFromConfig {
+                    name: "local_dep".into()
+                },
+            ]
+        );
+
+        let table =
+            PackageTable::build(&bare, &graph, Path::new("/proj/.dart_tool")).expect("table");
+        // Root carried by name, with no entry behind it.
+        assert_eq!(table.root().as_str(), "app");
+        assert!(table.get("app").is_none());
+        // The filtered member set mirrors the graph.
+        assert_eq!(table.workspace_members().map(BTreeSet::len), Some(0));
+        // The config's own entry attributes as usual.
+        assert_eq!(
+            table
+                .containing(Path::new("/proj/hosted/lib/h.dart"))
+                .map(|identity| identity.name.as_str()),
+            Some("hosted_dep")
+        );
+        // The bound's own tree is owned by nobody.
+        assert_eq!(table.containing(Path::new("/proj/lib/a.dart")), None);
     }
 
     #[test]
@@ -1210,30 +1242,40 @@ sdks:
         assert_eq!(table.memo_keys(), keys);
     }
 
-    /// The walk's inclusive bound requires the workspace root (the config
-    /// dir's parent) to be itself a config root — pub always writes the
-    /// root package's `rootUri` so. A divergent hand-config is a build
-    /// error in every profile, not a debug-only assert.
+    /// The walk's inclusive bound is the workspace root (the config dir's
+    /// parent) whether or not it is itself a config root. pub always writes
+    /// the root package's `rootUri` so; a divergent hand-config degrades:
+    /// member trees attribute through the walk, the bound's own tree falls
+    /// through to the fallback tier (the outside-workspace tier) and lands
+    /// `None` when no config root covers it — never a mis-attribution, and
+    /// never a build error (config as written).
     #[test]
-    fn workspace_root_not_among_config_roots_is_an_error() {
+    fn workspace_root_not_among_config_roots_degrades_to_the_fallback_tier() {
         // The only entry roots at /proj/app; nothing owns /proj, the
         // walk's inclusive bound.
         let config = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../app"}]}"#,
         )
         .expect("valid config");
-        let error = PackageTable::build(
+        let table = PackageTable::build(
             &config,
             &plain_graph(&config),
             Path::new("/proj/.dart_tool"),
         )
-        .expect_err("workspace root not a config root");
-        assert!(
-            error
-                .to_string()
-                .contains("must be one of the config roots"),
-            "unexpected error: {error}"
-        );
+        .expect("table");
+        let owner = |path: &str| {
+            table
+                .containing(Path::new(path))
+                .map(|identity| identity.name.as_str().to_owned())
+        };
+        // Inside the one config root: the walk owns it.
+        assert_eq!(owner("/proj/app/lib/a.dart"), Some("app".to_owned()));
+        assert_eq!(owner("/proj/app"), Some("app".to_owned()));
+        // The bound's own tree: walked unowned, fallback finds no root → None.
+        assert_eq!(owner("/proj/lib/a.dart"), None);
+        assert_eq!(owner("/proj"), None);
+        // The memo records the `None`s without poisoning the member tree.
+        assert_eq!(owner("/proj/app/lib/b.dart"), Some("app".to_owned()));
     }
 
     #[test]

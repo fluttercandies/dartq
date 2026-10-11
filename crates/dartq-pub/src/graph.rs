@@ -20,6 +20,7 @@ use dartq_source::{ContentId, content_hash};
 
 use crate::PubError;
 use crate::config::PackageConfig;
+use crate::freshness::StaleReason;
 use crate::lock::{LockDescription, LockFile, LockedPackage, SourceKind};
 use crate::pubspec::Pubspec;
 use crate::version::Version;
@@ -114,8 +115,14 @@ pub struct ResolvedPackageGraph {
     pub edges: Vec<PackageEdge>,
     pub root: PackageInstanceId,
     /// Workspace members when the root is a pub workspace, root excluded;
-    /// `None` outside workspaces.
+    /// `None` outside workspaces. Members absent from the config are
+    /// filtered out (config as written — outside the analysis universe).
     pub workspace_members: Option<Vec<PackageInstanceId>>,
+    /// Membership disagreements between the pubspec's wishes and the config
+    /// as written — root or declared member missing from the config. These
+    /// never abort assembly (the oracle reads the config as-is); the caller
+    /// turns them into `dartq/package_config_out_of_date` advisory reasons.
+    pub membership_findings: Vec<StaleReason>,
 }
 
 /// Assembles the graph from the resolution inputs.
@@ -127,11 +134,18 @@ pub struct ResolvedPackageGraph {
 /// path/git checkouts); hosted cache packages contribute instances but no
 /// outgoing edges.
 ///
+/// The graph is a faithful product of `(config, lock)`, not of the
+/// pubspec's wishes: a root or declared member missing from the config
+/// never aborts assembly (the oracle reads the config as-is) — the finding
+/// lands in [`ResolvedPackageGraph::membership_findings`] for the caller's
+/// stale-config advisory, and the root identity stays the pubspec name
+/// (backed by an instance exactly when the config covers it).
+///
 /// # Errors
 ///
-/// Returns [`PubError::Graph`] when the inputs disagree: the root missing
-/// from the config, duplicate config names, or a declared workspace member
-/// absent from the config.
+/// Returns [`PubError::Graph`] on duplicate config entry names — pub's
+/// hard error at config load (`package_config.dart:44-51`), which the
+/// oracle throws on too.
 pub fn build_graph(
     config: &PackageConfig,
     lock: &LockFile,
@@ -140,11 +154,11 @@ pub fn build_graph(
     workspace_members: Option<&[String]>,
     config_dir: &Path,
 ) -> Result<ResolvedPackageGraph, PubError> {
+    let mut membership_findings = Vec::new();
     if config.entry(&root.name).is_none() {
-        return Err(PubError::Graph(format!(
-            "root package `{}` is missing from package_config.json",
-            root.name
-        )));
+        membership_findings.push(StaleReason::RootMissingFromConfig {
+            name: root.name.clone(),
+        });
     }
 
     let mut instances = Vec::new();
@@ -208,14 +222,16 @@ pub fn build_graph(
     let workspace_members = match workspace_members {
         None => None,
         Some(members) => {
+            // Config as written: a member without a config entry is simply
+            // outside the analysis universe — filtered, and reported.
             let mut ids = Vec::with_capacity(members.len());
             for name in members {
-                if !names.contains(name) {
-                    return Err(PubError::Graph(format!(
-                        "workspace member `{name}` is missing from package_config.json"
-                    )));
+                if names.contains(name) {
+                    ids.push(PackageInstanceId(name.clone()));
+                } else {
+                    membership_findings
+                        .push(StaleReason::MemberMissingFromConfig { name: name.clone() });
                 }
-                ids.push(PackageInstanceId(name.clone()));
             }
             Some(ids)
         }
@@ -227,6 +243,7 @@ pub fn build_graph(
         edges,
         root: PackageInstanceId(root.name.clone()),
         workspace_members,
+        membership_findings,
     })
 }
 
@@ -344,7 +361,7 @@ fn collect_edges(
         };
         for dep in spec.dependencies.keys() {
             if !known.contains(dep) {
-                continue; // stale artifacts; Freshness reports this
+                continue; // stale artifacts; the freshness advisory reports this
             }
             insert(&name, dep, edge_kind);
             frontier.push((dep.clone(), reach));
@@ -642,7 +659,7 @@ dependency_overrides:
     }
 
     #[test]
-    fn workspace_members_validated_against_config() {
+    fn workspace_members_filter_to_the_config() {
         let config = config_from(CONFIG);
         let lock = lock_from(LOCK);
         let members = ["local_dep".to_owned()];
@@ -659,28 +676,76 @@ dependency_overrides:
             graph.workspace_members,
             Some(vec![PackageInstanceId("local_dep".into())])
         );
+        assert!(graph.membership_findings.is_empty());
 
-        let bogus = ["not_in_config".to_owned()];
-        let result = build_graph(
+        // A member without a config entry is filtered, not rejected — the
+        // config as written defines the analysis universe — and the finding
+        // is reported for the caller's advisory.
+        let bogus = ["local_dep".to_owned(), "not_in_config".to_owned()];
+        let graph = build_graph(
             &config,
             &lock,
             &root_pubspec(),
             &extra_pubspecs(),
             Some(&bogus),
             Path::new("/proj/.dart_tool"),
+        )
+        .expect("graph");
+        assert_eq!(
+            graph.workspace_members,
+            Some(vec![PackageInstanceId("local_dep".into())])
         );
-        assert!(matches!(result, Err(PubError::Graph(_))));
+        assert_eq!(
+            graph.membership_findings,
+            vec![StaleReason::MemberMissingFromConfig {
+                name: "not_in_config".into()
+            }]
+        );
     }
 
     #[test]
-    fn root_missing_from_config_is_an_error() {
+    fn root_missing_from_config_proceeds_with_a_finding() {
         let config = config_from(CONFIG);
         let lock = lock_from(LOCK);
         let stranger = Pubspec::parse("name: stranger\n").expect("ok");
-        let result = build_graph(
+        let graph = build_graph(
             &config,
             &lock,
             &stranger,
+            &BTreeMap::new(),
+            None,
+            Path::new("/proj/.dart_tool"),
+        )
+        .expect("graph");
+        // The root identity stays the pubspec name — defined, but backed by
+        // no instance because the config does not cover it.
+        assert_eq!(graph.root, PackageInstanceId("stranger".into()));
+        assert!(graph.instances.iter().all(|i| i.name != "stranger"));
+        assert_eq!(
+            graph.membership_findings,
+            vec![StaleReason::RootMissingFromConfig {
+                name: "stranger".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_config_names_stay_a_hard_error() {
+        let config = config_from(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "app", "rootUri": "../app"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        let lock = lock_from(LOCK);
+        let result = build_graph(
+            &config,
+            &lock,
+            &root_pubspec(),
             &BTreeMap::new(),
             None,
             Path::new("/proj/.dart_tool"),
