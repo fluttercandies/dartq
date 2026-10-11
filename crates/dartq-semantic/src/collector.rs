@@ -75,7 +75,7 @@ use dartq_parser::{
 };
 use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
-use dartq_scanner::TokenTable;
+use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
@@ -961,14 +961,28 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _begin: Token,
         _augment_kw: Option<Token>,
-        _base_kw: Option<Token>,
-        _mixin: Token,
+        base_kw: Option<Token>,
+        mixin: Token,
         name: Token,
     ) {
         let builder = &mut *self.builder.borrow_mut();
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Mixin, name, MicroKind::Mixin);
-        builder.mark_modifier(|open| open.is_base = _base_kw.is_some());
+        // `base` is the only legal mixin modifier, and the plain-`mixin`
+        // dispatch consumes it in the walk lookahead without forwarding it
+        // (the head reaches this event modifierless), so recover it from the
+        // token stream: `base` sits immediately before the `mixin` keyword
+        // exactly when the modifier row wrote it — no other token can stand
+        // between a declaration's modifier and its head keyword. The `mixin`
+        // keyword is always a scanned token (the dispatch cursor sits on
+        // it), so `id - 1` addresses its real predecessor.
+        let wrote_base = base_kw.is_some()
+            || mixin
+                .id
+                .checked_sub(1)
+                .and_then(|previous| builder.tokens.get(previous as usize))
+                .is_some_and(|token| token.kind == TokenKind::Keyword(Keyword::Base));
+        builder.mark_modifier(|open| open.is_base = wrote_base);
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {

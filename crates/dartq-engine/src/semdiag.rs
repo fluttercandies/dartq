@@ -60,22 +60,6 @@ fn duplicate_definition_name() -> &'static str {
         .name
 }
 
-/// The parse-phase declaration-site class-modifier rows the semantic fold
-/// re-emits from the frozen registry table (`dartq_resolution::modifiers`
-/// `ModifierCode::info`): the parser's recovery messages carry local text
-/// for the `abstract sealed`/`abstract final base`/`abstract final
-/// interface` pairs, while the registry rows carry the official
-/// problemMessage and correctionMessage — the semantic row is the single
-/// emission, exactly the `duplicate_definition` bake/fold split above. The
-/// enum/mixin/mixin-class rows stay parser-owned (the semantic layer has no
-/// keyword surface for them).
-fn reemitted_by_the_modifier_fold(name: &str) -> bool {
-    matches!(
-        name,
-        "abstract_sealed_class" | "abstract_final_base_class" | "abstract_final_interface_class"
-    )
-}
-
 /// The fold's element index: every resident file's model enters as an
 /// `Arc` clone of the facts' share — a refcount bump, never a deep clone
 /// (#308, consuming #286's shared index face). The whole
@@ -132,10 +116,12 @@ impl SemanticDiagnoser for Diagnoser {
                 // the view build, all-off without any.
                 library.strict,
             );
-            out.extend(report.diagnostics.into_iter().filter(|diagnostic| {
-                diagnostic.code.name != duplicate
-                    && !reemitted_by_the_modifier_fold(diagnostic.code.name)
-            }));
+            out.extend(
+                report
+                    .diagnostics
+                    .into_iter()
+                    .filter(|diagnostic| diagnostic.code.name != duplicate),
+            );
         }
     }
 }
