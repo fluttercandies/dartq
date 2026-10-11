@@ -608,8 +608,11 @@ impl PluginRuntime {
             // The death slot is authoritative (the reader records the cause
             // before sending the event; killers record before killing), so
             // build the error from it — which also adds the uniform
-            // restart-budget suffix at the accounting point.
-            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
+            // restart-budget suffix at the accounting point. A closed event
+            // channel is the same death observed from the reader side.
+            Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
+                Err(self.crash_error())
+            }
             Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
                 reason: "plugin re-handshaked mid-session".to_owned(),
             }),
@@ -630,7 +633,6 @@ impl PluginRuntime {
                     ms: u64::try_from(callback_ms).unwrap_or(u64::MAX),
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
         }
     }
 
@@ -671,8 +673,11 @@ impl PluginRuntime {
                 .saturating_duration_since(Instant::now()),
         ) {
             Ok(ProtocolEvent::ShutdownComplete) => Ok(()),
-            // Authoritative death slot, as in `request_fixes` (see there).
-            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
+            // Authoritative death slot, as in `request_fixes` (see there);
+            // a closed channel is the same death from the reader side.
+            Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
+                Err(self.crash_error())
+            }
             Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
                 reason: "plugin re-handshaked mid-session".to_owned(),
             }),
@@ -688,7 +693,6 @@ impl PluginRuntime {
                     ms: u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX),
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
         };
         if outcome.is_ok() {
             // Session over (wire contract). Closing stdin first is the
@@ -780,28 +784,25 @@ impl PluginRuntime {
         let (acks, acks_rx) = mpsc::channel();
         self.commands = Some(commands);
         self.acks = acks_rx;
-        self.reader = Some(spawn_reader(
-            stdout,
-            Arc::clone(&self.session),
-            Arc::clone(&self.pending),
-            events_tx,
-            Arc::clone(&self.analyze_clock),
-            Arc::clone(&self.alive),
-            Arc::clone(&self.death),
-            Arc::clone(&self.stats),
-        ));
+        let handles = GenerationHandles {
+            session: Arc::clone(&self.session),
+            pending: Arc::clone(&self.pending),
+            events: events_tx,
+            clock: Arc::clone(&self.analyze_clock),
+            running: Arc::clone(&self.running),
+            alive: Arc::clone(&self.alive),
+            death: Arc::clone(&self.death),
+            stats: Arc::clone(&self.stats),
+        };
+        self.reader = Some(spawn_reader(stdout, handles.clone()));
         self.writer = Some(spawn_writer(stdin, commands_rx, acks));
         self.monitor = Some(spawn_monitor(
+            handles,
             pid,
             self.memory_cap_bytes,
             self.callback_timeout,
             self.created,
-            Arc::clone(&self.analyze_clock),
             Arc::clone(&self.child),
-            Arc::clone(&self.running),
-            Arc::clone(&self.alive),
-            Arc::clone(&self.death),
-            Arc::clone(&self.stats),
         ));
 
         // Handshake: one `initialize`, reply awaited under the request budget.
@@ -819,8 +820,11 @@ impl PluginRuntime {
                 self.negotiated = Some(caps);
                 Ok(())
             }
-            // Authoritative death slot, as in `request_fixes` (see there).
-            Ok(ProtocolEvent::Dead) => Err(self.crash_error()),
+            // Authoritative death slot, as in `request_fixes` (see there);
+            // a closed channel is the same death from the reader side.
+            Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
+                Err(self.crash_error())
+            }
             Ok(ProtocolEvent::ShutdownComplete) => Err(RuntimeError::Crashed {
                 reason: "plugin answered shutdown before initialize".to_owned(),
             }),
@@ -836,7 +840,6 @@ impl PluginRuntime {
                     ms: u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX),
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.crash_error()),
         }
     }
 
@@ -964,29 +967,34 @@ impl Drop for PluginRuntime {
 
 // --- threads ---
 
-#[allow(clippy::needless_pass_by_value)]
-fn spawn_reader(
-    stdout: ChildStdout,
+/// The Arc'd per-generation state the worker threads share with the runtime.
+/// Cloning only bumps refcounts; each spawn site moves the bundle (or a
+/// clone) instead of threading eight separate parameters.
+#[derive(Clone)]
+struct GenerationHandles {
     session: Arc<Mutex<Session>>,
     pending: Arc<PendingDiagnostics>,
     events: Sender<ProtocolEvent>,
     clock: Arc<AnalyzeClock>,
+    running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
     stats: Arc<PluginStats>,
-) -> JoinHandle<()> {
+}
+
+fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("dartq-plugin-reader".to_owned())
         .spawn(move || {
             let outcome = run_reader(
                 BufReader::new(stdout),
-                &session,
-                &pending,
-                &events,
-                &stats,
-                &clock,
+                &h.session,
+                &h.pending,
+                &h.events,
+                &h.stats,
+                &h.clock,
             );
-            alive.store(false, Ordering::Relaxed);
+            h.alive.store(false, Ordering::Relaxed);
             if let Err(reason) = outcome {
                 // First-writer-wins on the death slot: every deterministic
                 // killer (monitor budget arms, request/write deadlines)
@@ -994,12 +1002,12 @@ fn spawn_reader(
                 // EOF is only the downstream observation of that kill and
                 // must not clobber the authoritative record. A genuine
                 // plugin-initiated close still lands — no prior writer.
-                let mut slot = death.lock().expect("death lock");
+                let mut slot = h.death.lock().expect("death lock");
                 if slot.is_none() {
                     *slot = Some(reason);
                 }
                 drop(slot);
-                let _ = events.send(ProtocolEvent::Dead);
+                let _ = h.events.send(ProtocolEvent::Dead);
             }
         })
         .expect("spawn reader thread")
@@ -1117,21 +1125,17 @@ fn spawn_writer(
 }
 
 fn spawn_monitor(
+    h: GenerationHandles,
     pid: u32,
     memory_cap_bytes: u64,
     callback_timeout: Duration,
     created: Instant,
-    clock: Arc<AnalyzeClock>,
     child: Arc<Mutex<Option<Child>>>,
-    running: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
-    death: Arc<Mutex<Option<String>>>,
-    stats: Arc<PluginStats>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("dartq-plugin-monitor".to_owned())
         .spawn(move || {
-            while running.load(Ordering::Relaxed) {
+            while h.running.load(Ordering::Relaxed) {
                 // §14.3 CPU row, analyze path: a fed demand that has produced
                 // no diagnostics for longer than the callback budget is the
                 // same isolation breach as the memory row. Checked before the
@@ -1141,26 +1145,26 @@ fn spawn_monitor(
                 // next interaction restarts instead of writing into the
                 // dying pipe, kill, and close the clock (the demand ends
                 // with the generation).
-                if let Some(open_for) = clock.open_for(created) {
-                    if open_for > callback_timeout {
-                        *death.lock().expect("death lock") = Some(format!(
-                            "no diagnostics were produced within the {} ms \
-                             analyze callback budget",
-                            callback_timeout.as_millis()
-                        ));
-                        alive.store(false, Ordering::Relaxed);
-                        if let Some(mut child) = child.lock().expect("child lock").take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        clock.close();
-                        break;
+                if let Some(open_for) = h.clock.open_for(created)
+                    && open_for > callback_timeout
+                {
+                    *h.death.lock().expect("death lock") = Some(format!(
+                        "no diagnostics were produced within the {} ms \
+                         analyze callback budget",
+                        callback_timeout.as_millis()
+                    ));
+                    h.alive.store(false, Ordering::Relaxed);
+                    if let Some(mut child) = child.lock().expect("child lock").take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
                     }
+                    h.clock.close();
+                    break;
                 }
                 match sample_rss(pid) {
                     // A zero sample (process gone) never raises the peak.
                     Some(rss) if rss > 0 => {
-                        stats.observe_rss(rss);
+                        h.stats.observe_rss(rss);
                         if rss > memory_cap_bytes {
                             // §14.3 memory enforcement: over-budget child
                             // dies. Record the cause so the crash diagnostic
@@ -1168,11 +1172,11 @@ fn spawn_monitor(
                             // the next interaction restarts instead of
                             // writing into the dying pipe; the reader's EOF
                             // turns this into the ordinary crash path.
-                            *death.lock().expect("death lock") = Some(format!(
+                            *h.death.lock().expect("death lock") = Some(format!(
                                 "RSS sample {rss} exceeded the {memory_cap_bytes}-byte \
                                  memory budget"
                             ));
-                            alive.store(false, Ordering::Relaxed);
+                            h.alive.store(false, Ordering::Relaxed);
                             if let Some(mut child) = child.lock().expect("child lock").take() {
                                 let _ = child.kill();
                                 let _ = child.wait();
@@ -1183,7 +1187,7 @@ fn spawn_monitor(
                     Some(_) => {}
                     None => break,
                 }
-                if !alive.load(Ordering::Relaxed) {
+                if !h.alive.load(Ordering::Relaxed) {
                     break;
                 }
                 std::thread::sleep(RSS_POLL_INTERVAL);
@@ -1356,7 +1360,9 @@ mod tests {
         // precision. Every open-state read passes the SAME reference the
         // monitor holds (`created`): a fresh `Instant::now()` would measure
         // elapsed ≈ 0 against the stored open-at and read 0 forever.
-        let created = Instant::now() - Duration::from_millis(500);
+        let created = Instant::now()
+            .checked_sub(Duration::from_millis(500))
+            .expect("clock goes back 500 ms");
         clock.open(created);
         let first = clock.open_for(created).expect("open after the feed");
 

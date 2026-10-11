@@ -15,7 +15,7 @@
 //! A missing `dart` skips at runtime (CI without the SDK must not go red);
 //! children are reaped by the runtime's own shutdown paths.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -42,6 +42,10 @@ const A_DART: &str = "import '\u{1F600}.dart';\nvoid main() {}\n";
 
 #[test]
 #[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+// One linear end-to-end scenario (discovery → spawn → feed → merge → fixes
+// → teardown) whose value is the uninterrupted sequence; carving it into
+// helpers would thread six Arcs of context for no reader benefit.
+#[expect(clippy::too_many_lines, reason = "see above")]
 fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -140,6 +144,9 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
         ),
     ];
     runtime.feed(&engine, &files).expect("engine feed");
+    // `Duration::from_minutes` is not stable on the pinned toolchain, so
+    // seconds remain the only expressible unit for this budget.
+    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_diagnostics(Duration::from_secs(60))
         .expect("plugin findings arrive within the drain budget");
@@ -345,7 +352,7 @@ struct MergedRow {
 /// repeated `(file, range.start, code, source)` key dropped.
 fn merge(engine: Vec<MergedRow>, mut findings: Vec<MergedRow>) -> Vec<MergedRow> {
     let mut merged = engine;
-    let mut seen: HashSet<(String, u32, u32, String, String)> = merged
+    let mut seen: FxHashSet<(String, u32, u32, String, String)> = merged
         .iter()
         .map(|row| {
             (

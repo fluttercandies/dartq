@@ -14,7 +14,7 @@
 //! build, so the gate's acceptance set can never silently shrink below the
 //! oracle's emit domain.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -175,8 +175,8 @@ fn pin_to_oracle_registry(manifest_dir: &Path, rows: &[Row]) {
     let snapshot = fs::read_to_string(&snapshot_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", snapshot_path.display()));
 
-    let tsv_names: HashSet<&str> = rows.iter().map(|row| row.name.as_str()).collect();
-    let mut exempted: HashSet<&str> = EXEMPTED_REGISTRY_CODES.into_iter().collect();
+    let tsv_names: FxHashSet<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+    let mut exempted: FxHashSet<&str> = EXEMPTED_REGISTRY_CODES.into_iter().collect();
     for (no, line) in snapshot.lines().enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() || line.starts_with('#') {
