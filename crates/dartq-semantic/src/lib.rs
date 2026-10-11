@@ -115,7 +115,7 @@ pub mod model;
 pub mod persisted;
 pub mod signature;
 
-pub use collector::collect;
+pub use collector::{collect, container_modifiers};
 pub use diagnose::{FileReport, NameRow, NameUse, StrictModes, diagnose, diagnose_with};
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,

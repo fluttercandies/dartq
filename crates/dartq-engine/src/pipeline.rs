@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use dartq_diagnostics::Diagnostic;
 use dartq_index::FileCapture;
 use dartq_resolution::{
-    Combinators, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
-    ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
+    ClassModifiers, Combinators, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder,
+    Namespaces, ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
 use dartq_semantic::MicroKind;
 use dartq_source::{FileId, FileTable, StringTable};
@@ -500,6 +500,18 @@ fn capture_surface(
     )
 }
 
+/// The declared modifier facts of a class-family declaration (class, mixin,
+/// enum), read through the semantic model's kind mapping — `None` for every
+/// other declaration shape and for container names without a captured model.
+fn class_modifier_facts(
+    elements: &dartq_semantic::FileElements,
+    name: dartq_source::StringId,
+) -> Option<ClassModifiers> {
+    elements
+        .container(name)
+        .map(dartq_semantic::container_modifiers)
+}
+
 /// The dart:core public face the engine's implicit core import resolves
 /// against: dart:core's own top-level declarations plus its
 /// `dart:async`/`dart:collection` export face, verbatim from the reference
@@ -635,8 +647,16 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         graph_ids.insert(library, graph_id);
         for file in member_files(info) {
             for (name, declaration) in state.residency[&file].elements.declarations() {
-                if declaration.kind != MicroKind::TypeParam {
-                    builder.declare(graph_id, name, file);
+                if declaration.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                // Class-family declarations register their declared modifier
+                // flags with the name (the M2 cross-library restriction
+                // facts, `dartq_resolution::modifiers`); every other shape
+                // registers as a plain declaration.
+                match class_modifier_facts(&state.residency[&file].elements, name) {
+                    Some(modifiers) => builder.declare_class(graph_id, name, file, modifiers),
+                    None => builder.declare(graph_id, name, file),
                 }
             }
         }

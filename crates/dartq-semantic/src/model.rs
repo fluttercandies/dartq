@@ -325,6 +325,16 @@ pub struct Container {
     /// kinds, which cannot be abstract). The abstract-completeness check
     /// reads it (concrete classes only).
     pub is_abstract: bool,
+    /// The `base` keyword was present on the header (classes, mixins, mixin
+    /// classes). The class-modifier restriction checks read it
+    /// (`dartq_resolution::modifiers`).
+    pub is_base: bool,
+    /// The `final` keyword was present on a class-family header.
+    pub is_final: bool,
+    /// The `interface` keyword was present on a class-family header.
+    pub is_interface: bool,
+    /// The declaration is the `mixin class` form.
+    pub is_mixin_class: bool,
     /// The direct superclass name (`extends S` / a named mixin application's
     /// head type), name-level; `None` when absent or unrecoverable.
     pub superclass: Option<StringId>,

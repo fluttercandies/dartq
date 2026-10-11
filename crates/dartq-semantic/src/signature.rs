@@ -317,6 +317,10 @@ impl<'a> Face<'a> {
             let Container {
                 kind,
                 is_abstract,
+                is_base,
+                is_final,
+                is_interface,
+                is_mixin_class,
                 superclass,
                 members,
                 type_params,
@@ -343,6 +347,21 @@ impl<'a> Face<'a> {
             self.uint(u64::from(*type_params));
             self.field(if *is_abstract { "abstract" } else { "concrete" });
             self.field(if *sealed { "sealed" } else { "unsealed" });
+            // The declared class-modifier facts: a modifier-only edit moves
+            // diagnostics (the restriction families), so it must flip the
+            // L2 gate.
+            self.field(if *is_base { "base" } else { "plain" });
+            self.field(if *is_final { "final" } else { "nonfinal" });
+            self.field(if *is_interface {
+                "interface"
+            } else {
+                "noninterface"
+            });
+            self.field(if *is_mixin_class {
+                "mixin-class"
+            } else {
+                "nominal-class"
+            });
             match superclass {
                 Some(superclass) => self.name(*superclass),
                 None => self.field("no-superclass"),

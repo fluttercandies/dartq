@@ -267,19 +267,30 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use dartq_diagnostics::{Diagnostic, Severity};
+use dartq_diagnostics::{CodeInfo, Diagnostic, Severity};
 use dartq_flow::{Flow, FlowFact};
 use dartq_parser::{
     AssertKind, BlockKind, ConstructorReferenceContext, DeclarationKind, ExperimentalFlag,
     FormalParameterKind, IdentifierContext, Message, Parser, ParserFeatures, ParserListener,
     TokenSpan as Token,
 };
-use dartq_resolution::{ImportEdge, LibraryGraph, LibraryId, NamespaceEntry, Namespaces};
+use dartq_resolution::modifiers::{
+    ClassModifiers, DeclarationViolation, ExplicitBaseFinal, ImplementsStep, InducedModifier,
+    ModifierCode, ModifierHierarchy, ModifierKeyword, Relation, SubtypeRestrictionInput,
+    SuperFacts, base_implemented_candidate, declaration_violations, final_extends_violation,
+    final_implements_candidate, final_mixin_constraint_violation, induced_modifier,
+    interface_extends_violation, may_ignore_class_modifiers, nearest_explicit_base_or_final,
+    sealed_supertype_violation, subtype_restriction_violation,
+};
+use dartq_resolution::{
+    ImportEdge, LibraryFeatureFacts, LibraryGraph, LibraryId, NamespaceEntry, Namespaces,
+};
 use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
+use crate::collector::container_modifiers;
 use crate::const_eval::{
     BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, IdentVerdict, UnOp, Verdict, eval,
 };
@@ -1104,6 +1115,10 @@ struct Engine<'a> {
     /// pass (one emission per container: an augmentation re-fires the
     /// event).
     reported_face_checks: FxHashSet<StringId>,
+    /// Containers whose class-modifier restriction checks (#600) already
+    /// ran this pass (one emission per container: an augmentation re-fires
+    /// the event).
+    reported_modifier_checks: FxHashSet<StringId>,
     /// The #279 constant-evaluation capture: expression folding while a
     /// const context is open ([`crate::const_eval`]).
     const_capture: ConstCapture,
@@ -1436,6 +1451,7 @@ impl<'a> Engine<'a> {
             owner_libs: RefCell::new(FxHashMap::default()),
             reported_extension_types: FxHashSet::default(),
             reported_face_checks: FxHashSet::default(),
+            reported_modifier_checks: FxHashSet::default(),
             locals: Vec::new(),
             frame_local_marks: Vec::new(),
             local_hits: FxHashMap::default(),
@@ -1570,6 +1586,24 @@ impl<'a> Engine<'a> {
             self.file,
             range,
             None,
+        ));
+    }
+
+    /// The class-modifier emit: the resolution layer's frozen registry row
+    /// (`ModifierCode::info`) rendered through the shared diagnostic model —
+    /// the template-fill shape the resolution family's engine-side emitter
+    /// uses (`l1::combinator_diagnostic`). `{0}`/`{1}` fill the outside-
+    /// library and subtype-family templates; the declaration-site rows carry
+    /// no arguments.
+    fn emit_modifier(&mut self, code: ModifierCode, range: SourceRange, a0: &str, a1: &str) {
+        let info = code.info();
+        self.report.diagnostics.push(Diagnostic::new(
+            info.dtype.severity(),
+            CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
+            info.message.replace("{0}", a0).replace("{1}", a1),
+            self.file,
+            range,
+            info.correction.map(str::to_owned),
         ));
     }
 
@@ -3648,6 +3682,328 @@ impl<'a> Engine<'a> {
         }
         let text = self.strings.resolve(owner);
         self.emit(SemanticCode::MustCallSuper, range, &text, "");
+    }
+
+    // —— class-modifier restriction families (#600) ——————————————————————
+
+    /// The declaration-site combination face (`parser_impl.dart:2976-3015`
+    /// through [`declaration_violations`]): the written header keywords
+    /// decide, and each violation anchors on its keyword token(s) — the
+    /// single keyword for the one-anchor rows, the `final`→`base`/
+    /// `interface` coverage for the spanned `abstract final …` pairs.
+    /// `anchors` carries the present keywords' spans.
+    fn check_modifier_declaration(
+        &mut self,
+        modifiers: &ClassModifiers,
+        anchors: &[(ModifierKeyword, SourceRange)],
+    ) {
+        for violation in declaration_violations(modifiers) {
+            let range = violation_span(&violation, anchors);
+            // The declaration-site rows are frozen zero-argument templates.
+            self.emit_modifier(violation.code, range, "", "");
+        }
+    }
+
+    /// The use-site restriction families, driven at the container's name
+    /// event (the element model is complete and the name token anchors the
+    /// emissions): the outside-library family (`error_verifier.dart`
+    /// `_checkFor*OutsideOfLibrary`, drive order base-implemented walks →
+    /// interface extends → final faces → sealed faces) and the
+    /// base-or-final subtype requirement (`BaseOrFinalTypeVerifier
+    /// .checkElement`, face order superclass → implements → with → `on`,
+    /// one error per element). Classes and named mixin applications carry
+    /// extends/with/implements, mixins implements/`on`; enums have no
+    /// official drive.
+    ///
+    /// Span note: the oracle anchors the outside-library rows on the
+    /// supertype's type annotation and the subtype rows on the declaring
+    /// name; the element model keeps clause names at the name level, so
+    /// every row anchors on the container's name token — a documented span
+    /// divergence for the outside-library family.
+    fn check_modifier_use_sites(&mut self, container: StringId, name_range: SourceRange) {
+        if !self.reported_modifier_checks.insert(container) {
+            return;
+        }
+        for finding in self.plan_modifier_use_sites(container) {
+            self.emit_modifier(finding.code, name_range, &finding.a0, &finding.a1);
+        }
+    }
+
+    /// The library facts the platform-exemption gate reads. `is_sdk` is the
+    /// graph URI's `dart:` prefix (the synthetic SDK faces); SDK faces
+    /// register no class declarations in this system, so the exemption's
+    /// SDK branch has no reachable input, and `has_class_modifiers` is the
+    /// modern-library posture — dartq's supported universe is
+    /// class-modifiers-enabled. A pre-`@dart=3.0` use site may therefore
+    /// over-report: a documented divergence, unreachable in the oracle
+    /// corpus.
+    fn library_facts(&self, lib: LibraryId) -> LibraryFeatureFacts {
+        LibraryFeatureFacts {
+            is_sdk: self.graph.uri(lib).starts_with("dart:"),
+            has_class_modifiers: true,
+        }
+    }
+
+    /// Resolves one written super-face name to its declaring handle and
+    /// library (#491 S2a attribution); `None` suppresses the face.
+    fn resolve_super(&self, name: StringId) -> Option<((FileId, StringId), LibraryId)> {
+        resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )?;
+        let lib = owner_library(self.graph, self.lib, self.file, name).unwrap_or(self.lib);
+        Some(((self.file, name), lib))
+    }
+
+    /// The use-site decisions, computed read-only and emitted by the caller:
+    /// every super face resolves through the fold's namespace hop (an
+    /// unresolvable face suppresses — the under-report direction), and the
+    /// effective-modifier facts (declared + sealed-class induced) come from
+    /// the [`FoldHierarchy`].
+    #[allow(clippy::too_many_lines)] // the five official passes, one linear sequence
+    fn plan_modifier_use_sites(&self, container: StringId) -> Vec<ModifierFinding> {
+        let Some(elements) = self.index.get(self.file) else {
+            return Vec::new();
+        };
+        let Some(decl) = elements.container(container) else {
+            return Vec::new();
+        };
+        let display = |name: StringId| self.strings.resolve(name).to_owned();
+        let element = (self.file, container);
+        let use_facts = self.library_facts(self.lib);
+        let hierarchy = FoldHierarchy {
+            graph: self.graph,
+            namespaces: self.namespaces,
+            index: self.index,
+            file: self.file,
+            lib: self.lib,
+            memo: RefCell::default(),
+            in_progress: RefCell::default(),
+        };
+        // The resolved faces, written order within a clause. The extends
+        // head exists on class-family declarations only (mixins have no
+        // superclass; enums never reach this face).
+        let mut extends: Option<ResolvedSuper> = None;
+        let mut withs: Vec<ResolvedSuper> = Vec::new();
+        let mut implements: Vec<ResolvedSuper> = Vec::new();
+        let mut ons: Vec<ResolvedSuper> = Vec::new();
+        if let Some(name) = decl.superclass
+            && let Some((handle, lib)) = self.resolve_super(name)
+        {
+            extends = Some(ResolvedSuper {
+                handle,
+                lib,
+                relation: Relation::Extends,
+            });
+        }
+        for name in &decl.with_clause {
+            if let Some((handle, lib)) = self.resolve_super(*name) {
+                withs.push(ResolvedSuper {
+                    handle,
+                    lib,
+                    relation: Relation::MixesIn,
+                });
+            }
+        }
+        for name in &decl.implements_clause {
+            if let Some((handle, lib)) = self.resolve_super(*name) {
+                implements.push(ResolvedSuper {
+                    handle,
+                    lib,
+                    relation: Relation::Implements,
+                });
+            }
+        }
+        for name in &decl.on_clause {
+            if let Some((handle, lib)) = self.resolve_super(*name) {
+                ons.push(ResolvedSuper {
+                    handle,
+                    lib,
+                    relation: Relation::MixinConstraint,
+                });
+            }
+        }
+        let super_facts = |entry: &ResolvedSuper| SuperFacts {
+            modifiers: hierarchy.effective(entry.handle),
+            same_library: hierarchy.library_of(entry.handle) == self.lib,
+            may_ignore: may_ignore_class_modifiers(
+                self.library_facts(hierarchy.library_of(entry.handle)),
+                use_facts,
+            ),
+        };
+        let mut findings = Vec::new();
+        // The class-family/mixin drive split (error_verifier.dart:2770-2784
+        // and :8195-8206): enums carry neither.
+        let class_family = decl.kind == ContainerKind::Class;
+        // Pass 1 — the base-implemented walks (`implements` entries, the
+        // named type plus its transitive supertypes, first report per
+        // entry; :3712-3752).
+        for entry in &implements {
+            for (handle, _) in std::iter::once((entry.handle, true)).chain(
+                hierarchy
+                    .closure(entry.handle)
+                    .into_iter()
+                    .map(|h| (h, false)),
+            ) {
+                let facts = SuperFacts {
+                    modifiers: hierarchy.effective(handle),
+                    same_library: hierarchy.library_of(handle) == self.lib,
+                    may_ignore: may_ignore_class_modifiers(
+                        self.library_facts(hierarchy.library_of(handle)),
+                        use_facts,
+                    ),
+                };
+                if let Some(code) = base_implemented_candidate(&facts) {
+                    findings.push(ModifierFinding {
+                        code,
+                        a0: display(handle.1),
+                        a1: String::new(),
+                    });
+                    break;
+                }
+            }
+        }
+        // Pass 2 — the interface extends face (class drive only;
+        // :5896-5926).
+        if let Some(entry) = &extends
+            && let Some(code) = interface_extends_violation(&super_facts(entry))
+        {
+            findings.push(ModifierFinding {
+                code,
+                a0: display(entry.handle.1),
+                a1: String::new(),
+            });
+        }
+        // Pass 3 — the final faces, official order: extends head
+        // (:5612-5627), `implements` walks (:5628-5665), `on` constraints
+        // (:5666-5686, mixin drive only).
+        if let Some(entry) = &extends
+            && let Some(code) = final_extends_violation(&super_facts(entry))
+        {
+            findings.push(ModifierFinding {
+                code,
+                a0: display(entry.handle.1),
+                a1: String::new(),
+            });
+        }
+        for entry in &implements {
+            let named_facts = self.library_facts(entry.lib);
+            for (handle, is_named) in std::iter::once((entry.handle, true)).chain(
+                hierarchy
+                    .closure(entry.handle)
+                    .into_iter()
+                    .map(|h| (h, false)),
+            ) {
+                let facts = SuperFacts {
+                    modifiers: hierarchy.effective(handle),
+                    same_library: hierarchy.library_of(handle) == self.lib,
+                    may_ignore: may_ignore_class_modifiers(
+                        self.library_facts(hierarchy.library_of(handle)),
+                        use_facts,
+                    ),
+                };
+                if let Some(code) = final_implements_candidate(
+                    &facts,
+                    &ImplementsStep {
+                        is_named_type: is_named,
+                        named_type_has_class_modifiers: named_facts.has_class_modifiers,
+                    },
+                ) {
+                    findings.push(ModifierFinding {
+                        code,
+                        a0: display(handle.1),
+                        a1: String::new(),
+                    });
+                    break;
+                }
+            }
+        }
+        for entry in &ons {
+            if let Some(code) = final_mixin_constraint_violation(&super_facts(entry)) {
+                findings.push(ModifierFinding {
+                    code,
+                    a0: display(entry.handle.1),
+                    a1: String::new(),
+                });
+            }
+        }
+        // Pass 4 — the sealed faces, every written face checked
+        // independently (the official NamedType lists: class drive
+        // superclass + `implements`, mixin drive `implements` + `on`;
+        // :7424-7437). The official class drive also lists the `with` types
+        // (:2780-2784), but that drive sits behind the
+        // `_checkForAllMixinErrorCodes` gate (:2746-2752) and a sealed
+        // *proper mixin* cannot exist (the declaration matrix forbids
+        // `sealed mixin`) — every reachable `with` input trips the gate's
+        // with-non-mixin problem, so the observable oracle never reports
+        // sealed through `with`. The `with` face stays out of the list.
+        let sealed_faces: Vec<&ResolvedSuper> = if class_family {
+            extends.iter().chain(implements.iter()).collect()
+        } else {
+            implements.iter().chain(ons.iter()).collect()
+        };
+        for entry in &sealed_faces {
+            if let Some(code) = sealed_supertype_violation(&super_facts(entry)) {
+                findings.push(ModifierFinding {
+                    code,
+                    a0: display(entry.handle.1),
+                    a1: String::new(),
+                });
+            }
+        }
+        // Pass 5 — the base-or-final subtype requirement, official face
+        // order superclass → implements → with → `on` (classes) /
+        // implements → `on` (mixins), one error per element
+        // (base_or_final_type_verifier.dart:47-74). The `{1}` slot names
+        // the nearest explicit `base`/`final` ancestor, not the direct
+        // super (:198/:222-315).
+        let subtype_faces: Vec<&ResolvedSuper> = if class_family {
+            extends
+                .iter()
+                .chain(implements.iter())
+                .chain(withs.iter())
+                .collect()
+        } else {
+            implements.iter().chain(ons.iter()).collect()
+        };
+        let element_mods = hierarchy.effective(element);
+        for entry in subtype_faces {
+            let Some(ancestor) = nearest_explicit_base_or_final(&hierarchy, entry.handle) else {
+                continue;
+            };
+            let ancestor_lib = hierarchy.library_of(ancestor);
+            // The official same-library gate (:185-187) is
+            // `element.library != _definingLibrary` — trivially false for
+            // declarations diagnosed in their own library; the ancestor
+            // equality that drives the final-family carve-out (:264-279)
+            // is the `ExplicitBaseFinal` field.
+            let input = SubtypeRestrictionInput {
+                element: element_mods,
+                element_library: use_facts,
+                super_element: hierarchy.effective(entry.handle),
+                super_library: self.library_facts(entry.lib),
+                same_library: true,
+                explicit_base_or_final: Some(ExplicitBaseFinal {
+                    modifiers: hierarchy.effective(ancestor),
+                    library: self.library_facts(ancestor_lib),
+                    same_library: ancestor_lib == self.lib,
+                }),
+                via_implements: entry.relation == Relation::Implements,
+            };
+            if let Some(code) = subtype_restriction_violation(&input) {
+                findings.push(ModifierFinding {
+                    code,
+                    a0: display(container),
+                    a1: display(ancestor.1),
+                });
+                break;
+            }
+        }
+        findings
     }
 
     // —— abstract completeness + interface conflicts (#498) ———————————
@@ -8258,22 +8614,287 @@ pub fn diagnose_with(
     report
 }
 
+/// One planned class-modifier emission: the code and its filled message
+/// arguments (the outside-library family fills `{0}` with the super/ancestor
+/// display name; the subtype family fills `{0}` with the subtype and `{1}`
+/// with the explicit ancestor).
+struct ModifierFinding {
+    code: ModifierCode,
+    a0: String,
+    a1: String,
+}
+
+/// One resolved super face of the diagnosed container: the declaring
+/// handle, its library (#491 S2a attribution), and the clause the name was
+/// written through.
+struct ResolvedSuper {
+    handle: (FileId, StringId),
+    lib: LibraryId,
+    relation: Relation,
+}
+
+/// The anchor span of a declaration-site violation: the single keyword's
+/// span, or the `first`→`second` coverage for the spanned `abstract final …`
+/// pairs (the frozen table carries at most two anchors).
+fn violation_span(
+    violation: &DeclarationViolation,
+    anchors: &[(ModifierKeyword, SourceRange)],
+) -> SourceRange {
+    let span_of = |keyword| {
+        anchors
+            .iter()
+            .find(|(candidate, _)| candidate == keyword)
+            .map(|(_, range)| *range)
+    };
+    let mut spans = violation
+        .anchors
+        .iter()
+        .filter_map(|keyword| span_of(keyword));
+    let first = spans
+        .next()
+        .expect("violation anchors name written keywords");
+    match spans.next() {
+        None => first,
+        Some(second) => SourceRange {
+            offset: first.offset,
+            length: second.offset + second.length - first.offset,
+        },
+    }
+}
+
+/// The [`ModifierHierarchy`] over the fold's element index: declarations are
+/// `(owner file, container name)` pairs resolved through the same namespace
+/// hop the member walks use, with the walk order the official preorder
+/// (extends head, `implements`, `with`, `on` — base_or_final_type_verifier
+/// .dart:115-132). The effective-modifier memo computes the sealed-class
+/// induced flags (`_setInducedModifier`, instance_member_inferrer
+/// .dart:649-719) lazily over the same index; a cycle revisit answers
+/// declared-only flags (a revisit cannot change the induced answer).
+struct FoldHierarchy<'a> {
+    graph: &'a LibraryGraph,
+    namespaces: &'a Namespaces,
+    index: &'a ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+    memo: RefCell<FxHashMap<(FileId, StringId), ClassModifiers>>,
+    in_progress: RefCell<FxHashSet<(FileId, StringId)>>,
+}
+
+impl FoldHierarchy<'_> {
+    /// The declared modifiers of `handle`, or `None` when the name resolves
+    /// to no container in the index (a broken face — suppress).
+    fn declared(&self, handle: (FileId, StringId)) -> Option<ClassModifiers> {
+        let (owner_file, name) = handle;
+        let (container, _) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            owner_file,
+            name,
+        )?;
+        Some(container_modifiers(container))
+    }
+
+    /// The effective modifiers: declared flags plus the sealed-class induced
+    /// flag computed from the direct faces' effective flags
+    /// (`_setInducedModifier`), memoized per fold.
+    fn effective(&self, handle: (FileId, StringId)) -> ClassModifiers {
+        if let Some(&cached) = self.memo.borrow().get(&handle) {
+            return cached;
+        }
+        let Some(mut mods) = self.declared(handle) else {
+            return ClassModifiers::default();
+        };
+        // Only sealed classes carry induced modifiers (:651-653).
+        if !mods.sealed_face() {
+            self.memo.borrow_mut().insert(handle, mods);
+            return mods;
+        }
+        if !self.in_progress.borrow_mut().insert(handle) {
+            return mods; // cycle revisit: the outer frame completes the value
+        }
+        // The induction reads the extends head, the `implements` list, and
+        // the `with` list (:655-718); `on` constraints do not participate
+        // for the sealed classes that carry induced flags.
+        let (supertype, interfaces, withs, _) = self.face_handles(handle);
+        let supertype = supertype.map(|supertype| self.effective(supertype));
+        let interfaces: Vec<ClassModifiers> = interfaces
+            .iter()
+            .map(|handle| self.effective(*handle))
+            .collect();
+        let mixins: Vec<ClassModifiers> =
+            withs.iter().map(|handle| self.effective(*handle)).collect();
+        match induced_modifier(&mods, supertype.as_ref(), &interfaces, &mixins) {
+            Some(InducedModifier::Final) => mods.is_final = true,
+            Some(InducedModifier::Base) => mods.is_base = true,
+            Some(InducedModifier::Interface) => mods.is_interface = true,
+            None => {}
+        }
+        self.in_progress.borrow_mut().remove(&handle);
+        self.memo.borrow_mut().insert(handle, mods);
+        mods
+    }
+
+    /// The resolved direct super handles: the extends head, then the
+    /// `implements` list, then the `with` list, then the `on` constraints
+    /// (base_or_final_type_verifier.dart:115-132). A super name resolves
+    /// through its declaring container's library (the #491 S2a hop);
+    /// unresolvable names drop out.
+    fn face_handles(
+        &self,
+        handle: (FileId, StringId),
+    ) -> (
+        Option<(FileId, StringId)>,
+        Vec<(FileId, StringId)>,
+        Vec<(FileId, StringId)>,
+        Vec<(FileId, StringId)>,
+    ) {
+        let (owner_file, name) = handle;
+        let Some((container, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            owner_file,
+            name,
+        ) else {
+            return (None, Vec::new(), Vec::new(), Vec::new());
+        };
+        let scope_lib = owner_library(self.graph, self.lib, owner_file, name).unwrap_or(self.lib);
+        let hop = |name: StringId| {
+            resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                scope_lib,
+                owner_file,
+                name,
+            )
+            .map(|(_, owner)| (owner, name))
+        };
+        (
+            container.superclass.and_then(|name| hop(name)),
+            container
+                .implements_clause
+                .iter()
+                .filter_map(|name| hop(*name))
+                .collect(),
+            container
+                .with_clause
+                .iter()
+                .filter_map(|name| hop(*name))
+                .collect(),
+            container
+                .on_clause
+                .iter()
+                .filter_map(|name| hop(*name))
+                .collect(),
+        )
+    }
+
+    /// The hierarchy walk order: the extends head, then `implements`, then
+    /// `with`, then `on`.
+    fn walk_supertypes(&self, handle: (FileId, StringId)) -> Vec<(FileId, StringId)> {
+        let (supertype, implements, withs, ons) = self.face_handles(handle);
+        supertype
+            .into_iter()
+            .chain(implements)
+            .chain(withs)
+            .chain(ons)
+            .collect()
+    }
+
+    /// The resolved supertype closure (the official `allSupertypes` face):
+    /// BFS over [`Self::walk_supertypes`], cycle-guarded; the start is not
+    /// included.
+    fn closure(&self, start: (FileId, StringId)) -> Vec<(FileId, StringId)> {
+        let mut out = Vec::new();
+        let mut visited = FxHashSet::default();
+        visited.insert(start);
+        let mut queue = self.walk_supertypes(start);
+        let mut cursor = 0;
+        while cursor < queue.len() {
+            let handle = queue[cursor];
+            cursor += 1;
+            if visited.insert(handle) {
+                out.push(handle);
+                queue.extend(self.walk_supertypes(handle));
+            }
+        }
+        out
+    }
+
+    /// The library whose scope owns `handle`'s declaration (#491 S2a); the
+    /// fold's own library when the probe cannot attribute it (under-report).
+    fn library_of(&self, handle: (FileId, StringId)) -> LibraryId {
+        let (owner_file, name) = handle;
+        if owner_file == self.file {
+            return self.lib;
+        }
+        owner_library(self.graph, self.lib, owner_file, name).unwrap_or(self.lib)
+    }
+}
+
+impl ModifierHierarchy for FoldHierarchy<'_> {
+    type Decl = (FileId, StringId);
+
+    fn modifiers(&self, decl: Self::Decl) -> ClassModifiers {
+        self.effective(decl)
+    }
+
+    fn supertypes(&self, decl: Self::Decl) -> Vec<Self::Decl> {
+        self.walk_supertypes(decl)
+    }
+}
+
 impl ParserListener for DiagnoseListener<'_> {
     // —— frames: containers ——————————————————————————————————————————
 
     fn begin_class_declaration(
         &mut self,
         _begin: Token,
-        _abstract_kw: Option<Token>,
-        _sealed_kw: Option<Token>,
-        _base_kw: Option<Token>,
-        _interface_kw: Option<Token>,
-        _final_kw: Option<Token>,
+        abstract_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
         _augment_kw: Option<Token>,
-        _mixin_kw: Option<Token>,
+        mixin_kw: Option<Token>,
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        // The declaration-site combination face reads the written header
+        // keywords (parser_impl.dart:2976-3015); each violation anchors on
+        // its own keyword tokens.
+        let mut anchors: Vec<(ModifierKeyword, SourceRange)> = Vec::new();
+        if let Some(token) = abstract_kw {
+            anchors.push((ModifierKeyword::Abstract, token.range));
+        }
+        if let Some(token) = sealed_kw {
+            anchors.push((ModifierKeyword::Sealed, token.range));
+        }
+        if let Some(token) = base_kw {
+            anchors.push((ModifierKeyword::Base, token.range));
+        }
+        if let Some(token) = interface_kw {
+            anchors.push((ModifierKeyword::Interface, token.range));
+        }
+        if let Some(token) = final_kw {
+            anchors.push((ModifierKeyword::Final, token.range));
+        }
+        engine.check_modifier_declaration(
+            &ClassModifiers {
+                kind: dartq_resolution::modifiers::DeclKind::Class,
+                is_abstract: abstract_kw.is_some(),
+                is_sealed: sealed_kw.is_some(),
+                is_base: base_kw.is_some(),
+                is_interface: interface_kw.is_some(),
+                is_final: final_kw.is_some(),
+                is_mixin_class: mixin_kw.is_some(),
+            },
+            &anchors,
+        );
         let name_range = name.range;
         engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
@@ -8281,6 +8902,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(name) = name {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
+            engine.check_modifier_use_sites(name, name_range);
         }
     }
 
@@ -8291,16 +8913,46 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_named_mixin_application(
         &mut self,
         _begin: Token,
-        _abstract_kw: Option<Token>,
-        _sealed_kw: Option<Token>,
-        _base_kw: Option<Token>,
-        _interface_kw: Option<Token>,
-        _final_kw: Option<Token>,
+        abstract_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
         _augment_kw: Option<Token>,
         _mixin_kw: Option<Token>,
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        // The same declaration-site combination face as a class header
+        // (the official parser shares the production).
+        let mut anchors: Vec<(ModifierKeyword, SourceRange)> = Vec::new();
+        if let Some(token) = abstract_kw {
+            anchors.push((ModifierKeyword::Abstract, token.range));
+        }
+        if let Some(token) = sealed_kw {
+            anchors.push((ModifierKeyword::Sealed, token.range));
+        }
+        if let Some(token) = base_kw {
+            anchors.push((ModifierKeyword::Base, token.range));
+        }
+        if let Some(token) = interface_kw {
+            anchors.push((ModifierKeyword::Interface, token.range));
+        }
+        if let Some(token) = final_kw {
+            anchors.push((ModifierKeyword::Final, token.range));
+        }
+        engine.check_modifier_declaration(
+            &ClassModifiers {
+                kind: dartq_resolution::modifiers::DeclKind::Class,
+                is_abstract: abstract_kw.is_some(),
+                is_sealed: sealed_kw.is_some(),
+                is_base: base_kw.is_some(),
+                is_interface: interface_kw.is_some(),
+                is_final: final_kw.is_some(),
+                is_mixin_class: false,
+            },
+            &anchors,
+        );
         let name_range = name.range;
         engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
@@ -8308,6 +8960,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(name) = name {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
+            engine.check_modifier_use_sites(name, name_range);
         }
     }
 
@@ -8326,11 +8979,24 @@ impl ParserListener for DiagnoseListener<'_> {
         &mut self,
         _begin: Token,
         _augment_kw: Option<Token>,
-        _base_kw: Option<Token>,
+        base_kw: Option<Token>,
         _mixin: Token,
         name: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        // `base` is the only legal mixin modifier; the declaration-site
+        // face still runs so a written `final`/`interface`/`sealed` the
+        // parser surfaces would decide through the frozen matrix.
+        if let Some(token) = base_kw {
+            engine.check_modifier_declaration(
+                &ClassModifiers {
+                    kind: dartq_resolution::modifiers::DeclKind::Mixin,
+                    is_base: true,
+                    ..ClassModifiers::default()
+                },
+                &[(ModifierKeyword::Base, token.range)],
+            );
+        }
         let name_range = name.range;
         engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
@@ -8338,6 +9004,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(name) = name {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Mixin, name_range);
+            engine.check_modifier_use_sites(name, name_range);
         }
     }
 

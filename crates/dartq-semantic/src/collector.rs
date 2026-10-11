@@ -74,6 +74,7 @@ use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
 };
 use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
+use dartq_resolution::{ClassModifiers, DeclKind};
 use dartq_scanner::TokenTable;
 use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
@@ -93,6 +94,10 @@ const OPERATORS_WITH_ONE_PARAMETER: [&str; 16] = [
 ];
 
 /// An open container on the capture stack.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one declared modifier keyword or one capture bit"
+)]
 struct OpenContainer {
     /// Lookup spelling with the name token's span (the duplicate log's
     /// location surface; the spelling is what the model keeps).
@@ -101,6 +106,13 @@ struct OpenContainer {
     superclass: Option<StringId>,
     /// The header's `abstract` modifier (class-family only).
     is_abstract: bool,
+    /// The header's `base`/`final`/`interface` keywords and the `mixin
+    /// class` form (the class-modifier fact set; the resolution graph's
+    /// `declare_class` feed and the modifier restriction checks read them).
+    is_base: bool,
+    is_final: bool,
+    is_interface: bool,
+    is_mixin_class: bool,
     members: FxHashMap<StringId, MemberEntry>,
     type_params: u16,
     /// The `sealed` modifier was present on the class header.
@@ -433,6 +445,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             kind,
             superclass: None,
             is_abstract: false,
+            is_base: false,
+            is_final: false,
+            is_interface: false,
+            is_mixin_class: false,
             members: FxHashMap::default(),
             type_params: header_type_params,
             sealed: false,
@@ -492,6 +508,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.file.containers.entry(name).or_insert(Container {
                 kind: open.kind,
                 is_abstract: open.is_abstract,
+                is_base: open.is_base,
+                is_final: open.is_final,
+                is_interface: open.is_interface,
+                is_mixin_class: open.is_mixin_class,
                 superclass: open.superclass,
                 members,
                 type_params: open.type_params,
@@ -524,6 +544,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn mark_abstract(&mut self) {
         if let Some(open) = self.containers.last_mut() {
             open.is_abstract = true;
+        }
+    }
+
+    /// Marks one of the open container's declared class-modifier facts (the
+    /// header keyword events: `base`/`final`/`interface` and the `mixin
+    /// class` form).
+    fn mark_modifier(&mut self, set: impl FnOnce(&mut OpenContainer)) {
+        if let Some(open) = self.containers.last_mut() {
+            set(open);
         }
     }
 
@@ -822,6 +851,31 @@ pub fn collect(
         .finish()
 }
 
+/// The declared class-modifier facts of one container — the resolution
+/// graph's `declare_class` feed shape (`dartq_resolution::modifiers`). The
+/// kind mapping is the official element-model split: enums carry no
+/// modifier face at all, mixins carry only `base`, and a `mixin class` is
+/// [`DeclKind::Class`] with the flag set.
+#[must_use]
+pub fn container_modifiers(container: &Container) -> ClassModifiers {
+    ClassModifiers {
+        kind: match container.kind {
+            ContainerKind::Class => DeclKind::Class,
+            ContainerKind::Mixin => DeclKind::Mixin,
+            ContainerKind::Enum => DeclKind::Enum,
+            // Extensions and extension types are not class-modifier
+            // carriers; the flags are always false on them.
+            ContainerKind::Extension | ContainerKind::ExtensionType => DeclKind::Class,
+        },
+        is_abstract: container.is_abstract,
+        is_base: container.is_base,
+        is_final: container.is_final,
+        is_interface: container.is_interface,
+        is_sealed: container.sealed,
+        is_mixin_class: container.is_mixin_class,
+    }
+}
+
 impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_class_declaration(
         &mut self,
@@ -845,6 +899,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if abstract_kw.is_some() {
             builder.mark_abstract();
         }
+        builder.mark_modifier(|open| {
+            open.is_base = _base_kw.is_some();
+            open.is_interface = _interface_kw.is_some();
+            open.is_final = _final_kw.is_some();
+            open.is_mixin_class = _mixin_kw.is_some();
+        });
     }
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
@@ -873,6 +933,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if abstract_kw.is_some() {
             builder.mark_abstract();
         }
+        builder.mark_modifier(|open| {
+            open.is_base = _base_kw.is_some();
+            open.is_interface = _interface_kw.is_some();
+            open.is_final = _final_kw.is_some();
+            open.sealed = _sealed_kw.is_some();
+        });
     }
 
     fn end_named_mixin_application(
@@ -902,6 +968,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut *self.builder.borrow_mut();
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Mixin, name, MicroKind::Mixin);
+        builder.mark_modifier(|open| open.is_base = _base_kw.is_some());
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {

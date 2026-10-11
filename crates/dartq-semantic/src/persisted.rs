@@ -134,6 +134,17 @@ pub struct PersistedMemberEntry {
 pub struct PersistedContainer {
     pub kind: PersistedContainerKind,
     pub is_abstract: bool,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the fields existed decode with no declared modifier flags
+    /// (the #539 additive-field discipline; the #600 class-modifier facts).
+    #[serde(default)]
+    pub is_base: bool,
+    #[serde(default)]
+    pub is_final: bool,
+    #[serde(default)]
+    pub is_interface: bool,
+    #[serde(default)]
+    pub is_mixin_class: bool,
     pub superclass: Option<u32>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
     pub type_params: u16,
@@ -487,6 +498,10 @@ impl PersistedContainer {
                 ContainerKind::ExtensionType => PersistedContainerKind::ExtensionType,
             },
             is_abstract: container.is_abstract,
+            is_base: container.is_base,
+            is_final: container.is_final,
+            is_interface: container.is_interface,
+            is_mixin_class: container.is_mixin_class,
             superclass: container.superclass.map(|name| s.id(name)),
             members: container
                 .members
@@ -531,6 +546,10 @@ impl PersistedContainer {
                 PersistedContainerKind::ExtensionType => ContainerKind::ExtensionType,
             },
             is_abstract: self.is_abstract,
+            is_base: self.is_base,
+            is_final: self.is_final,
+            is_interface: self.is_interface,
+            is_mixin_class: self.is_mixin_class,
             superclass: self.superclass.map(|at| ids[at as usize]),
             members: self
                 .members
@@ -704,6 +723,10 @@ mod tests {
             Container {
                 kind: ContainerKind::Class,
                 is_abstract: true,
+                is_base: true,
+                is_final: false,
+                is_interface: false,
+                is_mixin_class: false,
                 superclass: Some(name("Object")),
                 members: [name("m"), name("m=")]
                     .into_iter()
