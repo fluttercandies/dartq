@@ -374,13 +374,17 @@ fn collection_for_elements() {
 /// declaration body.
 #[test]
 fn unclosed_formal_relocation() {
+    // The empty `{ }` group takes the named arm's `parameterCount == 0` face
+    // (parser_impl.dart:2516-2533): one `empty_named_parameter_list` row,
+    // then the spliced synthetic name is consumed silently — the pre-#740
+    // insert-then-skip shape stacked a fourth `missing_identifier` row here
+    // that the official never emits.
     assert_codes_with_scanner(
         "enum E( {}\n",
         &[
             "empty_named_parameter_list",
             "expected_token",
             "missing_enum_body",
-            "missing_identifier",
         ],
         "unclosed paren relocates at the brace",
     );

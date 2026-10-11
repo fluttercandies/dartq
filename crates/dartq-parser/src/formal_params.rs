@@ -311,11 +311,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if parameter_count == 0 {
             let at = self.peek_span();
             self.report(msg::empty_named_parameter_list(), at);
-            let id = self
-                .cursor
+            // Queue the zero-length name and leave it current: official
+            // `rewriteAndRecover` (:5112) reports on the old next (this `}`)
+            // and splices the synthetic in front of it, then
+            // `parseFormalParameter` (:2527) starts at the synthetic and
+            // consumes it silently as the formal's type-or-name. Advancing
+            // past it here would feed the `}` to the name step instead
+            // (`missing_identifier` and a derailed list) — same shape as the
+            // positional arm above.
+            self.cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
-            self.cursor.advance();
-            let _ = id;
             self.parse_formal_parameter(FormalParameterKind::OptionalNamed, kind);
         }
         self.cursor.advance(); // `}`

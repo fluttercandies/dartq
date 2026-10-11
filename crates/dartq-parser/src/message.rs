@@ -1547,9 +1547,10 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn empty_named_parameter_list() -> Message {
-        Message::new(
+        Message::with_correction(
             local_code("empty_named_parameter_list", "EMPTY_NAMED_PARAMETER_LIST"),
             "Named parameter lists cannot be empty.",
+            "Try adding a named parameter to the list.",
         )
     }
 

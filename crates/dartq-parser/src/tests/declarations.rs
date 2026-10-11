@@ -565,6 +565,40 @@ fn spaced_empty_bracket_group_reports_empty_optional_parameter_list() {
 }
 
 #[test]
+fn spaced_empty_named_group_reports_empty_named_parameter_list() {
+    // The `{`-bracketed sibling of the spaced-`[` test above: a spaced empty
+    // named list `void f({ }) {}` walks `parseOptionalNamedParameters`
+    // normally and takes its `parameterCount == 0` arm
+    // (parser_impl.dart:2516-2533), whose `rewriteAndRecover` (:5112)
+    // reports `emptyNamedParameterList` on the real `}` (its own offset,
+    // width 1) and splices a zero-length synthetic identifier before it for
+    // `parseFormalParameter` (:2527) to consume silently. Same registry row
+    // (`emptyNamedParameterList`, diagnostic.g.dart:563), so problem +
+    // correction verbatim.
+    let c = parse("void f({ }) {}");
+    assert_eq!(c.error_codes(), ["empty_named_parameter_list"]);
+    assert_eq!(c.errors[0].1, 9); // the real `}` = `{` offset + 2
+    assert_eq!(c.errors[0].2, 10);
+    assert_eq!(&c.texts, &["Named parameter lists cannot be empty."]);
+    assert_eq!(
+        &c.corrections,
+        &[Some(
+            "Try adding a named parameter to the list.".to_string()
+        )]
+    );
+
+    // The arm fires after a comma too: one row, anchored the same way.
+    let c = parse("void f(int x, { }) {}");
+    assert_eq!(c.error_codes(), ["empty_named_parameter_list"]);
+    assert_eq!(c.errors[0].1, 16); // the real `}` = `{` offset + 2
+    assert_eq!(c.errors[0].2, 17);
+
+    // A well-formed named formal stays silent.
+    let c = parse("void f({x}) {}");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+}
+
+#[test]
 fn required_modifier_walk_matches_official_order() {
     // `required` on a non-named formal reports `extraneous_modifier` once at
     // the first token after the walk (modifier_context.dart:212-221); a
