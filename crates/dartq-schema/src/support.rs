@@ -197,6 +197,26 @@ pub(crate) fn exact_fields(
     Ok(())
 }
 
+/// Tier exactness (crate docs, "Verbosity tiers"): a field the payload's
+/// tier must omit. The `expected` text names the tier so a CI failure reads
+/// as the contract, not a type error.
+pub(crate) fn absent(
+    obj: &Map<String, Value>,
+    key: &str,
+    path: &str,
+    tier: crate::Verbosity,
+) -> Result<(), SchemaViolation> {
+    if let Some(value) = obj.get(key) {
+        Err(violation(
+            join(path, key),
+            format!("omitted at the {tier} tier"),
+            describe(value),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Pins the version field of a payload to its constant.
 pub(crate) fn pinned_version(
     obj: &Map<String, Value>,

@@ -9,9 +9,10 @@ use std::sync::LazyLock;
 use serde_json::{Value, json};
 
 use crate::SchemaViolation;
+use crate::Verbosity;
 use crate::support::{
-    enum_spelling, exact_fields, field, join, non_negative, object, one_based, pinned_version,
-    rows, session_fields, string, string_or_null,
+    absent, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
+    pinned_version, rows, session_fields, string, string_or_null,
 };
 
 /// The query answer's contract version. No producer constant exists yet —
@@ -134,10 +135,7 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
         let p = format!("references[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, REFERENCE, REFERENCE_OPTIONAL, &p)?;
-        string(
-            field(obj, "target_file", &p)?,
-            &join(&p, "target_file"),
-        )?;
+        string(field(obj, "target_file", &p)?, &join(&p, "target_file"))?;
         enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), REF_KINDS)?;
         let offset = join(&p, "offset");
         non_negative(field(obj, "offset", &p)?, &offset)?;
@@ -149,6 +147,31 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
         if let Some(file) = obj.get("file") {
             string(file, &join(&p, "file"))?;
         }
+    }
+    Ok(())
+}
+
+/// The tier-exact check ([`crate::validate_at_tier`]): minimal keeps the
+/// row locators; the convenience spellings (`container`, `qualified`) are
+/// the compact tier's contribution. The additive use-file column
+/// (`references[].file`) and the session fields ride absent-tolerant at
+/// every tier (crate docs, query table and "Token economics").
+pub(crate) fn validate_query_at_tier(
+    value: &Value,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    validate_query(value)?;
+    if tier != Verbosity::Minimal {
+        return Ok(());
+    }
+    let root = object(value, "")?;
+    for (i, row) in rows(root, "declarations")? {
+        let p = format!("declarations[{i}]");
+        absent(object(row, &p)?, "container", &p, tier)?;
+    }
+    for (i, row) in rows(root, "references")? {
+        let p = format!("references[{i}]");
+        absent(object(row, &p)?, "qualified", &p, tier)?;
     }
     Ok(())
 }
@@ -202,5 +225,37 @@ mod tests {
                 .collect();
             assert_eq!(spellings, declared);
         }
+    }
+
+    /// Tier exactness: a minimal answer omits the convenience spellings;
+    /// the same answer is exact at compact and full.
+    #[test]
+    fn minimal_tier_rejects_convenience_spellings() {
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_QUERY,
+            "name": "fb",
+            "declarations": [{
+                "file": "/w/lib/a.dart",
+                "container": "fb",
+                "kind": "class",
+                "name": "fb",
+                "line": 3,
+                "column": 7,
+                "length": 2,
+            }],
+            "references": [{
+                "target_file": "/w/lib/b.dart",
+                "kind": "invoked",
+                "qualified": "fb.fma()",
+                "offset": 42,
+                "length": 2,
+            }],
+        });
+        let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry the container");
+        assert_eq!(violation.path, "declarations[0].container");
+        assert_eq!(violation.expected, "omitted at the minimal tier");
+        assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Full).is_ok());
     }
 }

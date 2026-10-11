@@ -65,9 +65,13 @@
 //!
 //! Payloads carry no verbosity marker (adding one would break the compact
 //! byte shape), so each published schema is the **union** of its tiers'
-//! field sets: `validate` enforces the union and the red line, while tier
-//! exactness (a minimal answer omits exactly the tier-optional fields) is
-//! the emitter's test obligation.
+//! field sets: `validate` enforces the union and the red line. The tier-
+//! exact shapes are checked by [`validate_at_tier`], which rejects a
+//! payload carrying a field its tier must omit (a minimal row with a
+//! `problemMessage`, a compact edit with a `rule`, a full report with the
+//! minimal-only `counts`). Presence beyond the red line stays the emitter's
+//! fixture obligation: the §15.8.5 omission conventions make legitimate
+//! absences the validator cannot distinguish from tier violations.
 //!
 //! Diagnostics rows (`dartq-diagnostics` envelope; minimal = `code` +
 //! `location`, ~15 tokens):
@@ -210,7 +214,9 @@
 //!
 //! CI (and the harness) serializes a real output face — or captures it from
 //! the CLI/daemon — and calls [`validate`] with the producing [`Domain`];
-//! any [`SchemaViolation`] fails the run via its `Display`.
+//! any [`SchemaViolation`] fails the run via its `Display`. A face that
+//! answers under a known `--verbosity` is checked with [`validate_at_tier`]
+//! and the tier it answered under.
 //! `tests/alignment.rs` runs real producers through it;
 //! `tests/output_faces.rs` pins the hand-derived fixture shapes with their
 //! writer provenance.
@@ -253,6 +259,32 @@ pub enum Domain {
     Compat,
     /// The `--metrics-json` run summary (`dartq check` / `dartq analyze`).
     RunMetrics,
+}
+
+/// A §15.1/§15.8.1 verbosity tier — the `--verbosity` spelling a face
+/// answered under. Tier exactness is checked by [`validate_at_tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verbosity {
+    /// The red-line floor (§15.8): locating fields only — a diagnostic's
+    /// `code` + `location`, an edit's `offset`/`length`/`replacement`.
+    /// Nothing prose-like may ride along.
+    Minimal,
+    /// The default tier: each producer's baseline shape — the shape the
+    /// compact fixtures pin byte for byte.
+    Compact,
+    /// Compact plus the cheaply-available extras named per face in the
+    /// tier tables above.
+    Full,
+}
+
+impl fmt::Display for Verbosity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Verbosity::Minimal => "minimal",
+            Verbosity::Compact => "compact",
+            Verbosity::Full => "full",
+        })
+    }
 }
 
 /// The first structural violation found in a payload, named.
@@ -307,5 +339,42 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::Explain => explain::validate_explain(&value),
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
+    }
+}
+
+/// Validates a serialized output payload at a specific verbosity tier:
+/// everything [`validate`] checks, plus tier exactness — a payload may not
+/// carry a field its tier must omit (crate docs, "Verbosity tiers"). A
+/// `minimal` answer therefore carries only the red line plus the face's
+/// tier-independent fields; a `compact` answer carries no full-only field.
+///
+/// Presence beyond the red line is not enforced: the ● cells past the
+/// locating floor are the emitter's fixture obligation (§15.8.5 omission
+/// conventions make legitimate absences indistinguishable from violations).
+/// The tier-invariant faces ([`Domain::Impact`], [`Domain::RunMetrics`])
+/// ignore the tier — every field is a locator or a verdict.
+///
+/// # Errors
+///
+/// Returns a [`SchemaViolation`] naming the first union violation, or the
+/// first field the tier must omit.
+pub fn validate_at_tier(
+    payload: &str,
+    domain: Domain,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    let value = serde_json::from_str::<Value>(payload).map_err(|error| SchemaViolation {
+        path: String::new(),
+        expected: "a JSON document".to_owned(),
+        found: error.to_string(),
+    })?;
+    match (domain, tier) {
+        (Domain::Impact, _) => impact::validate_impact(&value),
+        (Domain::RunMetrics, _) => run_metrics::validate_run_metrics(&value),
+        (Domain::Diagnostics, tier) => diagnostics::validate_diagnostics_at_tier(&value, tier),
+        (Domain::FixPatch, tier) => fix_patch::validate_fix_patch_at_tier(&value, tier),
+        (Domain::Query, tier) => query::validate_query_at_tier(&value, tier),
+        (Domain::Compat, tier) => compat::validate_compat_at_tier(&value, tier),
+        (Domain::Explain, tier) => explain::validate_explain_at_tier(&value, tier),
     }
 }

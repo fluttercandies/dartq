@@ -7,8 +7,8 @@
 
 use dartq_ai::compatibility::{COMPAT_SCHEMA_VERSION, CompatReport};
 use dartq_ai::explain::{
-    DependencyRow, DeclarationRow, EXPLAIN_SCHEMA_VERSION, ExplainReport, MemberRow,
-    ReferenceRow, SectionCounts, SuperTypeRow,
+    DeclarationRow, DependencyRow, EXPLAIN_SCHEMA_VERSION, ExplainReport, MemberRow, ReferenceRow,
+    SectionCounts, SuperTypeRow,
 };
 use dartq_ai::impact::{
     AffectedTarget, AffectedTest, ChangedSymbol, EnvironmentImpact, IMPACT_SCHEMA_VERSION,
@@ -16,7 +16,7 @@ use dartq_ai::impact::{
 };
 use dartq_schema::{
     Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_DIAGNOSTICS, SCHEMA_VERSION_EXPLAIN,
-    SCHEMA_VERSION_IMPACT, SchemaViolation,
+    SCHEMA_VERSION_IMPACT, SchemaViolation, Verbosity, validate_at_tier,
 };
 
 /// Pin: dartq-ai owns the authoritative impact contract version; the schema
@@ -63,6 +63,19 @@ fn fixture_report() -> ImpactReport {
 fn real_impact_report_passes_validation() {
     let payload = serde_json::to_string(&fixture_report()).expect("serialize");
     validate_ok(&payload, Domain::Impact);
+}
+
+/// Tier-invariant face (crate docs, "Verbosity tiers"): every impact field
+/// is a locator or a verdict, so the at-tier check is the union check.
+#[test]
+fn impact_report_is_tier_invariant() {
+    let payload = serde_json::to_string(&fixture_report()).expect("serialize");
+    for tier in [Verbosity::Minimal, Verbosity::Compact, Verbosity::Full] {
+        assert!(
+            validate_at_tier(&payload, Domain::Impact, tier).is_ok(),
+            "impact report must validate at the {tier} tier"
+        );
+    }
 }
 
 #[test]
@@ -328,10 +341,9 @@ fn explain_version_constant_matches_dartq_ai() {
     assert_eq!(SCHEMA_VERSION_EXPLAIN, EXPLAIN_SCHEMA_VERSION);
 }
 
-/// The compact explain report a real assembler emits passes validation.
-#[test]
-fn real_explain_report_passes_validation() {
-    let report = ExplainReport {
+/// The compact explain report a real assembler emits.
+fn compact_explain_report() -> ExplainReport {
+    ExplainReport {
         schema_version: EXPLAIN_SCHEMA_VERSION,
         symbol: "Foo".to_owned(),
         declaration: Some(DeclarationRow {
@@ -365,8 +377,13 @@ fn real_explain_report_passes_validation() {
             path: "package:t/a_test.dart".to_owned(),
         }]),
         counts: None,
-    };
-    let payload = serde_json::to_string(&report).expect("serialize");
+    }
+}
+
+/// The compact explain report a real assembler emits passes validation.
+#[test]
+fn real_explain_report_passes_validation() {
+    let payload = serde_json::to_string(&compact_explain_report()).expect("serialize");
     validate_ok(&payload, Domain::Explain);
 }
 
@@ -403,6 +420,50 @@ fn minimal_explain_report_passes_validation() {
     };
     let payload = serde_json::to_string(&report).expect("serialize");
     validate_ok(&payload, Domain::Explain);
+}
+
+/// Tier exactness over the real producers: the compact report is exact at
+/// compact (and full — they coincide today), the minimal report at minimal
+/// only; its `counts` object is the minimal tier's exclusive content.
+#[test]
+fn explain_reports_are_exact_at_their_tier() {
+    let compact = serde_json::to_string(&compact_explain_report()).expect("serialize");
+    assert!(validate_at_tier(&compact, Domain::Explain, Verbosity::Compact).is_ok());
+    assert!(validate_at_tier(&compact, Domain::Explain, Verbosity::Full).is_ok());
+
+    let minimal = ExplainReport {
+        schema_version: EXPLAIN_SCHEMA_VERSION,
+        symbol: "Foo".to_owned(),
+        declaration: Some(DeclarationRow {
+            file: "a.dart".to_owned(),
+            name: "Foo".to_owned(),
+            kind: "class".to_owned(),
+            container: None,
+            range: [40, 43],
+        }),
+        inheritance: None,
+        interfaces: None,
+        constructors: None,
+        methods: None,
+        references: None,
+        dependencies: None,
+        affected_tests: None,
+        counts: Some(SectionCounts {
+            inheritance: 1,
+            interfaces: 0,
+            constructors: 0,
+            methods: 1,
+            references: 1,
+            dependencies: 1,
+            affected_tests: 1,
+        }),
+    };
+    let payload = serde_json::to_string(&minimal).expect("serialize");
+    assert!(validate_at_tier(&payload, Domain::Explain, Verbosity::Minimal).is_ok());
+    let violation = validate_at_tier(&payload, Domain::Explain, Verbosity::Compact)
+        .expect_err("compact must not carry the minimal counts");
+    assert_eq!(violation.path, "counts");
+    assert_eq!(violation.expected, "omitted at the compact tier");
 }
 
 #[test]

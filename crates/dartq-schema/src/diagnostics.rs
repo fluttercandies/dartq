@@ -7,9 +7,10 @@ use std::sync::LazyLock;
 use serde_json::{Value, json};
 
 use crate::SchemaViolation;
+use crate::Verbosity;
 use crate::support::{
-    enum_spelling, exact_fields, field, join, non_negative, object, one_based, pinned_version,
-    rows, string,
+    absent, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
+    pinned_version, rows, string,
 };
 
 /// The diagnostics JSON envelope's contract version — the oracle's
@@ -142,6 +143,29 @@ pub(crate) fn validate_diagnostics(value: &Value) -> Result<(), SchemaViolation>
     Ok(())
 }
 
+/// The tier-exact check ([`crate::validate_at_tier`]): at `minimal` a row
+/// carries exactly the red line — `code` + `location` — plus the
+/// tier-independent optionals; the message and classification fields are
+/// the compact tier's contribution (crate docs, diagnostics table).
+pub(crate) fn validate_diagnostics_at_tier(
+    value: &Value,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    validate_diagnostics(value)?;
+    if tier != Verbosity::Minimal {
+        return Ok(());
+    }
+    let root = object(value, "")?;
+    for (i, row) in rows(root, "diagnostics")? {
+        let p = format!("diagnostics[{i}]");
+        let obj = object(row, &p)?;
+        for key in ["severity", "type", "problemMessage"] {
+            absent(obj, key, &p, tier)?;
+        }
+    }
+    Ok(())
+}
+
 fn position(value: &Value, path: &str) -> Result<(), SchemaViolation> {
     let obj = object(value, path)?;
     exact_fields(obj, POSITION, &[], path)?;
@@ -199,8 +223,14 @@ mod tests {
             const_names(LOCATION)
         );
         let range = &item["properties"]["location"]["properties"]["range"];
-        assert_eq!(schema_keys(&range["properties"]["start"]), const_names(POSITION));
-        assert_eq!(schema_keys(&range["properties"]["end"]), const_names(POSITION));
+        assert_eq!(
+            schema_keys(&range["properties"]["start"]),
+            const_names(POSITION)
+        );
+        assert_eq!(
+            schema_keys(&range["properties"]["end"]),
+            const_names(POSITION)
+        );
     }
 
     #[test]
@@ -233,5 +263,34 @@ mod tests {
         let violation = validate_diagnostics(&value).expect_err("red-line omission");
         assert_eq!(violation.path, "diagnostics[0].location");
         assert_eq!(violation.found, "missing");
+    }
+
+    /// Tier exactness: a minimal answer may not carry the compact tier's
+    /// message and classification fields; the same envelope is exact at
+    /// compact and full.
+    #[test]
+    fn minimal_tier_rejects_prose_fields() {
+        let mut value = envelope();
+        let violation = validate_diagnostics_at_tier(&value, Verbosity::Minimal)
+            .expect_err("minimal must not carry severity");
+        assert_eq!(violation.path, "diagnostics[0].severity");
+        assert_eq!(violation.expected, "omitted at the minimal tier");
+        assert!(validate_diagnostics_at_tier(&value, Verbosity::Compact).is_ok());
+        assert!(validate_diagnostics_at_tier(&value, Verbosity::Full).is_ok());
+
+        value["diagnostics"][0] = json!({
+            "code": "undefined_identifier",
+            "location": {
+                "file": "lib/main.dart",
+                "range": {
+                    "start": {"offset": 0, "line": 1, "column": 1},
+                    "end": {"offset": 8, "line": 1, "column": 9},
+                },
+            },
+            "problemMessage": "Undefined name 'fa'.",
+        });
+        let violation = validate_diagnostics_at_tier(&value, Verbosity::Minimal)
+            .expect_err("minimal must not carry the message");
+        assert_eq!(violation.path, "diagnostics[0].problemMessage");
     }
 }

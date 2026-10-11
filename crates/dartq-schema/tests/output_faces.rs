@@ -7,7 +7,7 @@
 
 use dartq_schema::{
     Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_FIX_PATCH, SCHEMA_VERSION_QUERY,
-    SCHEMA_VERSION_RUN_METRICS, validate,
+    SCHEMA_VERSION_RUN_METRICS, Verbosity, validate, validate_at_tier,
 };
 
 /// The v1 freeze: every dartq-native face ships at contract version 1.
@@ -604,6 +604,127 @@ fn run_metrics_bad_files_type_is_named() {
     let violation = violation_of(&doc.to_string(), Domain::RunMetrics);
     assert_eq!(violation.path, "files");
     assert_eq!(violation.expected, "an integer");
+}
+
+// ---------------------------------------------------------------------------
+// Verbosity tiers (§15.8): the at-tier validator over the public API
+// ---------------------------------------------------------------------------
+
+/// Tier exactness on the fix face: the anchor is compact-tier content and
+/// `rule` full-tier only, so a tier violation names the field and its tier.
+#[test]
+fn fix_patch_is_exact_at_its_tier() {
+    let compact = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "edits": [{
+            "offset": 123,
+            "length": 8,
+            "replacement": "Bar",
+            "anchor": {"line": 10, "column": 7},
+        }],
+    });
+    assert!(validate_at_tier(&compact.to_string(), Domain::FixPatch, Verbosity::Compact).is_ok());
+    let violation = validate_at_tier(&compact.to_string(), Domain::FixPatch, Verbosity::Minimal)
+        .expect_err("minimal must not carry the anchor");
+    assert_eq!(violation.path, "edits[0].anchor");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+}
+
+/// Tier exactness on the query face: minimal omits `container` and
+/// `qualified`; compact/full carry them. The at-tier walk reports the
+/// first violation in face order (declarations before references).
+#[test]
+fn query_answer_is_exact_at_its_tier() {
+    let compact = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_QUERY,
+        "name": "fb",
+        "declarations": [{
+            "file": "/w/lib/a.dart",
+            "container": null,
+            "kind": "class",
+            "name": "fb",
+            "line": 3,
+            "column": 7,
+            "length": 2,
+        }],
+        "references": [
+            {
+                "target_file": "/w/lib/b.dart",
+                "kind": "invoked",
+                "qualified": "fb.fma()",
+                "offset": 42,
+                "length": 2,
+            },
+        ],
+    });
+    assert!(validate_at_tier(&compact.to_string(), Domain::Query, Verbosity::Compact).is_ok());
+    let violation = validate_at_tier(&compact.to_string(), Domain::Query, Verbosity::Minimal)
+        .expect_err("minimal must not carry the convenience spellings");
+    assert_eq!(violation.path, "declarations[0].container");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+
+    // With the container dropped, the reference row's `qualified` is named
+    // on its own.
+    let mut minimal = compact;
+    minimal["declarations"][0]
+        .as_object_mut()
+        .expect("object")
+        .remove("container");
+    let violation = validate_at_tier(&minimal.to_string(), Domain::Query, Verbosity::Minimal)
+        .expect_err("minimal must not carry the qualified spelling");
+    assert_eq!(violation.path, "references[0].qualified");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+}
+
+/// Tier exactness on the compat face: minimal keeps the verdict + axis
+/// identity; the evidence columns are compact-tier content.
+#[test]
+fn compat_report_is_exact_at_its_tier() {
+    let compact = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_COMPAT,
+        "file": "/w/lib/a.dart",
+        "matrix": [
+            {"sdk": "3.13.1", "compatible": true},
+            {
+                "sdk": "3.5.0",
+                "compatible": false,
+                "error": {
+                    "kind": "sdk_unavailable",
+                    "message": "required SDK file missing: /w/sdks/broken/version",
+                },
+            },
+        ],
+    });
+    assert!(validate_at_tier(&compact.to_string(), Domain::Compat, Verbosity::Compact).is_ok());
+    let violation = validate_at_tier(&compact.to_string(), Domain::Compat, Verbosity::Minimal)
+        .expect_err("minimal must not carry the load error");
+    assert_eq!(violation.path, "matrix[1].error");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+}
+
+/// Tier-invariant face (crate docs, "Verbosity tiers"): the at-tier check
+/// is the union check at every tier.
+#[test]
+fn run_metrics_are_tier_invariant() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_RUN_METRICS,
+        "files": 12,
+        "loc": 3_456,
+        "diagnostics": 2,
+        "discovery_ms": 4,
+        "analyze_ms": 31,
+        "total_ms": 35,
+        "libraries_analyzed": 9,
+        "libraries_from_cache": 3,
+        "max_rss_bytes": null,
+    });
+    for tier in [Verbosity::Minimal, Verbosity::Compact, Verbosity::Full] {
+        assert!(
+            validate_at_tier(&doc.to_string(), Domain::RunMetrics, tier).is_ok(),
+            "run metrics must validate at the {tier} tier"
+        );
+    }
 }
 
 fn validate_ok(payload: &str, domain: Domain) {

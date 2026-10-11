@@ -6,9 +6,10 @@ use std::sync::LazyLock;
 use serde_json::{Value, json};
 
 use crate::SchemaViolation;
+use crate::Verbosity;
 use crate::support::{
-    boolean, exact_fields, field, join, non_negative, object, one_based, pinned_version, rows,
-    string,
+    absent, boolean, exact_fields, field, join, non_negative, object, one_based, pinned_version,
+    rows, string,
 };
 
 /// The patch document's contract version. Mirrors the CLI fix face's
@@ -87,10 +88,7 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         non_negative(field(obj, "offset", &p)?, &offset)?;
         let length = join(&p, "length");
         non_negative(field(obj, "length", &p)?, &length)?;
-        string(
-            field(obj, "replacement", &p)?,
-            &join(&p, "replacement"),
-        )?;
+        string(field(obj, "replacement", &p)?, &join(&p, "replacement"))?;
         if let Some(anchor) = obj.get("anchor") {
             let ap = join(&p, "anchor");
             let anchor = object(anchor, &ap)?;
@@ -116,6 +114,28 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
     Ok(())
 }
 
+/// The tier-exact check ([`crate::validate_at_tier`]): the anchor is the
+/// compact tier's drift-correction locator, `rule` is full-tier only; the
+/// red-line trio and `stale` ride every tier (crate docs, fix table).
+pub(crate) fn validate_fix_patch_at_tier(
+    value: &Value,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    validate_fix_patch(value)?;
+    let root = object(value, "")?;
+    for (i, row) in rows(root, "edits")? {
+        let p = format!("edits[{i}]");
+        let obj = object(row, &p)?;
+        if tier == Verbosity::Minimal {
+            absent(obj, "anchor", &p, tier)?;
+        }
+        if tier != Verbosity::Full {
+            absent(obj, "rule", &p, tier)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,7 +145,10 @@ mod tests {
     #[test]
     fn document_and_validator_name_the_same_fields() {
         let patch = fix_patch_schema();
-        assert_eq!(crate::support::schema_keys(patch), crate::support::const_names(PATCH_TOP));
+        assert_eq!(
+            crate::support::schema_keys(patch),
+            crate::support::const_names(PATCH_TOP)
+        );
         let edit = &patch["properties"]["edits"]["items"];
         let mut edit_fields: Vec<String> = EDIT
             .iter()
@@ -142,5 +165,41 @@ mod tests {
             .collect();
         anchor_fields.sort_unstable();
         assert_eq!(crate::support::schema_keys(anchor), anchor_fields);
+    }
+
+    /// Tier exactness: the anchor is compact-tier content, `rule` full-tier
+    /// only; `stale` rides any tier.
+    #[test]
+    fn tiers_reject_higher_tier_fields() {
+        let doc = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{
+                "offset": 123,
+                "length": 8,
+                "replacement": "Bar",
+                "anchor": {"line": 10, "column": 7},
+                "rule": "unnecessary_new",
+                "stale": true,
+            }],
+        });
+        let violation = validate_fix_patch_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry the anchor");
+        assert_eq!(violation.path, "edits[0].anchor");
+        assert_eq!(violation.expected, "omitted at the minimal tier");
+
+        let violation = validate_fix_patch_at_tier(&doc, Verbosity::Compact)
+            .expect_err("compact must not carry the rule");
+        assert_eq!(violation.path, "edits[0].rule");
+        assert_eq!(violation.expected, "omitted at the compact tier");
+
+        assert!(validate_fix_patch_at_tier(&doc, Verbosity::Full).is_ok());
+
+        let minimal = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"offset": 123, "length": 8, "replacement": "Bar", "stale": true}],
+        });
+        assert!(validate_fix_patch_at_tier(&minimal, Verbosity::Minimal).is_ok());
     }
 }

@@ -7,9 +7,10 @@ use std::sync::LazyLock;
 use serde_json::{Value, json};
 
 use crate::SchemaViolation;
+use crate::Verbosity;
 use crate::support::{
-    boolean, enum_spelling, exact_fields, field, join, object, one_based, pinned_version, rows,
-    string,
+    absent, boolean, enum_spelling, exact_fields, field, join, object, one_based, pinned_version,
+    rows, string,
 };
 
 /// The compatibility report's contract version. Mirrors the authoritative
@@ -117,6 +118,29 @@ pub(crate) fn validate_compat(value: &Value) -> Result<(), SchemaViolation> {
     Ok(())
 }
 
+/// The tier-exact check ([`crate::validate_at_tier`]): minimal keeps the
+/// verdict + axis identity — the evidence columns are the compact tier's
+/// content, one `check` away (crate docs, compat table). At compact and
+/// full the columns appear exactly when the axis's content demands them,
+/// so nothing is forbidden there.
+pub(crate) fn validate_compat_at_tier(
+    value: &Value,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    validate_compat(value)?;
+    if tier != Verbosity::Minimal {
+        return Ok(());
+    }
+    let root = object(value, "")?;
+    for (i, row) in rows(root, "matrix")? {
+        let p = format!("matrix[{i}]");
+        let obj = object(row, &p)?;
+        absent(obj, "first_failure", &p, tier)?;
+        absent(obj, "error", &p, tier)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +170,32 @@ mod tests {
             crate::support::schema_keys(&axis["properties"]["error"]),
             crate::support::const_names(AXIS_ERROR)
         );
+    }
+
+    /// Tier exactness: a minimal answer carries the verdict + axis identity
+    /// only; the same answer with evidence columns is exact at compact.
+    #[test]
+    fn minimal_tier_rejects_evidence_columns() {
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_COMPAT,
+            "file": "/w/lib/a.dart",
+            "matrix": [{
+                "sdk": "3.5.0",
+                "compatible": false,
+                "first_failure": {
+                    "code": "uri_does_not_exist",
+                    "file": "/w/lib/a.dart",
+                    "line": 1,
+                    "col": 8,
+                    "message": "Target of URI doesn't exist: dart:async",
+                },
+            }],
+        });
+        let violation = validate_compat_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry evidence");
+        assert_eq!(violation.path, "matrix[0].first_failure");
+        assert_eq!(violation.expected, "omitted at the minimal tier");
+        assert!(validate_compat_at_tier(&doc, Verbosity::Compact).is_ok());
+        assert!(validate_compat_at_tier(&doc, Verbosity::Full).is_ok());
     }
 }

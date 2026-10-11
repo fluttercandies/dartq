@@ -32,9 +32,10 @@ use std::sync::LazyLock;
 use serde_json::{Value, json};
 
 use crate::SchemaViolation;
+use crate::Verbosity;
 use crate::query::{DECL_KINDS, REF_KINDS};
 use crate::support::{
-    array, boolean, enum_spelling, exact_fields, field, join, non_negative, object,
+    absent, array, boolean, enum_spelling, exact_fields, field, join, non_negative, object,
     pinned_version, range_pair, session_fields, string,
 };
 
@@ -295,6 +296,35 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
     Ok(())
 }
 
+/// The tier-exact check ([`crate::validate_at_tier`]): minimal replaces the
+/// section arrays with `counts` and drops the declaration's container (the
+/// `references[].qualified` row goes with the array it rides); compact and
+/// full carry the arrays, so the minimal-only `counts` is forbidden there
+/// (crate docs and the table above).
+pub(crate) fn validate_explain_at_tier(
+    value: &Value,
+    tier: Verbosity,
+) -> Result<(), SchemaViolation> {
+    validate_explain(value)?;
+    let root = object(value, "")?;
+    if tier == Verbosity::Minimal {
+        if let Some(declaration) = root.get("declaration") {
+            absent(
+                object(declaration, "declaration")?,
+                "container",
+                "declaration",
+                tier,
+            )?;
+        }
+        for section in EXPLAIN_SECTIONS {
+            absent(root, section, "", tier)?;
+        }
+    } else {
+        absent(root, "counts", "", tier)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -464,10 +494,7 @@ mod tests {
     #[test]
     fn missing_symbol_is_named() {
         let mut payload = full_report();
-        payload
-            .as_object_mut()
-            .expect("object")
-            .remove("symbol");
+        payload.as_object_mut().expect("object").remove("symbol");
         let violation = validate_explain(&payload).expect_err("missing symbol must violate");
         assert_eq!(violation.path, "symbol");
         assert_eq!(violation.found, "missing");
@@ -528,5 +555,35 @@ mod tests {
         let violation = validate_explain(&payload).expect_err("missing count entry");
         assert_eq!(violation.path, "counts.references");
         assert_eq!(violation.found, "missing");
+    }
+
+    /// Tier exactness: the arrays and `counts` are mutually exclusive —
+    /// minimal answers counts only, compact/full answers arrays only.
+    #[test]
+    fn tiers_keep_arrays_and_counts_exclusive() {
+        let violation = validate_explain_at_tier(&minimal_report(), Verbosity::Compact)
+            .expect_err("compact must not carry the minimal counts");
+        assert_eq!(violation.path, "counts");
+        assert_eq!(violation.expected, "omitted at the compact tier");
+
+        let violation = validate_explain_at_tier(&full_report(), Verbosity::Minimal)
+            .expect_err("minimal must not carry the section arrays");
+        assert_eq!(violation.path, "inheritance");
+        assert_eq!(violation.expected, "omitted at the minimal tier");
+
+        assert!(validate_explain_at_tier(&full_report(), Verbosity::Compact).is_ok());
+        assert!(validate_explain_at_tier(&full_report(), Verbosity::Full).is_ok());
+        assert!(validate_explain_at_tier(&minimal_report(), Verbosity::Minimal).is_ok());
+    }
+
+    /// The minimal tier also drops the declaration's container convenience
+    /// field.
+    #[test]
+    fn minimal_tier_rejects_the_declaration_container() {
+        let mut payload = minimal_report();
+        payload["declaration"]["container"] = json!("Foo");
+        let violation = validate_explain_at_tier(&payload, Verbosity::Minimal)
+            .expect_err("minimal must not carry the container");
+        assert_eq!(violation.path, "declaration.container");
     }
 }
