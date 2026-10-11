@@ -595,27 +595,44 @@ fn handle_notification(
             }
         }
         "textDocument/didChange" => match serde_json::from_value::<lsp::DidChangeParams>(params) {
-            // Full sync: events arrive in order, each carrying the whole
-            // document; the last well-formed one wins. A `range` marks a
-            // full-sync violation and cannot be applied.
-            Ok(change) => match change
-                .content_changes
-                .into_iter()
-                .rev()
-                .find(|event| event.range.is_none())
-            {
-                Some(event) => {
-                    session.queue_edit(
-                        &change.text_document.uri,
-                        &event.text,
-                        change.text_document.version,
-                    );
+            // Full sync (the advertised `textDocumentSync: 1`): every
+            // content event must carry the whole document, and the last
+            // full-text one wins. A `range` violates that contract; ranged
+            // edits are de-scoped (ticket #639 — revisit if the Cockpit e2e
+            // needs range sync), so ranged events are counted, logged once,
+            // and never applied.
+            Ok(change) => {
+                let mut full_text = None;
+                let mut ranged = 0usize;
+                for event in change.content_changes {
+                    if event.range.is_none() {
+                        full_text = Some(event.text);
+                    } else {
+                        ranged += 1;
+                    }
                 }
-                None => eprintln!(
-                    "dartq-daemon: dropping didChange without a full-text event (ranged edits \
-                     need incremental sync)"
-                ),
-            },
+                match full_text {
+                    Some(text) => {
+                        if ranged > 0 {
+                            eprintln!(
+                                "dartq-daemon: ignoring {ranged} ranged edit event(s) alongside \
+                                 the full-text event for {} (full-text sync only)",
+                                change.text_document.uri
+                            );
+                        }
+                        session.queue_edit(
+                            &change.text_document.uri,
+                            &text,
+                            change.text_document.version,
+                        );
+                    }
+                    None => eprintln!(
+                        "dartq-daemon: dropping didChange carrying only {ranged} ranged edit \
+                         event(s) for {} (full-text sync only)",
+                        change.text_document.uri
+                    ),
+                }
+            }
             Err(error) => eprintln!("dartq-daemon: dropping malformed didChange: {error}"),
         },
         "textDocument/didClose" => match serde_json::from_value::<lsp::DidCloseParams>(params) {
@@ -687,7 +704,8 @@ mod tests {
     use super::*;
     use crate::jsonrpc::RequestId;
     use crate::test_fixtures::{
-        self, BROKEN_MAIN, CLEAN_MAIN, notification, request, spawn, store_root,
+        self, BROKEN_MAIN, CLEAN_MAIN, answered, notification, publishes, request, spawn,
+        store_root,
     };
     use std::thread;
     use std::time::Duration;
@@ -698,7 +716,13 @@ mod tests {
         let result = result.expect("capabilities result");
         assert_eq!(error, None);
         assert_eq!(id, Some(RequestId::Num(1)));
-        assert_eq!(result["capabilities"]["textDocumentSync"], 1);
+        // Full sync (LSP TextDocumentSyncKind::Full = 1): change events
+        // carry whole documents only. The advertisement must never promise
+        // incremental (2) — ranged edits are de-scoped (ticket #639).
+        assert_eq!(
+            result["capabilities"]["textDocumentSync"], 1,
+            "textDocumentSync must advertise Full (1); ranged edits are not implemented"
+        );
         assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
         // The stable `dartq/*` command family, announced as experimental:
         // one entry per method, each carrying the response contract version.
@@ -710,6 +734,99 @@ mod tests {
             );
         }
         assert_eq!(result["serverInfo"]["name"], "dartq");
+    }
+
+    /// A ranged content event violates the advertised full-sync contract
+    /// (`textDocumentSync: 1`, ticket #639 de-scope): it is logged and
+    /// dropped without touching the document — the seeded analysis is
+    /// unchanged, nothing republishes, and the session stays healthy.
+    #[test]
+    fn ranged_did_change_is_ignored_and_leaves_state_untouched() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let mut h = spawn(&workspace, &store_root("ranged-change-ignored"));
+
+        h.step(&request(1, "initialize", json!({})), 1);
+        h.step(&notification("initialized", json!({})), 1);
+        // A ranged event whose text would clear the file if it were
+        // applied: the drop must leave the seeded content — and its
+        // diagnostics — intact.
+        h.step(
+            &notification(
+                "textDocument/didChange",
+                json!({"textDocument": {"uri": uri, "version": 2},
+                       "contentChanges": [{"range": {"start": {"line": 0, "character": 0},
+                                                      "end": {"line": 0, "character": 6}},
+                                           "text": ""}]}),
+            ),
+            0,
+        );
+        h.step(&request(2, "dartq/analyze", json!({})), 1);
+        h.step(&request(3, "shutdown", json!(null)), 1);
+        let (code, transcript) = h.exit();
+
+        assert_eq!(code, EXIT_CLEAN, "the violation never disturbs the session");
+        assert_eq!(
+            publishes(&transcript).len(),
+            1,
+            "only the sweep push: the dropped event changed no state"
+        );
+        let analyze = answered(&transcript)
+            .into_iter()
+            .find(|frame| frame["id"] == 2)
+            .expect("analyze answer");
+        assert!(
+            analyze["result"]["diagnostics"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|d| d["code"] == "uri_does_not_exist"),
+            "the document kept its seeded content: {analyze}"
+        );
+    }
+
+    /// The mixed-batch face of the same de-scope: ranged events riding
+    /// alongside full-text events are ignored while the last full-text
+    /// event still applies (the conforming path is untouched).
+    #[test]
+    fn mixed_ranged_and_full_change_applies_only_the_full_text() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let mut h = spawn(&workspace, &store_root("mixed-ranged-change"));
+
+        h.step(&request(1, "initialize", json!({})), 1);
+        h.step(&notification("initialized", json!({})), 1);
+        h.step(
+            &notification(
+                "textDocument/didChange",
+                json!({"textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [
+                    {"range": {"start": {"line": 0, "character": 0},
+                               "end": {"line": 0, "character": 7}},
+                     "text": "garbage"},
+                    {"text": CLEAN_MAIN}
+                ]}),
+            ),
+            1,
+        );
+        h.step(&request(2, "dartq/analyze", json!({})), 1);
+        h.step(&request(3, "shutdown", json!(null)), 1);
+        let (code, transcript) = h.exit();
+
+        assert_eq!(code, EXIT_CLEAN);
+        let pushes = publishes(&transcript);
+        assert_eq!(pushes.len(), 2, "sweep push + the full-text clear push");
+        assert_eq!(pushes[1]["params"]["version"], 2);
+        assert_eq!(pushes[1]["params"]["diagnostics"], json!([]));
+        let analyze = answered(&transcript)
+            .into_iter()
+            .find(|frame| frame["id"] == 2)
+            .expect("analyze answer");
+        assert_eq!(
+            analyze["result"]["diagnostics"],
+            json!([]),
+            "the full-text event applied; the ranged one changed nothing"
+        );
     }
 
     /// An idle daemon with a pending save wakes at the debounce deadline and
