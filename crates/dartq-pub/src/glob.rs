@@ -1172,15 +1172,19 @@ mod tests {
 
     /// Counts allocations by forwarding to the system allocator.
     ///
-    /// Installed crate-wide for the test binary; the counter is only read
-    /// by [`matching_hot_path_allocates_nothing`].
+    /// Installed crate-wide for the test binary. Tallies are kept
+    /// per-thread so concurrent tests under `--test-threads > 1` never
+    /// pollute each other's counts; [`matching_hot_path_allocates_nothing`]
+    /// reads its own thread's tally.
     struct CountingAllocator;
 
-    static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
             // SAFETY: forwarded with the caller's layout.
             unsafe { std::alloc::System.alloc(layout) }
         }
@@ -1191,7 +1195,7 @@ mod tests {
         }
 
         unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
             // SAFETY: forwarded with the caller's layout.
             unsafe { std::alloc::System.alloc_zeroed(layout) }
         }
@@ -1202,7 +1206,7 @@ mod tests {
             layout: std::alloc::Layout,
             new_size: usize,
         ) -> *mut u8 {
-            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
             // SAFETY: forwarded with the caller's layout and new size.
             unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
         }
@@ -1246,8 +1250,9 @@ mod tests {
         .map(str::to_owned)
         .collect();
 
-        // Construction allocations are out of scope; reset before matching.
-        ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Construction allocations are out of scope; only this thread's
+        // tally delta across the matching loop must be zero.
+        let before = ALLOCATIONS.with(|count| count.get());
         let mut hits = 0;
         for _ in 0..100 {
             for glob in &globs {
@@ -1258,11 +1263,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "matches_path allocated on the hot path"
-        );
+        let after = ALLOCATIONS.with(|count| count.get());
+        assert_eq!(after, before, "matches_path allocated on the hot path");
         assert!(hits > 0, "corpus must exercise matching paths");
     }
 }
