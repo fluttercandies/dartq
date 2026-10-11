@@ -972,17 +972,28 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         end
                     } else {
                         // Recovery: an incomplete dot shorthand like
-                        // `C c = const .` (official comment). The `.` is
-                        // consumed first (official `parseConstDotShorthand`:
-                        // `ensureIdentifier(., expressionContinuation)`
-                        // blames the FOLLOWER — the intertwined expect
-                        // reports "Expected an identifier, but got ';'" at
-                        // the `;`, which survives as the declaration
-                        // terminator), and the synthetic identifier is the
-                        // shorthand's operand/end.
+                        // `C c = const .` (official comment). The pinned
+                        // 3.13.1 oracle face for this exact shape
+                        // (`dot_shorthands/const_no_identifier_recovery.dart`)
+                        // is a single `expected_token(';')` from the
+                        // declaration terminator: the follower `;` is
+                        // consumed as the shorthand operand here, and the
+                        // statement's own `ensureSemicolon` reports once at
+                        // the real block closer. (The 3.15 CFE instead keeps
+                        // the `;` and reports `expectedIdentifier` via the
+                        // expressionContinuation template — the pinned
+                        // oracle face wins; the `.`-led sister shape
+                        // `var c = .` has no `const` head, takes the plain
+                        // `_isDotShorthand` recovery above, and keeps the
+                        // template behavior.)
                         let dot = self.peek_span();
                         self.cursor.advance();
-                        let end = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                        let end = if self.peek_kind() == TokenKind::Semicolon {
+                            let semi = self.cursor.advance();
+                            self.span_of(semi)
+                        } else {
+                            self.ensure_identifier(IdentifierContext::ExpressionContinuation)
+                        };
                         self.listener.handle_dot_shorthand_head(dot);
                         self.listener.handle_dot_shorthand_context(dot);
                         end
@@ -993,7 +1004,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // `const Foo.bar<int>(...)`.
                 self.listener.begin_const_expression(const_keyword);
                 self.parse_constructor_reference(ConstructorReferenceContext::Const);
-                let end = self.parse_constructor_invocation_arguments();
+                let end = self.parse_constructor_invocation_arguments(self.last_consumed_span());
                 self.listener.end_const_expression(end);
                 end
             }

@@ -804,7 +804,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let begin = self.peek_span();
         self.listener.begin_implicit_creation_expression(begin);
         self.parse_constructor_reference(ConstructorReferenceContext::Implicit);
-        let end = self.parse_constructor_invocation_arguments();
+        let end = self.parse_constructor_invocation_arguments(self.last_consumed_span());
         self.listener
             .end_implicit_creation_expression(begin, open_angle);
         end
@@ -1303,41 +1303,37 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         self.listener.begin_new_expression(new_kw);
         self.parse_constructor_reference(ConstructorReferenceContext::New);
-        let end = self.parse_constructor_invocation_arguments();
+        let end = self.parse_constructor_invocation_arguments(self.last_consumed_span());
         self.listener.end_new_expression(new_kw);
         end
     }
 
-    /// Official `parseConstructorInvocationArguments` :8641: arguments (or
-    /// the invalid-type-arguments recovery). The pinned oracle never
-    /// surfaces `constructor_with_type_arguments` (#96 cull), so the
-    /// type-argument arm emits only `handle_invalid_type_arguments` and the
-    /// generic `(`-missing recovery.
-    pub(crate) fn parse_constructor_invocation_arguments(&mut self) -> TokenSpan {
+    /// Official `parseConstructorInvocationArguments` :8884: arguments (or
+    /// the invalid-type-arguments recovery). [token] is the last-consumed
+    /// span — the official `token` parameter — so the missing-`(` report
+    /// lands on the type-argument closer/identifier, not the follower. The
+    /// pinned oracle never surfaces `constructor_with_type_arguments`
+    /// (#96 cull), so the type-argument arm emits only
+    /// `handle_invalid_type_arguments` and the generic `(`-missing recovery.
+    pub(crate) fn parse_constructor_invocation_arguments(&mut self, token: TokenSpan) -> TokenSpan {
         if self.peek_kind() == TokenKind::OpenParen {
             return self.parse_arguments_rest();
         }
-        let at = self.peek_span();
         let type_arg = self.compute_type_param_or_arg(false);
-        let end = if matches!(type_arg, TypeParamOrArg::None) {
-            self.report(msg::expected_after_but_got("("), at);
-            at
+        if matches!(type_arg, TypeParamOrArg::None) {
+            self.report(msg::expected_after_but_got("("), token);
         } else {
             let parsed = type_arg.parse_arguments(self);
             self.listener.handle_invalid_type_arguments(parsed);
-            self.peek_span()
-        };
+        }
         if self.peek_kind() != TokenKind::OpenParen {
             // Official `insertParens(includeIdentifier: false)`: an empty
-            // synthetic argument group.
+            // synthetic argument group, then `parseArgumentsRest` rides it.
             let offset = self.peek_span().range.offset;
             self.synthetic(TokenKind::OpenParen, offset);
-            self.cursor.advance();
             self.synthetic(TokenKind::CloseParen, offset);
-            self.cursor.advance();
-            return self.peek_span();
         }
-        end
+        self.parse_arguments_rest()
     }
 
     // ------------------------------------------------------------------

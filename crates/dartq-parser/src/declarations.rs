@@ -1115,7 +1115,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             );
         }
         if self.peek_kind() == TokenKind::OpenParen || has_type_arguments_or_dot {
-            self.parse_arguments_rest();
+            // Official `parseConstructorInvocationArguments` (the enum
+            // element is a verbatim copy of the constructor-reference tail,
+            // parser_impl.dart:2948-2950): the missing-`(` recovery reports
+            // `expected_after_but_got('(')` and splices an empty synthetic
+            // group instead of eating the `;`/`,` follower.
+            self.parse_constructor_invocation_arguments(self.last_consumed_span());
         } else {
             let at = self.peek_span();
             self.listener.handle_no_arguments(at);
