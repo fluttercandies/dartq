@@ -1,0 +1,17 @@
+name: signals_compat
+description: >-
+  Live-compat overlay wiring the real signals_lint plugin (pinned clone under
+  .third/aswp-samples/signals) onto the dartq plugin host. Not published.
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  # The official custom_lint API the upstream plugin is written against
+  # (PluginBase / CustomLintConfigs), needed to drive it.
+  custom_lint_builder: ^0.8.1
+  dartq_plugin_host:
+    path: ../..
+  signals_lint:
+    path: ../../../../.third/aswp-samples/signals/packages/signals_lint

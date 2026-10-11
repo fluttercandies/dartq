@@ -1,0 +1,20 @@
+name: riverpod_compat
+description: >-
+  Live-compat overlay wiring the real riverpod_lint plugin (pinned clone
+  under .third/aswp-samples/riverpod) onto the dartq plugin host. Not
+  published.
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  # The official registration face the upstream plugin's `register` call
+  # expects (the bridge implements it), and `DiagnosticCode` for the fix-code
+  # identity the host mirror keys on.
+  analysis_server_plugin: ^0.3.0
+  analyzer: ^13.0.0
+  dartq_plugin_host:
+    path: ../..
+  riverpod_lint:
+    path: ../../../../.third/aswp-samples/riverpod/packages/riverpod_lint

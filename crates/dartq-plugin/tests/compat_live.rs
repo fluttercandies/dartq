@@ -7,8 +7,19 @@
 //! UTF-16 edit applied to real text, and the crash mode surfaced as the
 //! `dartq/plugin_crashed` diagnostic (PRD §14).
 //!
+//! Four more rows drive the real ecosystem plugin overlays
+//! (`samples/{signals,jaspr,riverpod,pyramid}` — thin packages that run the
+//! actual upstream plugin objects from the pinned `.third/aswp-samples`
+//! clones over the host loop): the #644 compat matrix. Each row asserts the
+//! registration census (the observable proof the upstream `register` ran),
+//! the negotiated capabilities, and the fixes face where the row exercises
+//! it. The clones are maintainer-provisioned and not part of git, and the
+//! overlays' `.third` path deps additionally require `dart pub get` to have
+//! resolved them, so a row whose overlay directory is absent or unresolved
+//! skips at runtime with a clear message.
+//!
 //! Distinct from `live_host.rs` (the `bin/live_plugin` fixture): this drives
-//! the on-disk sample with its real `dartq_plugin.json` manifest. Both tests
+//! on-disk samples with their real `dartq_plugin.json` manifests. All tests
 //! spawn a real `dart` process: `#[ignore]`d here so the serial verification
 //! phase owns them — run with
 //! `cargo test -p dartq-plugin --test compat_live -- --ignored`.
@@ -20,9 +31,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
+use dartq_plugin::session::SessionError;
 use dartq_plugin::{
-    CapabilitySet, Manifest, PluginRuntime, RuntimeError, Severity as WireSeverity, SpawnSpec,
-    StdioPolicy, crash_diagnostic, discover,
+    Capability, CapabilitySet, Manifest, PluginRuntime, RuntimeError, Severity as WireSeverity,
+    SpawnSpec, StdioPolicy, crash_diagnostic, discover,
 };
 use dartq_source::{FileTable, LineIndex, utf16_offset_to_byte};
 
@@ -319,6 +331,303 @@ fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
         runtime.shutdown(),
         Err(RuntimeError::Crashed { .. })
     ));
+}
+
+// The #644 compat matrix: the four real ecosystem plugin overlays. One
+// driver runs each row through the full lifecycle (discovery → spawn →
+// handshake → the upstream `register` inside the child → diagnostics batch →
+// census → fixes face → close); the rows are expectation tables, not code.
+
+/// The fixes face one row exercises: one change per registered generator,
+/// the first change's message pinning the first registration, and the marker
+/// the edit writes at the requested UTF-16 range.
+struct FixesFace {
+    /// Changes in the reply (fix generators first, then assists).
+    count: usize,
+    /// The first change's message (registration order is wire order).
+    first_message: &'static str,
+    /// The replacement text the first edit writes.
+    replacement: &'static str,
+}
+
+/// One overlay's expectations, pinning its #644 matrix row to the pinned
+/// `.third` clone revision. If a pin moves, re-count the upstream
+/// `register(PluginRegistry)` calls (or `getLintRules`/`getAssists` for the
+/// custom_lint-shaped signals) and update the census/counts here — a census
+/// mismatch is the drift detector.
+struct OverlayRow {
+    /// Overlay directory (and manifest name) under
+    /// `dartq-plugin-host/samples/`.
+    name: &'static str,
+    /// The manifest's entrypoint.
+    entrypoint: &'static str,
+    /// Negotiated capabilities (manifest list, protocol order).
+    negotiated: &'static [&'static str],
+    /// `(lint, warning, fix, assist)` registration census.
+    census: (u64, u64, u64, u64),
+    /// The fixes face, when the row negotiates `fix`; `None` proves the
+    /// capability gate on a lint-only row.
+    fixes: Option<FixesFace>,
+}
+
+#[test]
+#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+fn signals_overlay_minimal_custom_lint_plugin_registers_and_applies_utf16_edits() {
+    // Minimal deps (custom_lint, no analyzer registry); its five producers
+    // are `DartAssist` subclasses served through `request/fixes`.
+    drive_overlay(&OverlayRow {
+        name: "signals",
+        entrypoint: "bin/signals_plugin.dart",
+        negotiated: &["lint", "fix"],
+        census: (5, 0, 0, 5),
+        fixes: Some(FixesFace {
+            count: 5,
+            first_message: "signals assist 1",
+            replacement: "/* dartq:signals */",
+        }),
+    });
+}
+
+#[test]
+#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+fn jaspr_overlay_all_three_capabilities_with_assist_round_trip() {
+    // 3 lint + 2 warning rules (census only: no host mirror), 4 fix
+    // generators + 14 assists delegated to the host registry.
+    drive_overlay(&OverlayRow {
+        name: "jaspr",
+        entrypoint: "bin/jaspr_plugin.dart",
+        negotiated: &["lint", "fix", "assist"],
+        census: (3, 2, 4, 14),
+        fixes: Some(FixesFace {
+            count: 18,
+            first_message: "jaspr fix LintCode.sort_children_last",
+            replacement: "/* dartq:jaspr */",
+        }),
+    });
+}
+
+#[test]
+#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+fn riverpod_overlay_bulk_registrations_over_a_live_process() {
+    // The bulk row: 16 warning rules (census only) + 6 fix generators + 12
+    // assists, all registered inside the child before the handshake.
+    drive_overlay(&OverlayRow {
+        name: "riverpod",
+        entrypoint: "bin/riverpod_plugin.dart",
+        negotiated: &["lint", "fix", "assist"],
+        census: (0, 16, 6, 12),
+        fixes: Some(FixesFace {
+            count: 18,
+            first_message: "riverpod fix LintCode.async_value_nullable_pattern",
+            replacement: "/* dartq:riverpod */",
+        }),
+    });
+}
+
+#[test]
+#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+fn pyramid_overlay_lint_only() {
+    // The lint-only row: the bulk of the upstream registration face (37
+    // rules + 23 fix generators + 3 assists) with `request/fixes` gated off
+    // by the manifest's `[lint]` capability.
+    drive_overlay(&OverlayRow {
+        name: "pyramid",
+        entrypoint: "bin/pyramid_plugin.dart",
+        negotiated: &["lint"],
+        census: (37, 0, 23, 3),
+        fixes: None,
+    });
+}
+
+/// The on-disk overlay directory for one ecosystem sample.
+fn overlay_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../dartq-plugin-host/samples")
+        .join(name)
+}
+
+/// Early-skips an overlay row when it cannot run: the `.third` ecosystem
+/// clones are maintainer-provisioned (absent on fresh clones), `dart pub get`
+/// must have resolved the overlay's `.third` path deps (proof: a generated
+/// `package_config.json`), or no `dart` is on PATH. Returns the overlay
+/// directory when ready.
+fn overlay_ready(name: &str) -> Option<PathBuf> {
+    let dir = overlay_dir(name);
+    if !dir.join("dartq_plugin.json").exists() {
+        eprintln!(
+            "skipping: {} is absent; the ecosystem sample clones under .third/ \
+             are maintainer-provisioned and not part of git",
+            dir.display()
+        );
+        return None;
+    }
+    if !dir.join(".dart_tool/package_config.json").exists() {
+        eprintln!(
+            "skipping: {} is unresolved; run `dart pub get` in it first (its \
+             .third path deps are maintainer-provisioned and not part of git)",
+            dir.display()
+        );
+        return None;
+    }
+    if !dart_available() {
+        eprintln!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return None;
+    }
+    Some(dir)
+}
+
+/// Parses a census message (`census lint=L warning=W fix=F assist=A`) into
+/// `(lint, warning, fix, assist)`.
+fn parse_census(message: &str) -> (u64, u64, u64, u64) {
+    let mut counts = [0u64; 4];
+    let body = message
+        .strip_prefix("census ")
+        .unwrap_or_else(|| panic!("census message, got: {message}"));
+    for pair in body.split_whitespace() {
+        let (key, value) = pair
+            .split_once('=')
+            .unwrap_or_else(|| panic!("census `key=value` pairs, got: {pair}"));
+        let slot = match key {
+            "lint" => 0,
+            "warning" => 1,
+            "fix" => 2,
+            "assist" => 3,
+            other => panic!("unknown census key `{other}`"),
+        };
+        counts[slot] = value
+            .parse()
+            .unwrap_or_else(|_| panic!("census count for `{key}`, got: {value}"));
+    }
+    (counts[0], counts[1], counts[2], counts[3])
+}
+
+/// Drives one overlay row through the full live lifecycle: manifest
+/// discovery, `dart <entrypoint>` spawn (the child runs the real upstream
+/// `register` before answering `initialize`), capability negotiation, one
+/// engine diagnostics batch answered with the registration census, the
+/// fixes face (or its capability gate), and graceful shutdown.
+// One linear end-to-end scenario per row; carving it up would thread the
+// runtime through helpers for no reader benefit (the compat test above
+// keeps the same posture).
+#[expect(clippy::too_many_lines, reason = "see above")]
+fn drive_overlay(row: &OverlayRow) {
+    let Some(dir) = overlay_ready(row.name) else {
+        return;
+    };
+
+    // Discovery through the real manifest: an explicit override loads the
+    // overlay directory (the convention scan is empty here).
+    let report = discover(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."), &[dir]);
+    assert!(
+        report.skipped.is_empty(),
+        "the overlay manifest must load cleanly: {:?}",
+        report.skipped
+    );
+    assert_eq!(report.plugins.len(), 1);
+    let discovered = &report.plugins[0];
+    assert_eq!(discovered.manifest.name, row.name);
+    assert_eq!(discovered.manifest.entrypoint, row.entrypoint);
+
+    let mut runtime = PluginRuntime::spawn(SpawnSpec::dart(
+        &discovered.dir,
+        discovered.manifest.clone(),
+    ))
+    .expect("the overlay spawns via `dart <entrypoint>` and completes the handshake");
+    assert_eq!(
+        runtime.negotiated().map(CapabilitySet::names),
+        Some(row.negotiated.to_vec()),
+        "the negotiated set is the manifest's capability list"
+    );
+
+    // The engine's batch: one .dart row whose UTF-16 range spans the emoji's
+    // surrogate pair (the position exchange's proof, as in the compat test).
+    let mut files = FileTable::new();
+    let a = files.intern(Path::new("lib/a.dart"));
+    let a_path = files
+        .path(a)
+        .expect("interned")
+        .to_string_lossy()
+        .into_owned();
+    let engine = vec![Diagnostic::new(
+        Severity::Error,
+        URI_DOES_NOT_EXIST,
+        "Target of URI doesn't exist: 'x.dart'.",
+        a,
+        SourceRange {
+            offset: 8,
+            length: 2,
+        },
+        None,
+    )];
+    runtime.feed(&engine, &files).expect("engine feed");
+    // `Duration::from_minutes` is not stable on the pinned toolchain, so
+    // seconds remain the only expressible unit for this budget.
+    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
+    let findings = runtime
+        .wait_diagnostics(Duration::from_secs(60))
+        .expect("overlay findings arrive within the drain budget");
+
+    // The census: the observable proof the upstream registration ran.
+    assert_eq!(findings.len(), 1, "one census row per batch");
+    assert_eq!(findings[0].file, a_path);
+    assert_eq!(findings[0].code, format!("{}/census", row.name));
+    assert_eq!(findings[0].severity, WireSeverity::Info);
+    assert_eq!(
+        parse_census(&findings[0].message),
+        row.census,
+        "registration census pins the clone revision"
+    );
+
+    match &row.fixes {
+        Some(face) => {
+            let reply = runtime
+                .request_fixes(&a_path, 8, 2)
+                .expect("fixes reply arrives within the callback budget");
+            assert_eq!(
+                reply.fixes.len(),
+                face.count,
+                "one change per registered generator"
+            );
+            assert_eq!(reply.fixes[0].message, face.first_message);
+            let edit = &reply.fixes[0].edits[0];
+            assert_eq!(
+                (edit.offset, edit.length),
+                (8, 2),
+                "the requested UTF-16 range echoed"
+            );
+            assert_eq!(edit.replacement, face.replacement);
+            // Applying the edit proves the UTF-16 exchange: offsets 8..10
+            // span the emoji's surrogate pair, where UTF-16 and byte offsets
+            // diverge.
+            let start = utf16_offset_to_byte(A_DART, 8);
+            let end = utf16_offset_to_byte(A_DART, 10);
+            let mut fixed = String::with_capacity(A_DART.len());
+            fixed.push_str(&A_DART[..start]);
+            fixed.push_str(&edit.replacement);
+            fixed.push_str(&A_DART[end..]);
+            assert_eq!(
+                fixed,
+                format!("import '{}.dart';\nvoid main() {{}}\n", face.replacement),
+                "the fix applied at the UTF-16 range the plugin echoed"
+            );
+        }
+        None => {
+            // Lint-only row: `request/fixes` is gated on the negotiated
+            // `fix` capability and must never reach the plugin.
+            let error = runtime
+                .request_fixes(&a_path, 0, 0)
+                .expect_err("the fix capability is not negotiated");
+            assert!(
+                matches!(
+                    error,
+                    RuntimeError::Protocol(SessionError::CapabilityNotNegotiated(Capability::Fix))
+                ),
+                "the gate is the capability check, got {error:?}"
+            );
+        }
+    }
+
+    runtime.shutdown().expect("graceful shutdown");
 }
 
 /// The content the engine holds for the other files of the set (the test

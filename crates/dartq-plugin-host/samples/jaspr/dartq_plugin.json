@@ -1,0 +1,12 @@
+{
+  "name": "jaspr",
+  "version": "0.7.2",
+  "entrypoint": "bin/jaspr_plugin.dart",
+  "capabilities": ["lint", "fix", "assist"],
+  "timeouts": {
+    "callback_ms": 30000,
+    "request_ms": 60000,
+    "request_retries": 3
+  },
+  "memory_budget_mb": 1024
+}
