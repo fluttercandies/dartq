@@ -1,9 +1,10 @@
 /// Unit tests for the plugin lifecycle surface:
 /// `package:dartq_plugin_host/plugin.dart`.
 ///
-/// The Rust live-fixture tests never invoke a producer's compute; this file
-/// closes that gap at the pure level: a real plugin registers real producers
-/// and one compute runs against a real [ProducerContext].
+/// The pure level of producer execution: a real plugin registers real
+/// producers and one compute runs against a real [ProducerContext] — the
+/// wire-level faces are pinned by `serve_plugin_test.dart` (the host loop)
+/// and dartq-plugin's `tests/live_host.rs` (a real process).
 library;
 
 import 'dart:async';
@@ -24,12 +25,12 @@ class _AddConstProducer implements Producer {
 
   @override
   Future<List<SourceEdit>> compute(ProducerContext context) async => [
-        SourceEdit(
-          offset: context.offset,
-          length: context.length,
-          replacement: 'const ',
-        ),
-      ];
+    SourceEdit(
+      offset: context.offset,
+      length: context.length,
+      replacement: 'const ',
+    ),
+  ];
 }
 
 /// A real third-party plugin as it would be authored against this package.

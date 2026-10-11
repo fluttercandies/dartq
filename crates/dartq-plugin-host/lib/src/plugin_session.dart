@@ -6,6 +6,8 @@
 /// so the transport lives in `host.dart`.
 library;
 
+import 'dart:async';
+
 import 'diagnostic.dart';
 import 'edits.dart';
 import 'frame.dart';
@@ -27,25 +29,34 @@ enum SessionState {
 /// diagnostics (`notification/engine_diagnostics`, one batch per analyze
 /// cycle). Pure function: whatever it returns is emitted back to the core as
 /// `notification/diagnostic` frames, in order.
-typedef EngineDiagnosticsHandler = List<PluginDiagnostic> Function(
-  List<PluginDiagnostic> engineDiagnostics,
-);
+typedef EngineDiagnosticsHandler =
+    List<PluginDiagnostic> Function(List<PluginDiagnostic> engineDiagnostics);
 
 /// Signature of the hook serving the core's `request/fixes` (only called
-/// when the session is ready). Pure function: the returned changes are
-/// serialized into the reply frame, best (lowest priority) first.
-typedef FixesHandler = List<PrioritizedChange> Function(
-  String file,
-  int offset,
-  int length,
-);
+/// when the session is ready). May compute synchronously or return a
+/// future: the serve loop awaits it, so a producer that needs async work
+/// delays only its own reply — the callback budget (`callback_ms`) stays
+/// the core's to enforce, and a stalled reply is answered by the runtime's
+/// kill-and-restart (PRD section 14.3). The returned changes are serialized
+/// into the reply frame, best (lowest priority) first. A handler failure
+/// propagates: the session never fabricates a fix.
+typedef FixesHandler =
+    FutureOr<List<PrioritizedChange>> Function(
+      String file,
+      int offset,
+      int length,
+    );
 
 /// Drives one plugin session: answers the core's `initialize`,
 /// `request/fixes`, and `shutdown`, feeds the engine's diagnostics to the
 /// plugin, and frames the plugin's diagnostics for delivery.
 class PluginSession {
   /// Builds a session for a plugin described by [config].
-  PluginSession({required this.config, this.onEngineDiagnostics, this.onRequestFixes});
+  PluginSession({
+    required this.config,
+    this.onEngineDiagnostics,
+    this.onRequestFixes,
+  });
 
   /// The plugin this session serves (its capabilities are advertised during
   /// the handshake).
@@ -70,8 +81,11 @@ class PluginSession {
 
   /// Feeds one inbound core frame. Requests return the reply frame to send;
   /// core notifications (`notification/engine_diagnostics`) dispatch to
-  /// [onEngineDiagnostics] and return null.
-  PluginFrame? handleFrame(PluginFrame frame) {
+  /// [onEngineDiagnostics] and complete with null. The future completes
+  /// once the frame is fully served — an async [onRequestFixes] is awaited
+  /// before the reply exists, so frames are served strictly in arrival
+  /// order.
+  Future<PluginFrame?> handleFrame(PluginFrame frame) async {
     final id = frame.id;
     if (id == null) {
       _handleCoreNotification(frame);
@@ -168,7 +182,7 @@ class PluginSession {
     });
   }
 
-  PluginFrame _handleFixes(int id, PluginFrame frame) {
+  Future<PluginFrame> _handleFixes(int id, PluginFrame frame) async {
     if (_state != SessionState.ready) {
       return PluginFrame.error(
         id,
@@ -180,7 +194,9 @@ class PluginSession {
     if (handler == null) {
       // No fixes handler: the honest answer for any location is the empty
       // set (real fixes need the engine Query API, PRD section 14.2).
-      return PluginFrame.request(id, frame.method, {'fixes': const <Object?>[]});
+      return PluginFrame.request(id, frame.method, {
+        'fixes': const <Object?>[],
+      });
     }
     final file = frame.params['file'];
     final offset = frame.params['offset'];
@@ -190,7 +206,7 @@ class PluginSession {
         'request/fixes payload requires string `file`, int `offset`, int `length`',
       );
     }
-    final changes = handler(file, offset, length);
+    final changes = await handler(file, offset, length);
     return PluginFrame.request(id, frame.method, {
       'fixes': [for (final change in changes) change.toJson()],
     });

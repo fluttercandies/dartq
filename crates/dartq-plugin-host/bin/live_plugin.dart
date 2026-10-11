@@ -2,37 +2,34 @@ import 'dart:io';
 
 import 'package:dartq_plugin_host/dartq_plugin_host.dart';
 
-/// The rule code the fixture registers its fix under (`Plugin.register`).
+/// The rule code the fixture registers its fix under (`Plugin.register`);
+/// the Rust side (`crates/dartq-plugin/tests/live_host.rs`) feeds an engine
+/// diagnostic carrying this code to give a `request/fixes` its fix context.
 const String ruleCode = 'live/fixed';
 
-/// The deterministic answer to every `request/fixes`: one edit with a fixed
-/// replacement on a fixed span, independent of the requested location. The
-/// Rust side (`crates/dartq-plugin/tests/live_host.rs`) asserts these exact
-/// values.
+/// The registered producer's answer, asserted by the Rust side: priority
+/// [fixedPriority], title [fixedMessage], and one edit replacing the fixing
+/// diagnostic's range (the producer context the host derives from the engine
+/// batch) with [fixedReplacement] — real `compute` output, not a canned
+/// reply.
 const int fixedPriority = 1;
 const String fixedMessage = 'live fix';
-const SourceEdit fixedEdit = SourceEdit(
-  offset: 10,
-  length: 4,
-  replacement: 'fixed',
-);
+const String fixedReplacement = 'fixed';
 
 /// Live E2E fixture for dartq-plugin's `tests/live_host.rs`: a real plugin
-/// process built on the package's [Plugin] lifecycle. Advertises the `fix`
-/// capability, registers one deterministic fix, serves `request/fixes` with
-/// it, and shuts down cleanly once the core closes its stdin.
+/// process on the package's integration path — [servePlugin] registers the
+/// plugin, executes the registered producer's `compute` per `request/fixes`,
+/// and serves its output. Advertises the `fix` capability and shuts down
+/// cleanly once the core closes its stdin.
 ///
-/// Launched with the `crash` argument it answers the handshake, then exits
-/// on the first work request — the mid-session death the runtime must
-/// isolate. Never run interactively; the core launches it (`dart run`).
+/// Launched with the `crash` argument the producer dies inside `compute` on
+/// the first fix request — the mid-session death the runtime must isolate;
+/// dying there also proves the host really executes registered producers.
+/// Never run interactively; the core launches it (`dart run`).
 Future<void> main(List<String> args) async {
-  final crashOnFirstFix = args.contains('crash');
-  const plugin = _LivePlugin();
-  final registry = PluginRegistryImpl();
-  plugin.register(registry);
-  await plugin.start();
-  await runPluginHost(
-    PluginConfig(
+  await servePlugin(
+    _LivePlugin(crashOnFirstFix: args.contains('crash')),
+    config: PluginConfig(
       name: 'live',
       version: '0.1.0',
       entrypoint: 'bin/live_plugin.dart',
@@ -43,48 +40,36 @@ Future<void> main(List<String> args) async {
       stdout.writeln(line);
       await stdout.flush();
     },
-    onRequestFixes: (_file, _offset, _length) {
-      if (crashOnFirstFix) {
-        // Mid-session death: no reply, the connection just drops — the core
-        // must report the death, never follow the plugin down.
-        exit(3);
-      }
-      // The registered rule is what this session serves: without a live
-      // registration the honest answer is the empty set.
-      if (!registry.fixesByRule.containsKey(ruleCode)) {
-        return const <PrioritizedChange>[];
-      }
-      return const <PrioritizedChange>[
-        PrioritizedChange(
-          priority: fixedPriority,
-          message: fixedMessage,
-          edits: [fixedEdit],
-        ),
-      ];
-    },
   );
-  // The core closed its stdin: the session is over, release resources.
-  await plugin.shutDown();
 }
 
 /// The fixture plugin: one registered fix, no resources of its own.
 class _LivePlugin extends Plugin {
-  const _LivePlugin();
+  const _LivePlugin({this.crashOnFirstFix = false});
+
+  /// Whether the producer dies mid-`compute` instead of answering.
+  final bool crashOnFirstFix;
 
   @override
   String get name => 'live';
 
   @override
   void register(PluginRegistry registry) {
-    registry.registerFixForRule(ruleCode, _fixedSpanFix);
+    registry.registerFixForRule(
+      ruleCode,
+      (context) => _FixedSpanFix(crashOnFirstFix: crashOnFirstFix),
+    );
   }
 }
 
-/// The registered fix: a fixed replacement on a fixed span for any location.
-Producer _fixedSpanFix(ProducerContext context) => const _FixedSpanFix();
-
+/// The registered fix: a fixed replacement over the fixing diagnostic's
+/// range — the context the host passes is the diagnostic's span, whatever
+/// range the request itself names.
 class _FixedSpanFix implements Producer {
-  const _FixedSpanFix();
+  const _FixedSpanFix({this.crashOnFirstFix = false});
+
+  /// Whether `compute` dies mid-request (the crash mode).
+  final bool crashOnFirstFix;
 
   @override
   int get priority => fixedPriority;
@@ -93,7 +78,18 @@ class _FixedSpanFix implements Producer {
   String get message => fixedMessage;
 
   @override
-  Future<List<SourceEdit>> compute(ProducerContext context) async => [
-    fixedEdit,
-  ];
+  Future<List<SourceEdit>> compute(ProducerContext context) async {
+    if (crashOnFirstFix) {
+      // Mid-session death: no reply, the connection just drops — the core
+      // must report the death, never follow the plugin down.
+      exit(3);
+    }
+    return [
+      SourceEdit(
+        offset: context.offset,
+        length: context.length,
+        replacement: fixedReplacement,
+      ),
+    ];
+  }
 }

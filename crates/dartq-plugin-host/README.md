@@ -28,8 +28,11 @@ contains no `Cargo.toml`, and the workspace member list in the root
   plugin-facing API, mirroring `analysis_server_plugin`'s `Plugin` /
   `PluginRegistry` observable surface (`registerAssist`,
   `registerFixForRule`).
-- `lib/src/host.dart`, `bin/dartq_plugin_host.dart` — the stdio main loop and
-  the launchable entry point.
+- `lib/src/host.dart`, `bin/dartq_plugin_host.dart` — the stdio main loop
+  and the launchable entry point; `servePlugin` is the plugin-bearing
+  integration a plugin package's entry point delegates to (registration,
+  producers, lifecycle on the same loop; `bin/live_plugin.dart` is the
+  reference wiring).
 - `bin/echo_plugin.dart`, `bin/live_plugin.dart`, `bin/fix_plugin.dart`,
   `bin/slow_plugin.dart` — test fixtures the live suites spawn.
 - `samples/compat/` — the compatibility sample plugin, shaped like an
@@ -39,7 +42,10 @@ contains no `Cargo.toml`, and the workspace member list in the root
 ## Status
 
 Protocol v1 is complete on both sides (handshake, capability negotiation,
-diagnostic notifications, fixes round trip). Serving real fixes requires the
-engine Query API and the core-side plugin discovery/lifecycle wiring, which
-land later in M4; runtime enforcement of the manifest's timeout and memory
+diagnostic notifications, fixes round trip), and registered producers are
+executed: `servePlugin` answers `request/fixes` from the registry (assists
+at the requested range, rule fixes at a matching engine diagnostic's range
+of the latest pushed batch), best priority first. Widening the producer
+context beyond the engine batch needs the engine Query API, which lands
+later in M4; runtime enforcement of the manifest's timeout and memory
 budgets is likewise a later M4 step.
