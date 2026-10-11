@@ -1,0 +1,25 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "lint_corpus_nested",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "lint_corpus",
+      "rootUri": "../../",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "lints",
+      "rootUri": "../../vendor/lints",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    }
+  ],
+  "generator": "pub",
+  "generatorVersion": "3.13.1"
+}

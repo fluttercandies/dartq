@@ -1,0 +1,42 @@
+# M3 unused-family diagnostic gate codes (goal #764): the code set for the
+# M3 unused-family gate run of scripts/m3-gate.sh. The run is one harness
+# invocation over the dedicated `tests/corpus/m3-unused` corpus package
+# (`--severity-filter WARNING` plus this `--codes-file`); the harness
+# verdict is ERROR-keyed (SKIPPED here), so the script scores the
+# WARNING-tier stats from the report, same as m2-gate.sh. One code per
+# line, # comments: same format as m1_codes.txt / m2_warning_codes.txt.
+#
+# Inclusion rule (mechanical, re-derivable): take the usage-analysis
+# `unused_*` family that M2 excluded (see the m2_warning_codes.txt header:
+# 11 registry STATIC_WARNING names, an exclusion that is load-bearing for
+# the M2 95% WARNING bar — these names must never leak into that file) and
+# keep every name dartq M3 implements, each backed by a targeted fixture
+# under tests/corpus/m3-unused/lib/targeted/ designed to fire exactly its
+# one code.
+#
+# Fixture map (tests/corpus/m3-unused/lib/targeted/<code>.dart):
+#  unused_local_variable      var x = 1; never read
+#  unused_label               labeled while; bare break, label never named
+#  unused_catch_clause        on FormatException catch (e) {}, empty body
+#  unused_catch_stack         catch (e, s); only e used
+#  unused_element             library-private class _C, unreferenced
+#  unused_field               private field written via initializing formal, never read
+#  unused_element_parameter   private method [int? y]; invoked without it
+#  unused_import              dart:async, never used
+#  unused_shown_name          show A, B; only A used (companion file exports both)
+#  unused_result              @useResult int f(); discarded as a statement (package:meta)
+#
+# Parked (NOT included): unused_field_from_primary_constructor — no M3
+# emission path this round; a fixture without one would mint permanent
+# oracle-only denominator rows.
+#
+unused_catch_clause
+unused_catch_stack
+unused_element
+unused_element_parameter
+unused_field
+unused_import
+unused_label
+unused_local_variable
+unused_result
+unused_shown_name

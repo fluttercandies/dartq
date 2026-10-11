@@ -1,0 +1,12 @@
+name: corpus_m3_unused
+description: >-
+  M3 unused-family targeted corpus (goal #764): one fixture per code in
+  tests/harness/m3_unused_codes.txt, dart-verify caliber,
+  implementation-independent. The usage-analysis unused_* family is the
+  WARNING-tier set M2 excluded (load-bearing for the M2 95% bar);
+  unused_field_from_primary_constructor is parked and gets no fixture.
+  The meta dependency backs only the @useResult fixture.
+environment:
+  sdk: ^3.13.0
+dependencies:
+  meta: ^1.19.0

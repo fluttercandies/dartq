@@ -1,0 +1,7 @@
+name: meta
+description: >-
+  Minimal local stand-in for package:meta, mirroring the real package's
+  `sealed` annotation face so the corpus resolves package:meta without
+  network access or machine-specific pub-cache paths.
+environment:
+  sdk: ^3.13.0

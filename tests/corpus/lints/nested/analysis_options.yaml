@@ -1,0 +1,26 @@
+# The nested sub-package's own options (fixture wave 2). The official
+# locator gives a directory with its own .dart_tool/package_config.json an
+# independent context root whose effective linter set is built from THIS
+# file's include chain — nested files do not inherit the parent's rules
+# implicitly, so the parent is included explicitly and the toggles apply
+# relative to it (official replace semantics; dartq mirrors the walk in
+# dartq-engine analysis_options.rs, the #595 nested-replace pin).
+#
+# Toggles relative to the parent's set:
+#  - await_only_futures is silenced ONLY via this child set: the root
+#    control lib/await_only_futures.dart fires, nested/lib/child_silence.dart
+#    is expect-empty. A dartq regression in nested enable-set resolution
+#    surfaces that file as a dartq-only gate row.
+#  - unnecessary_type_check is enabled ONLY via this child set. It is not a
+#    package:lints set rule (the oracle dropped it in the Dart 3.15 main
+#    re-pin, lint_divergences.tsv row), so the oracle reports undefined_lint
+#    on this options file and never lints child_enablement.dart, while
+#    dartq (Group::Diagnostic opt-in) fires there — every row sits outside
+#    the frozen universe codes file; the fixture proves the child enable
+#    set reaches the dartq lint stage.
+include: ../analysis_options.yaml
+
+linter:
+  rules:
+    await_only_futures: false
+    unnecessary_type_check: true

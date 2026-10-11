@@ -53,7 +53,8 @@ fingerprint.
       pubspec.yaml         # gateway factory redirect, widget part pairs,
                            # conditional-import facet trio
   tests/
-    unit_NNNNN_test.dart   # test-shaped files using package:test syntax
+    unit_NNNNN_test.dart   # test-shaped files: pattern/expression blocks in
+                           # plain Dart (no package:test dependency)
 ```
 
 File distribution: ~60% feature packages, ~15% core, ~10% app (root

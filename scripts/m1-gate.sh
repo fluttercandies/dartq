@@ -6,8 +6,8 @@
 # M1 bar, deliberately below the M0 0.99 — against a single oracle of record:
 # the fvm default install (Dart 3.13.1, the gate-caliber-r5 baseline). No
 # matrix: M1 acceptance is defined on one caliber. The report lands under
-# docs/audits/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r3;
-# the recorded history is baseline-r1 and r2, and r2 measured ERROR-tier
+# docs/audits/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r4;
+# the recorded history is baseline-r1, r2 and r3, and r2 measured ERROR-tier
 # Jaccard 0.8235 below this bar over the pre-growth corpus — five dartq
 # misses in the wrong_number_of_type_arguments family plus one dartq-only
 # attribution).
@@ -23,12 +23,17 @@
 #   --dry-run       resolve every path, print the plan and the exact harness
 #                   command, execute nothing (no dart, no harness).
 #   --label L       report directory name under docs/audits/gate-m1/.
-#                   Default: M1_LABEL env, else m1-r3.
+#                   Default: M1_LABEL env, else m1-r4. An existing report
+#                   directory is refused — a rerun never overwrites recorded
+#                   evidence.
 #   --allow-vacuous forwarded to the harness: accept a run whose oracle side
 #                   has no ERROR-tier entries post-filter. Without it such a
 #                   run is a harness error — the gate would pass at 1.000
 #                   without judging anything (a broken codes file, a wrong
 #                   corpus, an oracle that silently produced nothing).
+#   Every run persists post-filter divergences as regression cases under
+#   tests/corpus/regressions/cases (exempted against
+#   tests/corpus/regressions/known-diffs.json, PRD section 19.1).
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the default install must
 # exist — its Dart version banner is checked on the run path, a mismatch is
@@ -54,7 +59,7 @@ THRESHOLD="0.95"
 EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-m1"
 HARNESS="./target/debug/harness"
-DEFAULT_LABEL="m1-r3"
+DEFAULT_LABEL="m1-r4"
 
 usage() {
   sed -n '2,/^set -u -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -128,13 +133,17 @@ fi
 
 # --- plan --------------------------------------------------------------------
 outdir="$OUT_ROOT/$label"
+if [ -e "$outdir" ]; then
+  echo "m1-gate: $outdir already exists — refusing to overwrite recorded gate evidence (pass a new --label)" >&2
+  exit 2
+fi
 echo "== m1-gate plan"
 printf '  %-16s %s\n' "corpus" "$CORPUS"
 printf '  %-16s %s (ERROR tier, bar %s)\n' "codes" "$CODES_FILE" "$THRESHOLD"
 printf '  %-16s %s\n' "oracle" "$dart_bin"
 printf '  %-16s %s\n' "dartq" "$DARTQ_CMD"
 printf '  %-16s %s\n' "report" "$outdir"
-printf '  %-16s harness run --corpus-dir %s --oracle-dart %s --dartq-cmd "%s" --severity-filter ERROR --threshold %s --codes-file %s --out %s\n' \
+printf '  %-16s harness run --corpus-dir %s --oracle-dart %s --dartq-cmd "%s" --severity-filter ERROR --threshold %s --codes-file %s --out %s --persist-regressions tests/corpus/regressions/cases\n' \
   "command" "$CORPUS" "$dart_bin" "$DARTQ_CMD" "$THRESHOLD" "$CODES_FILE" "$outdir"
 if [ "$dry_run" = 1 ]; then
   echo "== dry run: paths resolved, nothing executed"
@@ -162,6 +171,8 @@ run_args=(
   --severity-filter ERROR
   --threshold "$THRESHOLD"
   --codes-file "$CODES_FILE"
+  # Divergences land in tests/corpus/regressions/cases, exempted via tests/corpus/regressions/known-diffs.json (PRD §19.1).
+  --persist-regressions tests/corpus/regressions/cases
   --out "$outdir"
 )
 if [ "$allow_vacuous" -eq 1 ]; then

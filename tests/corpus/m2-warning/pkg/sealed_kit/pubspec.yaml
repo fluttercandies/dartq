@@ -1,0 +1,8 @@
+name: sealed_kit
+description: >-
+  Corpus dependency for the m2 WARNING sealed-supertype fixtures: exports
+  @sealed-annotated classes (package:meta annotation face) that root
+  fixtures violate from a different package.
+environment:
+  sdk: ^3.13.0
+resolution: workspace

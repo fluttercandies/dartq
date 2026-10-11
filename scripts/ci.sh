@@ -64,4 +64,5 @@ done
 # for the serial verification phase (AGENTS.md resource discipline):
 #   scripts/coverage-gate.sh — llvm-cov coverage gate (serial phase only)
 #   scripts/m1-gate.sh       — M1 differential gate (serial phase only)
+#   scripts/repro-gate.sh    — §19.5 reproducibility gate (serial phase only)
 echo "ci: gate passed"
