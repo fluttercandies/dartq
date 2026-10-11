@@ -44,9 +44,22 @@ binaries (`dartq-cli`, `harness`). Concurrent cargo invocations share
 
 ## Command Surface
 
-`dartq` has eight commands: `analyze`, `check`, `compat`, `daemon`, `fix`,
-`impact`, `query`, and `version`. Every flag below is parsed by the CLI —
-run `dartq <command> --help` for the full grammar.
+`dartq` has eleven commands. Every flag below is parsed by the CLI — run
+`dartq <command> --help` for the full grammar.
+
+| Command | Purpose |
+| --- | --- |
+| `analyze` | Full engine over a package directory: scan, parse, resolution |
+| `check` | Scan + parse only — the differential face against `dart analyze` |
+| `compat` | One file under several SDK roots: a per-axis compatibility matrix |
+| `daemon` | LSP 3.17 server over stdin/stdout |
+| `explain` | One-stop AI report for one symbol over the analyzed workspace |
+| `fix` | Emit or apply anchored fix patches (`--dry-run` only prints them) |
+| `assists` | Query plugin hosts' assists for one file location (report-only) |
+| `index` | Build the symbol index over the analyzed workspace and report what it built |
+| `impact` | Assess what a change to one file would affect |
+| `query` | Query the symbol index — faces: `symbol`, `references`, `callers` |
+| `version` | Print the version |
 
 ```bash
 # Scan + parse a directory tree (the differential face): syntax
@@ -226,8 +239,8 @@ today:
 | Semantics | [`dartq-semantic`](crates/dartq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
 | Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
 | Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | landed |
-| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | landed |
-| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache and eviction policies | landed (L1) |
+| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | namespace placeholder — implementation lives in dartq-engine |
+| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache and eviction policies | namespace placeholder — implementation lives in dartq-engine (L1) |
 | Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | partial — flush machinery only |
 | Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | landed |
 | Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (64 official core/recommended rules) | rules implemented; CLI wiring pending |
@@ -329,8 +342,8 @@ Honest state of the current tree:
 - `dartq analyze` covers scan, parse, and resolution; the type-system and
   semantic-diagnostic seam is still landing, so semantic errors beyond
   syntax/resolution are not yet reported.
-- `query` has a single face, `symbol`. More query kinds are unplanned
-  future work.
+- `query` serves three faces: `symbol`, `references`, and `callers`. More
+  query kinds are unplanned future work.
 - The 64 built-in lint rules are implemented and tested but not yet wired
   into the CLI/daemon diagnostic output.
 - `dartq fix` plumbing (anchoring, drift-correcting applier, patch

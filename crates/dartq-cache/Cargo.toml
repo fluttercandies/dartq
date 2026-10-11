@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "Layered analysis cache (L1, L2, L3) and eviction policies for dartq."
 repository.workspace = true
 readme = "README.md"
+# Namespace placeholder — the implementation lives in `dartq-engine` (L1); not for publish.
+publish = false
 
 [lints]
 workspace = true
