@@ -37,9 +37,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.96"
-# Placeholder: no `origin` remote is configured yet; replace with the
-# canonical repository URL before publishing.
-repository = "https://github.com/dartq/dartq"
+repository = "https://github.com/fluttercandies/dartq"
 
 [workspace.dependencies]
 # One version decision per external dependency, made once here; member
