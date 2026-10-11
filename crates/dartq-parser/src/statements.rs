@@ -243,21 +243,44 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// The shared statement loop of `parseBlock`/`parseFunctionBody`: parse
     /// statements until `}`/EOF/bailout with the official no-progress guard
     /// (report `unexpectedToken` and force-advance). Returns the statement
-    /// count.
+    /// count. Each block starts with no spill region: the spill run of a
+    /// primary bracket error is scoped to the block whose group parse
+    /// adopted (or stranded) the scanner's synthetic closer, and the run is
+    /// drained at the loop head — before a stranded token can enter
+    /// `parse_statement` and mint its own expression/semicolon rows the
+    /// official enclosing jumps never emit (`ensureCloseParen` :5043-5049,
+    /// list drain :8569-8575, argument drain :9588-9600).
     fn parse_statements_until_close(&mut self) -> usize {
+        self.spill_after = None;
+        self.spill_scan_floor = self.cursor.real_pos();
         let mut count = 0usize;
         while !self.cursor.at_eof()
             && self.peek_kind() != TokenKind::CloseCurly
             && !self.is_bailed()
         {
+            if self.in_spill_region() {
+                // Spill run of a primary bracket error: the scan reported
+                // that error at the mismatching closer, and the official
+                // enclosing jumps consume the stranded region without
+                // per-token rows — drain silently (the drain is not a
+                // statement; the count is untouched).
+                self.drain_spill_run();
+                continue;
+            }
             let start = self.cursor.peek_id();
             self.parse_statement();
             count += 1;
             if self.cursor.peek_id() == start && !self.is_bailed() {
-                // No progress: report the current token and move forward.
-                let at = self.peek_span();
-                self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
-                self.force_advance();
+                if self.in_spill_region() {
+                    // Net for a statement parse that stalled inside the
+                    // spill region it entered (same silent jump shape).
+                    self.drain_spill_run();
+                } else {
+                    // No progress: report the current token and move forward.
+                    let at = self.peek_span();
+                    self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+                    self.force_advance();
+                }
             }
         }
         count
@@ -914,8 +937,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.listener
                 .end_else_statement(else_token, self.peek_span());
         }
+        // The official hook receives the branch's last consumed token, not
+        // the follower (parser_impl.dart:10148).
         self.listener
-            .end_if_statement(if_kw, else_kw, self.peek_span());
+            .end_if_statement(if_kw, else_kw, self.last_consumed_span());
     }
 
     /// Official `parseWhileStatement`.
@@ -930,7 +955,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.loop_state = LoopState::InsideLoop;
         self.parse_statement();
         self.loop_state = saved;
-        let end = self.peek_span();
+        // Both hooks receive the body's last consumed token (official
+        // parser_impl.dart:10485-10486).
+        let end = self.last_consumed_span();
         self.listener.end_while_statement_body(end);
         self.listener.end_while_statement(while_kw, end);
     }
@@ -1154,7 +1181,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.loop_state = LoopState::InsideLoop;
         self.parse_statement();
         self.loop_state = saved;
-        let end = self.peek_span();
+        // Both hooks receive the body's last consumed token (official
+        // parser_impl.dart:10339-10340).
+        let end = self.last_consumed_span();
         self.listener.end_for_statement_body(end);
         self.listener.end_for_statement(end);
     }
@@ -1230,7 +1259,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.loop_state = LoopState::InsideLoop;
         self.parse_statement();
         self.loop_state = saved;
-        let end = self.peek_span();
+        // Both hooks receive the body's last consumed token (official
+        // parser_impl.dart:10415-10416).
+        let end = self.last_consumed_span();
         self.listener.end_for_in_body(end);
         self.listener.end_for_in(end);
     }
@@ -1608,8 +1639,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         self.parse_switch_block();
         self.loop_state = saved;
+        // The official hook receives the block's last consumed token (the
+        // `}`), not the follower.
         self.listener
-            .end_switch_statement(switch_kw, self.peek_span());
+            .end_switch_statement(switch_kw, self.last_consumed_span());
     }
 
     /// Official `parseSwitchBlock`.

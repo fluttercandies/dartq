@@ -102,6 +102,20 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// (analyzer `error_verifier` `_checkForExtensionTypeRepresentationErrorCodes`,
     /// error_verifier.dart:5356-5460).
     pub(crate) rep_field_check: Option<RepFieldCheck>,
+    /// UTF-16 offset from which the enclosing statement loop drains the
+    /// spill run of a primary bracket error. Set when a closer adopted by
+    /// [`crate::recovery`] is the scanner's synthetic for an unmatched
+    /// begin, or located retroactively by [`crate::recovery`]'s bounded
+    /// backward scan: the scan reported that error at the mismatching
+    /// token, and the real closers/commas stranded behind it are the region
+    /// the official enclosing jumps consume without per-token rows
+    /// (`ensureCloseParen` parser_impl.dart:5043-5049, the list drain
+    /// :8569-8575; the `moveSynthetic` rationale :5034-5037).
+    pub(crate) spill_after: Option<u32>,
+    /// Lowest table index the spill backward scan has not yet covered:
+    /// fixed at each block's entry (just inside its `{`), so the scan never
+    /// leaves the block whose statement loop is running.
+    pub(crate) spill_scan_floor: usize,
 }
 
 /// Representation-field shape state for one extension type primary
@@ -147,6 +161,8 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             in_constructor_formals: false,
             last_parameter_count: 0,
             rep_field_check: None,
+            spill_after: None,
+            spill_scan_floor: 0,
         }
     }
 
@@ -162,6 +178,22 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     #[inline]
     pub(crate) fn peek_span(&self) -> TokenSpan {
         self.cursor.peek().span
+    }
+
+    /// Span of the token consumed by the latest advance — the construct's
+    /// true end token. The official end hooks deliver exactly this (the
+    /// `token` a `parseStatement`/block parse returned), never the
+    /// follower: `endIfStatement(ifToken, elseToken, token)`
+    /// (parser_impl.dart:10148), `endWhileStatement(whileToken, token)`
+    /// (:10485-10486), `endForStatement(token)`/:10339-10340,
+    /// `endForIn(token)`/:10415-10416. The peek fallback covers an empty
+    /// stream.
+    #[inline]
+    pub(crate) fn last_consumed_span(&self) -> TokenSpan {
+        self.cursor
+            .last_consumed_id()
+            .map(|id| self.span_of(id))
+            .unwrap_or_else(|| self.peek_span())
     }
 
     /// Queue-aware span of the token `n` positions ahead — queued inserted
@@ -370,6 +402,8 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             in_constructor_formals: self.in_constructor_formals,
             last_parameter_count: self.last_parameter_count,
             rep_field_check: None,
+            spill_after: self.spill_after,
+            spill_scan_floor: self.spill_scan_floor,
         }
     }
 }

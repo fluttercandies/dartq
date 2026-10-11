@@ -21,6 +21,13 @@ use crate::message::msg;
 use crate::parser::{AsyncModifier, Parser};
 use crate::token_id::TokenSpan;
 
+/// Backward-scan budget of [`Parser::locate_spill_mark`]: the stranded run
+/// of a primary bracket error begins at the mismatching token, so the
+/// distance from a spill head back to the parked synthetic is the run plus
+/// at most the statement parse that followed it — well under this bound;
+/// heads beyond it keep the official lone-junk stall shape.
+const SPILL_SCAN_LIMIT: usize = 64;
+
 impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// Reports a recoverable error pinned to `at` (official
     /// `reportRecoverableError`, `parser_impl.dart:11399`; the official
@@ -453,9 +460,11 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// Missing `)` with a scanner-synthesized closer for the group: adopt it
     /// (`moveSynthetic`) without re-reporting — the scanner already reported
     /// the unclosed group. A well-formed but distant `)` is reported once and
-    /// jumped to.
+    /// jumped to. Adopting the scanner's synthetic marks the spill run of the
+    /// primary bracket error (see [`Self::drain_spill_run`]).
     pub(crate) fn ensure_close_paren(&mut self, open: TokenSpan) -> TokenSpan {
         if let Some(id) = self.cursor.opt_kind(TokenKind::CloseParen) {
+            self.mark_spill_run(id);
             return self.span_of(id);
         }
         // Where does the group actually close?
@@ -467,6 +476,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 // token (official `moveSynthetic`, :5035-5037) — the scan
                 // already reported the unclosed group, and the enclosing
                 // parse resumes at the current token.
+                self.spill_after = Some(self.span_of(close_id).range.offset);
                 let at = self.peek_span();
                 let id = self
                     .cursor
@@ -497,6 +507,101 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     pub(crate) fn skip_to_token(&mut self, id: crate::token_id::TokenId) {
         while self.cursor.peek_id() != id && !self.cursor.at_eof() {
             self.cursor.advance();
+        }
+    }
+
+    /// Marks [`Self::drain_spill_run`]'s region when `id` is the scanner's
+    /// synthetic closer of an unmatched begin: the scan reported that primary
+    /// bracket error at the mismatching token (scanner `report_unmatchedBegin`),
+    /// so everything stranded behind it is the spill run the official
+    /// enclosing jumps consume silently (`moveSynthetic` rationale,
+    /// `parser_impl.dart:5034-5037`). Parser-inserted synthetics (ids past
+    /// the table) mark nothing.
+    fn mark_spill_run(&mut self, id: crate::token_id::TokenId) {
+        if (id as usize) >= self.table.len() {
+            return;
+        }
+        let (_, synthetic) = self.cursor.resolve(id);
+        if synthetic {
+            self.spill_after = Some(self.span_of(id).range.offset);
+        }
+    }
+
+    /// Whether the cursor sits in the spill run of a primary bracket error:
+    /// a stranded closer or comma strictly behind the scanner's parked
+    /// synthetic for an unmatched begin. The mismatching token itself (at
+    /// the marked offset) belongs to the enclosing group parses, which
+    /// consume it by kind; only what follows is spill. When no mark is
+    /// latched yet, [`Self::locate_spill_mark`] scans the consumed prefix.
+    pub(crate) fn in_spill_region(&mut self) -> bool {
+        if !matches!(
+            self.peek_kind(),
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::Comma
+        ) {
+            return false;
+        }
+        let head = self.peek_span().range.offset;
+        if !self.spill_after.is_some_and(|at| head > at) {
+            self.locate_spill_mark(head);
+        }
+        self.spill_after.is_some_and(|at| head > at)
+    }
+
+    /// Backward scan for the scanner's parked synthetic of a primary
+    /// bracket error, covering the adoptions that bypass
+    /// [`Self::mark_spill_run`] (the argument/list loop heads consume their
+    /// closers directly): the consumed table prefix is walked down to
+    /// [`Parser::spill_scan_floor`] — the block entry — looking for the
+    /// nearest scanner-synthetic closer at or before the head's offset; a
+    /// real `{` ends the walk (the block boundary). A find latches
+    /// `spill_after`, so later checks are O(1); misses are bounded by
+    /// [`SPILL_SCAN_LIMIT`] tokens, keeping repeated stalls linear.
+    fn locate_spill_mark(&mut self, head: u32) {
+        #[allow(clippy::cast_possible_truncation)] // ids are u32 by design
+        let mut id = self.cursor.real_pos();
+        let mut budget = SPILL_SCAN_LIMIT;
+        while id > self.spill_scan_floor && budget > 0 {
+            id -= 1;
+            budget -= 1;
+            let tid = id as crate::token_id::TokenId;
+            let (kind, synthetic) = self.cursor.resolve(tid);
+            let offset = self.span_of(tid).range.offset;
+            if offset > head {
+                continue; // EOF-parked or later-inserted: no verdict here
+            }
+            if synthetic
+                && matches!(
+                    kind,
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly
+                )
+            {
+                self.spill_after = Some(offset);
+                return;
+            }
+            if !synthetic && kind == TokenKind::OpenCurly {
+                break; // the enclosing block's `{`: the region ends here
+            }
+        }
+    }
+
+    /// Consumes the spill run of a primary bracket error: the contiguous
+    /// stranded closers and commas behind the mismatch. Official consumes
+    /// this region through the enclosing group drains — `ensureCloseParen`'s
+    /// endGroup jump (:5043-5049), the list drain (:8569-8575), the argument
+    /// drain (:9588-9600) — reporting at most the scanner's own row, never
+    /// one row per token. The run stops at any token an enclosing parse can
+    /// still consume (`;`, `}`) or that re-enters parsing (the official
+    /// `looksLikeExpressionStart`/`looksLikeLiteralEntry` comma forks,
+    /// :9588-9600 / :8563). Structurally advancing: every iteration consumes
+    /// one token and EOF pins the cursor.
+    pub(crate) fn drain_spill_run(&mut self) {
+        while !self.cursor.at_eof() {
+            match self.peek_kind() {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::Comma => {
+                    self.cursor.advance();
+                }
+                _ => break,
+            }
         }
     }
 

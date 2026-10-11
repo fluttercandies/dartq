@@ -1158,7 +1158,10 @@ pub trait ParserListener {
     fn end_then_statement(&mut self, begin: Token, end: Token) {}
     fn begin_else_statement(&mut self, token: Token) {}
     fn end_else_statement(&mut self, begin: Token, end: Token) {}
-    /// `endIfStatement(ifToken, elseToken, end)`.
+    /// `endIfStatement(ifToken, elseToken, end)`. `end` is the
+    /// statement's own last consumed token — its `node.end` token, never
+    /// the follower (the `parseStatement` result,
+    /// parser_impl.dart:10148).
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {}
     /// `beginForStatement(token)`.
     fn begin_for_statement(&mut self, token: Token) {}
@@ -1178,6 +1181,8 @@ pub trait ParserListener {
     fn end_for_statement_body(&mut self, end: Token) {}
     /// `endForStatement(endToken)` (the for-in counterpart is
     /// [`ParserListener::end_for_in`]; exactly one of the two fires).
+    /// `end` is the statement's own last consumed token — its `node.end`
+    /// token, never the follower (parser_impl.dart:10339-10340).
     fn end_for_statement(&mut self, end: Token) {}
     /// `handleForLoopParts(forToken, leftParen, leftSeparator,
     /// rightSeparator, expressionCount)`.
@@ -1193,7 +1198,9 @@ pub trait ParserListener {
     }
     fn begin_for_in_body(&mut self, token: Token) {}
     fn end_for_in_body(&mut self, end: Token) {}
-    /// `endForIn(endToken)`.
+    /// `endForIn(endToken)`. `end` is the statement's own last consumed
+    /// token — its `node.end` token, never the follower
+    /// (parser_impl.dart:10415-10416).
     fn end_for_in(&mut self, end: Token) {}
     /// `handleForInLoopParts(awaitToken, forToken, leftParen,
     /// patternKeyword, inKeyword)`.
@@ -1212,6 +1219,9 @@ pub trait ParserListener {
     fn begin_while_statement(&mut self, token: Token) {}
     fn begin_while_statement_body(&mut self, token: Token) {}
     fn end_while_statement_body(&mut self, end: Token) {}
+    /// `endWhileStatement(whileToken, endToken)`. `end` is the
+    /// statement's own last consumed token — its `node.end` token, never
+    /// the follower (parser_impl.dart:10485-10486).
     fn end_while_statement(&mut self, token: Token, end: Token) {}
     fn begin_do_while_statement(&mut self, token: Token) {}
     fn begin_do_while_statement_body(&mut self, token: Token) {}
@@ -1271,6 +1281,9 @@ pub trait ParserListener {
     }
     fn handle_finally_block(&mut self, finally_kw: Token) {}
     fn begin_switch_statement(&mut self, token: Token) {}
+    /// `endSwitchStatement(switchToken, endToken)`. `end` is the
+    /// statement's own last consumed token (the block's `}`) — its
+    /// `node.end` token, never the follower.
     fn end_switch_statement(&mut self, token: Token, end: Token) {}
     fn begin_switch_block(&mut self, token: Token) {}
     fn end_switch_block(&mut self, count: usize, begin: Token, end: Token) {}
