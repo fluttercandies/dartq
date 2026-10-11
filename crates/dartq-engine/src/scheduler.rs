@@ -297,4 +297,43 @@ mod tests {
         assert_eq!(report.tasks, vec![task(1, false, 2)]);
         assert_eq!(report.stale_dropped, 0);
     }
+
+    /// The runtime-policy gate (runtime-and-concurrency-model.md D1/D3): the
+    /// engine core is synchronous — scheduling is pure data plumbing, and
+    /// every thread (daemon reader, watch poller, rayon fan-out pool) lives
+    /// in a shell crate, never here. Asserted as a source walk rather than a
+    /// runtime thread count, which the multi-threaded test harness itself
+    /// would drown out. The needles are assembled from fragments so this
+    /// file's own source never matches the walk.
+    #[test]
+    fn engine_core_spawns_no_threads() {
+        const NEEDLES: [&str; 3] = [
+            concat!("use std", "::thread"),
+            concat!("thread", "::spawn"),
+            concat!("thread", "::Builder"),
+        ];
+        fn walk(dir: &std::path::Path, offenses: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("the engine src tree is readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, offenses);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("source is utf-8");
+                    offenses.extend(
+                        NEEDLES
+                            .iter()
+                            .filter(|needle| source.contains(*needle))
+                            .map(|needle| format!("{}: {needle}", path.display())),
+                    );
+                }
+            }
+        }
+        let mut offenses = Vec::new();
+        walk(std::path::Path::new("src"), &mut offenses);
+        offenses.sort_unstable();
+        assert!(
+            offenses.is_empty(),
+            "the engine core must not spawn threads (runtime-policy gate): {offenses:?}"
+        );
+    }
 }
