@@ -54,6 +54,7 @@ impl Ty {
     };
 
     /// The same base, non-nullable.
+    #[must_use]
     pub const fn non_null(self) -> Ty {
         Ty {
             base: self.base,
@@ -62,6 +63,7 @@ impl Ty {
     }
 
     /// The same base, nullable.
+    #[must_use]
     pub const fn make_nullable(self) -> Ty {
         Ty {
             base: self.base,

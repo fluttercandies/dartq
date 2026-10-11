@@ -53,6 +53,7 @@ pub struct Flow<'t> {
 }
 
 impl<'t> Flow<'t> {
+    #[must_use]
     pub fn new(tokens: &'t TokenTable, source: &'t str) -> Self {
         Self {
             tokens,
@@ -81,7 +82,7 @@ impl<'t> Flow<'t> {
             if let Some(&id) = self.names.get(lexeme) {
                 return id;
             }
-            let id = self.names.len() as u32;
+            let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
             self.names.insert(lexeme.into(), id);
             return id;
         }
@@ -90,7 +91,7 @@ impl<'t> Flow<'t> {
         if let Some(&id) = self.names.get(&key) {
             return id;
         }
-        let id = self.names.len() as u32;
+        let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
         self.names.insert(key, id);
         id
     }
@@ -173,12 +174,12 @@ impl<'t> Flow<'t> {
         };
         let ops = NameTypeOps;
         let mut interp = Interp::new(&ops);
-        interp.run(events);
+        interp.run(&events);
         self.facts.append(&mut interp.facts);
     }
 }
 
-impl<'t> ParserListener for Flow<'t> {
+impl ParserListener for Flow<'_> {
     // —— executable framing ————————————————————————————————————————————
 
     fn begin_top_level_method(
@@ -346,13 +347,13 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_block(&mut self, _count: usize, begin: Token, end: Token, _kind: BlockKind) {
-        if let (Some(buffer), Some(index)) = (&mut self.buffer, self.block_events.pop()) {
-            if let Some(Ev::Block { span, .. }) = buffer.get_mut(index) {
-                span.range = dartq_source::SourceRange {
-                    offset: begin.range.offset,
-                    length: end.range.offset + end.range.length - begin.range.offset,
-                };
-            }
+        if let (Some(buffer), Some(index)) = (&mut self.buffer, self.block_events.pop())
+            && let Some(Ev::Block { span, .. }) = buffer.get_mut(index)
+        {
+            span.range = dartq_source::SourceRange {
+                offset: begin.range.offset,
+                length: end.range.offset + end.range.length - begin.range.offset,
+            };
         }
         // Inside a do-while block body this is the body's own close (the
         // last-wins order makes inner blocks yield to it).
@@ -1230,7 +1231,7 @@ mod tests {
                 match tokens.get(index) {
                     Some(_) if tokens.lexeme(source, index) == lexeme => {
                         if seen == occurrence {
-                            return index as u32;
+                            return u32::try_from(index).expect("token index fits u32");
                         }
                         seen += 1;
                     }
@@ -1310,14 +1311,11 @@ mod tests {
         let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
         // The Nth token with the given lexeme.
         let index_of = |lexeme: &str| -> u32 {
-            (0..)
-                .map(|i| i as u32)
-                .find(|&i| {
-                    tokens
-                        .get(i as usize)
-                        .is_some_and(|_| tokens.lexeme(source, i as usize) == lexeme)
-                })
-                .unwrap_or_else(|| panic!("token {lexeme} not found"))
+            let index = (0..)
+                .map_while(|i| tokens.get(i).map(|_| i))
+                .find(|&i| tokens.lexeme(source, i) == lexeme)
+                .unwrap_or_else(|| panic!("token {lexeme} not found"));
+            u32::try_from(index).expect("token index fits u32")
         };
         let sp = |id: u32| TokenSpan {
             id,

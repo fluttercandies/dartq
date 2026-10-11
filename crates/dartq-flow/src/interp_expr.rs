@@ -9,9 +9,14 @@ use crate::model::State;
 use crate::model::is_non_nullable;
 use crate::ty::{Base, Ty};
 
-impl<'o> Interp<'o> {
+impl Interp<'_> {
     /// Handles one expression-layer event; `false` means the event belongs
     /// to another layer.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single port of the official expression decision order; splitting the \
+                  match would scatter the per-event documentation"
+    )]
     pub(crate) fn expr_step(
         &mut self,
         ev: &Ev,
@@ -65,12 +70,11 @@ impl<'o> Interp<'o> {
                 };
                 self.sink_type(ty);
             }
-            Ev::NoType => self.sink_type(Ty::UNKNOWN),
+            Ev::NoType | Ev::FunctionType => self.sink_type(Ty::UNKNOWN),
             Ev::VoidType => self.sink_type(Ty {
                 base: crate::ty::Base::Void,
                 nullable: false,
             }),
-            Ev::FunctionType => self.sink_type(Ty::UNKNOWN),
             Ev::Bool { value } => {
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 expr.bool_value = Some(*value);
@@ -153,7 +157,9 @@ impl<'o> Interp<'o> {
                     let shortcut = match left.reference {
                         Some(var) => {
                             let promoted = self.ops.promote_to_non_null(left.ty);
-                            if promoted != left.ty {
+                            if promoted == left.ty {
+                                self.current.clone()
+                            } else {
                                 self.current.clone().finish_type_test(
                                     self.ops,
                                     &mut self.lists,
@@ -161,8 +167,6 @@ impl<'o> Interp<'o> {
                                     None,
                                     Some(promoted),
                                 )
-                            } else {
-                                self.current.clone()
                             }
                         }
                         None => self.current.clone(),
@@ -233,7 +237,7 @@ impl<'o> Interp<'o> {
                     let inverted = matches!(op, BinOp::NotEq);
                     self.equality_check(&left, &right, inverted);
                 }
-                _ => {
+                BinOp::Other => {
                     self.exprs.pop();
                     self.exprs.pop();
                     self.exprs.push(Expr::trivial(Ty::UNKNOWN));
@@ -253,22 +257,19 @@ impl<'o> Interp<'o> {
                 };
                 let operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
-                match operand.reference {
-                    Some(var) => {
-                        let promoted = self.promotion_candidate(var, tested);
-                        let (matched, unmatched) = self.branch_type_test(var, tested, promoted);
-                        let (if_true, if_false) = if is_not {
-                            (unmatched, matched)
-                        } else {
-                            (matched, unmatched)
-                        };
-                        self.current = if_true.clone();
-                        expr.branches = Some((if_true, if_false));
-                    }
-                    None => {
-                        let cur = self.current.clone();
-                        expr.branches = Some((cur.clone(), cur));
-                    }
+                if let Some(var) = operand.reference {
+                    let promoted = self.promotion_candidate(var, tested);
+                    let (matched, unmatched) = self.branch_type_test(var, tested, promoted);
+                    let (if_true, if_false) = if is_not {
+                        (unmatched, matched)
+                    } else {
+                        (matched, unmatched)
+                    };
+                    self.current = if_true.clone();
+                    expr.branches = Some((if_true, if_false));
+                } else {
+                    let cur = self.current.clone();
+                    expr.branches = Some((cur.clone(), cur));
                 }
                 self.exprs.push(expr);
             }
@@ -419,7 +420,11 @@ impl<'o> Interp<'o> {
                     self.exprs.push(callee);
                 }
             }
-            Ev::ArgumentsBegin => {}
+            Ev::ArgumentsBegin
+            | Ev::ParenBegin
+            | Ev::ParenEnd
+            | Ev::ThenControlFlow
+            | Ev::AwaitBegin => {}
             Ev::ArgumentsEnd { count } => {
                 for _ in 0..*count {
                     self.exprs.pop();
@@ -432,7 +437,6 @@ impl<'o> Interp<'o> {
             Ev::Rethrow => {
                 self.unreachable_cur();
             }
-            Ev::ParenBegin | Ev::ParenEnd => {}
             Ev::RecordLitEnd { count } | Ev::ListLitEnd { count } => self.literal_value(*count),
             Ev::MapEntryEnd => {
                 // The entry's value is the value's own stack entry; the
@@ -491,7 +495,6 @@ impl<'o> Interp<'o> {
                 });
                 self.current = if_true;
             }
-            Ev::ThenControlFlow => {}
             Ev::ElseControlFlow => {
                 // The then-element is consumed; the else-element runs under
                 // the condition-false branch.
@@ -517,7 +520,6 @@ impl<'o> Interp<'o> {
                 // nets exactly one).
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
-            Ev::AwaitBegin => {}
             Ev::ExprBody => {
                 // The arrow body's value is consumed by the function; the
                 // function's own value for the consumer is netted at
@@ -559,12 +561,12 @@ impl<'o> Interp<'o> {
     /// stale id (recovery-shaped buffers can resolve a binding past a
     /// collect rollback) degrades to the unknown type.
     pub(crate) fn promoted_type_of(&self, var: u32, model: &crate::model::VarModel) -> Ty {
-        if model.promoted != crate::model::NIL {
-            self.lists.head(model.promoted)
-        } else {
+        if model.promoted == crate::model::NIL {
             self.vars
                 .get(var as usize)
                 .map_or(Ty::UNKNOWN, |meta| meta.ty)
+        } else {
+            self.lists.head(model.promoted)
         }
     }
 
@@ -673,38 +675,35 @@ impl<'o> Interp<'o> {
         } else {
             None
         };
-        match reference {
-            Some(var) => {
-                let operand = if null_side(right) { left } else { right };
-                if is_non_nullable(self.ops, operand.ty) {
-                    // Never null: the equality result is a known constant.
-                    expr.bool_value = Some(inverted);
-                    expr.branches = None;
+        if let Some(var) = reference {
+            let operand = if null_side(right) { left } else { right };
+            if is_non_nullable(self.ops, operand.ty) {
+                // Never null: the equality result is a known constant.
+                expr.bool_value = Some(inverted);
+                expr.branches = None;
+            } else {
+                let promoted = self.ops.promote_to_non_null(operand.ty);
+                let matched = self.current.clone().finish_type_test(
+                    self.ops,
+                    &mut self.lists,
+                    var,
+                    None,
+                    Some(promoted),
+                );
+                // `x == null`: the true-branch saw null; the
+                // false-branch saw non-null. `!=` inverts.
+                let (eq_true, eq_false) = (self.current.clone(), matched);
+                let (if_true, if_false) = if inverted {
+                    (eq_false, eq_true)
                 } else {
-                    let promoted = self.ops.promote_to_non_null(operand.ty);
-                    let matched = self.current.clone().finish_type_test(
-                        self.ops,
-                        &mut self.lists,
-                        var,
-                        None,
-                        Some(promoted),
-                    );
-                    // `x == null`: the true-branch saw null; the
-                    // false-branch saw non-null. `!=` inverts.
-                    let (eq_true, eq_false) = (self.current.clone(), matched);
-                    let (if_true, if_false) = if inverted {
-                        (eq_false, eq_true)
-                    } else {
-                        (eq_true, eq_false)
-                    };
-                    self.current = if_true.clone();
-                    expr.branches = Some((if_true, if_false));
-                }
+                    (eq_true, eq_false)
+                };
+                self.current = if_true.clone();
+                expr.branches = Some((if_true, if_false));
             }
-            None => {
-                let cur = self.current.clone();
-                expr.branches = Some((cur.clone(), cur));
-            }
+        } else {
+            let cur = self.current.clone();
+            expr.branches = Some((cur.clone(), cur));
         }
         self.exprs.push(expr);
     }

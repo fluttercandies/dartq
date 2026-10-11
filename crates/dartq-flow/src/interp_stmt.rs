@@ -9,9 +9,14 @@ use crate::interp::{DeclCtx, Effects, Expr, Frame, Interp, PatternKind, Scope, V
 use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
 
-impl<'o> Interp<'o> {
+impl Interp<'_> {
     /// Handles one statement-layer event; `false` means the event belongs
     /// to another layer.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single port of the official statement decision order; splitting the \
+                  match would scatter the per-event documentation"
+    )]
     pub(crate) fn stmt_step(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
         match ev {
             Ev::ExprStmt { span } => {
@@ -23,7 +28,11 @@ impl<'o> Interp<'o> {
                     self.exprs.pop();
                 }
             }
-            Ev::IfBegin { span } => self.dead_code(*span),
+            Ev::IfBegin { span }
+            | Ev::ReturnBegin { span }
+            | Ev::YieldBegin { span }
+            | Ev::SwitchBegin { span }
+            | Ev::SwitchExprBegin { span } => self.dead_code(*span),
             Ev::ThenBegin => {
                 // If-case: the pattern context holds the branch states.
                 if let Some(pattern) = self.pattern.as_mut() {
@@ -85,7 +94,7 @@ impl<'o> Interp<'o> {
                 let effects = if end == NIL {
                     Effects::default()
                 } else {
-                    self.collect_ranges(events, &[i..end as usize], match_of)
+                    self.collect_ranges(events, i..end as usize, match_of)
                 };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
@@ -116,7 +125,7 @@ impl<'o> Interp<'o> {
                 // The loop statement's end covers body intervals (official
                 // `visitWhileStatement`'s `flowEnd` on the body).
                 self.flow_end(crate::interp::Covered::Strict);
-                self.loop_exit(false)
+                self.loop_exit(false);
             }
             Ev::DoBegin { span } => {
                 self.dead_code(*span);
@@ -127,7 +136,7 @@ impl<'o> Interp<'o> {
                 let effects = if end == NIL {
                     Effects::default()
                 } else {
-                    self.collect_ranges(events, &[i..end as usize], match_of)
+                    self.collect_ranges(events, i..end as usize, match_of)
                 };
                 self.split_cur();
                 self.cjoin(&effects.written, &effects.captured);
@@ -174,13 +183,12 @@ impl<'o> Interp<'o> {
                 // makes the code after the do-while reachable (official
                 // `hasBreakStatement`).
                 let tail_reachable = self.reachable();
-                if let Some(window) = &mut self.dead {
-                    if window.awaiting_split() {
-                        window.attach_split(*while_range, tail_reachable);
-                    }
+                if let Some(window) = &mut self.dead
+                    && window.awaiting_split()
+                {
+                    window.attach_split(*while_range, tail_reachable);
                 }
             }
-            Ev::ReturnBegin { span } => self.dead_code(*span),
             Ev::ReturnEnd { has_expression } => {
                 if *has_expression {
                     self.exprs.pop();
@@ -189,7 +197,6 @@ impl<'o> Interp<'o> {
                 // unreachable (inside closures too).
                 self.unreachable_cur();
             }
-            Ev::YieldBegin { span } => self.dead_code(*span),
             Ev::YieldEnd => {
                 self.exprs.pop();
                 self.suspend();
@@ -282,7 +289,7 @@ impl<'o> Interp<'o> {
                             )
                         })
                         .unwrap_or(end);
-                    self.collect_ranges(events, &[i + 1..body_end], match_of)
+                    self.collect_ranges(events, i + 1..body_end, match_of)
                 };
                 let pre = self.current.clone();
                 self.split_cur();
@@ -421,9 +428,9 @@ impl<'o> Interp<'o> {
                         {
                             self.current = attach_finally(
                                 self,
-                                after_try,
-                                before_finally,
-                                self.current.clone(),
+                                &after_try,
+                                &before_finally,
+                                &self.current.clone(),
                             );
                         }
                     }
@@ -447,7 +454,6 @@ impl<'o> Interp<'o> {
                     }
                 }
             }
-            Ev::SwitchBegin { span } => self.dead_code(*span),
             Ev::SwitchBlockBegin => {
                 if self.collecting() {
                     return true;
@@ -525,7 +531,13 @@ impl<'o> Interp<'o> {
                 }
                 self.case_pattern_end(*has_guard);
             }
-            Ev::SwitchEnd | Ev::CaseEnd { .. } | Ev::CaseNoWhen => {}
+            Ev::SwitchEnd
+            | Ev::CaseEnd { .. }
+            | Ev::CaseNoWhen
+            | Ev::NoInitializer
+            | Ev::BlockBodyBegin
+            | Ev::BlockBodyEnd
+            | Ev::EmptyBody => {}
             Ev::SwitchBlockEnd => {
                 if self.collecting() {
                     return true;
@@ -536,7 +548,6 @@ impl<'o> Interp<'o> {
                 self.switch_after_case(frame_index);
                 self.switch_statement_end(frame_index);
             }
-            Ev::SwitchExprBegin { span } => self.dead_code(*span),
             Ev::SwitchExprBlockBegin => {
                 if self.collecting() {
                     return true;
@@ -733,7 +744,6 @@ impl<'o> Interp<'o> {
                 let var = self.declare_var(*name, meta, false);
                 self.pending_inits.push(var);
             }
-            Ev::NoInitializer => {}
             Ev::InitializerEnd => {
                 let var = self.pending_inits.pop();
                 let rhs = self.exprs.pop();
@@ -794,16 +804,13 @@ impl<'o> Interp<'o> {
                                 | Frame::Switch { .. }
                         )
                     );
-                    if !is_body_block {
-                        if let Some(window) = &mut self.dead {
-                            window.extend(*end);
-                        }
+                    if !is_body_block && let Some(window) = &mut self.dead {
+                        window.extend(*end);
                     }
                     self.stack.pop();
                     self.scopes.truncate(scopes_base);
                 }
             }
-            Ev::BlockBodyBegin | Ev::BlockBodyEnd | Ev::EmptyBody => {}
             _ => return false,
         }
         true
@@ -865,7 +872,7 @@ impl<'o> Interp<'o> {
         if labeled {
             // Labeled case bodies can be jumped into from anywhere in the
             // switch: conservatively join every write in the block.
-            let effects = self.collect_ranges(events, &[block.start..block.end], match_of);
+            let effects = self.collect_ranges(events, block.start..block.end, match_of);
             let previous = match &self.stack[frame_index] {
                 Frame::Switch { previous, .. } => previous.clone(),
                 _ => return,
@@ -948,7 +955,7 @@ impl<'o> Interp<'o> {
         }
     }
 
-    /// Pops the switch frame at SwitchBlockEnd: joins the break model and
+    /// Pops the switch frame at `SwitchBlockEnd`: joins the break model and
     /// the unmatched chain (official `switch_end`, isExhaustive always
     /// false — exhaustiveness needs the resolver).
     fn switch_statement_end(&mut self, switch_index: usize) {
@@ -967,7 +974,7 @@ impl<'o> Interp<'o> {
     }
 
     /// Statement-position if-case: the pattern's matched state becomes the
-    /// then-branch state (official ifCaseStatement_endAlternative).
+    /// then-branch state (official `ifCaseStatement_endAlternative`).
     /// Pattern-declared variables already live in the enclosing scope from
     /// their declaration events.
     fn if_case_then(&mut self) {
@@ -990,15 +997,14 @@ impl<'o> Interp<'o> {
 /// compare (identical before/after models keep the try promotions).
 fn attach_finally(
     interp: &mut Interp<'_>,
-    after_try: State,
-    before_finally: State,
-    after_finally: State,
+    after_try: &State,
+    before_finally: &State,
+    after_finally: &State,
 ) -> State {
-    let vars = interp.vars.len();
+    let vars = u32::try_from(interp.vars.len()).expect("variable count fits u32");
     let reachable_after = interp.reach.locally_reachable(after_finally.reach);
-    let mut models = Vec::with_capacity(vars);
-    for index in 0..vars {
-        let var = index as u32;
+    let mut models = Vec::with_capacity(vars as usize);
+    for var in 0..vars {
         let v1 = after_try.model(var);
         let v2 = before_finally.model(var);
         let v3 = after_finally.model(var);

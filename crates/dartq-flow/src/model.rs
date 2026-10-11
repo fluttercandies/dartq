@@ -66,7 +66,7 @@ impl ReachArena {
             overall: node.overall,
             depth: node.depth + 1,
         });
-        self.nodes.len() as u32 - 1
+        u32::try_from(self.nodes.len()).expect("checkpoint count fits u32") - 1
     }
 
     /// The same checkpoint, locally unreachable (official `setUnreachable`).
@@ -81,7 +81,7 @@ impl ReachArena {
             overall: false,
             depth: node.depth,
         });
-        self.nodes.len() as u32 - 1
+        u32::try_from(self.nodes.len()).expect("checkpoint count fits u32") - 1
     }
 
     /// Drops the most recent checkpoint (official `unsplit`). The root has
@@ -124,7 +124,7 @@ pub(crate) struct Lists {
 impl Lists {
     pub(crate) fn cons(&mut self, ty: Ty, next: u32) -> u32 {
         self.cells.push((ty, next));
-        self.cells.len() as u32 - 1
+        u32::try_from(self.cells.len()).expect("tested-set cell count fits u32") - 1
     }
 
     pub(crate) fn head(&self, id: u32) -> Ty {
@@ -261,8 +261,8 @@ impl State {
         self.with_model(var, model)
     }
 
-    /// Records a write (official `PromotionModel.write` + `_demoteViaAssignment`
-    /// + `_tryPromoteToTypeOfInterest`): marks assigned, drops promotions the
+    /// Records a write (official `PromotionModel.write`, `_demoteViaAssignment`,
+    /// `_tryPromoteToTypeOfInterest`): marks assigned, drops promotions the
     /// written type no longer satisfies, and re-promotes to a type of
     /// interest (the declared type's non-null form or a previously tested
     /// type) when the written value matches.
@@ -367,10 +367,10 @@ impl State {
     ) -> Self {
         let model = self.model(var);
         let mut new_tested = model.tested;
-        if let Some(tested) = tested {
-            if !lists.iter(model.tested).any(|t| t == tested) {
-                new_tested = append_tested(lists, model.tested, tested);
-            }
+        if let Some(tested) = tested
+            && !lists.iter(model.tested).any(|t| t == tested)
+        {
+            new_tested = append_tested(lists, model.tested, tested);
         }
         let mut new_promoted = model.promoted;
         if let Some(promoted) = promoted {
@@ -410,10 +410,11 @@ impl State {
         if !reach.locally_reachable(first.reach) {
             return second;
         }
-        let mut models = Vec::with_capacity(vars);
+        let vars = u32::try_from(vars).expect("variable count fits u32");
+        let mut models = Vec::with_capacity(vars as usize);
         for var in 0..vars {
-            let a = first.model(var as u32);
-            let b = second.model(var as u32);
+            let a = first.model(var);
+            let b = second.model(var);
             models.push(join_model(a, b, lists));
         }
         Self {
@@ -478,9 +479,11 @@ impl State {
     /// types of interest for writes after the loop.
     pub(crate) fn inherit_tested(self, other: &Self, lists: &mut Lists) -> Self {
         let mut this = self;
-        for var in 0..this.models.len().max(other.models.len()) {
-            let a = this.model(var as u32);
-            let b = other.model(var as u32);
+        let var_count = u32::try_from(this.models.len().max(other.models.len()))
+            .expect("variable count fits u32");
+        for var in 0..var_count {
+            let a = this.model(var);
+            let b = other.model(var);
             if a.tested == b.tested {
                 continue;
             }
@@ -492,7 +495,6 @@ impl State {
                     merged = append_tested(lists, merged, ty);
                 }
             }
-            let var = var as u32;
             this = this.with_model(
                 var,
                 VarModel {

@@ -208,8 +208,8 @@ impl ForBounds {
     ) -> Self {
         let mut cond_start = parts;
         let mut upd_start = parts;
-        for j in begin + 1..parts {
-            if let Some(span) = events[j].span() {
+        for (j, event) in events.iter().enumerate().take(parts).skip(begin + 1) {
+            if let Some(span) = event.span() {
                 if span.range.offset >= right {
                     upd_start = upd_start.min(j);
                 } else if span.range.offset >= left {
@@ -487,12 +487,12 @@ impl<'o> Interp<'o> {
 
     /// Runs one executable's buffer: the pre-pass collect, then the real
     /// replay.
-    pub(crate) fn run(&mut self, events: Vec<Ev>) {
-        let match_of = build_match_map(&events);
-        self.anywhere = self.collect_ranges(&events, &[0..events.len()], &match_of);
+    pub(crate) fn run(&mut self, events: &[Ev]) {
+        let match_of = build_match_map(events);
+        self.anywhere = self.collect_ranges(events, 0..events.len(), &match_of);
         let mut i = 0;
         while i < events.len() {
-            let control = self.step(&events, i, &match_of);
+            let control = self.step(events, i, &match_of);
             match control {
                 Control::Continue => i += 1,
                 Control::Jump(to) => i = to,
@@ -514,7 +514,7 @@ impl<'o> Interp<'o> {
     /// locals, or parameters) start assigned; plain locals without one
     /// start unassigned.
     pub(crate) fn declare_var(&mut self, name: u32, meta: VarMeta, initialized: bool) -> u32 {
-        let var = self.vars.len() as u32;
+        let var = u32::try_from(self.vars.len()).expect("variable count fits u32");
         self.vars.push(meta);
         if let Some(frames) = self.collect.as_mut() {
             for frame in frames.iter_mut() {
@@ -701,20 +701,19 @@ impl<'o> Interp<'o> {
                     range: while_part,
                 },
             });
-            if !window.split_broken {
-                if let Some(start) = window.split_start {
-                    if window.end > start {
-                        self.emit(FlowFact::DeadCode {
-                            span: TokenSpan {
-                                id: window.anchor.id,
-                                range: SourceRange {
-                                    offset: start,
-                                    length: window.end - start,
-                                },
-                            },
-                        });
-                    }
-                }
+            if !window.split_broken
+                && let Some(start) = window.split_start
+                && window.end > start
+            {
+                self.emit(FlowFact::DeadCode {
+                    span: TokenSpan {
+                        id: window.anchor.id,
+                        range: SourceRange {
+                            offset: start,
+                            length: window.end - start,
+                        },
+                    },
+                });
             }
         } else if window.end > window.anchor.range.offset {
             self.emit(FlowFact::DeadCode {
@@ -759,7 +758,7 @@ impl<'o> Interp<'o> {
     pub(crate) fn collect_ranges(
         &mut self,
         events: &[Ev],
-        ranges: &[Range<usize>],
+        range: Range<usize>,
         match_of: &[u32],
     ) -> Effects {
         let snapshot = Snapshot {
@@ -773,14 +772,12 @@ impl<'o> Interp<'o> {
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
-        for range in ranges {
-            let mut i = range.start;
-            while i < range.end {
-                match self.step(events, i, match_of) {
-                    Control::Continue => i += 1,
-                    // Extent handlers consume wholesale in collect runs too.
-                    Control::Jump(to) => i = to.max(range.start),
-                }
+        let mut i = range.start;
+        while i < range.end {
+            match self.step(events, i, match_of) {
+                Control::Continue => i += 1,
+                // Extent handlers consume wholesale in collect runs too.
+                Control::Jump(to) => i = to.max(range.start),
             }
         }
         let frames = self.collect.take().unwrap_or_default();
@@ -855,7 +852,7 @@ impl Default for State {
     }
 }
 
-impl<'o> Interp<'o> {
+impl Interp<'_> {
     // —— conservative-join plumbing —————————————————————————————————————
 
     /// The final variables among `written` (promotions on finals survive
@@ -929,18 +926,17 @@ impl<'o> Interp<'o> {
     /// label resolves to (official `getLabelTarget` walk, see
     /// [`Interp::find_labeled_target`]).
     pub(crate) fn find_break_target(&self, label: Option<u32>) -> Option<usize> {
-        match label {
-            Some(id) => self.find_labeled_target(id, true),
-            None => {
-                for (index, frame) in self.stack.iter().enumerate().rev() {
-                    match frame {
-                        Frame::While { .. } => return Some(index),
-                        Frame::Switch { is_expr, .. } if !*is_expr => return Some(index),
-                        _ => {}
-                    }
+        if let Some(id) = label {
+            self.find_labeled_target(id, true)
+        } else {
+            for (index, frame) in self.stack.iter().enumerate().rev() {
+                match frame {
+                    Frame::While { .. } => return Some(index),
+                    Frame::Switch { is_expr, .. } if !*is_expr => return Some(index),
+                    _ => {}
                 }
-                None
             }
+            None
         }
     }
 
@@ -949,21 +945,20 @@ impl<'o> Interp<'o> {
     /// never targets a switch (the official joins a continue model no
     /// switch end ever reads — a no-op), so it resolves to nothing there.
     pub(crate) fn find_continue_target(&self, label: Option<u32>) -> Option<usize> {
-        match label {
-            Some(id) => self.find_labeled_target(id, false),
-            None => {
-                for (index, frame) in self.stack.iter().enumerate().rev() {
-                    if matches!(frame, Frame::While { .. }) {
-                        return Some(index);
-                    }
+        if let Some(id) = label {
+            self.find_labeled_target(id, false)
+        } else {
+            for (index, frame) in self.stack.iter().enumerate().rev() {
+                if matches!(frame, Frame::While { .. }) {
+                    return Some(index);
                 }
-                None
             }
+            None
         }
     }
 
     /// Resolves a labeled `break`/`continue` to its target frame: the
-    /// official `getLabelTarget` walk (flow_analysis_visitor.dart:487)
+    /// official `getLabelTarget` walk (`flow_analysis_visitor.dart:487`)
     /// ported to frames. The nearest (top-down) `Labeled` frame carrying
     /// the label id is found; when its labeled statement's inner
     /// statement is a loop — or a switch, for `break` — that inner frame
@@ -1093,7 +1088,7 @@ impl<'o> Interp<'o> {
             return;
         }
         let end = end as usize;
-        let effects = self.collect_ranges(events, &[i + 1..end], match_of);
+        let effects = self.collect_ranges(events, i + 1..end, match_of);
         self.cjoin(&FxHashSet::default(), &effects.written);
         let saved = self.current.clone();
         let anywhere_written = self.anywhere.written.clone();
@@ -1216,7 +1211,7 @@ impl<'o> Interp<'o> {
             right_sep.range.offset,
             end,
         );
-        self.replay_c_for(bounds, events, match_of, false);
+        self.replay_c_for(&bounds, events, match_of, false);
         Control::Jump(end + 1)
     }
 
@@ -1225,13 +1220,13 @@ impl<'o> Interp<'o> {
     /// With `collection`, the frame stays until `ForControlFlowEnd`.
     fn replay_c_for(
         &mut self,
-        bounds: ForBounds,
+        bounds: &ForBounds,
         events: &[Ev],
         match_of: &[u32],
         collection: bool,
     ) {
         let base = self.exprs.len();
-        let effects = self.collect_ranges(events, &[bounds.init.start..bounds.body.end], match_of);
+        let effects = self.collect_ranges(events, bounds.init.start..bounds.body.end, match_of);
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);
@@ -1249,12 +1244,11 @@ impl<'o> Interp<'o> {
         self.exprs.truncate(base);
         // Condition (empty condition = `true`).
         let cond = self.run_header_expr(events, bounds.cond.clone(), match_of, base);
-        let (if_true, if_false) = match cond {
-            Some(expr) => self.cond_split(&expr),
-            None => {
-                let cur = self.current.clone();
-                (cur.clone(), cur.set_unreachable(&mut self.reach))
-            }
+        let (if_true, if_false) = if let Some(expr) = cond {
+            self.cond_split(&expr)
+        } else {
+            let cur = self.current.clone();
+            (cur.clone(), cur.set_unreachable(&mut self.reach))
         };
         if let Some(Frame::While { cond_false, .. }) = self.stack.get_mut(frame) {
             *cond_false = Some(if_false);
@@ -1357,7 +1351,7 @@ impl<'o> Interp<'o> {
                 right_sep.range.offset,
                 end,
             );
-            self.replay_c_for(bounds, events, match_of, true);
+            self.replay_c_for(&bounds, events, match_of, true);
             // The wholesale jump skips the `ForControlFlowEnd` event:
             // close the loop frame here (it would otherwise leak to the
             // end of the executable).
@@ -1430,7 +1424,7 @@ impl<'o> Interp<'o> {
             Some(start) => start..end,
             None => i + 1..end,
         };
-        let effects = self.collect_ranges(events, &[body], match_of);
+        let effects = self.collect_ranges(events, body, match_of);
         let previous = self.current.clone();
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
@@ -1502,7 +1496,10 @@ impl<'o> Interp<'o> {
 /// Builds the construct-extent match table: `match_of[i]` is the matching
 /// begin/end event index for construct framing events, `NIL` otherwise.
 fn build_match_map(events: &[Ev]) -> Vec<u32> {
-    use crate::ev::Ev::*;
+    use crate::ev::Ev::{
+        DoBegin, DoEnd, ExecBegin, ExecEnd, ForBegin, ForControlFlowBegin, ForControlFlowEnd,
+        ForEnd, ForInEnd, SwitchBlockBegin, SwitchBlockEnd, TryBegin, TryEnd, WhileBegin, WhileEnd,
+    };
     let mut match_of = vec![NIL; events.len()];
     let mut for_stack: Vec<usize> = Vec::new();
     let mut while_stack: Vec<usize> = Vec::new();
@@ -1514,56 +1511,55 @@ fn build_match_map(events: &[Ev]) -> Vec<u32> {
     for (i, ev) in events.iter().enumerate() {
         match ev {
             ForBegin { .. } => for_stack.push(i),
-            ForEnd { .. } | ForInEnd { .. } => {
+            ForEnd | ForInEnd => {
                 if let Some(begin) = for_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             ForControlFlowBegin => coll_for_stack.push(i),
             ForControlFlowEnd { .. } => {
                 if let Some(begin) = coll_for_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             WhileBegin { .. } => while_stack.push(i),
             WhileEnd => {
                 if let Some(begin) = while_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             DoBegin { .. } => do_stack.push(i),
             DoEnd { .. } => {
                 if let Some(begin) = do_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             ExecBegin { .. } => exec_stack.push(i),
             ExecEnd { .. } => {
                 if let Some(begin) = exec_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             TryBegin { .. } => try_stack.push(i),
             TryEnd { .. } => {
                 if let Some(begin) = try_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             SwitchBlockBegin => switch_block_stack.push(i),
             SwitchBlockEnd => {
                 if let Some(begin) = switch_block_stack.pop() {
-                    match_of[begin] = i as u32;
-                    match_of[i] = begin as u32;
+                    link_pair(&mut match_of, begin, i);
                 }
             }
             _ => {}
         }
     }
     match_of
+}
+
+/// Records the matching begin/end indices of one construct extent.
+fn link_pair(match_of: &mut [u32], begin: usize, end: usize) {
+    match_of[begin] = u32::try_from(end).expect("event index fits u32");
+    match_of[end] = u32::try_from(begin).expect("event index fits u32");
 }

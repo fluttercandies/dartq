@@ -332,6 +332,7 @@ pub enum BinOp {
 
 impl BinOp {
     /// Classifies an operator lexeme.
+    #[must_use]
     pub fn of(lexeme: &str) -> BinOp {
         match lexeme {
             "&&" => BinOp::And,
@@ -347,6 +348,7 @@ impl BinOp {
 impl Ev {
     /// The primary token of the event — the anchor used to partition a
     /// C-style `for` header by source offset.
+    #[must_use]
     pub fn span(&self) -> Option<TokenSpan> {
         match self {
             Ev::VarDeclBegin { span, .. }

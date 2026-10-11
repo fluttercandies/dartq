@@ -50,7 +50,7 @@ fn dead_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            _ => None,
+            FlowFact::UnassignedRead { .. } => None,
         })
         .collect()
 }
@@ -65,7 +65,7 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            _ => None,
+            FlowFact::DeadCode { .. } => None,
         })
         .collect()
 }
@@ -134,14 +134,14 @@ fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
 }
 
 /// Drives a hand-built buffer through a fresh interpreter (name-level ops).
-fn interp_of(events: Vec<crate::ev::Ev>) -> crate::interp::Interp<'static> {
+fn interp_of(events: &[crate::ev::Ev]) -> crate::interp::Interp<'static> {
     let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps);
     interp.run(events);
     interp
 }
 
 /// reachability basics: code after `return` is dead
-/// (official reachability/data/early_exit.dart).
+/// (official `reachability/data/early_exit.dart`).
 #[test]
 fn dead_after_return() {
     let source = "void f() { return; 1; }";
@@ -161,7 +161,7 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
-/// official `test_doWhile` (dead_code_test.dart): a dead do-while back
+/// official `test_doWhile` (`dead_code_test.dart`): a dead do-while back
 /// edge anchors the interval on the condition, and the close splits into
 /// the `while (c);` part plus the tail after the statement (official
 /// `parent is DoStatement`, dead_code_verifier.dart:292-308) — two rows,
@@ -186,7 +186,7 @@ fn do_body_runs_before_condition() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
-/// official definite_assignment/data/while.dart `condition_notTrue`: a
+/// official `definite_assignment/data/while.dart` `condition_notTrue`: a
 /// conditional `while` may run zero times.
 #[test]
 fn while_zero_iterations_leaves_unassigned() {
@@ -194,7 +194,7 @@ fn while_zero_iterations_leaves_unassigned() {
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
-/// official definite_assignment/data/while.dart `true_break_afterAssignment`:
+/// official `definite_assignment/data/while.dart` `true_break_afterAssignment`:
 /// the only exits from `while (true)` are breaks; a break after the
 /// assignment makes the read assigned.
 #[test]
@@ -203,14 +203,14 @@ fn while_true_break_after_assignment() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
-/// official definite_assignment/data/while.dart `true_break_beforeAssignment`.
+/// official `definite_assignment/data/while.dart` `true_break_beforeAssignment`.
 #[test]
 fn while_true_break_before_assignment() {
     let source = "void f(bool b) { int x; while (true) { if (b) break; x = 1; } x; }";
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
-/// official definite_assignment/data/while.dart `true_continue`: continues
+/// official `definite_assignment/data/while.dart` `true_continue`: continues
 /// re-enter the body, so an assignment after a conditional continue does
 /// not hold on every path that reaches the exit break.
 #[test]
@@ -222,7 +222,7 @@ fn while_true_continue_exit_is_assigned() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
-/// official definite_assignment/data/for.dart: a C-style `for` may run
+/// official `definite_assignment/data/for.dart`: a C-style `for` may run
 /// zero iterations.
 #[test]
 fn for_zero_iterations_leaves_unassigned() {
@@ -236,7 +236,7 @@ fn for_break_after_assignment() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
-/// official `getLabelTarget` (flow_analysis_visitor.dart:487): a labeled
+/// official `getLabelTarget` (`flow_analysis_visitor.dart:487`): a labeled
 /// break resolves to the labeled statement's loop, skipping the
 /// intervening inner loop. Before label ids were carried on the events
 /// this degraded to nearest-jump-target resolution: the break then exited
@@ -325,7 +325,7 @@ fn switch_case_inner_dead_code() {
     assert_eq!(dead_snippets(source), ["2"]);
 }
 
-/// official definite_assignment/data/closure.dart: writes inside closures
+/// official `definite_assignment/data/closure.dart`: writes inside closures
 /// do not make outer reads assigned.
 #[test]
 fn closure_write_does_not_assign_outer_local() {
@@ -333,7 +333,7 @@ fn closure_write_does_not_assign_outer_local() {
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
-/// official definite_assignment/data/if.dart: assignment on every path
+/// official `definite_assignment/data/if.dart`: assignment on every path
 /// (then assigns, else returns) makes the read assigned.
 #[test]
 fn if_else_return_covers_all_paths() {
@@ -347,7 +347,7 @@ fn if_without_else_leaves_unassigned() {
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
-/// official definite_assignment/data/try.dart shape: a catch that returns
+/// official `definite_assignment/data/try.dart` shape: a catch that returns
 /// removes the only path where the body's assignment did not run.
 #[test]
 fn try_catch_returning_catch_covers_paths() {
@@ -361,7 +361,7 @@ fn try_catch_open_catch_leaves_unassigned() {
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
-/// official definite_assignment/data/late.dart shape: reading a `late`
+/// official `definite_assignment/data/late.dart` shape: reading a `late`
 /// local before any assignment is definitely unassigned.
 #[test]
 fn late_local_read_unassigned() {
@@ -376,7 +376,7 @@ fn initialized_local_read_assigned() {
     assert!(unassigned_snippets(source).is_empty());
 }
 
-/// official type_promotion/data/null_check.dart shape: an `!= null` test
+/// official `type_promotion/data/null_check.dart` shape: an `!= null` test
 /// flows promotion into the then-branch; with the name-level seam this
 /// must not crash and must not produce false dead code.
 #[test]
@@ -482,7 +482,7 @@ fn closure_in_loop_no_facts() {
 }
 
 /// A `try/finally` whose finally returns: the code after is dead
-/// (official reachability/data/try_again shapes).
+/// (official `reachability/data/try_again` shapes).
 #[test]
 fn finally_return_kills_exit() {
     let source = "void f() { try { 1; } finally { return; } 2; }";
@@ -643,7 +643,7 @@ fn unmatched_construct_begins_do_not_panic() {
         Ev::SwitchBlockBegin,
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
 }
 
 /// A declaration head nested inside an initializer (the collection-for
@@ -712,7 +712,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
         Ev::ForControlFlowEnd { for_in: false },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
 }
@@ -752,7 +752,7 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::ExprStmt { span: span(4) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -779,7 +779,7 @@ fn case_less_switch_expression_does_not_panic() {
         Ev::SwitchExprBlockEnd,
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -793,7 +793,7 @@ fn case_less_switch_expression_does_not_panic() {
 
 /// try + catch + finally, every part completing normally: `FinallyBlock`
 /// joins the try-catch exit with the conservative exception-entry state
-/// (official `tryFinallyStatement_finallyBegin`, flow_analysis.dart:8269)
+/// (official `tryFinallyStatement_finallyBegin`, `flow_analysis.dart:8269`)
 /// and `TryEnd` attaches the finally without killing the tail.
 #[test]
 fn try_catch_finally_completes_normally() {
@@ -820,7 +820,7 @@ fn try_catch_finally_completes_normally() {
         Ev::TryEnd { has_finally: true },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -855,7 +855,7 @@ fn try_finally_body_return_leaves_tail_dead() {
         Ev::OtherExpr { span: span(6) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
     assert!(!interp.reachable());
@@ -889,7 +889,7 @@ fn try_finally_return_leaves_tail_dead() {
         Ev::OtherExpr { span: span(6) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
     assert!(!interp.reachable());
@@ -897,7 +897,7 @@ fn try_finally_return_leaves_tail_dead() {
 
 /// Two catch clauses: the first returns, the second completes. Later
 /// catches resume from `beforeCatch`, not from the previous catch's exit
-/// (official `tryCatchStatement_catchBegin`, flow_analysis.dart:8182), so
+/// (official `tryCatchStatement_catchBegin`, `flow_analysis.dart:8182`), so
 /// the second clause's completion keeps the statement exit alive.
 #[test]
 fn try_two_catches_first_returns_second_completes() {
@@ -927,7 +927,7 @@ fn try_two_catches_first_returns_second_completes() {
         Ev::TryEnd { has_finally: false },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -964,7 +964,7 @@ fn finally_break_exits_via_loop_exit_join() {
         Ev::OtherExpr { span: span(7) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1001,7 +1001,7 @@ fn finally_continue_exits_via_loop_exit_join() {
         Ev::OtherExpr { span: span(7) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1009,7 +1009,7 @@ fn finally_continue_exits_via_loop_exit_join() {
 
 /// try + catch + finally where the CATCH returns but the try body
 /// completes: the body's normal exit is seeded into the after-accumulator
-/// (official `tryCatchStatement_bodyEnd`, flow_analysis.dart:8163) and
+/// (official `tryCatchStatement_bodyEnd`, `flow_analysis.dart:8163`) and
 /// survives the returning catch, so the finally keeps the tail alive.
 #[test]
 fn try_catch_finally_returning_catch_keeps_tail_alive() {
@@ -1040,7 +1040,7 @@ fn try_catch_finally_returning_catch_keeps_tail_alive() {
         Ev::OtherExpr { span: span(8) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1054,7 +1054,7 @@ fn try_catch_finally_returning_catch_keeps_tail_alive() {
 /// recorder's order), and the block end joins the arms' combined state.
 /// Invariant-level: stack drains, no facts, replay stays reachable
 /// (official `switch_beginAlternative`/`switch_endAlternative`,
-/// flow_analysis.dart:1680).
+/// `flow_analysis.dart:1680`).
 #[test]
 fn switch_expression_cases_and_guard_replay() {
     use crate::ev::Ev;
@@ -1098,7 +1098,7 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::SwitchExprBlockEnd,
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1155,7 +1155,7 @@ fn switch_statement_default_exhaustive_tail_dead() {
         Ev::OtherExpr { span: span(7) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
     assert!(!interp.reachable());
@@ -1166,8 +1166,8 @@ fn switch_statement_default_exhaustive_tail_dead() {
 /// switch (x) { 1 => 2 }; y;` must not report `y` as definitely
 /// unassigned.
 ///
-/// Suspected defect (do not weaken): `SwitchExprCaseEnd` (interp_stmt.rs)
-/// pops each arm's value and `SwitchExprBlockEnd` (interp_stmt.rs) never
+/// Suspected defect (do not weaken): `SwitchExprCaseEnd` (`interp_stmt.rs`)
+/// pops each arm's value and `SwitchExprBlockEnd` (`interp_stmt.rs`) never
 /// pushes a replacement, so the whole expression nets ZERO values; the
 /// `InitializerEnd` pairing then finds no right-hand side and `y` stays
 /// unwritten — a false-positive `UnassignedRead`. The same hole makes `x =
@@ -1204,14 +1204,14 @@ fn assert_join_with_message_invariants() {
         Ev::AssertEnd,
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
 }
 
-/// official definite_assignment/data/assert.dart `assertStatement`: the
+/// official `definite_assignment/data/assert.dart` `assertStatement`: the
 /// condition's assignment holds while the message runs (so the message
 /// read is clean) but the exit joins the pre-assert state, and the read
 /// after the statement is definitely unassigned.
@@ -1271,7 +1271,7 @@ fn assert_condition_write_unassigned_after() {
         Ev::ExprStmt { span: span(8) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(
         interp
@@ -1345,7 +1345,7 @@ fn pattern_assignment_writes_targets() {
         Ev::ExprStmt { span: span(8) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.current.model(0).assigned);
@@ -1397,7 +1397,7 @@ fn pattern_declaration_declares_assigned() {
         Ev::ExprStmt { span: span(7) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.current.model(0).assigned);
@@ -1486,7 +1486,7 @@ fn closure_await_demotes_captured_reads() {
         Ev::ExprStmt { span: span(8) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1512,7 +1512,7 @@ fn closure_await_with_enclosing_write_no_facts() {
 /// Statement for-in, real replay: the head pops the iterable, the body's
 /// writes are conservatively joined at the loop head, and the exit joins
 /// the zero-iteration state (official `forEach_bodyBegin`/
-/// `forEach_end`, flow_analysis.dart:6941). Invariant-level on facts; the
+/// `forEach_end`, `flow_analysis.dart:6941`). Invariant-level on facts; the
 /// zero-iteration dominance on the loop variable's assignment is asserted
 /// on the model.
 #[test]
@@ -1554,7 +1554,7 @@ fn for_in_statement_replay_invariants() {
         Ev::ForInEnd,
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
     assert!(interp.facts.is_empty());
@@ -1602,7 +1602,7 @@ fn for_in_break_joins_exit() {
         Ev::OtherExpr { span: span(5) },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
     assert!(interp.reachable());
@@ -1645,13 +1645,13 @@ fn collection_for_in_element_nets_one_value() {
         Ev::ForControlFlowEnd { for_in: true },
     ];
     let mut interp = Interp::new(&NameTypeOps);
-    interp.run(events);
+    interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
     assert!(interp.facts.is_empty());
 }
 
-/// official definite_assignment/data/for_each.dart `forEach`: the iterable
+/// official `definite_assignment/data/for_each.dart` `forEach`: the iterable
 /// is evaluated (and its writes hold) even when the loop runs zero times,
 /// so only the body's write stays not-definite.
 #[test]
@@ -1661,7 +1661,7 @@ fn for_each_zero_iteration_leaves_unassigned() {
     assert_eq!(unassigned_snippets(source), ["v2"]);
 }
 
-/// official definite_assignment/data/for_each.dart `forEach_continue`:
+/// official `definite_assignment/data/for_each.dart` `forEach_continue`:
 /// continue paths re-enter the body, so neither the pre-continue write nor
 /// the post-continue write is definite at the exit.
 #[test]
@@ -1672,8 +1672,8 @@ fn for_each_continue_paths_unassigned() {
 
 /// Reading the for-in loop variable inside the body must produce no fact:
 /// the analyzer declares the loop variable initialized right before
-/// `forEach_bodyBegin` (analyzer for_resolver.dart,
-/// `declare(initialized: true)`; official corpus for_each.dart
+/// `forEach_bodyBegin` (analyzer `for_resolver.dart`,
+/// `declare(initialized: true)`; official corpus `for_each.dart`
 /// `forEach_assigns_to_declared_var`).
 ///
 /// The identifier-head form (`for (i in xs)`) writes its target at the
@@ -1710,7 +1710,7 @@ fn dead_assert_statement_reports_dead_code() {
 
 /// A dead plain block reports one row spanning the whole block extent,
 /// and statements entered inside it report nothing further: their
-/// unreachability is implied by the outermost row (official dead_code
+/// unreachability is implied by the outermost row (official `dead_code`
 /// folds each dead region into one diagnostic,
 /// `dead_code_verifier.dart` `_firstDead`).
 #[test]
@@ -1869,7 +1869,7 @@ fn assignment_demotion_keeps_the_least_specific_suffix() {
         ],
     ]
     .concat();
-    let interp = interp_of(events);
+    let interp = interp_of(&events);
     let model = interp.current.model(0);
     assert!(
         model.promoted != NIL,
@@ -1907,7 +1907,7 @@ fn is_not_then_branch_carries_the_factored_remainder() {
         is_test(X, named_ty(INT, false), true),
     ]
     .concat();
-    let interp = interp_of(events);
+    let interp = interp_of(&events);
     let model = interp.current.model(0);
     assert_eq!(
         interp.lists.head(model.promoted),
@@ -1943,7 +1943,7 @@ fn bottom_remainder_marks_the_else_branch_unreachable() {
         ],
     ]
     .concat();
-    let interp = interp_of(events);
+    let interp = interp_of(&events);
     assert!(
         matches!(interp.facts.as_slice(), [FlowFact::DeadCode { .. }]),
         "the else branch of `x is int?` on `int x` is provably dead: {:?}",
@@ -1976,7 +1976,7 @@ fn if_null_types_as_the_lhs_non_null_form() {
         ],
     ]
     .concat();
-    let interp = interp_of(events);
+    let interp = interp_of(&events);
     let result = interp.exprs.last().expect("?? leaves its value");
     assert_eq!(
         result.ty,
@@ -2015,7 +2015,7 @@ fn if_null_write_repromotes_via_types_of_interest() {
         ],
     ]
     .concat();
-    let interp = interp_of(events);
+    let interp = interp_of(&events);
     let model = interp.current.model(0);
     assert_eq!(
         interp.lists.head(model.promoted),
@@ -2043,7 +2043,7 @@ fn redundant_is_checks_do_not_promote() {
             is_test(X, named_ty(INT, tested_nullable), false),
         ]
         .concat();
-        let interp = interp_of(events);
+        let interp = interp_of(&events);
         assert_eq!(
             interp.current.model(0).promoted,
             NIL,

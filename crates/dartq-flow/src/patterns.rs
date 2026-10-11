@@ -5,7 +5,7 @@ use crate::ev::Ev;
 use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, VarMeta};
 use crate::ty::{Base, Ty};
 
-impl<'o> Interp<'o> {
+impl Interp<'_> {
     /// Handles one pattern-layer event.
     pub(crate) fn pattern_step(&mut self, ev: &Ev, _events: &[Ev], _i: usize, _match_of: &[u32]) {
         // The collect pre-pass tracks writes/declares only. The pattern
@@ -58,26 +58,24 @@ impl<'o> Interp<'o> {
             Ev::PatternEnd => {
                 self.pattern_depth = self.pattern_depth.saturating_sub(1);
             }
-            Ev::ConstantPatternBegin => {}
             Ev::ConstantPatternEnd => {
                 // A `null` constant test promotes the scrutinee on the
                 // matched path (official tryMarkNonNullable).
                 let constant = self.exprs.pop();
-                if let Some(pattern) = self.pattern.as_ref() {
-                    if constant.is_some_and(|e| e.ty.base == Base::Null) {
-                        if let Some(var) = pattern.scrutinee {
-                            let declared = self.vars[var as usize].ty;
-                            let promoted = self.ops.promote_to_non_null(declared);
-                            if promoted != declared {
-                                self.current = self.current.clone().finish_type_test(
-                                    self.ops,
-                                    &mut self.lists,
-                                    var,
-                                    None,
-                                    Some(promoted),
-                                );
-                            }
-                        }
+                if let Some(pattern) = self.pattern.as_ref()
+                    && constant.is_some_and(|e| e.ty.base == Base::Null)
+                    && let Some(var) = pattern.scrutinee
+                {
+                    let declared = self.vars[var as usize].ty;
+                    let promoted = self.ops.promote_to_non_null(declared);
+                    if promoted != declared {
+                        self.current = self.current.clone().finish_type_test(
+                            self.ops,
+                            &mut self.lists,
+                            var,
+                            None,
+                            Some(promoted),
+                        );
                     }
                 }
             }
@@ -119,10 +117,8 @@ impl<'o> Interp<'o> {
                 // on `current` next and leave it on the guard-true arm, so
                 // this snapshot is the guard-false arm for the close's
                 // unmatched join.
-                if self.pattern.is_some() {
-                    if let Some(pattern) = self.pattern.as_mut() {
-                        pattern.pre_guard = Some(self.current.clone());
-                    }
+                if let Some(pattern) = self.pattern.as_mut() {
+                    pattern.pre_guard = Some(self.current.clone());
                 }
             }
             Ev::GuardEnd => {
@@ -142,7 +138,7 @@ impl<'o> Interp<'o> {
     /// clause's pattern runs under the switch frame's chained unmatched
     /// state — earlier clauses' guard-false outcomes chain there — and one
     /// pattern context opens for the clause. `is_expr` selects the
-    /// switch-expression variant (no body lookahead, no case_open).
+    /// switch-expression variant (no body lookahead, no `case_open`).
     pub(crate) fn case_pattern_begin(&mut self, is_expr: bool) {
         let chain = self
             .switch_frame()
@@ -217,13 +213,12 @@ impl<'o> Interp<'o> {
             return;
         };
         let unmatched = self.apply_pattern_exit(pattern, false);
-        if let Some(frame_index) = self.switch_frame() {
-            if let Frame::Switch {
+        if let Some(frame_index) = self.switch_frame()
+            && let Frame::Switch {
                 unmatched: slot, ..
             } = &mut self.stack[frame_index]
-            {
-                *slot = unmatched;
-            }
+        {
+            *slot = unmatched;
         }
     }
 
@@ -233,7 +228,7 @@ impl<'o> Interp<'o> {
     /// becomes the clause's matched state, the false state joins the
     /// unmatched chain). The guard's own events ran on `current` between
     /// `GuardBegin` and `GuardEnd` — its last branching event (e.g. the
-    /// type-test's `IsEnd`, interp_expr.rs) left `current` on the true arm
+    /// type-test's `IsEnd`, `interp_expr.rs`) left `current` on the true arm
     /// — so `current` IS the guard's ifTrue state and the `GuardBegin`
     /// snapshot is its ifFalse.
     fn apply_pattern_exit(
@@ -242,14 +237,14 @@ impl<'o> Interp<'o> {
         has_guard: bool,
     ) -> crate::model::State {
         let mut unmatched = pattern.unmatched;
-        if has_guard || matches!(pattern.kind, PatternKind::Switch | PatternKind::SwitchExpr) {
-            if pattern.guard.take().is_some() {
-                let if_false = pattern
-                    .pre_guard
-                    .take()
-                    .unwrap_or_else(|| self.current.clone());
-                unmatched = self.join(Some(unmatched), Some(if_false));
-            }
+        if (has_guard || matches!(pattern.kind, PatternKind::Switch | PatternKind::SwitchExpr))
+            && pattern.guard.take().is_some()
+        {
+            let if_false = pattern
+                .pre_guard
+                .take()
+                .unwrap_or_else(|| self.current.clone());
+            unmatched = self.join(Some(unmatched), Some(if_false));
         }
         unmatched
     }
