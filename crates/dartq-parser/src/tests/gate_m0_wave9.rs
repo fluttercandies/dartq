@@ -178,3 +178,92 @@ fn member_position_class_keeps_class_in_class_report() {
         ("end", "class_declaration"),
     ]);
 }
+
+// —— #646: unnamed-factory version gate + record-type tail faces ——————————
+
+/// Parses `source` with the feature set of language version
+/// `(major, minor)` and returns the sorted parser diagnostic codes.
+fn sorted_codes_at(source: &'static str, major: u32, minor: u32) -> Vec<String> {
+    let (table, text) = super::collector::scan_ok(source);
+    let features =
+        crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
+            dartq_language::LanguageVersion::new(major, minor),
+        ));
+    let mut parser = Parser::new(text, table, features, Collector::default());
+    parser.parse_unit();
+    let mut codes = parser.listener.error_codes();
+    codes.sort();
+    codes
+}
+
+/// #646 cluster 1: the unnamed-factory head is a FEATURE-GATED branch
+/// (3.15 main: `isPrimaryConstructorsFeatureEnabled && next2.isA('(')` with
+/// the clean-modifier gate, `parser_impl.dart:5465-5484`; the 91.0.0 anchor
+/// has no such branch). The M0 corpus pairs
+/// `primary_constructors/factory_constructor_head.dart` (default version,
+/// feature on) with `factory_constructor_head_pre_feature.dart`
+/// (`// @dart=3.10`, feature off), so the same source carries two oracle
+/// faces:
+///
+/// * at 3.10 the `factory` built-in (`isIdentifier`) falls through the
+///   member keyword chain into the method lane, where a `const` modifier
+///   reports `const_method` (91.0.0 parseMethod tail :5569-5572) and an
+///   `=` body reports `redirection_in_non_factory_constructor` — the
+///   pre-feature residual face (const_method x4 + redirection x2).
+/// * at 3.13 the clean-modifier `factory (` heads take
+///   `parseFactoryMethod(hasName: false)`: only const BODIES report
+///   `const_factory` (the body arm's `handleConstFactory`); redirections
+///   and `external` shapes stay silent.
+#[test]
+fn unnamed_factory_head_is_feature_gated() {
+    let src = "class C {\n  factory () => C();\n  factory () {}\n  factory () = C;\n  external const factory ();\n  const factory () => C();\n  const factory () {}\n  const factory () = C;\n  void factory() => C();\n}\n";
+    assert_eq!(
+        sorted_codes_at(src, 3, 10),
+        [
+            "const_method",
+            "const_method",
+            "const_method",
+            "const_method",
+            "redirection_in_non_factory_constructor",
+            "redirection_in_non_factory_constructor",
+        ],
+        "pre-feature face: the method lane reports const/`=` shapes"
+    );
+    assert_eq!(
+        sorted_codes_at(src, 3, 13),
+        ["const_factory", "const_factory"],
+        "default-version face: the factory lane reports const bodies only"
+    );
+}
+
+/// #646 cluster 6: `record_type_one_positional_no_trailing_comma` fires
+/// only on a genuine one-positional record TYPE (`type_parse.rs`, official
+/// `computeRecordType`). The r5 rows in the valid flow-analysis corpus
+/// files (`bug42653.dart`, `type_promotion/data/for.dart`) were pre-#495
+/// stream cascades: a for-each header never enters record-type parsing, so
+/// the recovered topology carries no record rows there.
+#[test]
+fn record_type_one_positional_face_and_for_each_control() {
+    assert_eq!(
+        sorted_codes_at("void f((int) x) {}\n", 3, 13),
+        ["record_type_one_positional_no_trailing_comma"],
+        "one-positional record type reports once"
+    );
+    assert!(
+        sorted_codes_at("void f((int,) x) {}\n", 3, 13).is_empty(),
+        "trailing comma keeps the record type silent"
+    );
+    assert!(
+        sorted_codes_at("void f((int, int) x) {}\n", 3, 13).is_empty(),
+        "two-positional record type stays silent"
+    );
+    assert!(
+        sorted_codes_at(
+            "void f(Object x) {\n  if (x is int) {\n    for (x in [0]) {\n      x;\n    }\n  }\n}\n",
+            3,
+            13
+        )
+        .is_empty(),
+        "the for-each header never produces a record-type row"
+    );
+}
