@@ -77,7 +77,7 @@
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
 
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::collections::hash_map;
 
 use crate::modifiers::ClassModifiers;
@@ -121,16 +121,19 @@ pub enum CombinatorClause {
 }
 
 /// One written combinator token, captured at directive construction: the
-/// clause kind it was written under, its bare identifier, and the token's
-/// UTF-16 span as captured. The written sequence — duplicates preserved, in
-/// written order — is what [`LibraryGraph::undefined_combinator_names`]
-/// iterates, one report per written token (the oracle's
-/// `dead_code_verifier.dart:148-158` walks the AST name list as written).
+/// clause it was written under (the per-clause seen-set boundary of the
+/// duplicate-combinator check), the clause kind it was written under, its
+/// bare identifier, and the token's UTF-16 span as captured. The written
+/// sequence — duplicates preserved, in written order — is what
+/// [`LibraryGraph::undefined_combinator_names`] iterates, one report per
+/// written token (the oracle's `dead_code_verifier.dart:148-158` walks the
+/// AST name list as written).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WrittenName {
     name: StringId,
     hidden: bool,
     span: SourceRange,
+    clause: u32,
 }
 
 /// The ordered combinator list of one directive; empty means unfiltered.
@@ -163,8 +166,10 @@ impl Combinators {
         let clauses: Vec<CombinatorClause> = clauses.into_iter().collect();
         let written: Vec<WrittenName> = clauses
             .iter()
-            .flat_map(|clause| {
-                let (names, hidden) = clause_names(clause);
+            .enumerate()
+            .flat_map(|(clause, clause_body)| {
+                let (names, hidden) = clause_names(clause_body);
+                let clause = u32::try_from(clause).expect("more than u32::MAX clauses");
                 names.iter().copied().map(move |name| WrittenName {
                     name,
                     hidden,
@@ -172,6 +177,7 @@ impl Combinators {
                         offset: 0,
                         length: 0,
                     },
+                    clause,
                 })
             })
             .collect();
@@ -194,8 +200,10 @@ impl Combinators {
         let clauses: Vec<(CombinatorClause, Box<[SourceRange]>)> = clauses.into_iter().collect();
         let written: Vec<WrittenName> = clauses
             .iter()
-            .flat_map(|(clause, spans)| {
-                let (names, hidden) = clause_names(clause);
+            .enumerate()
+            .flat_map(|(clause, (clause_body, spans))| {
+                let (names, hidden) = clause_names(clause_body);
+                let clause = u32::try_from(clause).expect("more than u32::MAX clauses");
                 assert_eq!(
                     names.len(),
                     spans.len(),
@@ -205,7 +213,12 @@ impl Combinators {
                     .iter()
                     .copied()
                     .zip(spans.iter().copied())
-                    .map(move |(name, span)| WrittenName { name, hidden, span })
+                    .map(move |(name, span)| WrittenName {
+                        name,
+                        hidden,
+                        span,
+                        clause,
+                    })
             })
             .collect();
         let clauses = clauses.into_iter().map(|(clause, _)| clause).collect();
@@ -268,6 +281,35 @@ impl Combinators {
         self.written
             .iter()
             .map(|token| (token.name, token.hidden, token.span))
+    }
+
+    /// The written tokens grouped by clause, in source order — the
+    /// duplicate-combinator check's iteration shape (the oracle's
+    /// `_addDuplicateShownHiddenNames` re-arms its seen-set per clause,
+    /// `imports_verifier.dart:329-331`). Tokens of one clause are contiguous
+    /// in the written sequence (construction is clause-ordered), so a
+    /// `chunk_by` on the clause id yields the runs.
+    fn clauses_written(&self) -> impl Iterator<Item = (bool, &[WrittenName])> + '_ {
+        self.written
+            .chunk_by(|a, b| a.clause == b.clause)
+            .map(|run| (run[0].hidden, run))
+    }
+
+    /// Whether both directives carry the same written combinator shape —
+    /// same clause count, same kinds in order, same name sequences per
+    /// clause. The combinator half of the duplicate-directive identity
+    /// (`ast.dart:29097` `areSyntacticallyIdenticalExceptUri`'s
+    /// `areSameNames` walk: per-combinator lists, lexeme-compared in
+    /// written order — `show a, b` and `show a show b` differ). Interned
+    /// ids make the lexeme comparison an id comparison.
+    #[must_use]
+    pub fn written_shapes_equal(&self, other: &Self) -> bool {
+        self.written.len() == other.written.len()
+            && self
+                .written
+                .iter()
+                .zip(other.written.iter())
+                .all(|(a, b)| a.clause == b.clause && a.hidden == b.hidden && a.name == b.name)
     }
 
     /// The interned `name=` spelling of the written bare identifier `name`,
@@ -403,6 +445,24 @@ pub struct UndefinedCombinatorName {
     /// oracle anchors `atNode(name)`, `dead_code_verifier.dart:153-158`).
     /// Zero-length at offset 0 when the capture carried no spans
     /// ([`Combinators::new`]).
+    pub span: SourceRange,
+}
+
+/// One duplicate directive-combinator name ([`LibraryGraph::
+/// duplicate_combinator_names`]): a written `show`/`hide` token that repeats,
+/// within its own clause, a name the directive target's export scope defines
+/// — the 2nd+ occurrence (the oracle's seen-set probe fails only there,
+/// `imports_verifier.dart:336-342`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DuplicateCombinatorName {
+    /// The written (bare) identifier.
+    pub name: StringId,
+    /// `true` for a `hide` clause (`duplicate_hidden_name`), `false` for
+    /// `show` (`duplicate_shown_name`).
+    pub hidden: bool,
+    /// The written token's captured UTF-16 span — the report anchor (the
+    /// oracle anchors `at(name)`, `imports_verifier.dart:138/:147`). Same
+    /// zero-span rule as [`UndefinedCombinatorName::span`].
     pub span: SourceRange,
 }
 
@@ -936,6 +996,55 @@ impl LibraryGraph {
         })
     }
 
+    /// The directive-combinator duplicate findings for one resolved directive
+    /// edge: every written `show`/`hide` token that repeats, within its own
+    /// clause, a name the target's export scope defines — the
+    /// `duplicate_hidden_name`/`duplicate_shown_name` `STATIC_WARNING` pair
+    /// ([`crate::codes::DUPLICATE_HIDDEN_NAME`]/[
+    /// `crate::codes::DUPLICATE_SHOWN_NAME`]).
+    ///
+    /// Decision mirrors `imports_verifier.dart:328-358`
+    /// `_addDuplicateShownHiddenNames` exactly: a fresh seen-set per clause
+    /// (so `hide a hide a` is two independent clauses and never reports —
+    /// only in-clause repeats do), a token joins the set only when the
+    /// target defines it (the `pair != (null, null)` gate — undefined names
+    /// are the undefined-hidden/shown walk's reports, [`Self::
+    /// undefined_combinator_names`], and never duplicate-report), and every
+    /// insertion that finds the name already present reports at that token
+    /// (a 3rd occurrence reports again). The defined probe is the
+    /// undefined walk's both-spellings probe; the duplicate identity is the
+    /// interned bare name — two written tokens of one clause under one
+    /// spelling are the oracle's one `(element, setterElement)` pair.
+    ///
+    /// `target` gates like the undefined walk: `None` (no resolved library)
+    /// yields nothing (`imports_verifier.dart:62-88` — the `continue`s skip
+    /// the whole duplicate walk for a directive whose target has no
+    /// library).
+    pub fn duplicate_combinator_names<'a>(
+        &'a self,
+        target: Option<LibraryId>,
+        combinators: &'a Combinators,
+    ) -> impl Iterator<Item = DuplicateCombinatorName> + 'a {
+        target.into_iter().flat_map(move |target| {
+            combinators
+                .clauses_written()
+                .flat_map(move |(hidden, run)| {
+                    let mut seen = FxHashSet::<StringId>::default();
+                    run.iter().filter_map(move |token| {
+                        let defined = self.exported(target, token.name).is_some()
+                            || combinators
+                                .setter_spelling(token.name)
+                                .is_some_and(|setter| self.exported(target, setter).is_some());
+                        (defined && !seen.insert(token.name)).then_some(DuplicateCombinatorName {
+                            name: token.name,
+                            hidden,
+                            span: token.span,
+                        })
+                    })
+                })
+        })
+    }
+
     /// The locals link of the scope chain for `name` (either spelling): what
     /// `lib` itself declares, before any import is consulted. The oracle
     /// couples the two faces of a base name — `_lookupLibrary` hands back
@@ -1286,6 +1395,125 @@ mod tests {
             findings(&graph, strings, edge.target, &edge.combinators),
             [("noSuch".to_owned(), false), ("noSuch".to_owned(), true)]
         );
+    }
+
+    /// The duplicate-combinator face (`imports_verifier.dart:328-358`
+    /// `_addDuplicateShownHiddenNames`): only in-clause repeats of a
+    /// target-DEFINED name report, at each repeat token — the seen-set
+    /// re-arms per clause (so `hide max hide max` is two clauses and never
+    /// reports), undefined names never join the set (they are the undefined
+    /// walk's reports), a 3rd occurrence reports again, and the clause kind
+    /// picks the code face.
+    #[test]
+    fn duplicate_combinator_names_report_per_clause_at_repeats() {
+        let mut rig = Rig::new();
+        let math = rig.builder.intern("dart:math");
+        let face_file = rig.file("<dart:math>");
+        rig.declare(math, "max", face_file);
+        let strings = rig.strings;
+        let graph = rig.builder.finish();
+
+        // In-clause repeat of a defined name: the 2nd token reports
+        // (`hide max, max`), and a 3rd would too (`show max, max, max` →
+        // two findings).
+        let hidden_pair = combinators(true, &["max", "max"], strings);
+        let duplicates = |combinators: &Combinators| -> Vec<DuplicateCombinatorName> {
+            graph
+                .duplicate_combinator_names(Some(math), combinators)
+                .collect()
+        };
+        assert_eq!(
+            duplicates(&hidden_pair),
+            [DuplicateCombinatorName {
+                name: strings.intern("max"),
+                hidden: true,
+                span: SourceRange {
+                    offset: 4,
+                    length: 2
+                },
+            }],
+            "the 2nd occurrence reports at its own token"
+        );
+        let shown_triple = combinators(false, &["max", "max", "max"], strings);
+        assert_eq!(duplicates(&shown_triple).len(), 2, "3rd occurrence too");
+        assert!(!duplicates(&shown_triple)[0].hidden, "show picks its face");
+
+        // The seen-set re-arms per clause: `hide max hide max` is two
+        // independent clauses — the oracle declares `elements` inside the
+        // combinators loop (imports_verifier.dart:329-331) — so a
+        // cross-clause repeat never reports.
+        let cross_clause = Combinators::new(
+            [
+                CombinatorClause::Hide(Box::from([strings.intern("max")])),
+                CombinatorClause::Hide(Box::from([strings.intern("max")])),
+            ],
+            strings,
+        );
+        assert!(duplicates(&cross_clause).is_empty());
+
+        // Undefined names never join the seen-set (`pair != (null, null)`
+        // gate): `hide max, max, noSuch, noSuch` reports one duplicate max
+        // and no duplicate noSuch (both noSuch tokens are undefined-walk
+        // rows, and never re-arm the max seen-set either).
+        let with_undefined = combinators(true, &["max", "max", "noSuch", "noSuch"], strings);
+        let found = duplicates(&with_undefined);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, strings.intern("max"));
+
+        // No resolved target — the `addImports` registration gate
+        // (`imports_verifier.dart:62-88`): nothing reports.
+        assert!(
+            graph
+                .duplicate_combinator_names(None, &hidden_pair)
+                .next()
+                .is_none()
+        );
+    }
+
+    /// The written-shape identity (`ast.dart:29097`
+    /// `areSyntacticallyIdenticalExceptUri`'s combinator half): equal
+    /// clause counts, kinds in order, and per-clause written name
+    /// sequences — `show a, b` and `show a show b` differ (clause
+    /// grouping is part of the shape), and any name or kind divergence
+    /// breaks it.
+    #[test]
+    fn written_shapes_equal_demands_clause_structure() {
+        let strings = StringTable::new();
+        let (a, b) = (strings.intern("a"), strings.intern("b"));
+        let shape = |clauses: [CombinatorClause; 2]| {
+            Combinators::new(clauses, &strings).written_shapes_equal(&Combinators::new(
+                [
+                    CombinatorClause::Show(Box::from([a])),
+                    CombinatorClause::Hide(Box::from([b])),
+                ],
+                &strings,
+            ))
+        };
+
+        assert!(shape([
+            CombinatorClause::Show(Box::from([a])),
+            CombinatorClause::Hide(Box::from([b])),
+        ]));
+        assert!(!shape([
+            CombinatorClause::Show(Box::from([b])),
+            CombinatorClause::Hide(Box::from([b])),
+        ]));
+        assert!(!shape([
+            CombinatorClause::Hide(Box::from([a])),
+            CombinatorClause::Hide(Box::from([b])),
+        ]));
+        // One clause `show a, b` vs `show a` + `hide b`-kind divergence and
+        // the flat-sequence trap: identical flat (name, hidden) walks with
+        // different clause grouping must not be equal.
+        let grouped = Combinators::new([CombinatorClause::Show(Box::from([a, b]))], &strings);
+        let split = Combinators::new(
+            [
+                CombinatorClause::Show(Box::from([a])),
+                CombinatorClause::Show(Box::from([b])),
+            ],
+            &strings,
+        );
+        assert!(!grouped.written_shapes_equal(&split));
     }
 
     // ---- combinators ----

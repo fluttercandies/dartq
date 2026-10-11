@@ -358,7 +358,9 @@ impl Engine {
         }
         if let Some(members) = table.workspace_members() {
             dirs.extend(members.iter().filter_map(|name| {
-                table.get(name.as_str()).map(|identity| identity.root.clone())
+                table
+                    .get(name.as_str())
+                    .map(|identity| identity.root.clone())
             }));
         }
         for dir in dirs {

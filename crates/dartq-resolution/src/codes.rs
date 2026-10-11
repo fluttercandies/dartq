@@ -23,17 +23,20 @@
 //! codes are emitted by the library-graph/namespace layer and only have
 //! their frozen descriptors here.
 //!
-//! The two directive-combinator static warnings
-//! ([`UNDEFINED_HIDDEN_NAME`]/[`UNDEFINED_SHOWN_NAME`]) are registered as
-//! companion descriptor consts beside the table instead of variants, for one
-//! structural reason: the engine's persisted directive-code slot
+//! The six directive-combinator/duplicate static warnings
+//! ([`UNDEFINED_HIDDEN_NAME`]/[`UNDEFINED_SHOWN_NAME`],
+//! [`DUPLICATE_HIDDEN_NAME`]/[`DUPLICATE_SHOWN_NAME`],
+//! [`DUPLICATE_IMPORT`]/[`DUPLICATE_EXPORT`]) are registered as companion
+//! descriptor consts beside the table instead of variants, for one structural
+//! reason: the engine's persisted directive-code slot
 //! (`PersistedResolutionCode`) exhaustively mirrors [`ResolutionCode`] by
-//! design, and these two codes never ride it — they are not URI-target
-//! outcomes but directive-combinator checks the semantic layer emits with
-//! the combinator name spans ([`crate::library_graph::
-//! LibraryGraph::undefined_combinator_names`]), data the URI slot does not
-//! carry. Extending the frozen enum for them would trip the persistence
-//! tripwire in a foreign crate for a slot they can never occupy.
+//! design, and these codes never ride it — they are not URI-target outcomes
+//! but directive-combinator checks the semantic layer emits with the
+//! combinator name spans ([`crate::library_graph::
+//! LibraryGraph::undefined_combinator_names`]) or cross-directive duplicate
+//! findings a per-directive slot cannot express. Extending the frozen enum
+//! for them would trip the persistence tripwire in a foreign crate for a
+//! slot they can never occupy.
 
 use dartq_diagnostics::DiagnosticType;
 
@@ -145,6 +148,62 @@ pub const UNDEFINED_SHOWN_NAME: ResolutionCodeInfo = ResolutionCodeInfo {
     machine: "UNDEFINED_SHOWN_NAME",
     message: "The library '{0}' doesn't export a member with the shown name '{1}'.",
     correction: Some("Try removing the name from the list of shown members."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// An `import`/`export` combinator clause lists the same target-defined
+/// member twice — registry row verbatim (`diagnostic.g.dart:4585`, dart
+/// 3.15 main). `STATIC_WARNING`, published; the report anchors at each 2nd+
+/// written occurrence inside one clause (`imports_verifier.dart:328-358`
+/// `_addDuplicateShownHiddenNames` — a fresh seen-set per clause, defined
+/// names only, so cross-clause repeats and undefined names never report).
+/// The emit-side decision face is [`crate::library_graph::
+/// LibraryGraph::duplicate_combinator_names`].
+pub const DUPLICATE_HIDDEN_NAME: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "duplicate_hidden_name",
+    machine: "DUPLICATE_HIDDEN_NAME",
+    message: "Duplicate hidden name.",
+    correction: Some("Try removing the repeated name from the list of hidden members."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// The `show`-clause twin of [`DUPLICATE_HIDDEN_NAME`] — registry row
+/// verbatim (`diagnostic.g.dart:4757`), same decision face, `STATIC_WARNING`,
+/// published.
+pub const DUPLICATE_SHOWN_NAME: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "duplicate_shown_name",
+    machine: "DUPLICATE_SHOWN_NAME",
+    message: "Duplicate shown name.",
+    correction: Some("Try removing the repeated name from the list of shown members."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// One unit imports the same library twice with syntactically identical
+/// directives (same `as` prefix, same combinator shape) — registry row
+/// verbatim (`diagnostic.g.dart:4619`, dart 3.15 main). `STATIC_WARNING`,
+/// published; reported at each repeat directive's URI token
+/// (`imports_verifier.dart:361-390` `_duplicates`: same resolved library +
+/// `areSyntacticallyIdenticalExceptUri`, adjacent-pair walk).
+pub const DUPLICATE_IMPORT: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "duplicate_import",
+    machine: "DUPLICATE_IMPORT",
+    message: "Duplicate import.",
+    correction: Some("Try removing all but one import of the library."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// The export-side twin of [`DUPLICATE_IMPORT`] — registry row verbatim
+/// (`diagnostic.g.dart:4537`), same decision shape, `STATIC_WARNING`,
+/// published.
+pub const DUPLICATE_EXPORT: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "duplicate_export",
+    machine: "DUPLICATE_EXPORT",
+    message: "Duplicate export.",
+    correction: Some("Try removing all but one export of the library."),
     dtype: DiagnosticType::StaticWarning,
     has_published: true,
 };
@@ -451,6 +510,63 @@ mod tests {
         assert_eq!(UNDEFINED_SHOWN_NAME.dtype, DiagnosticType::StaticWarning);
         const {
             assert!(UNDEFINED_SHOWN_NAME.has_published);
+        }
+    }
+
+    /// Registry-true descriptors of the duplicate-directive rows (pinned live
+    /// registry: `duplicateHiddenName` diagnostic.g.dart:4584,
+    /// `duplicateShownName` :4757, `duplicateImport` :4619,
+    /// `duplicateExport` :4537 — all four `STATIC_WARNING`, published, with
+    /// corrections; texts oracle-verified against the pinned dart 3.15 main
+    /// registry).
+    #[test]
+    fn duplicate_rows_are_verbatim_oracle_descriptors() {
+        assert_eq!(DUPLICATE_HIDDEN_NAME.name, "duplicate_hidden_name");
+        assert_eq!(DUPLICATE_HIDDEN_NAME.machine, "DUPLICATE_HIDDEN_NAME");
+        assert_eq!(DUPLICATE_HIDDEN_NAME.message, "Duplicate hidden name.");
+        assert_eq!(
+            DUPLICATE_HIDDEN_NAME.correction,
+            Some("Try removing the repeated name from the list of hidden members.")
+        );
+        assert_eq!(DUPLICATE_HIDDEN_NAME.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(DUPLICATE_HIDDEN_NAME.has_published);
+        }
+
+        assert_eq!(DUPLICATE_SHOWN_NAME.name, "duplicate_shown_name");
+        assert_eq!(DUPLICATE_SHOWN_NAME.machine, "DUPLICATE_SHOWN_NAME");
+        assert_eq!(DUPLICATE_SHOWN_NAME.message, "Duplicate shown name.");
+        assert_eq!(
+            DUPLICATE_SHOWN_NAME.correction,
+            Some("Try removing the repeated name from the list of shown members.")
+        );
+        assert_eq!(DUPLICATE_SHOWN_NAME.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(DUPLICATE_SHOWN_NAME.has_published);
+        }
+
+        assert_eq!(DUPLICATE_IMPORT.name, "duplicate_import");
+        assert_eq!(DUPLICATE_IMPORT.machine, "DUPLICATE_IMPORT");
+        assert_eq!(DUPLICATE_IMPORT.message, "Duplicate import.");
+        assert_eq!(
+            DUPLICATE_IMPORT.correction,
+            Some("Try removing all but one import of the library.")
+        );
+        assert_eq!(DUPLICATE_IMPORT.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(DUPLICATE_IMPORT.has_published);
+        }
+
+        assert_eq!(DUPLICATE_EXPORT.name, "duplicate_export");
+        assert_eq!(DUPLICATE_EXPORT.machine, "DUPLICATE_EXPORT");
+        assert_eq!(DUPLICATE_EXPORT.message, "Duplicate export.");
+        assert_eq!(
+            DUPLICATE_EXPORT.correction,
+            Some("Try removing all but one export of the library.")
+        );
+        assert_eq!(DUPLICATE_EXPORT.dtype, DiagnosticType::StaticWarning);
+        const {
+            assert!(DUPLICATE_EXPORT.has_published);
         }
     }
 }

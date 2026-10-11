@@ -865,6 +865,27 @@ pub(crate) fn combinator_diagnostic(
     )
 }
 
+/// One duplicate-directive static warning — the placeholder-free sibling of
+/// [`uri_diagnostic`]: the `duplicate_import`/`duplicate_export`/
+/// `duplicate_hidden_name`/`duplicate_shown_name` templates carry no `{N}`
+/// slots, so the message is the verbatim template; the rest of the
+/// descriptor-driven shape is identical (the family decides TYPE and
+/// severity, the published flag and the verbatim correction ride along).
+pub(crate) fn duplicate_diagnostic(
+    info: dartq_resolution::ResolutionCodeInfo,
+    range: SourceRange,
+    file: FileId,
+) -> Diagnostic {
+    Diagnostic::new(
+        info.dtype.severity(),
+        CodeInfo::new(info.name, info.machine, info.dtype, info.has_published),
+        info.message.to_owned(),
+        file,
+        range,
+        info.correction.map(str::to_owned),
+    )
+}
+
 /// Parse-recovery diagnostics through the engine's listener (pass 1 of 2;
 /// see `recompute_facts` for the two-pass note). The listener moves into the
 /// parser (the trait is not object-safe over `&mut` here), so diagnostics

@@ -37,11 +37,14 @@ pub mod modifiers;
 pub mod namespace;
 pub mod uri;
 
-pub use codes::{ResolutionCode, ResolutionCodeInfo, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME};
+pub use codes::{
+    DUPLICATE_EXPORT, DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT, DUPLICATE_SHOWN_NAME,
+    ResolutionCode, ResolutionCodeInfo, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
+};
 pub use conditional::{Configuration, SelectedUri, resolve_conditional};
 pub use library_graph::{
-    CombinatorClause, Combinators, ExportEdge, ExportEntry, ImportEdge, LibraryGraph,
-    LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
+    CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, ImportEdge,
+    LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
 };
 pub use modifiers::{
     ClassModifiers, DeclKind, DeclarationViolation, ExplicitBaseFinal, ImplementsStep,
