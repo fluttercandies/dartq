@@ -1,6 +1,6 @@
 //! dartq-lints — the built-in lint rule engine and the syntax-visible slice
 //! of the `package:lints` recommended/core sets (PRD §13), complete to the
-//! member level through #315: every set member is implemented under the
+//! member level through #586: every set member is implemented under the
 //! documented lexical-approximation discipline or listed blocked with its
 //! fact.
 //!
@@ -105,50 +105,53 @@
 //!   substrate does not carry — pubspec data, the analyzing library's
 //!   package identity, element-model constant values — so the body is
 //!   ported as a pure function over an explicit input face (the
-//!   documented seam), and the engine wiring belongs to the mounting
-//!   ticket #434: the pubspec pair share the `rules::pubspec` data seam,
-//!   `implementation_imports` takes (own package name, resolved import
-//!   URI), and `exhaustive_cases` takes the enum-like candidate plus the
-//!   switch members. Registry rows keep name/group/count alignment with
-//!   `kinds: &[]`; the traversal never dispatches them.
+//!   documented seam), and the engine wiring belonged to the mounting
+//!   ticket #434, since landed: the pubspec pair run through the
+//!   `dartq-commands` pubspec pass over `dartq_pub::pubspec_facts`, and
+//!   `depend_on_referenced_packages` / `implementation_imports` dispatch
+//!   off `Unit.workspace`. `exhaustive_cases` keeps
+//!   (enum-like candidate, switch members) as its seam; its row stays
+//!   `kinds: &[]`.
+//! - standard-set completion (12, #586): `annotate_overrides`,
+//!   `overridden_fields`, `unnecessary_overrides`,
+//!   `avoid_renaming_method_parameters` (same-file inheritance chain —
+//!   extends/with/on as the concrete chain, plus implements as the
+//!   any-member chain, standing in for `getInheritedConcreteMember` /
+//!   `getInheritedMember`); `await_only_futures`,
+//!   `unrelated_type_equality_checks`, `void_checks`,
+//!   `null_check_on_nullable_type_parameter`,
+//!   `collection_methods_unrelated_type` (scalar-literal / written-type
+//!   faces standing in for static types); `implicit_call_tearoffs`
+//!   (written `FunctionType` target + same-file `call` class);
+//!   `invalid_runtime_check_with_js_interop_types` (same-file `@JS` class
+//!   under a `dart:js_interop` import); `depend_on_referenced_packages`
+//!   (the `rules::pubspec` package seam, `kinds: &[]` until #434 mounts
+//!   it). Each rule module spells out its over/under-report faces; the
+//!   registry now covers the full `package:lints` core+recommended union
+//!   (89 specs).
 //!
 //! With this tranche every `package:lints` member has a terminal state:
-//! implemented (72), or documented-blocked with the exact resolution fact it
+//! implemented (84), or documented-blocked with the exact resolution fact it
 //! waits for (below).
 //!
 //! # Documented-blocked members, with the blocker
 //!
-//! - **Type inference (static types of expressions)**: `await_only_futures`
-//!   (Future-subtype test on the awaited expression),
-//!   `collection_methods_unrelated_type` (receiver type arguments vs
-//!   argument type), `null_check_on_nullable_type_parameter` (type-parameter
-//!   nullability), `unrelated_type_equality_checks` (operand type
-//!   relation), `unnecessary_string_interpolations` (operand already
-//!   String — the dominant hit face is `'${stringVar}'`, neither erroneous
-//!   nor user-shadowed), `void_checks` (void-typed expressions).
-//! - **Element model (member/type resolution)**: `implicit_call_tearoffs`
-//!   (callable `call` member), `valid_regexps` (constant evaluation for
-//!   interpolated patterns plus an ECMAScript-grammar regex validator — the
-//!   Rust `regex` crate is a different grammar and would misjudge valid
-//!   patterns), `avoid_types_as_parameter_names` (in-scope name resolution
-//!   incl. imports and type parameters — a same-file-only face under-reports
-//!   the dominant imported-type case),
-//!   `invalid_runtime_check_with_js_interop_types` (JS-interop annotation
-//!   classification of the operand types).
-//! - **Inheritance / override graph**: `annotate_overrides`,
-//!   `unnecessary_overrides` (plus body-equivalence over resolved
-//!   elements — the inherited-declaration equality guard is what keeps
-//!   renamed-parameter overrides unreported), `overridden_fields`,
-//!   `avoid_renaming_method_parameters`,
-//!   `use_super_parameters` (super-constructor parameter correspondence).
+//! - **Type inference (static types of expressions)**:
+//!   `unnecessary_string_interpolations` (operand already String — the
+//!   dominant hit face is `'${stringVar}'`, neither erroneous nor
+//!   user-shadowed).
+//! - **Element model (member/type resolution)**: `valid_regexps` (constant
+//!   evaluation for interpolated patterns plus an ECMAScript-grammar regex
+//!   validator — the Rust `regex` crate is a different grammar and would
+//!   misjudge valid patterns), `avoid_types_as_parameter_names` (in-scope
+//!   name resolution incl. imports and type parameters — a same-file-only
+//!   face under-reports the dominant imported-type case).
+//! - **Inheritance / override graph**: `use_super_parameters`
+//!   (super-constructor parameter correspondence).
 //! - **Scope resolution beyond the file**: `package_config` package
 //!   identity remains the one scope face the [`Unit`] lacks;
 //!   `implementation_imports` (the only rule waiting on it) ships its
 //!   predicate over the seam above.
-//! - **Non-Dart artifacts**: `depend_on_referenced_packages` reads the
-//!   pubspec and the package graph (the pubspec value face itself is the
-//!   `rules::pubspec` seam, shared with the mounted `secure_pubspec_urls` /
-//!   `package_names`).
 //! - **Flow analysis (#278)**: `prefer_final_fields` (mutation analysis
 //!   across member bodies; a per-unit write scan over-reports on fields
 //!   mutated in a sibling part file).
@@ -176,6 +179,11 @@ mod testsupport;
 
 pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
-pub use engine::{Check, Features, Lint, Unit, run};
+pub use engine::{Check, Features, Lint, Unit, WorkspaceFacts, run};
 pub use ignore::IgnoreInfo;
 pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name};
+// The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
+// `analyze_lints`) walks the scanned pubspec facts through these — the
+// rules themselves stay crate-internal (`kinds: &[]`, no AST dispatch).
+pub use rules::pubspec::package_names::check_name;
+pub use rules::pubspec::secure_pubspec_urls::check_url;

@@ -7,7 +7,7 @@
 //! ancestor path so parent questions (`!(x is T)`, else-branch shape) cost
 //! one slice read, never the arena's forward-walk `parent`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use dartq_ast::{NodeKind, SyntaxTable, byte_span, utf16_span};
@@ -65,6 +65,36 @@ pub struct Unit<'a> {
     /// path-dependent rules, mirroring the official `element != null` guard.
     pub path: Option<&'a Path>,
     pub features: Features,
+    /// The containing-package facts the pub-aware rules read
+    /// ([`WorkspaceFacts`]). `None` — outside any known package, or where
+    /// the containing pubspec is unparseable — is the official no-pubspec
+    /// posture (`package is! PubPackage` / `pubspec == null`,
+    /// depend_on_referenced_packages.dart:33-40): those rules stay silent.
+    pub workspace: Option<&'a WorkspaceFacts>,
+}
+
+/// The pubspec-derived facts of the analyzed file's containing package,
+/// built once per package by the mounting face (the package table's
+/// attribution plus the containing pubspec's parsed dependency names).
+pub struct WorkspaceFacts {
+    /// The containing package's own name (official `pubspec.name`).
+    pub own_package: String,
+    /// The own name plus every `dependencies` entry — available to every
+    /// import of the package (depend_on_referenced_packages.dart:44-48).
+    pub dependencies: rustc_hash::FxHashSet<String>,
+    /// Every `dev_dependencies` entry — available only outside the public
+    /// dirs; the rule's check applies the `isInPublicDir` gate per unit
+    /// (ast.dart:112-129: `lib/`, `bin/`, `hook/build.dart`,
+    /// `hook/link.dart`).
+    pub dev_dependencies: rustc_hash::FxHashSet<String>,
+    /// The containing package's root (canonical) — the public-dir gates'
+    /// base.
+    pub root: PathBuf,
+    /// The package's package-URI directory (`packageUri`, normally `lib/`):
+    /// a file under it resolves to a `package:` URI —
+    /// implementation_imports' registration gate
+    /// (implementation_imports.dart:30-33).
+    pub lib_dir: PathBuf,
 }
 
 /// One reported lint.
@@ -493,6 +523,7 @@ mod tests {
             lines: &lines,
             path: None,
             features: Features::default(),
+            workspace: None,
         };
         let id = rule_by_name("avoid_empty_else").unwrap();
         let mut enabled = EnableSet::none();

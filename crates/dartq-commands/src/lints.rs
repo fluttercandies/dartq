@@ -49,15 +49,20 @@
 //! `session::run_group`, both before their display sorts. The check face
 //! stays lint-free by design (scan+parse only).
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
 use dartq_engine::Engine;
 use dartq_engine::analysis_options::AnalysisOptions;
-use dartq_lints::{EnableSet, Features, Group, Lint, RULES, RuleId, Unit, parse_unit, run};
-use dartq_source::FileId;
+use dartq_lints::{
+    EnableSet, Features, Group, Lint, RULES, RuleId, Unit, WorkspaceFacts, check_name, check_url,
+    parse_unit, rule_by_name, run,
+};
+use dartq_pub::pubspec_facts::scan as scan_pubspec;
+use dartq_pub::{Pubspec, pubspec_facts::Scalar};
+use dartq_source::{FileId, LineIndex};
 
 /// The whole `package:lints` slice: every registered rule ships in core or
 /// recommended (recommended includes core), so the default posture is the
@@ -132,9 +137,43 @@ pub fn diagnose(file: FileId, unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Diagn
         .collect()
 }
 
+/// The containing-package facts behind `Unit.workspace`, cached per package
+/// root for one run: the attribution resolves through the package table's
+/// `containing` walk, the pubspec parse runs once per package and only its
+/// names are kept. `None` — no containing package, an unreadable pubspec,
+/// or a parse failure — is the official no-pubspec posture: the
+/// package-aware rules stay silent for those files.
+fn workspace_facts<'a>(
+    engine: &Engine,
+    path: &Path,
+    cache: &'a mut FxHashMap<PathBuf, Option<WorkspaceFacts>>,
+) -> Option<&'a WorkspaceFacts> {
+    let identity = engine.packages().containing(path)?;
+    if !cache.contains_key(&identity.root) {
+        let face = std::fs::read_to_string(identity.root.join("pubspec.yaml"))
+            .ok()
+            .and_then(|text| Pubspec::parse(&text).ok())
+            .map(|spec| {
+                let mut dependencies: FxHashSet<String> =
+                    spec.dependencies.keys().cloned().collect();
+                dependencies.insert(spec.name.clone());
+                WorkspaceFacts {
+                    own_package: spec.name,
+                    dependencies,
+                    dev_dependencies: spec.dev_dependencies.keys().cloned().collect(),
+                    root: identity.root.clone(),
+                    lib_dir: identity.lib_dir.clone(),
+                }
+            });
+        cache.insert(identity.root.clone(), face);
+    }
+    cache.get(&identity.root).and_then(Option::as_ref)
+}
+
 /// The analyze pipeline's lint stage (#355 activation): every resident
 /// file's rows, one transient parse per file (the bridge's
-/// zero-persistent-memory ruling — nothing enters engine residency).
+/// zero-persistent-memory ruling — nothing enters engine residency), plus
+/// the pubspec pass over the workspace's `pubspec.yaml` files (#434).
 ///
 /// Per-subtree enable sets: each file runs under the options entry its own
 /// ancestry governs ([`governing_options`]) — the same deepest-governing
@@ -144,6 +183,13 @@ pub fn diagnose(file: FileId, unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Diagn
 /// set skips the file without parsing (opt-in cost ruling). Files that are
 /// no longer resident or are not UTF-8 are skipped — the engine's own pass
 /// already reported nothing for them.
+///
+/// The package-aware rules read the containing package's facts through
+/// `Unit.workspace` ([`workspace_facts`], one pubspec parse per package).
+/// The pubspec pass runs after the file loop: the root package's and every
+/// workspace member's `pubspec.yaml`, through the same enable-set
+/// resolution, the scanned facts, and the YAML `# ignore:` variant
+/// ([`YamlIgnores`]).
 #[must_use]
 pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     let mut files: Vec<FileId> = engine
@@ -157,6 +203,7 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     // One enable set per distinct file directory (governance is by
     // ancestry, so one directory always maps to one entry).
     let mut enabled: FxHashMap<PathBuf, EnableSet> = FxHashMap::default();
+    let mut workspace: FxHashMap<PathBuf, Option<WorkspaceFacts>> = FxHashMap::default();
 
     let mut out = Vec::new();
     for file in files {
@@ -185,9 +232,192 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
             continue;
         }
         let parsed = parse_unit(text, Features::default());
-        out.extend(diagnose(file, &parsed.unit(Some(path)), &set));
+        let mut unit = parsed.unit(Some(path));
+        unit.workspace = workspace_facts(engine, path, &mut workspace);
+        out.extend(diagnose(file, &unit, &set));
+    }
+    out.extend(pubspec_rows(engine, roots));
+    out
+}
+
+/// The pubspec pass (#434): the root package's and every workspace
+/// member's `pubspec.yaml` — the same set the engine captured at analyze
+/// time — under the same enable-set resolution the Dart files get. A
+/// capture miss (no engine pass yet, or no pubspec file) leaves the file
+/// unreported. Rows carry the official value-node span (UTF-16 over the
+/// pubspec text) and the `IgnoreInfo.forYaml` suppression face.
+fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
+    let table = engine.packages();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(root) = table.get(table.root().as_str()) {
+        dirs.push(root.root.clone());
+    }
+    if let Some(members) = table.workspace_members() {
+        dirs.extend(
+            members
+                .iter()
+                .filter_map(|name| table.get(name.as_str()))
+                .map(|identity| identity.root.clone()),
+        );
+    }
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        let path = dir.join("pubspec.yaml");
+        let Some(file) = engine.file_table().try_file_id(&path) else {
+            continue;
+        };
+        let Some(bytes) = engine.content(file) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let set = enable_set(
+            governing_options(engine, &dir, roots).map(|options| options.lint_rules.as_slice()),
+        );
+        let urls_rule = rule_by_name("secure_pubspec_urls");
+        let names_rule = rule_by_name("package_names");
+        let urls_on = urls_rule.is_some_and(|id| set.is_enabled(id));
+        let names_on = names_rule.is_some_and(|id| set.is_enabled(id));
+        if !urls_on && !names_on {
+            continue;
+        }
+        let facts = scan_pubspec(text);
+        let ignores = YamlIgnores::parse(text);
+        let lines = LineIndex::new(text);
+        let mut lints = Vec::new();
+        if urls_on {
+            let rule = urls_rule.expect("checked above");
+            let spec = &RULES[rule.0 as usize];
+            for Scalar { range, value } in facts.urls.iter().chain(&facts.dep_urls) {
+                let mut hits = Vec::new();
+                check_url(range.clone(), value, &mut hits);
+                lints.extend(hits.into_iter().filter_map(|hit| {
+                    let (line, _) = lines.byte_to_line_col(hit.range.start as u32);
+                    (!ignores.ignored(line, "secure_pubspec_urls")).then(|| Lint {
+                        rule,
+                        range: utf16_range(&lines, text, &hit.range),
+                        message: spec.render_problem(&[hit.scheme]),
+                        correction: spec.render_correction(&[]),
+                    })
+                }));
+            }
+        }
+        if names_on {
+            let rule = names_rule.expect("checked above");
+            let spec = &RULES[rule.0 as usize];
+            if let Some(name) = &facts.name {
+                let mut hits = Vec::new();
+                check_name(name.range.clone(), &name.value, &mut hits);
+                lints.extend(hits.into_iter().filter_map(|hit| {
+                    let (line, _) = lines.byte_to_line_col(hit.range.start as u32);
+                    (!ignores.ignored(line, "package_names")).then(|| Lint {
+                        rule,
+                        range: utf16_range(&lines, text, &hit.range),
+                        message: spec.render_problem(&[&hit.name]),
+                        correction: spec.render_correction(&[]),
+                    })
+                }));
+            }
+        }
+        out.extend(lints.into_iter().map(|lint| row(lint, file)));
     }
     out
+}
+
+/// A pubspec row's byte span in UTF-16 (the engine's diagnostic
+/// coordinate).
+fn utf16_range(
+    lines: &LineIndex,
+    text: &str,
+    range: &core::ops::Range<usize>,
+) -> core::ops::Range<u32> {
+    lines.byte_to_utf16(text, range.start as u32)..lines.byte_to_utf16(text, range.end as u32)
+}
+
+/// The YAML-face suppression table (`IgnoreInfo.forYaml`,
+/// pkg/analyzer/lib/src/ignore_comments/ignore_info.dart:97-104, 145-163):
+/// `# ignore:` entries — alone on their line suppress the NEXT line,
+/// trailing suppress their own — and `# ignore_for_file:` entries
+/// file-wide. The names are the comma-separated, whitespace-trimmed list;
+/// matching is case-insensitive (the Dart-token comment path is a
+/// different face and is not reused).
+struct YamlIgnores {
+    on_line: FxHashMap<u32, Vec<String>>,
+    for_file: Vec<String>,
+}
+
+impl YamlIgnores {
+    fn parse(text: &str) -> Self {
+        let mut info = Self {
+            on_line: FxHashMap::default(),
+            for_file: Vec::new(),
+        };
+        for (index, line) in text.lines().enumerate() {
+            let line_no = u32::try_from(index).expect("line count fits u32") + 1;
+            if let Some((before, names)) = yaml_ignore_entry(line, "ignore:") {
+                // Alone on the line -> the next line (ignore_info.dart:157).
+                let target = if before.trim().is_empty() {
+                    line_no + 1
+                } else {
+                    line_no
+                };
+                info.on_line.entry(target).or_default().extend(names);
+            }
+            if let Some((_, names)) = yaml_ignore_entry(line, "ignore_for_file:") {
+                info.for_file.extend(names);
+            }
+        }
+        info
+    }
+
+    /// Whether a lint named `name` reported on 1-based `line` is
+    /// suppressed (`_ignoredAt`, ignore_info.dart:186-212).
+    fn ignored(&self, line: u32, name: &str) -> bool {
+        self.for_file
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(name))
+            || self
+                .on_line
+                .get(&line)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
+    }
+}
+
+/// The `#`-commented marker entry of one YAML line: the text before the
+/// `#` run, and the name list after the marker. The official regexes'
+/// greedy `.*` reads the LAST `#` run the rest still matches from; the
+/// scan keeps the last candidate the same way.
+fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<String>)> {
+    let bytes = line.as_bytes();
+    let mut found = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'#' {
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j] == b'#' {
+            j += 1;
+        }
+        let mut k = j;
+        while k < bytes.len() && bytes[k] == b' ' {
+            k += 1;
+        }
+        if line[k..].starts_with(marker) {
+            found = Some((&line[..i], &line[k + marker.len()..]));
+        }
+    }
+    found.map(|(before, rest)| {
+        (
+            before,
+            rest.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
 }
 
 /// The options entry governing a file in `dir`: the nearest
@@ -439,6 +669,200 @@ mod tests {
         );
         assert!(
             !fires("lib/sub/nested_side.dart", "unnecessary_new"),
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The pubspec pass (#434) end to end: the root `pubspec.yaml`'s
+    /// insecure URLs report at their value spans (the official value-node
+    /// anchor), the secure ones stay silent.
+    #[test]
+    fn pubspec_url_rows_report_at_the_value_span() {
+        let root = crate::workspace::test_fixture::workspace("lints_pubspec_urls", &[]);
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fixture\nhomepage: http://github.com/fixture\nrepository: https://github.com/fixture\nenvironment:\n  sdk: ^3.5.0\ndependency_overrides:\n  dep:\n    git:\n      url: git://github.com/x/y.git\n",
+        )
+        .expect("pubspec");
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let mut spans: Vec<(u32, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "secure_pubspec_urls")
+            .map(|d| (d.range.offset, d.range.offset + d.range.length))
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, vec![(24, 49), (165, 189)], "{spans:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `package_names` over the same pass: a camel-case `name:` reports at
+    /// its value span with the official argument fill. `fooBar` is a legal
+    /// pub name, so the assembly needs the config's root entry renamed to
+    /// match (a real `pub get` writes it).
+    #[test]
+    fn package_names_row_reports_the_camel_case_name() {
+        let root = crate::workspace::test_fixture::workspace("lints_pubspec_names", &[]);
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fooBar\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
+        std::fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fooBar", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        )
+        .expect("config");
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(u32, u32, String)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "package_names")
+            .map(|d| {
+                (
+                    d.range.offset,
+                    d.range.offset + d.range.length,
+                    d.message.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                6,
+                12,
+                "The package name 'fooBar' isn't a lower_case_with_underscores identifier."
+                    .to_owned()
+            )],
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The YAML-face suppression (`IgnoreInfo.forYaml`): a `# ignore:`
+    /// line above the `homepage:` entry drops its row.
+    #[test]
+    fn pubspec_ignore_line_suppresses_the_url_row() {
+        let root = crate::workspace::test_fixture::workspace("lints_pubspec_ignore", &[]);
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fixture\n# ignore: secure_pubspec_urls\nhomepage: http://a.dev\nrepository: https://b.dev\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        assert!(
+            run.diagnostics
+                .iter()
+                .all(|d| d.code.name != "secure_pubspec_urls"),
+            "the suppressed homepage row is gone: {:?}",
+            run.diagnostics
+                .iter()
+                .map(|d| d.code.name)
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The package-aware directive rules ride the pipeline with the
+    /// mounted facts: a foreign import and a foreign `src/` import report
+    /// in `lib/`, the own package and the dev dependency stay silent
+    /// where the official gates hold.
+    #[test]
+    fn package_aware_directive_rules_flow_through_the_pipeline() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_pub_facts",
+            &[
+                (
+                    "lib/a.dart",
+                    "import 'package:foreign/foreign.dart';\nimport 'package:foreign/src/impl.dart';\nimport 'package:fixture/src/own.dart';\n",
+                ),
+                (
+                    "test/t.dart",
+                    "import 'package:fixture_dev/dev.dart';\nimport 'package:foreign/src/impl.dart';\n",
+                ),
+            ],
+        );
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\ndev_dependencies:\n  fixture_dev: ^1.0.0\n",
+        )
+        .expect("pubspec");
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(String, String, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.name.as_ref(),
+                    "depend_on_referenced_packages" | "implementation_imports"
+                )
+            })
+            .map(|d| {
+                (
+                    run.layout
+                        .file_path(d.file)
+                        .file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                    d.code.name.to_string(),
+                    d.range.offset,
+                )
+            })
+            .collect();
+        // a.dart: the plain foreign import and the foreign `src/` import
+        // both lack a dependency entry (the latter also reports as an
+        // implementation import); the own package stays silent. t.dart:
+        // the dev dependency is available outside the public dirs (no
+        // row), `foreign` still is not, and the `src/` import is outside
+        // the rule's `package:`-URI gate.
+        //
+        // The two a.dart rows at offset 46 tie through severity, path and
+        // offset, so the oracle display order's final key decides
+        // (`DiagnosticWithPath.compareTo`, dartdev analyze.dart:703-707 —
+        // message text): "Import of a library…" < "The imported
+        // package…".
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a.dart".to_owned(),
+                    "depend_on_referenced_packages".to_owned(),
+                    7
+                ),
+                ("a.dart".to_owned(), "implementation_imports".to_owned(), 46),
+                (
+                    "a.dart".to_owned(),
+                    "depend_on_referenced_packages".to_owned(),
+                    46
+                ),
+                (
+                    "t.dart".to_owned(),
+                    "depend_on_referenced_packages".to_owned(),
+                    46
+                ),
+            ],
             "{rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();

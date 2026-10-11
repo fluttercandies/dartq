@@ -329,6 +329,7 @@ impl Engine {
         on_event: &mut dyn FnMut(EngineEvent),
         cancel: &CancellationToken,
     ) -> Result<Vec<Diagnostic>, Cancelled> {
+        self.capture_pubspecs();
         let mut diagnostics = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
@@ -339,6 +340,38 @@ impl Engine {
         )?;
         self.append_options_diagnostics(&mut diagnostics);
         Ok(self.apply_severity_options(diagnostics))
+    }
+
+    /// Captures the workspace's pubspec files for the pubspec lint face
+    /// (#434): the root package's and every workspace member's
+    /// `pubspec.yaml` joins the file table with text and line index held
+    /// beside it (the options-file shape — reported rows resolve positions
+    /// through the [`Engine::content`]/[`Engine::line_index`] fallbacks,
+    /// never through Dart residency). Refreshed every analyze pass, so the
+    /// captured text is the analyzed one and the lint stage scans exactly
+    /// these bytes. One bounded read per package per pass.
+    fn capture_pubspecs(&mut self) {
+        let table = &self.state.packages;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(root) = table.get(table.root().as_str()) {
+            dirs.push(root.root.clone());
+        }
+        if let Some(members) = table.workspace_members() {
+            dirs.extend(members.iter().filter_map(|name| {
+                table.get(name.as_str()).map(|identity| identity.root.clone())
+            }));
+        }
+        for dir in dirs {
+            let path = dir.join("pubspec.yaml");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = self.state.files.intern(&path);
+            let index = dartq_source::LineIndex::new(&text);
+            self.state
+                .reported
+                .insert(file, (Arc::from(text.as_str()), index));
+        }
     }
 
     /// Appends the options-file self-diagnostics (#457) to an output set:
@@ -596,6 +629,14 @@ impl Engine {
         &self.state.files
     }
 
+    /// The context's package identity table — the lint face's package
+    /// attribution (`PackageTable::containing`) and its workspace member
+    /// set ([`PackageTable::workspace_members`]).
+    #[must_use]
+    pub fn packages(&self) -> &dartq_package::PackageTable {
+        &self.state.packages
+    }
+
     /// The merged analysis options governing `root` (a package root), or
     /// `None` when the root has no options file in its ancestry. The lint
     /// face resolves its enable set from [`analysis_options::AnalysisOptions::lint_rules`];
@@ -616,6 +657,9 @@ impl Engine {
         if let Some(facts) = self.state.residency.get(&file) {
             return Some(&facts.line_index);
         }
+        if let Some((_, index)) = self.state.reported.get(&file) {
+            return Some(index);
+        }
         let path = self.state.files.path(file)?;
         self.state
             .options
@@ -625,12 +669,16 @@ impl Engine {
             .map(|(_, index)| index)
     }
 
-    /// The resident bytes of a file. Options-file rows resolve through the
-    /// options face (see [`Engine::line_index`]).
+    /// The resident bytes of a file. Reported non-Dart files (the pubspec
+    /// face) and options-file rows resolve through their captured layouts
+    /// (see [`Engine::line_index`]).
     #[must_use]
     pub fn content(&self, file: FileId) -> Option<&[u8]> {
         if let Some(facts) = self.state.residency.get(&file) {
             return self.state.store.get(facts.content);
+        }
+        if let Some((text, _)) = self.state.reported.get(&file) {
+            return Some(text.as_bytes());
         }
         let path = self.state.files.path(file)?;
         self.state

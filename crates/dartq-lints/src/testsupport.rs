@@ -81,6 +81,22 @@ impl Fixture {
             lines: &self.lines,
             path: Some(&self.path),
             features: self.features,
+            workspace: None,
+        };
+        run(&unit, rules)
+    }
+
+    /// [`Fixture::run`] with the containing-package facts mounted — the
+    /// pub-aware rules' dispatch face.
+    pub fn run_workspace(&self, rules: &EnableSet, facts: &crate::WorkspaceFacts) -> Vec<Lint> {
+        let unit = Unit {
+            source: &self.source,
+            tokens: &self.tokens,
+            ast: &self.ast,
+            lines: &self.lines,
+            path: Some(&self.path),
+            features: self.features,
+            workspace: Some(facts),
         };
         run(&unit, rules)
     }

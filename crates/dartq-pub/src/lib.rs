@@ -29,6 +29,7 @@ pub mod glob;
 pub mod graph;
 pub mod lock;
 pub mod pubspec;
+pub mod pubspec_facts;
 pub mod version;
 pub mod workspace;
 
@@ -40,6 +41,7 @@ pub use graph::{
 };
 pub use lock::{DependencyKind, LockDescription, LockFile, LockedPackage, SourceKind};
 pub use pubspec::{DependencySpec, Environment, Pubspec, Resolution};
+pub use pubspec_facts::{PubspecFacts, Scalar};
 pub use version::{LanguageVersion, Version, VersionConstraint, VersionRange};
 pub use workspace::{WorkspaceLayout, find_workspace_root, normalize, workspace_ref_mismatches};
 

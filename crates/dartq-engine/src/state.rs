@@ -578,6 +578,13 @@ pub(crate) struct EngineState {
     /// residency and the live library set respectively.
     pub(crate) captures: BTreeMap<FileId, Arc<FileCapture>>,
     pub(crate) library_surfaces: BTreeMap<LibraryId, LibraryIndex>,
+    /// Reported non-Dart files (the pubspec lint face): the workspace's
+    /// pubspecs, interned with their captured text and line index so their
+    /// rows resolve positions through [`Engine::content`]/[`Engine::line_index`]
+    /// fallbacks without Dart residency — the options-file shape
+    /// ([`crate::analysis_options::AnalysisOptions`] layout). Refreshed
+    /// every analyze pass, so the captured text is the analyzed one.
+    pub(crate) reported: FxHashMap<FileId, (Arc<str>, LineIndex)>,
     /// Resident files whose content moved since the last analyze — the
     /// recapture queue the analyze phase drains. A body edit with a stable
     /// API signature keeps its library clean (the L2 win) but still moves
@@ -663,6 +670,7 @@ impl EngineState {
             scanned_order: VecDeque::new(),
             captures: BTreeMap::new(),
             library_surfaces: BTreeMap::new(),
+            reported: FxHashMap::default(),
             capture_dirty: Vec::new(),
             gc_debt: 0,
             budget: None,

@@ -44,11 +44,28 @@ fn import_prefix(c: &Check<'_>, node: u32) -> Option<u32> {
 /// The URI of an import: the leading run of `StringLiteral` direct children
 /// (the adjacent-string concatenation face — `AdjacentStringLiteralsHandle`
 /// is D1, consecutive segments in the parent, collapse map §3.5).
-fn leading_string_run(c: &Check<'_>, node: u32) -> Vec<u32> {
+pub(crate) fn leading_string_run(c: &Check<'_>, node: u32) -> Vec<u32> {
     c.collect_direct(node)
         .into_iter()
         .take_while(|&k| c.kind(k) == NodeKind::StringLiteral)
         .collect()
+}
+
+/// The written URI of an import/export directive: the cooked
+/// adjacent-string run (`stringValue`, None on interpolation) with its
+/// UTF-16 span — the official `node.uri` report anchor. `None` when the
+/// directive has no readable string URI.
+pub(crate) fn written_uri(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, String)> {
+    let run = leading_string_run(c, node);
+    let first = *run.first()?;
+    let last = *run.last()?;
+    let value = run
+        .iter()
+        .map(|&n| string_value(c, n))
+        .collect::<Option<String>>()?;
+    let start = c.utf16_span(first).start;
+    let end = c.utf16_span(last).end;
+    Some((start..end, value))
 }
 
 /// The value of one `StringLiteral` node — the official `stringValue`
@@ -57,7 +74,7 @@ fn leading_string_run(c: &Check<'_>, node: u32) -> Vec<u32> {
 /// short-escape/`\xHH`/`\uHHHH`/`\u{H…}`/passthrough set (the engine's
 /// cooked-string processor, dartq-engine/src/l1.rs `string_literal_value` —
 /// sibling crates, so the spec-mandated walk is mirrored here).
-fn string_value(c: &Check<'_>, node: u32) -> Option<String> {
+pub(crate) fn string_value(c: &Check<'_>, node: u32) -> Option<String> {
     let text = &c.unit.source[c.byte_span(node)];
     let is_raw = text.starts_with('r');
     let body = if is_raw { &text[1..] } else { text };
@@ -524,31 +541,54 @@ pub(crate) mod implementation_imports {
     //! other than the analyzing library's own (`isSamePackageAs`,
     //! uri.dart:15-21) reports at the import's URI node (:44-56).
     //!
-    //! Seam posture (documented): the verdict needs the analyzing library's
-    //! own package identity — the official `context.libraryElement?.uri`
-    //! (:30-34), resolved through the package config. [`Unit`][crate::Unit]
-    //! carries the file path only, so a mounted AST dispatch could not tell
-    //! the legal same-package `src/` imports from foreign ones (over-reports
-    //! valid code). The body below is the pure predicate over (own package
-    //! name, resolved import URI); the registry row keeps name/group
-    //! alignment with `kinds: &[]`, and #434 mounts it with the
-    //! package-identity face.
-    //!
-    //! The seam body is dead until #434 wires it (`kinds: &[]` keeps the
-    //! traversal from dispatching) — the allow below is the seam, not debt.
-    #![allow(dead_code)]
+    //! Mounted on the AST dispatch off
+    //! [`WorkspaceFacts`][crate::WorkspaceFacts] (`Unit.workspace`): the
+    //! official registration gate is the analyzing library's `package:`
+    //! URI (:30-33) — mounted as the file sitting under its package's
+    //! package-URI directory (`lib_dir`). Under that gate a written
+    //! `package:` URI resolves to itself; every other written form
+    //! resolves to a non-`package:` URI (`file:` absolute path, `dart:`
+    //! short path) that fails `isImplementation`, so the written-URI
+    //! verdict is the resolved one. The documented divergence: a written
+    //! `package:` URI that resolves to nothing (a package outside the
+    //! config) reports here where the official's `DirectiveUriWithSource`
+    //! guard stays silent — unresolvable imports are erroneous code.
 
-    use super::{Group, RuleSpec};
-    use crate::rules::not_dispatched;
+    use super::{Check, Group, NodeKind, RuleSpec, written_uri};
 
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "implementation_imports",
         group: Group::Recommended,
         problem: "Import of a library in the 'lib/src' directory of another package.",
         correction: "Try importing a public library that exports this library, or removing the import.",
-        kinds: &[],
-        check: not_dispatched,
+        kinds: &[NodeKind::Import],
+        check,
     };
+
+    fn check(c: &mut Check<'_>) {
+        let Some(facts) = c.unit.workspace else {
+            return;
+        };
+        // The official gate is the analyzing library's `package:` URI
+        // (:30-33); parts resolve through their library, which a part file
+        // outside `lib_dir` of a `lib/` library under-reports (parts live
+        // beside their library in practice).
+        if c.unit
+            .path
+            .is_none_or(|path| !path.starts_with(&facts.lib_dir))
+        {
+            return;
+        }
+        let Some((range, uri)) = written_uri(c, c.node()) else {
+            return;
+        };
+        if !uri.starts_with("package:") {
+            return;
+        }
+        if check_import(&facts.own_package, &uri) {
+            c.report(range, &[]);
+        }
+    }
 
     /// The official `visitImportDirective` verdict (:44-56) over one
     /// import: `true` reports at the URI node. `own_package` is the first
@@ -674,6 +714,204 @@ pub(crate) mod implementation_imports {
             assert!(uri_is_same_package_as("foo", "package:foo/src/a.dart"));
             assert!(!uri_is_same_package_as("foo", "package:bar/src/a.dart"));
             assert!(!uri_is_same_package_as("foo", "file:///x/lib/src/a.dart"));
+        }
+    }
+}
+
+/// The #434 dispatch pins: `depend_on_referenced_packages` and
+/// `implementation_imports` over the real parser trees, with the
+/// containing-package facts mounted (`Unit.workspace`).
+#[cfg(test)]
+mod workspace_pins {
+    use crate::WorkspaceFacts;
+    use crate::registry::rule_by_name;
+    use crate::testsupport::{Fixture, one_rule};
+    use rustc_hash::FxHashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Facts for a package at `root` named `own`, dependencies `deps`,
+    /// dev dependencies `dev`.
+    fn facts(own: &str, deps: &[&str], dev: &[&str], root: &Path) -> WorkspaceFacts {
+        let collect = |names: &[&str]| -> FxHashSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let mut dependencies = collect(deps);
+        dependencies.insert(own.to_owned());
+        WorkspaceFacts {
+            own_package: own.to_owned(),
+            dependencies,
+            dev_dependencies: collect(dev),
+            root: root.to_owned(),
+            lib_dir: root.join("lib"),
+        }
+    }
+
+    /// Hits as `(start, end, message)`, run with `facts` mounted and the
+    /// fixture's analyzed path set to `path`.
+    fn hits(
+        f: &mut Fixture,
+        path: &str,
+        rule: &str,
+        facts: &WorkspaceFacts,
+    ) -> Vec<(u32, u32, String)> {
+        f.path = PathBuf::from(path);
+        let id = rule_by_name(rule).expect("registered rule");
+        f.run_workspace(&one_rule(rule), facts)
+            .into_iter()
+            .map(|l| {
+                assert_eq!(l.rule, id);
+                (l.range.start, l.range.end, l.message)
+            })
+            .collect()
+    }
+
+    const ROOT: &str = "/pkg";
+
+    /// A foreign package's import reports at the URI span with the
+    /// official argument fill; a listed dependency and the own package
+    /// stay silent.
+    #[test]
+    fn foreign_import_reports_at_the_uri() {
+        let facts = facts("own", &["meta"], &[], Path::new(ROOT));
+        let mut f = Fixture::parse("import 'package:foreign/foreign.dart';\n");
+        assert_eq!(
+            hits(
+                &mut f,
+                "/pkg/lib/a.dart",
+                "depend_on_referenced_packages",
+                &facts
+            ),
+            vec![(
+                7,
+                37,
+                "The imported package 'foreign' isn't a dependency of the importing package."
+                    .to_owned()
+            )]
+        );
+        let mut dep = Fixture::parse("import 'package:meta/meta.dart';\n");
+        assert!(
+            hits(
+                &mut dep,
+                "/pkg/lib/a.dart",
+                "depend_on_referenced_packages",
+                &facts
+            )
+            .is_empty()
+        );
+        let mut own = Fixture::parse("import 'package:own/src/inner.dart';\n");
+        assert!(
+            hits(
+                &mut own,
+                "/pkg/lib/a.dart",
+                "depend_on_referenced_packages",
+                &facts
+            )
+            .is_empty()
+        );
+    }
+
+    /// Dev dependencies are available only outside the public dirs
+    /// (isInPublicDir, ast.dart:112-129): a `lib/` file reports, a
+    /// `test/` file stays silent.
+    #[test]
+    fn dev_dependencies_gate_on_the_public_dir() {
+        let facts = facts("own", &[], &["dev_pkg"], Path::new(ROOT));
+        let mut f = Fixture::parse("import 'package:dev_pkg/dev_pkg.dart';\n");
+        assert_eq!(
+            hits(
+                &mut f,
+                "/pkg/lib/a.dart",
+                "depend_on_referenced_packages",
+                &facts
+            )
+            .len(),
+            1,
+            "lib/ is public: the dev dependency is unavailable"
+        );
+        assert!(
+            hits(
+                &mut f,
+                "/pkg/test/a_test.dart",
+                "depend_on_referenced_packages",
+                &facts
+            )
+            .is_empty(),
+            "test/ is private: the dev dependency is available"
+        );
+    }
+
+    /// Exports dispatch like imports (:59-60).
+    #[test]
+    fn exports_dispatch() {
+        let facts = facts("own", &[], &[], Path::new(ROOT));
+        let mut f = Fixture::parse("export 'package:foreign/foreign.dart';\n");
+        assert_eq!(
+            hits(
+                &mut f,
+                "/pkg/lib/a.dart",
+                "depend_on_referenced_packages",
+                &facts
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// A foreign `src/` import from inside the own `lib/` reports at the
+    /// URI; the same package's `src/` stays silent; outside `lib/` (no
+    /// `package:` library URI) the rule never runs.
+    #[test]
+    fn implementation_import_gates() {
+        let facts = facts("own", &[], &[], Path::new(ROOT));
+        let mut f = Fixture::parse("import 'package:foo/src/foo.dart';\n");
+        assert_eq!(
+            hits(&mut f, "/pkg/lib/a.dart", "implementation_imports", &facts),
+            vec![(
+                7,
+                33,
+                "Import of a library in the 'lib/src' directory of another package.".to_owned()
+            )]
+        );
+        let mut own = Fixture::parse("import 'package:own/src/inner.dart';\n");
+        assert!(
+            hits(
+                &mut own,
+                "/pkg/lib/a.dart",
+                "implementation_imports",
+                &facts
+            )
+            .is_empty()
+        );
+        assert!(
+            hits(
+                &mut f,
+                "/pkg/test/a_test.dart",
+                "implementation_imports",
+                &facts
+            )
+            .is_empty(),
+            "outside the package-uri dir the library URI is not a package: URI"
+        );
+        let mut relative = Fixture::parse("import '../other/lib/src/a.dart';\n");
+        assert!(
+            hits(
+                &mut relative,
+                "/pkg/lib/a.dart",
+                "implementation_imports",
+                &facts
+            )
+            .is_empty(),
+            "a relative URI resolves to a file: URI, never an implementation import"
+        );
+    }
+
+    /// No containing package (`workspace: None`) keeps both rules silent —
+    /// the official no-pubspec registration gate.
+    #[test]
+    fn no_package_face_stays_silent() {
+        let f = Fixture::parse("import 'package:foreign/src/a.dart';\n");
+        for rule in ["depend_on_referenced_packages", "implementation_imports"] {
+            assert!(f.run(&one_rule(rule)).is_empty(), "{rule}");
         }
     }
 }
