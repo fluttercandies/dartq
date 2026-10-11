@@ -18,6 +18,11 @@ dartq-diagnostics = { workspace = true }
 dartq-plugin = { workspace = true }
 dartq-source = { workspace = true }
 
+# cache-hit-rate: the traced warm run post-processes through the engine's
+# §19.3 aggregator (dartq_engine::event::cache_hit_rate) — one source of
+# truth for the rate's semantics.
+dartq-engine = { workspace = true }
+
 # POSIX process-group kill for timed-out drivers (see oracle.rs kill_driver).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

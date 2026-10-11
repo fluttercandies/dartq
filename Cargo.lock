@@ -534,6 +534,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
+ "dartq-engine",
  "dartq-plugin",
  "dartq-source",
  "libc",

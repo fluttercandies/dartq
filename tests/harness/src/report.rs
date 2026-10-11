@@ -1170,6 +1170,7 @@ mod tests {
     use crate::compare::{build_side_labeled, compare};
     use crate::machine::{MachineDiag, Severity};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// File-name extension as `&str` — the case-sensitive comparison domain
     /// the gate's file-name assertions need (`Path::extension`, never
@@ -1694,9 +1695,16 @@ mod tests {
     // -- regression persistence ----------------------------------------------
 
     /// Fixture root with one dart file, plus the comparison where dartq misses
-    /// one of the oracle's two entries (a one-file diff).
+    /// one of the oracle's two entries (a one-file diff). Tests run in
+    /// parallel threads, so the root is unique per call: an earlier test's
+    /// cleanup (`remove_dir_all`) must not delete another test's fixture
+    /// mid-run — a missing fixture file makes `canonicalize` fall back to the
+    /// raw absolute path and the entry keys stop being corpus-relative.
     fn persist_fixture() -> (PathBuf, Comparison, Vec<MachineDiag>, Vec<MachineDiag>) {
-        let root = std::env::temp_dir().join(format!("dq_persist_root_{}", std::process::id()));
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("dq_persist_root_{}_{id}", std::process::id()));
         let lib = root.join("lib");
         fs::create_dir_all(&lib).expect("mkdir");
         fs::write(lib.join("a.dart"), "int a = 1;\nint b = 2;\n").expect("fixture");
