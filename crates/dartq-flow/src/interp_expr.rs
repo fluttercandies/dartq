@@ -79,7 +79,7 @@ impl<'o> Interp<'o> {
             Ev::Null => self.exprs.push(Expr::trivial(Ty::NULL)),
             Ev::OtherExpr { .. } => self.exprs.push(Expr::trivial(Ty::UNKNOWN)),
             Ev::UnaryPrefix { is_not } => {
-                let operand = self.exprs.pop().expect("unary operand");
+                let operand = self.pop_value();
                 if *is_not {
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
                     expr.bool_value = operand.bool_value.map(|b| !b);
@@ -90,7 +90,7 @@ impl<'o> Interp<'o> {
                 }
             }
             Ev::NonNullAssert => {
-                let operand = self.exprs.pop().expect("assert operand");
+                let operand = self.pop_value();
                 if let Some(var) = operand.reference {
                     let promoted = self.ops.promote_to_non_null(operand.ty);
                     if promoted != operand.ty {
@@ -112,9 +112,12 @@ impl<'o> Interp<'o> {
             Ev::UnaryPrefixAssign | Ev::UnaryPostfixAssign => {
                 // `++x` / `x++`: the target reference was pushed; the write
                 // stores a non-null value of the declared type.
-                let target = self.exprs.pop().expect("increment target");
+                let target = self.pop_value();
                 if let Some(var) = target.reference {
-                    let declared = self.vars[var as usize].ty;
+                    let declared = self
+                        .vars
+                        .get(var as usize)
+                        .map_or(Ty::UNKNOWN, |meta| meta.ty);
                     self.write_var(var, self.ops.promote_to_non_null(declared), false);
                 }
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
@@ -124,7 +127,7 @@ impl<'o> Interp<'o> {
                     // The left operand is on the stack; split on it and run
                     // the right operand under the taken branch (official
                     // `logicalBinaryOp_rightBegin`).
-                    let left = self.exprs.pop().expect("binary left");
+                    let left = self.pop_value();
                     let (left_if_true, left_if_false) = self.cond_split(&left);
                     let (taken, other) = if matches!(op, BinOp::And) {
                         (left_if_true, left_if_false)
@@ -145,7 +148,7 @@ impl<'o> Interp<'o> {
                     // promotion (`tryMarkNonNullable(...).ifTrue`), while
                     // the RHS itself evaluates on the LHS-null path (the
                     // split state, unchanged).
-                    let left = self.exprs.pop().expect("binary left");
+                    let left = self.pop_value();
                     self.split_cur();
                     let shortcut = match left.reference {
                         Some(var) => {
@@ -175,15 +178,16 @@ impl<'o> Interp<'o> {
             },
             Ev::BinaryEnd { op } => match op {
                 BinOp::And | BinOp::Or => {
-                    let right = self.exprs.pop().expect("binary right");
+                    let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
-                    let frame = self.stack.pop().expect("branch frame");
-                    let Frame::Branch {
+                    let Some(Frame::Branch {
                         branch: other,
                         ifnull_ty: _,
-                    } = frame
+                    }) = self.stack.pop()
                     else {
-                        self.stack.push(frame);
+                        // A frame-less close (unbalanced recovery buffer):
+                        // the binary still nets one value for its consumer.
+                        self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                         return true;
                     };
                     let (if_true, if_false) = if matches!(op, BinOp::And) {
@@ -204,15 +208,16 @@ impl<'o> Interp<'o> {
                     // path to both branches (its truthiness is the LHS
                     // value's — unknowable at the name level), the same
                     // convention as the And/Or arms above.
-                    let right = self.exprs.pop().expect("binary right");
+                    let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
-                    let frame = self.stack.pop().expect("branch frame");
-                    let Frame::Branch {
+                    let Some(Frame::Branch {
                         branch: shortcut,
                         ifnull_ty,
-                    } = frame
+                    }) = self.stack.pop()
                     else {
-                        self.stack.push(frame);
+                        // A frame-less close (unbalanced recovery buffer):
+                        // the binary still nets one value for its consumer.
+                        self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                         return true;
                     };
                     let if_true = self.join(Some(shortcut.clone()), Some(right_if_true));
@@ -223,8 +228,8 @@ impl<'o> Interp<'o> {
                     self.exprs.push(expr);
                 }
                 BinOp::Eq | BinOp::NotEq => {
-                    let right = self.exprs.pop().expect("binary right");
-                    let left = self.exprs.pop().expect("binary left");
+                    let right = self.pop_value();
+                    let left = self.pop_value();
                     let inverted = matches!(op, BinOp::NotEq);
                     self.equality_check(&left, &right, inverted);
                 }
@@ -246,7 +251,7 @@ impl<'o> Interp<'o> {
                 let Some((is_not, tested)) = self.type_test_pending.take() else {
                     return true;
                 };
-                let operand = self.exprs.pop().expect("is operand");
+                let operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 match operand.reference {
                     Some(var) => {
@@ -305,7 +310,7 @@ impl<'o> Interp<'o> {
                     }
                     return true;
                 }
-                let operand = self.exprs.pop().expect("as operand");
+                let operand = self.pop_value();
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, cast_ty);
                     if let Some(promoted) = promoted {
@@ -321,8 +326,8 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(cast_ty));
             }
             Ev::Assign { plain } => {
-                let rhs = self.exprs.pop().expect("assign rhs");
-                let target = self.exprs.pop().expect("assign target");
+                let rhs = self.pop_value();
+                let target = self.pop_value();
                 if let Some(var) = target.reference {
                     let written = if *plain { rhs.ty } else { Ty::UNKNOWN };
                     if let Some(span) = target.read_span {
@@ -343,13 +348,13 @@ impl<'o> Interp<'o> {
                 }
             }
             Ev::PatternAssign => {
-                let rhs = self.exprs.pop().expect("pattern assign rhs");
+                let rhs = self.pop_value();
                 for var in std::mem::take(&mut self.pending_writes) {
                     self.write_var(var, rhs.ty, true);
                 }
             }
             Ev::CondBegin => {
-                let cond = self.exprs.pop().expect("conditional condition");
+                let cond = self.pop_value();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::Cond {
                     branch: if_false,
@@ -358,7 +363,7 @@ impl<'o> Interp<'o> {
                 self.current = if_true;
             }
             Ev::CondColon => {
-                let then_expr = self.exprs.pop().expect("then expression");
+                let then_expr = self.pop_value();
                 if let Some(Frame::Cond { branch, then_state }) = self.stack.last_mut() {
                     *then_state = Some(self.current.clone());
                     self.current = branch.clone();
@@ -368,10 +373,11 @@ impl<'o> Interp<'o> {
                 // value at CondEnd.
             }
             Ev::CondEnd => {
-                let else_expr = self.exprs.pop().expect("else expression");
-                let frame = self.stack.pop().expect("cond frame");
-                let Frame::Cond { then_state, .. } = frame else {
-                    self.stack.push(frame);
+                let else_expr = self.pop_value();
+                let Some(Frame::Cond { then_state, .. }) = self.stack.pop() else {
+                    // A frame-less close (unbalanced recovery buffer): the
+                    // conditional still nets one value for its consumer.
+                    self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                     return true;
                 };
                 let joined = self.join(then_state, Some(self.current.clone()));
@@ -384,7 +390,7 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(ty));
             }
             Ev::DotAccess { null_aware } | Ev::IndexAccess { null_aware } => {
-                let target = self.exprs.pop().expect("access target");
+                let target = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 if *null_aware {
                     // Official nullAwareAccess_end: the access path sees
@@ -447,12 +453,18 @@ impl<'o> Interp<'o> {
                 self.exprs.pop();
             }
             Ev::CascadeEnd => {
-                let frame = self.stack.pop().expect("cascade frame");
-                if let Frame::Cascade { exprs_base } = frame {
-                    // Keep the cascade target as the value.
-                    self.exprs.truncate(exprs_base);
-                } else {
-                    self.stack.push(frame);
+                match self.stack.pop() {
+                    Some(Frame::Cascade { exprs_base }) => {
+                        // Keep the cascade target as the value.
+                        self.exprs.truncate(exprs_base);
+                    }
+                    other => {
+                        // A frame-less close (unbalanced recovery buffer) is
+                        // a no-op; a mismatched frame goes back.
+                        if let Some(frame) = other {
+                            self.stack.push(frame);
+                        }
+                    }
                 }
             }
             Ev::EndLiteralString {
@@ -471,7 +483,7 @@ impl<'o> Interp<'o> {
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
             Ev::IfControlFlowBegin => {
-                let cond = self.exprs.pop().expect("element condition");
+                let cond = self.pop_value();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::Branch {
                     branch: if_false,
@@ -493,9 +505,10 @@ impl<'o> Interp<'o> {
                 if *has_else {
                     // The then-element was popped at ElseControlFlow.
                 }
-                let frame = self.stack.pop().expect("if-element frame");
-                let Frame::Branch { branch, .. } = frame else {
-                    self.stack.push(frame);
+                let Some(Frame::Branch { branch, .. }) = self.stack.pop() else {
+                    // A frame-less close (unbalanced recovery buffer): the
+                    // element still nets one value for its consumer.
+                    self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                     return true;
                 };
                 let joined = self.join(Some(branch), Some(self.current.clone()));
@@ -518,6 +531,17 @@ impl<'o> Interp<'o> {
 
     // —— shared expression helpers ———————————————————————————————————————
 
+    /// Pops one operand value. Recovery-shaped buffers (metadata contexts,
+    /// cross-frame event bleed) can record a consumer without its
+    /// producers; the missing operand degrades to a trivial value — no
+    /// reference, no branches, so it contributes no fact — and the
+    /// handler's stack arithmetic stays intact.
+    pub(crate) fn pop_value(&mut self) -> Expr {
+        self.exprs
+            .pop()
+            .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN))
+    }
+
     /// Collapses one literal's element values to a single value: each
     /// element netted exactly one, so the last is the literal's own value
     /// for the enclosing consumer's LIFO pop and the earlier ones drop; an
@@ -531,12 +555,16 @@ impl<'o> Interp<'o> {
         }
     }
 
-    /// The promoted type of a variable read (chain head or declared).
+    /// The promoted type of a variable read (chain head or declared). A
+    /// stale id (recovery-shaped buffers can resolve a binding past a
+    /// collect rollback) degrades to the unknown type.
     pub(crate) fn promoted_type_of(&self, var: u32, model: &crate::model::VarModel) -> Ty {
         if model.promoted != crate::model::NIL {
             self.lists.head(model.promoted)
         } else {
-            self.vars[var as usize].ty
+            self.vars
+                .get(var as usize)
+                .map_or(Ty::UNKNOWN, |meta| meta.ty)
         }
     }
 

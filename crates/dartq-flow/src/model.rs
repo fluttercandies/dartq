@@ -397,7 +397,9 @@ impl State {
         vars: usize,
     ) -> Self {
         let Some(first) = first else {
-            return second.expect("join of two absent states");
+            // Both sides absent (a recovered construct can join nothing):
+            // degrade to the fresh reachable state — no facts either way.
+            return second.unwrap_or_default();
         };
         let Some(second) = second else {
             return first;
