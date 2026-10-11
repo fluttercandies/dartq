@@ -22,6 +22,7 @@ use crate::{ScanConfig, ScanResult};
 use dartq_diagnostics::{CodeInfo, EXPECTED_TOKEN};
 use dartq_language::LanguageVersion;
 use dartq_source::{FileId, LineIndex, SourceRange};
+use memchr::memchr2;
 
 /// Flow-control signals of `code_step`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,11 +48,10 @@ pub(crate) enum Flow {
 /// EOF — the token stream shape never depends on the cap.
 const MAX_DIAGNOSTICS: usize = 10_000;
 
-/// The lexer state is snapshotted (a plain clone) at every deep-match closer
-/// so the official dual-option recovery can run both postures to EOF on
-/// cloned state; everything owned is cloned, `src`/`config`/`file` are
-/// shared/Copy. Error-path-only cost.
-#[derive(Clone)]
+/// The lexer state. The dual-option recovery runs (official
+/// `_recoveryOptionScanner`) work on cheap snapshots ([`Lexer::option_snapshot`]:
+/// cursor + counters + the grouping stack, no accumulated vecs) instead of
+/// full clones. `src`/`config`/`file` are shared/Copy. Error-path-only cost.
 pub(crate) struct Lexer<'s> {
     src: &'s str,
     config: ScanConfig,
@@ -59,11 +59,24 @@ pub(crate) struct Lexer<'s> {
     /// Lookahead register: the character at `self.pos`; `None` = EOF.
     next: Option<char>,
     pos: usize,
+    /// Tokens past [`Lexer::token_base`] — the whole stream on the real
+    /// pass, empty at the start of a recovery-option run.
     tokens: Vec<Token>,
-    /// begin token index → close token index (grows in parallel with tokens).
+    /// begin token index → close token index (grows in parallel with `tokens`).
     end_of: Vec<u32>,
-    /// Open-group stack (token indices; `<` is pushed as well — see lib.rs for the silent-discard semantics).
-    groups: Vec<u32>,
+    /// Open-group stack: token index + kind (`<` is pushed as well — see
+    /// lib.rs for the silent-discard semantics). The kind rides along so a
+    /// recovery-option run (which carries no token vec) can match closers
+    /// without `tokens`.
+    groups: Vec<(u32, TokenKind)>,
+    /// Full-stream token count at the last option snapshot (0 on the real
+    /// pass): emitted indices stay full-stream; `tokens`/`end_of` are
+    /// base-relative.
+    token_base: u32,
+    /// Copy of the token just below [`Lexer::token_base`] — the single view
+    /// of the real token tail an option run still reads (the
+    /// illegal-character merge). `None` on the real pass.
+    last_real: Option<Token>,
     /// Capped at [`MAX_DIAGNOSTICS`] so adversarial input (an illegal
     /// character per byte, each with a fresh `format!` message) cannot grow
     /// this without bound before the parser's own fuse applies.
@@ -109,6 +122,8 @@ impl<'s> Lexer<'s> {
             tokens: Vec::with_capacity(src.len() / 4 + 1),
             end_of: Vec::new(),
             groups: Vec::new(),
+            token_base: 0,
+            last_real: None,
             diags: Vec::new(),
             utf16_value: 0,
             version_override: None,
@@ -239,6 +254,30 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    /// memchr fast-forward: same contract as [`Lexer::skip_bytes_until`] for a
+    /// fixed ASCII stop set — `locate` runs the kernel over the remaining
+    /// haystack and yields the stop byte's relative offset (`None` = run to
+    /// EOF; the stop byte is not consumed). The skipped span is credited in
+    /// one piece: an all-ASCII span costs its byte length; a span containing
+    /// any multi-byte character falls back to the per-character walk, so the
+    /// UTF-16 register lands exactly where the byte loop's accounting would
+    /// (astral characters count 2 units, surrogate pairs included). Stop
+    /// bytes are < 0x80 and UTF-8 continuation bytes are >= 0x80, so a hit is
+    /// always a character boundary.
+    fn skip_until_memchr(&mut self, locate: impl FnOnce(&[u8]) -> Option<usize>) {
+        let src = self.src;
+        let hit = self.pos + locate(&src.as_bytes()[self.pos..]).unwrap_or(src.len() - self.pos);
+        let span = &src[self.pos..hit];
+        let units = if span.is_ascii() {
+            span.len() as u32
+        } else {
+            span.chars().map(|c| c.len_utf16() as u32).sum()
+        };
+        self.utf16_value += units;
+        self.pos = hit;
+        self.next = self.peek_char(hit);
+    }
+
     /// The second character after the lookahead register (does not advance the register).
     fn peek2(&self) -> Option<char> {
         let after = self.pos + self.next.map_or(0, char::len_utf8);
@@ -257,7 +296,7 @@ impl<'s> Lexer<'s> {
             lexeme.chars().map(|c| c.len_utf16() as u32).sum()
         };
         let utf16 = self.utf16_value - utf16_len;
-        let idx = self.tokens.len() as u32;
+        let idx = self.token_base + self.tokens.len() as u32;
         self.tokens
             .push(Token::new(kind, start as u32, len as u32, utf16));
         self.end_of.push(crate::token::NO_END);
@@ -285,6 +324,37 @@ impl<'s> Lexer<'s> {
         self.end_of.push(crate::token::NO_END);
     }
 
+    /// The last emitted token (`tokens.last()`; inside an option run, the
+    /// snapshot copy of the real tail while nothing has been pushed yet).
+    fn last_token(&self) -> Option<&Token> {
+        self.tokens.last().or(self.last_real.as_ref())
+    }
+
+    /// Pops the most recent token (the illegal-character merge): an in-run
+    /// token pops with its `end_of` entry, the real-tail copy just drops.
+    fn pop_token(&mut self) {
+        if self.tokens.pop().is_some() {
+            self.end_of.pop();
+        } else {
+            self.last_real = None;
+        }
+    }
+
+    /// Full-stream index of the most recent token (callers emit right before).
+    fn last_index(&self) -> u32 {
+        self.token_base + self.tokens.len() as u32 - 1
+    }
+
+    /// `end_of` backfill for a begin→close pair. Entries below
+    /// [`Lexer::token_base`] belong to the real pass — an option run discards
+    /// the write (its whole table is thrown away); on the real pass (base 0)
+    /// this is the plain full-stream write.
+    fn record_end(&mut self, begin_idx: u32, close_idx: u32) {
+        if begin_idx >= self.token_base {
+            self.end_of[(begin_idx - self.token_base) as usize] = close_idx - self.token_base;
+        }
+    }
+
     /// Token ending at the current lookahead position (lexeme = source `start..self.pos`).
     fn emit_fixed(&mut self, kind: TokenKind, start: usize) {
         let len = self.pos - start;
@@ -296,12 +366,12 @@ impl<'s> Lexer<'s> {
             self.discard_open_lt();
         }
         let idx = self.emit(kind, start, self.pos - start);
-        self.groups.push(idx);
+        self.groups.push((idx, kind));
     }
 
     fn discard_open_lt(&mut self) {
-        while let Some(&top) = self.groups.last() {
-            if self.tokens[top as usize].kind == TokenKind::Lt {
+        while let Some(&(_, kind)) = self.groups.last() {
+            if kind == TokenKind::Lt {
                 self.groups.pop();
             } else {
                 break;
@@ -567,7 +637,7 @@ impl<'s> Lexer<'s> {
                     }
                 }
                 Some(_) => {
-                    self.skip_bytes_until(|b| matches!(b, b'*' | b'/'));
+                    self.skip_until_memchr(|h| memchr2(b'*', b'/', h));
                 }
             }
         }
@@ -756,21 +826,17 @@ impl<'s> Lexer<'s> {
         // the preceding adjacent IDENTIFIER is folded into the new token, then
         // identifier characters keep being consumed).
         let mut ident_start = start;
-        if let Some(last) = self.tokens.last()
+        if let Some(last) = self.last_token()
             && last.kind == TokenKind::Identifier
             && last.byte_offset + last.byte_len == start as u32
         {
             ident_start = last.byte_offset as usize;
-            self.tokens.pop();
-            self.end_of.pop();
+            self.pop_token();
         }
         self.bump(); // the illegal character itself becomes part of the token content
-        while matches!(
-            self.peek(),
-            Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$')
-        ) {
-            self.bump();
-        }
+        self.bump_ascii_while(
+            |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'),
+        );
         self.emit(TokenKind::Identifier, ident_start, self.pos - ident_start);
         Flow::Next
     }
@@ -782,12 +848,12 @@ impl<'s> Lexer<'s> {
             self.bump(); // 'r'
             return Flow::BeginString { start, raw: true };
         }
-        while matches!(
-            self.peek(),
-            Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$')
-        ) {
-            self.bump();
-        }
+        // ASCII byte sweep: identifiers are ASCII-only (lib.rs "Identifiers"),
+        // and a non-ASCII byte fails the predicate exactly where the
+        // per-character walk stopped, so the byte-level match is equivalent.
+        self.bump_ascii_while(
+            |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'),
+        );
         let lexeme = &self.src[start..self.pos];
         let kind = match keyword_from_str(lexeme) {
             Some(Keyword::Augment) if !self.config.enable_augmentations => TokenKind::Identifier,
@@ -827,15 +893,17 @@ impl<'s> Lexer<'s> {
         // Two-pass recovery (official tokenizeCloseBrace :1139-1153): in the
         // re-scan, a `}` whose stack head is the blamed `{` closes it with a
         // synthetic closer + report (unmatchedBeginGroup), and then goes on
-        // to close the next begin down via the normal path below.
+        // to close the next begin down via the normal path below. The
+        // `tokens` access is re-scan-only: option snapshots carry
+        // `curly_recovery = None`, so the chain short-circuits first.
         if close == TokenKind::CloseCurly
             && let Some(offset) = self.curly_recovery
-            && let Some(&begin_idx) = self.groups.last()
-            && self.tokens[begin_idx as usize].kind == TokenKind::OpenCurly
+            && let Some(&(begin_idx, begin_kind)) = self.groups.last()
+            && begin_kind == TokenKind::OpenCurly
             && self.tokens[begin_idx as usize].byte_offset == offset
         {
             self.groups.pop();
-            self.report_unmatched_begin(begin_idx, start);
+            self.report_unmatched_begin(begin_idx, begin_kind, start);
         }
         // `<` never matches an end token (official discardBeginGroupUntil).
         self.discard_open_lt();
@@ -843,7 +911,7 @@ impl<'s> Lexer<'s> {
         let Some(depth) = self
             .groups
             .iter()
-            .rposition(|&idx| opens.contains(&self.tokens[idx as usize].kind))
+            .rposition(|&(_, kind)| opens.contains(&kind))
         else {
             // No matching begin anywhere. `)`/`]`: leave the stack alone, the
             // token stands alone (official appendEndGroupInternal foundMatchingBrace
@@ -853,10 +921,10 @@ impl<'s> Lexer<'s> {
             // head stay queued for eof handling.
             self.recovery_count += 1;
             if close == TokenKind::CloseCurly
-                && let Some(&begin_idx) = self.groups.last()
+                && let Some(&(begin_idx, begin_kind)) = self.groups.last()
             {
                 self.groups.pop();
-                self.report_unmatched_begin(begin_idx, start);
+                self.report_unmatched_begin(begin_idx, begin_kind, start);
             }
             self.emit(close, start, self.pos - start);
             return Flow::Next;
@@ -883,11 +951,10 @@ impl<'s> Lexer<'s> {
     /// true). Closing a `${` returns [`Flow::CloseInterp`] — the string body
     /// resumes.
     fn close_matched(&mut self, close: TokenKind, start: usize) -> Flow {
-        let begin_idx = self.groups.pop().expect("head match guarantees a begin");
+        let (begin_idx, begin_kind) = self.groups.pop().expect("head match guarantees a begin");
         let idx = self.emit(close, start, self.pos - start);
-        self.end_of[begin_idx as usize] = idx;
-        if close == TokenKind::CloseCurly
-            && self.tokens[begin_idx as usize].kind == TokenKind::StringInterpolationExpression
+        self.record_end(begin_idx, idx);
+        if close == TokenKind::CloseCurly && begin_kind == TokenKind::StringInterpolationExpression
         {
             return Flow::CloseInterp;
         }
@@ -900,8 +967,8 @@ impl<'s> Lexer<'s> {
     /// @ the `}`), then the real closer closes the match.
     fn execute_insert(&mut self, close: TokenKind, start: usize, depth: usize) -> Flow {
         while self.groups.len() > depth + 1 {
-            let begin_idx = self.groups.pop().expect("depth bounds the stack walk");
-            self.report_unmatched_begin(begin_idx, start);
+            let (begin_idx, begin_kind) = self.groups.pop().expect("depth bounds the stack walk");
+            self.report_unmatched_begin(begin_idx, begin_kind, start);
         }
         self.close_matched(close, start)
     }
@@ -915,24 +982,51 @@ impl<'s> Lexer<'s> {
     }
 
     /// The dual-option comparison (official `discardBeginGroupUntil`
-    /// :787-826): both postures run the remaining input to EOF on cloned
-    /// state, then score `recoveryCount` + final grouping-stack size — option
-    /// 2 paying 1 extra for the ignored closer. Drop wins only STRICTLY
-    /// cheaper; ties keep insert (the official default). The option clones
-    /// drop the two-pass blamed-brace offset: official `_recoveryOptionScanner`
-    /// copies only the configuration and the grouping stack.
+    /// :787-826): both postures run the remaining input to EOF on
+    /// `_recoveryOptionScanner` snapshots, then score `recoveryCount` + final
+    /// grouping-stack size — option 2 paying 1 extra for the ignored closer.
+    /// Drop wins only STRICTLY cheaper; ties keep insert (the official
+    /// default). The real lexer is only read (the two snapshots are
+    /// independent), so there is nothing to restore.
     fn drop_wins(&mut self, close: TokenKind, start: usize, depth: usize) -> bool {
-        let base = self.clone();
-        let mut insert = base.clone();
-        insert.in_simulation = true;
-        insert.curly_recovery = None;
+        let insert = self.option_snapshot();
         let insert_cost = insert.run_option(|opt| opt.execute_insert(close, start, depth));
-        let mut drop = base.clone();
-        drop.in_simulation = true;
-        drop.curly_recovery = None;
+        let drop = self.option_snapshot();
         let drop_cost = drop.run_option(|opt| opt.execute_drop(close, start)) + 1;
-        *self = base;
         drop_cost < insert_cost
+    }
+
+    /// The option-run state (official `_recoveryOptionScanner` copies only
+    /// the configuration and the grouping stack): cursor, counters, string
+    /// frames and the group stack with their token kinds — never the
+    /// accumulated token/diagnostic vecs. The runs score `recoveryCount` +
+    /// final stack size only, so the real token tail is reduced to the one
+    /// token the illegal-character merge can still see ([`Lexer::last_real`])
+    /// and every accumulated vec starts empty; `end_of` backfills below the
+    /// snapshot base are discarded with the run. The two-pass blamed-brace
+    /// offset does not carry into a run.
+    fn option_snapshot(&self) -> Lexer<'s> {
+        Lexer {
+            src: self.src,
+            config: self.config,
+            file: self.file,
+            next: self.next,
+            pos: self.pos,
+            tokens: Vec::new(),
+            end_of: Vec::new(),
+            groups: self.groups.clone(),
+            token_base: self.tokens.len() as u32,
+            last_real: self.tokens.last().copied(),
+            diags: Vec::new(),
+            utf16_value: self.utf16_value,
+            version_override: self.version_override,
+            version_override_span: self.version_override_span,
+            curly_recovery: None,
+            string_frame: self.string_frame,
+            suspended: self.suspended.clone(),
+            in_simulation: true,
+            recovery_count: self.recovery_count,
+        }
     }
 
     /// Scores one option run: execute the posture, scan the tail to EOF under
@@ -959,15 +1053,18 @@ impl<'s> Lexer<'s> {
     /// translation `charOffset = begin.endToken.charOffset`; oracle
     /// `dart analyze --format=json` on `{[1};` → `expected_token` ']' @ the
     /// `}` offset, len 1).
-    fn report_unmatched_begin(&mut self, begin_idx: u32, close_start: usize) {
-        let begin_kind = self.tokens[begin_idx as usize].kind;
+    fn report_unmatched_begin(
+        &mut self,
+        begin_idx: u32,
+        begin_kind: TokenKind,
+        close_start: usize,
+    ) {
         let Some(close_kind) = begin_kind.matching_close() else {
             return;
         };
         self.recovery_count += 1;
         self.emit_synthetic(close_kind, close_start, 0);
-        let syn_idx = self.tokens.len() as u32 - 1;
-        self.end_of[begin_idx as usize] = syn_idx;
+        self.record_end(begin_idx, self.last_index());
         let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
         self.diag(
             EXPECTED_TOKEN,
@@ -984,12 +1081,11 @@ impl<'s> Lexer<'s> {
     fn close_unclosed_groups(&mut self) -> Option<u32> {
         self.discard_open_lt();
         let curly_begin = match self.groups.as_slice() {
-            [idx] if self.tokens[*idx as usize].kind == TokenKind::OpenCurly => Some(*idx),
+            [(idx, kind)] if *kind == TokenKind::OpenCurly => Some(*idx),
             _ => None,
         };
         let eof = self.src.len();
-        while let Some(begin_idx) = self.groups.pop() {
-            let begin_kind = self.tokens[begin_idx as usize].kind;
+        while let Some((begin_idx, begin_kind)) = self.groups.pop() {
             let Some(close_kind) = begin_kind.matching_close() else {
                 continue;
             };
@@ -998,7 +1094,7 @@ impl<'s> Lexer<'s> {
             self.tokens
                 .push(Token::new(close_kind, eof as u32, 0, utf16).synthetic());
             self.end_of.push(crate::token::NO_END);
-            self.end_of[begin_idx as usize] = close_idx;
+            self.record_end(begin_idx, close_idx);
             // analyzer translation: UnmatchedToken → expected_token, pinned AT
             // the eof position (oracle `dart analyze --format=json` on
             // `var x = {;` → expected_token '}' @11 = the eof offset; on

@@ -39,6 +39,7 @@ use dartq_diagnostics::{
     INVALID_UNICODE_ESCAPE_U_BRACKET, INVALID_UNICODE_ESCAPE_U_NO_BRACKET,
     INVALID_UNICODE_ESCAPE_U_STARTED, UNTERMINATED_STRING_LITERAL,
 };
+use memchr::{memchr, memchr3};
 
 /// One string body suspended by an open `${`: everything needed to resume body
 /// scanning once the interpolation's `}` arrives. Lives on the lexer (the
@@ -235,7 +236,7 @@ impl Lexer<'_> {
                 }
                 Some(_) => {
                     let q = f.quote as u8;
-                    self.skip_bytes_until(|b| b == q || matches!(b, b'\n' | b'\r'));
+                    self.skip_until_memchr(|h| memchr3(q, b'\n', b'\r', h));
                 }
             }
         }
@@ -285,10 +286,10 @@ impl Lexer<'_> {
             }
             if f.raw {
                 let q = f.quote as u8;
-                self.skip_bytes_until(|b| b == q);
+                self.skip_until_memchr(|h| memchr(q, h));
             } else {
                 let q = f.quote as u8;
-                self.skip_bytes_until(|b| b == q || matches!(b, b'$' | b'\\'));
+                self.skip_until_memchr(|h| memchr3(q, b'$', b'\\', h));
             }
         }
     }
@@ -317,8 +318,8 @@ impl Lexer<'_> {
             // a plain unterminated/terminated string instead of cascading
             // code-mode errors.
             if self.curly_recovery == Some(dollar_start as u32) {
-                let begin_idx = self.groups.pop().expect("SII was just pushed");
-                self.report_unmatched_begin(begin_idx, dollar_start);
+                let (begin_idx, begin_kind) = self.groups.pop().expect("SII was just pushed");
+                self.report_unmatched_begin(begin_idx, begin_kind, dollar_start);
                 f.segment_start = self.pos;
                 f.escape_err = false;
                 return false;
@@ -339,9 +340,7 @@ impl Lexer<'_> {
             let dollar_start = self.pos - 1; // `$` is a single byte
             self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
             let ident_start = self.pos;
-            while matches!(self.peek(), Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_')) {
-                self.bump();
-            }
+            self.bump_ascii_while(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'));
             let lexeme = &self.src[ident_start..self.pos];
             let kind = match keyword_from_str(lexeme) {
                 Some(Keyword::Augment) if !self.config.enable_augmentations => {

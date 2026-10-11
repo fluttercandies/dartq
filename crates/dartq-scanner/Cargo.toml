@@ -18,6 +18,7 @@ categories = ["parser-implementations"]
 dartq-language = { workspace = true }
 dartq-source = { workspace = true }
 dartq-diagnostics = { workspace = true }
+memchr = { workspace = true }
 
 [lints]
 workspace = true

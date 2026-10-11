@@ -220,6 +220,7 @@ dependencies = [
  "dartq-diagnostics",
  "dartq-engine",
  "dartq-source",
+ "filetime",
  "libc",
  "serde_json",
 ]
@@ -244,6 +245,8 @@ dependencies = [
  "dartq-sdk",
  "dartq-semantic",
  "dartq-source",
+ "filetime",
+ "rayon",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -425,6 +428,7 @@ dependencies = [
  "dartq-diagnostics",
  "dartq-language",
  "dartq-source",
+ "memchr",
 ]
 
 [[package]]

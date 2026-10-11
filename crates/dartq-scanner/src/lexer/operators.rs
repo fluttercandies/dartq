@@ -143,19 +143,19 @@ impl Lexer<'_> {
         // Close `<` groups: Gt closes one, GtGt two, GtGtGt three (official appendGt*).
         // Only the **outermost** closed `<` records endGroup (official: "in T<U<V>>,
         // the '>>' token closes the outer '<', the inner '<' is left without endGroup").
-        let closes = match self.tokens.last().map(|t| t.kind) {
+        let closes = match self.last_token().map(|t| t.kind) {
             Some(TokenKind::Gt) => 1,
             Some(TokenKind::GtGt) => 2,
             Some(TokenKind::GtGtGt) => 3,
             _ => 0,
         };
-        let gt_idx = self.tokens.len() as u32 - 1;
+        let gt_idx = self.last_index();
         for i in 0..closes {
             match self.groups.last() {
-                Some(&top) if self.tokens[top as usize].kind == TokenKind::Lt => {
+                Some(&(top, kind)) if kind == TokenKind::Lt => {
                     self.groups.pop();
                     if i + 1 == closes {
-                        self.end_of[top as usize] = gt_idx;
+                        self.record_end(top, gt_idx);
                     }
                 }
                 _ => break,
