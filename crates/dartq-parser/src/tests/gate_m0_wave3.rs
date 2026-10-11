@@ -429,7 +429,8 @@ fn assert_codes_engine(source: &'static str, expected: &[&str], label: &str) {
 /// without consuming the junk, so the missing `;` and the leftover tokens
 /// re-enter the member loop as `expected_class_member` (oracle:
 /// `constructor_head_error.dart` lines 2-3, `parser_impl.dart:6069/:6414/
-/// :11355`).
+/// :11355`; both multisets pinned by the `dart analyze` 3.13.1
+/// machine-format probe).
 #[test]
 fn new_constructor_redirect_cascade() {
     assert_codes(
@@ -458,23 +459,26 @@ fn new_constructor_redirect_cascade() {
 }
 
 /// `this.new` in an initializer list: the reserved name splices a synthetic
-/// field name, the synthetic-assignment recovery re-reads the entry, and the
-/// leftover `new = 0` re-enters the member loop as a `new`-headed
-/// constructor missing parameters (oracle: `new_in_initializer.dart` line 3).
+/// field name (official `insertSyntheticIdentifier(., fieldInitializer)`,
+/// `parser_impl.dart:4838-4844` — the report anchors on the real `new`), the
+/// synthetic-assignment recovery re-reads the entry (`:4902-4914` —
+/// `missing_assignment_in_initializer` anchored on `this`), and the body
+/// recovery splices a synthetic `{}` at the `new` head (`ensureBlock`,
+/// `BlockKind.functionBody` template, `:5000-5002` —
+/// `missing_function_body` anchored on `new`). The leftover `new = 0 ;`
+/// belongs to the recovered member: the analyzer-tier oracle (`dart
+/// analyze` 3.13.1, machine format, probed) surfaces exactly these three
+/// parser rows and nothing for the tail, so the tail is swallowed at the
+/// member-body arm instead of re-entering the member loop as a cascade
+/// (corpus: `new_in_initializer.dart` line 3).
 #[test]
 fn new_constructor_this_initializer_cascade() {
     assert_codes(
         "class C {\n  new() : this.new = 0;\n}\n",
         &[
             "missing_assignment_in_initializer",
-            "missing_identifier",
             "missing_function_body",
-            "missing_method_parameters",
-            "redirection_in_non_factory_constructor",
             "missing_identifier",
-            "expected_token",
-            "expected_class_member",
-            "expected_class_member",
         ],
         "this.new initializer cascade",
     );

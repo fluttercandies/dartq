@@ -1260,6 +1260,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 && self.async_state == AsyncModifier::Sync;
             self.parse_function_body(false, allow_abstract)
         };
+        // Analyzer-tier cascade gate (#577; oracle: `dart analyze` 3.13.1,
+        // machine format, `class C {\n  new() : this.new = 0;\n}` — exactly
+        // `missing_assignment_in_initializer` + `missing_identifier` +
+        // `missing_function_body`). When a constructor's initializer list
+        // ends on a junk head, the body recovery splices a synthetic `{}`
+        // at it (`ensureBlock`, `BlockKind.functionBody` template,
+        // `parser_impl.dart:5000-5002`, `insertBlock` :5006-5023) and the
+        // member ends there; the leftover run (`new = 0 ;`) belongs to the
+        // recovered member and surfaces nothing further, so it must not
+        // re-enter the member loop as a fresh `new`-head cascade. A real
+        // `;`/`{}`/`=>` body never trips the synthetic-close check.
+        if is_constructor
+            && begin_initializers.is_some()
+            && !self.is_bailed()
+            && self.cursor.resolve(end.id) == (TokenKind::CloseCurly, true)
+            && self.peek_kind() == TokenKind::Keyword(Keyword::New)
+        {
+            self.swallow_member_tail();
+        }
         self.async_state = saved_async;
 
         if is_constructor {
@@ -2071,6 +2090,34 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.report(msg::redirecting_constructor_with_body(), self.peek_span());
         }
         end
+    }
+
+    /// Consumes the junk run that trails a constructor body recovered by
+    /// the synthetic-block splice (see the gate at the member body arm):
+    /// up to and including the terminating `;`, leaving a class-body `}` or
+    /// EOF for the enclosing loop. Brace groups in the junk are skipped
+    /// whole (table-matched; the scanner guarantees `{` pairing) so the
+    /// junk can never swallow the enclosing class body. Terminates: every
+    /// branch consumes or returns, and EOF pins.
+    fn swallow_member_tail(&mut self) {
+        loop {
+            match self.peek_kind() {
+                TokenKind::Semicolon => {
+                    self.cursor.advance();
+                    return;
+                }
+                TokenKind::CloseCurly | TokenKind::Eof => return,
+                TokenKind::OpenCurly => {
+                    if let Some(close) = self.current_matching_end() {
+                        self.skip_to_token(close);
+                    }
+                    self.cursor.advance();
+                }
+                _ => {
+                    self.cursor.advance();
+                }
+            }
+        }
     }
 
     /// Official `parseSuperInitializerExpression` (:4918): lookahead over
