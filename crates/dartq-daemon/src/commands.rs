@@ -145,6 +145,23 @@ pub(crate) const METHODS: [&str; 12] = [
     "dartq/overlay.clear",
 ];
 
+/// The `dartq/query` face's `kind` parameter (PRD §15.2): which query
+/// answers. Absent means [`QueryKind::Symbol`] — the face's pre-kind
+/// behavior, byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum QueryKind {
+    /// Declaration rows plus every resolved reference to them (the default).
+    #[default]
+    Symbol,
+    /// The reference rows — the same rows the symbol face serves: the
+    /// index's reference surface is name-keyed and already kinded, so there
+    /// is nothing further to filter (the CLI references face's seam).
+    References,
+    /// The invocation-shaped subset of the reference rows (`invoked` only).
+    Callers,
+}
+
 /// A staged `dartq/*` request: decoded parameters. The request id — the
 /// identity `$/cancelRequest` keys on — stays on the session side.
 #[derive(Debug, Clone)]
@@ -170,8 +187,11 @@ pub(crate) enum Request {
         context: Option<String>,
         since: Option<u64>,
     },
+    /// The §15.2 symbol-index face; `kind` picks the answered rows (symbol
+    /// by default, references, or the callers subset).
     Query {
         name: String,
+        kind: QueryKind,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -278,6 +298,10 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
     #[derive(Deserialize)]
     struct QueryParams {
         name: String,
+        /// An unknown spelling fails here with serde's one-of message —
+        /// the accepted set, surfaced as `INVALID_PARAMS`.
+        #[serde(default)]
+        kind: QueryKind,
         #[serde(default)]
         verbosity: Verbosity,
     }
@@ -372,6 +396,7 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let decoded = serde_json::from_value::<QueryParams>(params.clone()).map_err(invalid)?;
             Ok(Request::Query {
                 name: decoded.name,
+                kind: decoded.kind,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -777,10 +802,11 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
         },
         Request::Query {
             name,
+            kind,
             verbosity,
             since,
             ..
-        } => Ok(query_answer(drain, name, *verbosity, *since)),
+        } => Ok(query_answer(drain, name, *kind, *verbosity, *since)),
         Request::Impact {
             target,
             verbosity,
@@ -1025,11 +1051,28 @@ fn check_engine_view(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/query — the symbol index face (CLI path labels)
+// dartq/query — the symbol-index face by kind (symbol / references / callers,
+// CLI path labels)
 // ---------------------------------------------------------------------------
 
-fn query_answer(drain: &Drain<'_>, name: &str, verbosity: Verbosity, since: Option<u64>) -> Value {
-    let mut run = query::symbol_after_analysis(drain.engine, name);
+/// The `dartq/query` answer: `kind` routes to the matching engine query
+/// face — symbol and references share the symbol rows (the index's
+/// reference surface is name-keyed and already kinded), callers keeps the
+/// invocation rows — and the shaping is the shared one, tier-for-tier, for
+/// every kind.
+fn query_answer(
+    drain: &Drain<'_>,
+    name: &str,
+    kind: QueryKind,
+    verbosity: Verbosity,
+    since: Option<u64>,
+) -> Value {
+    let mut run = match kind {
+        QueryKind::Symbol | QueryKind::References => {
+            query::symbol_after_analysis(drain.engine, name)
+        }
+        QueryKind::Callers => query::callers_after_analysis(drain.engine, name),
+    };
     if let Some(since) = since {
         run.decls.retain(|decl| {
             drain
