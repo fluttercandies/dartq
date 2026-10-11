@@ -70,7 +70,9 @@ pub struct ParsedUnit {
 }
 
 impl ParsedUnit {
-    /// Borrows the unit substrate for one lint run.
+    /// Borrows the unit substrate for one lint run. The workspace facts
+    /// mount by assignment after the call (`Unit::workspace`) — the bridge
+    /// itself carries no pubspec face.
     #[must_use]
     pub fn unit<'a>(&'a self, path: Option<&'a Path>) -> Unit<'a> {
         Unit {
@@ -80,6 +82,7 @@ impl ParsedUnit {
             lines: &self.lines,
             path,
             features: self.features,
+            workspace: None,
         }
     }
 }
@@ -607,15 +610,12 @@ impl ParserListener for AstListener {
         self.end_last(NodeKind::RecordType);
     }
 
-    fn begin_record_type_entry(&mut self) {
-        self.b.begin(
-            NodeKind::RecordTypeEntry,
-            self.b.last_end_token().unwrap_or(0),
-        );
+    fn begin_record_type_entry(&mut self, first: TokenSpan) {
+        self.begin(NodeKind::RecordTypeEntry, first);
     }
 
-    fn end_record_type_entry(&mut self) {
-        self.end_last(NodeKind::RecordTypeEntry);
+    fn end_record_type_entry(&mut self, last: TokenSpan) {
+        self.end_incl(NodeKind::RecordTypeEntry, last);
     }
 
     fn handle_no_name(&mut self, token: TokenSpan) {
@@ -1951,8 +1951,18 @@ impl ParserListener for AstListener {
         self.begin(NodeKind::InitializedIdentifier, token);
     }
 
-    fn end_initialized_identifier(&mut self, _name: TokenSpan) {
-        self.end_last(NodeKind::InitializedIdentifier);
+    fn end_initialized_identifier(&mut self, name: TokenSpan) {
+        // Tail = the initializer subtree when one parsed; otherwise the name
+        // itself bounds the node. Sealed state alone can regress behind the
+        // begin: a recovered name returns a span with no identifier event
+        // (recovery `ensure_identifier` flavors), so nothing seals at the
+        // name and the last seal sits before it (#654 class).
+        let name_end = self.t(name.id) + 1;
+        let end = self
+            .b
+            .last_end_token()
+            .map_or(name_end, |tail| tail.max(name_end));
+        self.end_at(NodeKind::InitializedIdentifier, end);
     }
 
     fn handle_no_variable_initializer(&mut self, _token: TokenSpan) {
@@ -2375,8 +2385,10 @@ impl ParserListener for AstListener {
     }
 
     fn handle_named_record_field(&mut self, colon: TokenSpan) {
-        // Childless Handle over `name :`; the value expression follows as a
-        // sibling inside the record literal (no end event nests it).
+        // Childless Handle anchored at the value head (the event fires
+        // after the field's value parses; same anchor face as
+        // `handle_named_argument`). The colon payload and the name token
+        // sit immediately before the anchor.
         let first = self.b.last_first_token().expect("record field anchor");
         self.b.begin(NodeKind::NamedRecordField, first);
         self.b.patch(0, self.t(colon.id));
