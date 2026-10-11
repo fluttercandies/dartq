@@ -561,33 +561,8 @@ impl<'t> LibraryGraphBuilder<'t> {
         // and pinned here).
         let underscore = strings.intern("_");
 
-        // Seed: locals first, so no propagation can ever displace them;
-        // `_`-private names stay out of the export face (the oracle's
-        // `buildInitialExportScope` filter, `library_builder.dart:252-262`)
-        // while entering the locals layer.
-        let mut scopes: Vec<FxHashMap<StringId, ExportEntry>> =
-            Vec::with_capacity(self.nodes.len());
-        let mut locals: Vec<FxHashMap<StringId, LocalSlot>> = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let mut scope = FxHashMap::default();
-            for (name, file) in &node.decls {
-                if strings.resolve(*name).starts_with('_') {
-                    continue;
-                }
-                // Deliberate deviation: first-wins, where the oracle's
-                // `ExportScope.declare` unconditionally overwrites
-                // (summary2/export.dart:97-100, last-wins) — the divergence
-                // only manifests in already-erroneous duplicate
-                // declarations, which the spec pins as
-                // non-namespace-shaping.
-                scope.entry(*name).or_insert(ExportEntry {
-                    file: *file,
-                    is_local: true,
-                });
-            }
-            scopes.push(scope);
-            locals.push(build_locals(&node.decls, strings));
-        }
+        // Seed: locals first, so no propagation can ever displace them.
+        let (mut scopes, locals) = seed_layers(&self.nodes, strings);
 
         // Flows: one per export edge with an in-graph target, grouped by
         // source library; within a source, (exporter registration order,
@@ -748,6 +723,43 @@ fn build_locals(
         slots.entry(coupled).or_insert(LocalSlot::ShadowOnly);
     }
     slots
+}
+
+/// The pre-propagation layers of the export fixpoint: per-library export
+/// scopes and locals links, indexed by library.
+type SeedLayers = (
+    Vec<FxHashMap<StringId, ExportEntry>>,
+    Vec<FxHashMap<StringId, LocalSlot>>,
+);
+
+/// The pre-propagation layers of [`LibraryGraphBuilder::finish`]: each
+/// library's export scope and locals link. `_`-private names stay out of
+/// the export face (the oracle's `buildInitialExportScope` filter,
+/// `library_builder.dart:252-262`) while entering the locals layer.
+fn seed_layers(nodes: &[NodeBuilder], strings: &StringTable) -> SeedLayers {
+    let mut scopes: Vec<FxHashMap<StringId, ExportEntry>> = Vec::with_capacity(nodes.len());
+    let mut locals: Vec<FxHashMap<StringId, LocalSlot>> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let mut scope = FxHashMap::default();
+        for (name, file) in &node.decls {
+            if strings.resolve(*name).starts_with('_') {
+                continue;
+            }
+            // Deliberate deviation: first-wins, where the oracle's
+            // `ExportScope.declare` unconditionally overwrites
+            // (summary2/export.dart:97-100, last-wins) — the divergence
+            // only manifests in already-erroneous duplicate
+            // declarations, which the spec pins as
+            // non-namespace-shaping.
+            scope.entry(*name).or_insert(ExportEntry {
+                file: *file,
+                is_local: true,
+            });
+        }
+        scopes.push(scope);
+        locals.push(build_locals(&node.decls, strings));
+    }
+    (scopes, locals)
 }
 
 /// Applies one flow for `name`: combinator filter, then a first-come-wins
@@ -915,7 +927,7 @@ impl LibraryGraph {
                     || combinators
                         .setter_spelling(token.name)
                         .is_some_and(|setter| self.exported(target, setter).is_some());
-                (!defined).then(|| UndefinedCombinatorName {
+                (!defined).then_some(UndefinedCombinatorName {
                     name: token.name,
                     hidden: token.hidden,
                     span: token.span,
@@ -968,10 +980,7 @@ impl LibraryGraph {
     /// query.
     #[must_use]
     pub fn declaring_libraries(&self, name: StringId) -> &[LibraryId] {
-        self.declarations
-            .get(&name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.declarations.get(&name).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -1039,7 +1048,7 @@ mod tests {
         let ids: Vec<StringId> = names.iter().map(|n| strings.intern(n)).collect();
         let spans: Box<[SourceRange]> = (0..ids.len())
             .map(|index| SourceRange {
-                offset: (4 * index) as u32,
+                offset: u32::try_from(4 * index).expect("test span offset fits u32"),
                 length: 2,
             })
             .collect();

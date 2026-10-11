@@ -111,6 +111,10 @@ pub enum DeclKind {
 /// instance_member_inferrer.dart:649-719). Declaration-site combination
 /// checks must be fed the *declared* keywords instead; see
 /// [`declaration_violations`].
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one official modifier keyword; the flag set mirrors the element model"
+)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct ClassModifiers {
     /// The declaration kind.
@@ -166,7 +170,7 @@ pub struct LibraryFeatureFacts {
 }
 
 /// `_mayIgnoreClassModifiers` (base_or_final_type_verifier.dart:164-173;
-/// the error_verifier carries the same gate for its outside-library
+/// the `error_verifier` carries the same gate for its outside-library
 /// checks): only modifiers in platform libraries can be ignored — when the
 /// *supertype's* library is the SDK and the *use-site* library is either
 /// the SDK itself or predates class modifiers.
@@ -231,115 +235,123 @@ pub struct DeclarationViolation {
 /// keywords are the parser layer's generic modifier diagnostics
 /// (`extraneousModifier`, `duplicatedModifier`) and are not decisions of
 /// this face.
+/// Records one violation with its keyword anchors.
+fn push_violation(
+    violations: &mut Vec<DeclarationViolation>,
+    code: ModifierCode,
+    anchors: &[ModifierKeyword],
+) {
+    violations.push(DeclarationViolation {
+        code,
+        anchors: anchors.to_vec(),
+    });
+}
+
+/// Records one violation only when its trigger keyword is present.
+fn flag_violation(
+    violations: &mut Vec<DeclarationViolation>,
+    flagged: bool,
+    code: ModifierCode,
+    anchors: &[ModifierKeyword],
+) {
+    if flagged {
+        push_violation(violations, code, anchors);
+    }
+}
+
 #[must_use]
 pub fn declaration_violations(modifiers: &ClassModifiers) -> Vec<DeclarationViolation> {
     let mut violations = Vec::new();
-    let push = |violations: &mut Vec<DeclarationViolation>, code, anchors: &[ModifierKeyword]| {
-        violations.push(DeclarationViolation {
-            code,
-            anchors: anchors.to_vec(),
-        });
-    };
     match modifiers.kind {
         DeclKind::Enum => {
             // parser_impl.dart:723-730 — report order base, final,
             // interface, sealed.
-            if modifiers.is_base {
-                push(
-                    &mut violations,
-                    ModifierCode::BaseEnum,
-                    &[ModifierKeyword::Base],
-                );
-            }
-            if modifiers.is_final {
-                push(
-                    &mut violations,
-                    ModifierCode::FinalEnum,
-                    &[ModifierKeyword::Final],
-                );
-            }
-            if modifiers.is_interface {
-                push(
-                    &mut violations,
-                    ModifierCode::InterfaceEnum,
-                    &[ModifierKeyword::Interface],
-                );
-            }
-            if modifiers.is_sealed {
-                push(
-                    &mut violations,
-                    ModifierCode::SealedEnum,
-                    &[ModifierKeyword::Sealed],
-                );
-            }
+            flag_violation(
+                &mut violations,
+                modifiers.is_base,
+                ModifierCode::BaseEnum,
+                &[ModifierKeyword::Base],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_final,
+                ModifierCode::FinalEnum,
+                &[ModifierKeyword::Final],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_interface,
+                ModifierCode::InterfaceEnum,
+                &[ModifierKeyword::Interface],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_sealed,
+                ModifierCode::SealedEnum,
+                &[ModifierKeyword::Sealed],
+            );
         }
         DeclKind::Mixin => {
             // parser_impl.dart:810-818 — only `base` is legal on a mixin.
-            if modifiers.is_final {
-                push(
-                    &mut violations,
-                    ModifierCode::FinalMixin,
-                    &[ModifierKeyword::Final],
-                );
-            }
-            if modifiers.is_interface {
-                push(
-                    &mut violations,
-                    ModifierCode::InterfaceMixin,
-                    &[ModifierKeyword::Interface],
-                );
-            }
-            if modifiers.is_sealed {
-                push(
-                    &mut violations,
-                    ModifierCode::SealedMixin,
-                    &[ModifierKeyword::Sealed],
-                );
-            }
+            flag_violation(
+                &mut violations,
+                modifiers.is_final,
+                ModifierCode::FinalMixin,
+                &[ModifierKeyword::Final],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_interface,
+                ModifierCode::InterfaceMixin,
+                &[ModifierKeyword::Interface],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_sealed,
+                ModifierCode::SealedMixin,
+                &[ModifierKeyword::Sealed],
+            );
         }
         DeclKind::Class if modifiers.is_mixin_class => {
             // parser_impl.dart:866-876 — only `base` is legal on a mixin
             // class.
-            if modifiers.is_final {
-                push(
-                    &mut violations,
-                    ModifierCode::FinalMixinClass,
-                    &[ModifierKeyword::Final],
-                );
-            }
-            if modifiers.is_interface {
-                push(
-                    &mut violations,
-                    ModifierCode::InterfaceMixinClass,
-                    &[ModifierKeyword::Interface],
-                );
-            }
-            if modifiers.is_sealed {
-                push(
-                    &mut violations,
-                    ModifierCode::SealedMixinClass,
-                    &[ModifierKeyword::Sealed],
-                );
-            }
+            flag_violation(
+                &mut violations,
+                modifiers.is_final,
+                ModifierCode::FinalMixinClass,
+                &[ModifierKeyword::Final],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_interface,
+                ModifierCode::InterfaceMixinClass,
+                &[ModifierKeyword::Interface],
+            );
+            flag_violation(
+                &mut violations,
+                modifiers.is_sealed,
+                ModifierCode::SealedMixinClass,
+                &[ModifierKeyword::Sealed],
+            );
         }
         DeclKind::Class => {
             // parser_impl.dart:2976-3015 — the abstract pair checks, in
             // the official nesting.
             if modifiers.is_abstract && modifiers.is_sealed {
-                push(
+                push_violation(
                     &mut violations,
                     ModifierCode::AbstractSealedClass,
                     &[ModifierKeyword::Sealed],
                 );
             } else if modifiers.is_abstract && modifiers.is_final {
                 if modifiers.is_base {
-                    push(
+                    push_violation(
                         &mut violations,
                         ModifierCode::AbstractFinalBaseClass,
                         &[ModifierKeyword::Final, ModifierKeyword::Base],
                     );
                 } else if modifiers.is_interface {
-                    push(
+                    push_violation(
                         &mut violations,
                         ModifierCode::AbstractFinalInterfaceClass,
                         &[ModifierKeyword::Final, ModifierKeyword::Interface],
@@ -467,7 +479,7 @@ pub fn final_implements_candidate(
 /// (error_verifier.dart:5896-5926): an `interface` (non-sealed) class from
 /// another library cannot be extended. The official reads
 /// `superclassElement.isInterface` — declared `interface` keyword plus the
-/// sealed-only induction (instance_member_inferrer.dart:693/717), and the
+/// sealed-only induction (`instance_member_inferrer.dart:693/717`), and the
 /// sealed case is excluded here — so the effective flag is the declared
 /// keyword in every reachable input.
 #[must_use]
@@ -558,7 +570,7 @@ pub struct ExplicitBaseFinal {
 ///    (:208-210).
 /// 5. `implements` + sealed super element + cross-library ancestor that
 ///    is `base`: the base-implemented family (:240-256) — the transitive
-///    twin of the error_verifier's direct check, anchored on the
+///    twin of the `error_verifier`'s direct check, anchored on the
 ///    implements entry.
 /// 6. An element that is itself neither base, final, nor sealed (:258)
 ///    under a `final` ancestor reports the final family (:259-294) unless
@@ -719,7 +731,7 @@ pub fn induced_modifier(
     if !element.sealed_face() {
         return None;
     }
-    if mixins.iter().any(|m| m.final_face()) {
+    if mixins.iter().any(ClassModifiers::final_face) {
         return Some(InducedModifier::Final); // :655-659
     }
     if let Some(supertype) = supertype {
@@ -733,7 +745,9 @@ pub fn induced_modifier(
             return Some(InducedModifier::Base); // :679-680
         }
         if supertype.is_interface {
-            if interfaces.iter().any(|i| i.base_face()) || mixins.iter().any(|m| m.base_face()) {
+            if interfaces.iter().any(ClassModifiers::base_face)
+                || mixins.iter().any(ClassModifiers::base_face)
+            {
                 return Some(InducedModifier::Final); // :682-694
             }
             return Some(InducedModifier::Interface); // :696-697
@@ -745,7 +759,7 @@ pub fn induced_modifier(
         return Some(InducedModifier::Base); // :700-706
     }
     if mixins.iter().any(|m| m.is_interface) {
-        if interfaces.iter().any(|i| i.base_face()) {
+        if interfaces.iter().any(ClassModifiers::base_face) {
             return Some(InducedModifier::Final); // :708-716
         }
         return Some(InducedModifier::Interface); // :717-718
@@ -852,6 +866,10 @@ pub struct ModifierCodeInfo {
 impl ModifierCode {
     /// The frozen official descriptor of this code. Length is the frozen
     /// table itself — a data table, not logic.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "frozen one-arm-per-row data table of verbatim registry strings"
+    )]
     #[must_use]
     pub const fn info(self) -> ModifierCodeInfo {
         match self {
@@ -1093,6 +1111,10 @@ mod tests {
         has_class_modifiers: false,
     };
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "test shorthand mirrors the four declared keyword flags"
+    )]
     fn class_mods(
         is_base: bool,
         is_final: bool,
@@ -1149,8 +1171,10 @@ mod tests {
     #[test]
     fn declaration_matrix_rejects_every_enum_modifier() {
         // parser_impl.dart:723-730 — order base, final, interface, sealed.
-        let mut enumeration = ClassModifiers::default();
-        enumeration.kind = DeclKind::Enum;
+        let mut enumeration = ClassModifiers {
+            kind: DeclKind::Enum,
+            ..ClassModifiers::default()
+        };
         assert!(declaration_violations(&enumeration).is_empty());
         enumeration.is_sealed = true;
         enumeration.is_base = true;
@@ -1171,9 +1195,11 @@ mod tests {
 
     #[test]
     fn declaration_matrix_mixins_and_mixin_classes_accept_only_base() {
-        let mut mixin = ClassModifiers::default();
-        mixin.kind = DeclKind::Mixin;
-        mixin.is_base = true;
+        let mut mixin = ClassModifiers {
+            kind: DeclKind::Mixin,
+            is_base: true,
+            ..ClassModifiers::default()
+        };
         assert!(declaration_violations(&mixin).is_empty());
         mixin.is_final = true;
         mixin.is_interface = true;
@@ -1190,10 +1216,12 @@ mod tests {
             ]
         );
 
-        let mut mixin_class = ClassModifiers::default();
-        mixin_class.kind = DeclKind::Class;
-        mixin_class.is_mixin_class = true;
-        mixin_class.is_base = true;
+        let mut mixin_class = ClassModifiers {
+            kind: DeclKind::Class,
+            is_mixin_class: true,
+            is_base: true,
+            ..ClassModifiers::default()
+        };
         assert!(declaration_violations(&mixin_class).is_empty());
         mixin_class.is_final = true;
         assert_eq!(
@@ -1507,6 +1535,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario per official gate of report_restriction_error, asserted in gate order"
+    )]
     fn subtype_restriction_family_matches_report_restriction_error() {
         let plain_element = class_mods(false, false, false, false);
         let base_super = class_mods(true, false, false, false);
@@ -1745,6 +1777,53 @@ mod tests {
         assert_eq!(induced_modifier(&sealed, None, &[plain], &[plain]), None);
     }
 
+    /// Every [`ModifierCode`], in declaration order.
+    const ALL_CODES: [ModifierCode; 24] = [
+        ModifierCode::SealedClassSubtypeOutsideOfLibrary,
+        ModifierCode::FinalClassExtendedOutsideOfLibrary,
+        ModifierCode::FinalClassImplementedOutsideOfLibrary,
+        ModifierCode::FinalClassUsedAsMixinConstraintOutsideOfLibrary,
+        ModifierCode::InterfaceClassExtendedOutsideOfLibrary,
+        ModifierCode::BaseClassImplementedOutsideOfLibrary,
+        ModifierCode::BaseMixinImplementedOutsideOfLibrary,
+        ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed,
+        ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed,
+        ModifierCode::MixinSubtypeOfBaseIsNotBase,
+        ModifierCode::MixinSubtypeOfFinalIsNotBase,
+        ModifierCode::AbstractSealedClass,
+        ModifierCode::AbstractFinalBaseClass,
+        ModifierCode::AbstractFinalInterfaceClass,
+        ModifierCode::BaseEnum,
+        ModifierCode::FinalEnum,
+        ModifierCode::InterfaceEnum,
+        ModifierCode::SealedEnum,
+        ModifierCode::FinalMixin,
+        ModifierCode::InterfaceMixin,
+        ModifierCode::SealedMixin,
+        ModifierCode::FinalMixinClass,
+        ModifierCode::InterfaceMixinClass,
+        ModifierCode::SealedMixinClass,
+    ];
+    /// The outside-library family — one machine name,
+    /// `INVALID_USE_OF_TYPE_OUTSIDE_LIBRARY`.
+    const OUTSIDE_LIBRARY_CODES: [ModifierCode; 7] = [
+        ModifierCode::SealedClassSubtypeOutsideOfLibrary,
+        ModifierCode::FinalClassExtendedOutsideOfLibrary,
+        ModifierCode::FinalClassImplementedOutsideOfLibrary,
+        ModifierCode::FinalClassUsedAsMixinConstraintOutsideOfLibrary,
+        ModifierCode::InterfaceClassExtendedOutsideOfLibrary,
+        ModifierCode::BaseClassImplementedOutsideOfLibrary,
+        ModifierCode::BaseMixinImplementedOutsideOfLibrary,
+    ];
+    /// The subtype family — one machine name,
+    /// `SUBTYPE_OF_BASE_OR_FINAL_IS_NOT_BASE_FINAL_OR_SEALED`.
+    const SUBTYPE_CODES: [ModifierCode; 4] = [
+        ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed,
+        ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed,
+        ModifierCode::MixinSubtypeOfBaseIsNotBase,
+        ModifierCode::MixinSubtypeOfFinalIsNotBase,
+    ];
+
     #[test]
     fn code_table_rows_are_registry_true() {
         // Every row: machine == name uppercased, message non-empty, and
@@ -1752,33 +1831,7 @@ mod tests {
         // subtype families COMPILE_TIME_ERROR + published, the
         // declaration-site rows SYNTACTIC_ERROR with only
         // abstract_sealed_class published.
-        let all = [
-            ModifierCode::SealedClassSubtypeOutsideOfLibrary,
-            ModifierCode::FinalClassExtendedOutsideOfLibrary,
-            ModifierCode::FinalClassImplementedOutsideOfLibrary,
-            ModifierCode::FinalClassUsedAsMixinConstraintOutsideOfLibrary,
-            ModifierCode::InterfaceClassExtendedOutsideOfLibrary,
-            ModifierCode::BaseClassImplementedOutsideOfLibrary,
-            ModifierCode::BaseMixinImplementedOutsideOfLibrary,
-            ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed,
-            ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed,
-            ModifierCode::MixinSubtypeOfBaseIsNotBase,
-            ModifierCode::MixinSubtypeOfFinalIsNotBase,
-            ModifierCode::AbstractSealedClass,
-            ModifierCode::AbstractFinalBaseClass,
-            ModifierCode::AbstractFinalInterfaceClass,
-            ModifierCode::BaseEnum,
-            ModifierCode::FinalEnum,
-            ModifierCode::InterfaceEnum,
-            ModifierCode::SealedEnum,
-            ModifierCode::FinalMixin,
-            ModifierCode::InterfaceMixin,
-            ModifierCode::SealedMixin,
-            ModifierCode::FinalMixinClass,
-            ModifierCode::InterfaceMixinClass,
-            ModifierCode::SealedMixinClass,
-        ];
-        for code in all {
+        for code in ALL_CODES {
             let info = code.info();
             assert_eq!(
                 info.name.to_uppercase(),
@@ -1787,20 +1840,8 @@ mod tests {
                 info.unique_name
             );
             assert!(!info.message.is_empty(), "{}", info.unique_name);
-            let use_site_or_subtype = matches!(
-                code,
-                ModifierCode::SealedClassSubtypeOutsideOfLibrary
-                    | ModifierCode::FinalClassExtendedOutsideOfLibrary
-                    | ModifierCode::FinalClassImplementedOutsideOfLibrary
-                    | ModifierCode::FinalClassUsedAsMixinConstraintOutsideOfLibrary
-                    | ModifierCode::InterfaceClassExtendedOutsideOfLibrary
-                    | ModifierCode::BaseClassImplementedOutsideOfLibrary
-                    | ModifierCode::BaseMixinImplementedOutsideOfLibrary
-                    | ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed
-                    | ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed
-                    | ModifierCode::MixinSubtypeOfBaseIsNotBase
-                    | ModifierCode::MixinSubtypeOfFinalIsNotBase
-            );
+            let use_site_or_subtype =
+                OUTSIDE_LIBRARY_CODES.contains(&code) || SUBTYPE_CODES.contains(&code);
             if use_site_or_subtype {
                 assert_eq!(
                     info.dtype,
@@ -1829,23 +1870,10 @@ mod tests {
         // sealed_class_subtype_outside_of_library ride
         // invalid_use_of_type_outside_library; the subtype family rides
         // subtype_of_base_or_final_is_not_base_final_or_sealed.
-        for code in [
-            ModifierCode::SealedClassSubtypeOutsideOfLibrary,
-            ModifierCode::FinalClassExtendedOutsideOfLibrary,
-            ModifierCode::FinalClassImplementedOutsideOfLibrary,
-            ModifierCode::FinalClassUsedAsMixinConstraintOutsideOfLibrary,
-            ModifierCode::InterfaceClassExtendedOutsideOfLibrary,
-            ModifierCode::BaseClassImplementedOutsideOfLibrary,
-            ModifierCode::BaseMixinImplementedOutsideOfLibrary,
-        ] {
+        for code in OUTSIDE_LIBRARY_CODES {
             assert_eq!(code.info().name, "invalid_use_of_type_outside_library");
         }
-        for code in [
-            ModifierCode::SubtypeOfBaseIsNotBaseFinalOrSealed,
-            ModifierCode::SubtypeOfFinalIsNotBaseFinalOrSealed,
-            ModifierCode::MixinSubtypeOfBaseIsNotBase,
-            ModifierCode::MixinSubtypeOfFinalIsNotBase,
-        ] {
+        for code in SUBTYPE_CODES {
             assert_eq!(
                 code.info().name,
                 "subtype_of_base_or_final_is_not_base_final_or_sealed"

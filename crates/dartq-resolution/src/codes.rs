@@ -88,7 +88,7 @@ pub enum ResolutionCode {
     AmbiguousExport,
     /// The same prefix is imported deferred in one place and non-deferred in
     /// another (analyzer-8.4.1 `error/codes.g.dart:6651`;
-    /// COMPILE_TIME_ERROR, `hasPublishedDocs`).
+    /// `COMPILE_TIME_ERROR`, `hasPublishedDocs`).
     SharedDeferredPrefix,
 }
 

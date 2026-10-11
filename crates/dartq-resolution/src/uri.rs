@@ -527,6 +527,12 @@ impl<'a> UriResolver<'a> {
     /// table cannot change under a live resolver); the returned borrow shares
     /// that lifetime, and callers needing a longer horizon cache the owned
     /// result — the engine's per-file canonical table does exactly that.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memo table misses after the insert above — a program
+    /// bug (the cache is `&mut self`, so no concurrent mutation is
+    /// possible).
     #[must_use]
     pub fn canonical_uri(&mut self, path: &Path) -> &str {
         if !self.canonical.contains_key(path) {
@@ -2192,7 +2198,7 @@ mod tests {
 
     /// The shared dartq-pub face applies to this table too: duplicate
     /// config names are pub's hard error (`package_config.dart:44-51`, the
-    /// verbatim ArgumentError text), never a silent last-wins over the
+    /// verbatim `ArgumentError` text), never a silent last-wins over the
     /// lib-dir index.
     #[test]
     fn duplicate_names_fail_loudly() {

@@ -98,6 +98,10 @@ pub enum SelectedUri {
 /// Pure and allocation-free: all comparisons are borrowed string equality.
 /// An undeclared name never matches — under the engine's empty default
 /// map (the no-`-D` oracle context) nothing matches at all.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "the declared-variables map is engine-internal and pinned to FxBuildHasher; std HashMap is disallowed workspace-wide"
+)]
 #[must_use]
 pub fn resolve_conditional(
     configs: &[Configuration],
