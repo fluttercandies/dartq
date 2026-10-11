@@ -12,6 +12,7 @@ use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
 use crate::type_args::RecordProbe;
 use crate::type_args::TypeParamOrArg;
+use crate::type_args::simple1_closer;
 use crate::types::{ComplexType, TypeInfo};
 
 // ---------------------------------------------------------------------------
@@ -26,7 +27,28 @@ impl TypeInfo {
         let start = parser.peek_id();
         match self {
             TypeInfo::NoType => start.saturating_sub(1),
-            TypeInfo::Void | TypeInfo::Simple => start,
+            // VoidType.skipType (type_info_impl.dart:469-479): `void`
+            // followed by type arguments skips the whole group — the
+            // official `computeTypeParamOrArg != noTypeParamOrArg` probe
+            // gates it and `typeParam.skip` lands on the group's closer
+            // (a compound closer names the official split leading `>`,
+            // #135). Probed read-only like `skip_type_len`'s void arm;
+            // exact for valid input.
+            TypeInfo::Void => {
+                if parser.cursor.look_kind(1) == TokenKind::Lt {
+                    let lt = parser.cursor.real_pos() + 1;
+                    if simple1_closer(parser, lt).is_some() {
+                        // `<` id closer: the `<`, the argument, then the
+                        // closer (SimpleTypeArgument1.skipEndGroup).
+                        return start + 3;
+                    }
+                    if let Some(len) = parser.gt_group_len(lt) {
+                        return start + len as u32;
+                    }
+                }
+                start
+            }
+            TypeInfo::Simple => start,
             TypeInfo::SimpleNullable => start + 1,
             TypeInfo::Prefixed => start + 2,
             // `id<id>`: `<`, the argument, then the closer (official

@@ -211,6 +211,44 @@ fn skip_type_positions() {
 }
 
 #[test]
+fn skip_type_void_consumes_type_arguments() {
+    // VoidType.skipType (type_info_impl.dart:469-479): `void` followed by
+    // type arguments skips the group and lands on its closer (the compound
+    // convention names the split leading `>`, #135); plain `void` still
+    // lands on the keyword itself.
+    let mut p = setup("void x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::Void));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), "void");
+
+    let mut p = setup("void<int> x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::Void));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), ">");
+
+    let mut p = setup("void<List<int>> x");
+    let info = p.compute_type(true, false);
+    assert!(matches!(info, TypeInfo::Void));
+    assert_eq!(p.cursor.lexeme(info.skip_type(&p)), ">>");
+}
+
+#[test]
+fn prefixed_type_args_optional_position_stays_expression_head() {
+    // computePrefixedType's optional-shape veto (type_info_impl.dart
+    // :1081-1083, the computeSimpleWithTypeArguments :1044 arm): in a
+    // non-required position `id.id<...>` is noType unless a declaration
+    // name follows the type end — `c.m<D>(x)` stays an expression head,
+    // `p.F<int> v` declares.
+    let mut p = setup("c.m<D>(x);");
+    let info = p.compute_type(false, false);
+    assert!(matches!(info, TypeInfo::NoType), "{info:?}");
+
+    let mut p = setup("p.F<int> v;");
+    let info = p.compute_type(false, false);
+    assert!(matches!(info, TypeInfo::Complex(_)), "{info:?}");
+}
+
+#[test]
 fn prefixed_type_with_arguments_computes_group() {
     // The `id . id <...>` group is computed at the continuation token
     // (type_info.dart:319), where `<` sits at cursor+3 — the old at(2)
@@ -236,6 +274,29 @@ fn extends_clause_scans_following_parameters() {
     for source in [
         "class C<T extends num, U> {}",
         "class C<T extends List<int>, U> {}",
+    ] {
+        let mut p = setup(source);
+        p.parse_unit();
+        assert!(
+            p.listener.errors.is_empty(),
+            "{source:?}: {:?}",
+            p.listener.errors
+        );
+        p.listener
+            .assert_sequence(&[("begin", "class_declaration"), ("end", "class_declaration")]);
+    }
+}
+
+#[test]
+fn extends_clause_composite_closer_needs_no_extra_row() {
+    // The supertype's argument group and the type-variable group close
+    // through one compound: the official split-remainder (parseCloser,
+    // type_info_impl.dart:1765) closes the type-variable group with the
+    // remainder, so the composite-bound declarations are clean Dart — no
+    // expectedAfterButGot('>') at the body.
+    for source in [
+        "class C<T extends List<int>> {}",
+        "class C<T extends Map<int, int>> {}",
     ] {
         let mut p = setup(source);
         p.parse_unit();

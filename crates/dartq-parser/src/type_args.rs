@@ -250,7 +250,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
 /// The fast-shape guard of `_computeTypeParamOrArgImpl` (`type_info.dart:446)`:
 /// `<` followed by a single name-ish token and a `>`-family closer.
-fn simple1_closer(
+pub(crate) fn simple1_closer(
     parser: &Parser<'_, '_, impl ParserListener>,
     lt_offset: usize,
 ) -> Option<SimpleCloser> {
