@@ -22,7 +22,7 @@
 //! its model cycled 0/2/0/2/0/0/0/0 pool words (4 per 9 nodes) ⇒ 24 +
 //! 16/9 ≈ **25.78 B/node** and 0.40 × 25.78 / 8.0 ≈ **1.29 MB/MB**. The
 //! #174 contract additionally eliminated the Identifier token word (span
-//! head) and the ModSet words (header flag bits); the model below cycles
+//! head) and the `ModSet` words (header flag bits); the model below cycles
 //! 0/1/0/2/0/0/0/0 pool words over its 9-node chunks — 3 words per 9 nodes
 //! — so the arithmetic expectation is 24 + 12/9 ≈ **25.33 B/node**
 //! steady-state and ≈ 0.40 × 25.33 / 8.0 ≈ **1.27 MB/MB** at the budget's
@@ -51,6 +51,12 @@ const CONFIG: ScanConfig = ScanConfig {
     enable_augmentations: true,
 };
 
+/// Corpus files that are intentionally not valid UTF-8 (gate blind-spot
+/// coverage, 018552d): the density walk skips them and asserts the skip set
+/// is exactly this list, so a new non-UTF8 corpus file fails consciously
+/// instead of silently shrinking the sample. Sorted; corpus-relative paths.
+const NON_UTF8_CORPUS_FILES: &[&str] = &["lib/targeted/blindspot_encoding.dart"];
+
 fn collect_dart_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -68,7 +74,7 @@ fn collect_dart_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Builds the model AST for one file: chunks of one span-only container plus
 /// 8 leaf-slot events whose payload widths cycle 0/1/0/2/0/0/0/0 — 3 words
 /// per 9 nodes. Post-#174: token leaves (LiteralInt/Bool/Null) and span-only
-/// kinds (StringLiteral, Send, Arguments) store no payload word, and the
+/// kinds (`StringLiteral`, `Send`, `Arguments`) store no payload word, and the
 /// Identifier token is derived from the span head; the words that remain are
 /// real fields (Identifier ctx, Conditional question/colon), built via
 /// begin/patch/end.
@@ -135,11 +141,15 @@ fn corpus_ast_density_within_budget() {
     let mut total_tokens = 0usize;
     let mut total_nodes = 0usize;
     let mut total_footprint = 0usize;
+    let mut non_utf8_skipped = Vec::new();
 
     for path in &files {
-        let source =
-            fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let result = scan(&source, CONFIG, files_table.intern(path));
+        let bytes = fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            non_utf8_skipped.push(path.clone());
+            continue;
+        };
+        let result = scan(source, CONFIG, files_table.intern(path));
         let ast = model_ast(&result.tokens);
 
         total_source += source.len();
@@ -147,6 +157,21 @@ fn corpus_ast_density_within_budget() {
         total_nodes += ast.len();
         total_footprint += ast.memory_footprint();
     }
+
+    let mut skipped: Vec<String> = non_utf8_skipped
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&corpus)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    skipped.sort();
+    assert_eq!(
+        skipped, NON_UTF8_CORPUS_FILES,
+        "non-UTF8 corpus file set drifted from the known blindspot fixtures"
+    );
 
     assert!(
         total_source >= 100 * 1024,
@@ -177,6 +202,10 @@ fn corpus_ast_density_within_budget() {
     let corpus_bytes_per_token = total_source as f64 / total_tokens as f64;
 
     println!("corpus files:              {}", files.len());
+    println!(
+        "non-UTF8 skipped:          {} (pinned blindspot set)",
+        skipped.len()
+    );
     println!("source bytes:              {total_source}");
     println!("scanned tokens:            {total_tokens}");
     println!(
