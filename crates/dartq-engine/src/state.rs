@@ -538,8 +538,10 @@ pub(crate) struct EngineState {
     pub pending: FxHashMap<FileId, PendingChange>,
     pub pending_order: Vec<FileId>,
 
-    /// Resolved analysis options per package root (PRD §12): the include
-    /// chain merged once at context assembly; discovery applies the exclude
+    /// Resolved analysis options per governing directory (PRD §12): the
+    /// include-merged file of every package root (or the synthesized
+    /// default) plus every nested options directory inside the roots,
+    /// merged once at context assembly; discovery applies the exclude
     /// globs, the lint face reads the rule names.
     pub options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
 
@@ -621,7 +623,9 @@ impl EngineState {
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
         // Options are a context field: the include chains merge once here,
-        // keyed by package root (cold path, workspace-assembly time).
+        // keyed by governing directory — package roots plus the nested
+        // options directories inside them (cold path, workspace-assembly
+        // time).
         let mut roots: Vec<PathBuf> = packages
             .iter()
             .map(|package| package.root.clone())
@@ -670,6 +674,32 @@ impl EngineState {
     /// Fact-cache lookup.
     pub(crate) fn cached_facts(&self, key: FactsKey) -> Option<Arc<UnitFacts>> {
         self.facts_cache.get(&key).cloned()
+    }
+
+    /// The language-strictness modes governing `file`: the deepest options
+    /// entry whose directory contains the file's path, its strict flags
+    /// each `unwrap_or(false)` (the official off posture — the
+    /// `AnalysisOptionsImpl` defaults). Resolved once per library at the
+    /// diagnoser seam (the defining file's modes govern the fold).
+    pub(crate) fn strict_modes_for(&self, file: FileId) -> dartq_semantic::StrictModes {
+        let Some(path) = self.files.path(file) else {
+            return dartq_semantic::StrictModes::default();
+        };
+        let mut best: Option<(usize, &crate::analysis_options::AnalysisOptions)> = None;
+        for (key, options) in &self.options {
+            if path.starts_with(key) {
+                let depth = key.components().count();
+                if best.is_none_or(|(depth_so_far, _)| depth >= depth_so_far) {
+                    best = Some((depth, options));
+                }
+            }
+        }
+        let strict_flags = best.map(|(_, options)| options);
+        dartq_semantic::StrictModes {
+            casts: strict_flags.is_some_and(|o| o.strict_casts.unwrap_or(false)),
+            inference: strict_flags.is_some_and(|o| o.strict_inference.unwrap_or(false)),
+            raw_types: strict_flags.is_some_and(|o| o.strict_raw_types.unwrap_or(false)),
+        }
     }
 
     /// Fact-cache insert with oldest-first cap eviction. Live residency

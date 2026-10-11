@@ -389,6 +389,10 @@ fn diagnose_library(
             packages: &state.packages,
             file_table: &state.files,
             namespaces,
+            // The defining file's strict modes govern the fold (#588 item
+            // 4): the `analyzer.language.strict-*` flags resolved through
+            // the governing options entry.
+            strict: state.strict_modes_for(info.defining),
             scanned,
         };
         diagnoser.diagnose_library(view, &mut out);

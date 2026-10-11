@@ -25,7 +25,7 @@
 //! L3 content-addressed store), `event`, `cancel`, `query` (the `query
 //! symbol` face, PRD
 //! §20.3), `semdiag` (the default semantic diagnoser, #236),
-//! `analysis_options` (the merged per-root options, PRD §12), `context` +
+//! `analysis_options` (the merged options per governing directory, PRD §12), `context` +
 //! `scheduler` (the multi-context runtime substrate — contexts, overlays,
 //! scheduling, cancellation — PRD §16).
 //!
@@ -36,7 +36,7 @@
 //! the part/part-of family — plugs in through [`SemanticDiagnoser`]: the
 //! trait lives here so the engine needs no dependency edge back upward, and
 //! the engine ships the default implementor ([`semdiag::Diagnoser`], #236),
-//! which folds `dartq_semantic::diagnose` over the [`LibraryView`] faces.
+//! which folds `dartq_semantic::diagnose_with` over the [`LibraryView`] faces.
 //! With no diagnoser configured the engine under-reports exactly those
 //! families and nothing else.
 
@@ -486,12 +486,26 @@ impl Engine {
 
         let mut stats = DiscoveryStats::default();
         for root in &roots {
-            // The root's merged options (PRD §12.2): excluded paths leave
-            // the analysis set — directories are not descended into, files
-            // are not interned — so neither diagnostics nor lints ever see
-            // them.
-            let options = self.state.options.get(root).cloned();
-            let is_excluded = |path: &Path| options.as_ref().is_some_and(|o| o.is_excluded(path));
+            // The governing options (PRD §12.2): the root's entry plus every
+            // nested options directory under it. Excluded paths leave the
+            // analysis set — directories are not descended into, files are
+            // not interned — so neither diagnostics nor lints ever see
+            // them. The predicate unions each governing entry's globs,
+            // anchored to their declaring directories (the official
+            // `root.excludedGlobs` accumulation, context_locator.dart
+            // :402-409), so a nested file's excludes prune only its subtree.
+            let governing: Vec<(PathBuf, Arc<analysis_options::AnalysisOptions>)> = self
+                .state
+                .options
+                .iter()
+                .filter(|(key, _)| key.starts_with(root))
+                .map(|(key, options)| (key.clone(), Arc::clone(options)))
+                .collect();
+            let is_excluded = |path: &Path| {
+                governing
+                    .iter()
+                    .any(|(key, options)| path.starts_with(key) && options.is_excluded(path))
+            };
             // The four declared surfaces; directly-in-root dart files are
             // interned below, never queued (the walk's `read_dir` on a file
             // is ENOTDIR and would silently drop them).
@@ -585,7 +599,9 @@ impl Engine {
     /// The merged analysis options governing `root` (a package root), or
     /// `None` when the root has no options file in its ancestry. The lint
     /// face resolves its enable set from [`analysis_options::AnalysisOptions::lint_rules`];
-    /// discovery has already applied [`analysis_options::AnalysisOptions::is_excluded`].
+    /// discovery has already applied [`analysis_options::AnalysisOptions::is_excluded`]
+    /// over every governing entry (the root's plus the nested options
+    /// directories inside it).
     #[must_use]
     pub fn options_for_root(&self, root: &Path) -> Option<&analysis_options::AnalysisOptions> {
         self.state.options.get(root).map(Arc::as_ref)
@@ -886,7 +902,7 @@ impl CsrGraph {
 /// Read-only view of one library for the semantic diagnostics seam — the
 /// context #120/#121 diagnose against (semantic crate's assumption contract
 /// documents what these fields guarantee). The per-unit faces a
-/// `dartq_semantic::diagnose` fold needs ride here: source text
+/// `dartq_semantic::diagnose_with` fold needs ride here: source text
 /// ([`LibraryView::store`] + the facts' content ids) and the token table
 /// (the persisted scan face of [`LibraryView::scanned`], filled by the
 /// apply-phase recompute — a miss re-derives the identical face locally).
@@ -915,6 +931,11 @@ pub struct LibraryView<'a> {
     /// The import namespaces of the current graph (built once per graph
     /// generation).
     pub namespaces: &'a dartq_resolution::Namespaces,
+    /// The language-strictness modes governing the library (the defining
+    /// file's analysis options, `unwrap_or(false)` per flag — the official
+    /// off posture): the `analyzer.language.strict-*` config → gate face
+    /// (#588 item 4, consumed by `dartq_semantic::diagnose_with`).
+    pub strict: dartq_semantic::StrictModes,
     /// The member files' persisted scan faces (token table + settled
     /// feature set, keyed by [`FileId`]); entries exist for cache hits the
     /// engine resolved before the call. A missing entry means the fold
@@ -926,7 +947,7 @@ pub struct LibraryView<'a> {
 /// The semantic diagnostics plug point (#120/#121).
 ///
 /// The engine ships the default implementor ([`semdiag::Diagnoser`], folding
-/// `dartq_semantic::diagnose`); a caller may substitute its own. Per-library
+/// `dartq_semantic::diagnose_with`); a caller may substitute its own. Per-library
 /// calls arrive on the batch fan-out workers, so implementations must be
 /// `Send + Sync` and stateless across calls; diagnostics append into `out`
 /// and carry no ordering obligations (the engine sorts canonically).

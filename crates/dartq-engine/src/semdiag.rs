@@ -1,5 +1,7 @@
 //! The engine's default [`SemanticDiagnoser`]: the #120/#121 plug point
-//! filled with `dartq_semantic::diagnose`, so the `undefined_*` /
+//! filled with `dartq_semantic::diagnose_with` (the library's
+//! `analyzer.language.strict-*` modes resolved from its analysis options,
+//! all-off without any), so the `undefined_*` /
 //! `wrong_number_of_*` families reach [`Engine::analyze`](crate::Engine::analyze)
 //! without the caller assembling an adapter (#236).
 //!
@@ -31,7 +33,7 @@
 //! ambiguous imports still suppress, and no emission site's logic
 //! changes with this widening.
 //!
-//! `dartq_semantic::diagnose` re-folds the collector's capture-time
+//! `dartq_semantic::diagnose_with` re-folds the collector's capture-time
 //! duplicate log into its report front; the bake in
 //! [`l1::duplicate_diagnostics`] is the single source, so the fold drops the
 //! re-issued `duplicate_definition`s and passes everything else through.
@@ -99,7 +101,7 @@ impl SemanticDiagnoser for Diagnoser {
                 local = face;
                 (feature_set, &local.tokens)
             };
-            let report = dartq_semantic::diagnose(
+            let report = dartq_semantic::diagnose_with(
                 text,
                 tokens,
                 ParserFeatures::from_feature_set(feature_set),
@@ -109,6 +111,10 @@ impl SemanticDiagnoser for Diagnoser {
                 library.graph,
                 library.namespaces,
                 &index,
+                // The library's `analyzer.language.strict-*` face (#588
+                // item 4): resolved from the governing analysis options at
+                // the view build, all-off without any.
+                library.strict,
             );
             out.extend(
                 report

@@ -1057,3 +1057,306 @@ fn engine_analyze_emits_and_relevels_options_rows() {
         "the override filters the options row: {diagnostics:?}"
     );
 }
+
+// --- enable-experiment (#588) ---
+
+/// The `enable-experiment` face (`_ParsedEnableExperimentsData.parse`,
+/// parse_model:470-536 + `validateFlags`, experiments_impl.dart:183-222):
+/// the flag list surfaces set-if-present across the include chain (a nearer
+/// list replaces a farther one whole, parser:207-215), and the rows pin the
+/// validation — unknown flag → `unsupported_option` (without values),
+/// expired flag → `invalid_option` (request matching the hardcoded state is
+/// "no longer required", contradicting it is "unconditionally enabled"),
+/// an opposite re-request → the conflict message, non-string entries and
+/// non-list sections → `invalid_section_format`.
+#[test]
+fn experiments_parse_merge_and_validate_rows() {
+    let dir = TempDir::new("experiments");
+    dir.write(
+        "far.yaml",
+        "analyzer:\n  enable-experiment: [data-assets, patterns]\n",
+    );
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "include: far.yaml\n",
+            "analyzer:\n",
+            "  enable-experiment:\n",
+            "    - variance\n",
+            "    - no-wildcard-variables\n",
+            "    - triple-shift\n",
+            "    - not-a-real-flag\n",
+            "    - 42\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    // The nearer list replaces the farther one whole (no union).
+    assert_eq!(
+        options.experiments,
+        Some(vec![
+            "variance".to_owned(),
+            "no-wildcard-variables".to_owned(),
+            "triple-shift".to_owned(),
+            "not-a-real-flag".to_owned(),
+        ]),
+        "string entries only, declaration order: {:?}",
+        options.experiments
+    );
+
+    let actual: Vec<(&str, String)> = options
+        .issues
+        .iter()
+        .map(|issue| (issue.code.name, issue.message.clone()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                "invalid_section_format",
+                "Invalid format for the 'enable-experiment' section.".to_owned()
+            ),
+            (
+                "invalid_option",
+                "Invalid option specified for 'enable-experiment': Flag \
+                 \"no-wildcard-variables\" was supplied, but the feature is already \
+                 unconditionally enabled."
+                    .to_owned()
+            ),
+            (
+                "invalid_option",
+                "Invalid option specified for 'enable-experiment': Flag \
+                 \"triple-shift\" is no longer required."
+                    .to_owned()
+            ),
+            (
+                "unsupported_option",
+                "The option 'not-a-real-flag' isn't supported by 'enable-experiment'.".to_owned()
+            ),
+        ],
+        "row order follows the file: the non-string entry, then validateFlags \
+         in flag order: {:?}",
+        options.issues
+    );
+    // The without-values correction.
+    assert_eq!(
+        options
+            .issues
+            .iter()
+            .find(|issue| issue.code.name == "unsupported_option")
+            .and_then(|issue| issue.correction.as_deref()),
+        Some("Try removing the option.")
+    );
+
+    // An opposite re-request reports the conflict; a same-value repeat and
+    // a non-list section are pinned too.
+    let conflict = TempDir::new("experiment_conflict");
+    conflict.write(
+        "analysis_options.yaml",
+        "analyzer:\n  enable-experiment: [variance, no-variance, variance]\n",
+    );
+    let options = AnalysisOptions::load(
+        &conflict.path("analysis_options.yaml"),
+        &empty_config(),
+        &conflict.0,
+    );
+    assert_eq!(
+        options
+            .issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>(),
+        ["Invalid option specified for 'enable-experiment': Flag \
+         \"no-variance\" conflicts with previous flag \"variance\""],
+        "the opposite re-request conflicts; the repeat does not: {:?}",
+        options.issues
+    );
+
+    let scalar = TempDir::new("experiment_scalar");
+    scalar.write(
+        "analysis_options.yaml",
+        "analyzer:\n  enable-experiment: variance\n",
+    );
+    let options = AnalysisOptions::load(
+        &scalar.path("analysis_options.yaml"),
+        &empty_config(),
+        &scalar.0,
+    );
+    assert_eq!(
+        options
+            .issues
+            .iter()
+            .map(|issue| issue.code.name)
+            .collect::<Vec<_>>(),
+        ["invalid_section_format"],
+        "a non-list section is invalid and nothing applies"
+    );
+    assert_eq!(options.experiments, None);
+}
+
+// --- Nested options directories (#588) ---
+
+/// Nested options files govern their own subtrees end-to-end: the nearest
+/// governing entry wins severity attribution (the deepest mapped ancestor,
+/// context_builder.dart:220-224), its excludes prune its subtree during
+/// discovery, and a file outside the subtree stays under the root's entry.
+#[test]
+fn nested_options_govern_their_subtree() {
+    use common::Fixture;
+
+    let fixture = Fixture::new(&[
+        ("lib/main.dart", "void main() {\n  var x = unknown;\n}\n"),
+        (
+            "lib/sub/late.dart",
+            "void delayed() {\n  var y = unknown;\n}\n",
+        ),
+        // Invalid syntax: if the nested exclusion failed, this would flood
+        // the output with parse rows.
+        ("lib/sub/hidden/gen.dart", "void broken() {\n"),
+    ]);
+    std::fs::write(
+        fixture.path("analysis_options.yaml"),
+        "analyzer:\n  errors:\n    undefined_identifier: warning\n",
+    )
+    .expect("root options");
+    std::fs::write(
+        fixture.path("lib/sub/analysis_options.yaml"),
+        "analyzer:\n  errors:\n    undefined_identifier: error\n  exclude:\n    - \"hidden/**\"\n",
+    )
+    .expect("nested options");
+
+    let mut engine = fixture.engine();
+    let stats = engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+
+    assert_eq!(
+        stats.file_count, 2,
+        "the nested exclude prunes hidden/: {stats:?}"
+    );
+    assert!(
+        engine
+            .file_table()
+            .try_file_id(&fixture.path("lib/sub/hidden/gen.dart"))
+            .is_none(),
+        "the nested glob drops the file from the analysis set"
+    );
+
+    let severity_of = |relative: &str| {
+        let file = engine
+            .file_table()
+            .try_file_id(&fixture.path(relative))
+            .expect("interned");
+        diagnostics
+            .iter()
+            .find(|d| d.file == file && d.code.name == "undefined_identifier")
+            .map(|d| d.severity)
+            .expect("the row exists")
+    };
+    // main.dart sits under the root entry only: the root's `warning` holds.
+    assert_eq!(
+        severity_of("lib/main.dart"),
+        dartq_diagnostics::Severity::Warning
+    );
+    // late.dart sits under both entries: the deepest (nested `error`) wins.
+    assert_eq!(
+        severity_of("lib/sub/late.dart"),
+        dartq_diagnostics::Severity::Error
+    );
+}
+
+/// Nested options files are independent include chains: without an explicit
+/// `include:`, a nested file contributes nothing to the root entry's merge
+/// and inherits nothing from it (each mapped file is parsed on its own,
+/// context_builder.dart:196-206) — chaining happens only through `include:`.
+#[test]
+fn nested_options_are_independent_chains() {
+    let dir = TempDir::new("nested_chains");
+    dir.write(
+        "analysis_options.yaml",
+        "linter:\n  rules:\n    - alpha_rule\n",
+    );
+    dir.write(
+        "lib/sub/analysis_options.yaml",
+        "linter:\n  rules:\n    - beta_rule\n",
+    );
+
+    let per_root = AnalysisOptions::for_roots(&[dir.path("")], &empty_config(), &dir.0);
+
+    let root = per_root.get(&dir.path("")).expect("root entry");
+    assert_eq!(root.lint_rules, ["alpha_rule"]);
+    let nested = per_root.get(&dir.path("lib/sub")).expect("nested entry");
+    assert_eq!(nested.lint_rules, ["beta_rule"]);
+}
+
+/// The fallback base without any options file in the ancestry: the
+/// synthesized default — the official `AnalysisOptionsImpl()` defaults
+/// (no lints, strictness unset, no excludes, no overrides). The official
+/// SDK default options file exists only for Blaze workspaces
+/// (`WorkspaceWithDefaultAnalysisOptions`, workspace.dart:146; blaze.dart
+/// :183) — a pub workspace never mounts one, so the defaults are the base.
+#[test]
+fn sdk_default_options_are_the_fallback_base() {
+    let dir = TempDir::new("defaults");
+    let per_root = AnalysisOptions::for_roots(&[dir.path("pkg")], &empty_config(), &dir.0);
+
+    let options = per_root.get(&dir.path("pkg")).expect("default entry");
+    assert!(options.lint_rules.is_empty());
+    assert_eq!(options.strict_casts, None);
+    assert_eq!(options.strict_inference, None);
+    assert_eq!(options.strict_raw_types, None);
+    assert_eq!(options.experiments, None);
+    assert!(options.exclude_globs().is_empty());
+    assert!(options.issues.is_empty());
+    assert!(options.file_path.as_os_str().is_empty());
+    // No overrides: every declared severity stands, every code ignorable.
+    assert_eq!(
+        options.processed_severity("dead_code", dartq_diagnostics::Severity::Warning),
+        Some(dartq_diagnostics::Severity::Warning)
+    );
+    assert!(options.is_ignorable("dead_code"));
+}
+
+// --- analyzer language modes → the semantic gates (#588 item 4) ---
+
+/// The `analyzer.language.strict-*` config → engine → semantic gate face
+/// end to end: `strict-raw-types: true` turns the raw generic annotation
+/// row on (`strict_raw_type` for a group-less local container with an
+/// unbounded parameter), and without the flag the same source stays silent
+/// (the official off posture — the config is the only activation).
+#[test]
+fn strict_modes_flow_from_options_to_the_semantic_gate() {
+    use common::Fixture;
+
+    let source = [("lib/main.dart", "class C<T> {}\nC c = C();\n")];
+
+    let on = Fixture::new(&source);
+    std::fs::write(
+        on.path("analysis_options.yaml"),
+        "analyzer:\n  language:\n    strict-raw-types: true\n",
+    )
+    .expect("options");
+    let mut engine = on.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+    assert!(
+        diagnostics.iter().any(|d| d.code.name == "strict_raw_type"),
+        "strict-raw-types turns the raw annotation row on: {diagnostics:?}"
+    );
+
+    let off = Fixture::new(&source);
+    let mut engine = off.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+    assert!(
+        diagnostics.iter().all(|d| d.code.name != "strict_raw_type"),
+        "the off posture stays silent: {diagnostics:?}"
+    );
+}

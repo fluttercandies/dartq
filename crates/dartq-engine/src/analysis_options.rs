@@ -59,6 +59,17 @@
 //!   (`_ParsedLanguageData.parse`, parse_model:904-998; `_applyLanguage`,
 //!   parser:250-260). Parsed and exposed only — the semantic consumption is
 //!   #480's.
+//! - **Experiments** — `analyzer.enable-experiment` parses as a flag list
+//!   (`_ParsedEnableExperimentsData.parse`, parse_model:470-536: non-list →
+//!   `invalid_section_format`, non-string entries row + skip) and applies
+//!   set-if-present across the chain (`_applyEnableExperiments`,
+//!   parser:207-215 — a nearer list replaces a farther one whole). The
+//!   official `validateFlags` (experiments_impl.dart:183-222) rows ride the
+//!   self-diagnostics: an unknown flag (the pinned `experiments.g.dart`
+//!   table, `no-` stripped) reports `unsupported_option`, an expired flag
+//!   reports `invalid_option` ("no longer required" vs "unconditionally
+//!   enabled"), and an opposite re-request reports the conflict. Flags are
+//!   parsed and exposed only — the engine consumes no experiment semantics.
 //! - **Self-diagnostics (#457)** — the options file's own problems surface
 //!   instead of degrading silently. The official reports every options
 //!   diagnostic on the *initial* file: include-chain rows directly at the
@@ -215,11 +226,12 @@ pub struct DeclaredRule {
     pub length: u32,
 }
 
-/// One package root's fully merged analysis options (the
+/// One governing directory's fully merged analysis options (the
 /// `ResolvedAnalysisOptions` slice PRD §12.1 names, limited to the sections
 /// this engine consumes: the lint rule set, the exclude globs, the
-/// `errors`/`cannot-ignore` severity face, and the language strictness
-/// scalars — the latter parsed and exposed only, #480 consumes them).
+/// `errors`/`cannot-ignore` severity face, the language strictness scalars,
+/// and the experiment flag list — the latter parsed and exposed only, #480
+/// consumes the strictness flags).
 #[derive(Debug, Default)]
 pub struct AnalysisOptions {
     /// Effective enabled lint rule names — the union across the include
@@ -236,6 +248,12 @@ pub struct AnalysisOptions {
     /// `analyzer.language.strict-raw-types`, same merge and caveat as
     /// [`AnalysisOptions::strict_casts`].
     pub strict_raw_types: Option<bool>,
+    /// `analyzer.enable-experiment` flag strings, in declaration order —
+    /// set-if-present across the include chain, a nearer file's list
+    /// replacing a farther one whole (`_applyEnableExperiments` assigns
+    /// `builder.contextFeatures`, parser:207-215). Parsed and exposed only;
+    /// the engine consumes no experiment semantics.
+    pub experiments: Option<Vec<String>>,
     /// Per-code severity overrides, keyed by lowercased code name; `None`
     /// filters the code, `Some` re-levels it (the official
     /// `ErrorProcessor` list's per-code map form).
@@ -406,10 +424,19 @@ impl AnalysisOptions {
         merge.build()
     }
 
-    /// One merged [`AnalysisOptions`] per package root, sharing loaded files
-    /// through `loaded` (workspace members under one repo-root options file
-    /// parse it once). Roots without any options file map to the shared
-    /// default.
+    /// One merged [`AnalysisOptions`] per governing directory, sharing
+    /// loaded files through `loaded` (workspace members under one repo-root
+    /// options file parse it once). Every package root maps to its entry:
+    /// the nearest `analysis_options.yaml` in its ancestry, or the
+    /// synthesized default (no file at all). Nested options files inside
+    /// each root's discovery surfaces are located and mapped to their own
+    /// directories — the official `optionsFileMap` (context_locator.dart
+    /// :393-401 registers each nested file at its folder; the consumer
+    /// resolves a file's options through the deepest mapped ancestor,
+    /// context_builder.dart:220-224) — each parsed with its own include
+    /// chain, not chained onto the root's. A nested file's exclude globs
+    /// join the root's walk predicate, anchored to its own directory (the
+    /// official `root.excludedGlobs.addAll`, context_locator.dart:402-409).
     #[must_use]
     pub fn for_roots(
         roots: &[PathBuf],
@@ -429,7 +456,70 @@ impl AnalysisOptions {
             };
             per_root.insert(root.clone(), options);
         }
+        for root in roots {
+            let base = per_root[root].clone();
+            Self::locate_nested(root, base, &mut loaded, &mut per_root, packages, config_dir);
+        }
         per_root
+    }
+
+    /// Walks `root`'s discovery surfaces (the same dot rule and exclude
+    /// pruning discovery applies) registering every nested options file at
+    /// its directory. Descent prunes against the globs accumulated so far —
+    /// the root's own first, each nested file's as it registers — mirroring
+    /// the official locator's walk under `containingRoot.excludedGlobs`
+    /// (context_locator.dart:411-431). Termination: the queue holds real
+    /// directories only (symlinked dirs are never entered, `entry.file_type`
+    /// is link-host) over a finite tree.
+    fn locate_nested(
+        root: &Path,
+        base: Arc<AnalysisOptions>,
+        loaded: &mut FxHashMap<PathBuf, Arc<AnalysisOptions>>,
+        out: &mut FxHashMap<PathBuf, Arc<AnalysisOptions>>,
+        packages: &PackageConfig,
+        config_dir: &Path,
+    ) {
+        const SURFACES: [&str; 4] = ["lib", "bin", "test", "tool"];
+        // The accumulated governing entries: the root's own first, each
+        // nested file's as it registers. Exclusion tests every entry's
+        // globs, each anchored to its declaring directory.
+        let mut governing: Vec<Arc<AnalysisOptions>> = vec![base];
+        let excluded = |path: &Path, governing: &[Arc<AnalysisOptions>]| {
+            governing.iter().any(|options| options.is_excluded(path))
+        };
+        let mut queue: Vec<PathBuf> = SURFACES.iter().map(|s| root.join(s)).collect();
+        while let Some(dir) = queue.pop() {
+            // Pop-time exclusion: a glob registered while this dir sat in
+            // the queue (its parent batch found a nested options file) must
+            // prune it — registration order inside one batch must not leak
+            // through.
+            if excluded(&dir, &governing) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if file_type.is_dir() {
+                    if !name.starts_with('.') {
+                        queue.push(path);
+                    }
+                } else if name == OPTIONS_FILE_NAME {
+                    let options = loaded
+                        .entry(path.clone())
+                        .or_insert_with(|| Arc::new(Self::load(&path, packages, config_dir)))
+                        .clone();
+                    governing.push(Arc::clone(&options));
+                    out.insert(dir.clone(), options);
+                }
+            }
+        }
     }
 }
 
@@ -449,6 +539,7 @@ struct MergeState {
     strict_casts: Option<bool>,
     strict_inference: Option<bool>,
     strict_raw_types: Option<bool>,
+    experiments: Option<Vec<String>>,
     excludes: Vec<ExcludeGlob>,
     /// Deduplication key of the official `Set<AnalysisOptionsExcludePattern>`:
     /// (declaring file, pattern).
@@ -604,6 +695,9 @@ impl MergeState {
         self.strict_casts = casts.or(self.strict_casts);
         self.strict_inference = inference.or(self.strict_inference);
         self.strict_raw_types = raw_types.or(self.strict_raw_types);
+        if let Some(experiments) = experiment_flags(map) {
+            self.experiments = Some(experiments);
+        }
         if is_initial {
             self.issues.extend(local_issues(map, &self.initial_text));
         }
@@ -625,6 +719,7 @@ impl MergeState {
             strict_casts: self.strict_casts,
             strict_inference: self.strict_inference,
             strict_raw_types: self.strict_raw_types,
+            experiments: self.experiments,
             severity_overrides: self.errors,
             unignorable: self.unignorable,
             excludes: self.excludes,
@@ -845,6 +940,194 @@ fn language_scalars(map: &serde_yaml::Mapping) -> (Option<bool>, Option<bool>, O
 
 // --- Local shape rows (the initial file's own sections, #457) ---
 
+/// `Invalid option specified for '{0}': {1}` (registry :9521-9535 —
+/// `STATIC_WARNING`; the detail message comes from the flag validation).
+const INVALID_OPTION: CodeInfo = CodeInfo::new(
+    "invalid_option",
+    "INVALID_OPTION",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// The experimental flags the pinned SDK knows (`experiments.g.dart`,
+/// dart 3.15 main — the `EnableString` table): the unknown-flag gate of
+/// [`experiment_flag_issues`]. Version-pinned data — a flag outside this
+/// list reports `unsupported_option` exactly as the official
+/// `validateFlags` does for its `_knownFeatures` miss.
+const KNOWN_EXPERIMENTS: [&str; 48] = [
+    "anonymous-methods",
+    "augmentations",
+    "class-modifiers",
+    "const-functions",
+    "constant-update-2018",
+    "constructor-tearoffs",
+    "control-flow-collections",
+    "data-assets",
+    "digit-separators",
+    "dot-shorthands",
+    "enhanced-enums",
+    "enhanced-parts",
+    "extension-methods",
+    "generic-metadata",
+    "getter-setter-error",
+    "inference-update-1",
+    "inference-update-2",
+    "inference-update-3",
+    "inference-update-4",
+    "inference-using-bounds",
+    "inline-class",
+    "macros",
+    "named-arguments-anywhere",
+    "native-assets",
+    "non-nullable",
+    "nonfunction-type-aliases",
+    "null-aware-elements",
+    "patterns",
+    "primary-constructors",
+    "private-named-parameters",
+    "promotion-chain-intersection-join",
+    "receiver-type-inference",
+    "record-use",
+    "records",
+    "sealed-class",
+    "set-literals",
+    "single-combinators",
+    "sound-flow-analysis",
+    "spread-collections",
+    "static-extensions",
+    "super-parameters",
+    "test-experiment",
+    "this-promotion",
+    "triple-shift",
+    "unnamed-libraries",
+    "unquoted-imports",
+    "variance",
+    "wildcard-variables",
+];
+
+/// The expired subset of [`KNOWN_EXPERIMENTS`] (`IsExpired`, same pinned
+/// table — all 31 are enabled-by-default, their behavior hardcoded into the
+/// toolchain): expired flags always report `invalid_option`, with the
+/// detail choosing "no longer required" (request matches the hardcoded
+/// state) vs "unconditionally enabled" (it contradicts it).
+const EXPIRED_EXPERIMENTS: [&str; 31] = [
+    "class-modifiers",
+    "constant-update-2018",
+    "constructor-tearoffs",
+    "control-flow-collections",
+    "digit-separators",
+    "dot-shorthands",
+    "enhanced-enums",
+    "extension-methods",
+    "generic-metadata",
+    "getter-setter-error",
+    "inference-update-1",
+    "inference-update-2",
+    "inference-update-3",
+    "inference-using-bounds",
+    "inline-class",
+    "named-arguments-anywhere",
+    "native-assets",
+    "non-nullable",
+    "nonfunction-type-aliases",
+    "null-aware-elements",
+    "patterns",
+    "private-named-parameters",
+    "records",
+    "sealed-class",
+    "set-literals",
+    "sound-flow-analysis",
+    "spread-collections",
+    "super-parameters",
+    "triple-shift",
+    "unnamed-libraries",
+    "wildcard-variables",
+];
+
+/// The `analyzer.enable-experiment` flag strings (the merge-side read of
+/// `_ParsedEnableExperimentsData.parse`, parse_model:470-536): list-only,
+/// string entries only — a non-list section is `None` (nothing applies),
+/// non-string entries are skipped. `(flags, present)`.
+fn experiment_flags(map: &serde_yaml::Mapping) -> Option<Vec<String>> {
+    let experiments = map.get(Value::from("analyzer"))?.as_mapping()?;
+    match experiments.get(Value::from("enable-experiment")) {
+        Some(Value::Sequence(list)) => Some(
+            list.iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The `validateFlags` rows for one file's flag list (experiments_impl.dart
+/// :183-222, reported per parse_model:510-524): an unknown flag — `no-`
+/// stripped before the known-feature test — reports `unsupported_option`
+/// (the without-values variant), an expired flag reports `invalid_option`
+/// ("no longer required" when the request matches the hardcoded state,
+/// "unconditionally enabled" otherwise), and an opposite second request for
+/// an already-requested feature reports the conflict. Anchors at the flag
+/// token's first occurrence.
+fn experiment_flag_issues(flags: &[String], text: &str) -> Vec<OptionsIssue> {
+    let mut issues = Vec::new();
+    let mut requested: FxHashMap<&str, bool> = FxHashMap::default();
+    for flag in flags {
+        let (feature, value) = match flag.strip_prefix("no-") {
+            Some(feature) => (feature, false),
+            None => (flag.as_str(), true),
+        };
+        if !KNOWN_EXPERIMENTS.contains(&feature) {
+            let (offset, length) = anchor_span(text, flag);
+            issues.push(OptionsIssue {
+                code: UNSUPPORTED_OPTION,
+                message: format!("The option '{flag}' isn't supported by 'enable-experiment'."),
+                correction: Some("Try removing the option.".to_owned()),
+                offset,
+                length,
+            });
+        } else if EXPIRED_EXPERIMENTS.contains(&feature) {
+            let detail = if value {
+                format!("Flag \"{flag}\" is no longer required.")
+            } else {
+                format!(
+                    "Flag \"{flag}\" was supplied, but the feature is already \
+                     unconditionally enabled."
+                )
+            };
+            let (offset, length) = anchor_span(text, flag);
+            issues.push(OptionsIssue {
+                code: INVALID_OPTION,
+                message: format!("Invalid option specified for 'enable-experiment': {detail}"),
+                correction: None,
+                offset,
+                length,
+            });
+        } else if requested.get(feature) == Some(&!value) {
+            let previous = if value {
+                format!("no-{feature}")
+            } else {
+                feature.to_owned()
+            };
+            let (offset, length) = anchor_span(text, flag);
+            issues.push(OptionsIssue {
+                code: INVALID_OPTION,
+                message: format!(
+                    "Invalid option specified for 'enable-experiment': \
+                     Flag \"{flag}\" conflicts with previous flag \"{previous}\""
+                ),
+                correction: None,
+                offset,
+                length,
+            });
+        } else {
+            // Not a conflict (first request, or a same-value repeat): the
+            // request records, matching the official else arm.
+            requested.insert(feature, value);
+        }
+    }
+    issues
+}
+
 /// The `analyzer` keys the official supports (`analyzerOptions`,
 /// analysis_options_file.dart:99-108, in the set literal's insertion order —
 /// the proposal text follows it).
@@ -890,7 +1173,9 @@ const EFFECTIVE_ERROR_ACTIONS: [&str; 5] = ["ignore", "false", "error", "info", 
 /// keys report `unrecognized_error_code`, non-boolean `language` values
 /// report `unsupported_value` — faces dartq has not built, silent here; the
 /// sections the engine does not consume (code-style, formatter, plugins,
-/// enable-experiment, strong-mode, optional-checks) are silent too.
+/// strong-mode, optional-checks) are silent too. `enable-experiment`
+/// (:470-536: non-list → row, non-string entry → row, then the
+/// `validateFlags` rows) is pinned in [`experiment_flag_issues`].
 fn local_issues(map: &serde_yaml::Mapping, text: &str) -> Vec<OptionsIssue> {
     let mut issues = Vec::new();
     let analyzer = match map.get(Value::from("analyzer")) {
@@ -980,6 +1265,30 @@ fn local_issues(map: &serde_yaml::Mapping, text: &str) -> Vec<OptionsIssue> {
                 }
             }
             Some(_) => push_invalid_section(&mut issues, text, "language", "language"),
+        }
+        // `enable-experiment` (parse_model:470-536) — not null-tolerant
+        // (`valueAt` returns the node, so a present-but-empty entry is a
+        // scalar); the flag validation rides the shape rows.
+        match analyzer.get(Value::from("enable-experiment")) {
+            None => {}
+            Some(Value::Sequence(list)) => {
+                let mut flags = Vec::new();
+                for entry in list {
+                    match entry.as_str() {
+                        Some(flag) => flags.push(flag.to_owned()),
+                        None => push_invalid_section(
+                            &mut issues,
+                            text,
+                            "enable-experiment",
+                            "enable-experiment",
+                        ),
+                    }
+                }
+                issues.extend(experiment_flag_issues(&flags, text));
+            }
+            Some(_) => {
+                push_invalid_section(&mut issues, text, "enable-experiment", "enable-experiment")
+            }
         }
     }
     // `linter` (:1130-1184) — null-tolerant; the unknown-key proposal is
