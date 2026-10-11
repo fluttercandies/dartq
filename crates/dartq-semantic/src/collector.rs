@@ -56,7 +56,15 @@
 //!   (local functions, closures) from clobbering a header count.
 //! * Declared types arm at `handle_type`/`handle_void_keyword` and disarm
 //!   at `handle_no_type` — every declaration head (typed or not) runs one
-//!   `parse_type`, so the arm never leaks across declarations.
+//!   `parse_type`, so the arm never leaks across declarations. The
+//!   written-type capture (#728) rides the same discipline: an annotation
+//!   site's argument group feeds a [`TreeSink`], the completing head
+//!   finalizes a single-root tree beside the armed type, and the
+//!   consuming declaration (`take_armed`) interns it bottom-up through
+//!   [`FileElements::type_args_mut`] — the pool's only intern entry, so
+//!   the pools stay capture-immutable after `collect`. Poisoned shapes
+//!   (function/record types inside the tree) and group-less heads stay
+//!   argument-less.
 //! * Declaration-arity violations (operator parameter counts, setter
 //!   parameter shape) are logged at commit into
 //!   [`FileElements::arity_violations`]; hash-map order must not reach the
@@ -79,9 +87,11 @@ use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
+use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
-    ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
-    FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
+    Annotation, ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
+    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal,
+    TopDecl, Ty,
 };
 
 use dartq_source::SourceRange;
@@ -138,6 +148,9 @@ struct OpenContainer {
     /// selector for `A.named`, the container's name for `A()`); flushed
     /// into the finished [`Container::ctor_formals`].
     ctor_formals: FxHashMap<StringId, Box<Formals>>,
+    /// The declaration's metadata star (`crate::model::Annotation`),
+    /// drained from the builder's pending buffer at the open.
+    annotations: Vec<Annotation>,
 }
 
 /// The open constructor's capture: the named selectors it declares plus
@@ -291,8 +304,31 @@ struct Builder<'src, 'tab> {
     /// The armed declared type (`handle_type`/`handle_void_keyword` arm,
     /// `handle_no_type` disarms).
     armed_ty: Option<Ty>,
+    /// The completed written-type tree of the current annotation (the
+    /// shared #610 capture, #728): armed beside [`Builder::armed_ty`] at
+    /// `handle_type`, consumed with it — the only pool-intern entry.
+    armed_tree: Option<TypeTree>,
+    /// The open annotation-site capture: one [`TreeSink`] fed by the
+    /// type events while an annotation's argument group is open.
+    capture: Option<TreeSink>,
+    /// The type head awaiting its argument group (`List` of `List<int>`),
+    /// armed at the `TypeReference` identifier and consumed at
+    /// `begin_type_arguments` or the head's own completion.
+    pending_type_head: Option<(StringId, SourceRange)>,
     /// The latched declared type of the open field group.
     field_group_ty: Option<Ty>,
+    /// The metadata star of the declaration that opens next, in written
+    /// order (`crate::model::Annotation`). Sealed at `end_metadata`,
+    /// drained by the next `open_container`; every other top-level
+    /// declaration boundary clears it — annotations belong to the
+    /// declaration they directly precede. Member annotations (inside an
+    /// open container) never buffer.
+    pending_annotations: Vec<Annotation>,
+    /// The annotation being parsed (open between `begin_metadata` and
+    /// `end_metadata`): the head name latches at `MetadataReference`,
+    /// qualified segments join, `end_metadata` seals the entry. `None`
+    /// outside a metadata star at top level.
+    open_annotation: Option<Annotation>,
 }
 
 impl<'src, 'tab> Builder<'src, 'tab> {
@@ -328,7 +364,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             super_candidate: None,
             executable_header_done: false,
             armed_ty: None,
+            armed_tree: None,
+            capture: None,
+            pending_type_head: None,
             field_group_ty: None,
+            pending_annotations: Vec::new(),
+            open_annotation: None,
         }
     }
 
@@ -396,8 +437,47 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// The armed declared type, or [`Ty::UNKNOWN`] when the head had none.
+    ///
+    /// This is the pool's only intern entry: a captured argument tree
+    /// interns here, at the moment a declaration consumes the annotation —
+    /// never for body noise, never after `collect` returns (the pools are
+    /// capture-immutable once [`FileElements`] is `Arc`-shared). The
+    /// conversion is bottom-up (model.rs:243-246, `into_ty` the working
+    /// reference): each argument subtree becomes a [`Ty`] first, then the
+    /// outer list interns. A poisoned tree or a group-less head stays
+    /// argument-less — the under-report direction.
     fn take_armed(&mut self) -> Ty {
-        self.armed_ty.take().unwrap_or(Ty::UNKNOWN)
+        let tree = self.armed_tree.take();
+        let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+        match (ty, tree) {
+            (Ty::Named { name, nullable, .. }, Some(tree))
+                if !tree.poisoned && !tree.args.is_empty() =>
+            {
+                self.named_from_tree(name, nullable, tree)
+            }
+            _ => ty,
+        }
+    }
+
+    /// Builds `name<...args...>` from a captured tree: the arguments
+    /// convert first (left-to-right source order, inner lists interned by
+    /// the recursion), then the outer list interns canonically.
+    fn named_from_tree(&mut self, name: StringId, nullable: bool, tree: TypeTree) -> Ty {
+        let args: Vec<Ty> = tree.args.into_iter().map(|arg| self.arg_ty(arg)).collect();
+        self.file.type_args_mut().named(name, nullable, &args)
+    }
+
+    /// One argument subtree. The head canonicalizes exactly like the
+    /// annotation head ([`DeclarationCollector::handle_type`]'s match —
+    /// `dynamic`/`void`/`Null` keep their dedicated [`Ty`] shapes); a
+    /// subtree with arguments recurses, a leaf stays pool-free.
+    fn arg_ty(&mut self, tree: TypeTree) -> Ty {
+        match self.strings.resolve(tree.head) {
+            "dynamic" => Ty::Dynamic,
+            "void" => Ty::Void,
+            "Null" => Ty::Null,
+            _ => self.named_from_tree(tree.head, tree.nullable, tree),
+        }
     }
 
     /// The field group's declared type: latched at the group's first name,
@@ -409,6 +489,75 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.field_group_ty.expect("latched above")
     }
 
+    /// Latches the head identifier of the annotation being parsed
+    /// (top-level only — member annotations are not the container face;
+    /// the W7 constructor face rides the diagnoser's own annotation
+    /// latch).
+    fn note_annotation_head(&mut self, name: StringId, range: SourceRange) {
+        if self.containers.is_empty() {
+            self.open_annotation = Some(Annotation { name, range });
+        }
+    }
+
+    /// Joins one qualified segment into the open annotation's name
+    /// (`@meta.sealed` interns the dot-joined spelling once; the string
+    /// table dedups repeated spellings).
+    fn note_annotation_segment(&mut self, name: StringId, range: SourceRange) {
+        if let Some(open) = &mut self.open_annotation {
+            let joined = format!(
+                "{}.{}",
+                self.strings.resolve(open.name),
+                self.strings.resolve(name)
+            );
+            open.name = self.strings.intern(&joined);
+            open.range.length = range.offset + range.length - open.range.offset;
+        }
+    }
+
+    /// Seals the open annotation into the pending star, `@` through the
+    /// name's last segment. The parser fires `end_metadata` exactly once
+    /// per `begin_metadata` (linear `parse_metadata`), so `take` sees the
+    /// entry when one was captured and `None` for nameless junk.
+    fn seal_annotation(&mut self, at_offset: u32) {
+        if let Some(mut open) = self.open_annotation.take() {
+            open.range.length += open.range.offset - at_offset;
+            open.range.offset = at_offset;
+            self.pending_annotations.push(open);
+        }
+    }
+
+    /// Drops the pending star: every top-level declaration boundary other
+    /// than a container opening claims (and discards) the annotations that
+    /// precede it — annotations bind to the declaration they directly
+    /// precede.
+    fn drop_pending_annotations(&mut self) {
+        self.pending_annotations.clear();
+    }
+
+    /// Closes the open annotation capture at the completing head: the
+    /// re-fired parameterized head merges into the root (carrying the
+    /// trailing `?`), and a single-root site arms the tree beside the
+    /// declared type. A completion inside an open argument group (the
+    /// inner `T` of `List<T>`) routes into the site and leaves it open —
+    /// the site is only claimed when its outermost group has closed. Any
+    /// other shape — a leftover root, an ambiguous multi-root site —
+    /// drops the capture: the argument-less direction.
+    fn complete_type_site(
+        &mut self,
+        head: StringId,
+        nullable: bool,
+        range: SourceRange,
+    ) -> Option<TypeTree> {
+        let mut site = self.capture.take()?;
+        site.leaf(head, nullable, range);
+        if !site.stack.is_empty() {
+            self.capture = Some(site);
+            return None;
+        }
+        let mut roots = site.done;
+        if roots.len() == 1 { roots.pop() } else { None }
+    }
+
     fn open_container(
         &mut self,
         kind: ContainerKind,
@@ -418,6 +567,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if let Some((name, range)) = name {
             self.declare_top(name, range, TopDecl::bare(tag));
         }
+        // The declaration's metadata star closed before this open (the
+        // parser fires it first); it belongs to this container.
+        let annotations = std::mem::take(&mut self.pending_annotations);
         // The header's type variables closed before this open (official
         // event order); they belong to this container.
         let header_type_params = std::mem::take(&mut self.header_type_params);
@@ -461,6 +613,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ctor_named: Vec::new(),
             ctor_has_unnamed: true,
             ctor_formals: FxHashMap::default(),
+            annotations,
         });
         // The `extends` head latches on class-family declarations only
         // (including a named mixin application's head type); enum
@@ -525,6 +678,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor: open.ctor_has_unnamed,
                 ctor_formals: open.ctor_formals,
+                annotations: open.annotations.into_boxed_slice(),
             });
         }
         // Extension headers capture no residue (their window's types latch
@@ -877,6 +1031,29 @@ pub fn container_modifiers(container: &Container) -> ClassModifiers {
 }
 
 impl ParserListener for DeclarationCollector<'_, '_> {
+    // Directive boundaries: an annotated directive (`@Deprecated import ...`)
+    // fires its metadata first and no declaration event after — its
+    // annotations bind to the directive and drop here.
+    fn begin_import(&mut self, _token: Token) {
+        self.builder.borrow_mut().drop_pending_annotations();
+    }
+
+    fn begin_export(&mut self, _token: Token) {
+        self.builder.borrow_mut().drop_pending_annotations();
+    }
+
+    fn begin_part(&mut self, _token: Token) {
+        self.builder.borrow_mut().drop_pending_annotations();
+    }
+
+    fn begin_library_name(&mut self, _token: Token) {
+        self.builder.borrow_mut().drop_pending_annotations();
+    }
+
+    fn begin_library_augmentation(&mut self, _augment_kw: Token, _library_keyword: Token) {
+        self.builder.borrow_mut().drop_pending_annotations();
+    }
+
     fn begin_class_declaration(
         &mut self,
         _begin: Token,
@@ -909,6 +1086,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
         self.builder.borrow_mut().end_header_window();
+    }
+
+    /// An unannotated declaration boundary: the star carried no
+    /// annotation, so anything still pending binds to nothing and drops
+    /// (recovery residue between declarations included).
+    fn end_metadata_star(&mut self, count: usize) {
+        if count == 0 {
+            self.builder.borrow_mut().drop_pending_annotations();
+        }
+    }
+
+    /// Seals the open annotation: the span widens back to the `@` sign
+    /// (`begin`), the official annotation-anchored report position.
+    fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, _end: Token) {
+        let at_offset = begin.range.offset;
+        self.builder.borrow_mut().seal_annotation(at_offset);
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
@@ -1148,30 +1341,103 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // where the canonical `Ty` is the observable contract (the
         // strict-casts overlay's source/target predicates, the nullability
         // faces). Every other name stays as written.
-        builder.armed_ty =
-            builder
-                .name_of(name)
-                .map(|spelling| match builder.strings.resolve(spelling) {
-                    "dynamic" => Ty::Dynamic,
-                    "void" => Ty::Void,
-                    "Null" => Ty::Null,
-                    _ => Ty::Named {
-                        name: spelling,
-                        nullable: question.is_some(),
-                        args: ArgListId::EMPTY,
-                    },
-                });
+        let spelling = builder.name_of(name);
+        // The head's own group (if any) closed before this completion;
+        // the slot is consumed either way.
+        builder.pending_type_head = None;
+        // The #610 capture, collector-side: the completing head merges
+        // into the open site's root (the re-fired parameterized head
+        // carries the trailing `?`), and a single-root tree arms beside
+        // the type for the consuming declaration to intern.
+        builder.armed_tree = spelling.and_then(|spelling| {
+            let range = match question {
+                Some(q) => SourceRange {
+                    offset: name.range.offset,
+                    length: q.range.end() - name.range.offset,
+                },
+                None => name.range,
+            };
+            builder.complete_type_site(spelling, question.is_some(), range)
+        });
+        builder.armed_ty = spelling.map(|spelling| match builder.strings.resolve(spelling) {
+            "dynamic" => Ty::Dynamic,
+            "void" => Ty::Void,
+            "Null" => Ty::Null,
+            _ => Ty::Named {
+                name: spelling,
+                nullable: question.is_some(),
+                args: ArgListId::EMPTY,
+            },
+        });
     }
     fn handle_no_type(&mut self, _last_consumed: Token) {
-        self.builder.borrow_mut().armed_ty = None;
+        let mut builder = self.builder.borrow_mut();
+        builder.armed_ty = None;
+        builder.armed_tree = None;
     }
 
     fn handle_void_keyword(&mut self, _token: Token) {
-        self.builder.borrow_mut().armed_ty = Some(Ty::Void);
+        let mut builder = self.builder.borrow_mut();
+        // A `void` type argument (`List<void>`) is a leaf of the open
+        // capture like any named head; outside a capture a stale tree
+        // cannot survive the arm.
+        let void_id = builder.strings.intern("void");
+        if let Some(site) = builder.capture.as_mut() {
+            site.leaf(void_id, false, _token.range);
+        } else {
+            builder.armed_tree = None;
+        }
+        builder.armed_ty = Some(Ty::Void);
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
-        self.builder.borrow_mut().armed_ty = Some(Ty::Void);
+        let mut builder = self.builder.borrow_mut();
+        builder.armed_tree = None;
+        builder.armed_ty = Some(Ty::Void);
+    }
+
+    fn begin_type_arguments(&mut self, _token: Token) {
+        let mut builder = self.builder.borrow_mut();
+        let head = builder.pending_type_head.take();
+        match (&mut builder.capture, head) {
+            (Some(site), Some((head, range))) => site.begin_group(Some((head, range))),
+            // A headless group inside a capture poisons its parent (the
+            // sink's discipline); an expression group (`f<int>()`) is
+            // never a site.
+            (Some(site), None) => site.begin_group(None),
+            (None, Some((head, range))) => {
+                let mut site = TreeSink::default();
+                site.begin_group(Some((head, range)));
+                builder.capture = Some(site);
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn end_type_arguments(&mut self, _count: usize, begin: Token, end: Token) {
+        let mut builder = self.builder.borrow_mut();
+        if let Some(site) = builder.capture.as_mut() {
+            site.end_group(SourceRange {
+                offset: begin.range.offset,
+                length: end.range.end() - begin.range.offset,
+            });
+        }
+    }
+
+    fn begin_function_type(&mut self, _begin: Token) {
+        // Function-type shapes are outside the model's `Ty`: poison the
+        // open capture (the conversion stays argument-less).
+        let mut builder = self.builder.borrow_mut();
+        if let Some(site) = builder.capture.as_mut() {
+            site.poison();
+        }
+    }
+
+    fn begin_record_type(&mut self, _left_paren: Token) {
+        let mut builder = self.builder.borrow_mut();
+        if let Some(site) = builder.capture.as_mut() {
+            site.poison();
+        }
     }
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
@@ -1183,6 +1449,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         match context {
             IdentifierContext::TypeReference | IdentifierContext::TypeReferenceContinuation => {
                 let offset = name_with_range.map_or(0, |(_, range)| range.offset);
+                // The annotation head awaits its argument group (the
+                // collector-side #610 capture). A continuation never
+                // carries one — a prefixed `p.C` completes its type
+                // through the head token's own `handle_type`.
+                if context == IdentifierContext::TypeReference {
+                    builder.pending_type_head = name_with_range;
+                }
                 builder.note_header_reference(context, name, offset);
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
@@ -1293,6 +1566,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     pending.name = name_with_range;
                 }
             }
+            IdentifierContext::MetadataReference => {
+                if let Some((name, range)) = name_with_range {
+                    builder.note_annotation_head(name, range);
+                }
+            }
+            IdentifierContext::MetadataContinuation
+            | IdentifierContext::MetadataContinuationAfterTypeArguments => {
+                if let Some((name, range)) = name_with_range {
+                    builder.note_annotation_segment(name, range);
+                }
+            }
             _ => {}
         }
     }
@@ -1352,6 +1636,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _last_consumed: Token,
     ) {
         let mut builder = self.builder.borrow_mut();
+        // A top-level variable group claims its preceding annotations
+        // (fields parse inside an open container, where nothing pends).
+        builder.drop_pending_annotations();
         builder.field_static = Some(static_kw.is_some());
         builder.field_abstract = _abstract_kw.is_some();
         builder.field_external = _external_kw.is_some();
@@ -1378,6 +1665,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
+        builder.armed_tree = None;
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
@@ -1400,6 +1688,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
+        builder.armed_tree = None;
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
@@ -1507,6 +1796,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _external: Option<Token>,
     ) {
         let mut builder = self.builder.borrow_mut();
+        builder.drop_pending_annotations();
         builder.pending_top = Some(PendingTop {
             name: None,
             type_params: 0,
@@ -1518,6 +1808,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, _end: Token) {
         let mut builder = self.builder.borrow_mut();
+        // Anything buffered inside the body (local-declaration metadata)
+        // binds to no container — drop it with the executable.
+        builder.drop_pending_annotations();
         if let Some(pending) = builder.pending_top.take()
             && let Some((name, range)) = pending.name
         {
@@ -1566,6 +1859,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_typedef(&mut self, _token: Token) {
         let mut builder = self.builder.borrow_mut();
+        builder.drop_pending_annotations();
         builder.pending_typedef = Some(PendingTypedef {
             name: None,
             type_params: 0,
@@ -2328,5 +2622,244 @@ mod tests {
         assert_eq!(other.named.len(), 1);
         assert!(!other.named[0].required);
         assert_eq!(other.named[0].name, id(&strings, "z"));
+    }
+
+    /// The written-type capture feeds the pool (#728): a generic formal's
+    /// declared type rides a non-empty slot (`List<T>` keeps its argument,
+    /// a type parameter stays argument-less inside it), and the `?`
+    /// projection lands on the annotated root. The reference pool interns
+    /// the same lists manually — slot equality across the two pools pins
+    /// the capture's numbering.
+    #[test]
+    fn declared_types_intern_their_arguments() {
+        let strings = StringTable::new();
+        let elements = build("class C<T> { List<T> f; List<int>? g; }", &strings);
+        let member = |name: &str| {
+            elements
+                .container(id(&strings, "C"))
+                .expect("C")
+                .members
+                .get(&id(&strings, name))
+                .unwrap_or_else(|| panic!("member {name}"))
+                .var_ty
+        };
+        let (list, t, int) = (id(&strings, "List"), id(&strings, "T"), id(&strings, "int"));
+        let mut reference = crate::model::ArgPool::default();
+        let list_t = reference.named(list, false, &[Ty::named(t)]);
+        let list_int_q = reference.named(list, true, &[Ty::named(int)]);
+        assert_eq!(member("f"), list_t, "`List<T>` rides a non-empty slot");
+        assert_eq!(member("g"), list_int_q, "the `?` projects on the root");
+        assert_eq!(elements.type_args().len(), 2);
+    }
+
+    /// Nested arguments intern bottom-up (model.rs:243-246): the inner
+    /// `List<int>` takes its slot before the outer `List<List<int>>`, in
+    /// left-to-right source order — the capture order the warm/cold
+    /// byte-equality discipline keys on. A capture that interned the
+    /// outer list first would number the slots in the other order and
+    /// fail the cross-pool equality below.
+    #[test]
+    fn nested_arguments_intern_inner_first() {
+        let strings = StringTable::new();
+        let elements = build("class C { List<List<int>> f; }", &strings);
+        let (list, int) = (id(&strings, "List"), id(&strings, "int"));
+        let f = elements
+            .container(id(&strings, "C"))
+            .expect("C")
+            .members
+            .get(&id(&strings, "f"))
+            .expect("f")
+            .var_ty;
+        let mut reference = crate::model::ArgPool::default();
+        let inner = reference.named(list, false, &[Ty::named(int)]);
+        let outer = reference.named(list, false, &[inner]);
+        assert_eq!(f, outer);
+        assert_eq!(elements.type_args().len(), 2);
+        assert_eq!(f.render(&strings, elements.type_args()), "List<List<int>>");
+    }
+
+    /// A poisoned tree stays argument-less: a function type inside the
+    /// argument list is a shape the model cannot represent, so the
+    /// declared type keeps the pre-feeding form exactly.
+    #[test]
+    fn poisoned_trees_stay_argument_less() {
+        let strings = StringTable::new();
+        let elements = build("class C { Map<String, void Function()> f; }", &strings);
+        let map = id(&strings, "Map");
+        let f = elements
+            .container(id(&strings, "C"))
+            .expect("C")
+            .members
+            .get(&id(&strings, "f"))
+            .expect("f")
+            .var_ty;
+        assert_eq!(
+            f,
+            Ty::Named {
+                name: map,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            }
+        );
+        assert!(elements.type_args().is_empty(), "nothing interned");
+    }
+
+    /// Only declarations intern: an `is`/`as` type inside a body arms a
+    /// capture like any annotation, but no declaration ever consumes it —
+    /// the pool must come out empty (capture-immutable after `collect`,
+    /// never fed by body noise).
+    #[test]
+    fn body_annotations_never_intern() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C { int f; } \
+             void m() { var x = y as List<int>; if (x is Map<String, int>) print(x); } \
+             String top = '';",
+            &strings,
+        );
+        assert!(
+            elements.type_args().is_empty(),
+            "body type arguments must not intern"
+        );
+        assert_eq!(
+            elements.decl(id(&strings, "top")).expect("top").var_ty,
+            Ty::named(id(&strings, "String"))
+        );
+    }
+
+    /// The declaration's metadata lands in the container face, name-level,
+    /// for every container kind; the span is `@` through the name's last
+    /// segment (the official annotation-anchored report position) and a
+    /// qualified spelling interns dot-joined (#705).
+    #[test]
+    fn container_annotations_capture_name_and_span() {
+        let strings = StringTable::new();
+        let elements = build(
+            "@sealed class C {}\n@x.y mixin M {}\n@literal enum E { e }\n",
+            &strings,
+        );
+        let annotations_of = |name: &str| {
+            elements
+                .container(id(&strings, name))
+                .expect(name)
+                .annotations
+                .to_vec()
+        };
+        let class = annotations_of("C");
+        assert_eq!(class.len(), 1);
+        assert_eq!(class[0].name, id(&strings, "sealed"));
+        assert_eq!(class[0].range.offset, 0);
+        assert_eq!(class[0].range.length, 7);
+        let mixin = annotations_of("M");
+        assert_eq!(mixin.len(), 1);
+        assert_eq!(mixin[0].name, id(&strings, "x.y"));
+        assert_eq!(mixin[0].range.offset, 19);
+        assert_eq!(mixin[0].range.length, 4);
+        let enum_ = annotations_of("E");
+        assert_eq!(enum_.len(), 1);
+        assert_eq!(enum_[0].name, id(&strings, "literal"));
+        assert_eq!(enum_[0].range.offset, 35);
+        assert_eq!(enum_[0].range.length, 8);
+    }
+
+    /// A member's metadata is not the container face: the class carrying
+    /// it and the next declaration both stay clean (the member star never
+    /// buffers, so nothing leaks into the following container).
+    #[test]
+    fn member_annotations_never_reach_containers() {
+        let strings = StringTable::new();
+        let elements = build("class A { @override void m() {} }\nclass B {}", &strings);
+        for name in ["A", "B"] {
+            let container = elements.container(id(&strings, name)).expect(name);
+            assert!(container.annotations.is_empty(), "{name}");
+        }
+    }
+
+    /// A non-container declaration claims (and discards) the metadata
+    /// preceding it: only the class's own star reaches its face — the
+    /// function, typedef, and top-level variable boundaries drop theirs.
+    #[test]
+    fn non_container_boundaries_drop_their_annotations() {
+        let strings = StringTable::new();
+        let elements = build(
+            "@Deprecated() f() {}\n@x typedef T = int;\n@y const z = 1;\n@sealed class C {}",
+            &strings,
+        );
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.annotations.len(), 1);
+        assert_eq!(c.annotations[0].name, id(&strings, "sealed"));
+    }
+
+    /// Metadata inside a function body (a local declaration's) binds to
+    /// nothing and drops with the executable.
+    #[test]
+    fn body_local_annotations_drop_with_the_function() {
+        let strings = StringTable::new();
+        let elements = build("void f() { @pragma('x') var q = 1; }\nclass C {}", &strings);
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert!(c.annotations.is_empty());
+    }
+
+    /// An annotated directive claims its metadata: the import's
+    /// `@Deprecated` never reaches the following class.
+    #[test]
+    fn annotated_directive_drops_its_annotations() {
+        let strings = StringTable::new();
+        let elements = build("@Deprecated import 'a.dart';\n@sealed class C {}", &strings);
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.annotations.len(), 1);
+        assert_eq!(c.annotations[0].name, id(&strings, "sealed"));
+    }
+
+    /// The pool-discipline law: a `Ty` slot is canonical only within its
+    /// own universe — reading it through another unit's pool fails loudly
+    /// (model.rs `ArgPool::get`'s documented panic), never falls back.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn a_foreign_slot_read_panics() {
+        let owner = StringTable::new();
+        let elements = build("class C { List<int> f; }", &owner);
+        let other = StringTable::new();
+        let foreign = build("class D {}", &other);
+        let f = elements
+            .container(id(&owner, "C"))
+            .expect("C")
+            .members
+            .get(&id(&owner, "f"))
+            .expect("f")
+            .var_ty;
+        // The foreign pool is empty; the slot indexes out of range.
+        let _ = f.render(&owner, foreign.type_args());
+    }
+
+    /// A nested declared type round-trips through the persisted payload
+    /// (plan T-A acceptance): `of` projects the pool structurally,
+    /// `into_elements` re-interns bottom-up, and the restored model equals
+    /// the captured one — same `Ty`s, same slots, same display.
+    #[test]
+    fn nested_declared_type_round_trips_through_the_payload() {
+        use crate::persisted::PersistedElements;
+        let strings = StringTable::new();
+        let elements = build("class C { Map<String, List<int>> f; }", &strings);
+        let restored = PersistedElements::of(&elements, &strings).into_elements(&strings);
+        let f = |e: &FileElements| {
+            e.container(id(&strings, "C"))
+                .expect("C")
+                .members
+                .get(&id(&strings, "f"))
+                .expect("f")
+                .var_ty
+        };
+        let (captured, restored_ty) = (f(&elements), f(&restored));
+        assert_eq!(captured, restored_ty, "same slots, bottom-up both ways");
+        assert_eq!(
+            captured.render(&strings, elements.type_args()),
+            "Map<String, List<int>>"
+        );
+        assert_eq!(
+            restored_ty.render(&strings, restored.type_args()),
+            "Map<String, List<int>>"
+        );
+        assert_eq!(restored.type_args().len(), 2);
     }
 }

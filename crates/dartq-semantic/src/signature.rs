@@ -348,6 +348,7 @@ impl<'a> Face<'a> {
                 constructors,
                 has_unnamed_constructor,
                 ctor_formals,
+                annotations,
             } = &elements.containers[&name];
             self.field("container");
             self.name(name);
@@ -445,6 +446,15 @@ impl<'a> Face<'a> {
             for j in 0..self.inner.len() {
                 let member_name = self.inner[j];
                 self.member("member", member_name, &members[&member_name]);
+            }
+            // The declaration's metadata (name-level, written order): an
+            // annotation-only edit moves the meta-getter verdicts, so it
+            // must flip the L2 gate.
+            self.usize(annotations.len());
+            for annotation in annotations {
+                self.name(annotation.name);
+                self.uint(u64::from(annotation.range.offset));
+                self.uint(u64::from(annotation.range.length));
             }
         }
     }

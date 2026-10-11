@@ -556,6 +556,25 @@ pub struct Container {
     /// reads it (`unused_local_elements_verifier.dart:780-792` walks every
     /// formal list, constructors included).
     pub ctor_formals: FxHashMap<StringId, Box<Formals>>,
+    /// The declaration's metadata, in written order (name-level,
+    /// [`Annotation`]). The meta-getter recognition (`crate::annotation`)
+    /// reads it; members' own metadata is not part of the container face.
+    pub annotations: Box<[Annotation]>,
+}
+
+/// One declaration annotation, name-level: the annotation's spelled name
+/// and its own span. Argument lists are not captured — the meta-getter
+/// faces the recognition helper reads ([`crate::annotation`]) need
+/// presence and name only.
+#[derive(Clone, Debug)]
+pub struct Annotation {
+    /// The name as written: the head identifier for a bare `@sealed`, the
+    /// dot-joined spelling for a qualified `@meta.sealed`.
+    pub name: StringId,
+    /// The annotation's own span, `@` through the name's last segment
+    /// (argument groups are outside it; the official annotation-anchored
+    /// reports anchor the `@` sign).
+    pub range: SourceRange,
 }
 
 /// One top-level declaration.

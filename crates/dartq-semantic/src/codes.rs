@@ -556,6 +556,141 @@ pub enum SemanticCode {
     /// and local functions follow their oracle exemptions
     /// (the local-function visit is an upstream TODO there).
     InferenceFailureOnFunctionReturnType,
+    // —— #612: the variance family (the `variance` experiment only; all
+    //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
+    /// `The '{0}' type parameter '{1}' can't be used in an '{2}' position.`
+    /// — a member face of a class/mixin/enum whose explicitly-variated type
+    /// parameter occurs in a position the keyword forbids: a field's
+    /// declared type and its non-final implicit setter
+    /// (`_checkForWrongTypeParameterVarianceInField`,
+    /// error_verifier.dart:7910-7933), a method's formals and return type
+    /// (`_checkForWrongTypeParameterVarianceInMethod`, :7936-7996), through
+    /// `_checkForWrongVariancePosition` (:8074-8088). Only parameters with
+    /// an explicit `in`/`out`/`inout` keyword are checked
+    /// (`!typeParameter.isLegacyCovariant`), so the code is unreachable
+    /// without the `variance` experiment. `{0}` is the parameter's own
+    /// keyword, `{2}` the position's computed variance keyword. The
+    /// method-formal and return-type faces anchor at the member name (the
+    /// oracle anchors at the formal/return-type node — a span divergence,
+    /// metric-neutral on the (code, file) gate); the formal `covariant`
+    /// exemption and a method type-parameter-bound face are unmodeled
+    /// (documented edges of this family).
+    WrongTypeParameterVariancePosition,
+    /// `'{0}' is an '{1}' type parameter and can't be used in an '{2}'
+    /// position in '{3}'.` — the explicit-keyword face of the
+    /// superinterface check
+    /// (`wrongExplicitTypeParameterVarianceInSuperinterface`,
+    /// error_verifier.dart:8017-8032): a superinterface of a class, mixin,
+    /// enum, or extension type uses an explicitly-variated type parameter
+    /// in a position its keyword forbids. `{1}` is the parameter's keyword,
+    /// `{2}` the computed position keyword, `{3}` the superinterface as
+    /// written; the anchor is the type parameter's name.
+    WrongExplicitTypeParameterVarianceInSuperinterface,
+    /// `'{0}' can't be used contravariantly or invariantly in '{1}'.` — the
+    /// legacy-covariant face of the same superinterface check
+    /// (`error_verifier.dart:8033-8048`), gated here to the `variance`
+    /// experiment by adjudication (#612: zero new emissions on default
+    /// programs — the oracle does fire it without the experiment, the
+    /// under-report is the recorded gate posture).
+    WrongTypeParameterVarianceInSuperinterface,
+    // —— W6/#702: the package:meta `@sealed` supertype contract (all
+    //    `STATIC_WARNING`) ——————————————————————————————————————————————————
+    /// `The class '{0}' shouldn't be used as a mixin constraint because it
+    /// is sealed, and any class mixing in this mixin must have '{0}' as a
+    /// superclass.` — a mixin whose direct `on` constraint is a cross-
+    /// package `@sealed` class (`_checkForInvalidSealedSuperclass`,
+    /// best_practices_verifier.dart:1172-1213; the constraint arm,
+    /// :1197-1204). One report per sealed supertype, at the declaring node.
+    MixinOnSealedClass,
+    /// `The class '{0}' shouldn't be extended, mixed in, or implemented
+    /// because it's sealed.` — a class/mixin/mixin-application whose
+    /// supertype closure contains a cross-package `@sealed` class through
+    /// any face other than a direct mixin `on` constraint (the regular arm,
+    /// best_practices_verifier.dart:1205-1212). Once per sealed supertype.
+    SubtypeOfSealedClass,
+    // —— #743: the W1-micro single-condition cluster (all `STATIC_WARNING`) ——
+    /// `Dead code: This on-catch block won't be executed because '{0}' is a
+    /// subtype of '{1}' and hence will have been caught already.` — a try's
+    /// on-clause type that is a subtype of an earlier on-clause type in the
+    /// same try (`_CatchClausesVerifier.nextCatchClause`,
+    /// dead_code_verifier.dart:589-604); the span covers the dead clause
+    /// through the try's last clause.
+    DeadCodeOnCatchSubtype,
+    /// `'{0}' shouldn't be called with a 'null' argument for the non-nullable
+    /// type argument '{1}'.` — `Completer<T>.complete(null)` with a
+    /// non-nullable `T` (`NullSafeApiVerifier._checkTypes`,
+    /// null_safe_api_verifier.dart:87-107); the registry's other face,
+    /// `Future<T>.value`, needs the creation-row machinery (the
+    /// documented under-report).
+    NullArgumentToNonNullType,
+    /// `A potentially nullable type can't be used in an 'on' clause because
+    /// it isn't valid to throw a nullable expression.` — an `on T?` (or
+    /// `on dynamic`) catch clause (`_checkForNullableTypeInCatchClause`,
+    /// best_practices_verifier.dart:1377-1391; `isPotentiallyNullable` =
+    /// `!isNonNullable`, type_system.dart:1260).
+    NullableTypeInCatchClause,
+    /// `A double can't equal 'double.nan', so the condition is always
+    /// 'false'.` — an `==` comparison against `double.nan`
+    /// (`isDoubleNan`, best_practices_verifier.dart:2264-2277; the
+    /// constant-pattern face is the documented under-report); one registry
+    /// code across the operator pair, unique names
+    /// `unnecessary_nan_comparison_false/true`.
+    UnnecessaryNanComparisonFalse,
+    /// `A double can't equal 'double.nan', so the condition is always
+    /// 'true'.` — the `!=` polarity of
+    /// [`SemanticCode::UnnecessaryNanComparisonFalse`].
+    UnnecessaryNanComparisonTrue,
+    /// `The '?' is unnecessary because '{0}' is nullable without it.` — a
+    /// `Null?`/`dynamic?` type annotation (`visitNamedType`,
+    /// best_practices_verifier.dart:762-779), anchored at the `?` token.
+    UnnecessaryQuestionMark,
+    /// `Unnecessary wildcard pattern.` — a wildcard pattern that is a direct
+    /// logical-and operand (`unnecessaryWildcardPattern`,
+    /// shared_type_analyzer.dart:250-258; the only wired
+    /// `UnnecessaryWildcardKind`), reported when the wildcard always matches
+    /// — unconditionally for a bare `_`, by the matched-type-subtype gate
+    /// for a typed one (type_analyzer.dart:2731-2737).
+    UnnecessaryWildcardPattern,
+    // —— #745: the W2a warning pair (all `STATIC_WARNING`) ——————————————————
+    /// `This cast always throws an exception because the expression always
+    /// evaluates to 'null'.` — an `e as T` whose operand's static type is
+    /// exactly `Null` and whose target is non-nullable
+    /// (`visitAsExpression`, best_practices_verifier.dart:180-190), or a
+    /// cast pattern over a `Null` matched value with a non-nullable target
+    /// (`visitCastPattern`, :227-239). `messages.yaml` :25674
+    /// (`castFromNullAlwaysFails` — no correctionMessage).
+    CastFromNullAlwaysFails,
+    /// `The receiver is of type 'Never', and will never complete with a
+    /// value.` — a member access, invocation, or operator whose receiver
+    /// (or function-position expression) has the static type `Never`
+    /// (`receiverOfTypeNever`, messages.yaml :29566). The official
+    /// thirteen resolver faces (`binary_expression_resolver.dart:442`,
+    /// `unary_operator_invocation_resolver.dart:49`,
+    /// `function_expression_invocation_resolver.dart:131`,
+    /// `method_invocation_resolver.dart:662`,
+    /// `increment_or_decrement_resolver.dart:273`, and the
+    /// `property_element_resolver.dart` read/write faces) collapse into
+    /// one receiver-row predicate at the diagnoser's junctions.
+    ReceiverOfTypeNever,
+    // —— #746: the W2b flow-fact consumers (all `STATIC_WARNING`) ————————————
+    /// `This cast will always throw an exception because the nullable local
+    /// variable '{0}' is not assigned.` — a simple local read whose declared
+    /// type is spelled nullable, cast (`as`) to a non-nullable named type,
+    /// where the read is definitely unassigned (`visitAsExpression`,
+    /// type_analyzer.dart:2107-2126). The definite-unassignment face only
+    /// the flow layer knows, so the candidate stages at the cast junction
+    /// and the teardown's `UnassignedRead` join decides. `messages.yaml`
+    /// :25705.
+    CastFromNullableAlwaysFails,
+    /// `This function has a nullable return type of '{0}', but ends without
+    /// returning a value.` — a block body that can complete normally under
+    /// a nullable return type whose `FutureOr` base is none of `dynamic`,
+    /// invalid, unknown, `void`, or `Null` (`checkForBodyMayCompleteNormally`,
+    /// type_analyzer.dart:639-704's nullable arm, reported at the block's
+    /// `{`). The potentially-non-nullable ERROR twin is the never-return
+    /// code's business and is never sent from this consumer.
+    /// `messages.yaml` :25633.
+    BodyMightCompleteNormallyNullable,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -877,6 +1012,63 @@ impl SemanticCode {
                 "inference_failure_on_function_return_type",
                 "INFERENCE_FAILURE_ON_FUNCTION_RETURN_TYPE",
             ),
+            // The #612 variance family (diagnostic.g.dart:18498-18519,
+            // :18771-18783, :18809-18825).
+            Self::WrongTypeParameterVariancePosition => (
+                "wrong_type_parameter_variance_position",
+                "WRONG_TYPE_PARAMETER_VARIANCE_POSITION",
+            ),
+            Self::WrongExplicitTypeParameterVarianceInSuperinterface => (
+                "wrong_explicit_type_parameter_variance_in_superinterface",
+                "WRONG_EXPLICIT_TYPE_PARAMETER_VARIANCE_IN_SUPERINTERFACE",
+            ),
+            Self::WrongTypeParameterVarianceInSuperinterface => (
+                "wrong_type_parameter_variance_in_superinterface",
+                "WRONG_TYPE_PARAMETER_VARIANCE_IN_SUPERINTERFACE",
+            ),
+            // The W6 @sealed contract rows (diagnostic.g.dart:11571-11586
+            // and :15857-15870).
+            Self::MixinOnSealedClass => ("mixin_on_sealed_class", "MIXIN_ON_SEALED_CLASS"),
+            Self::SubtypeOfSealedClass => ("subtype_of_sealed_class", "SUBTYPE_OF_SEALED_CLASS"),
+            // The #743 W1-micro cluster. The NaN pair keeps one registry
+            // name (sharedName `unnecessaryNanComparison`; the polarity
+            // lives in the message shape), like the null-comparison pair.
+            Self::DeadCodeOnCatchSubtype => {
+                ("dead_code_on_catch_subtype", "DEAD_CODE_ON_CATCH_SUBTYPE")
+            }
+            Self::NullArgumentToNonNullType => (
+                "null_argument_to_non_null_type",
+                "NULL_ARGUMENT_TO_NON_NULL_TYPE",
+            ),
+            Self::NullableTypeInCatchClause => (
+                "nullable_type_in_catch_clause",
+                "NULLABLE_TYPE_IN_CATCH_CLAUSE",
+            ),
+            Self::UnnecessaryNanComparisonFalse | Self::UnnecessaryNanComparisonTrue => {
+                ("unnecessary_nan_comparison", "UNNECESSARY_NAN_COMPARISON")
+            }
+            Self::UnnecessaryQuestionMark => {
+                ("unnecessary_question_mark", "UNNECESSARY_QUESTION_MARK")
+            }
+            Self::UnnecessaryWildcardPattern => (
+                "unnecessary_wildcard_pattern",
+                "UNNECESSARY_WILDCARD_PATTERN",
+            ),
+            // The #745 W2a pair (diagnostic.g.dart:1843-1853 and
+            // :14548-14559).
+            Self::CastFromNullAlwaysFails => {
+                ("cast_from_null_always_fails", "CAST_FROM_NULL_ALWAYS_FAILS")
+            }
+            Self::ReceiverOfTypeNever => ("receiver_of_type_never", "RECEIVER_OF_TYPE_NEVER"),
+            // The #746 W2b pair (diagnostic.g.dart:1827-1841 and :1608-1619).
+            Self::CastFromNullableAlwaysFails => (
+                "cast_from_nullable_always_fails",
+                "CAST_FROM_NULLABLE_ALWAYS_FAILS",
+            ),
+            Self::BodyMightCompleteNormallyNullable => (
+                "body_might_complete_normally_nullable",
+                "BODY_MIGHT_COMPLETE_NORMALLY_NULLABLE",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -896,6 +1088,15 @@ impl SemanticCode {
                 // (diagnostic.g.dart:15793-15806 — a doc comment, not the
                 // flag).
                 | Self::StrictRawType
+                // The #612 variance rows carry none either
+                // (diagnostic.g.dart:18498-18519/:18771-18783/:18809-18825).
+                | Self::WrongTypeParameterVariancePosition
+                | Self::WrongExplicitTypeParameterVarianceInSuperinterface
+                | Self::WrongTypeParameterVarianceInSuperinterface
+                // `receiverOfTypeNever` carries none either
+                // (diagnostic.g.dart:14548-14559; the W2a cast row does —
+                // :1849).
+                | Self::ReceiverOfTypeNever
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -952,7 +1153,36 @@ impl SemanticCode {
             // (`DiagnosticType.STATIC_WARNING`, diagnostic.g.dart:15804 and
             // :8110).
             | Self::StrictRawType
-            | Self::InferenceFailureOnFunctionReturnType => DiagnosticType::StaticWarning,
+            | Self::InferenceFailureOnFunctionReturnType
+            // The W6 @sealed contract rows are `STATIC_WARNING`
+            // (diagnostic.g.dart:11584 and :15866).
+            | Self::MixinOnSealedClass
+            | Self::SubtypeOfSealedClass
+            // The #743 W1-micro cluster (`messages.yaml`, the
+            // StaticWarningCode block: deadCodeOnCatchSubtype :25927,
+            // nullArgumentToNonNullType :29376,
+            // nullableTypeInCatchClause :29334,
+            // unnecessaryNanComparisonTrue/False :30910/:30872,
+            // unnecessaryQuestionMark :31052, unnecessaryWildcardPattern
+            // :31168 — all `type: staticWarning`).
+            | Self::DeadCodeOnCatchSubtype
+            | Self::NullArgumentToNonNullType
+            | Self::NullableTypeInCatchClause
+            | Self::UnnecessaryNanComparisonFalse
+            | Self::UnnecessaryNanComparisonTrue
+            | Self::UnnecessaryQuestionMark
+            | Self::UnnecessaryWildcardPattern
+            // The #745 W2a pair (`messages.yaml`, the StaticWarningCode
+            // block: castFromNullAlwaysFails :25674, receiverOfTypeNever
+            // :29566 — both `type: staticWarning`).
+            | Self::CastFromNullAlwaysFails
+            | Self::ReceiverOfTypeNever
+            // The #746 W2b pair (`messages.yaml`, the StaticWarningCode
+            // block: castFromNullableAlwaysFails :25705,
+            // bodyMightCompleteNormallyNullable :25633 — both `type:
+            // staticWarning`).
+            | Self::CastFromNullableAlwaysFails
+            | Self::BodyMightCompleteNormallyNullable => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -1276,6 +1506,73 @@ impl SemanticCode {
             // `message3`; real emissions go through `emit3`.
             Self::MissingOverrideOfMustBeOverriddenTwo
             | Self::MissingOverrideOfMustBeOverriddenThreePlus => self.message3(a0, a1, ""),
+            // The #612 legacy superinterface face: the type parameter name
+            // leads, the superinterface display fills the second slot
+            // (diagnostic.g.dart:18773-18774). The other two variance rows
+            // route through `message3`/`message4`.
+            Self::WrongTypeParameterVarianceInSuperinterface => {
+                format!("'{a0}' can't be used contravariantly or invariantly in '{a1}'.")
+            }
+            Self::WrongTypeParameterVariancePosition => self.message3(a0, a1, ""),
+            Self::WrongExplicitTypeParameterVarianceInSuperinterface => {
+                self.message4(a0, a1, "", "")
+            }
+            // The W6 `@sealed` contract rows: the sealed class's name fills
+            // `{0}` in both templates (diagnostic.g.dart:11573-11576 and
+            // :15859-15861).
+            Self::MixinOnSealedClass => format!(
+                "The class '{a0}' shouldn't be used as a mixin constraint because it is sealed, and any class mixing in this mixin must have '{a0}' as a superclass."
+            ),
+            Self::SubtypeOfSealedClass => format!(
+                "The class '{a0}' shouldn't be extended, mixed in, or implemented because it's sealed."
+            ),
+            // The #743 W1-micro cluster: verbatim oracle problemMessages
+            // (messages.yaml, the registry lines cited in the variant docs).
+            Self::DeadCodeOnCatchSubtype => {
+                format!(
+                    "Dead code: This on-catch block won't be executed because '{a0}' is a subtype of '{a1}' and hence will have been caught already."
+                )
+            }
+            Self::NullArgumentToNonNullType => {
+                format!(
+                    "'{a0}' shouldn't be called with a 'null' argument for the non-nullable type argument '{a1}'."
+                )
+            }
+            Self::NullableTypeInCatchClause => {
+                "A potentially nullable type can't be used in an 'on' clause because it isn't valid to throw a nullable expression."
+                    .to_string()
+            }
+            Self::UnnecessaryNanComparisonFalse => {
+                "A double can't equal 'double.nan', so the condition is always 'false'."
+                    .to_string()
+            }
+            Self::UnnecessaryNanComparisonTrue => {
+                "A double can't equal 'double.nan', so the condition is always 'true'."
+                    .to_string()
+            }
+            Self::UnnecessaryQuestionMark => {
+                format!("The '?' is unnecessary because '{a0}' is nullable without it.")
+            }
+            Self::UnnecessaryWildcardPattern => "Unnecessary wildcard pattern.".to_string(),
+            // The #745 W2a pair: no-argument rows, verbatim
+            // (messages.yaml :25676 and :29569).
+            Self::CastFromNullAlwaysFails => {
+                "This cast always throws an exception because the expression always evaluates to 'null'."
+                    .to_string()
+            }
+            Self::ReceiverOfTypeNever => {
+                "The receiver is of type 'Never', and will never complete with a value."
+                    .to_string()
+            }
+            // The #746 W2b pair: one-argument rows, verbatim
+            // (messages.yaml :25707 and :25638 — `{0}` is the variable name
+            // / the declared return type's display text).
+            Self::CastFromNullableAlwaysFails => {
+                format!("This cast will always throw an exception because the nullable local variable '{a0}' is not assigned.")
+            }
+            Self::BodyMightCompleteNormallyNullable => {
+                format!("This function has a nullable return type of '{a0}', but ends without returning a value.")
+            }
         }
     }
 
@@ -1284,6 +1581,12 @@ impl SemanticCode {
     #[must_use]
     pub fn message3(self, a0: &str, a1: &str, a2: &str) -> String {
         match self {
+            // The #612 member-face row: the parameter's own keyword leads,
+            // then its name, then the position's keyword
+            // (diagnostic.g.dart:18811-18812).
+            Self::WrongTypeParameterVariancePosition => {
+                format!("The '{a0}' type parameter '{a1}' can't be used in an '{a2}' position.")
+            }
             Self::WrongNumberOfParametersForOperator => {
                 format!("Operator '{a0}' should declare exactly {a1} parameters, but {a2} found.")
             }
@@ -1445,6 +1748,35 @@ impl SemanticCode {
     #[must_use]
     pub fn correction_message(self, a2: &str) -> Option<String> {
         match self {
+            // The W6 @sealed contract rows' verbatim oracle correctionMessages
+            // (diagnostic.g.dart:11577-11579 and :15862-15864; the subtype
+            // row's `{0}` is the sealed class name).
+            Self::MixinOnSealedClass => Some(
+                "Try composing with this class, or refer to its documentation for more \
+                 information."
+                    .to_string(),
+            ),
+            Self::SubtypeOfSealedClass => Some(format!(
+                "Try composing instead of inheriting, or refer to the documentation of \
+                 '{a2}' for more information."
+            )),
+            // The #612 variance rows' verbatim oracle correctionMessages
+            // (diagnostic.g.dart:18503-18505, :18775-18778, :18813-18816).
+            Self::WrongTypeParameterVariancePosition => Some(
+                "Try removing the type parameter or change the explicit variance modifier \
+                 declaration for the type parameter to another one of 'in', 'out', or 'inout'."
+                    .to_string(),
+            ),
+            Self::WrongExplicitTypeParameterVarianceInSuperinterface => Some(
+                "Try using 'in' type parameters in 'in' positions and 'out' type parameters \
+                 in 'out' positions in the superinterface."
+                    .to_string(),
+            ),
+            Self::WrongTypeParameterVarianceInSuperinterface => Some(
+                "Try not using class type parameters in types of formal parameters of \
+                 function types, nor in explicitly contravariant or invariant superinterfaces."
+                    .to_string(),
+            ),
             // The #610 bounds rows' verbatim oracle correctionMessages
             // (diagnostic.g.dart:16324 and :4915); the ITB face's `{2}` is
             // the substituted bound.
@@ -1548,6 +1880,39 @@ impl SemanticCode {
                 "Try updating this class to match the superclass, or removing the override annotation."
                     .to_string(),
             ),
+            // The #743 W1-micro cluster's verbatim oracle correctionMessages;
+            // `unnecessary_question_mark` carries none (messages.yaml).
+            Self::DeadCodeOnCatchSubtype => Some(
+                "Try reordering the catch clauses so that this block can be reached, or removing the unreachable catch clause."
+                    .to_string(),
+            ),
+            Self::NullArgumentToNonNullType => {
+                Some("Try adding a non-null argument.".to_string())
+            }
+            Self::NullableTypeInCatchClause => Some("Try using a non-nullable type.".to_string()),
+            Self::UnnecessaryNanComparisonFalse | Self::UnnecessaryNanComparisonTrue => Some(
+                "Try using 'double.isNan', or removing the condition.".to_string(),
+            ),
+            Self::UnnecessaryWildcardPattern => {
+                Some("Try removing the wildcard pattern.".to_string())
+            }
+            // The #745 W2a pair: the receiver row carries the registry's
+            // verbatim correctionMessage (messages.yaml :29570 — no trailing
+            // period in the template); the cast row declares none
+            // (:25674-25679).
+            Self::ReceiverOfTypeNever => Some(
+                "Try checking for throw expressions or type errors in the receiver".to_string(),
+            ),
+            // The #746 W2b pair's verbatim oracle correctionMessages
+            // (messages.yaml :25710 and :25640).
+            Self::CastFromNullableAlwaysFails => Some(
+                "Try giving it an initializer expression, or ensure that it's assigned on every execution path."
+                    .to_string(),
+            ),
+            Self::BodyMightCompleteNormallyNullable => Some(
+                "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -1558,6 +1923,14 @@ impl SemanticCode {
     #[must_use]
     pub fn message4(self, a0: &str, a1: &str, a2: &str, a3: &str) -> String {
         match self {
+            // The #612 explicit superinterface face: the parameter name, its
+            // keyword, the position's keyword, the superinterface display
+            // (diagnostic.g.dart:18500-18502).
+            Self::WrongExplicitTypeParameterVarianceInSuperinterface => {
+                format!(
+                    "'{a0}' is an '{a1}' type parameter and can't be used in an '{a2}' position in '{a3}'."
+                )
+            }
             Self::WrongNumberOfTypeArgumentsElement(_) => {
                 format!(
                     "The {a0} '{a1}' is declared with {a2} type parameters, but {a3} type arguments are given."
@@ -1725,6 +2098,20 @@ mod tests {
             SemanticCode::UnnecessaryCastPattern,
             SemanticCode::UnnecessaryNullCheckPattern,
             SemanticCode::UnnecessaryNullAssertPattern,
+            // The #743 W1-micro cluster.
+            SemanticCode::DeadCodeOnCatchSubtype,
+            SemanticCode::NullArgumentToNonNullType,
+            SemanticCode::NullableTypeInCatchClause,
+            SemanticCode::UnnecessaryNanComparisonFalse,
+            SemanticCode::UnnecessaryNanComparisonTrue,
+            SemanticCode::UnnecessaryQuestionMark,
+            SemanticCode::UnnecessaryWildcardPattern,
+            // The #745 W2a pair.
+            SemanticCode::CastFromNullAlwaysFails,
+            SemanticCode::ReceiverOfTypeNever,
+            // The #746 W2b pair.
+            SemanticCode::CastFromNullableAlwaysFails,
+            SemanticCode::BodyMightCompleteNormallyNullable,
         ];
         for code in codes {
             let info = code.code_info();
@@ -1791,6 +2178,20 @@ mod tests {
         SemanticCode::UnusedImport,
         SemanticCode::DeadNullAwareExpression,
         SemanticCode::DeadCodeCatchFollowingCatch,
+        // The #743 W1-micro cluster.
+        SemanticCode::DeadCodeOnCatchSubtype,
+        SemanticCode::NullArgumentToNonNullType,
+        SemanticCode::NullableTypeInCatchClause,
+        SemanticCode::UnnecessaryNanComparisonFalse,
+        SemanticCode::UnnecessaryNanComparisonTrue,
+        SemanticCode::UnnecessaryQuestionMark,
+        SemanticCode::UnnecessaryWildcardPattern,
+        // The #745 W2a pair.
+        SemanticCode::CastFromNullAlwaysFails,
+        SemanticCode::ReceiverOfTypeNever,
+        // The #746 W2b pair.
+        SemanticCode::CastFromNullableAlwaysFails,
+        SemanticCode::BodyMightCompleteNormallyNullable,
         SemanticCode::DuplicateDefinition,
         SemanticCode::UndefinedAnnotation,
         SemanticCode::UndefinedClass,
@@ -2106,6 +2507,58 @@ mod tests {
             SemanticCode::OverrideOnNonOverridingSetter.message("", ""),
             "The setter doesn't override an inherited setter."
         );
+        assert_eq!(
+            SemanticCode::MixinOnSealedClass.message("Guard", ""),
+            "The class 'Guard' shouldn't be used as a mixin constraint because it is sealed, and any class mixing in this mixin must have 'Guard' as a superclass."
+        );
+        assert_eq!(
+            SemanticCode::SubtypeOfSealedClass.message("Guard", ""),
+            "The class 'Guard' shouldn't be extended, mixed in, or implemented because it's sealed."
+        );
+        assert_eq!(
+            SemanticCode::DeadCodeOnCatchSubtype.message("Error", "Exception"),
+            "Dead code: This on-catch block won't be executed because 'Error' is a subtype of 'Exception' and hence will have been caught already."
+        );
+        assert_eq!(
+            SemanticCode::NullArgumentToNonNullType.message("Completer.complete", "int"),
+            "'Completer.complete' shouldn't be called with a 'null' argument for the non-nullable type argument 'int'."
+        );
+        assert_eq!(
+            SemanticCode::NullableTypeInCatchClause.message("", ""),
+            "A potentially nullable type can't be used in an 'on' clause because it isn't valid to throw a nullable expression."
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryNanComparisonTrue.message("", ""),
+            "A double can't equal 'double.nan', so the condition is always 'true'."
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryNanComparisonFalse.message("", ""),
+            "A double can't equal 'double.nan', so the condition is always 'false'."
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryQuestionMark.message("dynamic", ""),
+            "The '?' is unnecessary because 'dynamic' is nullable without it."
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryWildcardPattern.message("", ""),
+            "Unnecessary wildcard pattern."
+        );
+        assert_eq!(
+            SemanticCode::CastFromNullAlwaysFails.message("", ""),
+            "This cast always throws an exception because the expression always evaluates to 'null'."
+        );
+        assert_eq!(
+            SemanticCode::ReceiverOfTypeNever.message("", ""),
+            "The receiver is of type 'Never', and will never complete with a value."
+        );
+        assert_eq!(
+            SemanticCode::CastFromNullableAlwaysFails.message("x", ""),
+            "This cast will always throw an exception because the nullable local variable 'x' is not assigned."
+        );
+        assert_eq!(
+            SemanticCode::BodyMightCompleteNormallyNullable.message("int?", ""),
+            "This function has a nullable return type of 'int?', but ends without returning a value."
+        );
     }
 
     /// The correction-carrying rows answer the verbatim oracle
@@ -2131,6 +2584,76 @@ mod tests {
             SemanticCode::UnreachableSwitchDefault.correction_message(""),
             None,
             "the unreachable-default row keeps the case row's slot parity"
+        );
+        assert_eq!(
+            SemanticCode::MixinOnSealedClass.correction_message(""),
+            Some(
+                "Try composing with this class, or refer to its documentation for more information."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SemanticCode::SubtypeOfSealedClass.correction_message("Guard"),
+            Some(
+                "Try composing instead of inheriting, or refer to the documentation of 'Guard' for more information."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SemanticCode::DeadCodeOnCatchSubtype.correction_message(""),
+            Some(
+                "Try reordering the catch clauses so that this block can be reached, or removing the unreachable catch clause."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SemanticCode::NullArgumentToNonNullType.correction_message(""),
+            Some("Try adding a non-null argument.".to_string())
+        );
+        assert_eq!(
+            SemanticCode::NullableTypeInCatchClause.correction_message(""),
+            Some("Try using a non-nullable type.".to_string())
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryNanComparisonTrue.correction_message(""),
+            Some("Try using 'double.isNan', or removing the condition.".to_string())
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryQuestionMark.correction_message(""),
+            None,
+            "the registry row declares no correctionMessage"
+        );
+        assert_eq!(
+            SemanticCode::UnnecessaryWildcardPattern.correction_message(""),
+            Some("Try removing the wildcard pattern.".to_string())
+        );
+        // The #745 W2a pair: the receiver row's verbatim correction (no
+        // trailing period in the registry template); the cast row declares
+        // none.
+        assert_eq!(
+            SemanticCode::ReceiverOfTypeNever.correction_message(""),
+            Some("Try checking for throw expressions or type errors in the receiver".to_string())
+        );
+        assert_eq!(
+            SemanticCode::CastFromNullAlwaysFails.correction_message(""),
+            None,
+            "the registry row declares no correctionMessage"
+        );
+        // The #746 W2b pair: both rows carry the registry's verbatim
+        // correctionMessage (messages.yaml :25710 and :25640).
+        assert_eq!(
+            SemanticCode::CastFromNullableAlwaysFails.correction_message(""),
+            Some(
+                "Try giving it an initializer expression, or ensure that it's assigned on every execution path."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SemanticCode::BodyMightCompleteNormallyNullable.correction_message(""),
+            Some(
+                "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
+                    .to_string()
+            )
         );
     }
 }

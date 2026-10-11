@@ -122,8 +122,9 @@
 //! diagnostic spanning to the region's end (`dead_code_verifier.dart`
 //! `_firstDead`) — a documented divergence, as are the declaration
 //! anchors (variable names, not the declaration head). The
-//! `UnassignedRead` facts are produced but not yet consumed (the
-//! `not_assigned_potentially_non_nullable_local_variable` milestone).
+//! `UnassignedRead` facts feed the `cast_from_nullable_always_fails`
+//! join (#746); the unassigned non-nullable-local compile error remains
+//! unconsumed territory.
 
 //! # The frozen-family emit matrix (batch 1 #120, batch 2 #197)
 //!
@@ -290,6 +291,7 @@ use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::annotation::is_meta_getter;
 use crate::bounds::{Bounds, Clause, TypeTree};
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::collector::container_modifiers;
@@ -302,8 +304,8 @@ use crate::model::{
     Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use dartq_types::{
-    Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Witness as EngineWitness,
-    compute,
+    Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Variance,
+    Witness as EngineWitness, compute,
 };
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
@@ -701,6 +703,11 @@ struct Frame {
     locals: FxHashSet<StringId>,
     /// Declared-type bindings: name → declared type.
     var_types: FxHashMap<StringId, Ty>,
+    /// Written type arguments of a binding's declared type (name → the
+    /// annotation's arguments as written): `Ty`'s argument slots stay
+    /// argument-less at body level (the pool is capture-immutable), so the
+    /// null-argument face reads the annotation through this side channel.
+    written_args: FxHashMap<StringId, Vec<Ty>>,
     /// `type_params` length to truncate back to when this frame closes.
     type_mark: usize,
     /// The row-stack length when this frame opened: type parameters that
@@ -719,10 +726,20 @@ enum FrameKind {
     /// local functions stay `None` — their return checks under-report).
     /// `super_invoked` is the per-element `invokesSuperSelf` face: any
     /// `super` expression while this frame is the innermost executable.
+    /// `body_brace` is the executable's block-body `{` (`begin_block_
+    /// function_body` latches it, first brace wins — a nested closure's
+    /// body latches the closure's own frame), the
+    /// `body_might_complete_normally_nullable` anchor. `is_async`/`
+    /// generator` latch the body's async modifier (`handle_async_modifier`):
+    /// the completion warning's generator and async-legality gates
+    /// (`checkForBodyMayCompleteNormally`, type_analyzer.dart:658-681).
     Executable {
         instance: bool,
         ret: Option<ExecReturn>,
         super_invoked: bool,
+        body_brace: Option<SourceRange>,
+        is_async: bool,
+        generator: bool,
     },
     /// A statement block, catch clause, or typedef body.
     Block,
@@ -757,10 +774,43 @@ struct ArgLevel {
 
 /// The member-walk outcome: found, genuinely absent after a clean walk, or a
 /// broken chain (an unresolvable container hop — suppression territory).
+#[derive(Clone, Copy)]
 enum Walk<'a> {
     Found(&'a crate::model::MemberEntry),
     Missing,
     ChainBroken,
+}
+
+/// The pass's memo over the member-face climbs ([`Engine::walk_from`]): one
+/// outcome per `(container, member, super-climb)` probe. Sound because the
+/// element model is frozen once `collect` completes (the pass reads it
+/// through shared references) and the climb's start — the engine's
+/// `file`/`lib` — is fixed for the run, so a probe's answer never goes
+/// stale. Bounded by the distinct container-member pairs the pass touches;
+/// dropped with the engine, never a cross-pass cache.
+#[derive(Default)]
+struct MemberFace<'a> {
+    walks: RefCell<FxHashMap<(StringId, StringId, bool), Walk<'a>>>,
+}
+
+impl<'a> MemberFace<'a> {
+    /// The memoized climb: `climb` runs only on the probe's first visit;
+    /// every later probe of the same face pays one hash lookup.
+    fn walk(
+        &self,
+        container: StringId,
+        member: StringId,
+        super_walk: bool,
+        climb: impl FnOnce() -> Walk<'a>,
+    ) -> Walk<'a> {
+        let key = (container, member, super_walk);
+        if let Some(&hit) = self.walks.borrow().get(&key) {
+            return hit;
+        }
+        let walk = climb();
+        self.walks.borrow_mut().insert(key, walk);
+        walk
+    }
 }
 
 /// One non-static member hit of a face-chain walk
@@ -952,6 +1002,9 @@ struct CatchClauseFact {
     /// The `on T` type's name (`None` = plain `catch`, and `Object` plays
     /// the same catch-all role).
     on_type: Option<StringId>,
+    /// Whether the `on T` type was written `T?` (the subtype walk's type
+    /// is the written shape — `int?` is not a subtype of `int`).
+    on_nullable: bool,
     /// The clause's first token (`on`/`catch`).
     start: SourceRange,
     /// The clause block's closing brace.
@@ -1026,7 +1079,10 @@ struct Engine<'a> {
     /// The open pattern-nesting stack (`begin_pattern`/`end_pattern`
     /// brackets); each frame collects the leaf restrictions it spans.
     pattern_stack: Vec<PatternFrame>,
-    pending_binary_operand: bool,
+    /// The next operand pattern is a logical-and/or operand (`Some(is_or)`
+    /// — the wildcard check needs the operator: only the `&&` kind is
+    /// wired in the official, `type_analyzer.dart:1347-1359`).
+    pending_binary_operand: Option<bool>,
     /// The number of currently open patterns.
     pattern_depth: usize,
     /// Completed root restrictions per open case (switch cases only).
@@ -1115,9 +1171,48 @@ struct Engine<'a> {
     /// `Feature.primary_constructors`; the expected-representation-type row
     /// lives in the disabled arm only).
     primary_constructors_enabled: bool,
+    /// The `variance` experiment grant (`FeatureSet::is_enabled(Feature::
+    /// Variance)`): without it the #612 capture never opens and the family
+    /// is one branch — default programs stay byte-identical.
+    variance_enabled: bool,
+    /// The open type-variables window's captured parameters `(name,
+    /// declared keyword, name range)` — the container-begin event adopts
+    /// them ([`Engine::note_container_type_variables`]).
+    var_tv_window: Vec<(StringId, Option<Variance>, SourceRange)>,
+    /// The `begin_type_variable` names of the open group, in declaration
+    /// order: the Simple1 fast path fires `end_type_variable` with the
+    /// group's closer token (the official event shape), so the completing
+    /// end pairs with its name through this stack (LIFO — the general path
+    /// completes variables in reverse declaration order).
+    var_name_stack: Vec<(StringId, SourceRange)>,
+    /// The written type arguments of the argument group that just closed on
+    /// its head `(head name, head offset, arguments as written)`: the
+    /// completing `handle_type` claims the entry when it re-fires that
+    /// head, arming [`Engine::pending_type_args`] for the declaration that
+    /// binds next. The body-level pool is capture-immutable, so written
+    /// arguments of local/parameter annotations travel outside `Ty`'s
+    /// [`ArgListId`] (the null-argument face reads them).
+    completed_group: Option<(StringId, u32, Vec<Ty>)>,
+    /// The claimed written arguments of the annotation just completed,
+    /// consumed by the declaration bind points ([`Engine::bind_declared_type`]
+    /// / [`Engine::bind_parameter_type`]); a group-less head completion
+    /// clears it.
+    pending_type_args: Vec<Ty>,
+    /// The open container-header capture ([`VarHeader`]); `None` outside
+    /// container headers and whenever the experiment is off.
+    var_header: Option<VarHeader>,
+    /// The finished header captures, in declaration order (keep-first by
+    /// name — a duplicate header is the `duplicate_definition` face's
+    /// business, but its clause trees still write through).
+    var_containers: Vec<VarContainer>,
     /// The hop-namespace memo (`(file, probed name)` → the owning library):
     /// #491 S2a's reverse lookup, cached per probe.
     owner_libs: RefCell<FxHashMap<(FileId, StringId), Option<LibraryId>>>,
+    /// The member-face walk memo (`(container, member, super-climb)` →
+    /// outcome): the miss chains re-probe the same face several times per
+    /// row (#438), so every probe after the first is one hash lookup. See
+    /// [`MemberFace`] for the soundness argument.
+    member_faces: MemberFace<'a>,
     /// Extension types whose representation checks already ran this pass
     /// (one emission per container: an augmentation re-fires the event).
     reported_extension_types: FxHashSet<StringId>,
@@ -1247,6 +1342,10 @@ struct Engine<'a> {
     /// The `on`-type name of the catch clause in flight (the first type
     /// reference before the catch parameters).
     catch_on_type: Option<StringId>,
+    /// Whether the clause in flight's `on` type completed with a trailing
+    /// `?` (the head's own `handle_type` completions overwrite, so the
+    /// parameterized re-fire carrying the `?` wins).
+    catch_on_nullable: Option<bool>,
     /// The catch clause's first token (`on`/`catch`) — the clause fact's
     /// start anchor.
     catch_clause_start: Option<SourceRange>,
@@ -1343,6 +1442,20 @@ struct Engine<'a> {
     /// so the teardown re-decides each against the promoted-read staging
     /// before the row emits.
     staged_checks: Vec<StagedCheck>,
+    /// The #746 `cast_from_nullable_always_fails` candidates, offset-sorted
+    /// by the read's identifier span: the cast junction's four decidable
+    /// conditions held (simple local read, declared type spelled nullable,
+    /// non-nullable named target); the definite-unassignment face joins at
+    /// the teardown against the flow layer's `UnassignedRead` facts. The
+    /// name rides along (the message's placeholder — the row span is a
+    /// UTF-16 range, the interned id is the exact spelling).
+    cast_nullable: Vec<(SourceRange, StringId)>,
+    /// The #746 executable-completion rows, offset-sorted by the body's
+    /// end token (the `BodyMayCompleteNormally` fact's span): the declared
+    /// return type plus the block body's `{` when the body is a block.
+    /// One row per method/top-level declaration ([`Engine::
+    /// stage_body_completion`]).
+    body_completions: Vec<(SourceRange, Ty, Option<SourceRange>)>,
 }
 
 /// One deferred boundedness check (the [`Engine::pending_bounded_checks`]
@@ -1372,6 +1485,334 @@ struct TvWindow {
     vars: Vec<Token>,
     /// Variables declared without a bound.
     unbounded: u16,
+}
+
+// —— #612: the variance-family capture (the `variance` experiment only) ————
+// Written-type trees captured from the same parse events the #610 bounds
+// capture consumes, scoped to a container's header (from the container-begin
+// event, where the capture opens, to the body-begin event). The consuming
+// check runs in [`Engine::finalize_variance`]; without the experiment the
+// capture never opens and every hook is one `None`/`false` check.
+
+/// One written type inside a container header's clause region
+/// (`extends A<F<T>>`, `implements void Function(T)` shapes included — the
+/// shapes the #610 `TypeTree` poisons are exactly the ones this family's
+/// verdicts live in).
+struct VarTree {
+    kind: VarTreeKind,
+    /// The trailing `?` was written.
+    nullable: bool,
+    /// An unmodelable or ambiguous capture was seen inside: the whole tree
+    /// suppresses its face (the poison propagates to the root it rides on).
+    poisoned: bool,
+}
+
+enum VarTreeKind {
+    /// A named type as written (type parameters keep their name — the
+    /// model's bare-name convention), with the written arguments.
+    Head { name: StringId, args: Vec<VarTree> },
+    /// A function type: the return type (`None` for `void`/recovery — an
+    /// unrelated contribution), the formal types, and the bounds of the
+    /// signature's own type parameters (an occurrence forces `invariant`,
+    /// `variance_builder.dart:131-140`).
+    Fn {
+        ret: Option<Box<VarTree>>,
+        params: Vec<VarTree>,
+        bounds: Vec<VarTree>,
+    },
+    /// A record type: the meet runs over every field (the written field
+    /// names are not captured; the display renders the positional shape).
+    Record { fields: Vec<VarTree> },
+    /// A poison blob (a headless argument group): contributes nothing.
+    Unit,
+}
+
+/// Which clause a captured superinterface tree belongs to (the official
+/// walk's order is the supertype, the interfaces, the mixins, then a
+/// mixin's constraints — the staged rows sort by anchor offset, so the
+/// slot only feeds the capture bookkeeping).
+#[derive(Clone, Copy)]
+enum VarSlot {
+    Extends,
+    With,
+    Implements,
+    On,
+}
+
+/// One open nested capture frame inside a header: a type-argument group, a
+/// function type, or a record type.
+enum VarFrame {
+    /// `<...>`: `head` is `Some` until its group closes (the parser re-fires
+    /// a parameterized head after the group — the merge latch lives on the
+    /// sink, keyed by the head's name and offset).
+    Group {
+        head: Option<(StringId, u32)>,
+        nodes: Vec<VarTree>,
+        poisoned: bool,
+    },
+    Fn(VarFnFrame),
+    Record {
+        nodes: Vec<VarTree>,
+        poisoned: bool,
+    },
+}
+
+/// The open function-type frame: trees route by region (bounds of the
+/// signature's own type parameters, then the formals after the boundary,
+/// then the return).
+struct VarFnFrame {
+    ret: Option<VarTree>,
+    params: Vec<VarTree>,
+    bounds: Vec<VarTree>,
+    in_params: bool,
+    in_bounds: bool,
+    poisoned: bool,
+}
+
+impl VarFnFrame {
+    fn route(&mut self, node: VarTree) {
+        self.poisoned |= node.poisoned;
+        if self.in_bounds {
+            self.bounds.push(node);
+        } else if self.in_params {
+            self.params.push(node);
+        } else if self.ret.is_none() {
+            self.ret = Some(node);
+        } else {
+            // A second root before the formals is a capture this face
+            // cannot attribute (a leaked bound, recovery residue).
+            self.poisoned = true;
+        }
+    }
+
+    fn into_tree(mut self, nullable: bool) -> VarTree {
+        VarTree {
+            nullable,
+            poisoned: std::mem::take(&mut self.poisoned),
+            kind: VarTreeKind::Fn {
+                ret: self.ret.map(Box::new),
+                params: self.params,
+                bounds: self.bounds,
+            },
+        }
+    }
+}
+
+/// The written-type capture of one open container header.
+#[derive(Default)]
+struct VarSink {
+    roots: Vec<VarTree>,
+    stack: Vec<VarFrame>,
+    /// A parameterized group just closed; the re-fired head
+    /// (`handle_type`, same name at the same offset) completes it with its
+    /// trailing `?`.
+    pending_head: Option<(StringId, u32, Vec<VarTree>)>,
+}
+
+impl VarSink {
+    /// Routes a completed node into the innermost open frame (or the
+    /// roots), propagating the poison bit.
+    fn route(&mut self, node: VarTree) {
+        match self.stack.last_mut() {
+            Some(VarFrame::Group {
+                nodes, poisoned, ..
+            })
+            | Some(VarFrame::Record { nodes, poisoned }) => {
+                *poisoned |= node.poisoned;
+                nodes.push(node);
+            }
+            Some(VarFrame::Fn(frame)) => frame.route(node),
+            None => self.roots.push(node),
+        }
+    }
+
+    fn poison_top(&mut self) {
+        match self.stack.last_mut() {
+            Some(VarFrame::Group { poisoned, .. }) | Some(VarFrame::Record { poisoned, .. }) => {
+                *poisoned = true;
+            }
+            Some(VarFrame::Fn(frame)) => frame.poisoned = true,
+            None => self.roots.push(VarTree {
+                kind: VarTreeKind::Unit,
+                nullable: false,
+                poisoned: true,
+            }),
+        }
+    }
+
+    /// The innermost function-type frame consumed the formal boundary;
+    /// answers `false` when no frame did (the header-level rep-formals
+    /// latch takes over).
+    fn formal_boundary(&mut self) -> bool {
+        match self.stack.last_mut() {
+            Some(VarFrame::Fn(frame)) => {
+                frame.in_params = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn open_bounds(&mut self) {
+        if let Some(VarFrame::Fn(frame)) = self.stack.last_mut() {
+            frame.in_bounds = true;
+        }
+    }
+
+    fn close_bounds(&mut self) {
+        if let Some(VarFrame::Fn(frame)) = self.stack.last_mut() {
+            frame.in_bounds = false;
+        }
+    }
+}
+
+/// One container's captured header: its type parameters (name, declared
+/// keyword, name range — the emission anchor) and the clause-classified
+/// superinterface trees.
+struct VarHeader {
+    name: StringId,
+    params: Vec<(StringId, Option<Variance>, SourceRange)>,
+    sink: VarSink,
+    supers: Vec<(VarSlot, VarTree)>,
+    /// A clause count disagreed with its captured roots, or roots remained
+    /// unclaimed at body time: the capture is unfaithful, the container's
+    /// checks suppress.
+    open: bool,
+    /// The extension-type primary constructor's formals region (their
+    /// types are not superinterfaces).
+    rep_formals: bool,
+    /// The formals regions nested inside the rep-formals latch (a function
+    /// type formal's own region re-enters on the suppressed, frame-less
+    /// sink): the latch lifts only when the region that armed it closes.
+    rep_depth: u32,
+}
+
+impl VarHeader {
+    fn new(name: StringId) -> Self {
+        Self {
+            name,
+            params: Vec::new(),
+            sink: VarSink::default(),
+            supers: Vec::new(),
+            open: false,
+            rep_formals: false,
+            rep_depth: 0,
+        }
+    }
+
+    /// A clause completed: claims the roots since the last clause. A
+    /// count-bearing clause whose roots disagree marks the capture open.
+    /// Mixin `on` constraints join the set — the official checks them
+    /// (`element.superclassConstraints.forEach(checkOne)`,
+    /// error_verifier.dart:8050-8052).
+    fn clause(&mut self, slot: VarSlot, expected: Option<usize>) {
+        self.rep_formals = false;
+        if let Some(expected) = expected
+            && self.sink.roots.len() != expected
+        {
+            self.open = true;
+        }
+        let trees = std::mem::take(&mut self.sink.roots);
+        self.supers
+            .extend(trees.into_iter().map(|tree| (slot, tree)));
+    }
+}
+
+/// One container's finished header capture ([`Engine::finalize_variance`]'s
+/// input).
+struct VarContainer {
+    name: StringId,
+    params: Vec<(StringId, Option<Variance>, SourceRange)>,
+    supers: Vec<(VarSlot, VarTree)>,
+    open: bool,
+}
+
+/// The written-tree walk's depth budget: nesting beyond it answers
+/// `unrelated` (the parameter is treated as absent — the under-report
+/// direction), never recurses unbounded.
+const VARIANCE_WALK_DEPTH: u32 = 64;
+
+/// The variance of `parameter` in a written type — the
+/// `computeVarianceInType` decision matrix over the capture's trees
+/// (`variance_builder.dart:57-151`):
+///
+/// * a bare head naming the parameter: `covariant`;
+/// * a parameterized head: the meet of
+///   `declaredᵢ.combine(recursive)` over the arguments, the declaration's
+///   parameter variances read from `table` (unknown heads read
+///   all-covariant — every generic of the default SDK is legacy
+///   covariant, element.dart:11560-11562); an arity mismatch or a poison
+///   answers `unrelated` (the face suppresses);
+/// * a function type: the meet of the return with
+///   `contravariant.combine(…)` over the formals, forced `invariant` when
+///   the parameter occurs in any bound of the signature's own type
+///   parameters (variance_builder.dart:131-140);
+/// * a record type: the meet over the fields;
+/// * a poison blob: `unrelated`.
+fn variance_in_tree(
+    tree: &VarTree,
+    parameter: &StringId,
+    table: &FxHashMap<StringId, Vec<Variance>>,
+    depth: u32,
+) -> Variance {
+    if depth == 0 || tree.poisoned {
+        return Variance::Unrelated;
+    }
+    match &tree.kind {
+        VarTreeKind::Head { name, args } => {
+            if args.is_empty() && name == parameter {
+                return Variance::Covariant;
+            }
+            let declared = table
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![Variance::Covariant; args.len()]);
+            if declared.len() != args.len() {
+                return Variance::Unrelated;
+            }
+            let mut result = Variance::Unrelated;
+            for (variance, arg) in declared.iter().zip(args.iter()) {
+                result = result.meet(variance.combine(variance_in_tree(
+                    arg,
+                    parameter,
+                    table,
+                    depth - 1,
+                )));
+            }
+            result
+        }
+        VarTreeKind::Fn {
+            ret,
+            params,
+            bounds,
+        } => {
+            let mut result = ret.as_ref().map_or(Variance::Unrelated, |ret| {
+                variance_in_tree(ret, parameter, table, depth - 1)
+            });
+            for bound in bounds {
+                if variance_in_tree(bound, parameter, table, depth - 1) != Variance::Unrelated {
+                    result = Variance::Invariant;
+                }
+            }
+            for param in params {
+                result = result.meet(Variance::Contravariant.combine(variance_in_tree(
+                    param,
+                    parameter,
+                    table,
+                    depth - 1,
+                )));
+            }
+            result
+        }
+        VarTreeKind::Record { fields } => {
+            let mut result = Variance::Unrelated;
+            for field in fields {
+                result = result.meet(variance_in_tree(field, parameter, table, depth - 1));
+            }
+            result
+        }
+        VarTreeKind::Unit => Variance::Unrelated,
+    }
 }
 
 /// A const-environment binding.
@@ -1411,6 +1852,7 @@ impl<'a> Engine<'a> {
         file: FileId,
         lib: LibraryId,
         primary_constructors_enabled: bool,
+        variance_enabled: bool,
         strict: StrictModes,
     ) -> Self {
         let guard = UndefinedGuard::build(graph, lib);
@@ -1441,6 +1883,8 @@ impl<'a> Engine<'a> {
             pending_bounded_checks: Vec::new(),
             raw_type_sites: Vec::new(),
             staged_checks: Vec::new(),
+            cast_nullable: Vec::new(),
+            body_completions: Vec::new(),
             armed_ty: None,
             pending_decl_ty: None,
             group_heads: Vec::new(),
@@ -1453,7 +1897,7 @@ impl<'a> Engine<'a> {
             return_mark: None,
             switches: Vec::new(),
             pattern_stack: Vec::new(),
-            pending_binary_operand: false,
+            pending_binary_operand: None,
             pattern_depth: 0,
             pattern_roots: Vec::new(),
             case_sink_open: false,
@@ -1496,7 +1940,15 @@ impl<'a> Engine<'a> {
             enum_element_open: false,
             const_string_begins: Vec::new(),
             primary_constructors_enabled,
+            variance_enabled,
+            var_tv_window: Vec::new(),
+            var_name_stack: Vec::new(),
+            completed_group: None,
+            pending_type_args: Vec::new(),
+            var_header: None,
+            var_containers: Vec::new(),
             owner_libs: RefCell::new(FxHashMap::default()),
+            member_faces: MemberFace::default(),
             reported_extension_types: FxHashSet::default(),
             reported_face_checks: FxHashSet::default(),
             reported_modifier_checks: FxHashSet::default(),
@@ -1516,6 +1968,7 @@ impl<'a> Engine<'a> {
             imports: Vec::new(),
             label_scopes: Vec::new(),
             catch_on_type: None,
+            catch_on_nullable: None,
             catch_clause_start: None,
             catch_params: 0,
             try_clauses: Vec::new(),
@@ -1623,6 +2076,26 @@ impl<'a> Engine<'a> {
         let mut survivors: Vec<Diagnostic> = Vec::new();
         for check in std::mem::take(&mut self.staged_checks) {
             let from = promotions.promoted(check.range).unwrap_or(check.from);
+            if matches!(check.kind, StagedKind::NeverReceiver) {
+                // One row at the receiver span per `Never` receiver
+                // (`receiverOfTypeNever`). The join above replaced the type
+                // when the flow layer staged a promoted read; #477's drop
+                // rule keeps promoted-to-`Never` facts out today, so the
+                // unpromoted declared type decides (documented
+                // under-report).
+                if self.is_never_ty(from) {
+                    let code = SemanticCode::ReceiverOfTypeNever;
+                    survivors.push(Diagnostic::new(
+                        code.severity(),
+                        code.code_info(),
+                        code.message("", ""),
+                        self.file,
+                        check.range,
+                        code.correction_message(""),
+                    ));
+                }
+                continue;
+            }
             let verdict = match check.kind {
                 StagedKind::Return { .. } => self.return_verdict(from, check.to, check.literal),
                 _ => self.assignable(from, check.to, check.literal),
@@ -1633,6 +2106,9 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let (code, a2) = match check.kind {
+                // Routed by the early block above; the arm only keeps the
+                // match total.
+                StagedKind::NeverReceiver => continue,
                 StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
                 StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
                 StagedKind::Return { host, name } => {
@@ -1743,6 +2219,7 @@ impl<'a> Engine<'a> {
             kind,
             locals: FxHashSet::default(),
             var_types: FxHashMap::default(),
+            written_args: FxHashMap::default(),
             type_mark,
             row_mark,
         });
@@ -1940,6 +2417,69 @@ impl<'a> Engine<'a> {
         self.stage_usage(SemanticCode::UnnecessaryCast, at, "");
     }
 
+    /// `cast_from_null_always_fails` (`visitAsExpression`,
+    /// best_practices_verifier.dart:180-190): an `e as T` whose operand's
+    /// static type is exactly `Null` and whose target is non-nullable
+    /// always throws. Non-nullability is the syntactic `?` flag at name
+    /// level (`isNonNullable` — `dynamic`, `void`, and `Null` targets fail
+    /// it and stay silent).
+    fn check_cast_from_null(&mut self, at: SourceRange, operand: Ty, cast: Option<Ty>) {
+        if operand != Ty::Null {
+            return;
+        }
+        let Some(Ty::Named {
+            nullable: false, ..
+        }) = cast
+        else {
+            return;
+        };
+        self.stage_usage(SemanticCode::CastFromNullAlwaysFails, at, "");
+    }
+
+    /// `cast_from_nullable_always_fails` (`visitAsExpression`'s
+    /// unassigned-read face, type_analyzer.dart:2107-2126): a simple local
+    /// read whose declared type is spelled nullable, cast to a non-nullable
+    /// named type, reports when the read is definitely unassigned. That
+    /// fifth face only the flow layer knows, so the candidate stages keyed
+    /// by the read's identifier span and the teardown's `UnassignedRead`
+    /// join decides; the remaining four decide here — the operand row is a
+    /// bare read (`element is PromotableElementImpl`; the flow side never
+    /// surfaces non-locals, so the join keeps non-flow shapes silent), the
+    /// declared type carries the written `?` (`isNullable(element.type)` —
+    /// the read's parse-time type is the declared one), and the target is
+    /// non-nullable named (`isNonNullable(staticType)`).
+    fn check_cast_from_nullable(
+        &mut self,
+        operand: Option<(SourceRange, StringId)>,
+        operand_ty: Ty,
+        cast: Option<Ty>,
+    ) {
+        let Some((span, name)) = operand else {
+            return;
+        };
+        let Ty::Named { nullable: true, .. } = operand_ty else {
+            return;
+        };
+        let Some(Ty::Named {
+            nullable: false, ..
+        }) = cast
+        else {
+            return;
+        };
+        match self
+            .cast_nullable
+            .binary_search_by(|(r, _)| r.offset.cmp(&span.offset))
+        {
+            // A diverging repeat (two candidates on one span) leaves no
+            // single read that stands for it — poisoned, the join misses
+            // (the [`PromotionStaging`] rule).
+            Ok(index) => {
+                self.cast_nullable.remove(index);
+            }
+            Err(index) => self.cast_nullable.insert(index, (span, name)),
+        }
+    }
+
     /// The `is`/`is!` verdict walk (`_checkAllTypeChecks`,
     /// best_practices_verifier.dart:987-1041, mirrored from
     /// `TypeSystem::type_check_verdict`): unresolved sides are informative;
@@ -2027,11 +2567,9 @@ impl<'a> Engine<'a> {
     /// `==` is constant-false, `!=` constant-true. `super`/`this`
     /// receivers answer never-null without a type (the official's AST
     /// arm); an extension override suppresses, which the name level
-    /// cannot see and skips with the rest of the untyped shapes.
-    fn check_null_comparison(&mut self, negated: bool) {
-        let Some((mark, _op_range)) = self.null_cmp_groups.pop() else {
-            return;
-        };
+    /// cannot see and skips with the rest of the untyped shapes. The
+    /// caller pops the comparison's mark (the NaN walk shares it).
+    fn null_comparison(&mut self, mark: usize, negated: bool) {
         let Some(right) = self.rows.last() else {
             return;
         };
@@ -2062,6 +2600,63 @@ impl<'a> Engine<'a> {
         };
         let range = operand.range;
         self.stage_usage(code, range, "");
+    }
+
+    /// `unnecessary_nan_comparison` (`visitBinaryOperatorInvocation`'s
+    /// `checkLeftRight`, best_practices_verifier.dart:1234-1236 with the
+    /// `isDoubleNan` extension :2264-2277): an operand that is the
+    /// `double.nan` getter read makes the comparison constant — `!=` is
+    /// always 'true', `==` always 'false'. The left operand wins when both
+    /// are (the official's if/else), and the span runs from the NaN
+    /// operand through the operator (`reportStartEnd`). The
+    /// constant-pattern face (`visitConstantPattern` :317-324) is the
+    /// documented under-report.
+    fn check_nan_comparison(&mut self, mark: usize, negated: bool, op_range: SourceRange) {
+        let Some(right) = self.rows.last() else {
+            return;
+        };
+        let Some(left) = mark.checked_sub(1).and_then(|index| self.rows.get(index)) else {
+            return;
+        };
+        let left_nan = self.is_double_nan(left);
+        let right_nan = self.is_double_nan(right);
+        if !left_nan && !right_nan {
+            return;
+        }
+        let code = if negated {
+            SemanticCode::UnnecessaryNanComparisonTrue
+        } else {
+            SemanticCode::UnnecessaryNanComparisonFalse
+        };
+        let range = if left_nan {
+            SourceRange {
+                offset: left.range.offset,
+                length: op_range.end().saturating_sub(left.range.offset),
+            }
+        } else {
+            SourceRange {
+                offset: op_range.offset,
+                length: right.range.end().saturating_sub(op_range.offset),
+            }
+        };
+        self.stage_usage(code, range, "");
+    }
+
+    /// The `double.nan` getter read (`isDoubleNan`): a `double.nan` member
+    /// row — the class-static read on the `double` container. A shadowing
+    /// declaration of `double` resolves through the same face (the
+    /// name-level edge; the oracle reads the resolved getter).
+    fn is_double_nan(&self, row: &Row) -> bool {
+        self.strings.resolve(row.name) == "nan"
+            && matches!(
+                &row.shape,
+                RowShape::Member {
+                    recv: Receiver::Container {
+                        name,
+                        kind: ContainerKind::Class,
+                    },
+                } if *name == self.primitive_ids[1]
+            )
     }
 
     /// The cast-pattern pair (shared_type_analyzer.dart:145-152 and
@@ -2101,6 +2696,29 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// `cast_from_null_always_fails`'s pattern face (`visitCastPattern`,
+    /// best_practices_verifier.dart:227-239): a cast pattern whose matched
+    /// value type is `Null` and whose target is non-nullable. The matched
+    /// type is the open switch's scrutinee — the proxy
+    /// [`Engine::check_cast_pattern`] consumes — under the same root gate.
+    fn check_cast_pattern_null(&mut self, at: SourceRange, cast: Option<Ty>) {
+        let Some(Ty::Named {
+            nullable: false, ..
+        }) = cast
+        else {
+            return;
+        };
+        if !self.case_sink_open || self.pattern_stack.len() != 1 {
+            return;
+        }
+        let Some(ctx) = self.switches.last() else {
+            return;
+        };
+        if ctx.scrutinee == Ty::Null {
+            self.stage_usage(SemanticCode::CastFromNullAlwaysFails, at, "");
+        }
+    }
+
     /// `checkPatternNeverMatchesValueType`'s DeclaredVariable/Wildcard/
     /// Object kinds (type_analyzer.dart:723-756): a required type no
     /// matched value can inhabit proves the pattern dead. Root patterns
@@ -2125,6 +2743,83 @@ impl<'a> Engine<'a> {
             let a1 = self.ty_display(required);
             self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
         }
+    }
+
+    /// `unnecessary_wildcard_pattern` (`unnecessaryWildcardPattern`,
+    /// shared_type_analyzer.dart:250-258, fed by `analyzeWildcardPattern`
+    /// type_analyzer.dart:2731-2737): a wildcard pattern that is a direct
+    /// operand of a logical-and pattern and always matches. Only the
+    /// logical-and kind is wired in the official (`OR` dispatch resets the
+    /// kind to null, type_analyzer.dart:1347-1359 vs :1356); a bare `_` is
+    /// always matching (no declared type), a typed one when the matched
+    /// type already sits below the declaration (`promoteForPattern`'s
+    /// unchanged-type face, mirrored with the exact-subtype gate like the
+    /// cast-pattern check). Deep propagation through parenthesized and
+    /// other kind-resetting wrappers is the documented under-report.
+    ///
+    /// Both operands of one `&&` report (type_inference_test.dart's
+    /// WILDCARD1+WILDCARD2 shape). The operator event follows the left
+    /// operand, so a wildcard recorded under a frame without a binary
+    /// context arms when the `&&` arrives
+    /// ([`Engine::check_pending_wildcards`]); a wildcard whose frame the
+    /// `&&` already opened checks here.
+    fn check_wildcard_pattern(&mut self, at: SourceRange, declared: Option<Ty>) {
+        if !self.case_sink_open {
+            return;
+        }
+        let binary = self.pattern_stack.last().map(|frame| frame.binary);
+        match binary {
+            Some(Some(false)) => self.wildcard_row(at, declared),
+            // A root (or not-yet-binary) frame: the deciding `&&` follows.
+            Some(_) => {
+                if let Some(frame) = self.pattern_stack.last_mut() {
+                    frame.wildcards.push((at, declared));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The `&&` arrived: the top frame's recorded wildcards are its direct
+    /// left operands (the right operand opens its own frame after this
+    /// event). Each runs the same row the right-operand face runs.
+    fn check_pending_wildcards(&mut self) {
+        let pending = match self.pattern_stack.last_mut() {
+            Some(frame) => std::mem::take(&mut frame.wildcards),
+            None => return,
+        };
+        for (at, declared) in pending {
+            self.wildcard_row(at, declared);
+        }
+    }
+
+    /// One `unnecessary_wildcard_pattern` row: the shared conditions of
+    /// both operand faces (the case-header window, the all-binary frames
+    /// above the root, the typed wildcard's already-below gate).
+    fn wildcard_row(&mut self, at: SourceRange, declared: Option<Ty>) {
+        if !self.case_sink_open {
+            return;
+        }
+        // The matched type is the scrutinee only under binary frames (the
+        // constant-pattern walk's gate).
+        if !self
+            .pattern_stack
+            .iter()
+            .skip(1)
+            .all(|f| f.binary.is_some())
+        {
+            return;
+        }
+        if let Some(declared) = declared {
+            if declared == Ty::Unknown {
+                return;
+            }
+            let matched = self.switches.last().map_or(Ty::Unknown, |c| c.scrutinee);
+            if matched == Ty::Unknown || !self.name_subtype(matched, declared) {
+                return;
+            }
+        }
+        self.stage_usage(SemanticCode::UnnecessaryWildcardPattern, at, "");
     }
 
     /// The null-check/assert pattern pair
@@ -2169,7 +2864,13 @@ impl<'a> Engine<'a> {
         let (Some(constant), Some(at)) = (constant, at) else {
             return;
         };
-        if !self.case_sink_open || !self.pattern_stack.iter().skip(1).all(|f| f.binary) {
+        if !self.case_sink_open
+            || !self
+                .pattern_stack
+                .iter()
+                .skip(1)
+                .all(|f| f.binary.is_some())
+        {
             return;
         }
         let Some(ctx) = self.switches.last() else {
@@ -2286,6 +2987,11 @@ impl<'a> Engine<'a> {
     ) {
         if let Some(id) = name.and_then(|token| self.name_of(token)) {
             self.bounds.open_header(id);
+            // The #612 capture opens with the header (params adopt below,
+            // clause trees capture from here to the body).
+            if self.variance_enabled {
+                self.var_header = Some(VarHeader::new(id));
+            }
         }
         let Some((unbounded, window_end)) = self.pending_tv.take() else {
             return;
@@ -2307,6 +3013,576 @@ impl<'a> Engine<'a> {
             is_extension_type,
             is_enum,
         );
+        // The type-variable window just closed is this container's: adopt
+        // its captured parameters (name, keyword, anchor).
+        if self.variance_enabled
+            && let Some(header) = self.var_header.as_mut()
+            && header.name == id
+        {
+            header.params = std::mem::take(&mut self.var_tv_window);
+        }
+    }
+
+    // —— #612: the variance-family capture hooks ———————————————————————————
+    // Every hook is one gate check: without the `variance` experiment the
+    // capture never opens and each answers immediately — default programs
+    // stay byte-identical (#612 adjudication).
+
+    /// `end_type_variable`: one declared parameter `(name, keyword, anchor)`
+    /// joins the open window. The keyword's text is the official spelling
+    /// (`out`/`in`/`inout`, `shared_type.dart:28-47`); anything else reads
+    /// as the legacy default.
+    fn var_type_variable(&mut self, name: StringId, variance: Option<Token>, range: SourceRange) {
+        if !self.variance_enabled {
+            return;
+        }
+        let declared = variance.and_then(|token| match self.text_of(token) {
+            Some("out") => Some(Variance::Covariant),
+            Some("in") => Some(Variance::Contravariant),
+            Some("inout") => Some(Variance::Invariant),
+            _ => None,
+        });
+        self.var_tv_window.push((name, declared, range));
+    }
+
+    /// `begin_type_variables`: a fresh window (a previous declaration's
+    /// stale window never met its container — drop it, with any paired
+    /// names of an abandoned group).
+    fn var_reset_type_variables(&mut self) {
+        if self.variance_enabled {
+            self.var_tv_window.clear();
+            self.var_name_stack.clear();
+        }
+    }
+
+    /// `handle_type`: a simple type head completed inside the open header.
+    /// The re-fired parameterized head merges into its group node (same
+    /// name at the same offset — the trailing `?` rides on the re-fire).
+    fn var_leaf(&mut self, name: StringId, offset: u32, nullable: bool) {
+        let Some(header) = self.var_header.as_mut() else {
+            return;
+        };
+        if header.rep_formals {
+            return;
+        }
+        if header
+            .sink
+            .pending_head
+            .as_ref()
+            .is_some_and(|(h, o, _)| *h == name && *o == offset)
+        {
+            let (_, _, args) = header.sink.pending_head.take().expect("checked above");
+            header.sink.pending_head = None;
+            header.sink.route(VarTree {
+                nullable,
+                poisoned: false,
+                kind: VarTreeKind::Head { name, args },
+            });
+            return;
+        }
+        // A stale pending head whose re-fire never came routes as written.
+        if let Some((stale, _, args)) = header.sink.pending_head.take() {
+            header.sink.route(VarTree {
+                nullable: false,
+                poisoned: false,
+                kind: VarTreeKind::Head { name: stale, args },
+            });
+        }
+        header.sink.route(VarTree {
+            nullable,
+            poisoned: false,
+            kind: VarTreeKind::Head {
+                name,
+                args: Vec::new(),
+            },
+        });
+    }
+
+    /// `begin_type_arguments`: a group opened on `head` (name, offset).
+    fn var_begin_group(&mut self, head: Option<(StringId, SourceRange)>) {
+        if let Some(header) = self.var_header.as_mut()
+            && !header.rep_formals
+        {
+            header.sink.stack.push(VarFrame::Group {
+                head: head.map(|(name, range)| (name, range.offset)),
+                nodes: Vec::new(),
+                poisoned: false,
+            });
+        }
+    }
+
+    /// `end_type_arguments`: the group closed; a parameterized node waits
+    /// for its re-fired head, a headless group poisons the parent.
+    fn var_end_group(&mut self) {
+        let Some(header) = self.var_header.as_mut() else {
+            return;
+        };
+        let Some(VarFrame::Group {
+            head,
+            nodes,
+            poisoned,
+        }) = header.sink.stack.pop()
+        else {
+            return;
+        };
+        match head {
+            Some((name, offset)) => {
+                header.sink.pending_head = Some((name, offset, nodes));
+            }
+            None => {
+                if poisoned {
+                    header.sink.poison_top();
+                }
+            }
+        }
+    }
+
+    /// `begin_function_type`.
+    fn var_begin_function_type(&mut self) {
+        if let Some(header) = self.var_header.as_mut()
+            && !header.rep_formals
+        {
+            header.sink.stack.push(VarFrame::Fn(VarFnFrame {
+                ret: None,
+                params: Vec::new(),
+                bounds: Vec::new(),
+                in_params: false,
+                in_bounds: false,
+                poisoned: false,
+            }));
+        }
+    }
+
+    /// `end_function_type`: the frame closes into a tree.
+    fn var_end_function_type(&mut self, nullable: bool) {
+        if let Some(header) = self.var_header.as_mut() {
+            if let Some(VarFrame::Fn(frame)) = header.sink.stack.pop() {
+                header.sink.route(frame.into_tree(nullable));
+            }
+        }
+    }
+
+    /// `begin_formal_parameters`: a function-type frame enters its formals
+    /// region; at the header level this is an extension type's primary
+    /// constructor — its formals' types are not superinterfaces. The latch
+    /// arms with a nesting count: a function-type formal's own region
+    /// re-enters on the suppressed, frame-less sink, and only the arming
+    /// region's close lifts the latch, so the implements clause that
+    /// follows the header captures normally.
+    fn var_formal_boundary(&mut self) {
+        let Some(header) = self.var_header.as_mut() else {
+            return;
+        };
+        if !header.sink.formal_boundary() {
+            header.rep_depth += 1;
+            header.rep_formals = true;
+        }
+    }
+
+    /// `end_formal_parameters`: the innermost formals region closes; the
+    /// latch lifts when the arming (outermost) region does. A clause event
+    /// alone fires too late — the clause's trees parsed while the latch was
+    /// up, so they would already be lost.
+    fn var_formal_region_end(&mut self) {
+        let Some(header) = self.var_header.as_mut() else {
+            return;
+        };
+        if header.rep_depth > 0 {
+            header.rep_depth -= 1;
+            if header.rep_depth == 0 {
+                header.rep_formals = false;
+            }
+        }
+    }
+
+    /// A signature's own type-parameter window opened inside a function
+    /// type: trees complete into its bounds until the window closes.
+    fn var_open_bounds(&mut self) {
+        if let Some(header) = self.var_header.as_mut() {
+            header.sink.open_bounds();
+        }
+    }
+
+    fn var_close_bounds(&mut self) {
+        if let Some(header) = self.var_header.as_mut() {
+            header.sink.close_bounds();
+        }
+    }
+
+    /// `begin_record_type`.
+    fn var_begin_record_type(&mut self) {
+        if let Some(header) = self.var_header.as_mut()
+            && !header.rep_formals
+        {
+            header.sink.stack.push(VarFrame::Record {
+                nodes: Vec::new(),
+                poisoned: false,
+            });
+        }
+    }
+
+    /// `end_record_type`: the frame closes into a tree.
+    fn var_end_record_type(&mut self, nullable: bool) {
+        if let Some(header) = self.var_header.as_mut() {
+            if let Some(VarFrame::Record { nodes, poisoned }) = header.sink.stack.pop() {
+                header.sink.route(VarTree {
+                    nullable,
+                    poisoned,
+                    kind: VarTreeKind::Record { fields: nodes },
+                });
+            }
+        }
+    }
+
+    /// A clause event: the completed supertype trees join the set.
+    fn var_clause(&mut self, slot: VarSlot, expected: Option<usize>) {
+        if let Some(header) = self.var_header.as_mut() {
+            header.clause(slot, expected);
+        }
+    }
+
+    /// The body opened: the capture finalizes onto its container
+    /// (keep-first by name; a re-entry's clause trees write through).
+    fn var_finish_header(&mut self) {
+        if self.var_header.is_none() {
+            return;
+        }
+        let header = self.var_header.take().expect("checked above");
+        let open = header.open || !header.sink.roots.is_empty() || !header.sink.stack.is_empty();
+        if let Some(existing) = self
+            .var_containers
+            .iter_mut()
+            .find(|container| container.name == header.name)
+        {
+            existing.supers = header.supers;
+            existing.open = open;
+            return;
+        }
+        self.var_containers.push(VarContainer {
+            name: header.name,
+            params: header.params,
+            supers: header.supers,
+            open,
+        });
+    }
+
+    /// Declaration end: the safety-net drop (the capture normally closed
+    /// at the body).
+    fn var_drop_header(&mut self) {
+        self.var_header = None;
+    }
+
+    /// The end-of-pass variance family (#612): the superinterface face
+    /// (`_checkForWrongTypeParameterVarianceInSuperinterfaces`,
+    /// error_verifier.dart:7999-8054) and the member faces
+    /// (:7910-7996 through `_checkForWrongVariancePosition` :8074-8088),
+    /// against the whole-file capture. Runs after the parse, staged into
+    /// the usage rows for the teardown's source-ordered merge.
+    ///
+    /// Gate posture (#612 adjudication): the whole family answers nothing
+    /// without the `variance` experiment, keeping default programs
+    /// byte-identical — the oracle's legacy superinterface code does fire
+    /// without the experiment, so that face is a recorded under-report
+    /// outside the experiment.
+    ///
+    /// Model edges (documented divergences, all under-report except the
+    /// noted face): generic typedefs in superinterfaces answer unrelated
+    /// (alias expansion is a resolution fact this face does not model —
+    /// the same posture as the #610 map); the formal `covariant` and
+    /// field-group `covariant` exemptions (:7926-7929, :7972-7974) are
+    /// unmodeled; a method's type-parameter-bound face (:7943-7956) is
+    /// unmodeled; the method-formal/return anchors sit at the member name.
+    fn finalize_variance(&mut self) {
+        if !self.variance_enabled || self.var_containers.is_empty() {
+            return;
+        }
+        let strings = self.strings;
+        // The declared-variance table: this file's containers by name. A
+        // head outside it reads all-covariant — every generic of the
+        // default SDK carries legacy-covariant parameters
+        // (element.dart:11560-11562).
+        let table: FxHashMap<StringId, Vec<Variance>> = self
+            .var_containers
+            .iter()
+            .map(|container| {
+                (
+                    container.name,
+                    container
+                        .params
+                        .iter()
+                        .map(|(_, declared, _)| declared.unwrap_or(Variance::Covariant))
+                        .collect(),
+                )
+            })
+            .collect();
+        // The member name anchors (the model carries no spans; the
+        // declaration sites do).
+        let member_ranges: FxHashMap<(StringId, StringId), SourceRange> = self
+            .decl_sites
+            .iter()
+            .filter_map(|site| match site.kind {
+                DeclKind::Member { container, .. } => Some((container, site.name, site.range)),
+                _ => None,
+            })
+            .map(|(container, name, range)| ((container, name), range))
+            .collect();
+        for container in std::mem::take(&mut self.var_containers) {
+            if container.open {
+                continue;
+            }
+            let Some(model) = self
+                .index
+                .get(self.file)
+                .and_then(|elements| elements.container(container.name))
+            else {
+                continue;
+            };
+            // The official verifier has no extension-declaration visit
+            // (:615/:659/:1053/:1194/:1865 — class, class-type alias, enum,
+            // extension type, mixin).
+            if matches!(model.kind, ContainerKind::Extension) {
+                continue;
+            }
+            // —— the superinterface face ———————————————————————————————
+            for (parameter, declared, range) in &container.params {
+                let declared_variance = declared.unwrap_or(Variance::Covariant);
+                for (_, tree) in &container.supers {
+                    if tree.poisoned {
+                        continue;
+                    }
+                    let variance = variance_in_tree(tree, parameter, &table, VARIANCE_WALK_DEPTH);
+                    if variance.greater_or_equal(declared_variance) {
+                        continue;
+                    }
+                    let display = self.var_tree_display(tree);
+                    let code = match declared {
+                        Some(_) => SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface,
+                        None => SemanticCode::WrongTypeParameterVarianceInSuperinterface,
+                    };
+                    let name = strings.resolve(*parameter).to_owned();
+                    let message = match declared {
+                        Some(keyword) => {
+                            let position = variance.keyword().unwrap_or("");
+                            code.message4(
+                                &name,
+                                keyword.keyword().unwrap_or(""),
+                                position,
+                                &display,
+                            )
+                        }
+                        None => code.message(&name, &display),
+                    };
+                    self.report.usage.push(Diagnostic::new(
+                        code.severity(),
+                        code.code_info(),
+                        message,
+                        self.file,
+                        *range,
+                        code.correction_message(""),
+                    ));
+                }
+            }
+            // —— the member faces ———————————————————————————————————————
+            // Only explicit keywords are checked (`!isLegacyCovariant`,
+            // :7918/:7945): an all-legacy container can never fire.
+            if container
+                .params
+                .iter()
+                .all(|(_, declared, _)| declared.is_none())
+            {
+                continue;
+            }
+            for (member, entry) in &model.members {
+                if entry.is_static {
+                    continue;
+                }
+                let Some(&anchor) = member_ranges.get(&(container.name, *member)) else {
+                    continue;
+                };
+                for (parameter, declared, _) in &container.params {
+                    let Some(keyword) = declared.and_then(Variance::keyword) else {
+                        continue;
+                    };
+                    let parameter = *parameter;
+                    let declared_variance = declared.unwrap_or(Variance::Covariant);
+                    match entry.kind {
+                        MemberKind::Field => {
+                            let variance = self.variance_in_ty(entry.var_ty, parameter, &table);
+                            self.check_variance_position(
+                                variance,
+                                declared_variance,
+                                keyword,
+                                parameter,
+                                anchor,
+                            );
+                            if !entry.is_final {
+                                let setter = Variance::Contravariant.combine(variance);
+                                self.check_variance_position(
+                                    setter,
+                                    declared_variance,
+                                    keyword,
+                                    parameter,
+                                    anchor,
+                                );
+                            }
+                        }
+                        MemberKind::Method | MemberKind::Getter | MemberKind::Setter => {
+                            let variance = self.variance_in_ty(entry.return_ty, parameter, &table);
+                            self.check_variance_position(
+                                variance,
+                                declared_variance,
+                                keyword,
+                                parameter,
+                                anchor,
+                            );
+                            if let Some(formals) = &entry.formals {
+                                for formal in formals.positional.iter().chain(&formals.named) {
+                                    let variance = Variance::Contravariant
+                                        .combine(self.variance_in_ty(formal.ty, parameter, &table));
+                                    self.check_variance_position(
+                                        variance,
+                                        declared_variance,
+                                        keyword,
+                                        parameter,
+                                        anchor,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One `_position` verdict: `variance` must satisfy the parameter's
+    /// declared keyword (`_checkForWrongVariancePosition`,
+    /// error_verifier.dart:8074-8088).
+    fn check_variance_position(
+        &mut self,
+        variance: Variance,
+        declared: Variance,
+        keyword: &str,
+        parameter: StringId,
+        anchor: SourceRange,
+    ) {
+        if variance.greater_or_equal(declared) {
+            return;
+        }
+        // `unrelated` satisfies every declared keyword, so the position
+        // keyword is always present at an emission.
+        let Some(position) = variance.keyword() else {
+            return;
+        };
+        let code = SemanticCode::WrongTypeParameterVariancePosition;
+        let name = self.strings.resolve(parameter);
+        self.report.usage.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message3(keyword, name, position),
+            self.file,
+            anchor,
+            code.correction_message(""),
+        ));
+    }
+
+    /// The written-type display for a superinterface slot: the head, its
+    /// arguments, the function/record shapes as written (a function type's
+    /// own `<...>` section and record field names are not captured — a
+    /// documented display divergence on those edges).
+    fn var_tree_display(&self, tree: &VarTree) -> String {
+        match &tree.kind {
+            VarTreeKind::Head { name, args } => {
+                let mut text = self.strings.resolve(*name).to_owned();
+                if !args.is_empty() {
+                    text.push('<');
+                    for (index, arg) in args.iter().enumerate() {
+                        if index > 0 {
+                            text.push_str(", ");
+                        }
+                        text.push_str(&self.var_tree_display(arg));
+                    }
+                    text.push('>');
+                }
+                if tree.nullable {
+                    text.push('?');
+                }
+                text
+            }
+            VarTreeKind::Fn { ret, params, .. } => {
+                let mut text = match ret {
+                    Some(ret) => self.var_tree_display(ret),
+                    // `void` never fires a type event; an absent return
+                    // displays as `void` (a recovery residue displays so
+                    // too).
+                    None => "void".to_string(),
+                };
+                text.push_str(" Function(");
+                for (index, param) in params.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&self.var_tree_display(param));
+                }
+                text.push(')');
+                if tree.nullable {
+                    text.push('?');
+                }
+                text
+            }
+            VarTreeKind::Record { fields } => {
+                let mut text = String::from("(");
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&self.var_tree_display(field));
+                }
+                text.push(')');
+                if tree.nullable {
+                    text.push('?');
+                }
+                text
+            }
+            VarTreeKind::Unit => String::new(),
+        }
+    }
+
+    /// The variance of `parameter` in a model type: the tree walk over the
+    /// converted shape (`Ty` cannot represent function or record shapes —
+    /// an `Unknown` contributes unrelated, the under-report direction).
+    fn variance_in_ty(
+        &self,
+        ty: Ty,
+        parameter: StringId,
+        table: &FxHashMap<StringId, Vec<Variance>>,
+    ) -> Variance {
+        match self.ty_to_tree(ty) {
+            Some(tree) => variance_in_tree(&tree, &parameter, table, VARIANCE_WALK_DEPTH),
+            None => Variance::Unrelated,
+        }
+    }
+
+    fn ty_to_tree(&self, ty: Ty) -> Option<VarTree> {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        let pool = self.unit_args?;
+        let args = pool
+            .get(args)
+            .iter()
+            .map(|&arg| self.ty_to_tree(arg))
+            .collect::<Option<Vec<_>>>()?;
+        Some(VarTree {
+            nullable,
+            poisoned: false,
+            kind: VarTreeKind::Head { name, args },
+        })
     }
 
     /// The end-of-unit boundedness checks (#610): the deferred explicit
@@ -2943,12 +4219,15 @@ impl<'a> Engine<'a> {
         self.catch_params = 0;
         let Some(start) = self.catch_clause_start.take() else {
             self.catch_on_type = None;
+            self.catch_on_nullable = None;
             return;
         };
         let on_type = self.catch_on_type.take();
+        let on_nullable = self.catch_on_nullable.take().unwrap_or(false);
         if let Some(clauses) = self.try_clauses.last_mut() {
             clauses.push(CatchClauseFact {
                 on_type,
+                on_nullable,
                 start,
                 end: self.last_block_end.unwrap_or(start),
             });
@@ -2958,29 +4237,76 @@ impl<'a> Engine<'a> {
 
     /// `end_try_statement`: the official `_CatchClausesVerifier` — a
     /// catch-all clause (no `on` type, or `on Object`) followed by more
-    /// clauses makes the tail dead; the span covers the next clause's
-    /// first token through the last clause's closing brace
-    /// (`dead_code_verifier.dart`, `nextCatchClause`).
+    /// clauses makes the tail dead; and an on-clause whose type is a
+    /// subtype of an earlier on-clause type in the same try is dead too
+    /// (`dead_code_verifier.dart`, `nextCatchClause`; the subtype arm,
+    /// :589-604). Either way the span covers the first dead clause through
+    /// the last one, and one dead-catch row per try at most (`_done`).
     fn finish_try_statement(&mut self) {
         let Some(clauses) = self.try_clauses.pop() else {
             return;
         };
         let object = self.intern("Object");
+        let mut visited: Vec<Ty> = Vec::new();
         for (index, clause) in clauses.iter().enumerate() {
             let catches_all = clause.on_type.map_or(true, |t| t == object);
-            if catches_all && index + 1 < clauses.len() {
-                let start = clauses[index + 1].start.offset;
+            if catches_all {
+                if index + 1 < clauses.len() {
+                    let start = clauses[index + 1].start.offset;
+                    let end = clauses[clauses.len() - 1].end.end();
+                    self.stage_usage(
+                        SemanticCode::DeadCodeCatchFollowingCatch,
+                        SourceRange {
+                            offset: start,
+                            length: end.saturating_sub(start),
+                        },
+                        "",
+                    );
+                }
+                break;
+            }
+            // The subtype arm: `isSubtypeOf(current, earlier)` over the
+            // written on-types (`on int?` is not below `on int`).
+            let current = self.catch_on_ty(clause);
+            if let Some(earlier) = visited
+                .iter()
+                .find(|earlier| self.name_subtype(current, **earlier))
+                .copied()
+            {
+                let start = clause.start.offset;
                 let end = clauses[clauses.len() - 1].end.end();
-                self.stage_usage(
-                    SemanticCode::DeadCodeCatchFollowingCatch,
+                let a0 = self.ty_display(current);
+                let a1 = self.ty_display(earlier);
+                self.stage_typed(
+                    SemanticCode::DeadCodeOnCatchSubtype,
                     SourceRange {
                         offset: start,
                         length: end.saturating_sub(start),
                     },
-                    "",
+                    &a0,
+                    &a1,
                 );
                 break;
             }
+            visited.push(current);
+        }
+    }
+
+    /// The written on-clause type as a [`Ty`] (`dynamic`/`Null` keep their
+    /// dedicated shapes; everything else is the written name with its
+    /// trailing-`?` face).
+    fn catch_on_ty(&self, clause: &CatchClauseFact) -> Ty {
+        let Some(name) = clause.on_type else {
+            return Ty::UNKNOWN;
+        };
+        match self.strings.resolve(name) {
+            "dynamic" => Ty::Dynamic,
+            "Null" => Ty::Null,
+            _ => Ty::Named {
+                name,
+                nullable: clause.on_nullable,
+                args: ArgListId::EMPTY,
+            },
         }
     }
 
@@ -3195,8 +4521,12 @@ impl<'a> Engine<'a> {
     /// frame (one `parse_type` arms the group; every name in it binds).
     fn bind_declared_type(&mut self, name: StringId) {
         let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
+        let args = std::mem::take(&mut self.pending_type_args);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
+            if !args.is_empty() {
+                frame.written_args.insert(name, args);
+            }
         }
     }
 
@@ -3204,9 +4534,51 @@ impl<'a> Engine<'a> {
     /// parameter, not shared with a group).
     fn bind_parameter_type(&mut self, name: StringId) {
         let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+        let args = std::mem::take(&mut self.pending_type_args);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
+            if !args.is_empty() {
+                frame.written_args.insert(name, args);
+            }
         }
+    }
+
+    /// One written argument subtree as a body-level [`Ty`]: the head
+    /// canonicalizes like the annotation head (`dynamic`/`void`/`Null`),
+    /// deeper arguments stay unrepresented (the pool is capture-immutable;
+    /// the null-argument face only needs the argument's identity and
+    /// nullability).
+    fn tree_arg_ty(strings: &StringTable, tree: &crate::capture::TypeTree) -> Ty {
+        match strings.resolve(tree.head) {
+            "dynamic" => Ty::Dynamic,
+            "void" => Ty::Void,
+            "Null" => Ty::Null,
+            _ => Ty::Named {
+                name: tree.head,
+                nullable: tree.nullable,
+                args: ArgListId::EMPTY,
+            },
+        }
+    }
+
+    /// The first written type argument of a declared-typed receiver:
+    /// pooled slots for captured declarations (member fields read through
+    /// the walk), the frame's written-argument channel for locals and
+    /// parameters whose annotation never interns. `read` is the receiver's
+    /// declaration name at the merged member row (`None` = not a simple
+    /// read, the written-argument channel is out).
+    fn receiver_first_type_arg(&self, read: Option<StringId>, ty: Ty) -> Option<Ty> {
+        let Ty::Named { args, .. } = ty else {
+            return None;
+        };
+        if args != ArgListId::EMPTY {
+            return self.unit_args?.get(args).first().copied();
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.written_args.get(&read?).and_then(|args| args.first()))
+            .copied()
     }
 
     /// A container head: the member face and the `this`/`super` receiver for
@@ -3225,7 +4597,166 @@ impl<'a> Engine<'a> {
             instance,
             ret: None,
             super_invoked: false,
+            body_brace: None,
+            is_async: false,
+            generator: false,
         });
+    }
+
+    /// Latches the body's async modifier onto the innermost executable
+    /// frame (`handle_async_modifier`): the completion warning's generator
+    /// and async-legality gates read these bits (`checkForBodyMayComplete
+    /// Normally`'s `body.isGenerator` / `body.isAsynchronous` arms). The
+    /// modifier event belongs to the body whose frame is innermost — a
+    /// nested function literal latches its own frame.
+    fn note_async_modifier(&mut self, is_async: bool, generator: bool) {
+        if let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable {
+                is_async: slot_async,
+                generator: slot_generator,
+                ..
+            } = &mut frame.kind
+        {
+            *slot_async = is_async;
+            *slot_generator = generator;
+        }
+    }
+
+    /// The executable body's opening `{` while the innermost frame is the
+    /// executable being parsed: first brace wins (the body brace is the
+    /// first block-function-body event a frame sees — a nested closure's
+    /// body latches the closure's own frame).
+    fn note_body_brace(&mut self, brace: SourceRange) {
+        if let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable { body_brace, .. } = &mut frame.kind
+            && body_brace.is_none()
+        {
+            *body_brace = Some(brace);
+        }
+    }
+
+    /// The executable declaration's completion staging
+    /// (`end_method`/`end_top_level_method`, before the frame pops): the
+    /// declared return type and the block-body `{` stage keyed by the end
+    /// token — the exact span the flow layer's `BodyMayCompleteNormally`
+    /// fact carries — for the teardown's fold to join
+    /// (`body_might_complete_normally_nullable`). Setters stay out (the
+    /// official `!node.isSetter` gate), and frames without a latched return
+    /// type (constructors, local functions, closures) under-report. The
+    /// modifier gates front-run the staging: a generator body always
+    /// completes normally (`body.isGenerator` early return,
+    /// type_analyzer.dart:658-660), and an `async` body under an illegal
+    /// return type already reports its own face — no second row here
+    /// (:661-681, the `_isLegalReturnType` shape).
+    fn stage_body_completion(&mut self, get_or_set: Option<Token>, end: Token) {
+        if get_or_set.and_then(|t| self.text_of(t)) == Some("set") {
+            return;
+        }
+        let Some(Frame {
+            kind:
+                FrameKind::Executable {
+                    ret: Some(exec),
+                    body_brace,
+                    is_async,
+                    generator,
+                    ..
+                },
+            ..
+        }) = self.frames.last()
+        else {
+            return;
+        };
+        if *generator || (*is_async && !self.legal_async_return(exec.ty)) {
+            return;
+        }
+        let row = (end.range, exec.ty, *body_brace);
+        match self
+            .body_completions
+            .binary_search_by(|(r, ..)| r.offset.cmp(&row.0.offset))
+        {
+            // A diverging repeat (two executables sharing one end token)
+            // leaves no single row that stands for the span — poisoned, the
+            // join misses (the [`PromotionStaging`] rule).
+            Ok(index) => {
+                self.body_completions.remove(index);
+            }
+            Err(index) => self.body_completions.insert(index, row),
+        }
+    }
+
+    /// The name-level `_isLegalReturnType` for an `async` body: the top
+    /// types read true through the official `Future<Never> <: T` lower-bound
+    /// check (`dynamic`, `void`, and the inferred stand-in this model uses
+    /// for an absent declaration), plus the `Future`/`FutureOr` family; any
+    /// other head is the illegal-async-return-type face's own business, and
+    /// the completion warning spares it (type_analyzer.dart:661-681).
+    fn legal_async_return(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Unknown | Ty::Dynamic | Ty::Void => true,
+            Ty::Null => false,
+            Ty::Named { name, .. } => {
+                name == self.intern("Future") || name == self.intern("FutureOr")
+            }
+        }
+    }
+
+    /// The `body_might_complete_normally_nullable` verdict for the
+    /// executable whose body ends at exactly `end`
+    /// (`checkForBodyMayCompleteNormally`, type_analyzer.dart:639-704):
+    /// `Some((return type, block `{`))` when the warning fires — `None`
+    /// when no method/top-level staging stood for the end token, the body
+    /// is not a block (the official reports `BlockFunctionBody`s only), or
+    /// the branch order stays silent. The order, in the official shape:
+    /// (a) a potentially non-nullable return type belongs to the ERROR
+    /// twin (`body_might_complete_normally` — the never-return code's
+    /// business, silent here); (b) a nullable return type whose `FutureOr`
+    /// base is `dynamic`/invalid/unknown/`void`/`Null` stays silent; (c)
+    /// else the warning carries the return type's display text.
+    fn body_may_complete_report(&self, end: SourceRange) -> Option<(Ty, SourceRange)> {
+        let index = self
+            .body_completions
+            .binary_search_by(|(r, ..)| r.offset.cmp(&end.offset))
+            .ok()?;
+        let (staged, ret, brace) = &self.body_completions[index];
+        if *staged != end {
+            return None;
+        }
+        let brace = (*brace)?;
+        let fires = match *ret {
+            // (b)'s top faces: each is its own `FutureOr` base.
+            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => false,
+            // (a): potentially non-nullable — the ERROR twin's territory.
+            Ty::Named {
+                nullable: false, ..
+            } => false,
+            Ty::Named { nullable: true, .. } => !matches!(
+                self.future_or_base(*ret),
+                // (b): the base is one of the silent faces.
+                Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void // (c): the warning.
+            ),
+        };
+        fires.then_some((*ret, brace))
+    }
+
+    /// `TypeSystem::futureOrBase` at name level: a written `FutureOr<T>`
+    /// with exactly one type argument unwraps to `T`, every other type is
+    /// its own base (the written `?` never strips — `FutureOr<int>?`'s
+    /// base is `int`; a face-less argument pool keeps the type whole).
+    fn future_or_base(&self, ret: Ty) -> Ty {
+        let Ty::Named { name, args, .. } = ret else {
+            return ret;
+        };
+        if name != self.intern("FutureOr") || args == ArgListId::EMPTY {
+            return ret;
+        }
+        let Some(pool) = self.unit_args else {
+            return ret;
+        };
+        let list = pool.get(args);
+        if list.len() != 1 {
+            return ret;
+        }
+        list[0]
     }
 
     /// A `super` expression while the innermost executable frame is open:
@@ -3517,9 +5048,12 @@ impl<'a> Engine<'a> {
     /// later mixin shadows the earlier ones and the superclass), then the
     /// superclass name edges. Any unresolvable hop breaks the chain
     /// (external type, unresolvable superclass name): the caller suppresses
-    /// rather than reports.
+    /// rather than reports. Probes memoize per pass ([`MemberFace`]): the
+    /// miss chains re-ask the same face several times per row.
     fn walk_members(&self, container: StringId, member: StringId) -> Walk<'a> {
-        self.walk_from(container, member, false)
+        self.member_faces.walk(container, member, false, || {
+            self.walk_from(container, member, false)
+        })
     }
 
     /// The climb behind [`Engine::walk_members`]: `skip_own` starts at the
@@ -3600,7 +5134,9 @@ impl<'a> Engine<'a> {
         if container_decl.superclass.is_none() && container_decl.with_clause.is_empty() {
             return Walk::ChainBroken;
         }
-        self.walk_from(container, member, true)
+        self.member_faces.walk(container, member, true, || {
+            self.walk_from(container, member, true)
+        })
     }
 
     // —— invalid_override (#453: the inheritance-override family) ——————
@@ -3914,6 +5450,70 @@ impl<'a> Engine<'a> {
         }
         for finding in self.plan_modifier_use_sites(container) {
             self.emit_modifier(finding.code, name_range, &finding.a0, &finding.a1);
+        }
+    }
+
+    /// The package:meta `@sealed` supertype contract
+    /// (`_checkForInvalidSealedSuperclass`, best_practices_verifier.dart:
+    /// 1172-1213, mounted on class/mixin/class-type-alias declarations):
+    /// the declaring node's `allSupertypes` closure is walked once
+    /// ([`FoldHierarchy::closure`], cycle-guarded), and every supertype
+    /// whose annotations recognize the meta `sealed` getter
+    /// ([`is_meta_getter`]) reports once at the declaration —
+    /// `mixin_on_sealed_class` when the supertype is a direct `on`
+    /// constraint, `subtype_of_sealed_class` otherwise. Supertypes whose
+    /// declaring library is inside the analyzed package stay silent
+    /// (`_isLibraryInWorkspacePackage`: the sealed contract restricts only
+    /// other packages), so a same-package `@sealed` base never fires.
+    fn check_sealed_supertype_contract(&mut self, container: StringId, name_range: SourceRange) {
+        let (graph, namespaces, index, strings) =
+            (self.graph, self.namespaces, self.index, self.strings);
+        let element = (self.file, container);
+        let hierarchy = FoldHierarchy {
+            graph,
+            namespaces,
+            index,
+            file: self.file,
+            lib: self.lib,
+            memo: RefCell::default(),
+            in_progress: RefCell::default(),
+        };
+        // The constraint face is the DIRECT `on` list (the official
+        // `superclassConstraints.contains`, :1195-1196): the same sealed
+        // supertype reached through any other path reports the regular
+        // subtype face, and only mixins carry `on` constraints.
+        let direct_ons: FxHashSet<(FileId, StringId)> =
+            hierarchy.face_handles(element).3.into_iter().collect();
+        for handle in hierarchy.closure(element) {
+            let Some(decl) = index
+                .get(handle.0)
+                .and_then(|elements| elements.container(handle.1))
+            else {
+                continue;
+            };
+            let owner_lib = hierarchy.library_of(handle);
+            let is_sealed = decl
+                .annotations
+                .iter()
+                .any(|annotation| is_meta_getter(annotation, "sealed", strings, graph, owner_lib));
+            if !is_sealed || same_workspace_package(graph, owner_lib, self.lib) {
+                continue;
+            }
+            let code = if direct_ons.contains(&handle) {
+                SemanticCode::MixinOnSealedClass
+            } else {
+                SemanticCode::SubtypeOfSealedClass
+            };
+            let sealed_name = strings.resolve(handle.1).to_owned();
+            let correction = code.correction_message(&sealed_name);
+            self.report.diagnostics.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message(&sealed_name, ""),
+                self.file,
+                name_range,
+                correction,
+            ));
         }
     }
 
@@ -5529,6 +7129,12 @@ impl<'a> Engine<'a> {
         let receiver_offset = self.rows.last().map(|r| r.range.offset);
         let recv = match self.rows.pop() {
             Some(popped) => {
+                // The never-receiver junction (`receiverOfTypeNever`): the
+                // receiver row is in hand exactly once, here — every
+                // member face (getter read, setter target, method
+                // invocation, cascade section) folds through this pop.
+                let receiver_ty = self.receiver_static_ty(&popped);
+                self.stage_receiver_of_type_never(popped.range, receiver_ty);
                 // The receiver's read counts for the local it resolved to
                 // (`v.m` reads `v`): the member row inherits the hit.
                 if let Some(hit) = self.local_hits.remove(&popped.range.offset) {
@@ -5769,6 +7375,9 @@ impl<'a> Engine<'a> {
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
         };
+        // The null-argument face runs before the row borrow opens (it
+        // re-reads the rows itself and emits).
+        self.check_null_argument(callee, &level.args);
         let Some(row) = self.rows.get(callee) else {
             return;
         };
@@ -5846,6 +7455,16 @@ impl<'a> Engine<'a> {
         {
             row.intent = Intent::Invoke;
         }
+        // The function-position face (`function_expression_invocation_
+        // resolver.dart:131`): the invoked expression's own static type —
+        // pre-invocation, so no callee-result enrichment here.
+        if let Some(row) = self.rows.get(callee)
+            && let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape
+            && self.is_never_ty(*ty)
+        {
+            let at = row.range;
+            self.stage_receiver_of_type_never(at, *ty);
+        }
         if let Some(pos) = self
             .deferred_args
             .iter()
@@ -5916,6 +7535,80 @@ impl<'a> Engine<'a> {
     /// `function`, a member method is `method`. Function-typed variables and
     /// getters resolve to type displays M1 cannot render (the oracle's
     /// `_function` / kind-`getter` rows) — no declared count, suppress.
+    /// `null_argument_to_non_null_type` (`NullSafeApiVerifier._checkTypes`,
+    /// null_safe_api_verifier.dart:87-107): `Completer<T>.complete` with a
+    /// non-nullable `T` rejects a `null` argument — the call carries no
+    /// argument (the missing optional reports at the member name) or one
+    /// positional whose static type is `Null` (the `null` literal reads as
+    /// `Ty::Null`). The registry's other face, `Future<T>.value`, needs the
+    /// creation-row machinery (the documented under-report); more than one
+    /// positional or any named argument suppresses (`arguments2.length >
+    /// 1`), as does a nullable receiver (`T?` rides the null-aware faces).
+    fn check_null_argument(
+        &mut self,
+        callee: usize,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+    ) {
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        // The member invocation's send closes BEFORE the dot-access event
+        // merges `receiver.name` (`parse_send_from_identifier` parses the
+        // argument list inside `parse_primary`): the callee is the unmerged
+        // member placeholder (qualified, unresolved) with the receiver row
+        // directly below — the `check_invocation_arity` shape.
+        if !row.qualified
+            || !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+            || self.strings.resolve(row.name) != "complete"
+        {
+            return;
+        }
+        let Some(recv_row) = callee.checked_sub(1).and_then(|index| self.rows.get(index)) else {
+            return;
+        };
+        // The receiver read's own declaration name — the written-argument
+        // channel keys on it (the bare row is still alive; no merge hop).
+        let read = recv_row.name;
+        let recv = match &recv_row.shape {
+            RowShape::Bare(info) => Engine::receiver_of_bare(info.clone()),
+            RowShape::Receiver(recv) => *recv,
+            _ => Receiver::Unknown,
+        };
+        let Receiver::Typed { ty, .. } = recv else {
+            return;
+        };
+        let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = ty
+        else {
+            return;
+        };
+        if self.strings.resolve(name) != "Completer" {
+            return;
+        }
+        // `!_typeSystem.isNonNullable(type)` — the type argument decides
+        // (pooled slots for captured declarations, the written-argument
+        // channel for body-level annotations).
+        let Some(t0) = self.receiver_first_type_arg(Some(read), ty) else {
+            return;
+        };
+        if !t0.is_strictly_non_nullable() {
+            return;
+        }
+        let (range, a0) = match args {
+            // `c.complete()` — the missing optional argument reports at the
+            // invocation (the member-name token stands in; metric-neutral
+            // on the (code, file) gate).
+            [] => (row.range, "Completer.complete"),
+            [(None, ty, _, range)] if *ty == Ty::Null => (*range, "Completer.complete"),
+            _ => return,
+        };
+        let a1 = self.ty_display(t0);
+        self.stage_typed(SemanticCode::NullArgumentToNonNullType, range, a0, &a1);
+    }
+
     fn check_invocation_arity(&mut self, callee: usize, count: u16, range: SourceRange) {
         let Some(row) = self.rows.get(callee) else {
             return;
@@ -6239,20 +7932,32 @@ impl<'a> Engine<'a> {
             offset: begin.range.offset,
             length: end.range.end() - begin.range.offset,
         };
+        // A type head makes the group an annotation or a creation type
+        // reference.
+        let (head, base) = self.group_heads.pop().unwrap_or((None, 0));
         // The #610 site capture: the site's own group closed with a root —
         // record the check for the finalize pass (the whole-file snapshot).
+        // The root's written arguments also latch for the declaration that
+        // completes this head ([`Engine::completed_group`]): the body-level
+        // pool stays capture-immutable, so a local's declared type carries
+        // its arguments through this side channel.
         if let Some(mut roots) = self.bounds.end_group(range)
             && let Some(tree) = roots.pop()
         {
+            let args = tree
+                .args
+                .iter()
+                .map(|arg| Self::tree_arg_ty(self.strings, arg))
+                .collect();
+            self.completed_group = Some((tree.head, tree.range.offset, args));
             self.pending_bounded_checks.push(PendingBoundedCheck::Site {
                 head: tree.head,
                 args: tree.args,
                 in_scope: self.type_params.clone(),
             });
         }
-        // A type head makes the group an annotation or a creation type
-        // reference.
-        let (head, base) = self.group_heads.pop().unwrap_or((None, 0));
+        // The #612 capture: the header's group closed into its frame.
+        self.var_end_group();
         if let Some((head, _head_range)) = head {
             self.check_annotation_arity(head, count, range);
             return;
@@ -6412,6 +8117,107 @@ impl<'a> Engine<'a> {
             // member access must not.
             BareInfo::Missing { .. } => Receiver::Unknown,
         }
+    }
+
+    /// The `Never` type identity at name level: the non-nullable `Never`
+    /// spelling (`identical(receiverType, NeverTypeImpl.instance)`;
+    /// `Never?` interns as `Null`, so the nullable projection never
+    /// answers yes).
+    fn is_never_ty(&self, ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } if name == self.intern("Never")
+        )
+    }
+
+    /// The receiver row's expression type at a never-receiver junction: a
+    /// declared-type read keeps its push-time snapshot; an invoked callee's
+    /// result is the callee's declared return type (`f()`'s static type IS
+    /// `f`'s declared return type — the official `staticType` of the
+    /// resolved invocation). Container and keyword receivers take the
+    /// static-access faces (a declaration name is never the type) and
+    /// everything untyped suppresses — the under-report direction.
+    fn receiver_static_ty(&self, row: &Row) -> Ty {
+        if let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape
+            && *ty != Ty::UNKNOWN
+        {
+            return *ty;
+        }
+        if !matches!(row.intent, Intent::Invoke) {
+            return Ty::UNKNOWN;
+        }
+        self.callee_return_ty(row)
+    }
+
+    /// The declared return type of an invoked callee row (a completed
+    /// send's result type): a bare callee resolves through the top-level
+    /// namespace — a same-named local shadows it (suppress; its declared
+    /// type already rode the row when captured) — and a member callee
+    /// walks the container its merged receiver names. Unresolvable shapes
+    /// suppress.
+    fn callee_return_ty(&self, row: &Row) -> Ty {
+        if !row.qualified {
+            if self
+                .frames
+                .iter()
+                .rev()
+                .any(|f| f.locals.contains(&row.name))
+            {
+                return Ty::UNKNOWN;
+            }
+            return self
+                .top_level_decl(row.name)
+                .map_or(Ty::UNKNOWN, |decl| decl.return_ty);
+        }
+        let container = match &row.shape {
+            RowShape::Member { recv } => match recv {
+                Receiver::This { container, .. }
+                | Receiver::Super { container, .. }
+                | Receiver::Container {
+                    name: container, ..
+                }
+                | Receiver::Typed {
+                    type_name: container,
+                    ..
+                } => Some(*container),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(container) = container else {
+            return Ty::UNKNOWN;
+        };
+        match self.walk_members(container, row.name) {
+            Walk::Found(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
+                entry.return_ty
+            }
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// Stages the never-receiver junction (`receiverOfTypeNever`,
+    /// messages.yaml :29566). The staged check re-decides at the teardown
+    /// join, where a promoted-read fact on the receiver's exact span
+    /// replaces the type — the official read's flow-aware staticType. Only
+    /// a parse-time `Never` receiver stages: a non-`Never` type could only
+    /// fire through a promotion substitution, and #477's drop rule keeps
+    /// promoted-to-`Never` facts out of the staging, so staging those rows
+    /// would be dead weight on every junction.
+    fn stage_receiver_of_type_never(&mut self, at: SourceRange, receiver: Ty) {
+        if !self.is_never_ty(receiver) {
+            return;
+        }
+        self.staged_checks.push(StagedCheck {
+            kind: StagedKind::NeverReceiver,
+            range: at,
+            from: receiver,
+            to: Ty::UNKNOWN,
+            literal: false,
+        });
     }
 
     /// Arms the pending type head: the identifier just parsed a type
@@ -8622,6 +10428,11 @@ enum StagedKind {
     /// `return_of_invalid_type`: the host kind and executable name ride
     /// along (the message's third placeholder).
     Return { host: ExecKind, name: StringId },
+    /// `receiver_of_type_never`: the receiver row's parse-time type rides
+    /// in `from`; the teardown join substitutes a promoted-read fact staged
+    /// on the receiver's exact span (the official read's flow-aware
+    /// staticType).
+    NeverReceiver,
 }
 
 /// The promoted-read staging (#477 S1): the flow facts' promotion rows as
@@ -8629,6 +10440,31 @@ enum StagedKind {
 #[derive(Default)]
 struct PromotionStaging {
     rows: Vec<(SourceRange, Ty)>,
+}
+
+/// The `UnassignedRead` fact spans (#746), kept offset-sorted: the
+/// definite-unassignment face the `cast_from_nullable_always_fails` join
+/// consumes.
+#[derive(Default)]
+struct UnassignedStaging {
+    rows: Vec<SourceRange>,
+}
+
+impl UnassignedStaging {
+    /// Stages one unassigned-read span. One read event fires one fact, so
+    /// the repeat insert is a no-op.
+    fn stage(&mut self, range: SourceRange) {
+        if let Err(index) = self.rows.binary_search_by(|r| r.offset.cmp(&range.offset)) {
+            self.rows.insert(index, range);
+        }
+    }
+
+    /// Whether the read at exactly `range` is definitely unassigned.
+    fn staged(&self, range: SourceRange) -> bool {
+        self.rows
+            .binary_search_by(|r| r.offset.cmp(&range.offset))
+            .is_ok_and(|index| self.rows[index] == range)
+    }
 }
 
 impl PromotionStaging {
@@ -8782,6 +10618,7 @@ pub fn diagnose_with(
         file,
         lib,
         features.primary_constructors_enabled,
+        features.variance_enabled,
         strict,
     )));
     let flow = Rc::new(RefCell::new(Flow::new(tokens, source)));
@@ -8802,7 +10639,9 @@ pub fn diagnose_with(
     // report tail's merge below.
     let facts = flow.borrow_mut().take_facts();
     let mut promotions = PromotionStaging::default();
+    let mut unassigned = UnassignedStaging::default();
     let mut flow_diagnostics = Vec::new();
+    let mut body_rows = Vec::new();
     for fact in facts {
         match fact {
             FlowFact::DeadCode { span } => {
@@ -8821,12 +10660,50 @@ pub fn diagnose_with(
                     promotions.stage(span.range, promoted);
                 }
             }
-            FlowFact::UnassignedRead { .. } => {}
-            // #676's body-completion fact has no S1 consumer — the staging
-            // join for `body_might_complete_normally_nullable` is the
-            // follow-up lane's face (goal #677, Producer B).
-            FlowFact::BodyMayCompleteNormally { .. } => {}
+            // The definite-unassignment face (#746): the cast join reads it
+            // after the fold, when the promotions are complete too.
+            FlowFact::UnassignedRead { span, .. } => {
+                unassigned.stage(span.range);
+            }
+            // The body-completion fact joins the executable-completion
+            // staging: the row carries the declared return type and the
+            // block `{` the official row reports at.
+            FlowFact::BodyMayCompleteNormally { span } => {
+                let engine = engine.borrow();
+                if let Some((ret, brace)) = engine.body_may_complete_report(span.range) {
+                    let code = SemanticCode::BodyMightCompleteNormallyNullable;
+                    body_rows.push(Diagnostic::new(
+                        code.severity(),
+                        code.code_info(),
+                        code.message(&engine.render_ty(ret), ""),
+                        file,
+                        brace,
+                        code.correction_message(""),
+                    ));
+                }
+            }
         }
+    }
+    // The #746 cast join: a candidate fires when the flow layer saw its
+    // read definitely unassigned and no promotion stands at the span — the
+    // official gate reads the flow-aware static type
+    // (type_analyzer.dart:2118), and a promotion to `Null` is exactly the
+    // face the staging-time declared type cannot see.
+    let candidates = std::mem::take(&mut engine.borrow_mut().cast_nullable);
+    let mut cast_rows = Vec::with_capacity(candidates.len());
+    for (range, name) in candidates {
+        if !unassigned.staged(range) || promotions.promoted(range) == Some(Ty::Null) {
+            continue;
+        }
+        let code = SemanticCode::CastFromNullableAlwaysFails;
+        cast_rows.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message(strings.resolve(name), ""),
+            file,
+            range,
+            code.correction_message(""),
+        ));
     }
     // The parser held the only other strong reference and is gone, so the
     // unwrap cannot fail.
@@ -8838,6 +10715,10 @@ pub fn diagnose_with(
     // see every in-file container — folding the deferred sites, the enum
     // values-field checks, and the `strict_raw_type` displays.
     engine.finalize_bounds();
+    // The #612 variance family runs after the parse — the capture must see
+    // every container header — staged into the usage rows for the
+    // source-ordered merge. One branch without the experiment.
+    engine.finalize_variance();
     // The usage cluster's library-level pass runs after every use indexed:
     // declaration sites and import directives walk the index, staging into
     // the report; the staged emissions merge source-ordered into the tail.
@@ -8855,6 +10736,11 @@ pub fn diagnose_with(
     // The flow layer's dead-code facts join the source-ordered tail of the
     // report (both sides are offset-sorted; the merge keeps the invariant).
     report.diagnostics = merge_source_ordered(report.diagnostics, flow_diagnostics);
+    // The #746 flow-fact consumers join the same tail: the cast join's rows
+    // and the body-completion rows are each offset-sorted, and the merges
+    // keep the invariant.
+    report.diagnostics = merge_source_ordered(report.diagnostics, cast_rows);
+    report.diagnostics = merge_source_ordered(report.diagnostics, body_rows);
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
     report.diagnostics = merge_source_ordered(report.diagnostics, staged);
@@ -8932,6 +10818,28 @@ struct ModifierFinding {
     code: ModifierCode,
     a0: String,
     a1: String,
+}
+
+/// The `_isLibraryInWorkspacePackage` face at the graph's uri level: a
+/// declaring library sits in the diagnosed library's package when the two
+/// canonical uris are `package:` form naming the same package
+/// (`PubWorkspacePackage.contains`, workspace/pub.dart:546-554, the
+/// package-config workspace). Any other uri pair answers cross-package —
+/// the analyzed-set universe of the sealed contract is `package:` libraries
+/// (the SDK synthetics carry no `@sealed`, and the oracle's file-scheme
+/// containment branch, pub.dart:556-559, keys a path containment the graph
+/// does not carry).
+fn same_workspace_package(graph: &LibraryGraph, candidate: LibraryId, own: LibraryId) -> bool {
+    let package = |lib: LibraryId| {
+        graph
+            .uri(lib)
+            .strip_prefix("package:")
+            .and_then(|rest| rest.split('/').next())
+    };
+    match (package(candidate), package(own)) {
+        (Some(candidate), Some(own)) => candidate == own,
+        _ => false,
+    }
 }
 
 /// One resolved super face of the diagnosed container: the declaring
@@ -9213,12 +11121,14 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
             engine.check_modifier_use_sites(name, name_range);
+            engine.check_sealed_supertype_contract(name, name_range);
         }
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        engine.var_drop_header();
         engine.pop_frame();
     }
 
@@ -9273,6 +11183,7 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Class, name_range);
             engine.check_modifier_use_sites(name, name_range);
+            engine.check_sealed_supertype_contract(name, name_range);
         }
     }
 
@@ -9286,6 +11197,9 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        // The alias has no body-begin to finalize its header: this event is
+        // the finalize (a no-op when a body already closed it).
+        engine.var_finish_header();
         engine.pop_frame();
     }
 
@@ -9319,12 +11233,14 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Mixin, name_range);
             engine.check_modifier_use_sites(name, name_range);
+            engine.check_sealed_supertype_contract(name, name_range);
         }
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        engine.var_drop_header();
         engine.pop_frame();
     }
 
@@ -9364,6 +11280,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        engine.var_drop_header();
         engine.pop_frame();
     }
 
@@ -9388,6 +11305,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        engine.var_drop_header();
         engine.pop_frame();
     }
 
@@ -9420,6 +11338,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         engine.bounds.drop_header();
+        engine.var_drop_header();
         engine.pop_frame();
     }
 
@@ -9437,6 +11356,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 .borrow_mut()
                 .bounds
                 .header_clause(Clause::Extends(count));
+            self.engine
+                .borrow_mut()
+                .var_clause(VarSlot::Extends, Some(count));
         }
     }
 
@@ -9446,23 +11368,30 @@ impl ParserListener for DiagnoseListener<'_> {
                 .borrow_mut()
                 .bounds
                 .header_clause(Clause::Implements(count));
+            self.engine
+                .borrow_mut()
+                .var_clause(VarSlot::Implements, Some(count));
         }
     }
 
     fn handle_class_with_clause(&mut self, _with_keyword: Token) {
         self.engine.borrow_mut().bounds.header_clause(Clause::With);
+        self.engine.borrow_mut().var_clause(VarSlot::With, None);
     }
 
     fn handle_named_mixin_application_with_clause(&mut self, _with_keyword: Token) {
         self.engine.borrow_mut().bounds.header_clause(Clause::With);
+        self.engine.borrow_mut().var_clause(VarSlot::With, None);
     }
 
     fn handle_enum_with_clause(&mut self, _with_keyword: Token) {
         self.engine.borrow_mut().bounds.header_clause(Clause::With);
+        self.engine.borrow_mut().var_clause(VarSlot::With, None);
     }
 
     fn handle_mixin_with_clause(&mut self, _with_keyword: Token) {
         self.engine.borrow_mut().bounds.header_clause(Clause::With);
+        self.engine.borrow_mut().var_clause(VarSlot::With, None);
     }
 
     fn handle_mixin_on(&mut self, on: Option<Token>, count: usize) {
@@ -9471,15 +11400,20 @@ impl ParserListener for DiagnoseListener<'_> {
                 .borrow_mut()
                 .bounds
                 .header_clause(Clause::On(count));
+            self.engine
+                .borrow_mut()
+                .var_clause(VarSlot::On, Some(count));
         }
     }
 
     fn begin_class_or_mixin_or_extension_body(&mut self, _kind: DeclarationKind, _token: Token) {
         self.engine.borrow_mut().bounds.finish_header();
+        self.engine.borrow_mut().var_finish_header();
     }
 
     fn begin_enum_body(&mut self, _token: Token) {
         self.engine.borrow_mut().bounds.finish_header();
+        self.engine.borrow_mut().var_finish_header();
     }
 
     fn begin_function_type(&mut self, _begin: Token) {
@@ -9487,10 +11421,40 @@ impl ParserListener for DiagnoseListener<'_> {
         // open windows (a function-type bound's leaves also fail the
         // one-root claim — this is the belt to those braces).
         self.engine.borrow_mut().bounds.poison();
+        // The #612 capture models them: the frame routes its return, bounds
+        // of its own type parameters, and formals by region.
+        self.engine.borrow_mut().var_begin_function_type();
     }
 
     fn begin_record_type(&mut self, _left_paren: Token) {
         self.engine.borrow_mut().bounds.poison();
+        self.engine.borrow_mut().var_begin_record_type();
+    }
+
+    fn end_record_type(
+        &mut self,
+        _left_paren: Token,
+        question: Option<Token>,
+        _count: usize,
+        _has_named_fields: bool,
+    ) {
+        self.engine
+            .borrow_mut()
+            .var_end_record_type(question.is_some());
+    }
+
+    fn begin_formal_parameters(&mut self, _token: Token, _kind: dartq_parser::MemberKind) {
+        self.engine.borrow_mut().var_formal_boundary();
+    }
+
+    fn end_formal_parameters(
+        &mut self,
+        _count: usize,
+        _begin: Token,
+        _end: Token,
+        _kind: dartq_parser::MemberKind,
+    ) {
+        self.engine.borrow_mut().var_formal_region_end();
     }
 
     // —— frames: executables ——————————————————————————————————————————
@@ -9570,6 +11534,9 @@ impl ParserListener for DiagnoseListener<'_> {
         );
 
         let mut engine = self.engine.borrow_mut();
+        // The completion staging reads the executable frame before it pops
+        // (the `body_might_complete_normally_nullable` row).
+        engine.stage_body_completion(_get_or_set, _end);
         // The `must_call_super` verdict reads the body's super face before
         // the executable frame closes.
         let super_invoked = engine.top_executable_super_invoked();
@@ -9609,6 +11576,9 @@ impl ParserListener for DiagnoseListener<'_> {
             let bare = engine.decl_sites[site].name;
             engine.decl_sites[site].name = engine.setter_spelling(bare);
         }
+        // The completion staging reads the executable frame before it pops
+        // (the `body_might_complete_normally_nullable` row).
+        engine.stage_body_completion(_get_or_set, _end);
         engine.pop_frame();
     }
 
@@ -9829,6 +11799,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         engine.catch_clause_start = Some(_token.range);
         engine.catch_on_type = None;
+        engine.catch_on_nullable = None;
         engine.catch_params = 0;
         engine.push_block_frame();
     }
@@ -9957,6 +11928,12 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         if let Some(name) = engine.name_of(token) {
             engine.push_type_parameter(name);
+            // The #612 capture pairs the parameter's name here: the Simple1
+            // fast path completes the variable at `end_type_variable` with
+            // the group's closer token, whose text is not the name.
+            if engine.variance_enabled {
+                engine.var_name_stack.push((name, token.range));
+            }
         }
     }
 
@@ -9968,6 +11945,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // The header's bound counts open with it.
         engine.open_type_variables();
         engine.bounds.begin_type_variables();
+        // The #612 window resets with it (a nested function-type window
+        // inside a header resets an already-adopted container's — the
+        // offset guard at adoption rejects foreign windows).
+        engine.var_reset_type_variables();
+        // A window inside a function type carries its signature's own
+        // bounds; the container windows close before their header opens.
+        engine.var_open_bounds();
     }
 
     fn end_type_variable(
@@ -9975,7 +11959,7 @@ impl ParserListener for DiagnoseListener<'_> {
         token: Token,
         _index: usize,
         extends_or_super: Option<Token>,
-        _variance: Option<Token>,
+        variance: Option<Token>,
     ) {
         let mut engine = self.engine.borrow_mut();
         let Some(name) = engine.name_of(token) else {
@@ -9984,12 +11968,18 @@ impl ParserListener for DiagnoseListener<'_> {
         engine
             .bounds
             .end_type_variable(name, extends_or_super.is_some());
+        // The name rides the stack (the Simple1 end event carries the
+        // group closer); the keyword and the anchor come from this event.
+        if let Some((var_name, var_range)) = engine.var_name_stack.pop() {
+            engine.var_type_variable(var_name, variance, var_range);
+        }
     }
 
     fn end_type_variables(&mut self, _begin: Token, end: Token) {
         let mut engine = self.engine.borrow_mut();
         engine.close_type_variables(end);
         engine.bounds.end_type_variables();
+        engine.var_close_bounds();
     }
 
     // —— identifiers ——————————————————————————————————————————————————
@@ -10291,6 +12281,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 None => name.range,
             },
         );
+        // The #612 capture: the same leaf joins the open header (the
+        // parameterized re-fire merges through the sink's head latch).
+        engine.var_leaf(leaf_id, name.range.offset, question.is_some());
         // `dynamic` is a top type and `Null` is the null-type singleton —
         // both have dedicated [`Ty`] shapes.
         let ty = match text {
@@ -10302,7 +12295,68 @@ impl ParserListener for DiagnoseListener<'_> {
                 args: ArgListId::EMPTY,
             },
         };
+        // The catch clause's on-type completion (the re-fired
+        // parameterized head carries the trailing `?` — it overwrites, so
+        // the last completion of the clause's head wins).
+        if engine.catch_clause_start.is_some()
+            && engine.catch_params == 0
+            && engine.catch_on_type == Some(leaf_id)
+        {
+            engine.catch_on_nullable = Some(question.is_some());
+            // `nullable_type_in_catch_clause`
+            // (`_checkForNullableTypeInCatchClause`,
+            // best_practices_verifier.dart:1377-1391): the on-type is
+            // potentially nullable — `T?`, or `dynamic`
+            // (`isPotentiallyNullable` = `!isNonNullable`,
+            // type_system.dart:1260). An unresolved head reports in the
+            // oracle neither (the `InvalidType` guard): the `Missing`
+            // type-use row at the head's own offset suppresses.
+            if question.is_some() || text == "dynamic" {
+                let unresolved = matches!(
+                    engine.rows.last().map(|r| &r.shape),
+                    Some(RowShape::TypeUse(TypeVerdict::Missing, _))
+                ) && engine
+                    .rows
+                    .last()
+                    .is_some_and(|r| r.range.offset == name.range.offset);
+                if !unresolved {
+                    let span = match question {
+                        Some(q) => SourceRange {
+                            offset: name.range.offset,
+                            length: q.range.end() - name.range.offset,
+                        },
+                        None => name.range,
+                    };
+                    engine.stage_usage(SemanticCode::NullableTypeInCatchClause, span, "");
+                }
+            }
+        }
+        // `unnecessary_question_mark` (`visitNamedType`,
+        // best_practices_verifier.dart:762-779): `Null?` and `dynamic?` —
+        // the non-aliased names whose nullability the `?` adds nothing to
+        // (`dynamic` checks the lexeme, so a user declaration named
+        // `dynamic` is impossible) — anchor at the `?` token.
+        if question.is_some() && (text == "Null" || text == "dynamic") {
+            let q = question.expect("checked above");
+            let type_name = engine.strings.resolve(leaf_id).to_string();
+            engine.stage_usage(SemanticCode::UnnecessaryQuestionMark, q.range, &type_name);
+        }
         engine.armed_ty = Some(ty);
+        // The written-argument latch: a group whose head this completion
+        // re-fires arms its arguments for the binding declaration; any
+        // other completion (a group-less head, a headless group's leaf)
+        // resets the latch, so a stale annotation never reaches a bind.
+        match engine.completed_group.take() {
+            Some((group_head, group_offset, args))
+                if group_head == leaf_id && group_offset == name.range.offset =>
+            {
+                engine.pending_type_args = args;
+            }
+            other => {
+                engine.completed_group = other;
+                engine.pending_type_args.clear();
+            }
+        }
         if let Some((head_name, head_range)) = head {
             engine.check_raw_type(head_name, head_range);
         }
@@ -10333,6 +12387,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // capture like any named head.
         let void_id = engine.strings.intern("void");
         engine.bounds.leaf(void_id, false, _token.range);
+        // The #612 capture joins it (an unrelated contribution; the display
+        // stays written-shape).
+        engine.var_leaf(void_id, _token.range.offset, false);
         engine.armed_ty = Some(Ty::Void);
     }
 
@@ -10429,6 +12486,17 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(operator) else {
             return;
         };
+        // The binary-operator junction (`binary_expression_resolver.dart:
+        // 442`): the left operand's row is complete at the operator token.
+        // `??` is the if-null node — its operand feeds
+        // `dead_null_aware_expression`, not a member resolution.
+        if text != "??"
+            && let Some(row) = engine.operand_row()
+        {
+            let at = row.range;
+            let receiver_ty = engine.receiver_static_ty(row);
+            engine.stage_receiver_of_type_never(at, receiver_ty);
+        }
         engine
             .const_capture
             .begin_binary(bin_op_of(text), operator.range);
@@ -10454,8 +12522,15 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_capture.end_binary(end.range);
         match engine.text_of(_operator) {
             Some("??") => engine.end_if_null(),
-            Some("==") => engine.check_null_comparison(false),
-            Some("!=") => engine.check_null_comparison(true),
+            // One pop feeds both constant-comparison walks (the official
+            // verifiers are independent visitors over the same node).
+            op @ (Some("==") | Some("!=")) => {
+                let negated = op == Some("!=");
+                if let Some((mark, op_range)) = engine.null_cmp_groups.pop() {
+                    engine.null_comparison(mark, negated);
+                    engine.check_nan_comparison(mark, negated, op_range);
+                }
+            }
             _ => {}
         }
     }
@@ -10473,13 +12548,40 @@ impl ParserListener for DiagnoseListener<'_> {
             _ => UnOp::Inc, // `++`/`--` prefixes
         };
         engine.const_capture.unary_prefix(op);
+        // The unary-operator junction (`unary_operator_invocation_resolver.
+        // dart:49`): the operand's row is complete — the parser fires this
+        // event after the operand parses.
+        if let Some(row) = engine.operand_row() {
+            let at = row.range;
+            let receiver_ty = engine.receiver_static_ty(row);
+            engine.stage_receiver_of_type_never(at, receiver_ty);
+        }
+    }
+
+    fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
+        let mut engine = self.engine.borrow_mut();
+        // The prefix `++`/`--` junction (`increment_or_decrement_resolver.
+        // dart:273`, the prefix face): the operand's row is complete — the
+        // parser fires this event after the operand parses.
+        if let Some(row) = engine.operand_row() {
+            let at = row.range;
+            let receiver_ty = engine.receiver_static_ty(row);
+            engine.stage_receiver_of_type_never(at, receiver_ty);
+        }
+        let _ = operator;
     }
 
     fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .unary_postfix(operator.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.const_capture.unary_postfix(operator.range);
+        // The postfix `++`/`--` junction (`increment_or_decrement_resolver.
+        // dart:273`, the postfix face): the operand's row precedes the
+        // operator token.
+        if let Some(row) = engine.operand_row() {
+            let at = row.range;
+            let receiver_ty = engine.receiver_static_ty(row);
+            engine.stage_receiver_of_type_never(at, receiver_ty);
+        }
     }
 
     fn begin_conditional_expression(&mut self, _question: Token) {
@@ -10537,7 +12639,21 @@ impl ParserListener for DiagnoseListener<'_> {
         if engine.pattern_depth == 0 {
             let cast_ty = engine.armed_ty;
             let operand = engine.operand_row().map_or(Ty::Unknown, |row| row.ty);
+            // The simple-local face the nullable-cast join keys on (the
+            // row's span and name), snapshotted before the mutable calls.
+            let simple_local = engine.operand_row().and_then(|row| {
+                matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                    .then(|| (row.range, row.name))
+            });
             engine.check_unnecessary_cast(operator.range, operand, cast_ty);
+            // `visitAsExpression`'s cast face
+            // (best_practices_verifier.dart:180-190): the same pair decides
+            // `cast_from_null_always_fails`.
+            engine.check_cast_from_null(operator.range, operand, cast_ty);
+            // `visitAsExpression`'s unassigned-read face
+            // (type_analyzer.dart:2107-2126): stages the nullable-cast
+            // candidate for the teardown's `UnassignedRead` join.
+            engine.check_cast_from_nullable(simple_local, operand, cast_ty);
         }
         engine.const_capture.opaque_leaf(operator.range);
     }
@@ -10728,6 +12844,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.body_mark = Some(engine.rows.len());
+        // The completion gates read the modifier from the frame: `sync*`/
+        // `async*` are generator bodies, the `async` spelling alone decides
+        // the legality gate (`sync` never reaches it — the generator gate
+        // front-runs).
+        let is_async = _async_kw.and_then(|t| engine.text_of(t)) == Some("async");
+        engine.note_async_modifier(is_async, _star.is_some());
     }
 
     fn begin_cascade(&mut self, operator: Token) {
@@ -10811,6 +12933,7 @@ impl ParserListener for DiagnoseListener<'_> {
             or_ops: 0,
             fields: Vec::new(),
             binary,
+            wildcards: Vec::new(),
         });
     }
 
@@ -10840,8 +12963,13 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // The operand pattern parses next; its bracket frame inherits the
         // binary context (the scrutinee stays the matched type).
-        engine.pending_binary_operand = true;
         let is_or = engine.text_of(operator) == Some("||");
+        if !is_or {
+            // The left operand already parsed (its wildcard events wait on
+            // this operator): the logical-and face decides them now.
+            engine.check_pending_wildcards();
+        }
+        engine.pending_binary_operand = Some(is_or);
         if is_or && let Some(frame) = engine.pattern_stack.last_mut() {
             frame.or_ops += 1;
         }
@@ -10861,6 +12989,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // `checkPatternNeverMatchesValueType`).
         let cast_ty = engine.armed_ty;
         engine.check_cast_pattern(_operator.range, cast_ty);
+        // `visitCastPattern`'s face (best_practices_verifier.dart:227-239):
+        // the matched-value proxy is the same scrutinee pair.
+        engine.check_cast_pattern_null(_operator.range, cast_ty);
         engine.pattern_leaf(leaf);
         // The armed type was the cast pattern's — never a declaration's.
         engine.armed_ty = None;
@@ -11078,6 +13209,8 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(required) = engine.armed_ty {
             engine.check_pattern_never_matches(_wildcard.range, required);
         }
+        let declared = engine.armed_ty;
+        engine.check_wildcard_pattern(_wildcard.range, declared);
         let Some(Ty::Named { name, nullable, .. }) = engine.armed_ty.take() else {
             return;
         };
@@ -11294,6 +13427,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // windows opens the site capture (a headless group is never a
         // site — bounds requires the head).
         engine.bounds.begin_group(head, true);
+        // The #612 capture: the same group nests into the open header.
+        engine.var_begin_group(head);
         let base = engine.rows.len();
         engine.group_heads.push((head, base));
     }
@@ -11714,6 +13849,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_block_function_body(&mut self, token: Token) {
         self.flow.borrow_mut().begin_block_function_body(token);
+        // The block `{` is the executable-completion row's anchor (the
+        // official reports at the block's left bracket).
+        self.engine.borrow_mut().note_body_brace(token.range);
     }
 
     fn begin_do_while_statement(&mut self, token: Token) {
@@ -11890,6 +14028,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_function_type(&mut self, function: Token, question: Option<Token>) {
         self.flow.borrow_mut().end_function_type(function, question);
+        self.engine
+            .borrow_mut()
+            .var_end_function_type(question.is_some());
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
@@ -12209,12 +14350,18 @@ struct PatternFrame {
     leaves: Vec<Restriction>,
     or_ops: usize,
     fields: Vec<ObjectField>,
-    /// The frame is a logical-or/and operand: its matched type is still
-    /// the switch scrutinee, so constant leaves under it check against the
-    /// same space as root leaves (field sub-pattern frames are `false` —
-    /// their matched type is the property column, which the name level
-    /// does not descend into).
-    binary: bool,
+    /// The frame is a logical-or/and operand (`Some(is_or)`): its matched
+    /// type is still the switch scrutinee, so constant leaves under it
+    /// check against the same space as root leaves (field sub-pattern
+    /// frames are `None` — their matched type is the property column,
+    /// which the name level does not descend into).
+    binary: Option<bool>,
+    /// The frame's wildcard events `(anchor, declared type)`, pending the
+    /// `&&` that would make them the left operand of a logical-and (the
+    /// operator event follows the left operand, so its binary context
+    /// cannot arm the wildcard's own check — see
+    /// [`Engine::check_pending_wildcards`]). Cleared once checked.
+    wildcards: Vec<(SourceRange, Option<Ty>)>,
 }
 
 /// One object-pattern field's drained sub-restrictions (empty for a
@@ -12880,9 +15027,35 @@ mod tests {
         report_with(source, strict, |_| None)
     }
 
+    /// [`report`] with the `variance` experiment granted (#612): the only
+    /// path that can emit the family.
+    fn report_variance(source: &str) -> FileReport {
+        report_granted(source, true)
+    }
+
+    /// [`report`] with the `variance` experiment explicitly withheld — the
+    /// byte-identical-default pin (#612).
+    fn report_ungranted(source: &str) -> FileReport {
+        report_granted(source, false)
+    }
+
     /// The shared harness: one file, one library, the live pipeline.
     fn report_with(
         source: &str,
+        strict: StrictModes,
+        make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
+    ) -> FileReport {
+        report_granted_features(source, false, strict, make_edge)
+    }
+
+    /// [`report_with`] with the experiment grant switch.
+    fn report_granted(source: &str, variance: bool) -> FileReport {
+        report_granted_features(source, variance, StrictModes::default(), |_| None)
+    }
+
+    fn report_granted_features(
+        source: &str,
+        variance: bool,
         strict: StrictModes,
         make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
     ) -> FileReport {
@@ -12901,9 +15074,13 @@ mod tests {
             scanned.diagnostics.is_empty(),
             "scanner diagnostics: {source:?}"
         );
-        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-            LanguageVersion::new(3, 15),
-        ));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let set = if variance {
+            set.with_experiment(dartq_language::Feature::Variance)
+        } else {
+            set
+        };
+        let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
         let mut builder = LibraryGraphBuilder::new(&strings);
         let lib = builder.intern("package:t/main.dart");
@@ -17719,6 +19896,34 @@ mod tests {
         assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
+    // —— #443: the member-face walk memo ——————————————————————————————————
+
+    /// Repeated probes keep their verdicts under the memo, and the two
+    /// climb flavors of one member stay distinct keys: `m()` hits the
+    /// instance probe (`Found` through `C`'s own face) while `super.m()`
+    /// misses the super-climb probe of the *same* member — a key that
+    /// conflated the two would silence the `undefined_super_member`. The
+    /// two `nope()` rows share one cached `Missing` and still both report.
+    #[test]
+    fn member_face_memo_keeps_repeated_probe_verdicts() {
+        let report = report(
+            "class B {} \
+             class C extends B { \
+               void m() {} void f() { m(); nope(); nope(); super.m(); } \
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_method",
+                "undefined_method",
+                "undefined_super_member",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
     /// The override check sees the stacked winner: `C.m()` is arity-broken
     /// against `M2.m(int)` (the interface winner per
     /// `inheritance_manager3.dart:571-579`) — reported once for the stacked
@@ -18373,6 +20578,391 @@ mod tests {
         );
     }
 
+    // —— #743: the W1-micro single-condition cluster ——————————————————————
+
+    /// An on-clause whose type sits below an earlier clause's is dead
+    /// (`_CatchClausesVerifier.nextCatchClause`'s subtype arm,
+    /// dead_code_verifier.dart:589-604); the message names both types.
+    /// The supertype clause comes first (`on A`, then `on B`): the
+    /// verifier reports the CURRENT clause when its type is a subtype of
+    /// a previous one, so the corpus's original `on B {} on A {}` order
+    /// is silent in the oracle — expectation corrected, not weakened.
+    #[test]
+    fn dead_code_on_catch_subtype_reports() {
+        let r = report("class A {} class B extends A {} void main() { try {} on A {} on B {} }");
+        assert_eq!(
+            code_names(&r),
+            ["dead_code_on_catch_subtype"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "Dead code: This on-catch block won't be executed because 'B' is a subtype of 'A' and hence will have been caught already."
+        );
+    }
+
+    /// `Completer<T>.complete(null)` with a non-nullable `T` reports the
+    /// null-argument row (`NullSafeApiVerifier._checkTypes`); a nullable
+    /// type argument stays silent. `class int {}` follows the harness
+    /// convention (core names are modeled through concrete declarations —
+    /// `BUILTIN_TYPES` carries only `dynamic`), without it every `int`
+    /// type use reports its own `undefined_class`.
+    #[test]
+    fn null_argument_to_non_null_type_reports() {
+        let r = report(
+            "class int {} class Completer<T> { void complete(int? value) {} } void main() { Completer<int> c = Completer<int>(); c.complete(null); Completer<int?> d = Completer<int?>(); d.complete(null); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["null_argument_to_non_null_type"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "'Completer.complete' shouldn't be called with a 'null' argument for the non-nullable type argument 'int'."
+        );
+        assert_eq!(
+            r.diagnostics[0].correction.as_deref(),
+            Some("Try adding a non-null argument.")
+        );
+    }
+
+    /// A nullable on-clause type reports (`_checkForNullableTypeInCatchClause`).
+    #[test]
+    fn nullable_type_in_catch_clause_reports() {
+        let r = report("class int {} void main() { try {} on int? {} }");
+        assert_eq!(
+            code_names(&r),
+            ["nullable_type_in_catch_clause"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "A potentially nullable type can't be used in an 'on' clause because it isn't valid to throw a nullable expression."
+        );
+    }
+
+    /// `double.nan` comparisons are constant in both polarities
+    /// (`checkLeftRight` + `isDoubleNan`).
+    #[test]
+    fn unnecessary_nan_comparison_polarities() {
+        let r = report(
+            "class double { static double get nan => 0; } void main() { double x = 1; if (x == double.nan) {} if (x != double.nan) {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unnecessary_nan_comparison", "unnecessary_nan_comparison",],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "A double can't equal 'double.nan', so the condition is always 'false'."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "A double can't equal 'double.nan', so the condition is always 'true'."
+        );
+    }
+
+    /// `dynamic?` and `Null?` gain nothing from the `?`
+    /// (`visitNamedType`'s question-mark check).
+    #[test]
+    fn unnecessary_question_mark_reports() {
+        let r = report("class Null {} void main() { dynamic? a; a; Null? b; b; }");
+        assert_eq!(
+            code_names(&r),
+            ["unnecessary_question_mark", "unnecessary_question_mark",],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The '?' is unnecessary because 'dynamic' is nullable without it."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The '?' is unnecessary because 'Null' is nullable without it."
+        );
+    }
+
+    /// A wildcard pattern as a logical-and operand always matches
+    /// (`unnecessaryWildcardPattern`, the logical-and kind); both operands
+    /// report.
+    #[test]
+    fn unnecessary_wildcard_pattern_reports() {
+        let r = report(
+            "class Object {} void main() { Object o = Object(); switch (o) { case _ && _: break; } }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "unnecessary_wildcard_pattern",
+                "unnecessary_wildcard_pattern",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(r.diagnostics[0].message, "Unnecessary wildcard pattern.");
+    }
+
+    // —— #745: the W2a warning pair ———————————————————————————————————————
+
+    /// `cast_from_null_always_fails` (`visitAsExpression`,
+    /// best_practices_verifier.dart:180-190): a `Null` operand under a
+    /// non-nullable target always throws; a nullable target and a
+    /// non-`Null` operand stay silent. The casts sit in initializers — a
+    /// statement-position cast drops its leading operand in the parser's
+    /// statement disambiguation (see the `unnecessary_cast` pin); the
+    /// `var` targets keep the assignment face out. `0 as int` reports the
+    /// oracle's `unnecessary_cast` row (structural equality) and nothing
+    /// from this code.
+    #[test]
+    fn cast_from_null_always_fails_routes_by_operand_and_target() {
+        let r =
+            report("void main() { var a = null as int; var b = null as int?; var c = 0 as int; }");
+        let mut names = code_names(&r);
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "cast_from_null_always_fails",
+                "unnecessary_cast",
+                "unused_local_variable",
+                "unused_local_variable",
+                "unused_local_variable",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        let cast = r
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "cast_from_null_always_fails")
+            .expect("the `null as int` cast always throws");
+        assert_eq!(
+            cast.message,
+            "This cast always throws an exception because the expression always evaluates to 'null'."
+        );
+        assert_eq!(
+            cast.correction.as_deref(),
+            None,
+            "the registry row declares no correctionMessage"
+        );
+    }
+
+    /// The pattern face (`visitCastPattern`,
+    /// best_practices_verifier.dart:227-239): a `Null` matched value under
+    /// a non-nullable target reports beside the disjointness row the same
+    /// pair provably fires (`pattern_never_matches_value_type` — the
+    /// oracle emits both at the node). The `default` clause keeps the
+    /// exhaustiveness face out of the pin.
+    #[test]
+    fn cast_from_null_pattern_reports() {
+        let r =
+            report("void main() { switch (null) { case null as int: break; default: break; } }");
+        assert_eq!(
+            code_names(&r),
+            [
+                "pattern_never_matches_value_type",
+                "cast_from_null_always_fails",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "This cast always throws an exception because the expression always evaluates to 'null'."
+        );
+    }
+
+    /// `receiver_of_type_never` (messages.yaml :29566, the
+    /// property-access face of the thirteen collapsed into the receiver
+    /// junction): `f()`'s result type is `f`'s declared return type, so
+    /// the `.foo` access on it reports at the receiver. A `Never`
+    /// receiver under `as` is a different code's business — nothing here.
+    /// `class Never {}` follows the harness convention (core names are
+    /// modeled through concrete declarations; the never-identity keys on
+    /// the name — see `never_promotion_does_not_clean_the_row`), without
+    /// it the `Never` annotation itself reports `undefined_class`.
+    #[test]
+    fn receiver_of_type_never_reports_at_the_property_junction() {
+        let r = report(
+            "class Object {} class Never {} Never f() => throw Object(); void main() { f().foo(); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["receiver_of_type_never"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The receiver is of type 'Never', and will never complete with a value."
+        );
+        assert_eq!(
+            r.diagnostics[0].correction.as_deref(),
+            Some("Try checking for throw expressions or type errors in the receiver")
+        );
+        // The `as` operand face keys on `Null`, not `Never` — and the
+        // discarded initializer only leaves the oracle's
+        // `unused_local_variable`.
+        let r = report(
+            "class Object {} class Never {} Never f() => throw Object(); void main() { var a = f() as int; }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_local_variable"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    // —— #746: the W2b flow-fact consumers ——————————————————————————————————
+
+    /// `cast_from_nullable_always_fails` (type_analyzer.dart:2107-2126): an
+    /// unassigned nullable local's cast to a non-nullable target reports at
+    /// the read's identifier. The cast sits in an initializer on purpose (a
+    /// statement-position cast drops its leading operand in the parser's
+    /// statement disambiguation — see the `unnecessary_cast` pin). The
+    /// assigned read joins no `UnassignedRead` fact and the nullable target
+    /// fails the staging gate — both stay silent. `class int {}` follows
+    /// the harness convention (core names are modeled through concrete
+    /// declarations — `BUILTIN_TYPES` carries only `dynamic`), without it
+    /// the `int?` annotation reports its own `undefined_class`.
+    #[test]
+    fn cast_from_nullable_always_fails_joins_unassigned_reads() {
+        let r = report("class int {} void main() { int? x; var y = x as int; }");
+        let mut names = code_names(&r);
+        names.sort();
+        assert_eq!(
+            names,
+            ["cast_from_nullable_always_fails", "unused_local_variable",],
+            "{:?}",
+            code_names(&r)
+        );
+        let cast = r
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "cast_from_nullable_always_fails")
+            .expect("the unassigned read's cast always throws");
+        assert_eq!(cast.range.offset, 43, "the read's identifier, not the cast");
+        assert_eq!(cast.range.length, 1);
+        assert_eq!(
+            cast.message,
+            "This cast will always throw an exception because the nullable local variable 'x' is not assigned."
+        );
+        assert_eq!(
+            cast.correction.as_deref(),
+            Some(
+                "Try giving it an initializer expression, or ensure that it's assigned on every execution path."
+            )
+        );
+        // The assigned read carries no `UnassignedRead` fact — and it still
+        // counts as a use, so `x` is spared: the usage cluster's only row is
+        // the never-read `y`.
+        let r = report("class int {} void main() { int? x; x = 1; var y = x as int; }");
+        let mut names = code_names(&r);
+        names.sort();
+        assert_eq!(names, ["unused_local_variable",], "{:?}", code_names(&r));
+    }
+
+    /// `body_might_complete_normally_nullable` (type_analyzer.dart:639-704):
+    /// a completable block body under a nullable return type reports at the
+    /// body's `{` with the declared type's display text — the top-level and
+    /// member faces alike. The potentially non-nullable ERROR twin
+    /// (`body_might_complete_normally`) is the never-return code's business
+    /// and never fires here; the `void` face, the expression body (no
+    /// `BlockFunctionBody`), and the returning body (its exit is
+    /// unreachable) stay silent. `class int {}` follows the harness
+    /// convention (core names are modeled through concrete declarations —
+    /// `BUILTIN_TYPES` carries only `dynamic`), without it every `int`
+    /// type use reports its own `undefined_class`.
+    #[test]
+    fn body_might_complete_normally_nullable_reports_at_the_block_brace() {
+        let r = report("class int {} int? f() {}");
+        assert_eq!(
+            code_names(&r),
+            ["body_might_complete_normally_nullable",],
+            "{:?}",
+            code_names(&r)
+        );
+        let row = &r.diagnostics[0];
+        assert_eq!(
+            row.range.offset, 22,
+            "the block's left brace, not the end token"
+        );
+        assert_eq!(row.range.length, 1);
+        assert_eq!(
+            row.message,
+            "This function has a nullable return type of 'int?', but ends without returning a value."
+        );
+        assert_eq!(
+            row.correction.as_deref(),
+            Some(
+                "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
+            )
+        );
+        let r = report("class int {} class C { int? m() {} }");
+        assert_eq!(
+            code_names(&r),
+            ["body_might_complete_normally_nullable",],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(r.diagnostics[0].range.offset, 32);
+        // The silent faces: (a) the non-nullable twin, (b) `void`, the
+        // expression body, and the returning body.
+        assert_eq!(
+            code_names(&report("class int {} int f() {}")),
+            [] as [&str; 0]
+        );
+        assert_eq!(code_names(&report("void f() {}")), [] as [&str; 0]);
+        assert_eq!(
+            code_names(&report("class int {} int? f() => null;")),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            code_names(&report("class int {} int? f() { return null; }")),
+            [] as [&str; 0]
+        );
+    }
+
+    /// The completion warning's modifier gates (`checkForBodyMayComplete
+    /// Normally`, type_analyzer.dart:658-681): a generator body always
+    /// completes normally by the generator contract (`body.isGenerator`
+    /// early return — the official test's own `async*`/`sync*` shapes stay
+    /// silent), and an `async` body under a return type that cannot carry
+    /// awaits (`Future<Never> ⊄ int?`, the `_isLegalReturnType` shape)
+    /// spares the second row. The plain sync twin keeps reporting — the
+    /// pin's control face. `class Future<T> {}`/`class Iterable<T> {}`/
+    /// `class int {}` follow the harness convention (core names are
+    /// modeled through concrete declarations) — the `int` type arguments
+    /// are type-reference uses like any annotation head, so each reports
+    /// its own `undefined_class` without the stub.
+    #[test]
+    fn body_might_complete_normally_nullable_spares_generator_and_illegal_async() {
+        assert_eq!(
+            code_names(&report(
+                "class int {} class Future<T> {} class Iterable<T> {} \
+                 Future<int>? f() async* {} \
+                 Iterable<int>? g() sync* {}"
+            )),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            code_names(&report("class int {} int? h() async {}")),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            code_names(&report("class int {} int? k() {}")),
+            ["body_might_complete_normally_nullable"]
+        );
+    }
+
     // —— #507: the pattern/type-space disjointness cluster —————————————————
 
     /// A cast pattern over a matched type already below the target is dead
@@ -18828,5 +21418,464 @@ mod tests {
             "The generic type 'Box<dynamic>' should have explicit type arguments but doesn't."
         );
         assert!(report(src).diagnostics.is_empty());
+    }
+
+    // —— #612: the variance family (the `variance` experiment only) ————————
+    // Oracle anchors: error_verifier.dart:7999-8088 (the superinterface
+    // walk and `_checkForWrongVariancePosition`), :7910-7996 (the member
+    // faces); texts from diagnostic.g.dart:18498-18519/:18771-18783/
+    // :18809-18825.
+
+    /// The byte-identical default: the very program the experiment fires
+    /// on emits nothing without the grant — the legacy superinterface
+    /// shape included (the oracle fires it there; the gate is the
+    /// recorded #612 under-report posture).
+    #[test]
+    fn variance_family_stays_silent_without_the_experiment() {
+        let src = "class A<X> {} \
+                   class B<X> extends A<void Function(X)> {}";
+        assert!(report_ungranted(src).diagnostics.is_empty());
+    }
+
+    /// The legacy-covariant superinterface face: a class type parameter
+    /// used contravariantly in a direct superinterface reports at the
+    /// parameter's name with the oracle's verbatim text.
+    #[test]
+    fn variance_superinterface_legacy_face_fires_under_the_experiment() {
+        let src = "class A<X> {} \
+                   class B<X> extends A<void Function(X)> {}";
+        let report = report_variance(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+        let row = &report.diagnostics[0];
+        assert_eq!(
+            row.message,
+            "'X' can't be used contravariantly or invariantly in 'A<void Function(X)>'."
+        );
+        assert_eq!(
+            &src[row.range.offset as usize..][..row.range.length as usize],
+            "X"
+        );
+    }
+
+    /// The explicit-keyword face picks its text by the parameter's own
+    /// keyword and the position's computed variance
+    /// (`wrongExplicitTypeParameterVarianceInSuperinterface`).
+    #[test]
+    fn variance_superinterface_explicit_face_by_keyword() {
+        let out_src = "class B<T> {} \
+                       class A<out T> implements B<void Function(T)> {}";
+        let out = report_variance(out_src);
+        assert_eq!(
+            code_names(&out),
+            ["wrong_explicit_type_parameter_variance_in_superinterface"]
+        );
+        assert_eq!(
+            out.diagnostics[0].message,
+            "'T' is an 'out' type parameter and can't be used in an 'in' position in \
+             'B<void Function(T)>'."
+        );
+        let row = &out.diagnostics[0];
+        assert_eq!(
+            &out_src[row.range.offset as usize..][..row.range.length as usize],
+            "T"
+        );
+
+        let in_src = "class B<T> {} \
+                      class A<in T> implements B<T Function()> {}";
+        let in_report = report_variance(in_src);
+        assert_eq!(
+            code_names(&in_report),
+            ["wrong_explicit_type_parameter_variance_in_superinterface"]
+        );
+        assert_eq!(
+            in_report.diagnostics[0].message,
+            "'T' is an 'in' type parameter and can't be used in an 'out' position in \
+             'B<T Function()>'."
+        );
+    }
+
+    /// Passing positions per keyword: covariant under `out`, contravariant
+    /// under `in`, the invariant meet under `inout` — no rows.
+    #[test]
+    fn variance_superinterface_passing_positions_stay_silent() {
+        let src = "class B<T> {} \
+                   class A1<out T> implements B<T> {} \
+                   class A2<in T> implements B<void Function(T)> {} \
+                   class A3<inout T> implements B<T Function(T)> {}";
+        assert!(report_variance(src).diagnostics.is_empty());
+    }
+
+    /// The named mixin application has no body: the declaration-end event
+    /// finalizes the header, so the head type checks.
+    #[test]
+    fn variance_named_mixin_application_checks_its_head() {
+        let src = "class A<X> {} \
+                   mixin M {} \
+                   class B<X> = A<void Function(X)> with M;";
+        let report = report_variance(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+    }
+
+    /// The enum face: a `with` mixin instantiation in a contravariant
+    /// position checks through the enum header.
+    #[test]
+    fn variance_enum_with_clause_checks() {
+        let src = "class A<X> {} \
+                   enum E<X> with A<void Function(X)> { v }";
+        let report = report_variance(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+    }
+
+    /// The mixin face: an `on` constraint checks like the official walk's
+    /// superclass constraints (:8050-8052).
+    #[test]
+    fn variance_mixin_on_constraint_checks() {
+        let src = "class A<X> {} \
+                   mixin B<X> on A<void Function(X)> {}";
+        let report = report_variance(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+    }
+
+    /// The extension-type face: the representation formal's type does not
+    /// pollute the implements capture (the rep-formals latch), and the
+    /// official test's shape reports (:1194 call site).
+    #[test]
+    fn variance_extension_type_checks_implements() {
+        let src = "class A<T> {} \
+                   extension type B<T>(A<void Function(T)> it) \
+                   implements A<void Function(T)> {}";
+        let report = report_variance(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+    }
+
+    /// The member faces (`_checkForWrongTypeParameterVarianceInField`
+    /// :7910-7933 and `...InMethod` :7936-7996): a field's declared type
+    /// and its non-final implicit setter, a method's return type and
+    /// formals, each with the verbatim `_position` text.
+    #[test]
+    fn variance_member_faces_report_forbidden_positions() {
+        // `out T` field: the declared type passes, the implicit setter
+        // fails.
+        let field_src = "class A<out T> { T x; }";
+        let field = report_variance(field_src);
+        assert_eq!(
+            code_names(&field),
+            ["wrong_type_parameter_variance_position"]
+        );
+        assert_eq!(
+            field.diagnostics[0].message,
+            "The 'out' type parameter 'T' can't be used in an 'in' position."
+        );
+        assert_eq!(
+            &field_src[field.diagnostics[0].range.offset as usize..]
+                [..field.diagnostics[0].range.length as usize],
+            "x"
+        );
+
+        // `in T` final field: the declared type fails, the (absent)
+        // setter face spares.
+        let final_src = "class A<in T> { final T x; }";
+        let final_report = report_variance(final_src);
+        assert_eq!(
+            code_names(&final_report),
+            ["wrong_type_parameter_variance_position"]
+        );
+        assert_eq!(
+            final_report.diagnostics[0].message,
+            "The 'in' type parameter 'T' can't be used in an 'out' position."
+        );
+
+        // `in T` return type fails; `out T` formal fails.
+        let method_src = "class A<in T> { T m() => throw ''; } \
+                          class B<out T> { void m(T x) {} }";
+        let method = report_variance(method_src);
+        assert_eq!(
+            code_names(&method),
+            [
+                "wrong_type_parameter_variance_position",
+                "wrong_type_parameter_variance_position"
+            ]
+        );
+        assert_eq!(
+            method.diagnostics[0].message,
+            "The 'in' type parameter 'T' can't be used in an 'out' position."
+        );
+        assert_eq!(
+            method.diagnostics[1].message,
+            "The 'out' type parameter 'T' can't be used in an 'in' position."
+        );
+    }
+
+    /// Legacy parameters never fire the member faces (the official
+    /// `isLegacyCovariant` skips, :7918/:7945) — and the superinterface
+    /// face only through the legacy row.
+    #[test]
+    fn variance_legacy_parameters_stay_silent_on_member_faces() {
+        let src = "class A<T> { T x; void m(T y) {} T n() => throw ''; }";
+        assert!(report_variance(src).diagnostics.is_empty());
+    }
+
+    /// The walk composes: a contravariant occurrence through a covariant
+    /// argument stays contravariant, and an occurrence in a function
+    /// type's own parameter bound forces `invariant`
+    /// (variance_builder.dart:131-140; the official `test_typeParameter_
+    /// bound` shape — the display renders the written shape without the
+    /// signature's `<...>` section, a documented divergence).
+    #[test]
+    fn variance_walk_composes_nesting_and_signature_bounds() {
+        let nested = report_variance(
+            "class A<X> {} \
+             class B<Y> extends A<A<void Function(Y)>> {}",
+        );
+        assert_eq!(
+            code_names(&nested),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+
+        let bound = report_variance(
+            "class B<X> {} \
+             class C<out X> extends B<void Function<Y extends X>()> {}",
+        );
+        assert_eq!(
+            code_names(&bound),
+            ["wrong_explicit_type_parameter_variance_in_superinterface"]
+        );
+        assert_eq!(
+            bound.diagnostics[0].message,
+            "'X' is an 'out' type parameter and can't be used in an 'inout' position in \
+             'B<void Function()>'."
+        );
+    }
+}
+
+/// The W6 `@sealed` supertype-contract producer tests (#702). Kept as a
+/// standalone module so the shared `tests` rig stays untouched: the faces
+/// here need a second analyzed library and the meta stand-in node, which
+/// the single-file rig cannot express.
+#[cfg(test)]
+mod sealed_contract_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// The two-library W6 rig: `source` is the diagnosed file of the
+    /// analyzed package `package:t`; `dependency` is analyzed too but
+    /// belongs to a foreign package per `dependency_uri`, carries the
+    /// `@sealed` surface, and is imported unprefixed; the meta stand-in
+    /// node backs the annotation's resolution face (`is_meta_getter` keys
+    /// the `package:meta/` uri — the vendored corpus stand-in's shape).
+    fn sealed_report(source: &str, dependency: &str, dependency_uri: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let dep_file = files.intern(Path::new("kit.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let scanned_dep = dartq_scanner::scan(
+            dependency,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dep_file,
+        );
+        assert!(
+            scanned_dep.diagnostics.is_empty(),
+            "scanner diagnostics: {dependency:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let dep_elements = collect(dependency, &scanned_dep.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let dep_lib = builder.intern(dependency_uri);
+        let meta = builder.intern("package:meta/meta.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        for (name, decl) in dep_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(dep_lib, name, dep_file);
+        }
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(dep_lib),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        builder.import(
+            dep_lib,
+            ImportEdge {
+                target: Some(meta),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        index.insert(dep_file, dep_elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+        )
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report.diagnostics.iter().map(|d| d.code.name).collect()
+    }
+
+    /// The canonical violation: an extends face over a cross-package
+    /// `@sealed` class reports `subtype_of_sealed_class` once with the
+    /// verbatim problem and correction messages.
+    #[test]
+    fn cross_package_sealed_extends_reports_verbatim() {
+        let report = sealed_report(
+            "import 'package:s/kit.dart'; class Sub extends Guard {}",
+            "import 'package:meta/meta.dart'; @sealed class Guard {}",
+            "package:s/kit.dart",
+        );
+        assert_eq!(code_names(&report), ["subtype_of_sealed_class"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The class 'Guard' shouldn't be extended, mixed in, or implemented because it's sealed."
+        );
+        assert_eq!(
+            report.diagnostics[0].correction.as_deref(),
+            Some(
+                "Try composing instead of inheriting, or refer to the documentation of 'Guard' for more information."
+            )
+        );
+    }
+
+    /// Same-package `@sealed` stays silent
+    /// (`_isLibraryInWorkspacePackage`): the dependency's uri names the
+    /// analyzed package `t`, so the sealed contract does not reach across.
+    #[test]
+    fn same_package_sealed_supertype_stays_silent() {
+        let report = sealed_report(
+            "import 'package:t/kit.dart'; class Same extends Local {}",
+            "import 'package:meta/meta.dart'; @sealed class Local {}",
+            "package:t/kit.dart",
+        );
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The two faces split on the DIRECT `on` constraint (the official
+    /// `superclassConstraints.contains` arm): a mixin whose `on` list
+    /// carries the sealed class reports the constraint variant, a mixin
+    /// merely implementing it the regular one.
+    #[test]
+    fn mixin_constraint_and_implements_faces_split() {
+        let report = sealed_report(
+            "import 'package:s/kit.dart'; \
+             mixin NeedsGuard on Guard {} \
+             mixin Adopts implements Guard {}",
+            "import 'package:meta/meta.dart'; @sealed class Guard {}",
+            "package:s/kit.dart",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["mixin_on_sealed_class", "subtype_of_sealed_class"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The class 'Guard' shouldn't be used as a mixin constraint because it is sealed, and any class mixing in this mixin must have 'Guard' as a superclass."
+        );
+    }
+
+    /// Per-sealed-supertype multiplicity and transitivity: two distinct
+    /// sealed supertypes report at one declaration each once (no break),
+    /// and a sealed supertype reachable only through a same-package
+    /// unsealed middle reports at the transitive subtype too.
+    #[test]
+    fn closure_reports_each_sealed_supertype_transitively() {
+        let report = sealed_report(
+            "import 'package:s/kit.dart'; \
+             class Breach extends Guard implements Vault {} \
+             class Mid extends Guard {} \
+             class Deep extends Mid {}",
+            "import 'package:meta/meta.dart'; @sealed class Guard {} @sealed class Vault {}",
+            "package:s/kit.dart",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "subtype_of_sealed_class", // Breach <- Guard
+                "subtype_of_sealed_class", // Breach <- Vault
+                "subtype_of_sealed_class", // Mid <- Guard
+                "subtype_of_sealed_class", // Deep <- Guard, transitively
+            ]
+        );
+    }
+
+    /// The closure walk is cycle-safe: a cyclic hierarchy terminates and
+    /// reports once per declaring node, never per path.
+    #[test]
+    fn cyclic_hierarchy_reports_each_node_once() {
+        let report = sealed_report(
+            "import 'package:s/kit.dart'; \
+             class A extends B {} \
+             class B extends A implements C {}",
+            "import 'package:meta/meta.dart'; @sealed class C {}",
+            "package:s/kit.dart",
+        );
+        // A's closure holds B and the sealed C; B's revisits A (the cycle)
+        // before reaching C again — one row per node, no loop.
+        assert_eq!(
+            code_names(&report),
+            ["subtype_of_sealed_class", "subtype_of_sealed_class"]
+        );
     }
 }

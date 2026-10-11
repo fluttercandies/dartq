@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
-    ArgPool, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
-    FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
+    Annotation, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
+    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal,
+    TopDecl, Ty,
 };
 
 /// A span projection: `SourceRange`'s two public columns (`SourceRange`
@@ -174,6 +175,20 @@ pub struct PersistedContainer {
     /// #539 additive-field discipline).
     #[serde(default)]
     pub ctor_formals: Vec<(u32, Box<PersistedFormals>)>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no declaration metadata (the
+    /// #539 additive-field discipline; the #705 annotation substrate).
+    #[serde(default)]
+    pub annotations: Vec<PersistedAnnotation>,
+}
+
+/// One declaration annotation in payload form: the dot-joined name id and
+/// the annotation's own span (`@` through the name's last segment).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAnnotation {
+    pub name: u32,
+    pub offset: u32,
+    pub length: u32,
 }
 
 /// One extension application face in payload form (the implicit-application
@@ -566,6 +581,15 @@ impl PersistedContainer {
                 .iter()
                 .map(|(name, formals)| (s.id(*name), Box::new(s.formals(formals))))
                 .collect(),
+            annotations: container
+                .annotations
+                .iter()
+                .map(|annotation| PersistedAnnotation {
+                    name: s.id(annotation.name),
+                    offset: annotation.range.offset,
+                    length: annotation.range.length,
+                })
+                .collect(),
         }
     }
 
@@ -641,6 +665,17 @@ impl PersistedContainer {
                         ids[at as usize],
                         Box::new(into_formals(*formals, ids, pool)),
                     )
+                })
+                .collect(),
+            annotations: self
+                .annotations
+                .into_iter()
+                .map(|annotation| Annotation {
+                    name: ids[annotation.name as usize],
+                    range: SourceRange {
+                        offset: annotation.offset,
+                        length: annotation.length,
+                    },
                 })
                 .collect(),
         }
@@ -807,6 +842,13 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                annotations: Box::new([Annotation {
+                    name: name("sealed"),
+                    range: SourceRange {
+                        offset: 0,
+                        length: 7,
+                    },
+                }]),
             },
         );
         elements.container_order.push(name("C"));
@@ -848,6 +890,7 @@ mod tests {
         let restored_c = restored.container(name("C")).expect("container C");
         assert_eq!(restored_c.members.len(), 2);
         assert!(restored_c.members.contains_key(&name("m=")));
+        assert_eq!(restored_c.annotations[0].name, name("sealed"));
         let restored_face = &restored.extension_faces[0];
         assert_eq!(restored_face.name, Some(name("E")));
         assert_eq!(restored_face.on_type, Some(name("int")));

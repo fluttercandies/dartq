@@ -9,6 +9,10 @@
 //!   superclass name edges, per-executable formal tables (positional +
 //!   named, with declared types), declared types (fields, variables, return
 //!   types), type-parameter counts, and the capture-time arity log.
+//! * [`capture`] — the shared written-type capture ([`capture::TypeTree`],
+//!   [`capture::TreeSink`]): one parse-event sink shape for the boundedness
+//!   face's windows and the collector's declaration-annotation feeding
+//!   (#728).
 //! * [`collector`] — the collecting [`ParserListener`]: consumes the
 //!   parser's declaration-surface event stream into a model
 //!   ([`collector::collect`]). The parser event stream is the stable face —
@@ -106,7 +110,9 @@
 //! diagnostic tickets; when the parser's directive milestone lands, the
 //! fold moves behind this API without changing its shape.
 
+pub mod annotation;
 pub mod bounds;
+pub(crate) mod capture;
 pub mod codes;
 pub mod collector;
 pub mod const_eval;
