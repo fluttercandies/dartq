@@ -25,6 +25,7 @@ pub(crate) mod types;
 
 use dartq_ast::NodeKind;
 use dartq_scanner::KeywordStyle;
+use rustc_hash::FxHashMap;
 
 use crate::engine::Check;
 
@@ -106,13 +107,25 @@ pub(crate) fn is_statement_row(c: &Check<'_>, row: u32) -> bool {
 /// children (the production body opens at `{` before all members — every
 /// member is a body child; hand-built tables may skip the wrapper, hence
 /// the `ancestor` fallback).
+///
+/// Memoized per row in [`RunCaches::body_member_rows`] — the override-family
+/// rules re-derive the identical list per member, and the parent-pointer
+/// face filters the arena (#758).
 pub(crate) fn body_members(c: &Check<'_>, ancestor: u32) -> Vec<u32> {
+    if let Some(rows) = c.caches.body_member_rows.borrow().get(&ancestor) {
+        return rows.clone();
+    }
     let body = c
         .collect_direct(ancestor)
         .into_iter()
         .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
         .unwrap_or(ancestor);
-    rows_with_parent(c, body)
+    let rows = rows_with_parent(c, body);
+    c.caches
+        .body_member_rows
+        .borrow_mut()
+        .insert(ancestor, rows.clone());
+    rows
 }
 
 /// The written name of a class-like declaration row: the production
@@ -178,17 +191,23 @@ pub(crate) fn initialized_identifier_name(c: &Check<'_>, var: u32) -> Option<u32
 }
 
 /// The `var`/`final`/`const` keyword of a [`NodeKind::VariablesDeclaration`]
-/// row. Real parses store only `late` in payload word 0 — the bridge drops
-/// `varFinalOrConst` and the row's span starts at the name — so on the real
-/// face the keyword precedes the type spelling and is recovered with a
-/// bounded backward token walk stopped by statement boundaries; hand-built
-/// tables may carry the keyword itself in word 0.
+/// row. Real parses store only `late` in payload word 0; the span head is
+/// face-dependent — a field declaration anchors the row at the keyword
+/// itself (members.rs `decl_head`: `late`, else var/final/const, else the
+/// type start), a local declaration at the name — so the head answers
+/// directly when it lexes as the keyword, and the name-anchored face
+/// recovers it with a bounded backward token walk stopped by statement
+/// boundaries; hand-built tables may carry the keyword itself in word 0.
 pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u32> {
     let stored = c.payload(row).first().copied().unwrap_or(NONE_TOKEN);
     if stored != NONE_TOKEN && matches!(c.lexeme(stored), "var" | "final" | "const") {
         return Some(stored);
     }
-    let mut token = c.head_token(row);
+    let head = c.head_token(row);
+    if matches!(c.lexeme(head), "var" | "final" | "const") {
+        return Some(head);
+    }
+    let mut token = head;
     for _ in 0..256 {
         token = token.checked_sub(1)?;
         match c.lexeme(token) {
@@ -532,39 +551,64 @@ pub(crate) enum MemberQuery {
 /// (`ClassDeclaration` / `MixinDeclaration` / `EnumDeclaration`), or `None`
 /// when the name is not a same-file class-like declaration (an SDK type, an
 /// import — the face never sees through it).
+///
+/// Memoized as a name -> row index built once per run on first query
+/// ([`RunCaches::class_rows`]). (#758: every lookup re-walked every
+/// top-level wrapper, and the ancestor chain resolves one name per edge per
+/// build.)
 pub(crate) fn same_file_declaration(c: &Check<'_>, name: &str) -> Option<u32> {
+    if c.caches.class_rows.borrow().is_none() {
+        let index = class_row_index(c);
+        *c.caches.class_rows.borrow_mut() = Some(index);
+    }
+    c.caches
+        .class_rows
+        .borrow()
+        .as_ref()
+        .expect("index built above")
+        .get(name)
+        .copied()
+}
+
+/// The name -> class-like row index of the unit: per top-level wrapper, the
+/// wrapper's first class-like row paired with every class-naming
+/// `Identifier` child (the [`same_file_declaration`] shape). The first
+/// wrapper wins per name — the order the per-name wrapper walk answered in.
+fn class_row_index(c: &Check<'_>) -> FxHashMap<String, u32> {
     const CLASS_LIKE: [NodeKind; 3] = [
         NodeKind::ClassDeclaration,
         NodeKind::MixinDeclaration,
         NodeKind::EnumDeclaration,
     ];
-    let root = c.unit.ast.root()?;
-    let tops = c.collect_direct(root);
-    for top in tops {
+    let mut index = FxHashMap::default();
+    let Some(root) = c.unit.ast.root() else {
+        return index;
+    };
+    for top in c.collect_direct(root) {
         if c.kind(top) != NodeKind::TopLevelDeclaration {
             continue;
         }
-        // The wrapper's name identifier and the declaration row are both
-        // direct children (collapse map §3.2 #1-5).
         let kids = c.collect_direct(top);
-        let named = kids.iter().any(|&kid| {
-            c.kind(kid) == NodeKind::Identifier
+        let Some(&class_row) = kids.iter().find(|&kid| CLASS_LIKE.contains(&c.kind(*kid))) else {
+            continue;
+        };
+        for kid in kids {
+            let named = c.kind(kid) == NodeKind::Identifier
                 && matches!(
                     c.payload(kid).first().copied(),
                     Some(ctx)
                         if ctx == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                             as u32
                             || ctx == dartq_parser::IdentifierContext::EnumDeclaration as u32
-                )
-                && c.lexeme(c.head_token(kid)) == name
-        });
-        if named
-            && let Some(&class_row) = kids.iter().find(|&kid| CLASS_LIKE.contains(&c.kind(*kid)))
-        {
-            return Some(class_row);
+                );
+            if named {
+                index
+                    .entry(c.lexeme(c.head_token(kid)).to_string())
+                    .or_insert(class_row);
+            }
         }
     }
-    None
+    index
 }
 
 /// The clause a supertype is written in — the concrete-member lookup walks
@@ -579,40 +623,49 @@ pub(crate) enum SupertypeClause {
 }
 
 /// The written supertypes of a class-like header, in source order with
-/// their clause: the `Type` rows inside the declaration's own span but
-/// outside its body and outside any type-arguments span (the `Type` is a
-/// width-0 leaf row — bridge.rs `handle_type` — so the header scan is a
-/// bounded window walk, each row's clause read off the nearest preceding
-/// clause keyword, itself a bounded backward token walk).
+/// their clause: the `Type` rows among the declaration's direct children,
+/// stopping at the body (the `Type` is a width-0 leaf row — bridge.rs
+/// `handle_type` — and the clause keywords are payload words with no
+/// wrapper rows, so the direct-children walk covers the whole header;
+/// `TypeArguments`/`TypeVariables` rows are skipped wholesale, each
+/// collected row's clause read off the nearest preceding clause keyword,
+/// itself a bounded backward token walk).
+///
+/// Memoized per class-like row in [`RunCaches::supertype_lists`] — the
+/// header is invariant for the run. (#758: the previous form walked the
+/// declaration's whole completion window per call — O(class subtree), with
+/// every member type collected as a phantom name on the way — and its
+/// `TypeArguments` skip never advanced the cursor, since `children(i).end
+/// == i` for every row in this post-order arena, hanging on the first
+/// generic declaration.)
 pub(crate) fn supertypes<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<(&'a str, SupertypeClause)> {
-    let window = c.children(class_row);
-    let class_end = c.byte_span(class_row).end;
-    let mut names = Vec::new();
-    let mut i = window.start;
-    while i <= class_row {
-        let span = c.byte_span(i);
-        if span.end > class_end {
-            break;
-        }
-        match c.kind(i) {
-            NodeKind::Type => {
+    if !c.caches.supertype_lists.borrow().contains_key(&class_row) {
+        let rows: Vec<(u32, SupertypeClause)> = c
+            .collect_direct(class_row)
+            .into_iter()
+            .take_while(|&kid| {
+                !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
+            })
+            .filter(|&kid| c.kind(kid) == NodeKind::Type)
+            .map(|kid| {
                 // The head token is the name; a `?` tail rides the same row.
-                let head = c.head_token(i);
-                let clause = clause_of(c, class_row, head);
-                names.push((c.lexeme(head), clause));
-            }
-            NodeKind::TypeArguments | NodeKind::TypeVariables => {
-                // Skip the nested rows wholesale (type arguments of a
-                // supertype, the declaration's own type parameters).
-                i = c.children(i).end;
-                continue;
-            }
-            NodeKind::DeclarationBody | NodeKind::EnumBody => break,
-            _ => {}
-        }
-        i += 1;
+                let head = c.head_token(kid);
+                (head, clause_of(c, class_row, head))
+            })
+            .collect();
+        c.caches
+            .supertype_lists
+            .borrow_mut()
+            .insert(class_row, rows);
     }
-    names
+    c.caches
+        .supertype_lists
+        .borrow()
+        .get(&class_row)
+        .expect("row inserted above")
+        .iter()
+        .map(|&(token, clause)| (c.lexeme(token), clause))
+        .collect()
 }
 
 /// The clause keyword governing the supertype named at `head`: the nearest
@@ -640,7 +693,20 @@ fn clause_of(c: &Check<'_>, class_row: u32, head: u32) -> SupertypeClause {
 /// concrete-member lookup); otherwise `implements` interfaces join too
 /// (the any-member lookup behind `annotate_overrides`). The chain stops at
 /// names that leave the file.
+///
+/// Memoized per `(row, concrete)` in [`RunCaches::ancestor_chains`] — the
+/// chain is a per-container invariant. (#758: `annotate_overrides` rebuilt
+/// the identical chain per member, each rebuild rescanning every header on
+/// the way.)
 pub(crate) fn same_file_ancestors(c: &Check<'_>, class_row: u32, concrete: bool) -> Vec<u32> {
+    if let Some(cached) = c
+        .caches
+        .ancestor_chains
+        .borrow()
+        .get(&(class_row, concrete))
+    {
+        return cached.clone();
+    }
     let clause_joins =
         |clause: SupertypeClause| !concrete || !matches!(clause, SupertypeClause::Implements);
     let mut chain = Vec::new();
@@ -662,6 +728,10 @@ pub(crate) fn same_file_ancestors(c: &Check<'_>, class_row: u32, concrete: bool)
             queue.push(row);
         }
     }
+    c.caches
+        .ancestor_chains
+        .borrow_mut()
+        .insert((class_row, concrete), chain.clone());
     chain
 }
 
@@ -814,6 +884,10 @@ pub(crate) struct TypeFace<'a> {
 /// `Fields` row's written type sibling — the prefer_initializing_formals
 /// tiling). `None` when the name is no instance field of the enclosing
 /// class-like declaration.
+///
+/// Reads the run's per-class field index ([`field_type_rows`], the #703 F4
+/// hoist): the enclosing class body was re-walked per call — once per `Send`
+/// for `collection_methods_unrelated_type` — now one walk per class per run.
 pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<TypeFace<'a>> {
     let class_row = c.path.iter().rev().find_map(|&a| {
         matches!(
@@ -825,13 +899,43 @@ pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<Typ
         )
         .then_some(a)
     })?;
+    let type_row = field_type_rows(c, class_row)
+        .iter()
+        .find(|(tok, _)| c.lexeme(*tok) == name)
+        .and_then(|(_, row)| *row)?;
+    Some(type_face(c, type_row))
+}
+
+/// The instance-field index of `class_row`, built once per run on first
+/// query and cached in the run's [`RunCaches`][crate::engine::RunCaches]:
+/// the class's non-static `Fields` members as `(name token, written type
+/// row)` pairs in body order (`None` row = untyped). The query's lexeme
+/// find is first-wins, matching the body walk this index replaces: the
+/// FIRST member carrying the name decides, untyped or not. The returned
+/// borrow is a read-only view, function-local to [`type_face_of_field`].
+fn field_type_rows<'a>(
+    c: &'a Check<'a>,
+    class_row: u32,
+) -> core::cell::Ref<'a, Vec<(u32, Option<u32>)>> {
+    if !c.caches.field_types.borrow().contains_key(&class_row) {
+        let rows = build_field_type_rows(c, class_row);
+        c.caches.field_types.borrow_mut().insert(class_row, rows);
+    }
+    core::cell::Ref::map(c.caches.field_types.borrow(), |cache| {
+        cache.get(&class_row).expect("built above")
+    })
+}
+
+/// The one class-body walk behind [`field_type_rows`]: the previous
+/// per-call `type_face_of_field` loop, collecting every name instead of one.
+fn build_field_type_rows(c: &Check<'_>, class_row: u32) -> Vec<(u32, Option<u32>)> {
+    let mut rows = Vec::new();
     for member in body_members(c, class_row) {
+        // The same face `member_matches`' Variable arm reads: a non-static
+        // `Fields` row declaring through `InitializedIdentifier` rows.
         if c.kind(member) != NodeKind::Fields
             || c.payload(member).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
         {
-            continue;
-        }
-        if member_matches(c, member, MemberQuery::Variable, name).is_empty() {
             continue;
         }
         let type_row = c.collect_direct(member).into_iter().find(|&kid| {
@@ -839,10 +943,24 @@ pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<Typ
                 c.kind(kid),
                 NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType
             )
-        })?;
-        return Some(type_face(c, type_row));
+        });
+        for decl in c.collect_direct(member) {
+            if c.kind(decl) != NodeKind::VariablesDeclaration {
+                continue;
+            }
+            for var in c.collect_direct(decl) {
+                if c.kind(var) != NodeKind::InitializedIdentifier {
+                    continue;
+                }
+                if let Some(name_row) = initialized_identifier_name(c, var) {
+                    // `name_row` is a TOKEN id (`member_matches` compares its
+                    // lexeme directly) — store it as-is, never re-head it.
+                    rows.push((name_row, type_row));
+                }
+            }
+        }
     }
-    None
+    rows
 }
 
 /// The face of one written type row.

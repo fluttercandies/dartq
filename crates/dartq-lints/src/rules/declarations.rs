@@ -2018,6 +2018,9 @@ pub(crate) mod annotate_overrides {
             NodeKind::Method => MemberQuery::Method,
             _ => MemberQuery::Getter,
         };
+        // The chain is a per-container invariant — derive it once, not per
+        // member name (#758).
+        let ancestors = same_file_ancestors(c, class_row, false);
         for name_row in member_names(c, node) {
             // Both faces name at the row's span head (the method's
             // `Identifier`, the field's width-0-at-name
@@ -2025,9 +2028,9 @@ pub(crate) mod annotate_overrides {
             // name token.
             let name_token = c.head_token(name_row);
             let name = c.lexeme(name_token);
-            let inherited = same_file_ancestors(c, class_row, false)
-                .into_iter()
-                .find_map(|ancestor| inherited_member(c, ancestor, query, name));
+            let inherited = ancestors
+                .iter()
+                .find_map(|&ancestor| inherited_member(c, ancestor, query, name));
             if inherited.is_some() {
                 let range = crate::rules::utf16_token_span(c, name_token);
                 c.report(range, &[name]);

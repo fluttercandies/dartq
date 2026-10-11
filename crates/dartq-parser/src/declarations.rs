@@ -843,7 +843,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         } else {
             self.ensure_identifier(IdentifierContext::EnumDeclaration)
         };
-        let type_param = self.compute_type_param_or_arg_on_lt(false);
+        // Official parseEnum passes inDeclaration: true, allowsVariance: true
+        // (parser_impl.dart:2629): the header accepts variance modifiers.
+        let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
         self.listener
             .begin_enum_declaration(begin, augment, enum_keyword, name);
@@ -1161,7 +1163,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
         }
         let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
-        let type_param = self.compute_type_param_or_arg_on_lt(false);
+        // Official parseClassOrNamedMixinApplication passes inDeclaration:
+        // true, allowsVariance: true (parser_impl.dart:2981): the header
+        // accepts variance modifiers (covers named mixin applications too —
+        // same entry).
+        let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
 
         // The abstract+final/interface/sealed modifier trio is owned by the
@@ -1588,7 +1594,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
         }
         let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
-        let type_param = self.compute_type_param_or_arg_on_lt(false);
+        // Official parseMixin passes inDeclaration: true, allowsVariance: true
+        // (parser_impl.dart:3412): the header accepts variance modifiers.
+        let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
         self.listener
             .begin_mixin_declaration(begin, augment, base, mixin_keyword, name);

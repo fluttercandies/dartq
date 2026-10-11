@@ -13,10 +13,13 @@ use std::sync::LazyLock;
 use dartq_ast::{NodeKind, SyntaxTable, byte_span, utf16_span};
 use dartq_scanner::TokenTable;
 use dartq_source::LineIndex;
+use rustc_hash::FxHashMap;
 
 use crate::comments::Comments;
 use crate::ignore::IgnoreInfo;
 use crate::registry::{EnableSet, RULES, RuleId, rule_by_name};
+use crate::rules::SupertypeClause;
+use crate::rules::expressions::same_file::Decls;
 
 /// The language-feature bits a rule may query. Features the caller does not
 /// know are treated per their shipped defaults; the caller pins the bits it
@@ -146,6 +149,54 @@ static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock:
     table
 });
 
+/// The run-scoped, lazily-built caches for the whole-unit declaration faces
+/// (the #703 F4 hoist): before this, every candidate node re-walked all
+/// top-level declarations (`same_file::scan` + `declares_name`) and every
+/// field query re-walked the class body (`type_face_of_field`) —
+/// O(candidates x declarations) arena walks and allocations per run. Each
+/// slot is built once on first query (units a rule family never touches pay
+/// nothing) and dropped with the run; no global state. Contents are token
+/// tables only — name queries compare lexemes over the cached rows (the
+/// O(children) read the rules are documented against), never re-walk the
+/// arena.
+///
+/// Slot contract (the [`Check::direct_children`] materialize-first rule,
+/// applied to caches): a returned borrow is a read-only view shared freely,
+/// but it must not stay alive across a build of the *same* slot — the build
+/// takes the slot exclusively. The accessors keep guards function-local to
+/// their read, so no call site can trip this; nested-borrow panics name the
+/// violation.
+pub(crate) struct RunCaches {
+    /// The unit's same-file declaration index
+    /// ([`Decls`]), read by the annotation/shadow/creation faces.
+    pub(crate) decls: core::cell::RefCell<Option<Decls>>,
+    /// Class row -> its instance fields as `(name token, written type row)`
+    /// in body order (`None` type row = the field is untyped). Read by
+    /// [`crate::rules::type_face_of_field`].
+    pub(crate) field_types: core::cell::RefCell<FxHashMap<u32, Vec<(u32, Option<u32>)>>>,
+    /// Class-like row -> its written supertypes as `(name head token,
+    /// clause)` pairs in source order. Read by [`crate::rules::supertypes`]
+    /// (#758: the header scan ran per ancestor per ancestor-chain build —
+    /// O(class subtree) each — and its `TypeArguments` skip never advanced
+    /// the cursor, hanging on every generic declaration).
+    pub(crate) supertype_lists: core::cell::RefCell<FxHashMap<u32, Vec<(u32, SupertypeClause)>>>,
+    /// Supertype/class-like name -> the same-file class-like row, built once
+    /// per run on first query (`None`-guarded like [`Self::decls`]). Read by
+    /// [`crate::rules::same_file_declaration`] (#758: every lookup re-walked
+    /// all top-level wrappers).
+    pub(crate) class_rows: core::cell::RefCell<Option<FxHashMap<String, u32>>>,
+    /// `(class-like row, concrete)` -> the transitive same-file ancestor
+    /// chain in written order. Read by
+    /// [`crate::rules::same_file_ancestors`] (#758: `annotate_overrides`
+    /// rebuilt the identical chain per member).
+    pub(crate) ancestor_chains: core::cell::RefCell<FxHashMap<(u32, bool), Vec<u32>>>,
+    /// Class-like row -> its member rows ([`crate::rules::body_members`]).
+    /// Read by the override-family rules, which re-derive the identical list
+    /// per member (#758: each derivation filtered the whole arena by
+    /// `parent`).
+    pub(crate) body_member_rows: core::cell::RefCell<FxHashMap<u32, Vec<u32>>>,
+}
+
 /// Runs the enabled rules over one unit. Output is in traversal order:
 /// pre-order (a node before its children), registry order within a node —
 /// the official visitor dispatch order.
@@ -183,8 +234,16 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
     let mut stack: Vec<(u32, usize)> = Vec::new();
     let mut path: Vec<u32> = vec![root];
     let direct = core::cell::RefCell::new(Vec::new());
+    let caches = RunCaches {
+        decls: core::cell::RefCell::new(None),
+        field_types: core::cell::RefCell::new(FxHashMap::default()),
+        supertype_lists: core::cell::RefCell::new(FxHashMap::default()),
+        class_rows: core::cell::RefCell::new(None),
+        ancestor_chains: core::cell::RefCell::new(FxHashMap::default()),
+        body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
+    };
     dispatch(
-        unit, &comments, &ignore, &path, enabled, &direct, &wildcards, &mut out,
+        unit, &comments, &ignore, &path, enabled, &direct, &caches, &wildcards, &mut out,
     );
     push_direct(unit.ast, root, &mut stack, &direct, path.len());
 
@@ -195,7 +254,7 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
             collect_wildcard(unit, &path, &mut wildcards);
         }
         dispatch(
-            unit, &comments, &ignore, &path, enabled, &direct, &wildcards, &mut out,
+            unit, &comments, &ignore, &path, enabled, &direct, &caches, &wildcards, &mut out,
         );
         push_direct(unit.ast, node, &mut stack, &direct, path.len());
     }
@@ -292,6 +351,7 @@ fn dispatch(
     path: &[u32],
     enabled: &EnableSet,
     direct: &core::cell::RefCell<Vec<u32>>,
+    caches: &RunCaches,
     wildcards: &[WildcardScope],
     out: &mut Vec<Lint>,
 ) {
@@ -311,6 +371,7 @@ fn dispatch(
             wildcards,
             rule: RuleId(rule),
             direct,
+            caches,
             out: &mut *out,
         };
         (RULES[rule as usize].check)(&mut check);
@@ -335,6 +396,9 @@ pub struct Check<'a> {
     /// Shared direct-children scratch (one buffer per run, refilled per
     /// call — no per-node allocation).
     direct: &'a core::cell::RefCell<Vec<u32>>,
+    /// The run's lazily-built declaration caches ([`RunCaches`]); the
+    /// whole-unit scans the declaration rules read, built once per run.
+    pub(crate) caches: &'a RunCaches,
     out: &'a mut Vec<Lint>,
 }
 
@@ -381,16 +445,34 @@ impl<'a> Check<'a> {
         self.unit.ast.children(id)
     }
 
-    /// The direct children of `id`, ascending, in the shared scratch. The
-    /// borrow lives until the returned guard drops; a nested
-    /// `direct_children` call while a guard is alive panics — nest through
-    /// [`Check::collect_direct`] instead.
+    /// The direct children of `id`, ascending, in the shared scratch.
+    ///
+    /// # The materialize-first contract
+    ///
+    /// The scratch is ONE buffer per run, so the returned borrow is the only
+    /// legal view of it: it must not stay alive across any nested children
+    /// read — the next refill would clobber the buffer under the guard. Code
+    /// whose children must survive a nested read materializes them first
+    /// through [`Check::collect_direct`] (an owned copy) — the rule the
+    /// rule-side comments call "collect first". Debug builds assert the
+    /// contract here and name the violation; release keeps the `RefCell`
+    /// guard as the backstop (the refill panics on the live borrow).
     pub fn direct_children(&self, id: u32) -> core::cell::Ref<'_, Vec<u32>> {
+        debug_assert!(
+            self.direct.try_borrow().is_ok(),
+            "the shared children scratch is already checked out: \
+             materialize with `collect_direct` before a nested children read"
+        );
         fill_direct(self.unit.ast, id, &mut self.direct.borrow_mut());
         self.direct.borrow()
     }
 
-    /// [`Check::direct_children`] as an owned vec, for the rare nested scans.
+    /// [`Check::direct_children`] as an owned vec — the materialize-first
+    /// contract's escape hatch: it never touches the shared scratch, so the
+    /// result survives any nested children read (and any nested
+    /// `direct_children` borrow). Use it whenever children are held across a
+    /// call that may itself read children; prefer [`Check::direct_children`]
+    /// otherwise (no allocation).
     pub fn collect_direct(&self, id: u32) -> Vec<u32> {
         let mut buf = Vec::new();
         fill_direct(self.unit.ast, id, &mut buf);

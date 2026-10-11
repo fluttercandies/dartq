@@ -300,8 +300,7 @@ pub(crate) mod library_annotations {
         if c.lexeme(c.head_token(name)) != "pragma" {
             return false;
         }
-        let decls = crate::rules::expressions::same_file::scan(c);
-        if crate::rules::expressions::same_file::declares_name(c, &decls, "pragma") {
+        if crate::rules::expressions::same_file::declares_name(c, "pragma") {
             return false;
         }
         let Some(arguments) = arguments else {
@@ -524,8 +523,7 @@ pub(crate) mod provide_deprecation_message {
         if c.lexeme(c.head_token(name)) != "deprecated" {
             return;
         }
-        let decls = crate::rules::expressions::same_file::scan(c);
-        if crate::rules::expressions::same_file::declares_name(c, &decls, "deprecated") {
+        if crate::rules::expressions::same_file::declares_name(c, "deprecated") {
             return;
         }
         let range = c.utf16_span(node);

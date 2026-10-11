@@ -304,7 +304,6 @@ pub(crate) mod prefer_collection_literals {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let decls = same_file::scan(c);
         let report = match c.kind(node) {
             // The explicit-new shape owns its callee and argument list.
             NodeKind::NewExpression | NodeKind::ImplicitCreation => {
@@ -316,11 +315,11 @@ pub(crate) mod prefer_collection_literals {
                 else {
                     return;
                 };
-                owned_creation(c, &decls, &kids, args)
+                owned_creation(c, &kids, args)
             }
             // A plain send owns nothing — rebuild from the owner slice.
             NodeKind::Send => match slice::owner_slice(c) {
-                Some((kids, pos)) => send_face(c, &decls, &kids, pos),
+                Some((kids, pos)) => send_face(c, &kids, pos),
                 None => false,
             },
             _ => false,
@@ -336,7 +335,7 @@ pub(crate) mod prefer_collection_literals {
     /// the callee is the identifier before the argument list — the
     /// explicit-new shape carries a `ConstructorReference` marker owning
     /// the name.
-    fn owned_creation(c: &Check<'_>, decls: &same_file::Decls, kids: &[u32], args: u32) -> bool {
+    fn owned_creation(c: &Check<'_>, kids: &[u32], args: u32) -> bool {
         let Some(args_pos) = kids.iter().position(|&kid| kid == args) else {
             return false;
         };
@@ -355,14 +354,14 @@ pub(crate) mod prefer_collection_literals {
         else {
             return false;
         };
-        unnamed_face(c, decls, name, args)
+        unnamed_face(c, name, args)
     }
 
     /// The unnamed faces (`constructorName == null && arguments.isEmpty`,
     /// :57-59/:68-71): written empty parentheses only — a `NoArguments`
     /// send is a tear-off, no creation. The `Linked*` faces add the
     /// context-type exemption (:85-88/:101-104).
-    fn unnamed_face(c: &Check<'_>, decls: &same_file::Decls, name: &str, args: u32) -> bool {
+    fn unnamed_face(c: &Check<'_>, name: &str, args: u32) -> bool {
         if !UNNAMED.contains(&name) || c.kind(args) != NodeKind::Arguments {
             return false;
         }
@@ -375,7 +374,7 @@ pub(crate) mod prefer_collection_literals {
         }) {
             return false;
         }
-        if same_file::declares_name(c, decls, name) {
+        if same_file::declares_name(c, name) {
             return false;
         }
         if name == "LinkedHashMap" || name == "LinkedHashSet" {
@@ -389,7 +388,7 @@ pub(crate) mod prefer_collection_literals {
     /// head before that (skipping the type-argument wrapper). A trailing
     /// same-span `DotAccess` marker switches to the member faces. A
     /// `NoArguments` send is a tear-off — no invocation, no face.
-    fn send_face(c: &Check<'_>, decls: &same_file::Decls, kids: &[u32], pos: usize) -> bool {
+    fn send_face(c: &Check<'_>, kids: &[u32], pos: usize) -> bool {
         let Some((head, args)) = slice::send_parts(c, kids, pos) else {
             return false;
         };
@@ -399,9 +398,9 @@ pub(crate) mod prefer_collection_literals {
         let selector = c.lexeme(c.head_token(kids[head]));
         let access = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match (access, args) {
-            (None, Some(args)) => unnamed_face(c, decls, selector, args),
+            (None, Some(args)) => unnamed_face(c, selector, args),
             (Some(_), Some(args)) if selector == "from" || selector == "of" => {
-                named_face(c, decls, kids, head, args)
+                named_face(c, kids, head, args)
             }
             (Some(access), Some(_)) if selector == "toSet" => to_set_face(c, kids, head, access),
             _ => false,
@@ -411,13 +410,7 @@ pub(crate) mod prefer_collection_literals {
     /// The `Set.from([…])`/`Set.of([…])` faces (:75-81): the receiver is
     /// the bare-identifier tear-off group ending at the selector, and the
     /// single argument is a list literal.
-    fn named_face(
-        c: &Check<'_>,
-        decls: &same_file::Decls,
-        kids: &[u32],
-        sel: usize,
-        args: u32,
-    ) -> bool {
+    fn named_face(c: &Check<'_>, kids: &[u32], sel: usize, args: u32) -> bool {
         let Some(group_start) = sel.checked_sub(4) else {
             return false;
         };
@@ -425,7 +418,7 @@ pub(crate) mod prefer_collection_literals {
             return false;
         }
         let written = c.lexeme(c.head_token(kids[group_start]));
-        if !NAMED_SET.contains(&written) || same_file::declares_name(c, decls, written) {
+        if !NAMED_SET.contains(&written) || same_file::declares_name(c, written) {
             return false;
         }
         single_list_literal(c, args)

@@ -511,6 +511,53 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 };
                 self.parse_selector_chain(end, context)
             }
+            TokenKind::Period => {
+                // Dot-shorthand head in pattern position: parsePrimaryPattern's
+                // fallthrough reaches parsePrecedenceExpression, whose
+                // `_isDotShorthand` entry check (:7042-7053) admits `.` +
+                // identifier/`new` (shipped 3.10, expired flag — no gate). The
+                // head/context events bracket the shorthand (:7146-7198); no
+                // `!` capture — in pattern context the bang stays for the
+                // pattern loop (null-assert pattern), like every other
+                // operand face here. Under a negation the member head reports
+                // like the identifier arm (official parsePrimary :8112-8115,
+                // which the shorthand route reaches through parsePrimary). An
+                // incomplete face (`case .:`) takes the entry recovery
+                // (:6539-6551): synthetic identifier + the same event pair.
+                //
+                // The member parses as a NAME (selector-chain `.` arm's
+                // handling), not through parse_primary's send face: the
+                // bridge's Send leaf tiles through the unconsumed follower
+                // (#585), which would drag the case colon into the operand's
+                // token window and break the constant-head face downstream.
+                let dot = self.peek_span();
+                if context == ConstantPatternContext::NumericLiteralOnly {
+                    self.report(invalid_constant_pattern_negation(), dot);
+                }
+                self.cursor.advance();
+                if crate::recovery::is_identifier(self.peek_kind())
+                    || self.peek_kind() == TokenKind::Keyword(Keyword::New)
+                {
+                    let member = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
+                        let span = self.peek_span();
+                        self.cursor.advance();
+                        self.listener
+                            .handle_identifier(span, IdentifierContext::ExpressionContinuation);
+                        span
+                    } else {
+                        self.ensure_identifier(IdentifierContext::ExpressionContinuation)
+                    };
+                    self.listener.handle_dot_shorthand_head(dot);
+                    let end = self.parse_selector_chain(member, context);
+                    self.listener.handle_dot_shorthand_context(dot);
+                    end
+                } else {
+                    let end = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                    self.listener.handle_dot_shorthand_head(dot);
+                    self.listener.handle_dot_shorthand_context(dot);
+                    self.parse_selector_chain(end, context)
+                }
+            }
             kind if crate::recovery::is_identifier(kind) => {
                 let begin = self.peek_span();
                 if context == ConstantPatternContext::NumericLiteralOnly {
@@ -1110,7 +1157,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{Log, parser};
-    use crate::listener::PatternContext;
+    use crate::listener::{IdentifierContext, PatternContext, Token};
+    use crate::message::Message;
+    use crate::token_id::TokenSpan;
 
     fn pattern_errors(source: &'static str) -> Vec<String> {
         let mut p = parser(source, Log::default());
@@ -1237,5 +1286,90 @@ mod tests {
             let _ = p.parse_const_expression();
             assert!(p.listener.errors_empty(), "{source}");
         }
+    }
+
+    /// Local listener capturing the dot-shorthand face: head dot offsets,
+    /// member identifier offsets, and send spans (the #757 inverted-span
+    /// regression).
+    #[derive(Default)]
+    struct ShorthandLog {
+        errors: Vec<String>,
+        head_dots: Vec<u32>,
+        members: Vec<u32>,
+        sends: Vec<(u32, u32)>,
+    }
+
+    impl crate::listener::ParserListener for ShorthandLog {
+        fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+            self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_identifier(&mut self, token: Token, _: IdentifierContext) {
+            self.members.push(token.range.offset);
+        }
+
+        fn handle_send(&mut self, begin: Token, end: Token) {
+            self.sends.push((begin.range.offset, end.range.offset));
+        }
+
+        fn handle_dot_shorthand_head(&mut self, dot: Token) {
+            self.head_dots.push(dot.range.offset);
+        }
+    }
+
+    #[test]
+    fn dot_shorthand_pattern_head_parses_clean() {
+        // #757 (official parsePrimaryPattern fallthrough →
+        // parsePrecedenceExpression `_isDotShorthand` :7042): `.e` and `.new`
+        // heads are constant-pattern operands; no recovery noise (the old
+        // parse_send fallthrough spliced a synthetic and reported
+        // expected_identifier), and member invocations stay syntactically
+        // parseable.
+        for source in [".e", ".new", ".e(1)"] {
+            let mut p = parser(source, ShorthandLog::default());
+            let _ = p.parse_pattern_entry(PatternContext::Matching);
+            assert_eq!(p.listener.head_dots, vec![0], "{source}");
+            assert!(
+                p.listener.errors.is_empty(),
+                "{source}: {:?}",
+                p.listener.errors
+            );
+        }
+    }
+
+    #[test]
+    fn dot_shorthand_pattern_head_member_is_a_name_not_a_send() {
+        // The member is an identifier leaf (`handle_identifier`); no Send —
+        // the send leaf tiles through the unconsumed follower (#585) and
+        // would drag the case colon into the operand's token window.
+        let mut p = parser(".e", ShorthandLog::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        assert!(p.listener.sends.is_empty());
+        assert_eq!(p.listener.head_dots, vec![0]);
+        assert_eq!(p.listener.members, vec![1]);
+        assert!(p.listener.errors.is_empty());
+    }
+
+    #[test]
+    fn incomplete_dot_shorthand_pattern_takes_entry_recovery() {
+        // Official :6539-6551: a `.` head with no identifier after reports
+        // once through the expressionContinuation template and splices the
+        // synthetic name; head/context events still fire.
+        let mut p = parser(".", ShorthandLog::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        assert_eq!(p.listener.errors, ["missing_identifier"]);
+        assert_eq!(p.listener.head_dots, vec![0]);
+        assert!(p.listener.members.is_empty());
+    }
+
+    #[test]
+    fn negated_dot_shorthand_reports_like_negated_identifier() {
+        // Official parsePrimary :8112-8115: under numeric-literal-only the
+        // member head reports invalidConstantPatternNegation (the shorthand
+        // route reaches parsePrimary's identifier arm).
+        assert_eq!(
+            pattern_errors("-.e"),
+            vec!["invalid_constant_pattern_negation".to_string()]
+        );
     }
 }

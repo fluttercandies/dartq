@@ -1409,19 +1409,43 @@ pub(crate) mod same_file {
 
     /// The unit's type declarations: class-like shapes plus typedef names
     /// (a local typedef shadows any imported name in the combined
-    /// namespace).
+    /// namespace), and the top-level value name tokens `declares_name`
+    /// answers from. Built once per run (the #703 F4 hoist — candidates no
+    /// longer re-walk the top-level declarations); the rows are token ids,
+    /// and name queries compare lexemes over them in declaration order.
     pub(crate) struct Decls {
         classes: Vec<ClassDecl>,
         typedefs: Vec<u32>,
+        /// Top-level function/getter/setter/variable name tokens.
+        values: Vec<u32>,
     }
 
-    /// Scans the unit once per call (top-level wrappers only — cheap, and
-    /// the rules that need it run per candidate node).
-    #[must_use]
-    pub fn scan(c: &Check<'_>) -> Decls {
+    /// The unit's same-file declaration index — built once per run on first
+    /// query and cached in the run's [`crate::engine::RunCaches`] (the
+    /// #703 F4 hoist). The returned borrow is a read-only view; re-entrant
+    /// calls share it. The build is the single whole-unit walk; queries
+    /// scan the cached token rows. Module-internal: the query faces below
+    /// borrow it for their read and hand back owned answers, so no rule
+    /// ever holds a cache guard.
+    fn scan<'a>(c: &'a Check<'a>) -> core::cell::Ref<'a, Decls> {
+        let cached = c.caches.decls.borrow();
+        if cached.is_some() {
+            return core::cell::Ref::map(cached, |slot| slot.as_ref().expect("present above"));
+        }
+        drop(cached);
+        *c.caches.decls.borrow_mut() = Some(build(c));
+        let cache = c.caches.decls.borrow();
+        core::cell::Ref::map(cache, |slot| slot.as_ref().expect("just built"))
+    }
+
+    /// The one whole-unit walk behind [`scan`]: the previous per-candidate
+    /// `scan` body plus the second walk `declares_name` used to do per
+    /// query, folded into the same pass over the top-level wrappers.
+    fn build(c: &Check<'_>) -> Decls {
         let mut decls = Decls {
             classes: Vec::new(),
             typedefs: Vec::new(),
+            values: Vec::new(),
         };
         let Some(root) = c.path.first().copied() else {
             return decls;
@@ -1450,6 +1474,23 @@ pub(crate) mod same_file {
                             decls.classes.push(decl);
                         }
                     }
+                    // Top-level function/getter/setter names (a written
+                    // return type is a `TypeReference` identifier, filtered
+                    // out here).
+                    NodeKind::TopLevelMethod | NodeKind::TopLevelFields => {
+                        let ctx = if c.kind(inner) == NodeKind::TopLevelMethod {
+                            dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
+                        } else {
+                            dartq_parser::IdentifierContext::TopLevelVariableDeclaration
+                        } as u32;
+                        for kid in c.collect_direct(inner) {
+                            if c.kind(kid) == NodeKind::Identifier
+                                && c.payload(kid).first() == Some(&ctx)
+                            {
+                                decls.values.push(c.head_token(kid));
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1460,15 +1501,22 @@ pub(crate) mod same_file {
     impl Decls {
         /// Whether a class-like declaration carries `name`.
         #[must_use]
-        pub fn has_class(&self, c: &Check<'_>, name: &str) -> bool {
+        fn has_class(&self, c: &Check<'_>, name: &str) -> bool {
             self.classes.iter().any(|d| c.lexeme(d.name) == name)
         }
 
         /// Whether any type declaration (class-like or typedef) carries
         /// `name`.
         #[must_use]
-        pub fn has_type(&self, c: &Check<'_>, name: &str) -> bool {
+        fn has_type(&self, c: &Check<'_>, name: &str) -> bool {
             self.has_class(c, name) || self.typedefs.iter().any(|&tok| c.lexeme(tok) == name)
+        }
+
+        /// Whether the unit declares `name` in any namespace — types plus
+        /// top-level values (functions, getters, variables).
+        #[must_use]
+        fn declares_name(&self, c: &Check<'_>, name: &str) -> bool {
+            self.has_type(c, name) || self.values.iter().any(|&tok| c.lexeme(tok) == name)
         }
     }
 
@@ -1478,38 +1526,8 @@ pub(crate) mod same_file {
     /// annotation rules (`library_annotations`, `provide_deprecation_message`)
     /// and `unnecessary_this` bail on.
     #[must_use]
-    pub fn declares_name(c: &Check<'_>, decls: &Decls, name: &str) -> bool {
-        if decls.has_type(c, name) {
-            return true;
-        }
-        let Some(root) = c.path.first().copied() else {
-            return false;
-        };
-        for top in c.collect_direct(root) {
-            for inner in c.collect_direct(top) {
-                match c.kind(inner) {
-                    // Top-level function/getter/setter names (a written
-                    // return type is a `TypeReference` identifier, filtered
-                    // out here).
-                    NodeKind::TopLevelMethod | NodeKind::TopLevelFields => {
-                        let ctx = if c.kind(inner) == NodeKind::TopLevelMethod {
-                            dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
-                        } else {
-                            dartq_parser::IdentifierContext::TopLevelVariableDeclaration
-                        } as u32;
-                        if c.collect_direct(inner).into_iter().any(|kid| {
-                            c.kind(kid) == NodeKind::Identifier
-                                && c.payload(kid).first() == Some(&ctx)
-                                && c.lexeme(c.head_token(kid)) == name
-                        }) {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        false
+    pub fn declares_name(c: &Check<'_>, name: &str) -> bool {
+        scan(c).declares_name(c, name)
     }
 
     /// How a written type name resolves over the same-file declarations.
@@ -1530,26 +1548,16 @@ pub(crate) mod same_file {
     /// (extends / on / with / implements) walk — the official
     /// `element.allSupertypes` face (null_closures.dart:245-250). `core` is
     /// the set of written names the caller's table keys on.
-    pub(crate) fn resolve<'a>(
-        c: &Check<'a>,
-        decls: &Decls,
-        name: &'a str,
-        core: &[&'static str],
-    ) -> Verdict {
-        let mut seen: Vec<&'a str> = Vec::new();
-        walk(c, decls, name, false, core, &mut seen)
+    pub(crate) fn resolve(c: &Check<'_>, name: &str, core: &[&'static str]) -> Verdict {
+        let decls = scan(c);
+        walk(c, &decls, name, false, core, &mut Vec::new())
     }
 
     /// Resolves `name` as a creation receiver: the superclass chain only —
     /// the official `extendsClass` walk (extensions.dart:305-353).
-    pub(crate) fn resolve_super<'a>(
-        c: &Check<'a>,
-        decls: &Decls,
-        name: &'a str,
-        core: &[&'static str],
-    ) -> Verdict {
-        let mut seen: Vec<&'a str> = Vec::new();
-        walk(c, decls, name, true, core, &mut seen)
+    pub(crate) fn resolve_super(c: &Check<'_>, name: &str, core: &[&'static str]) -> Verdict {
+        let decls = scan(c);
+        walk(c, &decls, name, true, core, &mut Vec::new())
     }
 
     /// The exact-name verdict: the static-call face matches
@@ -1557,8 +1565,8 @@ pub(crate) mod same_file {
     /// (null_closures.dart:224-233), so a same-file class is never the core
     /// element even when it lexically shares the name.
     #[must_use]
-    pub fn direct(c: &Check<'_>, decls: &Decls, name: &str, core: &[&'static str]) -> Verdict {
-        if decls.has_class(c, name) {
+    pub fn direct(c: &Check<'_>, name: &str, core: &[&'static str]) -> Verdict {
+        if scan(c).has_class(c, name) {
             return Verdict::NotCore;
         }
         verdict_of(core, name)
@@ -1989,7 +1997,6 @@ pub(crate) mod null_closures {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let decls = same_file::scan(c);
         // Which table matches, gated on the same-file type verdict:
         // `NotCore` bails (provably not the core API), `Unknown` falls
         // back to the written-name match (instance faces: silent).
@@ -2001,13 +2008,13 @@ pub(crate) mod null_closures {
                     .iter()
                     .copied()
                     .find(|&kid| c.kind(kid) == NodeKind::Arguments);
-                args.zip(creation_slots(c, &decls, &kids))
+                args.zip(creation_slots(c, &kids))
             }
             // A plain send owns nothing — rebuild from the owner slice.
             NodeKind::Send => slice::owner_slice(c).and_then(|(kids, pos)| {
                 let (head, args) = slice::send_parts(c, &kids, pos)?;
                 // A `None` argument list is a function tear-off.
-                send_slots(c, &decls, &kids, head, pos).and_then(|s| Some((args?, s)))
+                send_slots(c, &kids, head, pos).and_then(|s| Some((args?, s)))
             }),
             _ => return,
         };
@@ -2021,7 +2028,7 @@ pub(crate) mod null_closures {
     /// `new Future(null)`): the callee is the identifier before the
     /// argument list — the explicit-new shape carries a
     /// `ConstructorReference` marker between them.
-    fn creation_slots(c: &Check<'_>, decls: &same_file::Decls, kids: &[u32]) -> Option<Slots> {
+    fn creation_slots(c: &Check<'_>, kids: &[u32]) -> Option<Slots> {
         let args_pos = kids
             .iter()
             .position(|&kid| c.kind(kid) == NodeKind::Arguments)?;
@@ -2037,15 +2044,15 @@ pub(crate) mod null_closures {
                     .find(|&k| c.kind(k) == NodeKind::Identifier),
                 _ => None,
             })?;
-        unnamed_slots(c, decls, c.lexeme(c.head_token(callee)))
+        unnamed_slots(c, c.lexeme(c.head_token(callee)))
     }
 
     /// The unnamed-creation table hit for one written type name, gated on
     /// the same-file superclass chain (`extendsClass`, extensions.dart
     /// :305-353): a same-file class shadows its core namesake, a same-file
     /// subclass reports like the official.
-    fn unnamed_slots(c: &Check<'_>, decls: &same_file::Decls, name: &str) -> Option<Slots> {
-        match same_file::resolve_super(c, decls, name, CORE_TYPES) {
+    fn unnamed_slots(c: &Check<'_>, name: &str) -> Option<Slots> {
+        match same_file::resolve_super(c, name, CORE_TYPES) {
             same_file::Verdict::NotCore => None,
             same_file::Verdict::Core(core) => CONSTRUCTORS
                 .iter()
@@ -2061,20 +2068,14 @@ pub(crate) mod null_closures {
     /// The send face over the owner slice with the invocation send at
     /// `pos` and its callee head at `head`: a trailing same-span
     /// `DotAccess` marker switches to the member faces.
-    fn send_slots<'a>(
-        c: &'a Check<'a>,
-        decls: &same_file::Decls,
-        kids: &[u32],
-        head: usize,
-        pos: usize,
-    ) -> Option<Slots> {
+    fn send_slots(c: &Check<'_>, kids: &[u32], head: usize, pos: usize) -> Option<Slots> {
         if c.kind(kids[head]) != NodeKind::Identifier {
             return None;
         }
         let member_face = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match member_face {
-            None => unnamed_slots(c, decls, c.lexeme(c.head_token(kids[head]))),
-            Some(access) => member_slots(c, decls, kids, head, access),
+            None => unnamed_slots(c, c.lexeme(c.head_token(kids[head]))),
+            Some(access) => member_slots(c, kids, head, access),
         }
     }
 
@@ -2087,23 +2088,17 @@ pub(crate) mod null_closures {
     /// receiver name (`Timer.periodic` — a class reference); otherwise
     /// the instance face resolves the receiver's declared type (`xs.map`
     /// — a value), Core verdicts only.
-    fn member_slots<'a>(
-        c: &'a Check<'a>,
-        decls: &same_file::Decls,
-        kids: &[u32],
-        sel: usize,
-        _access: u32,
-    ) -> Option<Slots> {
+    fn member_slots(c: &Check<'_>, kids: &[u32], sel: usize, _access: u32) -> Option<Slots> {
         let group_start = sel.checked_sub(4)?;
         if !slice::is_tear_off_group(c, kids, group_start) {
             return None;
         }
         let member = c.lexeme(c.head_token(kids[sel]));
         let written = c.lexeme(c.head_token(kids[group_start]));
-        named_slots(c, decls, written, member).or_else(|| {
+        named_slots(c, written, member).or_else(|| {
             let verdict = same_file::written_type(c, kids[group_start], written)
                 .map_or(same_file::Verdict::NotCore, |ty| {
-                    same_file::resolve(c, decls, ty, CORE_TYPES)
+                    same_file::resolve(c, ty, CORE_TYPES)
                 });
             match verdict {
                 same_file::Verdict::Core(core) => INSTANCE_METHODS
@@ -2180,13 +2175,8 @@ pub(crate) mod null_closures {
     /// before the dot: the named-creation table first, then the static
     /// table (the official splits them on the target's element — a class
     /// element vs a top-level function; one written shape serves both).
-    fn named_slots(
-        c: &Check<'_>,
-        decls: &same_file::Decls,
-        class_name: &str,
-        member_name: &str,
-    ) -> Option<Slots> {
-        let constructor = match same_file::resolve_super(c, decls, class_name, CORE_TYPES) {
+    fn named_slots(c: &Check<'_>, class_name: &str, member_name: &str) -> Option<Slots> {
+        let constructor = match same_file::resolve_super(c, class_name, CORE_TYPES) {
             same_file::Verdict::NotCore => None,
             same_file::Verdict::Core(core) => CONSTRUCTORS
                 .iter()
@@ -2197,19 +2187,17 @@ pub(crate) mod null_closures {
                 .find(|entry| entry.0.0 == class_name && entry.0.1 == Some(member_name))
                 .map(|entry| entry.1),
         };
-        constructor.or_else(
-            || match same_file::direct(c, decls, class_name, CORE_TYPES) {
-                same_file::Verdict::NotCore => None,
-                same_file::Verdict::Core(core) => STATICS
-                    .iter()
-                    .find(|entry| entry.0 == core && entry.1 == member_name)
-                    .map(|entry| entry.2),
-                same_file::Verdict::Unknown => STATICS
-                    .iter()
-                    .find(|entry| entry.0 == class_name && entry.1 == member_name)
-                    .map(|entry| entry.2),
-            },
-        )
+        constructor.or_else(|| match same_file::direct(c, class_name, CORE_TYPES) {
+            same_file::Verdict::NotCore => None,
+            same_file::Verdict::Core(core) => STATICS
+                .iter()
+                .find(|entry| entry.0 == core && entry.1 == member_name)
+                .map(|entry| entry.2),
+            same_file::Verdict::Unknown => STATICS
+                .iter()
+                .find(|entry| entry.0 == class_name && entry.1 == member_name)
+                .map(|entry| entry.2),
+        })
     }
 }
 
@@ -2318,8 +2306,7 @@ pub(crate) mod unnecessary_this {
         if import_may_shadow(c, name_lexeme) {
             return;
         }
-        let decls = same_file::scan(c);
-        if same_file::declares_name(c, &decls, name_lexeme) {
+        if same_file::declares_name(c, name_lexeme) {
             return;
         }
         // No scope hit (`isNone`): the unqualified form resolves through
