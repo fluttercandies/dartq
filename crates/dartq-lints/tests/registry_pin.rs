@@ -211,6 +211,23 @@ fn rule_by_name_round_trips() {
     assert_eq!(rule_by_name("no_such_lint_name"), None);
 }
 
+/// The official registry lowercases every name (`registry.dart:42,53,133`),
+/// so any casing of a registered name resolves — the SDK machine lowercase
+/// form and the `package:lints` mixed-case yaml spelling are the same rule,
+/// and only truly unknown names error (the `undefined_lint` face).
+#[test]
+fn rule_by_name_is_case_insensitive() {
+    let canonical = rule_by_name("prefer_iterable_whereType").expect("registered name");
+    for spelling in [
+        "prefer_iterable_wheretype",
+        "PREFER_ITERABLE_WHERETYPE",
+        "Prefer_Iterable_WhereType",
+    ] {
+        assert_eq!(rule_by_name(spelling), Some(canonical), "{spelling}");
+    }
+    assert_eq!(rule_by_name("prefer_iterable_wheretypeX"), None);
+}
+
 #[test]
 fn enable_set_all_and_resolve_agree() {
     let all = EnableSet::all();

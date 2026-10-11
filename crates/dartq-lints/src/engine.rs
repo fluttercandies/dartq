@@ -38,6 +38,13 @@ pub struct Features {
     /// `unnecessary_library_name` registers only with it
     /// (unnecessary_library_name.dart:32-34).
     pub unnamed_libraries: bool,
+    /// `patterns` (shipped in 3.0, `experimental_features.yaml:387-389`): the
+    /// bit the official AstBuilder keys switch-statement member
+    /// materialization on (ast_builder.dart:1295) — with it on, every `case`
+    /// of a switch statement is a `SwitchPatternCase`, so
+    /// `no_duplicate_case_values` (whose visitor processes only legacy
+    /// `SwitchCase` members, no_duplicate_case_values.dart:41) is silent.
+    pub patterns: bool,
 }
 
 impl Default for Features {
@@ -46,6 +53,7 @@ impl Default for Features {
             wildcard_variables: true,
             enhanced_parts: false,
             unnamed_libraries: true,
+            patterns: true,
         }
     }
 }

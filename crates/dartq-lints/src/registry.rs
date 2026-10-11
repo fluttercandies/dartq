@@ -177,13 +177,17 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::expressions::unnecessary_type_check::SPEC,
 ];
 
-/// The rule with machine name `name` (linear scan; a one-per-run lookup, not
-/// a hot path).
+/// The rule with machine name `name`, case-insensitively (linear scan; a
+/// one-per-run lookup, not a hot path). The official registry lowercases
+/// every name (`pkg/analyzer/lib/src/lint/registry.dart:42,53,133`), so any
+/// casing of a registered rule resolves — the SDK machine names are lowercase
+/// while `package:lints` yaml uses mixed-case spellings; the spec's canonical
+/// name (what reports render) is unchanged.
 #[must_use]
 pub fn rule_by_name(name: &str) -> Option<RuleId> {
     RULES
         .iter()
-        .position(|spec| spec.name == name)
+        .position(|spec| spec.name.eq_ignore_ascii_case(name))
         .map(|i| RuleId(i as u16))
 }
 

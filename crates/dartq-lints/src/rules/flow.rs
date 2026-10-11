@@ -289,7 +289,16 @@ pub(crate) mod no_duplicate_case_values {
     /// Official: `pkg/linter/lib/src/rules/no_duplicate_case_values.dart:37-58`
     /// — a `case` whose constant value equals an earlier `case` of the same
     /// switch reports at the duplicate expression with both sources spelled
-    /// into `{0}`/`{1}`. The official keys the map by the computed constant
+    /// into `{0}`/`{1}`. The official visitor processes only legacy members
+    /// (`if (member is SwitchCase)`, :41); the AstBuilder materializes that
+    /// member shape only when `Feature.patterns` is off (ast_builder.dart:1295
+    /// — patterns shipped in 3.0), so at the default language version every
+    /// case is a `SwitchPatternCase` and the lint is silent — the official
+    /// test pins exactly that (all default-version duplicates expect no lint;
+    /// the reports live in `NoDuplicateCaseValuesTestLanguage219`). The gate
+    /// here is the same version face at unit granularity (the members of one
+    /// switch are uniformly one shape): the check runs only with `patterns`
+    /// off. The official keys the map by the computed constant
     /// (`computeConstantValue`, :44); the face here is an in-rule constant
     /// folder over the syntax substrate — integer/string/bool/null
     /// literals, `+ - * ~/ %` and unary `-`, parentheses (64-bit wrapping
@@ -310,6 +319,12 @@ pub(crate) mod no_duplicate_case_values {
     };
 
     fn check(c: &mut Check<'_>) {
+        // The official `member is SwitchCase` gate (:41): with `Feature.
+        // patterns` on (the 3.0+ default) every member is a pattern case and
+        // the visitor finds nothing to process.
+        if c.unit.features.patterns {
+            return;
+        }
         let Some(block) = c
             .collect_direct(c.node())
             .into_iter()
@@ -1364,6 +1379,14 @@ mod tests {
 
     use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
 
+    /// A legacy (`Feature.patterns` off, `<=2.19`) fixture — the library
+    /// version whose switch members are legacy `SwitchCase` shapes, the only
+    /// face `no_duplicate_case_values` processes.
+    fn legacy(mut f: Fixture) -> Fixture {
+        f.features.patterns = false;
+        f
+    }
+
     /// `test/rules/curly_braces_in_flow_control_structures_test.dart`
     /// `test_if_multiline` — a multi-line arm without a block reports.
     #[test]
@@ -1943,10 +1966,13 @@ mod tests {
 
     // —— no_duplicate_case_values —————————————————————————————————————————
 
-    /// `test/rules/no_duplicate_case_values_test.dart` `test_duplicateCase`
-    /// — the duplicate reports with both sources in the message.
+    /// The default-version face (official `test_duplicateIntConstant_ok`/
+    /// `test_duplicateStringConstant_ok`/`test_duplicateConstClassValue_ok`/
+    /// `test_duplicateEnumValue_ok`): with `Feature.patterns` on (3.0+) every
+    /// member is a pattern case and the lint is silent — even on repeated
+    /// constant values.
     #[test]
-    fn duplicate_case_value_reports() {
+    fn duplicate_case_value_silent_at_default_version() {
         let source = "switch (x) { case 1: break; case 1: break; }";
         // switch0 (1 x2 )3 {4 case5 16 :7 break8 ;9 case10 111 :12 break13 ;14 }15
         let f = Fixture::build(
@@ -1969,6 +1995,36 @@ mod tests {
                 b.end(NodeKind::SwitchStatement, 16);
             }),
         );
+        assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
+    }
+
+    /// `test/rules/no_duplicate_case_values_test.dart` `test_duplicateCase`
+    /// (`NoDuplicateCaseValuesTestLanguage219`) — in a legacy (`patterns`
+    /// off) library the duplicate reports with both sources in the message.
+    #[test]
+    fn duplicate_case_value_reports_legacy() {
+        let source = "switch (x) { case 1: break; case 1: break; }";
+        // switch0 (1 x2 )3 {4 case5 16 :7 break8 ;9 case10 111 :12 break13 ;14 }15
+        let f = legacy(Fixture::build(
+            source,
+            unit_of(|b, _t| {
+                b.begin(NodeKind::SwitchStatement, 0);
+                b.begin(NodeKind::SwitchBlock, 4);
+                for (case_head, int_tok, colon) in [(5, 6, 7), (10, 11, 12)] {
+                    b.begin(NodeKind::SwitchCase, case_head);
+                    b.patch(0, NONE);
+                    b.patch(1, colon);
+                    b.patch(2, 1); // one matched expression
+                    b.leaf(NodeKind::LiteralInt, int_tok);
+                    b.begin(NodeKind::Break, int_tok + 2);
+                    b.patch(0, 0);
+                    b.end(NodeKind::Break, int_tok + 4);
+                    b.end(NodeKind::SwitchCase, int_tok + 4);
+                }
+                b.end(NodeKind::SwitchBlock, 16);
+                b.end(NodeKind::SwitchStatement, 16);
+            }),
+        ));
         let lints = f.run(&one_rule("no_duplicate_case_values"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -1982,13 +2038,14 @@ mod tests {
         assert_eq!(lints[0].range.start, utf16_at(&f, 11));
     }
 
-    /// Distinct values and a `default:` clause (no expressions) pass.
+    /// Distinct values and a `default:` clause (no expressions) pass — the
+    /// legacy (`Language219`) face.
     #[test]
     fn distinct_and_default_cases_pass() {
         let source = "switch (x) { case 1: break; case 2: break; default: break; }";
         // switch0 (1 x2 )3 {4 case5 16 :7 break8 ;9 case10 211 :12 break13 ;14
         // default15 :16 break17 ;18 }19
-        let f = Fixture::build(
+        let f = legacy(Fixture::build(
             source,
             unit_of(|b, _t| {
                 b.begin(NodeKind::SwitchStatement, 0);
@@ -2025,19 +2082,19 @@ mod tests {
                 b.end(NodeKind::SwitchBlock, 20);
                 b.end(NodeKind::SwitchStatement, 20);
             }),
-        );
+        ));
         assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
     }
 
     /// The official keys by computed constant (`computeConstantValue`, :44):
     /// `case 1 + 1:` collides with `case 2:` — the later expression reports
-    /// with both sources.
+    /// with both sources (legacy face).
     #[test]
     fn computed_duplicate_case_values_report() {
         let source = "switch (x) { case 1 + 1: break; case 2: break; }";
         // switch0 (1 x2 )3 {4 case5 16 +7 18 :9 break10 ;11 case12 213 :14
         // break15 ;16 }17
-        let f = Fixture::build(
+        let f = legacy(Fixture::build(
             source,
             unit_of(|b, _t| {
                 b.begin(NodeKind::SwitchStatement, 0);
@@ -2067,7 +2124,7 @@ mod tests {
                 b.end(NodeKind::SwitchBlock, 18);
                 b.end(NodeKind::SwitchStatement, 18);
             }),
-        );
+        ));
         let lints = f.run(&one_rule("no_duplicate_case_values"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -2078,13 +2135,13 @@ mod tests {
     }
 
     /// String concatenation folds: `case 'a' + 'b':` collides with
-    /// `case 'ab':`.
+    /// `case 'ab':` (legacy face).
     #[test]
     fn string_concatenation_duplicate_cases_report() {
         let source = "switch (x) { case 'a' + 'b': break; case 'ab': break; }";
         // switch0 (1 x2 )3 {4 case5 'a'6 +7 'b'8 :9 break10 ;11 case12
         // 'ab'13 :14 break15 ;16 }17
-        let f = Fixture::build(
+        let f = legacy(Fixture::build(
             source,
             unit_of(|b, _t| {
                 b.begin(NodeKind::SwitchStatement, 0);
@@ -2114,7 +2171,7 @@ mod tests {
                 b.end(NodeKind::SwitchBlock, 18);
                 b.end(NodeKind::SwitchStatement, 18);
             }),
-        );
+        ));
         let lints = f.run(&one_rule("no_duplicate_case_values"));
         assert_eq!(lints.len(), 1);
         // The official `toString()` arguments carry the source spelling,
@@ -2127,13 +2184,13 @@ mod tests {
 
     /// Expressions outside the folder's grammar evaluate unknown and never
     /// dedupe (the official `hasKnownValue` skip): repeated non-constant
-    /// identifiers stay silent.
+    /// identifiers stay silent (legacy face).
     #[test]
     fn non_constant_case_expressions_pass() {
         let source = "switch (x) { case y: break; case y: break; }";
         // switch0 (1 x2 )3 {4 case5 y6 :7 break8 ;9 case10 y11 :12 break13
         // ;14 }15
-        let f = Fixture::build(
+        let f = legacy(Fixture::build(
             source,
             unit_of(|b, _t| {
                 b.begin(NodeKind::SwitchStatement, 0);
@@ -2152,7 +2209,7 @@ mod tests {
                 b.end(NodeKind::SwitchBlock, 16);
                 b.end(NodeKind::SwitchStatement, 16);
             }),
-        );
+        ));
         assert!(f.run(&one_rule("no_duplicate_case_values")).is_empty());
     }
 
