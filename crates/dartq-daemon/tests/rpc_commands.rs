@@ -232,7 +232,14 @@ fn dartq_query_equals_the_cli_json_face() {
     assert_eq!(references.len(), 2, "the type use plus the invocation");
     assert_eq!(references[0]["target_file"], a.display().to_string());
     assert_eq!(references[0]["kind"], "reference");
-    assert_eq!(references[0]["qualified"], false);
+    // The frozen contract types `qualified` as the qualified-name string and
+    // the row model carries only the bit, so the shared writer omits the
+    // column (contract-legal, #627) and the daemon adds nothing back.
+    assert!(
+        references[0].get("qualified").is_none(),
+        "the unproducible qualified column stays omitted: {row}",
+        row = &references[0]
+    );
     assert_eq!(references[0]["offset"], 33);
     assert_eq!(references[1]["kind"], "invoked");
     assert_eq!(references[1]["offset"], 42);
