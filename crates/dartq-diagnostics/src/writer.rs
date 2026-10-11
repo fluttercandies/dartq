@@ -25,26 +25,30 @@ use crate::model::{AnalysisOutput, Diagnostic};
 /// # Errors
 /// Propagates any I/O error surfaced by `out`.
 pub fn write_machine(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::Result<()> {
+    use std::fmt::Write as _;
+
     let mut field = String::new();
     for d in output.diagnostics {
         let (line, column) = output.files.line_col(d.file, d.range.offset);
+        // The whole row is assembled in the reused buffer and flushed with a
+        // single `write_all` — no per-field format machinery on the I/O path.
         field.clear();
+        field.push_str(d.severity.as_machine_str());
+        field.push('|');
+        field.push_str(d.code.dtype.as_str());
+        field.push('|');
+        field.push_str(d.code.machine);
+        field.push('|');
         escape_into(
             output.files.file_path(d.file).to_string_lossy().as_ref(),
             &mut field,
         );
-        write!(
-            out,
-            "{}|{}|{}|{}|{line}|{column}|{}|",
-            d.severity.as_machine_str(),
-            d.code.dtype.as_str(),
-            d.code.machine,
-            field,
-            d.range.length,
-        )?;
-        field.clear();
+        // Infallible: `String`'s `fmt::Write` never fails.
+        let _ = write!(field, "|{line}|{column}|{}", d.range.length);
+        field.push('|');
         escape_into(&d.message, &mut field);
-        writeln!(out, "{field}")?;
+        field.push('\n');
+        out.write_all(field.as_bytes())?;
     }
     Ok(())
 }
@@ -182,14 +186,24 @@ fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
 /// Machine-format field escaping, equivalent to the oracle's
 /// `_escapeForMachineMode`: `\` → `\\`, `|` → `\|`, newline → literal `\n`,
 /// CR → literal `\r`; everything else verbatim.
+///
+/// Byte-oriented: the four special bytes are ASCII, so every slice between
+/// them starts and ends on a char boundary and is copied verbatim — non-ASCII
+/// text passes through as raw UTF-8 without per-char decode/re-encode.
 fn escape_into(text: &str, out: &mut String) {
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '|' => out.push_str("\\|"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
+    let bytes = text.as_bytes();
+    let mut copied = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped = match b {
+            b'\\' => "\\\\",
+            b'|' => "\\|",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        out.push_str(&text[copied..i]);
+        out.push_str(escaped);
+        copied = i + 1;
     }
+    out.push_str(&text[copied..]);
 }

@@ -1,6 +1,7 @@
 //! Diagnostic data model: severity, type layering, source locations, and the
 //! file-layout abstraction the output writers consume.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
@@ -116,9 +117,12 @@ pub struct Diagnostic {
     pub severity: Severity,
     /// Stable code identifying the diagnostic (PRD §13.2 naming discipline).
     pub code: CodeInfo,
-    /// problemMessage text. Owned in M0 for simplicity; will move to the
-    /// engine-wide string intern table (`StringId`) later.
-    pub message: String,
+    /// problemMessage text. `Borrowed` rows carry a bare template verbatim
+    /// (no interpolation — zero heap per row); `Owned` rows carry the
+    /// interpolated form, rendered once at the emit site (a scratch buffer
+    /// can be moved in, no copy). Moving to the engine-wide string intern
+    /// table (`StringId`) remains the recorded follow-up.
+    pub message: Cow<'static, str>,
     /// File the diagnostic points at; a sibling of [`Diagnostic::range`],
     /// per the PRD §13.1 shape.
     pub file: FileId,
@@ -130,11 +134,17 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// Creates a diagnostic located in `file` at `range`.
+    ///
+    /// `message` accepts a `&'static str` bare template (borrowed verbatim,
+    /// zero allocation) or an owned rendered `String` (interpolated rows) —
+    /// the emit site picks the cheapest form; `Cow::Owned` also accepts a
+    /// scratch buffer moved in via `mem::take`, so per-row-group rendering
+    /// reuses one buffer's capacity.
     #[must_use]
     pub fn new(
         severity: Severity,
         code: CodeInfo,
-        message: impl Into<String>,
+        message: impl Into<Cow<'static, str>>,
         file: FileId,
         range: SourceRange,
         correction: Option<String>,

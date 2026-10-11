@@ -63,7 +63,7 @@ impl FileLayoutProvider for Fixture {
 fn diagnostic(
     severity: Severity,
     code: CodeInfo,
-    message: &str,
+    message: &'static str,
     file: FileId,
     range: SourceRange,
 ) -> Diagnostic {
@@ -252,6 +252,31 @@ fn machine_escapes_backslash() {
     assert_eq!(
         machine(&files.output(&[d])),
         r"ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart|1|1|1|path like C:\\dir".to_owned()
+            + "\n",
+    );
+}
+
+#[test]
+fn machine_escapes_backslash_in_owned_message() {
+    // The `Cow::Owned` arm of `Diagnostic.message` (interpolated `String`
+    // rendered at the emit site) must escape identically to borrowed
+    // templates.
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {}\n");
+    let d = Diagnostic::new(
+        Severity::Error,
+        dartq_diagnostics::EXPECTED_TOKEN,
+        format!("back\\slash {}", 1),
+        f,
+        SourceRange {
+            offset: 0,
+            length: 1,
+        },
+        None,
+    );
+    assert_eq!(
+        machine(&files.output(&[d])),
+        r"ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart|1|1|1|back\\slash 1".to_owned()
             + "\n",
     );
 }
@@ -639,7 +664,7 @@ fn code_registry_looks_up_official_and_dartq_codes() {
         assert_eq!(code.machine, code.name.to_uppercase());
         count += 1;
     }
-    // 258 official table codes (7 measured-dead rows pruned, #222) + 14
+    // 258 official table codes (7 measured-dead rows pruned, #222) + 15
     // hand-written codes.
-    assert_eq!(count, 272);
+    assert_eq!(count, 273);
 }

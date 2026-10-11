@@ -10,7 +10,7 @@
 //! table (the M0-measured compile-time/warning/lint set and the dartq-own
 //! namespace) are hand-written below.
 
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 use crate::model::DiagnosticType;
 
@@ -175,6 +175,15 @@ pub const DARTQ_PACKAGE_CONFIG_OUT_OF_DATE: CodeInfo = CodeInfo::new(
     DiagnosticType::Tool,
     false,
 );
+/// No `package_config.json` was found; analysis runs degraded on the
+/// BasicWorkspace floor with every `package:` import unresolved (the
+/// oracle's no-config posture — it analyzes, it does not refuse).
+pub const DARTQ_PACKAGE_CONFIG_MISSING: CodeInfo = CodeInfo::new(
+    "dartq/package_config_missing",
+    "DARTQ/PACKAGE_CONFIG_MISSING",
+    DiagnosticType::Tool,
+    false,
+);
 /// An internal panic/bug was downgraded to a per-file diagnostic (PRD §8).
 pub const DARTQ_INTERNAL_ERROR: CodeInfo = CodeInfo::new(
     "dartq/internal_error",
@@ -216,7 +225,7 @@ pub const DARTQ_PLUGIN_TIMEOUT: CodeInfo = CodeInfo::new(
 
 /// The hand-written codes above: M0-measured families outside the generated
 /// table, plus the dartq-own namespace.
-const OWN_CODES: [CodeInfo; 14] = [
+const OWN_CODES: [CodeInfo; 15] = [
     DUPLICATE_DEFINITION,
     AWAIT_IN_WRONG_CONTEXT,
     URI_DOES_NOT_EXIST,
@@ -226,6 +235,7 @@ const OWN_CODES: [CodeInfo; 14] = [
     DEAD_CODE,
     PREFER_SINGLE_QUOTES,
     DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
+    DARTQ_PACKAGE_CONFIG_MISSING,
     DARTQ_INTERNAL_ERROR,
     DARTQ_MEMORY_DEGRADED,
     DARTQ_MISSING_GENERATED_SOURCE,
@@ -241,7 +251,7 @@ const OWN_CODES: [CodeInfo; 14] = [
 /// the `dartq/` prefix).
 #[derive(Debug, Clone)]
 pub struct CodeRegistry {
-    by_name: BTreeMap<&'static str, CodeInfo>,
+    by_name: FxHashMap<&'static str, CodeInfo>,
 }
 
 impl CodeRegistry {
@@ -264,7 +274,7 @@ impl CodeRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Iterates all builtin codes, ordered by name.
+    /// Iterates all builtin codes in unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = CodeInfo> + '_ {
         self.by_name.values().copied()
     }

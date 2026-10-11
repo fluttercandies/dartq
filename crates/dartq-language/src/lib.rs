@@ -93,9 +93,16 @@ impl Feature {
 /// `experimentEnabledVersion: Version(2, 14)`). The CFE feeds exactly this
 /// predicate into `ScannerConfiguration.enableTripleShift`
 /// (`pkg/_fe_analyzer_shared/lib/src/parser/experimental_features.dart`).
+///
+/// Reads the one registry bit directly (the exact
+/// [`FeatureSet::for_language_version`] predicate) instead of materializing
+/// the full set.
 #[must_use]
 pub fn triple_shift_enabled(version: LanguageVersion) -> bool {
-    FeatureSet::for_language_version(version).is_enabled(Feature::TripleShift)
+    Feature::TripleShift
+        .meta()
+        .enabled_in
+        .is_some_and(|enabled_in| version >= enabled_in)
 }
 
 /// A Dart language version (`major.minor`), e.g. `3.13`.

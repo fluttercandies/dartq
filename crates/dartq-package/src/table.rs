@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use dartq_pub::{PackageConfig, ResolvedPackageGraph, normalize};
+use dartq_pub::{LanguageVersion, PackageConfig, ResolvedPackageGraph, normalize};
 use dartq_source::normalize_path;
 use rustc_hash::FxHashMap;
 
@@ -45,7 +45,10 @@ pub struct PackageTable {
     /// prefix scan for content outside the workspace bound (the pub-cache
     /// tier; depths are computed once here, never per query).
     by_depth: Vec<PackageName>,
-    root: PackageName,
+    /// The entrypoint package's name, `None` for a context with no named
+    /// root package (the bare degraded floor — no pubspec anywhere on the
+    /// walk).
+    root: Option<PackageName>,
     /// Workspace members when the root is a pub workspace, root excluded;
     /// `None` outside workspaces (mirrors
     /// [`ResolvedPackageGraph::workspace_members`]).
@@ -238,17 +241,70 @@ impl PackageTable {
             packages,
             by_root,
             by_depth,
-            root: root_name,
+            root: Some(root_name),
             workspace_members,
             workspace_root,
             ancestor_memo: Mutex::new(FxHashMap::default()),
         })
     }
 
-    /// The entrypoint package of the resolution.
+    /// The degraded no-config table (#759) — the oracle's BasicWorkspace
+    /// floor (`context_locator.dart:517-522`, `basic.dart:14-18`): a
+    /// single-package context rooted at `root_dir` when a pubspec names a
+    /// self package, else a bare table. The self package's language version
+    /// is its pubspec's sdk lower bound — the value pub materializes into a
+    /// written config's `languageVersion`, so the degraded face mirrors the
+    /// configured one. The `package:` URI map is a separate table over the
+    /// package config (empty here), so this identity never makes a package
+    /// URI resolve — it exists for file→package attribution only, exactly
+    /// the oracle's `BasicWorkspacePackage` over `Packages.empty`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::PackageError::InvalidName`] when the self package's name is
+    /// not a valid pub package name.
+    pub fn basic(
+        root_dir: &Path,
+        self_package: Option<(&str, Option<LanguageVersion>)>,
+    ) -> Result<PackageTable, crate::PackageError> {
+        let root_dir = normalize_path(root_dir);
+        let mut packages = BTreeMap::new();
+        let mut by_root = FxHashMap::default();
+        // One entry: the deepest-first fallback order is trivially itself.
+        let mut by_depth = Vec::new();
+        let root = match self_package {
+            Some((name, language_version)) => {
+                let name = PackageName::new(name)?;
+                let identity = PackageIdentity {
+                    lib_dir: normalize_path(&root_dir.join("lib")),
+                    name: name.clone(),
+                    root: root_dir.clone(),
+                    language_version,
+                    category: SourceCategory::Path,
+                };
+                by_root.insert(root_dir.clone(), name.clone());
+                by_depth.push(name.clone());
+                packages.insert(name.clone(), identity);
+                Some(name)
+            }
+            None => None,
+        };
+        Ok(PackageTable {
+            packages,
+            by_root,
+            by_depth,
+            root,
+            workspace_members: None,
+            workspace_root: root_dir,
+            ancestor_memo: Mutex::new(FxHashMap::default()),
+        })
+    }
+
+    /// The entrypoint package of the resolution, `None` for a context with
+    /// no named root package.
     #[must_use]
-    pub fn root(&self) -> &PackageName {
-        &self.root
+    pub fn root(&self) -> Option<&PackageName> {
+        self.root.as_ref()
     }
 
     /// Looks a package up by name (raw, as it appears in `package:` URIs).
@@ -532,7 +588,7 @@ dependencies:
         let table = table_for(&PackageConfig::parse(CONFIG).expect("valid config"));
 
         assert_eq!(table.len(), 3);
-        assert_eq!(table.root().as_str(), "app");
+        assert_eq!(table.root().map(PackageName::as_str), Some("app"));
         assert_eq!(table.workspace_members().map(BTreeSet::len), Some(1));
         assert!(table.is_workspace_member("local_dep"));
         assert!(!table.is_workspace_member("hosted_dep"));
@@ -660,7 +716,7 @@ sdks:
         let table =
             PackageTable::build(&bare, &graph, Path::new("/proj/.dart_tool")).expect("table");
         // Root carried by name, with no entry behind it.
-        assert_eq!(table.root().as_str(), "app");
+        assert_eq!(table.root().map(PackageName::as_str), Some("app"));
         assert!(table.get("app").is_none());
         // The filtered member set mirrors the graph.
         assert_eq!(table.workspace_members().map(BTreeSet::len), Some(0));
