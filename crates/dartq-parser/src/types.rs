@@ -61,15 +61,18 @@ impl TypeInfo {
     /// Whether the shape's last token is a `?` (official
     /// `TypeInfo.isNullable`, `type_info.dart`).
     pub(crate) fn is_nullable(&self) -> bool {
-        match self {
-            TypeInfo::SimpleNullable | TypeInfo::SimpleWith1Arg { nullable: true } => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            TypeInfo::SimpleNullable | TypeInfo::SimpleWith1Arg { nullable: true }
+        )
     }
 }
 
 /// `ComplexTypeInfo` (`type_info_impl.dart:526`). Ids are captured at compute
 /// time; `end` is the last token of the type.
+// Field-for-field mirror of the official `ComplexTypeInfo`; the four bools
+// are its official fields, so packing them would obscure the oracle mapping.
+#[expect(clippy::struct_excessive_bools, reason = "see above")]
 #[derive(Clone, Debug)]
 pub struct ComplexType {
     pub(crate) start: TokenId,
@@ -78,7 +81,7 @@ pub struct ComplexType {
     pub(crate) end: TokenId,
     /// `end` names a raw compound closer (`>=`/`>>`/...) whose *leading*
     /// `>` closed the group (the official parser splits it there,
-    /// `splitCloser`, `type_info_impl.dart:1772): the successor reads the
+    /// `splitCloser`, `type_info_impl.dart:1772`): the successor reads the
     /// split remainder, never a real token.
     pub(crate) end_raw_compound: bool,
     /// `Function` tokens seen during analysis, in source order.
@@ -566,14 +569,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
             if !matches!(type_param, TypeParamOrArg::None) {
                 // The official `looksLikeName(typeParamOrArg.skip(next).next!)`
-                // reads the split remainder for a compound closer (`=`/`>`),
-                // which is never a name (type_info_impl.dart:1263/1293).
-                let compound = matches!(
-                    &type_param,
-                    TypeParamOrArg::Simple1 {
-                        closer: SimpleCloser::GtEq | SimpleCloser::GtGt
-                    }
-                );
+                // (type_info.dart:172-175) reads the split remainder for a raw
+                // compound closer — `=`/`>` for the fast shape
+                // (splitGtEq/splitGtGt, type_info_impl.dart:1263/1293), the
+                // splitCloser remainder for a full group whose scan stopped on
+                // the compound's leading `>` (skipEnd, :1409) — and a remainder
+                // is never a name, so only `required` enters the recovered
+                // complex shape.
+                let compound = type_param.ends_on_raw_compound();
                 let skip_end = type_param.skip(self.peek_id());
                 if required || (!compound && self.looks_like_name_at_id(skip_end + 1)) {
                     let mut complex = self.complex_from_here(type_param);
@@ -674,9 +677,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         );
         let decide_conditional = matches!(follower, TokenKind::OpenCurly)
             || follower == TokenKind::Keyword(Keyword::When);
-        let result = if keep_nullable {
-            type_info
-        } else if decide_conditional && !self.can_parse_as_conditional_after(skip_end) {
+        let result = if keep_nullable
+            || (decide_conditional && !self.can_parse_as_conditional_after(skip_end))
+        {
             type_info
         } else {
             // `asNonNullable`; the complex shapes keep their `?` (documented

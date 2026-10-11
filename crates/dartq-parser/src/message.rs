@@ -146,7 +146,7 @@ pub(crate) mod msg {
         Message::new(MISSING_IDENTIFIER, "Expected an identifier.")
     }
 
-    /// `expectedIdentifierButGotKeyword` (identifier_context_impl.dart
+    /// `expectedIdentifierButGotKeyword` (`identifier_context_impl.dart`
     /// recovery templates): a reserved word used as a name — the keyword is
     /// reported and then consumed as the identifier.
     pub(crate) fn expected_identifier_but_got_keyword(lexeme: &str) -> Message {
@@ -620,7 +620,7 @@ pub(crate) mod msg {
     /// SwitchStatement,SwitchExpression}Body`: the shared parser's per-kind
     /// block-body codes all surface under the single analyzer registry name
     /// `expected_body` (the pinned analyzer-8.4.1 `syntactic_errors.g.dart`
-    /// carries nine same-name `EXPECTED_BODY` ParserErrorCode constants, one
+    /// carries nine same-name `EXPECTED_BODY` `ParserErrorCode` constants, one
     /// per CFE shared code; `diagnostic.g.dart` names each variant uniquely —
     /// `ExpectedClassBody`, … — and binds it with `sharedCode`), each keeping
     /// its official fixed text. The template flavors (`expectedEnumBody`,
@@ -1720,8 +1720,9 @@ pub(crate) enum BlockKind {
     /// `expectedSwitchExpressionBody`, whose `sharedCode` makes it one of
     /// the nine same-name registry variants — it emits the name-level
     /// `EXPECTED_BODY` like the rest of the family). Emit-vs-cull
-    /// decision (pinned oracle, block_kind.dart:58 + parser_impl.dart
-    /// :12433): EMIT — `ensureBlock` reports it live on `switch (n);`
+    /// decision (pinned oracle, `block_kind.dart:58` +
+    /// `parser_impl.dart:12433`): EMIT — `ensureBlock` reports it live on
+    /// `switch (n);`
     /// (script in messages.yaml), with the report anchored on the token
     /// before the missing `{`.
     SwitchExpression,

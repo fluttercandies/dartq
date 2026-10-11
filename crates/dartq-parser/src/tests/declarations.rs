@@ -119,6 +119,109 @@ fn typedef_old_style() {
 }
 
 #[test]
+fn typedef_new_style_generic_gteq_compound() {
+    // #167: `T<b>` followed by `= int` scans as a `>=` compound closing the
+    // fast-shape group. The official new/old-style head decision reads the
+    // split remainder `=` (parser_impl.dart:1497 via splitGtEq,
+    // type_info_impl.dart:1263) — not the real successor — so this parses
+    // as a valid new-style generic alias.
+    let c = parse("typedef T<b>= int;");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("begin", "typedef"), ("end", "typedef")]);
+}
+
+#[test]
+fn typedef_head_compound_gt_gt_stays_old_style() {
+    // The remainder `>` of `T<b>>` is not `=`, so the head stays old-style
+    // (official `skip.next` = the splitCloser remainder,
+    // type_info_impl.dart:1409): the old-style body starts from the noType
+    // head instead of entering the new-style name/type-variable path.
+    let c = parse("typedef T<b>> = x;");
+    c.assert_sequence(&[
+        ("begin", "typedef"),
+        ("handle", "no_type"),
+        ("end", "typedef"),
+    ]);
+}
+
+#[test]
+fn typedef_head_lone_lt_compound_routes_to_member() {
+    // `typedef <int,int>> = x;` never reaches the typedef parse: the lone
+    // `<` is popped by `appendGtGt`'s inner step WITHOUT an endGroup
+    // (abstract_scanner.dart:637-655 — only the outermost closed `<`
+    // records one), so the routing guard
+    // `keyword.next.endGroup?.next.isA(EQ)` (parser_impl.dart:769) fails
+    // and the keyword falls through to `parseTopLevelMemberImpl` (:775).
+    // The member parse takes `typedef` as a built-in-keyword method name
+    // and reports the missing parameter list anchored on the name
+    // (`parseGetterOrFormalParameters`, parser_impl.dart:1704,
+    // TopLevelMethod → `missingFunctionParameters`, :2015).
+    let c = parse("typedef <int,int>> = x;");
+    assert!(
+        !c.log.contains(&("begin", "typedef")),
+        "unexpected typedef parse: {:?}",
+        c.log
+    );
+    assert!(
+        c.log.contains(&("begin", "top_level_member")),
+        "no member parse: {:?}",
+        c.log
+    );
+    assert_eq!(
+        c.errors.first(),
+        Some(&("missing_function_parameters".to_string(), 0, 7)),
+        "{:?}",
+        c.errors
+    );
+}
+
+#[test]
+fn typedef_head_nested_group_compound_eq_is_new_style() {
+    // `typedef <A<B>> = x;` DOES reach the typedef parse: with two `<`
+    // opens, `appendGtGt` pops the inner one silently and records the
+    // endGroup on the outer `<` (abstract_scanner.dart:644-655), so the
+    // routing guard (parser_impl.dart:769) sees `=` and enters
+    // `parseTypedef` (:774). The head recheck (:1510-1518) recomputes the
+    // group from the keyword and reads its split-stream `skip.next`: the
+    // group's own closer is the compound's LAST `>`, whose successor is the
+    // real `=` — new-style. The name is missing, so the parse recovers:
+    // `missing_identifier` on the consumed `<` (identifier_context_impl.dart
+    // consume-in-doubt), the variable list `<A<B>>` walks with a missing
+    // comma and per-variable `handle_no_type` (official `parseVariables`,
+    // type_info_impl.dart:1476/:1575), and the RHS alias type still parses.
+    // The old-style cascade (missing typedef parameters / final-variable
+    // riders) never fires.
+    let c = parse("typedef <A<B>> = x;");
+    assert!(
+        c.log.contains(&("begin", "typedef")),
+        "no typedef parse: {:?}",
+        c.log
+    );
+    assert!(
+        c.log.contains(&("handle", "no_type")),
+        "variable recovery events missing: {:?}",
+        c.log
+    );
+    assert!(
+        c.log.contains(&("handle", "type")),
+        "RHS alias type not parsed: {:?}",
+        c.log
+    );
+    assert!(
+        c.errors.iter().any(|e| e.0 == "missing_identifier"),
+        "missing-name recovery not reported: {:?}",
+        c.errors
+    );
+    assert!(
+        !c.errors.iter().any(
+            |e| e.0 == "missing_typedef_parameters" || e.0 == "missing_const_final_var_or_type"
+        ),
+        "old-style cascade fired: {:?}",
+        c.errors
+    );
+}
+
+#[test]
 fn top_level_members() {
     let c = parse("int x = 1; void f() {} int get g => 1; set g(int v) {}");
     assert!(c.errors.is_empty(), "{:?}", c.errors);

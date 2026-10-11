@@ -857,7 +857,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             self.cursor.advance();
                             self.listener.begin_const_literal(self.peek_span());
                             let _ = type_param.parse_arguments(self);
-                            let end = match self.peek_kind() {
+                            match self.peek_kind() {
                                 TokenKind::OpenSquare | TokenKind::Index => {
                                     self.parse_list_literal(Some(const_keyword))
                                 }
@@ -869,8 +869,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                                     self.report(msg::expected_but_got("["), at);
                                     at
                                 }
-                            };
-                            end
+                            }
                         };
                         self.listener.end_const_literal(end);
                         return end;

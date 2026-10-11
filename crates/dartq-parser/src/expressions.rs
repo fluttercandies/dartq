@@ -294,22 +294,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // An identifier here has no precedence (`NO_PRECEDENCE`, :7079) —
         // both the `Some`-below-floor and `None` cases land in the entry
         // recovery attempt (:6644-6659).
-        let mut level: i16 = match self.precedence_of(self.peek_kind()) {
-            Some(l) => l as i16,
-            None => {
-                if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
-                    return self.precedence_loop(
-                        precedence,
-                        allow_cascades,
-                        type_arg,
-                        new_left,
-                        false,
-                    );
-                }
-                return left;
+        let Some(mut level) = self.precedence_of(self.peek_kind()) else {
+            if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
+                return self.precedence_loop(precedence, allow_cascades, type_arg, new_left, false);
             }
+            return left;
         };
-        if level < precedence as i16 {
+        if level < precedence {
             // Entry floor (:6644-6659), with the written-out-operator
             // recovery attempt (currentLevel = -1).
             if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
@@ -317,14 +308,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             return left;
         }
-        let mut last_binary_level: i16 = -1;
+        let mut last_binary_level: Option<u8> = None;
         let mut last_cascade = false;
         loop {
             let kind = self.peek_kind();
             let Some(token_level) = self.precedence_of(kind) else {
                 break;
             };
-            if token_level as i16 > level {
+            if token_level > level {
                 break;
             }
             if token_level == CASCADE_PRECEDENCE {
@@ -394,7 +385,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let end = if self.peek_kind() == TokenKind::Keyword(Keyword::Throw) {
                     self.parse_throw_expression(allow_cascades)
                 } else {
-                    self.parse_precedence(level as u8, allow_cascades)
+                    self.parse_precedence(level, allow_cascades)
                 };
                 self.listener.handle_assignment_expression(operator, end);
                 left = end;
@@ -489,27 +480,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             } else {
                 // Plain binary (:6818-6851). Equality/relational chains are
                 // rejected once per tier.
-                if level == crate::expr_const::EQUALITY_PRECEDENCE as i16
-                    || level == crate::expr_const::RELATIONAL_PRECEDENCE as i16
+                if level == crate::expr_const::EQUALITY_PRECEDENCE
+                    || level == crate::expr_const::RELATIONAL_PRECEDENCE
                 {
-                    if last_binary_level == level {
+                    if last_binary_level == Some(level) {
                         self.report(msg::equality_cannot_be_equality_operand(), self.peek_span());
                     } else {
-                        last_binary_level = level;
+                        last_binary_level = Some(level);
                     }
                 }
                 let operator = self.peek_span();
                 self.listener.begin_binary_expression(operator);
                 self.cursor.advance();
-                let right = self.parse_precedence(level as u8 + 1, allow_cascades);
+                let right = self.parse_precedence(level + 1, allow_cascades);
                 self.listener.end_binary_expression(operator, right);
                 left = right;
             }
             // Loop bookkeeping (:6874-6920). A `None` precedence is an
             // identifier position — exactly where the official recovery
             // flag fires — so the written-out attempt runs there.
-            let next_level: i16 = match self.precedence_of(self.peek_kind()) {
-                Some(l) => l as i16,
+            let next_level: u8 = match self.precedence_of(self.peek_kind()) {
+                Some(l) => l,
                 None => {
                     if let Some((new_left, _replacement_level)) =
                         self.attempt_written_out_operator(-1, allow_cascades)
@@ -519,7 +510,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         // follower's level and re-run the `<= level` check
                         // with it (:6905-6920).
                         match self.precedence_of(self.peek_kind()) {
-                            Some(nl) if nl >= precedence => nl as i16,
+                            Some(nl) if nl >= precedence => nl,
                             _ => break,
                         }
                     } else {
@@ -530,7 +521,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if next_level > level {
                 break;
             }
-            if next_level < precedence as i16 {
+            if next_level < precedence {
                 break;
             }
             level = next_level;
@@ -564,7 +555,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let operator_lexeme = self.cursor.lexeme(operator_span.id);
         for &replacement in candidates {
             let replacement_level = kind_precedence(replacement).expect("candidate operator");
-            if current_level >= 0 && replacement_level as i16 > current_level {
+            if current_level >= 0 && i16::from(replacement_level) > current_level {
                 continue;
             }
             // Speculative: identifier consumed as the operator, right operand
@@ -742,14 +733,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.synthetic(TokenKind::Identifier, plus.range.offset);
                 self.parse_primary(IdentifierContext::Expression)
             }
-            TokenKind::Bang | TokenKind::Tilde => {
-                let operator = self.peek_span();
-                self.cursor.advance();
-                let end = self.parse_precedence(POSTFIX_PRECEDENCE, allow_cascades);
-                self.listener.handle_unary_prefix_expression(operator);
-                end
-            }
-            TokenKind::Minus => {
+            TokenKind::Bang | TokenKind::Tilde | TokenKind::Minus => {
                 let operator = self.peek_span();
                 self.cursor.advance();
                 let end = self.parse_precedence(POSTFIX_PRECEDENCE, allow_cascades);
@@ -834,10 +818,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.cursor.advance();
         self.listener.begin_await_expression(await_kw);
         let end = self.parse_precedence(POSTFIX_PRECEDENCE, allow_cascades);
-        if self.async_state != AsyncModifier::Sync {
-            self.listener.end_await_expression(await_kw, end);
-        } else {
+        if self.async_state == AsyncModifier::Sync {
             self.listener.end_invalid_await_expression(await_kw, end);
+        } else {
+            self.listener.end_await_expression(await_kw, end);
         }
         end
     }
@@ -881,10 +865,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         loop {
             let mut potential_null_aware = self.peek_kind() == TokenKind::Question
                 && self.cursor.look_kind(1) == TokenKind::OpenSquare;
-            if potential_null_aware && !checked_null_aware {
-                if self.can_parse_as_conditional() {
-                    potential_null_aware = false;
-                }
+            if potential_null_aware && !checked_null_aware && self.can_parse_as_conditional() {
+                potential_null_aware = false;
             }
             if self.peek_kind() == TokenKind::OpenSquare || potential_null_aware {
                 let mut question: Option<TokenSpan> = None;
@@ -1175,7 +1157,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let token = self.peek_span();
                     self.report(msg::unexpected_token(self.cursor.lexeme(token.id)), token);
                     self.cursor.advance();
-                    return self.parse_primary(context);
+                    self.parse_primary(context)
                 }
                 _ => self.parse_send(context),
             },
@@ -1288,7 +1270,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     self.report(
                         msg::literal_with_class_and_new(
                             &value.to_lowercase(),
-                            &self.cursor.lexeme(identifier.id),
+                            self.cursor.lexeme(identifier.id),
                         ),
                         new_kw,
                     );
@@ -1392,7 +1374,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             if is_function_literal {
                 self.cursor.reset(start);
-                return self.parse_function_literal(type_info, type_param);
+                return self.parse_function_literal(&type_info, &type_param);
             }
         }
         self.cursor.reset(start);
@@ -1407,8 +1389,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// on the way to the formals).
     fn parse_function_literal(
         &mut self,
-        type_info: TypeInfo,
-        type_param: TypeParamOrArg,
+        type_info: &TypeInfo,
+        type_param: &TypeParamOrArg,
     ) -> TokenSpan {
         let start = self.cursor.mark();
         let begin = self.peek_span();
@@ -1432,7 +1414,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// statement-side parser in `statements.rs`. The cursor sits on the
     /// function name; the type-variable group (already evented in the
     /// detection pass) is skipped without events on the way to the formals.
-    fn parse_named_function_expression_rest(&mut self, type_param: TypeParamOrArg) -> TokenSpan {
+    fn parse_named_function_expression_rest(&mut self, type_param: &TypeParamOrArg) -> TokenSpan {
         let begin_name = self.peek_span();
         self.listener.begin_function_name(begin_name);
         let name = self.ensure_identifier(IdentifierContext::LocalFunctionDeclaration);
@@ -1576,11 +1558,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 type_arg = candidate;
             }
         }
-        if !matches!(type_arg, TypeParamOrArg::None) {
-            let _ = type_arg.parse_arguments(self);
-        } else {
+        if matches!(type_arg, TypeParamOrArg::None) {
             let next = self.peek_span();
             self.listener.handle_no_type_arguments(next);
+        } else {
+            let _ = type_arg.parse_arguments(self);
         }
         let end = if self.peek_kind() == TokenKind::OpenParen {
             self.parse_arguments_rest()
@@ -1716,11 +1698,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // Empty list pattern.
                 Some(self.real_id(pos))
             }
-            kind if matches!(
-                kind,
-                TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::OpenParen
-            ) =>
-            {
+            TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::OpenParen => {
                 self.cursor.table_matching_end(self.real_id(pos))
             }
             _ => None,
@@ -1825,7 +1803,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             outcome => {
                 let identifier = self.peek_span();
                 let identifier_pos = self.cursor.real_pos();
-                self.parse_for_loop_parts_mid(await_kw, outcome);
+                self.parse_for_loop_parts_mid(await_kw, &outcome);
                 if matches!(
                     self.peek_kind(),
                     TokenKind::Keyword(Keyword::In) | TokenKind::Colon
@@ -1974,27 +1952,23 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             .cursor
                             .table_matching_end(begin_switch.id)
                             .map(|c| self.offset_of(c));
-                        match close_pos.and_then(|limit| {
+                        if let Some(sep_pos) = close_pos.and_then(|limit| {
                             self.find_next_comma_or_semicolon(self.cursor.real_pos(), limit)
                         }) {
-                            Some(sep_pos) => {
-                                // Official reports the missing comma at the
-                                // current token once, whichever separator the
-                                // search found (:11890-11897).
-                                let at = self.peek_span();
-                                self.report(msg::expected_but_got(","), at);
-                                self.skip_to_token(self.real_id(sep_pos));
-                                self.cursor.advance();
+                            // Official reports the missing comma at the
+                            // current token once, whichever separator the
+                            // search found (:11890-11897).
+                            let at = self.peek_span();
+                            self.report(msg::expected_but_got(","), at);
+                            self.skip_to_token(self.real_id(sep_pos));
+                            self.cursor.advance();
+                        } else {
+                            let at = self.peek_span();
+                            self.report(msg::expected_but_got("}"), at);
+                            if let Some(close) = self.cursor.table_matching_end(begin_switch.id) {
+                                self.skip_to_token(close);
                             }
-                            None => {
-                                let at = self.peek_span();
-                                self.report(msg::expected_but_got("}"), at);
-                                if let Some(close) = self.cursor.table_matching_end(begin_switch.id)
-                                {
-                                    self.skip_to_token(close);
-                                }
-                                break;
-                            }
+                            break;
                         }
                     }
                 }
@@ -2019,11 +1993,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         while pos < limit {
             match self.kind_at(pos) {
                 TokenKind::Comma | TokenKind::Semicolon => return Some(pos),
-                kind if matches!(
-                    kind,
-                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
-                ) =>
-                {
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                     let end = self.cursor.table_matching_end(self.real_id(pos));
                     match end {
                         Some(end) => pos = self.offset_of(end) + 1,

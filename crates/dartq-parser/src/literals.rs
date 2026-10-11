@@ -39,8 +39,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// `expected_else_or_comma` recovery message).
     ///
     /// Each pending machine frame is one active nesting unit and obeys the
-    /// shared `MAX_DEPTH` gate (crate::parser::MAX_DEPTH) — the linearized counterpart of the official
-    /// `expressionDepth` counter (`parseExpression`, parser_impl.dart:6936):
+    /// shared `MAX_DEPTH` gate (`crate::parser::MAX_DEPTH`) — the
+    /// linearized counterpart of the official
+    /// `expressionDepth` counter (`parseExpression`, `parser_impl.dart:6936`):
     /// past the cap the bailout latches with a single `stackOverflow` report
     /// and the enclosing loops unwind on the bail checks.
     fn parse_collection_entry(
@@ -146,12 +147,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     }
                 }
             }
-            // A body leaf finished: unwind the pending completers.
-            loop {
-                match self.unwind_pending(&mut pending) {
-                    Unwind::Done(end) => return (end, if_count),
-                    Unwind::Else => continue 'outer,
-                }
+            // A body leaf finished: unwind the pending completers. The `Else`
+            // case is the loop body's tail — falling through continues the
+            // outer loop exactly as the explicit `continue` did.
+            match self.unwind_pending(&mut pending) {
+                Unwind::Done(end) => return (end, if_count),
+                Unwind::Else => {}
             }
         }
     }

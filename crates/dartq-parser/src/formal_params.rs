@@ -608,19 +608,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // context) always ensure a name (parser_impl.dart:2371).
         let name = if let Some(n) = inline_name {
             n
-        } else if before_inline_function_type.is_none()
-            && name_context == IdentifierContext::FormalParameterDeclaration
-            && !matches!(type_info, TypeInfo::NoType)
-            && !is_identifier(self.peek_kind())
-            && !matches!(
+        } else if !(before_inline_function_type.is_some()
+            || name_context != IdentifierContext::FormalParameterDeclaration
+            || matches!(type_info, TypeInfo::NoType)
+            || is_identifier(self.peek_kind())
+            || matches!(
                 self.peek_kind(),
                 TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
             )
-            && !(in_function_type
+            || (in_function_type
                 && matches!(
                     parameter_kind,
                     FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
-                ))
+                )))
         {
             let next = self.peek_span();
             self.listener.handle_no_name(next);

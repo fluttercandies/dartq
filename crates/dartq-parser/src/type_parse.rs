@@ -43,6 +43,9 @@ impl TypeInfo {
                         return start + 3;
                     }
                     if let Some(len) = parser.gt_group_len(lt) {
+                        // `len` counts table tokens and the table is
+                        // u32-positioned, so the cast cannot truncate.
+                        #[expect(clippy::cast_possible_truncation, reason = "see above")]
                         return start + len as u32;
                     }
                 }

@@ -136,10 +136,10 @@ fn dot_access_operand_missing_identifier() {
 /// delimited loops then recover per the official decision order: the list
 /// loop's per-iteration no-progress skip consumes the blocker; the
 /// parenthesized loop leaves it for `ensureCloseParen` (expected `)` at the
-/// blocker, parser_impl.dart:12229-12231 + :5028); the map loop's
+/// blocker, `parser_impl.dart:12229-12231` + `:5028`); the map loop's
 /// stale-`next` skip leaves the first entry's blocker for the `,`
 /// recovery, which re-parses it as the next key (official
-/// syntheticIdentifier_inside* corpus).
+/// `syntheticIdentifier_inside*` corpus).
 #[test]
 fn pattern_reserved_element_positions() {
     assert_codes(
@@ -209,7 +209,7 @@ fn pattern_rhs_reserved_head() {
 /// ast_builder.dart:3831-3837) reports `missingAssignableSelector` for the
 /// non-assignable const record on top of the statement-level
 /// `illegalAssignmentToNonAssignable` (oracle:
-/// patterns/patternVariableDeclarationStatement_disallowsConst.dart).
+/// `patterns/patternVariableDeclarationStatement_disallowsConst.dart`).
 #[test]
 fn const_statement_assignment_targets() {
     assert_codes(

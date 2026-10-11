@@ -611,7 +611,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// recovery reports (oracle: `import 5;` carries no `unexpectedToken`
     /// from the string read) — and splice a synthetic empty string in BEFORE
     /// the offending token (`rewriteAndRecover` → `insertToken`,
-    /// token_stream_rewriter.dart:85 — the real token survives and belongs
+    /// `token_stream_rewriter.dart:85` — the real token survives and belongs
     /// to the next grammar position: a following `;` still terminates the
     /// directive, a garbage token is the recovery boundary's or the
     /// top-level continuation's own report), then parse the literal. The

@@ -117,7 +117,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             TokenKind::Keyword(Keyword::Return) => self.parse_return_statement(),
             TokenKind::Keyword(Keyword::Var | Keyword::Final) => {
                 let var_or_final = self.peek_span();
-                if !self.is_statement_modifier_at(1) {
+                if self.is_statement_modifier_at(1) {
+                    self.parse_expression_statement_or_declaration(false);
+                } else {
                     self.cursor.advance();
                     self.parse_expression_statement_or_declaration_after_modifiers(
                         None,
@@ -126,8 +128,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         false,
                         false,
                     );
-                } else {
-                    self.parse_expression_statement_or_declaration(false);
                 }
             }
             TokenKind::Keyword(Keyword::If) => self.parse_if_statement(),
@@ -190,12 +190,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.force_advance();
                 self.parse_statement_x();
             }
+            kind if is_identifier(kind) && self.cursor.look_kind(1) == TokenKind::Colon => {
+                self.parse_labeled_statement();
+            }
             kind if is_identifier(kind) => {
-                if self.cursor.look_kind(1) == TokenKind::Colon {
-                    self.parse_labeled_statement();
-                } else {
-                    self.parse_expression_statement_or_declaration(false);
-                }
+                self.parse_expression_statement_or_declaration(false);
             }
             _ => {
                 self.parse_expression_statement_or_declaration(false);
@@ -1047,7 +1046,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             outcome => {
                 let identifier = self.peek_span();
                 let identifier_pos = self.cursor.real_pos();
-                self.parse_for_loop_parts_mid(await_kw, outcome);
+                self.parse_for_loop_parts_mid(await_kw, &outcome);
                 if matches!(
                     self.peek_kind(),
                     TokenKind::Keyword(Keyword::In) | TokenKind::Colon
@@ -1097,7 +1096,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     pub(crate) fn parse_for_loop_parts_mid(
         &mut self,
         await_kw: Option<TokenSpan>,
-        outcome: ExprStmtOrDecl,
+        outcome: &ExprStmtOrDecl,
     ) {
         match outcome {
             ExprStmtOrDecl::DeclHead => {
@@ -1543,7 +1542,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         let open = self.peek_span();
         let close_id = self.cursor.table_matching_end(open.id);
-        let open_group_synthetic = close_id.map_or(true, |close| self.cursor.resolve(close).1);
+        let open_group_synthetic = close_id.is_none_or(|close| self.cursor.resolve(close).1);
         let scan_mark = self.cursor.mark();
         self.cursor.advance(); // `(`
         // Synthetic-ness of the consumed name (official
@@ -1748,7 +1747,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             let at_end = peek_kind == TokenKind::CloseCurly && self.cursor.real_pos() == peek_pos;
             if matches!(
                 peek_kind,
-                TokenKind::Keyword(Keyword::Case) | TokenKind::Keyword(Keyword::Default)
+                TokenKind::Keyword(Keyword::Case | Keyword::Default)
             ) || at_end
             {
                 break;
@@ -1933,9 +1932,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// offset `n`, including the built-in follower and record-type
     /// refinements.
     fn is_statement_modifier_at(&self, n: usize) -> bool {
-        let keyword = match self.cursor.look_kind(n) {
-            TokenKind::Keyword(kw) => kw,
-            _ => return false,
+        let TokenKind::Keyword(keyword) = self.cursor.look_kind(n) else {
+            return false;
         };
         let is_builtin = matches!(keyword.style(), KeywordStyle::BuiltIn);
         match keyword {
@@ -2032,8 +2030,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
             }
             TokenKind::Period | TokenKind::CloseParen | TokenKind::CloseSquare => true,
-            TokenKind::Comma if ctx == AwaitYieldCtx::UnaryExpression => true,
-            TokenKind::Semicolon if ctx == AwaitYieldCtx::UnaryExpression => true,
+            TokenKind::Comma | TokenKind::Semicolon if ctx == AwaitYieldCtx::UnaryExpression => {
+                true
+            }
             kind if crate::expr_const::binary_level(kind).is_some() => true,
             _ => false,
         }

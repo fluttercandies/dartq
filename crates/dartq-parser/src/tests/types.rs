@@ -117,6 +117,48 @@ fn builtin_recovery_compound_closer_optional_is_no_type() {
     assert!(matches!(info, TypeInfo::NoType));
 }
 
+// --- #167: Complex-path compound closer, optional position --------------
+
+#[test]
+fn complex_group_raw_compound_optional_is_no_type() {
+    // `Map<int,int>>` in optional position: the group's scan stops on the
+    // compound's leading `>` (skipEnd = splitCloser,
+    // type_info_impl.dart:1409), so computeSimpleWithTypeArguments decides
+    // on the remainder `>` — never a name, never end-of-block
+    // (type_info_impl.dart:1044-1046) — and stays noType.
+    let info = compute_shape("Map<int, int>>x", false);
+    assert!(matches!(info, TypeInfo::NoType));
+}
+
+#[test]
+fn complex_group_gt_eq_optional_is_no_type() {
+    // Same rule with a `>=` compound: the decision token is the remainder
+    // `=` (splitGtEq, type_info_impl.dart:1263), so optional position is
+    // noType even with a name after the compound.
+    let info = compute_shape("Map<int, int>=c d", false);
+    assert!(matches!(info, TypeInfo::NoType));
+}
+
+#[test]
+fn builtin_recovery_complex_group_raw_compound_optional_is_no_type() {
+    // The built-in recovery arm reads the split remainder for a full group
+    // too: `required<B, C>>` ends on the compound's leading `>`
+    // (skipEnd = splitCloser, type_info_impl.dart:1409) and the remainder
+    // `>` is never a name (type_info.dart:172-175), so optional position
+    // stays noType.
+    let info = compute_shape("required<B, C>>c d", false);
+    assert!(matches!(info, TypeInfo::NoType));
+}
+
+#[test]
+fn builtin_recovery_complex_group_raw_compound_required_keeps_type() {
+    // Required position enters the recovered complex shape regardless of
+    // the follower (type_info.dart:172-175); `end` names the compound —
+    // the position of the official split leading `>`.
+    let info = compute_shape("required<B, C>>c d", true);
+    assert!(matches!(info, TypeInfo::Complex(c) if c.end_raw_compound));
+}
+
 // --- #178: type-compute defect cluster --------------------------------------
 
 /// Runs `compute_type` and returns the analyzed shape together with the

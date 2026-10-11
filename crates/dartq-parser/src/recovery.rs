@@ -630,8 +630,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         let at = if kind == crate::message::BlockKind::SwitchExpression {
             self.cursor
                 .last_consumed_id()
-                .map(|id| self.span_of(id))
-                .unwrap_or(follower)
+                .map_or(follower, |id| self.span_of(id))
         } else {
             follower
         };

@@ -1,7 +1,7 @@
 //! `computeVariablePatternType` follower-set contract (official
 //! `type_info.dart:392-411` riding on `computeType`'s follower decision,
 //! :305-385). A bare identifier names a variable-pattern type only when
-//! the follower is a name (`looksLikeName`, type_info_impl.dart:487), a
+//! the follower is a name (`looksLikeName`, `type_info_impl.dart:487`), a
 //! `?` before a name, or a `Function` group; every other follower
 //! (`)`, `:`, `}`, `,`, `;`, operators) yields noType, so
 //! `parsePrimaryPattern` (parser_impl.dart:11820-11894) reaches the
@@ -47,7 +47,7 @@ fn pattern_window<'a>(c: &'a Collector, label: &str) -> &'a [Logged] {
 /// subtree a `constant_pattern` pair around the operand's send — a bare
 /// identifier fires the official argument-less variant
 /// (`handleSendWithoutArguments`, listener.dart:1368, from `parseSend`'s
-/// short-circuit at parser_impl.dart:9433, which also skips the No*
+/// short-circuit at `parser_impl.dart:9433`, which also skips the No*
 /// events) — and no type or variable-pattern events (the noType path
 /// never commits a type).
 fn assert_constant_pattern(c: &Collector, label: &str) {

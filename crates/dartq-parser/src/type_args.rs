@@ -37,7 +37,7 @@ pub struct ComplexTypeParamOrArg {
     pub recovered: bool,
     /// `end` names a raw compound closer whose *leading* `>` closed this
     /// group (the official parser splits it there, `splitCloser`,
-    /// `type_info_impl.dart:1772): the successor of `end` reads the split
+    /// `type_info_impl.dart:1772`): the successor of `end` reads the split
     /// remainder, never a real token. `false` when the compound is shared
     /// with enclosing groups (its *last* closer closes this group, so the
     /// real successor follows).
@@ -66,12 +66,12 @@ impl TypeParamOrArg {
         }
     }
 
-    /// `skip` (`type_info.dart:113)`: last token of the group, or `before`
+    /// `skip` (`type_info.dart:113`): last token of the group, or `before`
     /// when absent. Returns real ids only.
     ///
     /// For a compound closer (`>=`/`>>`) this names the compound token —
     /// the position of the official *split* leading `>`
-    /// (`splitGtEq`/`splitGtGt`, `type_info_impl.dart:1263/1293), whose
+    /// (`splitGtEq`/`splitGtGt`, `type_info_impl.dart:1263/1293`), whose
     /// successor is the remainder. The remainder is never a name, `?`, or a
     /// `Function` intro; decision sites special-case it instead of reading
     /// the next real token.
@@ -969,6 +969,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 /// `looksLikeTypeParamOrArg` (`type_info_impl.dart:512`), cursor flavor: the
 /// current token continues a type parameter list after a missing comma.
 fn looks_like_type_param_member(parser: &Parser<'_, '_, impl ParserListener>) -> bool {
+    // Official `looksLikeTypeParamOrArg(inDeclaration, next)`
+    // (type_info_impl.dart:1417-1421): a `<`-headed group after a variable
+    // reads as a missing comma — "Looks like missing comma. Continue
+    // looping." — not as the group end (`typedef <A<B>> = x;` walks `A`,
+    // `<`, `B` as recovered variables before the shared closer).
+    if parser.peek_kind() == TokenKind::Lt && is_identifier(parser.cursor.look_kind(1)) {
+        return true;
+    }
     if !is_identifier(parser.peek_kind()) {
         return false;
     }

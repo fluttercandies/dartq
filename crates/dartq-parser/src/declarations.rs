@@ -574,6 +574,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.listener
             .begin_uncategorized_top_level_declaration(typedef_keyword);
         self.listener.begin_typedef(typedef_keyword);
+        // Official `parseTypedef` anchors on `typedefKeyword` itself
+        // (parser_impl.dart:1470): some recovery routes reach us with the
+        // cursor already past the keyword, so re-anchor before consuming.
+        self.cursor.rewind_to(typedef_keyword.id);
         self.cursor.advance(); // `typedef`
 
         let type_info = self.compute_type(false, true);
@@ -592,7 +596,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let mut type_param = self.compute_type_param_or_arg_at(head_offset, true);
         if matches!(type_info, TypeInfo::NoType) {
             let skip = type_param.skip(self.peek_id());
-            let next_kind = self.kind_at(self.offset_of(skip) + 1);
+            // Official `skip.next!.isA(TokenType.EQ)` (parser_impl.dart:1497):
+            // the successor of the group's `skip` target in the official split
+            // stream — the split remainder when the closer is a raw compound
+            // (`=`/`>` for the fast shape, splitGtEq/splitGtGt,
+            // type_info_impl.dart:1263/1293; the splitCloser remainder for a
+            // full group, :1409), the real next token when the compound's last
+            // closer closes the group. `type_arg_follower` is exactly that
+            // read over our whole-compound table, so `typedef T<b>= int;`
+            // decides new-style off the remainder `=` while `typedef T<b>>`
+            // sees the remainder `>` and stays old-style.
+            let next_kind =
+                self.type_arg_follower(&type_param, self.cursor.real_pos() + head_offset);
             if next_kind == TokenKind::Eq || self.kind_at(self.offset_of(skip)) == TokenKind::Eq {
                 new_style = true;
             } else if self.kind_at(self.offset_of(skip)) == TokenKind::Lt
@@ -601,8 +616,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     .table_matching_end(self.real_id(self.offset_of(skip)))
                 && self.kind_at(self.offset_of(end) + 1) == TokenKind::Eq
             {
-                type_param = self.compute_type_param_or_arg_at(0, true);
-                new_style = true;
+                // Official recheck (:1510-1518): the group is recomputed from
+                // the typedef keyword and the decision re-tests the recomputed
+                // group's own successor — new-style only when that successor
+                // is `=` (official "This if shouldn't be necessary, but let's
+                // do it anyway").
+                let new_type_param = self.compute_type_param_or_arg_at(0, true);
+                if self.type_arg_follower(&new_type_param, self.cursor.real_pos()) == TokenKind::Eq
+                {
+                    type_param = new_type_param;
+                    new_style = true;
+                }
             }
         }
 
@@ -614,7 +638,26 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration)
             };
             let _ = name;
+            // The missing-name recovery may have consumed the variable
+            // group's own `<` as the name (the official consume-in-doubt
+            // branch, identifier_context_impl.dart:39-42); official
+            // `parseVariables` then re-uses that token as the group start
+            // (`assert(identical(token.next!, start))` over the consumed
+            // name, type_info_impl.dart:1477). Re-anchor the same way so the
+            // group parses from its opener.
+            if let crate::type_args::TypeParamOrArg::Complex(g) = &type_param
+                && name.id == g.start
+            {
+                self.cursor.rewind_to(g.start);
+            }
             type_param.parse_variables(self, false);
+            // Official :1528-1534 "Recovery after recovery": the variable
+            // walk's closer consumption may leave a split remainder (an
+            // inserted `>` from a shared `>>`) in front of the `=`; skip it
+            // so the RHS alias type still attaches.
+            if self.peek_kind() != TokenKind::Eq && self.cursor.look_kind(1) == TokenKind::Eq {
+                self.cursor.advance();
+            }
             if self.peek_kind() == TokenKind::Eq {
                 equals = Some(self.peek_span());
                 self.cursor.advance();

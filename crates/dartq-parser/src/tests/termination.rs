@@ -164,7 +164,8 @@ fn adversarial_inputs_terminate_with_bounded_diagnostics() {
     for case in cases {
         let source: &'static str = Box::leak(case.to_owned().into_boxed_str());
         let (table, text) = scan_ok(source);
-        let utf16_len: u32 = source.chars().map(char::len_utf16).sum::<usize>() as u32;
+        let utf16_len: u32 = u32::try_from(source.chars().map(char::len_utf16).sum::<usize>())
+            .expect("utf16 length fits u32");
         let mut listener = Collector::default();
         {
             let mut parser = Parser::new(text, table, latest_features(), listener);
