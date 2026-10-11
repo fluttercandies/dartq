@@ -725,19 +725,45 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             }
         }
         // Message-carrying kinds report on the token BEFORE the missing `{`
-        // (official ensureBlock: `reportRecoverableError(token, message)`).
-        // The switch-expression lane pins this anchor (`switch (n)` reports
-        // on the `)`); the other message kinds keep the follower anchor of
-        // their own lanes (#18/#19) pending their differential passes. The
-        // synthetic `{}` still lands at the follower (insertBlock uses
-        // `next.charOffset`).
+        // (official ensureBlock: `reportRecoverableError(token, message)`,
+        // parser_impl.dart:4995-5002), anchored per `findNonZeroLengthToken`
+        // (util.dart:56-61): the last consumed token walked FORWARD over
+        // zero-width synthetics — a synthetic name inserted in front of the
+        // follower must not capture the anchor (bare `class` at EOF anchors
+        // on the EOF position, oracle `issue_46346_prime_2` col 6 length 0),
+        // while a real last token carries it (`class C(int a)` at EOF anchors
+        // on the `)`). Template flavors (`expectedEnumBody`/`expectedFunction
+        // Body`, block_kind.dart:31-34/47-50) report on `next` instead
+        // (:5003-5005) — through the SAME `reportRecoverableError`
+        // (:11399-11401), so a zero-width synthetic follower walks forward
+        // to the next real token too (bare `enum` + a next declaration: the
+        // synthetic name inserted behind a reserved head anchors the body
+        // row on that head, oracle `issue_48371_prime3` col 1 length 5). The
+        // switch-expression lane pins the same last-consumed anchor (its
+        // report lands on the `)` of `switch (n);`). The
+        // try/catch/finally/switch-statement lanes keep the follower anchor
+        // of their own milestones pending their differential passes.
         let follower = self.peek_span();
-        let at = if kind == crate::message::BlockKind::SwitchExpression {
-            self.cursor
-                .last_consumed_id()
-                .map_or(follower, |id| self.span_of(id))
-        } else {
-            follower
+        let at = match kind {
+            crate::message::BlockKind::Class
+            | crate::message::BlockKind::Mixin
+            | crate::message::BlockKind::Extension
+            | crate::message::BlockKind::ExtensionType
+            | crate::message::BlockKind::SwitchExpression => match self.cursor.last_consumed_id() {
+                Some(id) if self.span_of(id).range.length > 0 => self.span_of(id),
+                _ => follower,
+            },
+            // findNonZeroLengthToken over the follower: forward while
+            // zero-width, EOF terminates the walk and stays as-is.
+            _ => {
+                let mut at = follower;
+                let mut n = 0usize;
+                while at.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                    n += 1;
+                    at = self.look_span_at(n);
+                }
+                at
+            }
         };
         let lexeme = self.cursor.lexeme(follower.id);
         self.report(msg::expected_block_body(kind, lexeme), at);

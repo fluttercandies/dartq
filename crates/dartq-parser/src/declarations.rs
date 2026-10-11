@@ -277,6 +277,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             self.check_declaration();
                             let class_keyword = self.look_span_at(1);
                             let mods = self.parse_class_modifiers(modifier_start, class_keyword);
+                            // Official `_handleModifiersForClassDeclaration`
+                            // (parser_impl.dart:850-876) starts
+                            // `parseClassOrNamedMixinApplication` AT the
+                            // `class` token (`Token token = classKeyword`,
+                            // :2969); the modifier walk stops on the `mixin`
+                            // head (`_parseModifiers`, modifier_context.dart
+                            // :345-384 — `mixin` is not in the modifier set),
+                            // leaving the cursor on it. Consume `mixin` so the
+                            // cursor sits on `class` — the same position the
+                            // plain-`class` dispatch leaves. Without this the
+                            // name step took `class` as the class name
+                            // (`final mixin class M {}` reported
+                            // `expected_identifier_but_got_keyword` at `class`
+                            // and `unexpected_token` at `M`).
+                            self.cursor.advance(); // `mixin`
                             if let Some(f) = mods.final_kw {
                                 self.report(msg::final_mixin_class(), f);
                             }
@@ -2167,13 +2182,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
     /// Official `recoverySmallLookAheadSkipTokens` (`parser_impl.dart:2861`):
     /// bounded lookahead of up to 3 garbage tokens searching for a clause
-    /// boundary; refuses to start on or cross a token that looks like the
-    /// start of the next top-level declaration. Callers may sit ON a boundary
-    /// (`{` with no clauses parsed) — there is nothing to skip and the
-    /// boundary belongs to the caller. On success reports the skip
-    /// (`unexpected_token` for a single skipped token, `unexpected_tokens`
-    /// for a range) and leaves the cursor on the boundary; returns whether a
-    /// boundary was reached.
+    /// boundary in `lookFor`. A token that looks like the start of the next
+    /// top-level declaration is a BAIL condition only — before the probe and
+    /// after each step (:2870, :2882) it returns null WITHOUT reporting or
+    /// consuming; success is a `lookFor` boundary alone (:2872-2874).
+    /// Callers may sit ON a boundary (`{` with no clauses parsed) — there is
+    /// nothing to skip and the boundary belongs to the caller. On success
+    /// reports the skip (`unexpected_token` for a single skipped token,
+    /// `unexpected_tokens` for a range) and leaves the cursor on the
+    /// boundary. On failure the probe is non-destructive (official only
+    /// walks `token.next` pointers and never consumes), so the cursor
+    /// rewinds to the entry position and `false` is returned.
     fn skip_to_clause(&mut self, boundaries: &[TokenKind]) -> bool {
         let kind = self.peek_kind();
         if self.cursor.at_eof()
@@ -2183,15 +2202,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             return false;
         }
         let first = self.peek_span();
+        let mark = self.cursor.mark();
         let mut last = first;
         let mut skipped = 0usize;
         while skipped < 3 {
             skipped += 1;
             let next = self.cursor.look_kind(1);
             if next == TokenKind::Eof {
+                self.cursor.reset(mark);
                 return false;
             }
-            if boundaries.contains(&next) || Self::starts_next_top_level_declaration(next) {
+            if boundaries.contains(&next) {
                 if skipped == 1 {
                     self.report(msg::unexpected_token(self.cursor.lexeme(first.id)), first);
                 } else {
@@ -2203,9 +2224,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.cursor.advance();
             last = self.peek_span();
             if Self::starts_next_top_level_declaration(self.peek_kind()) {
+                self.cursor.reset(mark);
                 return false;
             }
         }
+        self.cursor.reset(mark);
         false
     }
 

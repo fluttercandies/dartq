@@ -246,17 +246,19 @@ fn const_pattern_named_function_expression() {
 
 /// `enum` followed by a foreign declaration starter: the bounded skip
 /// refuses at the next top-level declaration (`recoverySmallLookAheadSkip`
-/// and `looksLikeStartOfNextTopLevelDeclaration`), the reserved head gets a
-/// synthetic name, and the missing body is reported.
+/// and `looksLikeStartOfNextTopLevelDeclaration` — bail only, no report:
+/// the official null-return paths `parser_impl.dart:2870/2882` report
+/// nothing; success requires a `lookFor` boundary, :2872-2874), the
+/// reserved head gets a synthetic name, and the missing body is reported.
+/// The oracle emits no `unexpected_token` on this shape — the 3.13.1
+/// differential lists it dartq-only for the twin fixture
+/// (`issue_48371_prime3.dart`, gate-caliber-r5) — the row this pin used
+/// to carry was the old port's success-on-bail bug.
 #[test]
 fn enum_header_reserved_head_skip_refusal() {
     assert_codes(
         "enum\nclass A {\n  void foo(int x) {}\n}\n",
-        &[
-            "missing_enum_body",
-            "missing_identifier",
-            "unexpected_token",
-        ],
+        &["missing_enum_body", "missing_identifier"],
         "enum foreign header",
     );
 }
