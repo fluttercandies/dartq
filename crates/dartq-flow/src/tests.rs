@@ -424,14 +424,50 @@ fn cast_pattern_does_not_pop_the_expr_stack() {
     let source = "void f(Object? o) { switch (o) { case _ as Object?: 1; } }";
     assert!(facts_of(source).is_empty());
     // Declared primary: the pattern variable is assigned on the matched
-    // path. The soundness read lives in the guard — guard events run
-    // under the pattern's matched state, before `CaseBegin` resets
-    // `current` to the pre-case state (interp_stmt.rs:439; the head
-    // state never lands in the group because `PatternBegin` replaces
-    // the Switch-kind `PatternState`, so `case_pattern_end` skips —
-    // a known gap, not this pin's subject).
+    // path and the case body runs under that state — a body read is
+    // sound (the head's matched state reaches the body through
+    // `case_pattern_end` plus the body-open join; official
+    // `switch_endAlternative`/`switch_endAlternatives`,
+    // flow_analysis.dart:8004-8066).
+    let source = "void f(Object? o) { switch (o) { case var x as int: x; } }";
+    assert!(unassigned_snippets(source).is_empty());
+    // Guard position: the guard also evaluates under the matched state.
     let source = "void f(Object? o) { switch (o) { case var x as int when x > 0: 1; } }";
     assert!(unassigned_snippets(source).is_empty());
+}
+
+/// The case head's state carries into the case body: the guard's outcome
+/// joins the unmatched chain and the group's combined state feeds the
+/// body (official `switch_endAlternative`, flow_analysis.dart:8004-8042,
+/// and `switch_endAlternatives`, :8044-8066), and the cast pattern's
+/// promotion reaches the body the same way.
+#[test]
+fn case_head_state_carries_into_the_body() {
+    // A never-true guard makes the group's combined state unreachable,
+    // but the body still opens on a control-flow split checkpoint:
+    // official `Reachability.split` passes locallyReachable=true
+    // (flow_analysis.dart:5607) and `switch_endAlternatives` splits the
+    // body's entry state (:8060-8066), so no dead code is reported
+    // inside the case body — the guard's false outcome lives only in
+    // the unmatched chain.
+    let source = "void f(Object? o) { switch (o) { case _ when false: 1; } }";
+    assert!(dead_snippets(source).is_empty());
+    // Guard type-test promotion carries into the body: with `n`
+    // promoted to `int` by the guard, the impossible `n is! int`
+    // then-branch is dead (official tryPromoteForTypeCheck's bottom
+    // typeIfFalse, flow_analysis.dart:4118-4179). The row is the
+    // outermost dead construct only — the whole then-block, exactly
+    // one diagnostic (official dead_code per dead statement, no
+    // per-descendant rows).
+    let source =
+        "void f(num x) { switch (x) { case num n when n is int: if (n is! int) { return; } n; } }";
+    assert_eq!(dead_snippets(source), ["{ return; }"]);
+    // With `x` promoted to `int` by the cast pattern, `x is! int` cannot
+    // hold: the then-branch is dead, reported as the single outermost
+    // block row.
+    let source =
+        "void f(Object? o) { switch (o) { case var x as int: if (x is! int) { return; } x; } }";
+    assert_eq!(dead_snippets(source), ["{ return; }"]);
 }
 
 /// Closures inside loops: the loop-head conservative join must not crash
@@ -1664,17 +1700,15 @@ fn dead_assert_statement_reports_dead_code() {
     assert_eq!(dead_snippets(source), ["assert"]);
 }
 
-/// A dead plain block reports at its `{`, and each statement entered
-/// inside it reports its own anchor (variable declarations anchor at the
-/// declared name, expression statements at their head): the fact layer
-/// reports per statement entered while unreachable. The oracle folds each
-/// dead region into one diagnostic spanning to the region's end
-/// (`dead_code_verifier.dart` `_firstDead`) — a documented consumer-side
-/// divergence.
+/// A dead plain block reports one row spanning the whole block extent,
+/// and statements entered inside it report nothing further: their
+/// unreachability is implied by the outermost row (official dead_code
+/// folds each dead region into one diagnostic,
+/// `dead_code_verifier.dart` `_firstDead`).
 #[test]
-fn dead_statement_block_reports_per_statement() {
+fn dead_statement_block_reports_outermost_row() {
     let source = "void f() { return; { var x = 1; x; } }";
-    assert_eq!(dead_snippets(source), ["{", "x", "x"]);
+    assert_eq!(dead_snippets(source), ["{ var x = 1; x; }"]);
 }
 
 /// A live try/finally block produces no fact: its `begin_block` fires with
@@ -1751,8 +1785,11 @@ fn is_not_then_branch_carries_the_factored_remainder() {
     use crate::ty::{Base, Ty};
     const INT: u32 = 102;
     const X: u32 = 7;
-    let events: Vec<Ev> = [declared(X, named_ty(INT, true)), is_test(X, named_ty(INT, false), true)]
-        .concat();
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, true)),
+        is_test(X, named_ty(INT, false), true),
+    ]
+    .concat();
     let interp = interp_of(events);
     let model = interp.current.model(0);
     assert_eq!(

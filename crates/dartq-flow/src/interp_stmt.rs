@@ -428,15 +428,10 @@ impl<'o> Interp<'o> {
                 let Some(frame_index) = self.switch_frame() else {
                     return true;
                 };
-                // Close the previous case body (official switch_afterCase).
+                // Close the previous case body (official switch_afterCase;
+                // no-op when `CaseExprBegin` already closed it).
                 self.switch_after_case(frame_index);
-                let (unmatched, is_default) = match &self.stack[frame_index] {
-                    Frame::Switch { unmatched, .. } => (unmatched.clone(), *expression_count == 0),
-                    _ => return true,
-                };
-                // Each alternative branches from the chained unmatched
-                // state (official switch_beginAlternative).
-                self.current = unmatched;
+                let is_default = *expression_count == 0;
                 if let Frame::Switch {
                     group_labels,
                     group_default,
@@ -446,14 +441,26 @@ impl<'o> Interp<'o> {
                 {
                     *group_labels |= *label_count > 0;
                     *group_default |= is_default;
-                    // A default case has no case-expression events: its
-                    // group opens immediately.
-                    *case_open = *expression_count == 0;
+                    // The clause heads opened this group through
+                    // `case_pattern_end` (official switch_endAlternative);
+                    // a default clause has no head events, so it opens the
+                    // group here — official `default` runs its
+                    // endAlternative with a true guard
+                    // (flow_analysis.dart:1725-1740).
+                    *case_open |= is_default;
                 }
             }
             Ev::CaseExprBegin => {
                 if self.collecting() {
                     return true;
+                }
+                // Official switch_afterCase closes the previous case body
+                // just before the next clause begins (contract at
+                // flow_analysis.dart:1656-1684: afterCase follows each
+                // body; the next clause's beginAlternative is the first
+                // event of that clause).
+                if let Some(frame_index) = self.switch_frame() {
+                    self.switch_after_case(frame_index);
                 }
                 self.case_pattern_begin(false);
             }
@@ -757,19 +764,20 @@ impl<'o> Interp<'o> {
         }) else {
             return;
         };
-        let (labeled, block, combined, default) = match &self.stack[frame_index] {
+        let (labeled, block, combined, default, chain) = match &self.stack[frame_index] {
             Frame::Switch {
                 group_labels,
                 block,
                 group_combined,
                 group_default,
-                case_open: _,
+                unmatched,
                 ..
             } => (
                 *group_labels,
                 block.clone(),
                 group_combined.clone(),
                 *group_default,
+                unmatched.clone(),
             ),
             _ => return,
         };
@@ -785,7 +793,20 @@ impl<'o> Interp<'o> {
             let joined = previous.conservative_join(&effects.written, &effects.captured, &finals);
             self.current = joined;
         } else {
-            self.current = combined.unwrap_or_else(|| self.current.clone());
+            // Official `switch_endAlternatives`
+            // (flow_analysis.dart:8044-8066): the body runs under the
+            // group's combined matched state; with no contributing clause
+            // it runs under the chained unmatched state. A default clause
+            // contributes the chain as its own alternative state (official
+            // `default` runs its endAlternative with a true guard, whose
+            // guard-true state is the chain), so a default-bearing group's
+            // body joins both.
+            let body = match combined {
+                Some(state) if default => self.join(Some(state), Some(chain)),
+                Some(state) => state,
+                None => chain,
+            };
+            self.current = body;
         }
         if default {
             // The default alternative always matches: no unmatched state

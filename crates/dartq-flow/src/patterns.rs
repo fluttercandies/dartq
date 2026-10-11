@@ -8,24 +8,51 @@ use crate::ty::{Base, Ty};
 impl<'o> Interp<'o> {
     /// Handles one pattern-layer event.
     pub(crate) fn pattern_step(&mut self, ev: &Ev, _events: &[Ev], _i: usize, _match_of: &[u32]) {
+        // The collect pre-pass tracks writes/declares only. The pattern
+        // state machine (matched/unmatched splits, guard snapshots) is a
+        // flow-walk concern, and a collect-run pattern context leaks
+        // across `collect_ranges`' rollback (its snapshot does not cover
+        // `self.pattern`), double-driving the head events the real walk
+        // then re-runs.
+        if self.collecting()
+            && matches!(
+                ev,
+                Ev::PatternBegin | Ev::PatternEnd | Ev::GuardBegin | Ev::GuardEnd
+            )
+        {
+            return;
+        }
         match ev {
             Ev::PatternBegin => {
                 self.pattern_depth += 1;
                 if self.pattern_depth == 1 {
-                    // Official `_pushPattern`: the unmatched sibling is the
-                    // pre-split state; the matched path continues in
-                    // `current`.
-                    let unmatched = self.current.clone();
-                    self.split_cur();
-                    // An if-case's scrutinee expression is on the stack.
-                    let scrutinee = self.exprs.pop().and_then(|e| e.reference);
-                    self.pattern = Some(PatternState {
-                        kind: std::mem::replace(&mut self.pattern_kind_hint, PatternKind::Decl),
-                        unmatched,
-                        scrutinee,
-                        guard: None,
-                        pending_decls: Vec::new(),
-                    });
+                    if self.pattern.is_some() {
+                        // A case head already opened the pattern context
+                        // (`case_pattern_begin`): official
+                        // `switch_beginAlternative` pushes exactly one
+                        // pattern context per clause, so the case-level
+                        // state IS the clause's context — keep its kind,
+                        // unmatched chain and scrutinee; only version the
+                        // matched path for the pattern's component joins.
+                        self.split_cur();
+                    } else {
+                        // Standalone pattern context (if-case, pattern
+                        // variable declaration): official `_pushPattern` —
+                        // the unmatched sibling is the pre-split state; the
+                        // matched path continues in `current`.
+                        let unmatched = self.current.clone();
+                        self.split_cur();
+                        // An if-case's scrutinee expression is on the stack.
+                        let scrutinee = self.exprs.pop().and_then(|e| e.reference);
+                        self.pattern = Some(PatternState {
+                            kind: std::mem::replace(&mut self.pattern_kind_hint, PatternKind::Decl),
+                            unmatched,
+                            scrutinee,
+                            guard: None,
+                            pre_guard: None,
+                            pending_decls: Vec::new(),
+                        });
+                    }
                 }
             }
             Ev::PatternEnd => {
@@ -77,8 +104,15 @@ impl<'o> Interp<'o> {
             }
             Ev::Wildcard { .. } => {}
             Ev::GuardBegin => {
-                // The guard expression evaluates under the matched state;
-                // its events run next.
+                // Snapshot the pre-guard state: the guard's own events run
+                // on `current` next and leave it on the guard-true arm, so
+                // this snapshot is the guard-false arm for the close's
+                // unmatched join.
+                if self.pattern.is_some() {
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.pre_guard = Some(self.current.clone());
+                    }
+                }
             }
             Ev::GuardEnd => {
                 let guard = self.exprs.pop();
@@ -93,10 +127,20 @@ impl<'o> Interp<'o> {
     }
 
     /// Opens the pattern context of a case expression (official
-    /// `switch_beginAlternative` + `_pushPattern`); `is_expr` selects the
+    /// `switch_beginAlternative`, flow_analysis.dart:7965-7971): the
+    /// clause's pattern runs under the switch frame's chained unmatched
+    /// state — earlier clauses' guard-false outcomes chain there — and one
+    /// pattern context opens for the clause. `is_expr` selects the
     /// switch-expression variant (no body lookahead, no case_open).
     pub(crate) fn case_pattern_begin(&mut self, is_expr: bool) {
-        let unmatched = self.current.clone();
+        let chain = self
+            .switch_frame()
+            .and_then(|frame_index| match &self.stack[frame_index] {
+                Frame::Switch { unmatched, .. } => Some(unmatched.clone()),
+                _ => None,
+            });
+        let unmatched = chain.unwrap_or_else(|| self.current.clone());
+        self.current = unmatched.clone();
         self.pattern = Some(PatternState {
             kind: if is_expr {
                 PatternKind::SwitchExpr
@@ -106,6 +150,7 @@ impl<'o> Interp<'o> {
             unmatched,
             scrutinee: None,
             guard: None,
+            pre_guard: None,
             pending_decls: Vec::new(),
         });
     }
@@ -172,7 +217,14 @@ impl<'o> Interp<'o> {
     }
 
     /// Applies a pattern's guard to split matched/unmatched, returning the
-    /// chained unmatched state (official `_popPattern`).
+    /// chained unmatched state (official `_popPattern`, fed by the clause's
+    /// `guardInfo` — flow_analysis.dart:8004-8042: the guard's true state
+    /// becomes the clause's matched state, the false state joins the
+    /// unmatched chain). The guard's own events ran on `current` between
+    /// `GuardBegin` and `GuardEnd` — its last branching event (e.g. the
+    /// type-test's `IsEnd`, interp_expr.rs) left `current` on the true arm
+    /// — so `current` IS the guard's ifTrue state and the `GuardBegin`
+    /// snapshot is its ifFalse.
     fn apply_pattern_exit(
         &mut self,
         mut pattern: PatternState,
@@ -180,9 +232,11 @@ impl<'o> Interp<'o> {
     ) -> crate::model::State {
         let mut unmatched = pattern.unmatched;
         if has_guard || matches!(pattern.kind, PatternKind::Switch | PatternKind::SwitchExpr) {
-            if let Some(guard) = pattern.guard.take() {
-                let (if_true, if_false) = self.cond_split(&guard);
-                self.current = if_true;
+            if pattern.guard.take().is_some() {
+                let if_false = pattern
+                    .pre_guard
+                    .take()
+                    .unwrap_or_else(|| self.current.clone());
                 unmatched = self.join(Some(unmatched), Some(if_false));
             }
         }

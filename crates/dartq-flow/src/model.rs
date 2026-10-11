@@ -512,7 +512,11 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
     // Written on one path since the branch or not, the conservative join is
     // the common (less specific) chain prefix either way; write-captured on
     // either path keeps no promotion at all (official `joinPromotionInfo`).
-    let promoted = if captured { NIL } else { join_promoted(a.promoted, b.promoted, lists) };
+    let promoted = if captured {
+        NIL
+    } else {
+        join_promoted(a.promoted, b.promoted, lists)
+    };
     let tested = union_tested(a.tested, b.tested, lists);
     VarModel {
         promoted,

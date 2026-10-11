@@ -84,6 +84,10 @@ pub(crate) struct PatternState {
     pub scrutinee: Option<u32>,
     /// The pattern's `when`-guard expression, if one fired.
     pub guard: Option<crate::interp_expr::Expr>,
+    /// The state at `GuardBegin`: the guard-false arm for the close's
+    /// unmatched join (the guard-true arm is `current` itself — the
+    /// guard's own events ran on it).
+    pub pre_guard: Option<State>,
     /// Pattern-declared variables awaiting scope flush (name id, final).
     pub pending_decls: Vec<(u32, bool)>,
 }
@@ -320,6 +324,12 @@ pub(crate) struct Interp<'o> {
     pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
     pub(crate) anywhere: Effects,
+    /// The unreachable reach node a dead-code row was already emitted
+    /// for. Descendant constructs inside the same dead region stay on
+    /// that node, so their rows are implied — official dead_code
+    /// reports one diagnostic per outermost dead statement and does
+    /// not descend.
+    dead_region: Option<u32>,
 
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
@@ -366,6 +376,7 @@ impl<'o> Interp<'o> {
             as_base: 0,
             for_header_depth: 0,
             anywhere: Effects::default(),
+            dead_region: None,
             collect: None,
             snapshot: None,
         }
@@ -514,7 +525,13 @@ impl<'o> Interp<'o> {
     }
 
     pub(crate) fn dead_code(&mut self, span: TokenSpan) {
-        if !self.reachable() {
+        // One row per dead region: constructs inside an already-marked
+        // dead region keep the same unreachable reach node, so their
+        // unreachability is implied by the outermost row (official
+        // dead_code emits per outermost dead statement). A revived
+        // region re-enters with a fresh reach node and reports again.
+        if !self.reachable() && self.dead_region != Some(self.current.reach) {
+            self.dead_region = Some(self.current.reach);
             self.emit(FlowFact::DeadCode { span });
         }
     }
@@ -999,8 +1016,7 @@ impl<'o> Interp<'o> {
         collection: bool,
     ) {
         let base = self.exprs.len();
-        let effects =
-            self.collect_ranges(events, &[bounds.init.start..bounds.body.end], match_of);
+        let effects = self.collect_ranges(events, &[bounds.init.start..bounds.body.end], match_of);
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);

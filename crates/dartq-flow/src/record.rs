@@ -40,6 +40,8 @@ pub struct Flow<'t> {
     pending_labels: Vec<u32>,
     /// Recording buffer of the outermost active executable, if any.
     buffer: Option<Vec<Ev>>,
+    /// Open `Ev::Block` event indices, for end-of-block span widening.
+    block_events: Vec<usize>,
     /// Executable nesting depth inside the active recording.
     exec_depth: usize,
     facts: Vec<FlowFact>,
@@ -54,6 +56,7 @@ impl<'t> Flow<'t> {
             pending_label_ref: None,
             pending_labels: Vec::new(),
             buffer: None,
+            block_events: Vec::new(),
             exec_depth: 0,
             facts: Vec::new(),
         }
@@ -319,9 +322,24 @@ impl<'t> ParserListener for Flow<'t> {
             }
         };
         self.record(Ev::Block { kind, span: token });
+        // The dead-code row for a dead block spans the full `{ ... }`
+        // extent (official dead_code reports the whole statement); the
+        // closing brace only arrives at `endBlock`, so remember the
+        // event index and widen it there.
+        if let Some(buffer) = &self.buffer {
+            self.block_events.push(buffer.len() - 1);
+        }
     }
 
-    fn end_block(&mut self, _count: usize, _begin: Token, _end: Token, _kind: BlockKind) {
+    fn end_block(&mut self, _count: usize, begin: Token, end: Token, _kind: BlockKind) {
+        if let (Some(buffer), Some(index)) = (&mut self.buffer, self.block_events.pop()) {
+            if let Some(Ev::Block { span, .. }) = buffer.get_mut(index) {
+                span.range = dartq_source::SourceRange {
+                    offset: begin.range.offset,
+                    length: end.range.offset + end.range.length - begin.range.offset,
+                };
+            }
+        }
         self.record(Ev::EndBlock);
     }
 
@@ -902,14 +920,18 @@ impl<'t> ParserListener for Flow<'t> {
         self.record(Ev::IsBegin);
     }
 
-    fn end_is_operator_type(&mut self, _operator: Token) {
-        self.record(Ev::IsEnd);
-    }
+    // The polarity only arrives with the follow-up `handle_is_operator`
+    // call (official `parseIsOperatorRest` fires `endIsOperatorType`
+    // before `handleIsOperator`), so the flow's completion pair is
+    // emitted there: the interp applies the branch at `IsEnd` from the
+    // `(is_not, tested)` state `IsOperator` establishes.
+    fn end_is_operator_type(&mut self, _operator: Token) {}
 
     fn handle_is_operator(&mut self, _is_operator: Token, not: Option<Token>) {
         self.record(Ev::IsOperator {
             is_not: not.is_some(),
         });
+        self.record(Ev::IsEnd);
     }
 
     fn begin_as_operator_type(&mut self, _operator: Token) {
@@ -1101,6 +1123,17 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn end_pattern_guard(&mut self, _token: Token) {
+        self.record(Ev::GuardEnd);
+    }
+
+    fn begin_switch_case_when_clause(&mut self, _token: Token) {
+        // A switch-statement case guard. The guard's value is mandatory
+        // flow input: official `switch_endAlternative` receives it as
+        // `guardInfo` (flow_analysis.dart:1725-1740).
+        self.record(Ev::GuardBegin);
+    }
+
+    fn end_switch_case_when_clause(&mut self, _token: Token) {
         self.record(Ev::GuardEnd);
     }
 
