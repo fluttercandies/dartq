@@ -98,6 +98,10 @@ pub struct RefRow {
     /// The use has an explicit qualifier (`p.x`) and cannot be shadowed by
     /// a local declaration (the official `isQualified` bit, spec §4).
     pub qualified: bool,
+    /// The import prefix that armed the resolution (`p` in `p.fa`) — the
+    /// §15.8 qualified-name spelling's qualifier half, resolved to its
+    /// interned spelling at the query boundary. `None` for bare uses.
+    pub qualifier: Option<StringId>,
 }
 
 /// One unresolved name use — the §8 names table row (the recovery surface
@@ -284,6 +288,7 @@ impl<'a> LibraryBuilder<'a> {
                             kind,
                             range,
                             qualified: false,
+                            qualifier: None,
                         }),
                         BareHit::Prefix(prefix) => armed = Some(prefix),
                         BareHit::Miss => self.names.push(NameRow {
@@ -295,11 +300,14 @@ impl<'a> LibraryBuilder<'a> {
                     }
                 }
                 Family::Continuation => {
-                    let hit = armed
-                        .take()
-                        .map(|prefix| self.namespaces.lookup_prefixed(self.lib, prefix, name));
+                    let hit = armed.take().map(|prefix| {
+                        (
+                            prefix,
+                            self.namespaces.lookup_prefixed(self.lib, prefix, name),
+                        )
+                    });
                     match hit {
-                        Some(Lookup::Found(NamespaceEntry::Decl(target))) => {
+                        Some((prefix, Lookup::Found(NamespaceEntry::Decl(target)))) => {
                             self.refs.push(RefRow {
                                 file,
                                 target_file: target,
@@ -307,6 +315,7 @@ impl<'a> LibraryBuilder<'a> {
                                 kind,
                                 range,
                                 qualified: true,
+                                qualifier: Some(prefix),
                             });
                         }
                         // No armed prefix (member access on an untyped
@@ -631,6 +640,11 @@ pub(crate) mod tests {
             fa_refs.iter().map(|row| row.qualified).collect::<Vec<_>>(),
             vec![false, true]
         );
+        assert_eq!(
+            fa_refs.iter().map(|row| row.qualifier).collect::<Vec<_>>(),
+            vec![None, Some(strings.intern("p"))],
+            "the prefixed twin carries its import prefix, the bare twin none"
+        );
         // The call span pins to the source (`fa()` line 6 of b).
         let fa_call = SRC_B.find("    fa();").expect("bare call") + 4;
         assert_eq!(fa_refs[0].range.offset as usize, fa_call);
@@ -907,6 +921,7 @@ pub(crate) mod tests {
             .expect("prefixed hit");
         assert_eq!(gone.len(), 1);
         assert!(gone[0].qualified);
+        assert_eq!(gone[0].qualifier, Some(strings.intern("p")));
 
         // `z.w;`: the bare miss `z` disarmed the prefix, so `w` is a member
         // access even though d.dart declares it.

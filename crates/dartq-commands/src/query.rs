@@ -28,7 +28,7 @@ pub struct SymbolRun<'a> {
     pub decls: Vec<DeclHit<'a>>,
     /// Every resolved reference to those declarations, path-then-offset
     /// order.
-    pub refs: Vec<RefHit>,
+    pub refs: Vec<RefHit<'a>>,
     /// Position/path resolution over the analyzed engine.
     pub layout: EngineLayout<'a>,
 }
@@ -151,21 +151,22 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
         .refs
         .iter()
         .map(|reference| {
-            json!({
+            let mut row = json!({
                 "target_file": run.layout.file_path(reference.target_file).display().to_string(),
                 "kind": ref_kind_name(reference.kind),
                 "file": run.layout.file_path(reference.file).display().to_string(),
-                // The §15.2 `qualified` column is the qualified NAME string,
-                // but the row model carries only the `isQualified` bit
-                // (`RefHit::qualified: bool`) — the use-site qualifier
-                // spelling is dropped at the index boundary. The field is
-                // the schema's optional convenience column, so it stays
-                // omitted rather than emitting a boolean (or an invented
-                // spelling); it returns when the qualifier is plumbed
-                // through `RefRow` → `RefHit`.
                 "offset": reference.range.offset,
                 "length": reference.range.length,
-            })
+            });
+            // The §15.8 convenience column: the qualified-name spelling,
+            // emitted only when an armed import prefix resolved the use
+            // (the schema's optional string — bare rows keep the key
+            // omitted). RefRows exist only for the queried name, so the
+            // queried spelling completes the column.
+            if let Some(prefix) = reference.qualified_name {
+                row["qualified"] = json!(format!("{prefix}.{name}"));
+            }
+            row
         })
         .collect();
     json!({
@@ -225,11 +226,28 @@ mod tests {
     const A: &str = "class Foo {\n  void meth() {}\n}\nvoid top() {}\n";
     const B: &str = "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  top();\n}\n";
     const C: &str = "import 'a.dart';\nvoid other() {\n  var f2 = Foo();\n}\n";
+    /// A prefixed import plus use site: the §15.8 qualified-name column
+    /// needs an armed import prefix to exercise the row (the shared
+    /// fixture's imports are bare).
+    const D: &str = "import 'a.dart' as p;\n\nvoid from_d() {\n  p.Foo();\n}\n";
 
     fn fixture(tag: &str) -> PathBuf {
         workspace(
             tag,
             &[("lib/a.dart", A), ("lib/b.dart", B), ("lib/c.dart", C)],
+        )
+    }
+
+    /// The shared surface plus the prefixed use site (`lib/d.dart`).
+    fn prefixed_fixture(tag: &str) -> PathBuf {
+        workspace(
+            tag,
+            &[
+                ("lib/a.dart", A),
+                ("lib/b.dart", B),
+                ("lib/c.dart", C),
+                ("lib/d.dart", D),
+            ],
         )
     }
 
@@ -252,9 +270,12 @@ mod tests {
             vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
             "both constructor sites, one per use file"
         );
-        for reference in &run.refs {
+        // RefHit borrows the engine's interned spellings, so the rows' ids
+        // are copied out before the table is consulted again.
+        let targets: Vec<_> = run.refs.iter().map(|r| r.target_file).collect();
+        for target in targets {
             assert_eq!(
-                engine.file_table().path(reference.target_file),
+                engine.file_table().path(target),
                 Some(a.as_path()),
                 "rows target a.dart's Foo"
             );
@@ -324,16 +345,28 @@ mod tests {
     /// constant.
     #[test]
     fn json_face_passes_the_query_contract() {
-        let root = fixture("query_json");
+        let root = prefixed_fixture("query_json");
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
 
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
         assert_eq!(json["schema_version"], dartq_schema::SCHEMA_VERSION_QUERY);
-        // The `qualified` convenience spelling stays omitted: the row model
-        // carries only the is-qualified bit, and the contract types the
-        // column as the qualified name string — no boolean may leak in.
-        assert!(json["references"][0].get("qualified").is_none());
+        // The §15.8 qualified-name column rides armed-prefix rows only:
+        // the bare sites keep the key omitted, the prefixed site spells
+        // `<qualifier>.<name>` (the schema's optional string). Rows sort
+        // by offset then use path: b (41), then c and d both 43 with the
+        // path tiebreak.
+        let qualified: Vec<Option<&str>> = json["references"]
+            .as_array()
+            .expect("references array")
+            .iter()
+            .map(|row| row["qualified"].as_str())
+            .collect();
+        assert_eq!(
+            qualified,
+            vec![None, None, Some("p.Foo")],
+            "bare b, bare c, prefixed d"
+        );
         let text = json.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
         for tier in [
