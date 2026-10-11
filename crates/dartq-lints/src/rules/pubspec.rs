@@ -1,17 +1,20 @@
-//! The pubspec family: `secure_pubspec_urls` (core) and `package_names`
-//! (recommended) — the non-Dart-artifact rules (official home
-//! `pkg/linter/lib/src/rules/pub/`).
+//! The pubspec family: `secure_pubspec_urls` (core), `package_names`
+//! (recommended), and `depend_on_referenced_packages` (core) — the official
+//! home is `pkg/linter/lib/src/rules/pub/`.
 //!
-//! They read `pubspec.yaml`, which the engine's [`Unit`][crate::Unit] does
-//! not carry (its facts are the Dart substrate: source, tokens, AST, line
-//! index, path, features — no pubspec face). Each rule is therefore
-//! **seam-mounted**: the body is a pure function over the pubspec fact its
-//! check consumes (one URL value / one `name:` value, with its byte range),
-//! returning report rows; the [`RuleSpec`] sits in [`crate::RULES`] for
-//! name/group/count alignment with `kinds: &[]`, so the traversal never
-//! dispatches it. The visited-field walk (which entries of the pubspec to
-//! feed in) is the official visitor's (:24-58 in each rule) and belongs to
-//! the mounting side. #434 mounts these as the pubspec data face lands.
+//! Two mounting shapes. `secure_pubspec_urls` and `package_names` read
+//! `pubspec.yaml` itself, which the engine's [`Unit`][crate::Unit] does not
+//! carry: the body is a pure function over one pubspec fact (one URL value
+//! / one `name:` value, with its byte range) returning report rows; the
+//! [`RuleSpec`] sits in [`crate::RULES`] for name/group/count alignment
+//! with `kinds: &[]`, and the pubspec pass at the mounting face
+//! (`dartq-commands` `analyze_lints`) walks the visited fields (the
+//! official visitor's :24-58) over the scanned facts
+//! (`dartq_pub::pubspec_facts`). `depend_on_referenced_packages` rides the
+//! normal AST dispatch (`kinds: [Import, Export]`) off the
+//! [`WorkspaceFacts`][crate::WorkspaceFacts] the mount attaches per unit.
+
+use dartq_ast::NodeKind;
 
 use crate::registry::{Group, RuleSpec};
 use crate::rules::not_dispatched;
@@ -24,9 +27,8 @@ pub(crate) mod secure_pubspec_urls {
     //! :24-58) must not use the `http` or `git` scheme (`_checkUrl`,
     //! :60-69). Message: `diagnostic.g.dart` `securePubspecUrls`.
     //!
-    //! The seam body is dead until #434 wires it (`kinds: &[]` keeps the
-    //! traversal from dispatching) — the allow below is the seam, not debt.
-    #![allow(dead_code)]
+    //! `kinds: &[]` — the verdict runs per pubspec value, not per AST node;
+    //! the pubspec pass at the mounting face feeds the visited fields.
 
     use super::{Group, RuleSpec, not_dispatched};
 
@@ -161,9 +163,8 @@ pub(crate) mod package_names {
     //! `isReservedWord` holds). Message: `diagnostic.g.dart`
     //! `packageNames`.
     //!
-    //! The seam body is dead until #434 wires it (`kinds: &[]` keeps the
-    //! traversal from dispatching) — the allow below is the seam, not debt.
-    #![allow(dead_code)]
+    //! `kinds: &[]` — the verdict runs per pubspec value, not per AST node;
+    //! the pubspec pass at the mounting face feeds the `name:` entry.
 
     use super::{Group, RuleSpec, not_dispatched};
 
@@ -358,6 +359,175 @@ pub(crate) mod package_names {
             out.clear();
             check_name(0..3, "foo", &mut out);
             assert!(out.is_empty());
+        }
+    }
+}
+
+pub(crate) mod depend_on_referenced_packages {
+    //! Official: `pkg/linter/lib/src/rules/pub/depend_on_referenced_packages.dart`
+    //! — an import or export whose URI is a plain `package:<name>/…`
+    //! string, whose `<name>` is neither the importing package itself nor
+    //! one of its (lib-visible) dependencies, reports at the URI node
+    //! (:58-79; the available set :44-55 — the own name, `dependencies`,
+    //! and `dev_dependencies` outside the public dirs, `isInPublicDir`,
+    //! ast.dart:112-129). Virtual packages (`flutter_gen`, :68-72) skip.
+    //!
+    //! Mounted on the AST dispatch off [`WorkspaceFacts`][crate::WorkspaceFacts]
+    //! (`Unit.workspace`): `None` is the official no-pubspec registration
+    //! gate (:33-40), keeping the rule silent. Message:
+    //! `diagnostic.g.dart` `dependOnReferencedPackages`.
+
+    use super::{Group, NodeKind, RuleSpec};
+
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "depend_on_referenced_packages",
+        group: Group::Core,
+        problem: "The imported package '{0}' isn't a dependency of the importing package.",
+        correction: "Try adding a dependency for '{0}' in the 'pubspec.yaml' file.",
+        kinds: &[NodeKind::Import, NodeKind::Export],
+        check,
+    };
+
+    /// The virtual packages that never report (:68-72).
+    const VIRTUAL_PACKAGES: [&str; 1] = ["flutter_gen"];
+
+    fn check(c: &mut crate::engine::Check<'_>) {
+        let Some(facts) = c.unit.workspace else {
+            return;
+        };
+        // Dev dependencies drop out of the available set in the public
+        // dirs (:47-55, isInPublicDir). A pathless run reads as outside
+        // them (dev deps available) — the official `cuPath == null` arm.
+        let public = c
+            .unit
+            .path
+            .is_some_and(|path| is_in_public_dir(path, &facts.root));
+        let Some((range, uri)) = crate::rules::directives::written_uri(c, c.node()) else {
+            return;
+        };
+        let dev = (!public).then_some(&facts.dev_dependencies);
+        if let Some(package) = check_uri(&facts.dependencies, dev, &uri) {
+            c.report(range, &[&package]);
+        }
+    }
+
+    /// The official `_checkDirective` (:58-79) over one directive URI:
+    /// `Some(package name)` reports at the URI node. `available` is the
+    /// own name plus the `dependencies` entries; `dev_available` carries
+    /// the `dev_dependencies` entries for units outside the public dirs
+    /// (the caller applies `isInPublicDir`).
+    #[must_use]
+    pub fn check_uri(
+        available: &rustc_hash::FxHashSet<String>,
+        dev_available: Option<&rustc_hash::FxHashSet<String>>,
+        uri: &str,
+    ) -> Option<String> {
+        let rest = uri.strip_prefix("package:")?;
+        let first_slash = rest.find('/')?;
+        let package_name = &rest[..first_slash];
+        if VIRTUAL_PACKAGES.contains(&package_name) {
+            return None;
+        }
+        if available.contains(package_name)
+            || dev_available.is_some_and(|dev| dev.contains(package_name))
+        {
+            return None;
+        }
+        Some(package_name.to_owned())
+    }
+
+    /// `isInPublicDir` (ast.dart:112-129): inside the package's `lib/` or
+    /// `bin/`, or one of the two hook files at the root.
+    pub(crate) fn is_in_public_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
+        path.starts_with(root.join("lib"))
+            || path.starts_with(root.join("bin"))
+            || path == root.join("hook").join("build.dart")
+            || path == root.join("hook").join("link.dart")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn set(names: &[&str]) -> rustc_hash::FxHashSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        }
+
+        /// A dependency import stays silent; a foreign package reports.
+        #[test]
+        fn foreign_package_reports() {
+            let available = set(&["own", "meta"]);
+            assert_eq!(
+                check_uri(&available, None, "package:foreign/foreign.dart"),
+                Some("foreign".to_owned())
+            );
+            assert_eq!(check_uri(&available, None, "package:meta/meta.dart"), None);
+        }
+
+        /// The own package's imports never report (:44-55).
+        #[test]
+        fn own_package_imports_stay_silent() {
+            assert_eq!(
+                check_uri(&set(&["own"]), None, "package:own/src/inner.dart"),
+                None
+            );
+        }
+
+        /// Dev dependencies count only where the caller passed them (the
+        /// public-dir gate is the mounter's, :47-55).
+        #[test]
+        fn dev_dependencies_honor_the_public_dir_gate() {
+            let dev = set(&["test"]);
+            assert_eq!(
+                check_uri(&set(&["own"]), Some(&dev), "package:test/test.dart"),
+                None
+            );
+            assert_eq!(
+                check_uri(&set(&["own"]), None, "package:test/test.dart"),
+                Some("test".to_owned())
+            );
+        }
+
+        /// Non-`package:` URIs (SDK, relative, truncated) never report
+        /// (:61-64).
+        #[test]
+        fn non_package_uris_stay_silent() {
+            let available = set(&["own"]);
+            assert_eq!(check_uri(&available, None, "dart:core"), None);
+            assert_eq!(check_uri(&available, None, "foo.dart"), None);
+            assert_eq!(check_uri(&available, None, "package:noname"), None);
+        }
+
+        /// Virtual packages skip (:68-72).
+        #[test]
+        fn virtual_packages_skip() {
+            assert_eq!(
+                check_uri(&set(&["own"]), None, "package:flutter_gen/gen.dart"),
+                None
+            );
+        }
+
+        /// The public-dir gate (`isInPublicDir`, ast.dart:112-129): under
+        /// `lib/` or `bin/`, or one of the two hook files.
+        #[test]
+        fn public_dir_gate() {
+            let root = std::path::Path::new("/pkg");
+            for public in [
+                "/pkg/lib/a.dart",
+                "/pkg/bin/run.dart",
+                "/pkg/hook/build.dart",
+            ] {
+                assert!(
+                    is_in_public_dir(std::path::Path::new(public), root),
+                    "{public}"
+                );
+            }
+            for private in ["/pkg/test/a.dart", "/pkg/lib2/a.dart", "/other/lib/a.dart"] {
+                assert!(
+                    !is_in_public_dir(std::path::Path::new(private), root),
+                    "{private}"
+                );
+            }
         }
     }
 }

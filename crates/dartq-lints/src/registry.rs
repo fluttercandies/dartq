@@ -69,7 +69,8 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the #478 pure-AST tranche. Order is registry
+/// All rules through the #586 standard-set completion (the full
+/// `package:lints` union: 34 core + 55 recommended-only). Order is registry
 /// order ([`RuleId`] assignment), grouped core-first then alphabetically
 /// within each group — keep the pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
@@ -78,17 +79,22 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::directives::avoid_relative_lib_imports::SPEC,
     &crate::rules::types::avoid_shadowing_type_parameters::SPEC,
     &crate::rules::names::avoid_types_as_parameter_names::SPEC,
+    &crate::rules::expressions::await_only_futures::SPEC,
     &crate::rules::names::camel_case_extensions::SPEC,
     &crate::rules::names::camel_case_types::SPEC,
+    &crate::rules::collections::collection_methods_unrelated_type::SPEC,
     &crate::rules::flow::SPEC,
     &crate::rules::docs::dangling_library_doc_comments::SPEC,
+    &crate::rules::pubspec::depend_on_referenced_packages::SPEC,
     &crate::rules::empty::empty_catches::SPEC,
     &crate::rules::names::file_names::SPEC,
     &crate::rules::declarations::hash_and_equals::SPEC,
+    &crate::rules::expressions::implicit_call_tearoffs::SPEC,
     &crate::rules::directives::library_annotations::SPEC,
     &crate::rules::flow::no_duplicate_case_values::SPEC,
     &crate::rules::names::no_wildcard_variable_uses::SPEC,
     &crate::rules::names::non_constant_identifier_names::SPEC,
+    &crate::rules::expressions::null_check_on_nullable_type_parameter::SPEC,
     &crate::rules::declarations::prefer_generic_function_type_aliases::SPEC,
     &crate::rules::expressions::prefer_is_empty::SPEC,
     &crate::rules::expressions::prefer_is_not_empty::SPEC,
@@ -98,11 +104,16 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::pubspec::secure_pubspec_urls::SPEC,
     &crate::rules::flow::type_literal_in_constant_pattern::SPEC,
     &crate::rules::docs::unintended_html_in_doc_comment::SPEC,
+    &crate::rules::declarations::unnecessary_overrides::SPEC,
+    &crate::rules::expressions::unrelated_type_equality_checks::SPEC,
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
     &crate::rules::regexp::valid_regexps::SPEC,
+    &crate::rules::expressions::void_checks::SPEC,
     // —— recommended (`.third/lints/lib/recommended.yaml`) ——
     &crate::rules::expressions::avoid_function_literals_in_foreach_calls::SPEC,
+    &crate::rules::declarations::annotate_overrides::SPEC,
     &crate::rules::declarations::avoid_init_to_null::SPEC,
+    &crate::rules::declarations::avoid_renaming_method_parameters::SPEC,
     &crate::rules::declarations::avoid_return_types_on_setters::SPEC,
     &crate::rules::flow::avoid_returning_null_for_void::SPEC,
     &crate::rules::expressions::avoid_single_cascade_in_expression_statements::SPEC,
@@ -112,11 +123,13 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::empty::empty_statements::SPEC,
     &crate::rules::flow::exhaustive_cases::SPEC,
     &crate::rules::directives::implementation_imports::SPEC,
+    &crate::rules::expressions::invalid_runtime_check_with_js_interop_types::SPEC,
     &crate::rules::directives::library_prefixes::SPEC,
     &crate::rules::types::library_private_types_in_public_api::SPEC,
     &crate::rules::directives::no_leading_underscores_for_library_prefixes::SPEC,
     &crate::rules::names::no_leading_underscores_for_local_identifiers::SPEC,
     &crate::rules::expressions::null_closures::SPEC,
+    &crate::rules::declarations::overridden_fields::SPEC,
     &crate::rules::pubspec::package_names::SPEC,
     &crate::rules::expressions::prefer_adjacent_string_concatenation::SPEC,
     &crate::rules::collections::prefer_collection_literals::SPEC,

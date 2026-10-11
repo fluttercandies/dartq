@@ -164,13 +164,12 @@ fn registry_fits_the_enable_set_word_count() {
     );
 }
 
-/// The slice pin: 18 wave-1, 18 wave-2, 6 directive-milestone, 10 wave-3,
-/// 12 #353-completion, 4 #315-wave-3, 4 #435-release-gate-seam and 5 #478
-/// pure-AST rules make 77 registered — every `package:lints` member is
-/// either here or documented-blocked in the crate docs.
+/// The slice pin: 77 rules through #478 plus the 12 #586 standard-set
+/// completions make 89 — the full `package:lints` union (34 core + 55
+/// recommended-only), with no member left blocked or documented-out.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 77);
+    assert_eq!(RULES.len(), 89);
 }
 
 /// The two camelCase registry spellings are the yaml/LintNames forms

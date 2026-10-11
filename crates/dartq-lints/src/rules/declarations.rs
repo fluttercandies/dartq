@@ -1951,18 +1951,1029 @@ fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
     }
 }
 
-/// The `get`/`set` keyword token of a member declaration, by lexeme.
-/// `Method` payload word 1 and `TopLevelMethod` payload word 0 are the
-/// `get_set` option (collapse map §3.3).
-fn get_set_token<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
-    let word = match c.kind(node) {
-        NodeKind::Method => 1,
-        NodeKind::TopLevelMethod => 0,
-        _ => return None,
+pub(crate) use crate::rules::get_set_token;
+
+pub(crate) mod annotate_overrides {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{MemberQuery, has_override_annotation, member_matches, same_file_ancestors};
+
+    /// Official: `pkg/linter/lib/src/rules/annotate_overrides.dart` — an
+    /// instance field or method (getters/setters/operators ride the same
+    /// `MethodDeclaration` face) that overrides an inherited member without
+    /// a `@override` annotation reports at the member's name token, with
+    /// the inherited member's name as the argument (:40-72).
+    ///
+    /// Approximations (documented): `overriddenMember`
+    /// (`extensions.dart:389-406` — `getInheritedMember`, abstract or
+    /// concrete, interfaces included) is the same-file ancestor chain built
+    /// from the written supertype names (extends/with/on/implements,
+    /// `same_file_ancestors(concrete: false)`). Cross-file ancestors
+    /// (imports, the SDK) resolve to no row and never report — the dominant
+    /// under-report face. The static skips (:57, :68), the augmentation
+    /// skip (augmentations are scanner-gated off), the extension-type skip
+    /// (:58, :69) and the `@override` check (:42) port directly. The
+    /// primary-constructor parameter face (:74-93) stays unported. A
+    /// field's lookup answers the getter name namespace (:391 — the
+    /// field's getter); a same-named ancestor *method* (a member-namespace
+    /// conflict, erroneous code) stays silent here. Message:
+    /// `diagnostic.g.dart` `annotateOverrides`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "annotate_overrides",
+        group: Group::Recommended,
+        problem: "The member '{0}' overrides an inherited member but isn't annotated with '@override'.",
+        correction: "Try adding the '@override' annotation.",
+        kinds: &[NodeKind::Fields, NodeKind::Method],
+        check,
     };
-    match c.payload(node).get(word) {
-        Some(&token) if token != NONE_TOKEN => Some(c.lexeme(token)),
-        _ => None,
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        if !is_instance_member(c, node) {
+            return;
+        }
+        // The body: the member's parent — the MemberEnd collapse enters
+        // members into the body's children directly (collapse map §3.3
+        // MemberEnd D1); hand-built tables may skip the wrapper.
+        let Some(owner) = c.ancestor(1) else {
+            return;
+        };
+        if !matches!(
+            c.kind(owner),
+            NodeKind::DeclarationBody
+                | NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::ExtensionDeclaration
+        ) {
+            return;
+        }
+        // `element.metadata.hasOverride` (:42).
+        if has_override_annotation(c, owner, node) {
+            return;
+        }
+        let Some(&class_row) = class_row_of(c) else {
+            return;
+        };
+        let query = match c.kind(node) {
+            NodeKind::Method => MemberQuery::Method,
+            _ => MemberQuery::Getter,
+        };
+        for name_row in member_names(c, node) {
+            // Both faces name at the row's span head (the method's
+            // `Identifier`, the field's width-0-at-name
+            // `InitializedIdentifier`); the official report anchors at the
+            // name token.
+            let name_token = c.head_token(name_row);
+            let name = c.lexeme(name_token);
+            let inherited = same_file_ancestors(c, class_row, false)
+                .into_iter()
+                .find_map(|ancestor| inherited_member(c, ancestor, query, name));
+            if inherited.is_some() {
+                let range = crate::rules::utf16_token_span(c, name_token);
+                c.report(range, &[name]);
+            }
+        }
+    }
+
+    /// The first member of `ancestor`'s body matching `query` by `name`.
+    fn inherited_member(
+        c: &Check<'_>,
+        ancestor: u32,
+        query: MemberQuery,
+        name: &str,
+    ) -> Option<u32> {
+        crate::rules::body_members(c, ancestor)
+            .into_iter()
+            .find(|&member| !member_matches(c, member, query, name).is_empty())
+    }
+
+    /// The instance-member gates shared with the other override rules:
+    /// fields by their kind payload, methods by the header ModSet bit
+    /// (collapse map §1 — static is bit 3), extension-type members out of
+    /// face (:58, :69).
+    fn is_instance_member(c: &Check<'_>, node: u32) -> bool {
+        const STATIC_BIT: u16 = 1 << 3;
+        match c.kind(node) {
+            NodeKind::Fields => {
+                c.payload(node).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                    && !in_extension_type(c)
+            }
+            NodeKind::Method => {
+                dartq_ast::mod_flags(c.unit.ast, node) & STATIC_BIT == 0 && !in_extension_type(c)
+            }
+            _ => false,
+        }
+    }
+
+    fn in_extension_type(c: &Check<'_>) -> bool {
+        c.path
+            .iter()
+            .any(|&a| c.kind(a) == NodeKind::ExtensionTypeDeclaration)
+    }
+
+    /// The nearest enclosing class-like row (extension types excluded —
+    /// their members never report).
+    fn class_row_of<'a>(c: &'a Check<'a>) -> Option<&'a u32> {
+        c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        })
+    }
+
+    /// The checked name rows: the method's name (`Identifier` in the
+    /// method context, or the operator name), a field group's every
+    /// declared variable (:60-62 — the `InitializedIdentifier` rows, whose
+    /// span head is the name token).
+    fn member_names(c: &Check<'_>, node: u32) -> Vec<u32> {
+        match c.kind(node) {
+            NodeKind::Method => c
+                .collect_direct(node)
+                .into_iter()
+                .filter(|&kid| {
+                    matches!(c.kind(kid), NodeKind::OperatorName)
+                        || (c.kind(kid) == NodeKind::Identifier
+                            && c.payload(kid).first()
+                                == Some(
+                                    &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
+                                ))
+                })
+                .collect(),
+            _ => {
+                let mut names = Vec::new();
+                for decl in c.collect_direct(node) {
+                    if c.kind(decl) != NodeKind::VariablesDeclaration {
+                        continue;
+                    }
+                    for var in c.collect_direct(decl) {
+                        if c.kind(var) == NodeKind::InitializedIdentifier
+                            && crate::rules::initialized_identifier_name(c, var).is_some()
+                        {
+                            names.push(var);
+                        }
+                    }
+                }
+                names
+            }
+        }
+    }
+}
+
+pub(crate) mod avoid_renaming_method_parameters {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{
+        MemberQuery, has_doc_comment, member_is_concrete, member_matches, same_file_ancestors,
+        utf16_token_span,
+    };
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_renaming_method_parameters.dart`
+    /// — an overriding method whose positional parameter names differ from
+    /// the inherited concrete method's reports at each renamed parameter
+    /// token, with `(name, inherited name)` (:90-114).
+    ///
+    /// Approximations (documented): the inherited concrete member
+    /// (`getInheritedConcreteMember`, :76-79) is the same-file
+    /// extends/with/on chain, concrete members only (an abstract
+    /// declaration never counts). The lib-directory gate (:37
+    /// `isInLibDir` — the file lives under the package's `lib/`) reads the
+    /// unit path's `lib` component. The skips port: static methods (:56),
+    /// methods with a documentation comment (:57), getters/setters/
+    /// operators (no parameter list, :59-61), named parameters (positional
+    /// only, :90). Wildcard `_` parameters skip on both sides (:97-106,
+    /// feature-gated, the shipped default). The augmentation branch
+    /// (:82-88) stays unported (augmentations are scanner-gated off).
+    /// Cross-file inherited methods under-report. Message:
+    /// `diagnostic.g.dart` `avoidRenamingMethodParameters`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_renaming_method_parameters",
+        group: Group::Recommended,
+        problem: "The parameter name '{0}' doesn't match the name '{1}' in the overridden method.",
+        correction: "Try changing the name to '{1}'.",
+        kinds: &[NodeKind::Method],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // `if (!context.isInLibDir) return` (:37).
+        let in_lib = c
+            .unit
+            .path
+            .is_some_and(|path| path.components().any(|part| part.as_os_str() == "lib"));
+        if !in_lib {
+            return;
+        }
+        let node = c.node();
+        // Static skip (:56) — header ModSet bit (static is bit 3).
+        const STATIC_BIT: u16 = 1 << 3;
+        if dartq_ast::mod_flags(c.unit.ast, node) & STATIC_BIT != 0 {
+            return;
+        }
+        // A documentation comment on the override skips (:57).
+        if has_doc_comment(c, node) {
+            return;
+        }
+        let Some(params) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return; // getters/setters/operators have no parameters (:59-61)
+        };
+        let Some(&class_row) = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        }) else {
+            return;
+        };
+        let Some(name_row) = c.collect_direct(node).into_iter().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && c.payload(kid).first()
+                    == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+        }) else {
+            return;
+        };
+        let name = c.lexeme(c.head_token(name_row));
+        let Some(inherited) = same_file_ancestors(c, class_row, true)
+            .into_iter()
+            .find_map(|ancestor| {
+                crate::rules::body_members(c, ancestor)
+                    .into_iter()
+                    .find(|&member| {
+                        // The concreteness test reads the member container —
+                        // `member_matches` answers name rows, not the member.
+                        c.kind(member) == NodeKind::Method
+                            && member_is_concrete(c, member)
+                            && !member_matches(c, member, MemberQuery::Method, name).is_empty()
+                    })
+            })
+        else {
+            return;
+        };
+        let inherited_names: Vec<&str> = inherited_positional_names(c, inherited);
+        let mine = positional_params(c, params);
+        let count = mine.len().min(inherited_names.len());
+        let mut renames: Vec<(u32, &str, &str)> = Vec::new();
+        for i in 0..count {
+            let (_, mine_token) = mine[i];
+            let mine_name = c.lexeme(mine_token);
+            let inherited_name = inherited_names[i];
+            if is_wildcard(c, mine_name) || is_wildcard(c, inherited_name) {
+                continue;
+            }
+            if mine_name != inherited_name {
+                renames.push((mine_token, mine_name, inherited_name));
+            }
+        }
+        // The names borrow `c`; own them before reporting.
+        let renames: Vec<(u32, String, String)> = renames
+            .into_iter()
+            .map(|(t, m, i)| (t, m.to_owned(), i.to_owned()))
+            .collect();
+        for (token, mine_name, inherited_name) in renames {
+            let range = utf16_token_span(c, token);
+            c.report(range, &[mine_name.as_str(), inherited_name.as_str()]);
+        }
+    }
+
+    /// The `_` wildcard face (:51-52, :97-106) — feature-gated, the
+    /// shipped default is on.
+    fn is_wildcard(c: &Check<'_>, name: &str) -> bool {
+        c.unit.features.wildcard_variables && name == "_"
+    }
+
+    /// The `(receiver, name-token)` pairs of the positional parameters,
+    /// required group then `[]` group, in order (:90 — named parameters
+    /// stay out).
+    fn positional_params(c: &Check<'_>, params: u32) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for section in c.collect_direct(params) {
+            match c.kind(section) {
+                NodeKind::FormalParameter => {
+                    if let Some(pair) = param_pair(c, section) {
+                        out.push(pair);
+                    }
+                }
+                NodeKind::OptionalFormalParameters => {
+                    // The `[]` group is positional; the `{}` group is named.
+                    if c.lexeme(c.head_token(section)) != "[" {
+                        continue;
+                    }
+                    for param in c.collect_direct(section) {
+                        if c.kind(param) == NodeKind::FormalParameter
+                            && let Some(pair) = param_pair(c, param)
+                        {
+                            out.push(pair);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A formal's `(receiver, name)` tokens (receiver formals keep their
+    /// written name — `this.x` names `x`).
+    fn param_pair(c: &Check<'_>, param: u32) -> Option<(u32, u32)> {
+        let payload = c.payload(param);
+        let name = payload.get(1).copied()?;
+        (name != crate::rules::NONE_TOKEN).then_some((0, name))
+    }
+
+    /// The inherited method's positional parameter names, in order (the
+    /// member row is the lookup's answer — no second body scan).
+    fn inherited_positional_names<'a>(c: &'a Check<'_>, member: u32) -> Vec<&'a str> {
+        let Some(params) = c
+            .collect_direct(member)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return Vec::new();
+        };
+        positional_params(c, params)
+            .into_iter()
+            .map(|(_, token)| c.lexeme(token))
+            .collect()
+    }
+}
+
+pub(crate) mod overridden_fields {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{MemberQuery, member_matches, same_file_ancestors};
+
+    /// Official: `pkg/linter/lib/src/rules/overridden_fields.dart` — an
+    /// instance field whose inherited concrete member is a variable-backed
+    /// getter reports at the field name, with the defining interface's name
+    /// as the argument (:66-81).
+    ///
+    /// Approximations (documented): `getInheritedConcreteMember` (:69-71)
+    /// is the same-file extends/with/on chain, concrete members only; the
+    /// variable-backed getter test (`isOriginVariable`, :72-73) is the
+    /// ancestor's `Fields` rows exclusively (a declared getter never
+    /// matches). The defining interface (:74-78) is the nearest ancestor
+    /// class row declaring the field — the most-specific concrete
+    /// declaration, as the official lookup resolves. Static fields skip
+    /// (:40), augmentations are scanner-gated off, and the
+    /// primary-constructor parameter face (:50-64) stays unported.
+    /// Cross-file ancestors under-report. Message: `diagnostic.g.dart`
+    /// `overriddenFields`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "overridden_fields",
+        group: Group::Recommended,
+        problem: "Field overrides a field inherited from '{0}'.",
+        correction: "Try removing the field, overriding the getter and setter if necessary.",
+        kinds: &[NodeKind::Fields],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.isStatic` (:40).
+        if c.payload(node).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32)) {
+            return;
+        }
+        let Some(&class_row) = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        }) else {
+            return;
+        };
+        let chain = same_file_ancestors(c, class_row, true);
+        let fields: Vec<(&str, u32)> = field_names(c, node)
+            .into_iter()
+            .map(|(n, r)| (n, r))
+            .collect();
+        // The nearest concrete variable-backed declaration in the chain
+        // supplies the defining interface (:69-78); names collect owned —
+        // the lookup borrows `c` immutably across the report.
+        let mut hits: Vec<(u32, String)> = Vec::new();
+        for (name, name_row) in fields {
+            if let Some(defining) = chain.iter().find_map(|&ancestor| {
+                crate::rules::body_members(c, ancestor)
+                    .into_iter()
+                    .find(|&member| {
+                        c.kind(member) == NodeKind::Fields
+                            && !member_matches(c, member, MemberQuery::Variable, name).is_empty()
+                    })
+                    .and_then(|_| declaration_name(c, ancestor))
+            }) {
+                hits.push((name_row, defining.to_owned()));
+            }
+        }
+        for (name_row, defining) in hits {
+            let range = c.utf16_span(name_row);
+            c.report(range, &[defining.as_str()]);
+        }
+    }
+
+    /// The `(name lexeme, name row)` pairs of one `Fields` group.
+    fn field_names<'a>(c: &Check<'a>, node: u32) -> Vec<(&'a str, u32)> {
+        let mut out = Vec::new();
+        for decl in c.collect_direct(node) {
+            if c.kind(decl) != NodeKind::VariablesDeclaration {
+                continue;
+            }
+            for var in c.collect_direct(decl) {
+                if c.kind(var) != NodeKind::InitializedIdentifier {
+                    continue;
+                }
+                if let Some(row) = crate::rules::initialized_identifier_name(c, var) {
+                    out.push((c.lexeme(row), row));
+                }
+            }
+        }
+        out
+    }
+
+    /// The declared class-like name of the ancestor row.
+    fn declaration_name<'a>(c: &'a Check<'a>, class_row: u32) -> Option<&'a str> {
+        crate::rules::class_declaration_name(c, class_row)
+    }
+}
+pub(crate) mod unnecessary_overrides {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{
+        MemberQuery, has_any_annotation, has_doc_comment, member_is_concrete, member_matches,
+        same_file_ancestors, token_seq_equal, type_before,
+    };
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_overrides.dart` —
+    /// an override whose body is exactly a super forward with the same
+    /// parameters reports at the method name (:52-113, the four faces).
+    ///
+    /// Approximations (documented): the inherited concrete member is the
+    /// same-file extends/with/on chain (an abstract declaration never
+    /// counts; cross-file under-reports). The signature-equality guard
+    /// (`_haveSameDeclaration`, :133-155 — element types) reads written
+    /// shapes: same written return type (token run equality or both
+    /// absent), same parameter count, per-parameter kind group, name,
+    /// written prefix run (type + `covariant`), and default value run —
+    /// differing-but-subtype spellings and resolved defaults under-report.
+    /// The metadata guard (:117-131) skips on any annotation except
+    /// `@override` (the `@protected` pairing reads the written name). The
+    /// noSuchMethod and doc-comment skips (:76-79), the body-shape walk
+    /// (:52-113: one statement / arrow body, no comments before the
+    /// `return`, super target, same-name selector, arguments naming the
+    /// parameters) and the setter write face (:313-326) port structurally;
+    /// the operator faces (:245-292) stay unported (operator forwards have
+    /// no parameter-name face to preserve). Message: `diagnostic.g.dart`
+    /// `unnecessaryOverrides`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_overrides",
+        group: Group::Core,
+        problem: "Unnecessary override.",
+        correction: "Try adding behavior in the overriding member or removing the override.",
+        kinds: &[NodeKind::Method],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.isStatic` (:332) — header ModSet bit.
+        const STATIC_BIT: u16 = 1 << 3;
+        if dartq_ast::mod_flags(c.unit.ast, node) & STATIC_BIT != 0 {
+            return;
+        }
+        let Some(name_row) = c.collect_direct(node).into_iter().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && c.payload(kid).first()
+                    == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+        }) else {
+            return; // operators stay unported (documented)
+        };
+        let name = c.lexeme(c.head_token(name_row));
+        // 'noSuchMethod' is mandatory to proxify (:76).
+        if name == "noSuchMethod" {
+            return;
+        }
+        // It's ok to override to have better documentation (:79).
+        if has_doc_comment(c, node) {
+            return;
+        }
+        let get_set = super::get_set_token(c, node);
+        let query = match get_set {
+            Some("get") => MemberQuery::Getter,
+            Some("set") => MemberQuery::Setter,
+            _ => MemberQuery::Method,
+        };
+        let Some(&class_row) = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        }) else {
+            return;
+        };
+        // The inherited concrete member (:81-82).
+        let Some(inherited) = same_file_ancestors(c, class_row, true)
+            .into_iter()
+            .find_map(|ancestor| {
+                crate::rules::body_members(c, ancestor)
+                    .into_iter()
+                    .find(|&member| {
+                        c.kind(member) == NodeKind::Method
+                            && member_is_concrete(c, member)
+                            && !member_matches(c, member, query, name).is_empty()
+                    })
+            })
+        else {
+            return;
+        };
+        // It's ok to override to add annotations (:87, :117-131).
+        let Some(owner) = c.ancestor(1) else {
+            return;
+        };
+        if has_any_annotation(c, owner, node) {
+            return;
+        }
+        // It's ok to override to change the signature (:90, :133-155).
+        if !same_declaration(c, node, name_row, inherited) {
+            return;
+        }
+        // The body walk (:95, :52-113).
+        if forwards_to_super(c, node, query, name) {
+            let range = c.utf16_span(name_row);
+            c.report(range, &[]);
+        }
+    }
+
+    /// `_haveSameDeclaration` (:133-155) over written shapes: return type,
+    /// then every parameter's name, kind group, receiver, prefix run
+    /// (written type + modifiers) and default run.
+    fn same_declaration(c: &Check<'_>, mine: u32, mine_name: u32, inherited: u32) -> bool {
+        // The inherited method's name row (the query matched it). The
+        // member-name identifier carries the `MethodDeclaration` context —
+        // a written return type's own name tiles before it in the
+        // completion order, so the first `Identifier` is not the name.
+        let kids = c.collect_direct(inherited);
+        let Some(inherited_name) = kids
+            .iter()
+            .copied()
+            .find(|&kid| {
+                c.kind(kid) == NodeKind::Identifier
+                    && c.payload(kid).first()
+                        == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+            })
+            .or_else(|| {
+                kids.iter()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::OperatorName)
+            })
+        else {
+            return false;
+        };
+        // Return types: same written spelling or both absent (:138-140).
+        match (
+            type_before(c, mine, mine_name),
+            type_before(c, inherited, inherited_name),
+        ) {
+            (None, None) => {}
+            (Some(a), Some(b)) if token_seq_equal(c, a.0, b.0) => {}
+            _ => return false,
+        }
+        let (Some(mine_params), Some(inherited_params)) = (
+            c.collect_direct(mine)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters),
+            c.collect_direct(inherited)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters),
+        ) else {
+            // Both sides are accessors — no parameter lists to differ.
+            return true;
+        };
+        let a = flat_params(c, mine_params);
+        let b = flat_params(c, inherited_params);
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(p, q)| {
+                p.name == q.name
+                    && p.group == q.group
+                    && p.receiver == q.receiver
+                    && prefix_run(c, p.name_token) == prefix_run(c, q.name_token)
+                    && default_run(c, p.name_token) == default_run(c, q.name_token)
+            })
+    }
+
+    /// One parameter's comparable face: receiver lexeme (`this`/`super`/
+    /// `covariant`), name lexeme, kind group (0 required, 1 optional
+    /// positional, 2 named).
+    struct ParamFace<'a> {
+        receiver: Option<&'a str>,
+        name: &'a str,
+        name_token: u32,
+        group: u8,
+    }
+
+    /// Every parameter of a list in order, all groups.
+    fn flat_params<'a>(c: &'a Check<'_>, params: u32) -> Vec<ParamFace<'a>> {
+        let mut out = Vec::new();
+        for section in c.collect_direct(params) {
+            match c.kind(section) {
+                NodeKind::FormalParameter => {
+                    if let Some(face) = param_face(c, section, 0) {
+                        out.push(face);
+                    }
+                }
+                NodeKind::OptionalFormalParameters => {
+                    let group: u8 = if c.lexeme(c.head_token(section)) == "{" {
+                        2
+                    } else {
+                        1
+                    };
+                    for param in c.collect_direct(section) {
+                        if c.kind(param) == NodeKind::FormalParameter
+                            && let Some(face) = param_face(c, param, group)
+                        {
+                            out.push(face);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn param_face<'a>(c: &'a Check<'_>, param: u32, group: u8) -> Option<ParamFace<'a>> {
+        let payload = c.payload(param);
+        let receiver = payload.first().copied().unwrap_or(crate::rules::NONE_TOKEN);
+        let name_token = payload.get(1).copied()?;
+        if name_token == crate::rules::NONE_TOKEN {
+            return None;
+        }
+        let receiver = (receiver != crate::rules::NONE_TOKEN).then(|| c.lexeme(receiver));
+        Some(ParamFace {
+            receiver,
+            name: c.lexeme(name_token),
+            name_token,
+            group,
+        })
+    }
+
+    /// The written tokens before a parameter's name, back to the enclosing
+    /// boundary — the type-and-modifier run (`covariant int?`).
+    fn prefix_run<'a>(c: &'a Check<'_>, name_token: u32) -> Vec<&'a str> {
+        let mut run = Vec::new();
+        let mut token = name_token;
+        for _ in 0..64 {
+            let Some(prev) = token.checked_sub(1) else {
+                break;
+            };
+            token = prev;
+            match c.lexeme(prev) {
+                "," | "(" | ")" | "{" | "}" | "[" | "]" | ";" | "=" | "<" => break,
+                lex => run.push(lex),
+            }
+        }
+        run.reverse();
+        run
+    }
+
+    /// The written tokens after a parameter's name up to the next
+    /// boundary — the default value run (presence and spelling).
+    fn default_run<'a>(c: &'a Check<'_>, name_token: u32) -> Vec<&'a str> {
+        let mut run = Vec::new();
+        let mut token = name_token;
+        for _ in 0..64 {
+            token += 1;
+            if c.unit.tokens.get(token as usize).is_none() {
+                break;
+            }
+            match c.lexeme(token) {
+                "," | ")" | "}" | "]" | ";" | "{" => break,
+                lex => run.push(lex),
+            }
+        }
+        run
+    }
+
+    /// The body walk (:52-113): an arrow body's expression — the childless
+    /// `ExpressionBody` handle keeps the expression as the member window's
+    /// trailing rows — or a block body's single statement, whose rows tile
+    /// flat into the block (the statement row itself trails the
+    /// expression; the `return`-comment guard :105, no guard on a bare
+    /// expression statement :69-71); then the face shape.
+    fn forwards_to_super(c: &Check<'_>, node: u32, query: MemberQuery, name: &str) -> bool {
+        let kids = c.collect_direct(node);
+        let Some(&body) = kids
+            .iter()
+            .find(|&&kid| matches!(c.kind(kid), NodeKind::BlockBody | NodeKind::ExpressionBody))
+        else {
+            return false;
+        };
+        let rows: Vec<u32> = match c.kind(body) {
+            NodeKind::ExpressionBody => {
+                // The expression completes before the childless handle
+                // opens (bridge `handle_expression_function_body`): the
+                // member-window pieces before the handle, from the arrow
+                // on — the signature rows tile before the arrow and drop
+                // out.
+                let arrow_end = crate::rules::byte_span_of_token(c, c.head_token(body)).end;
+                let pos = kids.iter().position(|&kid| kid == body).unwrap_or(0);
+                kids[..pos]
+                    .iter()
+                    .copied()
+                    .filter(|&row| c.byte_span(row).start >= arrow_end)
+                    .collect()
+            }
+            _ => {
+                // Statement tiling: the statement rows (and their expression
+                // pieces) are the body row's own children on production
+                // parses — a `Block` wrapper row exists only in hand-built
+                // trees.
+                let block_rows = match c
+                    .collect_direct(body)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Block)
+                {
+                    Some(block) => c.collect_direct(block),
+                    None => c.collect_direct(body),
+                };
+                // Exactly one statement (:52-56): the statement's own row
+                // is the block window's last row, and no other statement
+                // row precedes it.
+                let Some((&last, head)) = block_rows.split_last() else {
+                    return false;
+                };
+                if head
+                    .iter()
+                    .any(|&row| crate::rules::is_statement_row(c, row))
+                {
+                    return false;
+                }
+                match c.kind(last) {
+                    NodeKind::ExpressionStatement => head.to_vec(),
+                    NodeKind::ReturnStatement => {
+                        if c.comments.has_attached(c.head_token(last) as usize) {
+                            return false;
+                        }
+                        c.collect_direct(last)
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        match query {
+            MemberQuery::Method => super_call_forwards(c, &rows, name, node),
+            MemberQuery::Getter => super_getter_forwards(c, &rows, name),
+            MemberQuery::Setter => {
+                let Some(param) = sole_parameter(c, node) else {
+                    return false;
+                };
+                super_setter_forwards(c, &rows, name, param)
+            }
+            MemberQuery::Variable => false,
+        }
+    }
+
+    /// The setter's single parameter name (:314-316 — one parameter).
+    fn sole_parameter<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
+        let params = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)?;
+        let faces = flat_params(c, params);
+        match faces.as_slice() {
+            [one] => Some(one.name),
+            _ => None,
+        }
+    }
+
+    /// The method face (:232-242): a super invocation of `name` whose
+    /// arguments name the parameters (`argumentsMatchParameters`,
+    /// `dart_type_utilities.dart:13-49`).
+    fn super_call_forwards(c: &Check<'_>, rows: &[u32], name: &str, node: u32) -> bool {
+        let Some(send_pos) = rows.iter().position(|&row| c.kind(row) == NodeKind::Send) else {
+            return false;
+        };
+        // The callee head and the argument group (flat production tiling).
+        let Some((head, arguments)) = crate::rules::slice::send_parts(c, rows, send_pos) else {
+            return false;
+        };
+        // The target is `super` and the selector names the member.
+        if head == 0 || c.kind(rows[head - 1]) != NodeKind::SuperExpression {
+            return false;
+        }
+        if c.lexeme(c.head_token(rows[head])) != name {
+            return false;
+        }
+        // The invocation is the whole expression: nothing after the send
+        // but its own access marker.
+        let trailing = &rows[send_pos + 1..];
+        if trailing
+            .iter()
+            .any(|&row| !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified))
+        {
+            return false;
+        }
+        let Some(arguments) = arguments else {
+            return false;
+        };
+        // The parameter names in order: positional group then named group.
+        let params = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters);
+        let Some(params) = params else {
+            return false;
+        };
+        let faces = flat_params(c, params);
+        let positional: Vec<&str> = faces
+            .iter()
+            .filter(|f| f.group != 2)
+            .map(|f| f.name)
+            .collect();
+        let named: Vec<&str> = faces
+            .iter()
+            .filter(|f| f.group == 2)
+            .map(|f| f.name)
+            .collect();
+        arguments_match_parameters(c, arguments, &positional, &named)
+    }
+
+    /// `argumentsMatchParameters` (:13-49): each positional argument is
+    /// the bare identifier of the corresponding positional parameter; the
+    /// named arguments cover the named parameters one-to-one, each value
+    /// the bare identifier of its parameter.
+    fn arguments_match_parameters(
+        c: &Check<'_>,
+        arguments: u32,
+        positional: &[&str],
+        named: &[&str],
+    ) -> bool {
+        let rows = c.collect_direct(arguments);
+        // Split the flattened rows into arguments: a named group runs from
+        // its label to the marker; a positional argument is one row. The
+        // bare-name send group's markers tile beside each argument root and
+        // stay out of the split.
+        let mut pos_args: Vec<&str> = Vec::new();
+        let mut named_args: Vec<(&str, &str)> = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            if crate::rules::slice::is_send_group_piece(c, rows[i]) {
+                i += 1;
+                continue;
+            }
+            if c.kind(rows[i]) == NodeKind::NamedArgument {
+                // The label is the identifier two tokens back; the value is
+                // the root row before the marker (its send group trails).
+                let Some(label) = crate::rules::slice::named_arg_name(c, &rows, i) else {
+                    return false;
+                };
+                let Some(value_row) = (0..i)
+                    .rev()
+                    .find(|&j| !crate::rules::slice::is_send_group_piece(c, rows[j]))
+                    .map(|j| rows[j])
+                else {
+                    return false;
+                };
+                if c.kind(value_row) != NodeKind::Identifier {
+                    return false;
+                }
+                named_args.push((
+                    c.lexeme(c.head_token(rows[label])),
+                    c.lexeme(c.head_token(value_row)),
+                ));
+                i += 1;
+                continue;
+            }
+            if c.kind(rows[i]) != NodeKind::Identifier {
+                return false;
+            }
+            pos_args.push(c.lexeme(c.head_token(rows[i])));
+            i += 1;
+        }
+        if pos_args.len() != positional.len()
+            || pos_args.iter().zip(positional).any(|(a, p)| a != p)
+        {
+            return false;
+        }
+        if named_args.len() != named.len() {
+            return false;
+        }
+        named.iter().all(|param| {
+            named_args
+                .iter()
+                .any(|(label, value)| *label == *param && *value == *param)
+        })
+    }
+
+    /// The getter face (:204-208): a super property read of `name` —
+    /// `super.name`, nothing else. The trailing send group (the bare-name
+    /// `parse_send` markers and leaf) tiles beside the chain rows.
+    fn super_getter_forwards(c: &Check<'_>, rows: &[u32], name: &str) -> bool {
+        // The access marker spans the whole read; the send group trails it.
+        let mut end = rows.len();
+        while end > 0
+            && (matches!(
+                c.kind(rows[end - 1]),
+                NodeKind::DotAccess | NodeKind::Qualified
+            ) || crate::rules::slice::is_send_group_piece(c, rows[end - 1]))
+        {
+            end -= 1;
+        }
+        let [target, property] = &rows[..end] else {
+            return false;
+        };
+        c.kind(*target) == NodeKind::SuperExpression
+            && c.kind(*property) == NodeKind::Identifier
+            && c.lexeme(c.head_token(*property)) == name
+    }
+
+    /// The setter face (:313-326): an assignment whose right side is the
+    /// bare parameter and whose left side is the super property.
+    fn super_setter_forwards(c: &Check<'_>, rows: &[u32], name: &str, param: &str) -> bool {
+        let Some((idx, &assignment)) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| c.kind(**row) == NodeKind::Assignment)
+        else {
+            return false;
+        };
+        let Some(&op) = c.payload(assignment).first() else {
+            return false;
+        };
+        if c.lexeme(op) != "=" {
+            return false;
+        }
+        let Some(op_start) = c
+            .unit
+            .tokens
+            .get(op as usize)
+            .map(|t| t.byte_offset as usize)
+        else {
+            return false;
+        };
+        // The operand runs: rows left/right of the operator byte, from the
+        // statement's own rows and the assignment's adopted window (the
+        // right side's pieces tile before the adopted window opens).
+        let window = c.children(assignment);
+        let mut lhs: Vec<u32> = rows[..idx]
+            .iter()
+            .copied()
+            .filter(|&row| c.byte_span(row).end <= op_start)
+            .collect();
+        lhs.extend((window.start..window.end).filter(|&row| c.byte_span(row).end <= op_start));
+        let mut rhs: Vec<u32> = rows
+            .iter()
+            .copied()
+            .filter(|&row| row != assignment && c.byte_span(row).start >= op_start)
+            .collect();
+        rhs.extend((window.start..window.end).filter(|&row| c.byte_span(row).start >= op_start));
+        // LHS: `super.name` (an access marker and the bare-name send group
+        // may trail).
+        while lhs.len() > 2
+            && (matches!(
+                c.kind(lhs[lhs.len() - 1]),
+                NodeKind::DotAccess | NodeKind::Qualified
+            ) || crate::rules::slice::is_send_group_piece(c, lhs[lhs.len() - 1]))
+        {
+            lhs.pop();
+        }
+        let [target, property] = lhs.as_slice() else {
+            return false;
+        };
+        if c.kind(*target) != NodeKind::SuperExpression
+            || c.kind(*property) != NodeKind::Identifier
+            || c.lexeme(c.head_token(*property)) != name
+        {
+            return false;
+        }
+        // RHS: the bare parameter identifier (the send group trails).
+        while rhs.len() > 1
+            && (matches!(
+                c.kind(rhs[rhs.len() - 1]),
+                NodeKind::DotAccess | NodeKind::Qualified
+            ) || crate::rules::slice::is_send_group_piece(c, rhs[rhs.len() - 1]))
+        {
+            rhs.pop();
+        }
+        // The left selector's own send-group markers anchor right of the
+        // operator byte (the width-0 `NoArguments` sits at the value head),
+        // so they leak into the rhs head — they carry no face here.
+        let lead = rhs
+            .iter()
+            .position(|&row| !crate::rules::slice::is_send_group_piece(c, row))
+            .unwrap_or(rhs.len());
+        rhs.drain(..lead);
+        matches!(rhs.as_slice(), [only] if c.kind(*only) == NodeKind::Identifier && c.lexeme(c.head_token(*only)) == param)
     }
 }
 
@@ -4160,5 +5171,161 @@ mod tests {
         let lints = f.run(&one_rule("prefer_function_declarations_over_variables"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 6));
+    }
+
+    // ---- #586 standard-set completions (production-bridge fixtures) ----
+
+    /// `annotate_overrides` (:58-64): a member overriding without
+    /// `@override` reports its name. The message is the current official
+    /// template (`diagnostic.g.dart` `annotateOverrides` problemMessage:
+    /// "The member '{0}' overrides an inherited member but isn't annotated
+    /// with '@override'.") with the member name as `{0}`.
+    #[test]
+    fn annotate_overrides_reports_unannotated_member() {
+        let f = Fixture::parse(
+            "class A { int x = 0; void foo() {} }\nclass B extends A {\n  int x = 1;\n  void foo() {}\n  void own() {}\n}",
+        );
+        let lints = f.run(&one_rule("annotate_overrides"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The member 'x' overrides an inherited member but isn't annotated with '@override'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "The member 'foo' overrides an inherited member but isn't annotated with '@override'."
+        );
+    }
+
+    /// `@override`-annotated members and members with no inherited
+    /// namesake stay silent (:42, :96-99).
+    #[test]
+    fn annotate_overrides_annotation_and_non_overrides_pass() {
+        let f = Fixture::parse(
+            "class A { int x = 0; void foo() {} }\nclass B extends A {\n  @override\n  int x = 1;\n  @override\n  void foo() {}\n}",
+        );
+        assert!(f.run(&one_rule("annotate_overrides")).is_empty());
+    }
+
+    /// The `lib/` gate (`rule_context.dart:15-21`) plus the wildcard and
+    /// doc-comment skips of `avoid_renaming_method_parameters`.
+    #[test]
+    fn avoid_renaming_reports_renamed_parameters_in_lib() {
+        let mut f = Fixture::parse(
+            "class A { void foo(int aa, String bb) {} }\nclass B extends A {\n  void foo(int cc, String dd) {}\n}",
+        );
+        f.path = "lib/a.dart".into();
+        let lints = f.run(&one_rule("avoid_renaming_method_parameters"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The parameter name 'cc' doesn't match the name 'aa' in the overridden method."
+        );
+        assert_eq!(
+            lints[1].message,
+            "The parameter name 'dd' doesn't match the name 'bb' in the overridden method."
+        );
+    }
+
+    #[test]
+    fn avoid_renaming_gates() {
+        let source =
+            "class A { void foo(int aa) {} }\nclass B extends A {\n  void foo(int cc) {}\n}";
+        // Outside `lib/` the official rule never registers its visitors
+        // (`avoid_renaming_method_parameters.dart:33` —
+        // `if (!context.isInLibDir) return;`).
+        let mut f = Fixture::parse(source);
+        f.path = "tool/gen.dart".into();
+        assert!(
+            f.run(&one_rule("avoid_renaming_method_parameters"))
+                .is_empty()
+        );
+
+        // Matching names, wildcards, and a documented rename stay silent.
+        let mut f = Fixture::parse(
+            "class A { void foo(int aa, int bb, int cc) {} }\nclass B extends A {\n  /// Keep `cc` renamed for docs.\n  void foo(int aa, int _, int cc) {}\n}",
+        );
+        f.path = "lib/a.dart".into();
+        assert!(
+            f.run(&one_rule("avoid_renaming_method_parameters"))
+                .is_empty()
+        );
+    }
+
+    /// An abstract inherited method has no concrete parameter names to
+    /// match (`getInheritedConcreteMember` face) — no report.
+    #[test]
+    fn avoid_renaming_abstract_inherited_passes() {
+        let mut f = Fixture::parse(
+            "abstract class A { void foo(int aa); }\nclass B extends A {\n  void foo(int cc) {}\n}",
+        );
+        f.path = "lib/a.dart".into();
+        assert!(
+            f.run(&one_rule("avoid_renaming_method_parameters"))
+                .is_empty()
+        );
+    }
+
+    /// `overridden_fields` (:41-47): a field redeclaring an inherited
+    /// instance field reports.
+    #[test]
+    fn overridden_fields_reports_redeclared_field() {
+        let f = Fixture::parse("class A { int x = 0; }\nclass B extends A { int x = 1; }");
+        let lints = f.run(&one_rule("overridden_fields"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Field overrides a field inherited from 'A'."
+        );
+    }
+
+    /// Declared getters/setters are not variable-backed fields
+    /// (`isOriginVariable` face) and static members are not instance
+    /// members — neither reports.
+    #[test]
+    fn overridden_fields_setter_and_static_passes() {
+        let f = Fixture::parse(
+            "class A { set x(int v) {} static int s = 0; }\nclass B extends A { int x = 1; static int s = 1; }",
+        );
+        assert!(f.run(&one_rule("overridden_fields")).is_empty());
+    }
+
+    /// `unnecessary_overrides` (:52-113): a pure `super` forward reports;
+    /// abstract inherited methods have nothing to forward to.
+    #[test]
+    fn unnecessary_overrides_reports_bare_super_forward() {
+        let f = Fixture::parse(
+            "class A { void foo(int aa) {} }\nclass B extends A {\n  void foo(int aa) { super.foo(aa); }\n}",
+        );
+        let lints = f.run(&one_rule("unnecessary_overrides"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary override.");
+    }
+
+    #[test]
+    fn unnecessary_overrides_abstract_and_extra_work_passes() {
+        // Abstract inherited: no concrete member to forward to.
+        let f = Fixture::parse(
+            "abstract class A { void foo(int aa); }\nclass B extends A {\n  void foo(int aa) { super.foo(aa); }\n}",
+        );
+        assert!(f.run(&one_rule("unnecessary_overrides")).is_empty());
+
+        // Two statements: the override does more than forward (:52-56).
+        let f = Fixture::parse(
+            "class A { void foo(int aa) {} }\nclass B extends A {\n  void foo(int aa) { super.foo(aa); aa++; }\n}",
+        );
+        assert!(f.run(&one_rule("unnecessary_overrides")).is_empty());
+    }
+
+    /// Getter/setter forwards through every body form.
+    #[test]
+    fn unnecessary_overrides_accessors() {
+        let f = Fixture::parse(
+            "class A {\n  int get g => 1;\n  set s(int v) {}\n}\nclass B extends A {\n  int get g => super.g;\n  set s(int v) { super.s = v; }\n}",
+        );
+        let lints = f.run(&one_rule("unnecessary_overrides"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary override.");
+        assert_eq!(lints[1].message, "Unnecessary override.");
     }
 }

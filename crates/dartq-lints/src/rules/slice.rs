@@ -36,6 +36,19 @@ pub(crate) fn owner_slice(c: &Check<'_>) -> Option<(Vec<u32>, usize)> {
     Some((kids, pos))
 }
 
+/// The operand run before a statement-level operator container: the pieces
+/// after the last statement row (statement tiling trails the container row
+/// in the enclosing block, so everything up to it belongs to earlier
+/// statements). Runs with no statement row keep every piece (the
+/// initializer / argument single-expression parents).
+fn statement_run(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
+    let start = run
+        .iter()
+        .rposition(|&row| crate::rules::is_statement_row(c, row))
+        .map_or(0, |i| i + 1);
+    run[start..].to_vec()
+}
+
 /// The adopted-begin operator container's (`BinaryExpression`,
 /// `Assignment`) operand runs. The container flattens its operand subtrees
 /// into its own completion window, but a member-access operand's pieces stay
@@ -59,8 +72,9 @@ pub(crate) fn owner_slice(c: &Check<'_>) -> Option<(Vec<u32>, usize)> {
 ///
 /// Divergence (documented): when the parent holds earlier expression
 /// siblings (argument lists), their subtree roots fall below the adopted
-/// window and would join the left run; every current caller's parent owns a
-/// single expression (statement / initializer), so the run is exact there.
+/// window and would join the left run; a statement-run parent is bounded at
+/// its last statement row ([`statement_run`]), and an initializer parent
+/// owns a single expression, so the run is exact there.
 pub(crate) fn binary_operands(c: &Check<'_>) -> Option<(Vec<u32>, Vec<u32>)> {
     let node = c.node();
     let op_token = c.payload(node).first().copied()?;
@@ -69,14 +83,14 @@ pub(crate) fn binary_operands(c: &Check<'_>) -> Option<(Vec<u32>, Vec<u32>)> {
     let parent = c.ancestor(1)?;
     let kids = c.collect_direct(parent);
     let below: Vec<u32> = match kids.iter().position(|&kid| kid == node) {
-        Some(pos) if pos > 0 => kids[..pos].to_vec(),
+        Some(pos) if pos > 0 => statement_run(c, &kids[..pos]),
         _ => {
             let grand = c.ancestor(2)?;
             let owner_kids = c.collect_direct(grand);
             let Some(container_pos) = owner_kids.iter().position(|&kid| kid == parent) else {
                 return None;
             };
-            owner_kids[..container_pos].to_vec()
+            statement_run(c, &owner_kids[..container_pos])
         }
     };
     let mut rows: Vec<u32> = below
@@ -151,6 +165,35 @@ pub(crate) fn access_marker(
 ) -> Option<u32> {
     let &access = kids.get(pos.checked_add(1)?)?;
     (c.kind(access) == kind && c.utf16_span(access) == c.utf16_span(kids[pos])).then_some(access)
+}
+
+/// Whether the row is one of the bare-identifier send group's marker
+/// pieces (`NoTypeArguments | TypeArguments`, `NoArguments`, `Send`):
+/// `parse_send` emits the full group for every bare name, and the group's
+/// pieces tile beside the access-chain rows — the operand-run readers skip
+/// them when they look for the `[target, name]` faces.
+pub(crate) fn is_send_group_piece(c: &Check<'_>, row: u32) -> bool {
+    matches!(
+        c.kind(row),
+        NodeKind::NoTypeArguments
+            | NodeKind::TypeArguments
+            | NodeKind::NoArguments
+            | NodeKind::Send
+    )
+}
+
+/// The access-chain operand run over an owner slice: the pieces minus the
+/// childless access markers and the bare-identifier send group's marker
+/// pieces ([`is_send_group_piece`]) — what remains for the
+/// `[ThisExpression, name]` / `[name]` face matches.
+pub(crate) fn access_run(c: &Check<'_>, rows: &[u32]) -> Vec<u32> {
+    rows.iter()
+        .copied()
+        .filter(|&row| {
+            !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
+                && !is_send_group_piece(c, row)
+        })
+        .collect()
 }
 
 /// Whether the four pieces starting at `start` are the bare-identifier

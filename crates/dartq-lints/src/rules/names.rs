@@ -403,7 +403,9 @@ pub(crate) mod non_constant_identifier_names {
                 for var in c.direct_children(node).iter().copied() {
                     if c.kind(var) == NodeKind::InitializedIdentifier {
                         let name = c.head_token(var);
-                        if name != NONE_TOKEN {
+                        // A recovery-inserted name is an empty-lexeme token;
+                        // a real declared name always carries text.
+                        if name != NONE_TOKEN && !c.lexeme(name).is_empty() {
                             hits.push(name);
                         }
                     }
@@ -530,18 +532,30 @@ pub(crate) mod non_constant_identifier_names {
                 }
             }
             NodeKind::RecordLiteral => {
+                // Collect first: the field scan re-enters `direct_children`,
+                // and the scratch RefCell forbids a live outer guard.
                 let mut hits: Vec<u32> = Vec::new();
-                for field in c.direct_children(node).iter().copied() {
+                for field in c.collect_direct(node) {
                     if c.kind(field) != NodeKind::NamedRecordField {
                         continue;
                     }
-                    if let Some(name) = c
-                        .direct_children(field)
-                        .iter()
-                        .copied()
-                        .find(|&ch| c.kind(ch) == NodeKind::Identifier)
+                    // The childless marker anchors at the VALUE head (the
+                    // event fires after the value parses, bridge
+                    // `handle_named_record_field`); the colon payload and
+                    // the name sit immediately before it.
+                    let Some(&colon) = c.payload(field).first() else {
+                        continue;
+                    };
+                    let Some(name) = colon.checked_sub(1) else {
+                        continue;
+                    };
+                    let Some(token) = c.unit.tokens.get(name as usize) else {
+                        continue;
+                    };
+                    if token.kind == dartq_scanner::TokenKind::Identifier
+                        && !c.token_is_synthetic(name)
                     {
-                        hits.push(c.head_token(name));
+                        hits.push(name);
                     }
                 }
                 for name in hits {
@@ -549,12 +563,15 @@ pub(crate) mod non_constant_identifier_names {
                 }
             }
             NodeKind::RecordType => {
+                // Collect first: `collect_entry_name` re-enters
+                // `direct_children`, and the scratch RefCell forbids a live
+                // outer guard.
                 let mut hits: Vec<u32> = Vec::new();
-                for entry in c.direct_children(node).iter().copied() {
+                for entry in c.collect_direct(node) {
                     match c.kind(entry) {
                         NodeKind::RecordTypeEntry => collect_entry_name(c, entry, &mut hits),
                         NodeKind::RecordTypeNamedFields => {
-                            for sub in c.direct_children(entry).iter().copied() {
+                            for sub in c.collect_direct(entry) {
                                 if c.kind(sub) == NodeKind::RecordTypeEntry {
                                     collect_entry_name(c, sub, &mut hits);
                                 }
@@ -572,11 +589,14 @@ pub(crate) mod non_constant_identifier_names {
     }
 
     fn collect_entry_name(c: &Check<'_>, entry: u32, hits: &mut Vec<u32>) {
-        if let Some(name) = c
-            .direct_children(entry)
-            .iter()
-            .copied()
-            .find(|&ch| c.kind(ch) == NodeKind::Identifier)
+        // The field name is the entry's RecordFieldDeclaration-context
+        // identifier; the type's identifiers carry type-reference contexts
+        // and must not be scanned.
+        let ctx = dartq_parser::IdentifierContext::RecordFieldDeclaration as u32;
+        if let Some(name) =
+            c.direct_children(entry).iter().copied().find(|&ch| {
+                c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+            })
         {
             hits.push(c.head_token(name));
         }
@@ -1859,6 +1879,59 @@ mod tests {
     }
 
     // —— file_names ——————————————————————————————————————————————————————
+
+    /// Regression pin: the record-literal and record-type field scans
+    /// re-enter `direct_children` per field, so both run over an owned
+    /// collect — these shapes panicked on a nested scratch borrow before
+    /// the collect-first fix (M0 gate). Expectations follow the official
+    /// gate: `isLowerCamelCase` passes a lone uppercase identifier
+    /// (utils.dart:68-71, `id.length == 1 && isUpperCase(...)`), so the
+    /// reporting face is a multi-character violation — the official
+    /// `test_recordFields` pins `(x: 1)` clean against `([!XX!]: 1)`.
+    #[test]
+    fn non_constant_record_field_scans_survive_nested_children() {
+        let f = Fixture::parse("void main() { const r = (n: 1, m: 2); }");
+        assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
+
+        let f = Fixture::parse("void main() { const r = (XX: 1, YY: 2); }");
+        let lints = f.run(&one_rule("non_constant_identifier_names"));
+        assert_eq!(
+            lints.len(),
+            2,
+            "both multi-char uppercase field names report"
+        );
+    }
+
+    /// The record-type-annotation face (official `test_recordFields`, type
+    /// side): record-type entry names report like record-literal names — a
+    /// multi-char upper-camel name reports (the lone-uppercase pass,
+    /// utils.dart:68-71, keeps single letters clean), lowercase passes. This
+    /// face was untestable until the entry events carried their token
+    /// bounds: the bridge anchored the first entry at the last sealed node,
+    /// tripping the builder's span assert on every positional record type.
+    #[test]
+    fn non_constant_record_type_annotation_fields_report() {
+        let f = Fixture::parse("void main() { (int NN, int MM) t = (1, 2); }");
+        assert_eq!(
+            f.run(&one_rule("non_constant_identifier_names")).len(),
+            2,
+            "both positional record-type field names report"
+        );
+
+        // The named shape exercises the recovery VariablesDeclaration (the
+        // parser lane's record-type-entry scope): the synthetic empty name
+        // must not report — see the empty-lexeme guard in the
+        // VariablesDeclaration arm.
+        let f = Fixture::parse("void main() { ({int NN}) t; }");
+        assert_eq!(
+            f.run(&one_rule("non_constant_identifier_names")).len(),
+            1,
+            "the named record-type field name reports"
+        );
+
+        let f = Fixture::parse("void main() { (int n, int m) t = (1, 2); }");
+        assert!(f.run(&one_rule("non_constant_identifier_names")).is_empty());
+    }
 
     #[test]
     fn file_names_reports_a_mixed_case_name() {

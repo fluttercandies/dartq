@@ -867,6 +867,148 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
     }
 }
 
+pub(crate) mod collection_methods_unrelated_type {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{slice, type_face_of_field};
+
+    /// Official: `pkg/linter/lib/src/rules/collection_methods_unrelated_type.dart`
+    /// — a single-argument invocation of a collection method whose argument
+    /// type is unrelated to the receiver's type argument reports at the
+    /// argument, with `(argument type, expected type)` (:243-265). The
+    /// method table (:117-177): `Iterable.contains` → `E`,
+    /// `List.remove`/`Set.remove`/`Queue.remove` → `E`, `Set.lookup` →
+    /// `E`, `Map.[]` → `K`, `Map.containsKey`/`Map.remove` → `K`,
+    /// `Map.containsValue` → `V`.
+    ///
+    /// Approximation (documented): the receiver type is the same-class
+    /// field's written type, read off `this.<field>` (bare `<field>`
+    /// inside instance scope over-reports under shadowing — the user-
+    /// shadowed family; a top-level or sibling-class name of the same
+    /// spelling over-reports too). The written type arguments stand in
+    /// for the resolved ones; an omitted argument list (raw `List`) carries
+    /// no verdict. The argument type is the scalar-literal face (`int`,
+    /// `double`, `String`, `bool`, `null`); unknown arguments stay silent.
+    /// The relation (`typesAreUnrelated`) ports as: equal names, `num`
+    /// against `int`/`double`, `Object`/`dynamic` against everything,
+    /// nullable-`?` against `Null`, and `Comparable`/`Pattern` (the core
+    /// supertypes the scalars implement) are comparable — everything else
+    /// reports. The index-operator face (`Map.[]`, :180-200) and the
+    /// cross-file `Queue` row stay unported (no written receiver face).
+    /// Message: `diagnostic.g.dart` `collectionMethodsUnrelatedType`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "collection_methods_unrelated_type",
+        group: Group::Core,
+        problem: "The argument type '{0}' isn't related to '{1}'.",
+        correction: "Try changing the argument or element type to match.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        // The statement's own run: expression rows tile flat in the
+        // enclosing block (the span-only statement leaf trails them), so
+        // the send's owner slice can span earlier statements — the
+        // receiver read starts after the last one.
+        let start = kids[..pos]
+            .iter()
+            .rposition(|&row| crate::rules::is_statement_row(c, row))
+            .map_or(0, |i| i + 1);
+        let kids = &kids[start..];
+        let pos = pos - start;
+        let Some((head, Some(arguments))) = slice::send_parts(c, kids, pos) else {
+            return;
+        };
+        let name = c.lexeme(c.head_token(kids[head]));
+        // The receiver run: the pieces before the selector, read through
+        // the access-run form (the markers and the bare-name send group
+        // tile beside the chain rows).
+        let mut end = head;
+        while end > 0
+            && matches!(
+                c.kind(kids[end - 1]),
+                NodeKind::NoTypeArguments | NodeKind::TypeArguments
+            )
+        {
+            end -= 1;
+        }
+        let trimmed = slice::access_run(c, &kids[..end]);
+        let field = match trimmed.as_slice() {
+            [target, field] if c.kind(*target) == NodeKind::ThisExpression => {
+                c.lexeme(c.head_token(*field))
+            }
+            [field] if c.kind(*field) == NodeKind::Identifier => c.lexeme(c.head_token(*field)),
+            _ => return,
+        };
+        let Some(face) = type_face_of_field(c, field) else {
+            return;
+        };
+        let Some((index, _)) = expected_slot(name, face.name.unwrap_or("")) else {
+            return;
+        };
+        if face.type_arguments.len() <= index {
+            return; // raw or argument-less written type: no verdict
+        }
+        // The single scalar-literal argument (:203-205).
+        let arg_rows = c.collect_direct(arguments);
+        let [arg] = arg_rows.as_slice() else {
+            return;
+        };
+        let Some(arg_type) = literal_type_name(c, *arg) else {
+            return;
+        };
+        let (element, element_nullable) = face.type_arguments[index];
+        if comparable(element, element_nullable, arg_type) {
+            return;
+        }
+        let mut expected = element.to_owned();
+        if element_nullable {
+            expected.push('?');
+        }
+        let range = c.utf16_span(*arg);
+        c.report(range, &[arg_type, &expected]);
+    }
+
+    /// The method's expected slot: `(type-argument index, declaring
+    /// containers)` — `None` when the method is outside the table. `String`
+    /// joins `contains` through its `Iterable<String>` face.
+    fn expected_slot(method: &str, written: &str) -> Option<(usize, ())> {
+        match (method, written) {
+            ("contains", "List" | "Set" | "Iterable" | "String") => Some((0, ())),
+            ("remove", "List" | "Set") => Some((0, ())),
+            ("remove", "Map") => Some((0, ())),
+            ("lookup", "Set") => Some((0, ())),
+            ("containsKey", "Map") => Some((0, ())),
+            ("containsValue", "Map") => Some((1, ())),
+            _ => None,
+        }
+    }
+
+    /// The scalar-literal type face; `null` answers `"Null"`.
+    fn literal_type_name(c: &Check<'_>, row: u32) -> Option<&'static str> {
+        match c.kind(row) {
+            NodeKind::LiteralInt => Some("int"),
+            NodeKind::LiteralDouble => Some("double"),
+            NodeKind::StringLiteral => Some("String"),
+            NodeKind::LiteralBool => Some("bool"),
+            NodeKind::LiteralNull => Some("Null"),
+            _ => None,
+        }
+    }
+
+    /// `typesAreUnrelated` on the ported faces (documented on the SPEC).
+    fn comparable(element: &str, element_nullable: bool, arg: &str) -> bool {
+        element == arg
+            || matches!(
+                element,
+                "Object" | "dynamic" | "void" | "Comparable" | "Pattern"
+            )
+            || (element == "num" && matches!(arg, "int" | "double"))
+            || (element_nullable && arg == "Null")
+    }
+}
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1295,6 +1437,48 @@ mod tests {
         );
         assert!(
             f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+                .is_empty()
+        );
+    }
+    // ---- #586: collection_methods_unrelated_type (production bridge) ----
+
+    /// A scalar-literal argument unrelated to the receiver's written type
+    /// argument reports at the argument; comparable arguments and methods
+    /// outside the table stay silent.
+    #[test]
+    fn collection_methods_unrelated_type_reports_mismatched_argument() {
+        let f = Fixture::parse(
+            "class C {\n  List<int> list = [];\n  Set<String> set = {};\n  Map<int, String> map = {};\n  void m() {\n    this.list.contains('x');\n    this.set.remove(1);\n    this.map.containsKey('k');\n    this.map.containsValue(1);\n    this.list.contains(1);\n    this.list.length;\n  }\n}",
+        );
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 4, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "The argument type 'int' isn't related to 'String'."
+        );
+        assert_eq!(
+            lints[2].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+        assert_eq!(
+            lints[3].message,
+            "The argument type 'int' isn't related to 'String'."
+        );
+    }
+
+    /// `num` accepts `int`/`double` arguments; a raw written type carries
+    /// no verdict.
+    #[test]
+    fn collection_methods_unrelated_type_num_and_raw_pass() {
+        let f = Fixture::parse(
+            "class C {\n  List<num> nums = [];\n  List raw = [];\n  void m() {\n    this.nums.contains(1);\n    this.nums.contains(0.5);\n    this.raw.contains('x');\n  }\n}",
+        );
+        assert!(
+            f.run(&one_rule("collection_methods_unrelated_type"))
                 .is_empty()
         );
     }

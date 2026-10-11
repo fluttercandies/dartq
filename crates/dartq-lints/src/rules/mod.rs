@@ -24,6 +24,7 @@ pub(crate) mod strings;
 pub(crate) mod types;
 
 use dartq_ast::NodeKind;
+use dartq_scanner::KeywordStyle;
 
 use crate::engine::Check;
 
@@ -72,6 +73,81 @@ pub(crate) fn rows_with_parent(c: &Check<'_>, owner: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Whether a block-window row delimits its statement (the flat tiling
+/// keeps one statement row per statement, trailing its expression rows).
+pub(crate) fn is_statement_row(c: &Check<'_>, row: u32) -> bool {
+    matches!(
+        c.kind(row),
+        NodeKind::Block
+            | NodeKind::LabeledStatement
+            | NodeKind::IfStatement
+            | NodeKind::ForStatement
+            | NodeKind::ForIn
+            | NodeKind::WhileStatement
+            | NodeKind::DoWhileStatement
+            | NodeKind::SwitchStatement
+            | NodeKind::TryStatement
+            | NodeKind::ReturnStatement
+            | NodeKind::RethrowStatement
+            | NodeKind::YieldStatement
+            | NodeKind::InvalidYieldStatement
+            | NodeKind::Assert
+            | NodeKind::Break
+            | NodeKind::Continue
+            | NodeKind::EmptyStatement
+            | NodeKind::ExpressionStatement
+            | NodeKind::PatternVarDeclStatement
+            | NodeKind::InvalidStatement
+            | NodeKind::VariablesDeclaration
+    )
+}
+
+/// The member rows of a class-like `ancestor`: the body row's direct
+/// children (the production body opens at `{` before all members — every
+/// member is a body child; hand-built tables may skip the wrapper, hence
+/// the `ancestor` fallback).
+pub(crate) fn body_members(c: &Check<'_>, ancestor: u32) -> Vec<u32> {
+    let body = c
+        .collect_direct(ancestor)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
+        .unwrap_or(ancestor);
+    rows_with_parent(c, body)
+}
+
+/// The written name of a class-like declaration row: the production
+/// wrapper (collapse map §3.2 #1-5) keeps the name `Identifier` as the
+/// row's left sibling; hand-built trees nest it inside the row.
+pub(crate) fn class_declaration_name<'a>(c: &'a Check<'_>, class_row: u32) -> Option<&'a str> {
+    let is_class_name = |kid: u32| {
+        c.kind(kid) == NodeKind::Identifier
+            && matches!(
+                c.payload(kid).first().copied(),
+                Some(ctx)
+                    if ctx
+                        == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                            as u32
+                        || ctx == dartq_parser::IdentifierContext::EnumDeclaration as u32
+            )
+    };
+    if let Some(name) = c
+        .collect_direct(class_row)
+        .into_iter()
+        .find(|&kid| is_class_name(kid))
+    {
+        return Some(c.lexeme(c.head_token(name)));
+    }
+    let parent = c.unit.ast.parent(class_row)?;
+    let siblings = c.collect_direct(parent);
+    let pos = siblings.iter().position(|&kid| kid == class_row)?;
+    let name = siblings[..pos]
+        .iter()
+        .rev()
+        .copied()
+        .find(|&kid| is_class_name(kid))?;
+    Some(c.lexeme(c.head_token(name)))
+}
+
 /// The name-bearing direct child (Identifier or OperatorName) of a member
 /// declaration node — operators name through [`NodeKind::OperatorName`],
 /// everything else through an `Identifier` (collapse map §3.3/§3.5).
@@ -86,12 +162,19 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
 /// production row is width-0 at the name (bridge.rs
 /// `begin_initialized_identifier` begins at the name — the name is the span
 /// head), so the token itself answers; hand-built tables nest an
-/// `Identifier` row and keep the same span head. `None` when the head is
-/// not an identifier (recovery shapes).
+/// `Identifier` row and keep the same span head. Built-in identifiers
+/// (`set`, `get`, …) lex as `Keyword` tokens of [`KeywordStyle::BuiltIn`]
+/// yet bind as plain names (a field named `set` is legal Dart), so they
+/// answer too. `None` otherwise (reserved words, literals — recovery
+/// shapes).
 pub(crate) fn initialized_identifier_name(c: &Check<'_>, var: u32) -> Option<u32> {
     let head = c.head_token(var);
     let token = c.unit.tokens.get(head as usize)?;
-    (token.kind == dartq_scanner::TokenKind::Identifier).then_some(head)
+    match token.kind {
+        dartq_scanner::TokenKind::Identifier => Some(head),
+        dartq_scanner::TokenKind::Keyword(kw) if kw.style() == KeywordStyle::BuiltIn => Some(head),
+        _ => None,
+    }
 }
 
 /// The `var`/`final`/`const` keyword of a [`NodeKind::VariablesDeclaration`]
@@ -370,6 +453,507 @@ fn head_is_const(c: &Check<'_>, node: u32) -> bool {
 /// The last token of `id`'s span (the span's `end` is exclusive).
 pub(crate) fn tail_token(c: &Check<'_>, id: u32) -> u32 {
     c.unit.ast.token_range(id).end - 1
+}
+
+/// The byte span of one token.
+pub(crate) fn byte_span_of_token(c: &Check<'_>, token: u32) -> core::ops::Range<usize> {
+    let t = c
+        .unit
+        .tokens
+        .get(token as usize)
+        .expect("token outside the table");
+    t.byte_offset as usize..(t.byte_offset + t.byte_len) as usize
+}
+
+/// The UTF-16 span of one token — the `reportAtToken` face.
+pub(crate) fn utf16_token_span(c: &Check<'_>, token: u32) -> core::ops::Range<u32> {
+    let start = c
+        .unit
+        .tokens
+        .get(token as usize)
+        .expect("token outside the table")
+        .utf16_offset;
+    let len = c.lexeme(token).encode_utf16().count() as u32;
+    start..start + len
+}
+
+/// Whether the node carries a documentation comment (`node.documentationComment
+/// != null`): a `///` or `/**` comment attached to its first token.
+pub(crate) fn has_doc_comment(c: &Check<'_>, node: u32) -> bool {
+    c.comments
+        .attached(c.head_token(node) as usize)
+        .iter()
+        .any(|comment| {
+            let text = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
+            text.starts_with("///") || text.starts_with("/**")
+        })
+}
+
+/// The `get`/`set` keyword token of a member declaration, by lexeme.
+/// `Method` payload word 1 and `TopLevelMethod` payload word 0 are the
+/// `get_set` option (collapse map §3.3).
+pub(crate) fn get_set_token<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
+    let word = match c.kind(node) {
+        NodeKind::Method => 1,
+        NodeKind::TopLevelMethod => 0,
+        _ => return None,
+    };
+    match c.payload(node).get(word) {
+        Some(&token) if token != crate::rules::NONE_TOKEN => Some(c.lexeme(token)),
+        _ => None,
+    }
+}
+
+// —— same-file class-hierarchy face ————————————————————————————————————————
+//
+// The four override-family rules (`annotate_overrides`,
+// `avoid_renaming_method_parameters`, `overridden_fields`,
+// `unnecessary_overrides`) read the class hierarchy the official rules get
+// from the inheritance manager. The substrate carries the same facts for
+// same-file declarations: supertype names are written `Type` rows in the
+// header, and the unit's top-level declarations are a bounded root scan.
+// Cross-file supertypes (imports, SDK types) resolve to `None` — the face
+// under-reports there, the documented divergence family of this group.
+
+/// The kind of member a lookup targets (the official
+/// `lookUpMethod`/`lookUpGetter`/`lookUpSetter` split). A `Fields` row
+/// answers every query kind: the official variable carries both accessors —
+/// except [`MemberQuery::Variable`], which only fields answer (the
+/// `isOriginVariable` getter face of `overridden_fields`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberQuery {
+    Method,
+    Getter,
+    Setter,
+    Variable,
+}
+
+/// The row of the same-file class-like declaration named `name`
+/// (`ClassDeclaration` / `MixinDeclaration` / `EnumDeclaration`), or `None`
+/// when the name is not a same-file class-like declaration (an SDK type, an
+/// import — the face never sees through it).
+pub(crate) fn same_file_declaration(c: &Check<'_>, name: &str) -> Option<u32> {
+    const CLASS_LIKE: [NodeKind; 3] = [
+        NodeKind::ClassDeclaration,
+        NodeKind::MixinDeclaration,
+        NodeKind::EnumDeclaration,
+    ];
+    let root = c.unit.ast.root()?;
+    let tops = c.collect_direct(root);
+    for top in tops {
+        if c.kind(top) != NodeKind::TopLevelDeclaration {
+            continue;
+        }
+        // The wrapper's name identifier and the declaration row are both
+        // direct children (collapse map §3.2 #1-5).
+        let kids = c.collect_direct(top);
+        let named = kids.iter().any(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && matches!(
+                    c.payload(kid).first().copied(),
+                    Some(ctx)
+                        if ctx == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                            as u32
+                            || ctx == dartq_parser::IdentifierContext::EnumDeclaration as u32
+                )
+                && c.lexeme(c.head_token(kid)) == name
+        });
+        if named
+            && let Some(&class_row) = kids.iter().find(|&kid| CLASS_LIKE.contains(&c.kind(*kid)))
+        {
+            return Some(class_row);
+        }
+    }
+    None
+}
+
+/// The clause a supertype is written in — the concrete-member lookup walks
+/// extends/with/on only (a concrete implementation never comes from an
+/// `implements` interface), the any-member lookup walks all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SupertypeClause {
+    Extends,
+    With,
+    On,
+    Implements,
+}
+
+/// The written supertypes of a class-like header, in source order with
+/// their clause: the `Type` rows inside the declaration's own span but
+/// outside its body and outside any type-arguments span (the `Type` is a
+/// width-0 leaf row — bridge.rs `handle_type` — so the header scan is a
+/// bounded window walk, each row's clause read off the nearest preceding
+/// clause keyword, itself a bounded backward token walk).
+pub(crate) fn supertypes<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<(&'a str, SupertypeClause)> {
+    let window = c.children(class_row);
+    let class_end = c.byte_span(class_row).end;
+    let mut names = Vec::new();
+    let mut i = window.start;
+    while i <= class_row {
+        let span = c.byte_span(i);
+        if span.end > class_end {
+            break;
+        }
+        match c.kind(i) {
+            NodeKind::Type => {
+                // The head token is the name; a `?` tail rides the same row.
+                let head = c.head_token(i);
+                let clause = clause_of(c, class_row, head);
+                names.push((c.lexeme(head), clause));
+            }
+            NodeKind::TypeArguments | NodeKind::TypeVariables => {
+                // Skip the nested rows wholesale (type arguments of a
+                // supertype, the declaration's own type parameters).
+                i = c.children(i).end;
+                continue;
+            }
+            NodeKind::DeclarationBody | NodeKind::EnumBody => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    names
+}
+
+/// The clause keyword governing the supertype named at `head`: the nearest
+/// preceding `extends`/`with`/`on`/`implements` lexeme back to the
+/// declaration's span head (a header is a handful of tokens).
+fn clause_of(c: &Check<'_>, class_row: u32, head: u32) -> SupertypeClause {
+    let start = c.head_token(class_row);
+    let mut token = head;
+    while token > start {
+        token -= 1;
+        match c.lexeme(token) {
+            "extends" => return SupertypeClause::Extends,
+            "with" => return SupertypeClause::With,
+            "on" => return SupertypeClause::On,
+            "implements" => return SupertypeClause::Implements,
+            _ => {}
+        }
+    }
+    SupertypeClause::Implements
+}
+
+/// The same-file ancestor chain of `class_row`, each written supertype name
+/// resolved through [`same_file_declaration`], in written order,
+/// transitively. `concrete` walks extends/with/on links only (the official
+/// concrete-member lookup); otherwise `implements` interfaces join too
+/// (the any-member lookup behind `annotate_overrides`). The chain stops at
+/// names that leave the file.
+pub(crate) fn same_file_ancestors(c: &Check<'_>, class_row: u32, concrete: bool) -> Vec<u32> {
+    let clause_joins =
+        |clause: SupertypeClause| !concrete || !matches!(clause, SupertypeClause::Implements);
+    let mut chain = Vec::new();
+    let mut seen = vec![class_row];
+    let mut queue: Vec<u32> = vec![class_row];
+    while let Some(current) = queue.pop() {
+        for (name, clause) in supertypes(c, current) {
+            if !clause_joins(clause) {
+                continue;
+            }
+            let Some(row) = same_file_declaration(c, name) else {
+                continue;
+            };
+            if seen.contains(&row) {
+                continue;
+            }
+            seen.push(row);
+            chain.push(row);
+            queue.push(row);
+        }
+    }
+    chain
+}
+
+/// Whether the member row carries an `@override` annotation: its left
+/// sibling in the body's child list is the `MetadataStar`, whose `Metadata`
+/// children name the annotations (declarations.rs `has_annotations` idiom).
+pub(crate) fn has_override_annotation(c: &Check<'_>, body: u32, member: u32) -> bool {
+    has_annotation_named(c, body, member, "override")
+}
+
+/// Whether the member row carries any annotation other than `override`
+/// (the `_addsMetadata` guard of `unnecessary_overrides`, :117-131).
+pub(crate) fn has_any_annotation(c: &Check<'_>, body: u32, member: u32) -> bool {
+    member_annotations(c, body, member).iter().any(|&meta| {
+        c.collect_direct(meta).into_iter().any(|piece| {
+            c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) != "override"
+        })
+    })
+}
+
+/// The `Metadata` rows of one member: the `MetadataStar` left sibling's
+/// children (declarations.rs `has_annotations` idiom), empty when the
+/// member carries no annotations.
+pub(crate) fn member_annotations(c: &Check<'_>, body: u32, member: u32) -> Vec<u32> {
+    let members = c.collect_direct(body);
+    let Some(index) = members.iter().position(|&m| m == member) else {
+        return Vec::new();
+    };
+    let Some(&star) = index.checked_sub(1).and_then(|i| members.get(i)) else {
+        return Vec::new();
+    };
+    if c.kind(star) != NodeKind::MetadataStar {
+        return Vec::new();
+    }
+    c.collect_direct(star)
+        .into_iter()
+        .filter(|&meta| c.kind(meta) == NodeKind::Metadata)
+        .collect()
+}
+
+fn has_annotation_named(c: &Check<'_>, body: u32, member: u32, name: &str) -> bool {
+    member_annotations(c, body, member).iter().any(|&meta| {
+        c.collect_direct(meta).into_iter().any(|piece| {
+            c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name
+        })
+    })
+}
+
+/// The name rows of the instance members of `member` answering `query` and
+/// named `name`. Methods name through their `MethodDeclaration`-context
+/// `Identifier` (or [`NodeKind::OperatorName`] for operators, split off the
+/// `get_set` payload — declarations.rs `get_set_token`), fields through
+/// their [`NodeKind::InitializedIdentifier`] rows. The returned rows are
+/// the name-bearing rows (an `Identifier`/`OperatorName`, or the field's
+/// name-token holder for the field face).
+pub(crate) fn member_matches(
+    c: &Check<'_>,
+    member: u32,
+    query: MemberQuery,
+    name: &str,
+) -> Vec<u32> {
+    let mut hits = Vec::new();
+    match c.kind(member) {
+        NodeKind::Method => {
+            let get_set = get_set_token(c, member);
+            let wanted: Option<&str> = match query {
+                MemberQuery::Method => {
+                    if get_set.is_some() {
+                        return hits;
+                    }
+                    None
+                }
+                MemberQuery::Getter => Some("get"),
+                MemberQuery::Setter => Some("set"),
+                MemberQuery::Variable => return hits,
+            };
+            if wanted != get_set {
+                return hits;
+            }
+            for kid in c.collect_direct(member) {
+                match c.kind(kid) {
+                    NodeKind::Identifier
+                        if c.payload(kid).first()
+                            == Some(
+                                &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
+                            ) =>
+                    {
+                        if c.lexeme(c.head_token(kid)) == name {
+                            hits.push(kid);
+                        }
+                    }
+                    NodeKind::OperatorName if query == MemberQuery::Method => {
+                        let op = c.payload(kid).first().copied().unwrap_or(u32::MAX);
+                        if c.lexeme(op) == name {
+                            hits.push(kid);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        NodeKind::Fields => {
+            if query == MemberQuery::Method
+                || c.payload(member).first()
+                    != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            {
+                return hits;
+            }
+            for decl in c.collect_direct(member) {
+                if c.kind(decl) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                for var in c.collect_direct(decl) {
+                    if c.kind(var) != NodeKind::InitializedIdentifier {
+                        continue;
+                    }
+                    if let Some(name_row) = crate::rules::initialized_identifier_name(c, var)
+                        && c.lexeme(name_row) == name
+                    {
+                        hits.push(var);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    hits
+}
+
+/// The written-type verdicts the field-reading faces need (void_checks,
+/// implicit_call_tearoffs, null_check_on_nullable_type_parameter).
+pub(crate) struct TypeFace<'a> {
+    /// The written type's head name (`List` of `List<int>`, `T` of `T?`);
+    /// `None` for `void` and function types.
+    pub name: Option<&'a str>,
+    /// Whether the written type carries a `?` tail.
+    pub nullable: bool,
+    /// Whether the written type is `void`.
+    pub is_void: bool,
+    /// Whether the written type is `FutureOr<void>`.
+    pub is_future_or_void: bool,
+    /// Whether the written type is a function type.
+    pub is_function_type: bool,
+    /// The written type arguments, `(name, nullable)` in order (empty for
+    /// a raw or argument-less type).
+    pub type_arguments: Vec<(&'a str, bool)>,
+}
+
+/// The written type face of the same-class instance field `name` (the
+/// `Fields` row's written type sibling — the prefer_initializing_formals
+/// tiling). `None` when the name is no instance field of the enclosing
+/// class-like declaration.
+pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<TypeFace<'a>> {
+    let class_row = c.path.iter().rev().find_map(|&a| {
+        matches!(
+            c.kind(a),
+            NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::ExtensionDeclaration
+        )
+        .then_some(a)
+    })?;
+    for member in body_members(c, class_row) {
+        if c.kind(member) != NodeKind::Fields
+            || c.payload(member).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+        {
+            continue;
+        }
+        if member_matches(c, member, MemberQuery::Variable, name).is_empty() {
+            continue;
+        }
+        let type_row = c.collect_direct(member).into_iter().find(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType
+            )
+        })?;
+        return Some(type_face(c, type_row));
+    }
+    None
+}
+
+/// The face of one written type row.
+fn type_face<'a>(c: &'a Check<'_>, row: u32) -> TypeFace<'a> {
+    match c.kind(row) {
+        NodeKind::VoidType => TypeFace {
+            name: None,
+            nullable: false,
+            is_void: true,
+            is_future_or_void: false,
+            is_function_type: false,
+            type_arguments: Vec::new(),
+        },
+        NodeKind::FunctionType => TypeFace {
+            name: None,
+            nullable: false,
+            is_void: false,
+            is_future_or_void: false,
+            is_function_type: true,
+            type_arguments: Vec::new(),
+        },
+        _ => {
+            let head = c.head_token(row);
+            let name = c.lexeme(head);
+            let nullable = c.byte_span(row).end > byte_span_of_token(c, head).end;
+            let is_future_or_void = name == "FutureOr" && type_argument_is_void(c, row);
+            TypeFace {
+                name: Some(name),
+                nullable,
+                is_void: false,
+                is_future_or_void,
+                is_function_type: false,
+                type_arguments: type_arguments_of(c, row),
+            }
+        }
+    }
+}
+
+/// The `TypeArguments` sibling of a `Type` row. Production completion
+/// order puts the sibling BEFORE the `Type` row (the collapse keeps the
+/// `Type` span-only over its name tokens, so it seals after the argument
+/// list parses — the `<int>` of `List<int>` is the left sibling under the
+/// member row); hand-built trees may place it after.
+fn type_arguments_sibling(c: &Check<'_>, type_row: u32) -> Option<u32> {
+    let owner = c.unit.ast.parent(type_row)?;
+    let members = c.collect_direct(owner);
+    let index = members.iter().position(|&m| m == type_row)?;
+    let arg_row = |row: &u32| c.kind(*row) == NodeKind::TypeArguments;
+    members[..index]
+        .iter()
+        .rev()
+        .find(|row| arg_row(row))
+        .or_else(|| members[index + 1..].iter().find(|row| arg_row(row)))
+        .copied()
+}
+
+/// The `(name, nullable)` pairs of the `TypeArguments` sibling of a
+/// `Type` row, in order (empty when the sibling is absent).
+fn type_arguments_of<'a>(c: &'a Check<'_>, type_row: u32) -> Vec<(&'a str, bool)> {
+    let Some(args) = type_arguments_sibling(c, type_row) else {
+        return Vec::new();
+    };
+    c.collect_direct(args)
+        .into_iter()
+        .filter(|&arg| c.kind(arg) == NodeKind::Type)
+        .map(|arg| {
+            let head = c.head_token(arg);
+            let nullable = c.byte_span(arg).end > byte_span_of_token(c, head).end;
+            (c.lexeme(head), nullable)
+        })
+        .collect()
+}
+
+/// Whether the `TypeArguments` sibling of a `Type` row holds a lone
+/// `void` (the `FutureOr<void>` shape).
+fn type_argument_is_void(c: &Check<'_>, type_row: u32) -> bool {
+    let Some(args) = type_arguments_sibling(c, type_row) else {
+        return false;
+    };
+    c.collect_direct(args)
+        .into_iter()
+        .any(|arg| c.kind(arg) == NodeKind::VoidType)
+}
+
+/// Whether the member row is abstract: a `Method` whose body is absent or
+/// an `EmptyBody`/`NoBody` sentinel. A `Fields` row is always concrete (the
+/// official variable carries storage).
+pub(crate) fn member_is_concrete(c: &Check<'_>, member: u32) -> bool {
+    match c.kind(member) {
+        NodeKind::Method => {
+            let body = c.collect_direct(member).into_iter().find(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::BlockBody
+                        | NodeKind::Block
+                        | NodeKind::ExpressionBody
+                        | NodeKind::EmptyBody
+                        | NodeKind::NoBody
+                        | NodeKind::SkippedBody
+                        | NodeKind::NativeFunctionBody
+                        | NodeKind::InvalidFunctionBody
+                )
+            });
+            match body {
+                None => false,
+                Some(body) => !matches!(c.kind(body), NodeKind::EmptyBody | NodeKind::NoBody),
+            }
+        }
+        NodeKind::Fields => true,
+        _ => false,
+    }
 }
 
 /// Whether two nodes have the same token-lexeme sequence — the anchored

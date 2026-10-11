@@ -2708,6 +2708,891 @@ pub(crate) mod prefer_final_fields {
     }
 }
 
+pub(crate) mod await_only_futures {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `pkg/linter/lib/src/rules/await_only_futures.dart:38-56` —
+    /// `await` on an expression whose static type is not assignable to
+    /// `Future` reports at the `await` keyword, with the type as the
+    /// argument (:55).
+    ///
+    /// Approximation (documented): the static-type face needs inference.
+    /// The ported face is the syntax-knowable slice: `await` on a scalar
+    /// literal (int / double / String / bool — the exact types), reading
+    /// through parenthesized expressions. `await null` never reports
+    /// (:39), unknown expressions (identifiers, calls, collections —
+    /// inference-bound) never report, the dominant under-report face. The
+    /// Dynamic/FutureOr/extension-type exemptions (:42-46) are unreachable
+    /// on the ported face. Message: `diagnostic.g.dart` `awaitOnlyFutures`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "await_only_futures",
+        group: Group::Core,
+        problem: "Uses 'await' on an instance of '{0}', which is not a subtype of 'Future'.",
+        correction: "Try removing the 'await' or changing the expression.",
+        kinds: &[NodeKind::AwaitExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The awaited expression tiles inside the container's window; its
+        // root is the last row (a container completes after its subtree).
+        let window = c.children(node);
+        if window.start >= window.end {
+            return;
+        }
+        let mut root = window.end - 1;
+        // Read through transparent `(...)` wrappers (the content is the
+        // wrapper window's last row).
+        while c.kind(root) == NodeKind::ParenthesizedExpression {
+            let inner = c.children(root);
+            if inner.start >= inner.end {
+                return;
+            }
+            root = inner.end - 1;
+        }
+        let Some(type_name) = scalar_literal_type(c, root) else {
+            return;
+        };
+        // The `await` keyword is the width-0 kind's span head.
+        let range = utf16_token_span(c, c.head_token(node));
+        c.report(range, &[type_name]);
+    }
+
+    /// The exact static type of a scalar literal (`int`, `double`,
+    /// `String`, `bool`); `None` when the syntax carries no verdict.
+    /// `await null` skips upstream (official :39).
+    fn scalar_literal_type(c: &Check<'_>, row: u32) -> Option<&'static str> {
+        match c.kind(row) {
+            NodeKind::LiteralInt => Some("int"),
+            NodeKind::LiteralDouble => Some("double"),
+            NodeKind::StringLiteral => Some("String"),
+            NodeKind::LiteralBool => Some("bool"),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) mod unrelated_type_equality_checks {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{slice, utf16_token_span};
+
+    /// Official: `pkg/linter/lib/src/rules/unrelated_type_equality_checks.dart`
+    /// — an `==`/`!=` comparison (a bool-typed one, :47-49) whose operand
+    /// types are unrelated reports at the operator, with `(right type,
+    /// left type)` (:62-66; the pattern face :69-83 needs the matched
+    /// value type — unported).
+    ///
+    /// Approximations (documented): the operand types are the syntax-
+    /// knowable slice — scalar literals (`int`, `double`, `String`,
+    /// `bool`) and `this` (the enclosing class's name). Both operands must
+    /// carry a face; anything else (identifiers, calls) stays silent. The
+    /// comparability relation (`typesAreUnrelated`) reduces on this face
+    /// to exact-name equality — no two distinct names in the ported set
+    /// stand in a subtype relation (`int`/`double` are unrelated exactly
+    /// as the official rule judges them; `num`/`Object` are unreachable as
+    /// literal types). `null` operands skip (:53-55). A user class may
+    /// override `==` returning non-`bool` — the official bool-typed gate
+    /// (:47) then silences where this face reports (over-report, the
+    /// user-shadowed family). Message: `diagnostic.g.dart`
+    /// `unrelatedTypeEqualityChecksInExpression`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unrelated_type_equality_checks",
+        group: Group::Core,
+        problem: "The type of the right operand ('{0}') isn't a subtype or a supertype of the left operand ('{1}').",
+        correction: "Try changing one or both of the operands.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(op) = c.payload(node).first().copied() else {
+            return;
+        };
+        if !matches!(c.lexeme(op), "==" | "!=") {
+            return;
+        }
+        // The operand runs of the flattened container (:52-59).
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        let left_type = operand_type(c, &left).map(str::to_owned);
+        let right_type = operand_type(c, &right).map(str::to_owned);
+        let (Some(left_type), Some(right_type)) = (left_type, right_type) else {
+            return;
+        };
+        if left_type == right_type {
+            return; // `_comparable` on the ported face
+        }
+        let range = utf16_token_span(c, op);
+        c.report(range, &[right_type.as_str(), left_type.as_str()]);
+    }
+
+    /// The operand's type face: a scalar literal or `this` (the enclosing
+    /// class-like name); `null` literals answer `Some("Null")` so the
+    /// caller's equality gate treats them as reported faces — except the
+    /// official skips them outright (:53-55), enforced here by `None`
+    /// being indistinguishable… they are excluded explicitly.
+    fn operand_type<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+        let [root] = rows else {
+            return None; // a multi-row operand is a chain — no face
+        };
+        match c.kind(*root) {
+            NodeKind::LiteralInt => Some("int"),
+            NodeKind::LiteralDouble => Some("double"),
+            NodeKind::StringLiteral => Some("String"),
+            NodeKind::LiteralBool => Some("bool"),
+            NodeKind::LiteralNull => None, // the official skips null operands
+            NodeKind::ThisExpression => {
+                let class_row = c.path.iter().rev().find(|&&a| {
+                    matches!(
+                        c.kind(a),
+                        NodeKind::ClassDeclaration
+                            | NodeKind::MixinDeclaration
+                            | NodeKind::EnumDeclaration
+                            | NodeKind::ExtensionDeclaration
+                    )
+                })?;
+                let name = c
+                    .collect_direct(*class_row)
+                    .into_iter()
+                    .find(|&kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                            && c.payload(kid).first()
+                                == Some(&(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32))
+                    })?;
+                Some(c.lexeme(c.head_token(name)))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) mod void_checks {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{slice, type_face_of_field};
+    /// Official: `pkg/linter/lib/src/rules/void_checks.dart` — a value
+    /// written where `void` is expected reports (:141-173, the
+    /// `_check` core). The ported face is the assignment branch
+    /// (:76-84): assigning to a `void`-typed target, reported at the
+    /// assignment (:156-158).
+    ///
+    /// Approximations (documented): the target type is the same-class
+    /// field's written type, read off `this.<field>` (bare `<field>`
+    /// inside instance scope over-reports under shadowing — the user-
+    /// shadowed family). The right side's type is the syntax-knowable
+    /// scalar-literal face; unknown right sides never report (under-
+    /// report). `null` and dynamic right sides are acceptable when
+    /// expecting void (:55-65) — `null` skips. The `FutureOr<void>`
+    /// target branch (:158-161) ports through written `FutureOr<void>`
+    /// fields with the same literal faces (dynamic/null/`Future<void>`
+    /// are acceptable — the literals never are). The return, pattern,
+    /// argument and instance-creation branches (:67-103, :175-187) need
+    /// resolved types and stay unported. Message: `diagnostic.g.dart`
+    /// `voidChecks`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "void_checks",
+        group: Group::Core,
+        problem: "Assignment to a variable of type 'void'.",
+        correction: "Try removing the assignment or changing the type of the variable.",
+        kinds: &[NodeKind::Assignment],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(op) = c.payload(node).first().copied() else {
+            return;
+        };
+        if c.lexeme(op) != "=" {
+            return;
+        }
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        // The target: `this.<field>` or bare `<field>` (instance scope).
+        let name = field_name_of(c, &left);
+        let Some(name) = name else {
+            return;
+        };
+        let Some(face) = type_face_of_field(c, name) else {
+            return;
+        };
+        // `isTypeAcceptableWhenExpectingVoid` (:55-65) on the literal
+        // faces: `null` is acceptable, the scalar literals are not.
+        let right_type = literal_null_or_scalar(c, &right);
+        let Some(right_type) = right_type else {
+            return;
+        };
+        let mut void_target = face.is_void;
+        if face.is_future_or_void {
+            // `isTypeAcceptableWhenExpectingFutureOrVoid` (:40-53):
+            // dynamic/void-acceptable pass; the literals never do.
+            void_target = true;
+        }
+        if !void_target {
+            return;
+        }
+        if right_type == "Null" {
+            return; // acceptable when expecting void (:57)
+        }
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+
+    /// The assigned name off the left run: `this.<field>` or a bare
+    /// `<field>`. The run reads through the access-run form (the access
+    /// markers and the bare-name send group tile beside the chain rows).
+    fn field_name_of<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+        match slice::access_run(c, rows).as_slice() {
+            [single] if c.kind(*single) == NodeKind::Identifier => {
+                Some(c.lexeme(c.head_token(*single)))
+            }
+            [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
+                Some(c.lexeme(c.head_token(*name)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The right side's face: `Null` for a null literal, the scalar type
+    /// for scalar literals, `None` (no verdict) otherwise.
+    fn literal_null_or_scalar<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+        let run = slice::access_run(c, rows);
+        let [root] = run.as_slice() else {
+            return None;
+        };
+        match c.kind(*root) {
+            NodeKind::LiteralNull => Some("Null"),
+            NodeKind::LiteralInt => Some("int"),
+            NodeKind::LiteralDouble => Some("double"),
+            NodeKind::StringLiteral => Some("String"),
+            NodeKind::LiteralBool => Some("bool"),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) mod null_check_on_nullable_type_parameter {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
+    /// — a `!` whose operand's static type is a nullable type parameter
+    /// `T?`, in a context whose expected type is that same `T?`, reports
+    /// at the operator (:55-67).
+    ///
+    /// Approximation (documented): the operand face is `this.<field>` or
+    /// bare `<field>` where the same-class field is written `T?` with `T`
+    /// a class type parameter. The context face (`getExpectedType`,
+    /// unnecessary_null_checks.dart) ports for the two syntax-knowable
+    /// sites: a `return` inside a method whose written return type is
+    /// `T?`, and a variable initializer whose declaration is written
+    /// `T?`. Other contexts (arguments, assignments) stay silent
+    /// (under-report). The pattern face (:48-52 — `matchedValueType`)
+    /// stays unported. Message: `diagnostic.g.dart`
+    /// `nullCheckOnNullableTypeParameter`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "null_check_on_nullable_type_parameter",
+        group: Group::Core,
+        problem: "The null check operator shouldn't be used on a variable whose type is a potentially nullable type parameter.",
+        correction: "Try explicitly testing for 'null'.",
+        // The `!` tiles as the `NonNullAssert` token leaf (bridge
+        // `handle_non_null_assert_expression`); `UnaryPostfix` is `++`/`--`.
+        kinds: &[NodeKind::NonNullAssert],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.operator.type != BANG` bails (:56).
+        if c.lexeme(c.head_token(node)) != "!" {
+            return;
+        }
+        // The operand rows precede the leaf (the owner-slice idiom).
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        let name = operand_field_name(c, &kids[..pos]);
+        let Some(name) = name else {
+            return;
+        };
+        if !field_is_nullable_type_parameter(c, name) {
+            return;
+        }
+        if !context_expects_same_nullable(c, name) {
+            return;
+        }
+        let range = utf16_token_span(c, c.head_token(node));
+        c.report(range, &[]);
+    }
+
+    /// The operand's field name: `this.<field>` or bare `<field>`, read
+    /// through the access-run form (the bare-name send group tiles beside
+    /// the chain rows inside the statement container).
+    fn operand_field_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+        match crate::rules::slice::access_run(c, rows).as_slice() {
+            [single] if c.kind(*single) == NodeKind::Identifier => {
+                Some(c.lexeme(c.head_token(*single)))
+            }
+            [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
+                Some(c.lexeme(c.head_token(*name)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the same-class field is written `T?` with `T` a type
+    /// parameter of the enclosing class.
+    fn field_is_nullable_type_parameter(c: &Check<'_>, name: &str) -> bool {
+        let Some(class_row) = c
+            .path
+            .iter()
+            .rev()
+            .find_map(|&a| matches!(c.kind(a), NodeKind::ClassDeclaration).then_some(a))
+        else {
+            return false;
+        };
+        let type_parameters = class_type_parameter_names(c, class_row);
+        let Some(face) = crate::rules::type_face_of_field(c, name) else {
+            return false;
+        };
+        face.nullable
+            && face
+                .name
+                .is_some_and(|t| type_parameters.iter().any(|p| *p == t))
+    }
+
+    /// The enclosing class's type parameter names. Production tiling: the
+    /// `TypeVariables` row is the `ClassDeclaration`'s left sibling under
+    /// the `TopLevelDeclaration` wrapper, and each name `Identifier`
+    /// (context `TypeVariableDeclaration`) tiles beside its span-only
+    /// `TypeVariable` row; hand-built trees nest both inside the class row.
+    fn class_type_parameter_names<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<&'a str> {
+        let owner = c.unit.ast.parent(class_row).unwrap_or(class_row);
+        let variables = c
+            .collect_direct(owner)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+            .or_else(|| {
+                c.collect_direct(class_row)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+            });
+        let Some(variables) = variables else {
+            return Vec::new();
+        };
+        let ctx = dartq_parser::IdentifierContext::TypeVariableDeclaration as u32;
+        let names: Vec<&'a str> = c
+            .collect_direct(variables)
+            .into_iter()
+            .filter(|&kid| {
+                c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+            })
+            .map(|name| c.lexeme(c.head_token(name)))
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+        c.collect_direct(variables)
+            .into_iter()
+            .filter(|&param| c.kind(param) == NodeKind::TypeVariable)
+            .filter_map(|param| {
+                c.collect_direct(param)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            })
+            .map(|name| c.lexeme(c.head_token(name)))
+            .collect()
+    }
+
+    /// Whether the context at the site expects the same `T?`: the
+    /// nearest meaningful ancestor decides (a `return` face with the
+    /// enclosing method's written return type, or a variable initializer
+    /// face with the declaration's written type; a body boundary first
+    /// bails).
+    fn context_expects_same_nullable(c: &Check<'_>, name: &str) -> bool {
+        let Some(expected) = expected_type_type_parameter(c) else {
+            return false;
+        };
+        let Some(face) = crate::rules::type_face_of_field(c, name) else {
+            return false;
+        };
+        face.nullable && face.name == Some(expected)
+    }
+
+    /// The context's expected type-parameter name, when written `T?`.
+    fn expected_type_type_parameter<'a>(c: &'a Check<'_>) -> Option<&'a str> {
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                NodeKind::VariableInitializer => {
+                    // `T? x = <e>!;` — the declaration's written type.
+                    let decl = c.unit.ast.parent(ancestor)?;
+                    let face = written_declaration_type(c, decl)?;
+                    return if face.1 { Some(face.0) } else { None };
+                }
+                NodeKind::ReturnStatement => {
+                    // `return <e>!;` — the enclosing method's written
+                    // return type.
+                    let function = enclosing_function(c, ancestor)?;
+                    return written_return_type(c, function)
+                        .filter(|face| face.1)
+                        .and_then(|face| Some(face.0));
+                }
+                NodeKind::Block | NodeKind::BlockBody | NodeKind::ExpressionBody => {
+                    return None; // a body boundary — no written context face
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The enclosing method-like row of a statement.
+    fn enclosing_function(c: &Check<'_>, statement: u32) -> Option<u32> {
+        let pos = c.path.iter().position(|&a| a == statement)?;
+        c.path[..pos].iter().rev().copied().find(|&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::Method | NodeKind::TopLevelMethod | NodeKind::FunctionExpression
+            )
+        })
+    }
+
+    /// The written type sibling of a declaration row: `(name, nullable)`.
+    type WrittenType<'a> = (&'a str, bool);
+    fn written_declaration_type<'a>(c: &'a Check<'_>, decl: u32) -> Option<WrittenType<'a>> {
+        let Some(owner) = c.unit.ast.parent(decl) else {
+            return None;
+        };
+        let members = c.collect_direct(owner);
+        let index = members.iter().position(|&m| m == decl)?;
+        let type_row = index
+            .checked_sub(1)
+            .and_then(|i| members.get(i))
+            .copied()
+            .filter(|&row| matches!(c.kind(row), NodeKind::Type | NodeKind::VoidType))?;
+        let name_token = c.head_token(type_row);
+        let nullable =
+            c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
+        Some((c.lexeme(name_token), nullable))
+    }
+
+    /// The written return type of a method-like row.
+    fn written_return_type<'a>(c: &'a Check<'_>, function: u32) -> Option<(&'a str, bool)> {
+        // The member-name identifier — a written return type's own name
+        // tiles before it in the completion order, so the first
+        // `Identifier` is the type, not the member.
+        let kids = c.collect_direct(function);
+        let is_declaration_name = |kid: u32| {
+            c.kind(kid) == NodeKind::Identifier
+                && matches!(
+                    c.payload(kid).first().copied(),
+                    Some(ctx)
+                        if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
+                            || ctx
+                                == dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
+                                    as u32
+                )
+        };
+        let name = kids
+            .iter()
+            .copied()
+            .find(|&kid| is_declaration_name(kid))
+            .or_else(|| {
+                kids.iter()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            })?;
+        let (type_row, kind) = crate::rules::type_before(c, function, name)?;
+        if kind != NodeKind::Type {
+            return None;
+        }
+        let name_token = c.head_token(type_row);
+        let nullable =
+            c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
+        Some((c.lexeme(name_token), nullable))
+    }
+}
+
+pub(crate) mod implicit_call_tearoffs {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{slice, type_face_of_field};
+
+    /// Official: `pkg/linter/lib/src/rules/implicit_call_tearoffs.dart` —
+    /// the resolution-built `ImplicitCallReference` (an object with a
+    /// `call` member used where a function is expected) reports at the
+    /// node (:34-39).
+    ///
+    /// Approximation (documented): the analyzer node never exists on this
+    /// substrate, so the ported face reconstructs it syntactically for the
+    /// assignment/initializer site: a written `FunctionType` target and a
+    /// right side of `this.<field>` (or bare `<field>` — the user-shadowed
+    /// family over-reports) whose same-class field type names a same-file
+    /// class declaring an instance `call` method. Argument, return and
+    /// collection sites, inferred targets and cross-file `call` classes
+    /// stay silent (the dominant under-report face). Message:
+    /// `diagnostic.g.dart` `implicitCallTearoffs`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "implicit_call_tearoffs",
+        group: Group::Core,
+        problem: "Implicit tear-off of the 'call' method.",
+        correction: "Try explicitly tearing off the 'call' method.",
+        kinds: &[NodeKind::Assignment, NodeKind::VariableInitializer],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The context type: an assignment's left field or an
+        // initializer's declared variable — both written `FunctionType`.
+        let context_is_function = match c.kind(node) {
+            NodeKind::VariableInitializer => {
+                let decl = c.unit.ast.parent(node);
+                decl.is_some_and(|decl| written_type_is_function(c, declaration_type_row(c, decl)))
+            }
+            NodeKind::Assignment => {
+                let Some(op) = c.payload(node).first().copied() else {
+                    return;
+                };
+                if c.lexeme(op) != "=" {
+                    return;
+                }
+                let Some((left, _)) = slice::binary_operands(c) else {
+                    return;
+                };
+                let left = slice::access_run(c, &left);
+                let Some(name) = assigned_name(c, &left) else {
+                    return;
+                };
+                let Some(face) = type_face_of_field(c, name) else {
+                    return;
+                };
+                face.is_function_type
+            }
+            _ => false,
+        };
+        if !context_is_function {
+            return;
+        }
+        // The right side: `this.<field>` or bare `<field>`, whose field
+        // type names a same-file class with an instance `call` method.
+        let rows = match c.kind(node) {
+            NodeKind::VariableInitializer => c.collect_direct(node),
+            _ => {
+                let Some((_, right)) = slice::binary_operands(c) else {
+                    return;
+                };
+                right
+            }
+        };
+        let run = slice::access_run(c, &rows);
+        let Some(field) = assigned_name(c, &run) else {
+            return;
+        };
+        let Some(face) = type_face_of_field(c, field) else {
+            return;
+        };
+        let Some(type_name) = face.name else {
+            return;
+        };
+        if !same_file_class_has_call(c, type_name) {
+            return;
+        }
+        // Report at the expression (the official node face): the access
+        // run spans it in source order.
+        let start = c.utf16_span(run[0]).start;
+        let end = c.utf16_span(run[run.len() - 1]).end;
+        c.report(start..end, &[]);
+    }
+
+    /// The assigned name off an access run: `this.<field>` or bare
+    /// `<field>`.
+    fn assigned_name<'a>(c: &'a Check<'_>, run: &[u32]) -> Option<&'a str> {
+        match run {
+            [single] if c.kind(*single) == NodeKind::Identifier => {
+                Some(c.lexeme(c.head_token(*single)))
+            }
+            [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
+                Some(c.lexeme(c.head_token(*name)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The declaration's written type row (the sibling before the
+    /// declaration).
+    fn declaration_type_row(c: &Check<'_>, decl: u32) -> Option<u32> {
+        let owner = c.unit.ast.parent(decl)?;
+        let members = c.collect_direct(owner);
+        let index = members.iter().position(|&m| m == decl)?;
+        index
+            .checked_sub(1)
+            .and_then(|i| members.get(i))
+            .copied()
+            .filter(|&row| matches!(c.kind(row), NodeKind::Type | NodeKind::FunctionType))
+    }
+
+    /// Whether the written row is a function type (the `FunctionType`
+    /// kind — `void Function()`, `int Function(String)`).
+    fn written_type_is_function(c: &Check<'_>, row: Option<u32>) -> bool {
+        row.is_some_and(|row| c.kind(row) == NodeKind::FunctionType)
+    }
+
+    /// Whether the same-file class `name` declares an instance `call`
+    /// method.
+    fn same_file_class_has_call(c: &Check<'_>, name: &str) -> bool {
+        let Some(class_row) = crate::rules::same_file_declaration(c, name) else {
+            return false;
+        };
+        crate::rules::body_members(c, class_row)
+            .into_iter()
+            .any(|member| {
+                c.kind(member) == NodeKind::Method
+                    && crate::rules::get_set_token(c, member).is_none()
+                    && crate::rules::member_is_concrete(c, member)
+                    && !crate::rules::member_matches(
+                        c,
+                        member,
+                        crate::rules::MemberQuery::Method,
+                        "call",
+                    )
+                    .is_empty()
+            })
+    }
+}
+
+pub(crate) mod invalid_runtime_check_with_js_interop_types {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    const DART_IS_JS_PROBLEM: &str = "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.";
+    const DART_IS_JS_CORRECTION: &str =
+        "Try using 'isA' from 'dart:js_interop' to check if the Dart value is a JS interop type.";
+    const DART_AS_JS_PROBLEM: &str = "Cast from '{0}' to '{1}' casts a Dart value to a JS interop type, which might not be platform-consistent.";
+    const DART_AS_JS_CORRECTION: &str = "Try using conversion methods from 'dart:js_interop' to convert between Dart types and JS interop types.";
+
+    /// Official:
+    /// `pkg/linter/lib/src/rules/invalid_runtime_check_with_js_interop_types.dart`
+    /// — a runtime type test involving JS interop types that is not
+    /// statically guaranteed reports (:360-398, eight diagnostic
+    /// variants; the visit faces :400-437).
+    ///
+    /// Approximation (documented): the interop classification
+    /// (`_isJsInteropType`, :43-72 — extension types, `@staticInterop`,
+    /// SDK web libraries) reduces on the syntax face to same-file classes
+    /// annotated `@JS`, in a file importing `dart:js_interop`. The ported
+    /// face is the dart-is/as-js slice: `this is JSClass` / `this as
+    /// JSClass` (the left type is the enclosing Dart class), reported at
+    /// the expression with `(dart type, js type)` (:400-437). Other left
+    /// expressions (no written type), cross-file interop types, the
+    /// catch-clause face and the js-side variants stay silent (the
+    /// dominant under-report face). Message: `diagnostic.g.dart`
+    /// `invalidRuntimeCheckWithJsInteropTypesDart{Is,As}Js`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "invalid_runtime_check_with_js_interop_types",
+        group: Group::Recommended,
+        problem: DART_IS_JS_PROBLEM,
+        correction: DART_IS_JS_CORRECTION,
+        kinds: &[NodeKind::IsExpression, NodeKind::AsExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let is_check = c.kind(node) == NodeKind::IsExpression;
+        // The left operand rows precede the operator container; the tested
+        // type tiles inside it.
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        // Left face: a lone `this` (the enclosing Dart class) immediately
+        // before the operator container — an arrow body's signature rows
+        // tile before it in the member window, so only the trailing `this`
+        // is the tested expression and everything earlier must be
+        // signature.
+        let left: Vec<u32> = kids[..pos]
+            .iter()
+            .copied()
+            .filter(|&row| !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified))
+            .collect();
+        let Some(&root) = left.last() else {
+            return;
+        };
+        if c.kind(root) != NodeKind::ThisExpression {
+            return;
+        }
+        if left[..left.len() - 1]
+            .iter()
+            .any(|&row| !is_signature_row(c, row))
+        {
+            return;
+        }
+        let Some(dart_type) = enclosing_class_name(c) else {
+            return;
+        };
+        // The tested type: the `Type` row naming a same-file `@JS` class,
+        // in a file importing `dart:js_interop`. The type tiles inside the
+        // operator container (the bridge begins it at the operator, before
+        // the type parses); the sibling face — the rows completing before
+        // the container seals — is accepted too. The head token after the
+        // operator keyword tells the tested type from the member's return
+        // type (token ids are source-ordered).
+        let op_head = c.head_token(node);
+        let mut candidates = c.collect_direct(node);
+        candidates.extend_from_slice(&kids[..pos]);
+        let Some(type_row) = candidates
+            .into_iter()
+            .rev()
+            .find(|&row| c.kind(row) == NodeKind::Type && c.head_token(row) > op_head)
+        else {
+            return;
+        };
+        let js_type = c.lexeme(c.head_token(type_row));
+        if !imports_js_interop(c) || !same_file_js_class(c, js_type) {
+            return;
+        }
+        let (dart_type, js_type) = (dart_type.to_owned(), js_type.to_owned());
+        let range = c.utf16_span(node);
+        if is_check {
+            c.report_texts(
+                range,
+                DART_IS_JS_PROBLEM,
+                DART_IS_JS_CORRECTION,
+                &[dart_type.as_str(), js_type.as_str()],
+            );
+        } else {
+            c.report_texts(
+                range,
+                DART_AS_JS_PROBLEM,
+                DART_AS_JS_CORRECTION,
+                &[dart_type.as_str(), js_type.as_str()],
+            );
+        }
+    }
+
+    /// The enclosing class-like declaration's name (the wrapper-aware
+    /// read — the production name is the row's left sibling).
+    fn enclosing_class_name<'a>(c: &'a Check<'_>) -> Option<&'a str> {
+        let class_row = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        })?;
+        crate::rules::class_declaration_name(c, *class_row)
+    }
+
+    /// The member-signature rows that tile before an arrow body's
+    /// expression (the written return type, the name, the parameter list,
+    /// their wrappers — and the childless `ExpressionBody` handle the
+    /// expression rows trail).
+    fn is_signature_row(c: &Check<'_>, row: u32) -> bool {
+        matches!(
+            c.kind(row),
+            NodeKind::Type
+                | NodeKind::VoidType
+                | NodeKind::FunctionType
+                | NodeKind::Identifier
+                | NodeKind::FormalParameters
+                | NodeKind::OptionalFormalParameters
+                | NodeKind::TypeVariables
+                | NodeKind::OperatorName
+                | NodeKind::NoTypeArguments
+                | NodeKind::TypeArguments
+                | NodeKind::ExpressionBody
+        )
+    }
+
+    /// Whether the unit imports `dart:js_interop`.
+    fn imports_js_interop(c: &Check<'_>) -> bool {
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        // The import directive tiles inside its `TopLevelDeclaration`
+        // wrapper; a root-direct Import is accepted too should a shape ever
+        // leave it bare.
+        let has_uri = |c: &Check<'_>, row: u32| {
+            c.kind(row) == NodeKind::Import
+                && c.collect_direct(row).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::StringLiteral && {
+                        let span = c.byte_span(kid);
+                        let text = &c.unit.source[span.start..span.end];
+                        text.trim_matches(|q| q == '\'' || q == '"') == "dart:js_interop"
+                    }
+                })
+        };
+        c.collect_direct(root).into_iter().any(|row| {
+            has_uri(c, row)
+                || (c.kind(row) == NodeKind::TopLevelDeclaration
+                    && c.collect_direct(row).into_iter().any(|kid| has_uri(c, kid)))
+        })
+    }
+
+    /// Whether `name` is a same-file class carrying a `@JS` annotation
+    /// (the annotation star precedes the top-level wrapper at the root).
+    fn same_file_js_class(c: &Check<'_>, name: &str) -> bool {
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        let tops = c.collect_direct(root);
+        for (i, &top) in tops.iter().enumerate() {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            let named = c.collect_direct(top).into_iter().any(|kid| {
+                c.kind(kid) == NodeKind::Identifier
+                    && c.payload(kid).first()
+                        == Some(
+                            &(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                                as u32),
+                        )
+                    && c.lexeme(c.head_token(kid)) == name
+            });
+            if !named {
+                continue;
+            }
+            // The class's annotation star tiles as the wrapper's left
+            // sibling at the root (the annotation seals before the wrapper
+            // opens), or inside the wrapper when the wrapper opened first —
+            // read both faces.
+            let mut stars: Vec<u32> = Vec::new();
+            if i > 0 && c.kind(tops[i - 1]) == NodeKind::MetadataStar {
+                stars.push(tops[i - 1]);
+            }
+            for kid in c.collect_direct(top) {
+                if c.kind(kid) == NodeKind::MetadataStar {
+                    stars.push(kid);
+                }
+            }
+            let annotated = stars.into_iter().any(|star| {
+                c.collect_direct(star).into_iter().any(|meta| {
+                    c.kind(meta) == NodeKind::Metadata
+                        && c.collect_direct(meta).into_iter().any(|piece| {
+                            c.kind(piece) == NodeKind::Identifier
+                                && c.lexeme(c.head_token(piece)) == "JS"
+                        })
+                })
+            });
+            if annotated {
+                return true;
+            }
+        }
+        false
+    }
+}
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -4704,5 +5589,130 @@ mod tests {
             b.end(NodeKind::CompilationUnit, t.len() as u32);
         });
         assert!(field_hits(&f).is_empty());
+    }
+
+    // ---- #586 standard-set completions (production-bridge fixtures) ----
+
+    /// `await` on scalar literals reports at the keyword with the exact
+    /// type; `null` (:39) and inference-bound expressions stay silent.
+    #[test]
+    fn await_only_futures_scalar_literals_report() {
+        let f = Fixture::parse(
+            "void f() async {\n  await 1;\n  await 'x';\n  await (2.5);\n  await null;\n  await g();\n}\nvoid g() {}",
+        );
+        let lints = f.run(&one_rule("await_only_futures"));
+        assert_eq!(lints.len(), 3, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'int', which is not a subtype of 'Future'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "Uses 'await' on an instance of 'String', which is not a subtype of 'Future'."
+        );
+        assert_eq!(
+            lints[2].message,
+            "Uses 'await' on an instance of 'double', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// `==`/`!=` on unrelated scalar literal faces reports at the
+    /// operator with `(right, left)`; null operands (:53-55) and equal
+    /// faces stay silent.
+    #[test]
+    fn unrelated_type_equality_reports_mismatched_scalars() {
+        let f = Fixture::parse(
+            "void f() {\n  if (1 == 'a') {}\n  if (1 != true) {}\n  if (1 == 2) {}\n  if (null == 1) {}\n}",
+        );
+        let lints = f.run(&one_rule("unrelated_type_equality_checks"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The type of the right operand ('String') isn't a subtype or a supertype of the left operand ('int')."
+        );
+        assert_eq!(
+            lints[1].message,
+            "The type of the right operand ('bool') isn't a subtype or a supertype of the left operand ('int')."
+        );
+    }
+
+    /// Assigning a non-null scalar to a `void` (or `FutureOr<void>`)
+    /// field reports; `null` is acceptable when expecting void (:57).
+    #[test]
+    fn void_checks_reports_void_field_assignment() {
+        let f = Fixture::parse(
+            "import 'dart:async';\nclass C {\n  void v;\n  FutureOr<void> fv;\n  int n;\n  void set_it() {\n    this.v = 1;\n    this.v = null;\n    this.fv = 'x';\n    this.fv = null;\n    this.n = 1;\n  }\n}",
+        );
+        let lints = f.run(&one_rule("void_checks"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].message, "Assignment to a variable of type 'void'.");
+        assert_eq!(lints[1].message, "Assignment to a variable of type 'void'.");
+    }
+
+    /// A `==` comparison is not an assignment face — no void_checks
+    /// report (the coordinator boundary case).
+    #[test]
+    fn void_checks_equality_operand_stays_silent() {
+        let f = Fixture::parse("class C {\n  void v;\n  bool eq(int x) => x == 1;\n}");
+        assert!(f.run(&one_rule("void_checks")).is_empty());
+    }
+
+    /// `!` on a `T?` field in a `T?` context reports at the operator;
+    /// a different context type and no-`!` reads stay silent.
+    #[test]
+    fn null_check_on_nullable_type_parameter_reports_in_matching_context() {
+        let f = Fixture::parse(
+            "class C<T> {\n  T? f;\n  T? m() { return this.f!; }\n  T? n() { return f!; }\n  T? ok() { return this.f; }\n  int? other() { return this.f!; }\n}",
+        );
+        let lints = f.run(&one_rule("null_check_on_nullable_type_parameter"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The null check operator shouldn't be used on a variable whose type is a potentially nullable type parameter."
+        );
+    }
+
+    /// A `FunctionType` target assigned a `call`-bearing object reports
+    /// the implicit tear-off; explicit `.call` and plain values stay
+    /// silent.
+    #[test]
+    fn implicit_call_tearoffs_reports_function_typed_target() {
+        let f = Fixture::parse(
+            "class Callable {\n  void call() {}\n}\nclass Plain {\n  void hello() {}\n}\nclass C {\n  Callable obj = Callable();\n  Plain p = Plain();\n  void Function() f;\n  void setup() {\n    this.f = this.obj;\n    this.f = this.p;\n    this.f = this.obj.call;\n    this.f = 1;\n  }\n}",
+        );
+        let lints = f.run(&one_rule("implicit_call_tearoffs"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Implicit tear-off of the 'call' method.");
+    }
+
+    /// `this is JSClass` / `this as JSClass` with a same-file `@JS`
+    /// class under a `dart:js_interop` import reports; non-interop
+    /// types, other receivers and files without the import stay silent.
+    #[test]
+    fn invalid_runtime_check_reports_dart_vs_js() {
+        let f = Fixture::parse(
+            "import 'dart:js_interop';\n\n@JS\nclass JS {\n  external JS();\n}\n\nclass Dart {\n  bool check() => this is JS;\n  Object cast() => this as JS;\n  bool plain(Object o) => o is JS;\n  bool self() => this is Dart;\n}",
+        );
+        let lints = f.run(&one_rule("invalid_runtime_check_with_js_interop_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Runtime check between 'Dart' and 'JS' checks whether a Dart value is a JS interop type, which might not be platform-consistent."
+        );
+        assert_eq!(
+            lints[1].message,
+            "Cast from 'Dart' to 'JS' casts a Dart value to a JS interop type, which might not be platform-consistent."
+        );
+    }
+
+    /// Without `dart:js_interop` the same syntax is not interop-classified.
+    #[test]
+    fn invalid_runtime_check_requires_js_interop_import() {
+        let f =
+            Fixture::parse("@JS\nclass JS {}\n\nclass Dart {\n  bool check() => this is JS;\n}");
+        assert!(
+            f.run(&one_rule("invalid_runtime_check_with_js_interop_types"))
+                .is_empty()
+        );
     }
 }
