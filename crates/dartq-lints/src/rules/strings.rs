@@ -181,6 +181,14 @@ pub(crate) mod unnecessary_string_escapes {
     ) {
         let lexeme = c.lexeme(segment as u32);
         let bytes = lexeme.as_bytes();
+        // Empty contents (`''`, `""`): both quotes book into the leading
+        // and trailing runs, so the runs overlap across the whole lexeme
+        // and the contents slice degenerates. The official `visitLexeme`
+        // yields no candidates for empty contents (:44-91), so return
+        // before slicing.
+        if bytes.len() <= leading + trailing {
+            return;
+        }
         let contents = core::str::from_utf8(&bytes[leading..bytes.len() - trailing])
             .expect("contents of a valid lexeme");
         let contents_end = bytes.len() - trailing; // lexeme-local
@@ -511,6 +519,16 @@ mod tests {
         assert_eq!(lints.len(), 2);
     }
 
+    /// Empty contents (`''`, `""`, raw `r''`) visit nothing: both quotes
+    /// book into the leading and trailing runs, so the runs overlap the
+    /// whole lexeme — the official `visitLexeme` yields no candidates for
+    /// empty contents (:44-91), and the rule must not slice degenerately.
+    #[test]
+    fn empty_literals_yield_no_candidates() {
+        let f = fixture("var a = '';\nvar b = \"\";\nvar c = r'';\n");
+        assert!(f.run(&one_rule("unnecessary_string_escapes")).is_empty());
+    }
+
     // —— unnecessary_string_interpolations ————————————————————————————————
     // The rule reads the literal's flat token range; the fixture mounts one
     // `StringLiteral` span per literal (the collapse-map §3.5 contract) over
@@ -593,7 +611,10 @@ mod tests {
             b.leaf_span(NodeKind::StringLiteral, 4, 9);
             b.end(NodeKind::CompilationUnit, t.len() as u32);
         });
-        assert!(f.run(&one_rule("unnecessary_string_interpolations")).is_empty());
+        assert!(
+            f.run(&one_rule("unnecessary_string_interpolations"))
+                .is_empty()
+        );
     }
 
     /// `'$this'` interpolates the enclosing object — never `String` (:50-53).
