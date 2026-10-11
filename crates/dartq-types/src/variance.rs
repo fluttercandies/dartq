@@ -40,7 +40,7 @@
 //! parameter does not occur free in the type"), never a declared variance.
 
 use crate::ids::{TypeId, TypeParamId};
-use crate::system::{TypeSystem, DEPTH_LIMIT};
+use crate::system::{DEPTH_LIMIT, TypeSystem};
 use crate::ty::TypeKind;
 
 /// The variance of a type parameter in a type
@@ -133,7 +133,7 @@ impl Variance {
 /// element.dart:11560-11562) and its declared bound (`None` = unbounded;
 /// the ITB face substitutes `dynamic` exactly where the official reads
 /// `typeParameter.bound ?? DynamicTypeImpl.instance`,
-/// type_system.dart:786).
+/// `type_system.dart:786`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ParamFacts {
     /// The declared variance (`in`/`out`/`inout`, or the legacy default).
@@ -214,7 +214,7 @@ impl ParamFactsTable {
 ///   is referenced in a bound at all, it makes the variance … invariant");
 /// * a record type: the meet over all field types
 ///   (variance_builder.dart:111-117);
-/// * unit kinds: `unrelated` (variance_builder.dart:118).
+/// * unit kinds: `unrelated` (`variance_builder.dart:118`).
 ///
 /// Recursion is bounded by [`DEPTH_LIMIT`] like the other type-operation
 /// walks; a tripped budget answers `unrelated` at the frame that tripped.
@@ -244,42 +244,40 @@ fn variance_in_type_bounded(
         TypeKind::TypeParameter { .. } => Variance::Unrelated,
         TypeKind::Interface { decl, args } => {
             let mut result = Variance::Unrelated;
-            let params = &sys.hierarchy().decl(decl).expect("declared owner").type_parameters;
+            let params = &sys
+                .hierarchy()
+                .decl(decl)
+                .expect("declared owner")
+                .type_parameters;
             for (i, &arg) in sys.table().args(args).iter().enumerate() {
                 let parameter_variance = facts.get(params[i]).variance;
-                result = result.meet(
-                    parameter_variance.combine(variance_in_type_bounded(
-                        sys,
-                        facts,
-                        parameter,
-                        arg,
-                        depth - 1,
-                    )),
-                );
+                result = result.meet(parameter_variance.combine(variance_in_type_bounded(
+                    sys,
+                    facts,
+                    parameter,
+                    arg,
+                    depth - 1,
+                )));
             }
             result
         }
-        TypeKind::FutureOr { base } => variance_in_type_bounded(
-            sys,
-            facts,
-            parameter,
-            base,
-            depth - 1,
-        ),
+        TypeKind::FutureOr { base } => {
+            variance_in_type_bounded(sys, facts, parameter, base, depth - 1)
+        }
         TypeKind::Function { signature } => {
             let sig = sys.table().signature(signature);
-            let mut result = variance_in_type_bounded(sys, facts, parameter, sig.return_type, depth - 1);
+            let mut result =
+                variance_in_type_bounded(sys, facts, parameter, sig.return_type, depth - 1);
             // The bound-invariance rule (variance_builder.dart:131-140):
             // occurrence in any bound of the signature's own parameters
             // forces `invariant`.
             for p in sys.table().function_type_parameters(sig.type_parameters) {
                 let bound = facts.get(p).bound;
-                if let Some(bound) = bound {
-                    if variance_in_type_bounded(sys, facts, parameter, bound, depth - 1)
+                if let Some(bound) = bound
+                    && variance_in_type_bounded(sys, facts, parameter, bound, depth - 1)
                         != Variance::Unrelated
-                    {
-                        result = Variance::Invariant;
-                    }
+                {
+                    result = Variance::Invariant;
                 }
             }
             for member in sys.table().named_members(sig.named) {
@@ -308,17 +306,31 @@ fn variance_in_type_bounded(
             let mut result = Variance::Unrelated;
             for i in 0..shape.positional.len() {
                 let p = sys.table().arg(shape.positional.offset() + i);
-                result = result.meet(variance_in_type_bounded(sys, facts, parameter, p, depth - 1));
+                result = result.meet(variance_in_type_bounded(
+                    sys,
+                    facts,
+                    parameter,
+                    p,
+                    depth - 1,
+                ));
             }
             for member in sys.table().named_members(shape.named) {
-                result = result.meet(variance_in_type_bounded(sys, facts, parameter, member.ty, depth - 1));
+                result = result.meet(variance_in_type_bounded(
+                    sys,
+                    facts,
+                    parameter,
+                    member.ty,
+                    depth - 1,
+                ));
             }
             result
         }
         // Unit kinds carry no parameter references (variance_builder.dart:118).
-        TypeKind::Never | TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => {
-            Variance::Unrelated
-        }
+        TypeKind::Never
+        | TypeKind::Dynamic
+        | TypeKind::Void
+        | TypeKind::Invalid
+        | TypeKind::Null => Variance::Unrelated,
     }
 }
 
@@ -334,7 +346,12 @@ fn variance_in_type_bounded(
 /// differ in length (the walk's arity precondition,
 /// `subtype.dart:48-50`).
 #[must_use]
-pub fn arguments_related(sys: &TypeSystem<'_>, variances: &[Variance], sub: &[TypeId], sup: &[TypeId]) -> bool {
+pub fn arguments_related(
+    sys: &TypeSystem<'_>,
+    variances: &[Variance],
+    sub: &[TypeId],
+    sup: &[TypeId],
+) -> bool {
     assert_eq!(
         sub.len(),
         sup.len(),
@@ -447,11 +464,20 @@ mod tests {
             Variance::Invariant
         );
         // meet = index | index (shared_type.dart:129-134).
-        assert_eq!(Variance::Covariant.meet(Variance::Contravariant), Variance::Invariant);
+        assert_eq!(
+            Variance::Covariant.meet(Variance::Contravariant),
+            Variance::Invariant
+        );
         // `Unrelated` is the lattice top: its encoding 0 ORs away, so the
         // meet of top with anything is that thing.
-        assert_eq!(Variance::Unrelated.meet(Variance::Invariant), Variance::Invariant);
-        assert_eq!(Variance::Covariant.meet(Variance::Invariant), Variance::Invariant);
+        assert_eq!(
+            Variance::Unrelated.meet(Variance::Invariant),
+            Variance::Invariant
+        );
+        assert_eq!(
+            Variance::Covariant.meet(Variance::Invariant),
+            Variance::Invariant
+        );
         // greaterThanOrEqual (shared_type.dart:109-127).
         assert!(Variance::Unrelated.greater_or_equal(Variance::Invariant));
         assert!(Variance::Covariant.greater_or_equal(Variance::Invariant));
@@ -487,7 +513,10 @@ mod tests {
         assert_eq!(variance_in_type(&sys, &facts, t, num), Variance::Unrelated);
         // `T` in `Iterable<T>`: covariant (legacy-covariant parameter).
         let iterable_t = itf(&table, ITERABLE, &[t_ty]);
-        assert_eq!(variance_in_type(&sys, &facts, t, iterable_t), Variance::Covariant);
+        assert_eq!(
+            variance_in_type(&sys, &facts, t, iterable_t),
+            Variance::Covariant
+        );
         // `T` in `Function(T)`: contravariant (:142-148).
         let fn_t = table
             .intern_function(
@@ -501,7 +530,10 @@ mod tests {
                 false,
             )
             .expect("signature is well-formed");
-        assert_eq!(variance_in_type(&sys, &facts, t, fn_t), Variance::Contravariant);
+        assert_eq!(
+            variance_in_type(&sys, &facts, t, fn_t),
+            Variance::Contravariant
+        );
         // `T` in `List<Function(T)>`: contravariant — the docstring example
         // (shared_type.dart:70-73) via covariant.combine(contravariant);
         // not pinned separately because the Function arm above already
@@ -532,7 +564,10 @@ mod tests {
         // `FutureOr<T>`: covariant — the official FutureOr parameter is
         // legacy covariant (type.dart:518).
         let future_or_t = table.intern(UninternedType::FutureOr { base: t_ty }, false);
-        assert_eq!(variance_in_type(&sys, &facts, t, future_or_t), Variance::Covariant);
+        assert_eq!(
+            variance_in_type(&sys, &facts, t, future_or_t),
+            Variance::Covariant
+        );
     }
 
     #[test]
@@ -543,11 +578,36 @@ mod tests {
         let int = itf(&table, INT, &[]);
         // int <: num: covariant pair agrees, contravariant pair flips,
         // invariant pair accepts only the symmetric order.
-        assert!(arguments_related(&sys, &[Variance::Covariant], &[int], &[num]));
-        assert!(!arguments_related(&sys, &[Variance::Contravariant], &[int], &[num]));
-        assert!(arguments_related(&sys, &[Variance::Contravariant], &[num], &[int]));
-        assert!(arguments_related(&sys, &[Variance::Invariant], &[int], &[int]));
-        assert!(!arguments_related(&sys, &[Variance::Invariant], &[int], &[num]));
+        assert!(arguments_related(
+            &sys,
+            &[Variance::Covariant],
+            &[int],
+            &[num]
+        ));
+        assert!(!arguments_related(
+            &sys,
+            &[Variance::Contravariant],
+            &[int],
+            &[num]
+        ));
+        assert!(arguments_related(
+            &sys,
+            &[Variance::Contravariant],
+            &[num],
+            &[int]
+        ));
+        assert!(arguments_related(
+            &sys,
+            &[Variance::Invariant],
+            &[int],
+            &[int]
+        ));
+        assert!(!arguments_related(
+            &sys,
+            &[Variance::Invariant],
+            &[int],
+            &[num]
+        ));
     }
 
     #[test]

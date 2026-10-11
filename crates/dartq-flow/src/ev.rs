@@ -96,6 +96,14 @@ pub enum Ev {
     VoidType,
 
     // —— statements ——
+    /// A statement's completion point: the end of its last token, the
+    /// trailing `;` included where present. An open dead-code interval
+    /// runs to this end (the official close trims the covering list to
+    /// its last statement and reports `node.end - offset` —
+    /// dead_code_verifier.dart:253-279, :326-332).
+    StmtEnd {
+        end: u32,
+    },
     ExprStmt {
         span: TokenSpan,
     },

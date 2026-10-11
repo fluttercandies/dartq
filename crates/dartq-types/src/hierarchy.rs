@@ -214,6 +214,9 @@ impl TypeHierarchyBuilder {
     /// [`TypeError::SupertypeNotInterface`], [`TypeError::ObjectSupertype`],
     /// [`TypeError::NullableSupertype`], [`TypeError::ArityMismatch`],
     /// [`TypeError::ForeignTypeParameter`], [`TypeError::CyclicHierarchy`].
+    // Port of the official hierarchy build; one long pass mirrors it —
+    // splitting would scatter the oracle mapping across helpers.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     pub fn build(self, table: &TypeTable) -> Result<TypeHierarchy, TypeError> {
         let core = self.core;
         let sealed = self.sealed;

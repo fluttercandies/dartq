@@ -4,7 +4,7 @@
 //! (`pkg/analyzer/lib/src/dart/element/type_system.dart:762-838`), the
 //! algorithm of dart-lang/sdk#27526 (comment 260021397): start each
 //! parameter at its declared bound (unbounded reads `dynamic`,
-//! type_system.dart:786), then repeatedly substitute defaulted parameters
+//! `type_system.dart:786`), then repeatedly substitute defaulted parameters
 //! into the remaining "partial" defaults until a fixed point; parameters
 //! whose defaults still mention free parameters at the fixed point are
 //! *malbounded* and get the Phi substitution (each uncompleted parameter
@@ -55,6 +55,12 @@ pub struct BoundsInstantiation {
 
 /// `instantiateTypeFormalsToBounds` (`type_system.dart:762-838`). See the
 /// module docs for the algorithm and the iteration-order note.
+///
+/// # Panics
+///
+/// Panics on the two ordering invariants of the fixed-point loop — a
+/// defaulted parameter always came from the input list, and every input
+/// parameter completes; both are pinned by `expect`s.
 #[must_use]
 pub fn instantiate_type_formals_to_bounds(
     table: &TypeTable,
@@ -126,11 +132,17 @@ pub fn instantiate_type_formals_to_bounds(
 
     let mut ordered: Vec<Option<TypeId>> = vec![None; count];
     for (parameter, default) in defaults {
-        let slot = parameters.iter().position(|&p| p == parameter).expect("parameter came from the input");
+        let slot = parameters
+            .iter()
+            .position(|&p| p == parameter)
+            .expect("parameter came from the input");
         ordered[slot] = Some(default);
     }
     BoundsInstantiation {
-        defaults: ordered.into_iter().map(|d| d.expect("every parameter completed")).collect(),
+        defaults: ordered
+            .into_iter()
+            .map(|d| d.expect("every parameter completed"))
+            .collect(),
         malbounded,
     }
 }
@@ -141,6 +153,9 @@ pub fn instantiate_type_formals_to_bounds(
 /// (type_system.dart:588-600); the official alias arm
 /// (type_system.dart:596-598) has no counterpart — dartq types carry no
 /// alias kinds.
+// The workspace pins Fx hashing (rustc-hash) — generalizing over
+// `BuildHasher` would add a parameter no caller can use differently.
+#[expect(clippy::implicit_hasher, reason = "see above")]
 #[must_use]
 pub fn get_free_parameters(
     table: &TypeTable,
@@ -150,12 +165,16 @@ pub fn get_free_parameters(
     let mut found: Vec<TypeParamId> = Vec::new();
     let mut visited: FxHashSet<TypeId> = FxHashSet::default();
     let mut bound: FxHashSet<TypeParamId> = FxHashSet::default();
-    append_free_parameters(table, candidates, root, &mut visited, &mut bound, &mut found, 0);
-    if found.is_empty() {
-        None
-    } else {
-        Some(found)
-    }
+    append_free_parameters(
+        table,
+        candidates,
+        root,
+        &mut visited,
+        &mut bound,
+        &mut found,
+        0,
+    );
+    if found.is_empty() { None } else { Some(found) }
 }
 
 /// The `appendParameters` closure (`type_system.dart:579-609`), iterative
@@ -204,13 +223,29 @@ fn append_free_parameters(
             for p in &newly_bound {
                 bound.insert(*p);
             }
-            append_free_parameters(table, candidates, sig.return_type, visited, bound, found, depth + 1);
+            append_free_parameters(
+                table,
+                candidates,
+                sig.return_type,
+                visited,
+                bound,
+                found,
+                depth + 1,
+            );
             for i in 0..sig.positional.len() {
                 let p = table.arg(sig.positional.offset() + i);
                 append_free_parameters(table, candidates, p, visited, bound, found, depth + 1);
             }
             for member in table.named_members(sig.named) {
-                append_free_parameters(table, candidates, member.ty, visited, bound, found, depth + 1);
+                append_free_parameters(
+                    table,
+                    candidates,
+                    member.ty,
+                    visited,
+                    bound,
+                    found,
+                    depth + 1,
+                );
             }
             for p in &newly_bound {
                 bound.remove(p);
@@ -223,11 +258,23 @@ fn append_free_parameters(
                 append_free_parameters(table, candidates, p, visited, bound, found, depth + 1);
             }
             for member in table.named_members(shape.named) {
-                append_free_parameters(table, candidates, member.ty, visited, bound, found, depth + 1);
+                append_free_parameters(
+                    table,
+                    candidates,
+                    member.ty,
+                    visited,
+                    bound,
+                    found,
+                    depth + 1,
+                );
             }
         }
         // Unit kinds carry no structure (the official `null`/fall-through).
-        TypeKind::Never | TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => {}
+        TypeKind::Never
+        | TypeKind::Dynamic
+        | TypeKind::Void
+        | TypeKind::Invalid
+        | TypeKind::Null => {}
     }
 }
 
@@ -236,6 +283,11 @@ fn append_free_parameters(
 /// — the official reads each `typeParameterImpl.defaultType!`
 /// (`_defaultTypeArguments`, type_system.dart:1811-1820), which is exactly
 /// the ITB default computed here.
+///
+/// # Panics
+///
+/// Panics if `decl` is missing from the hierarchy — impossible for a
+/// well-formed interface type; the `expect` pins that invariant.
 #[must_use]
 pub fn instantiate_interface_to_bounds(
     sys: &TypeSystem<'_>,
@@ -297,7 +349,7 @@ mod tests {
     }
 
     /// Unbounded parameters default to `dynamic`
-    /// (type_system.dart:786).
+    /// (`type_system.dart:786`).
     #[test]
     fn unbounded_parameter_defaults_to_dynamic() {
         let table = fixture();
@@ -336,8 +388,14 @@ mod tests {
         );
         let result = instantiate_type_formals_to_bounds(&table, &facts, &[t1, t2]);
         assert!(!result.malbounded);
-        assert!(matches!(table.get(result.defaults[0]).kind(), TypeKind::Interface { decl: INT, .. }));
-        assert!(matches!(table.get(result.defaults[1]).kind(), TypeKind::Interface { decl: INT, .. }));
+        assert!(matches!(
+            table.get(result.defaults[0]).kind(),
+            TypeKind::Interface { decl: INT, .. }
+        ));
+        assert!(matches!(
+            table.get(result.defaults[1]).kind(),
+            TypeKind::Interface { decl: INT, .. }
+        ));
     }
 
     /// The recursive-bound edge: `class A<T extends A<T>>` — `T`'s default
@@ -393,8 +451,14 @@ mod tests {
         );
         let result = instantiate_type_formals_to_bounds(&table, &facts, &[t, u]);
         assert!(result.malbounded);
-        assert!(matches!(table.get(result.defaults[0]).kind(), TypeKind::Dynamic));
-        assert!(matches!(table.get(result.defaults[1]).kind(), TypeKind::Dynamic));
+        assert!(matches!(
+            table.get(result.defaults[0]).kind(),
+            TypeKind::Dynamic
+        ));
+        assert!(matches!(
+            table.get(result.defaults[1]).kind(),
+            TypeKind::Dynamic
+        ));
     }
 
     /// `getFreeParameters` honors function-type binders

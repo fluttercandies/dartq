@@ -10,7 +10,7 @@
 //! (:17642/:17655) are the renamed family members; the `is Null`/`is! Null`
 //! warning's code name is `type_check_with_null` (:16358, unique names
 //! `type_check_is_null`/`type_check_is_not_null`), not
-//! "unnecessary_type_check_with_null".
+//! `"unnecessary_type_check_with_null"`.
 //!
 //! | code | facet | official decision order |
 //! |---|---|---|
@@ -202,10 +202,6 @@ impl TypeSystem<'_> {
                 let greatest = self.eliminate_to_greatest(value);
                 self.is_subtype(constant, greatest)
             }
-            // The official recurses on the (promoted) bound when it is fully
-            // concrete; with no bounds modeled the boundless fallback is the
-            // same answer: no warning.
-            TypeKind::TypeParameter { .. } => true,
             TypeKind::Function { .. } | TypeKind::Record { .. } => {
                 if constant_is_null {
                     self.is_nullable(value)
@@ -213,6 +209,10 @@ impl TypeSystem<'_> {
                     false
                 }
             }
+            // The official recurses on a type parameter's (promoted) bound
+            // when it is fully concrete; with no bounds modeled the
+            // boundless fallback — like every other kind here — is the same
+            // answer: no warning.
             _ => true,
         }
     }
@@ -225,7 +225,7 @@ impl TypeSystem<'_> {
     /// the parameters. Variance flips once around a function type's whole
     /// parameter list (replacement_visitor.dart:242-260); interface
     /// arguments, `FutureOr` bases, and record fields stay covariant
-    /// (replacement_visitor.dart:360/:433 have no flip). A replacement
+    /// (`replacement_visitor.dart:360`/`:433` have no flip). A replacement
     /// unites nullabilities with the parameter's own `?`
     /// (least_greatest_closure.dart:123-128) — `T?` in a contravariant
     /// position is `Never?`, which interns as `Null` (type.dart:1207-1209).
@@ -239,6 +239,9 @@ impl TypeSystem<'_> {
         self.eliminate(t, true)
     }
 
+    // Port of eliminateToGreatest's visitor; arm order mirrors
+    // replacement_visitor.dart, so the body stays one function.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn eliminate(&self, t: TypeId, covariant: bool) -> TypeId {
         let ty = self.table().get(t);
         match ty.kind() {
@@ -263,9 +266,7 @@ impl TypeSystem<'_> {
                     changed |= eliminated != argument;
                     rebuilt.push(eliminated);
                 }
-                if !changed {
-                    t
-                } else {
+                if changed {
                     self.table().intern(
                         UninternedType::Interface {
                             decl,
@@ -273,6 +274,8 @@ impl TypeSystem<'_> {
                         },
                         ty.is_nullable(),
                     )
+                } else {
+                    t
                 }
             }
             TypeKind::FutureOr { base } => {

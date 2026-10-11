@@ -291,9 +291,10 @@ pub(crate) struct DeadWindow {
     depth: usize,
     /// The first dead node's first token: the row's anchor.
     anchor: TokenSpan,
-    /// End of the interval so far: the furthest dead statement end seen
-    /// (the official trim to the covering block's last statement — the
-    /// last statement of a dead tail is its furthest dead statement).
+    /// End of the interval so far: the furthest statement end seen while
+    /// the interval is open — the covering list's last statement's
+    /// `node.end`, its trailing `;` included (`StmtEnd` events; official
+    /// dead_code_verifier.dart:253-279 trim, :326-332 length).
     end: u32,
     /// Do-while split (official `parent is DoStatement`): the interval's
     /// anchor is a do-while condition whose back edge is dead, so the
@@ -674,9 +675,10 @@ impl<'o> Interp<'o> {
     /// The first unreachable node opens the dead-code interval (official
     /// `_visitNode`): every later unreachable node continues the same
     /// interval — no row of its own — and the interval's end tracks the
-    /// furthest dead statement so the close can trim the row to the last
-    /// one (official `Block.statements.last`). Reachable nodes keep the
-    /// interval open: only a covering close retires it.
+    /// furthest statement end so the close can trim the row to the
+    /// covering list's last statement, its trailing `;` included
+    /// (official `Block.statements.last` + `node.end`). Reachable nodes
+    /// keep the interval open: only a covering close retires it.
     pub(crate) fn dead_code(&mut self, span: TokenSpan) {
         if self.reachable() {
             return;

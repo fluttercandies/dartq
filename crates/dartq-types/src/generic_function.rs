@@ -16,8 +16,8 @@
 //!   interface arguments are processed with the *incoming* variance — the
 //!   official does not fold the parameter's own variance here (:97-100) —
 //!   and record types have no arm, so they pass through unchanged (:43).
-//!   The FutureOr mapping: the official models `FutureOr<T>` as an
-//!   interface type with one argument (type.dart:518), which is exactly
+//!   The `FutureOr` mapping: the official models `FutureOr<T>` as an
+//!   interface type with one argument (`type.dart:518`), which is exactly
 //!   the `FutureOr` arm below.
 //! * `pkg/analyzer/lib/src/dart/element/well_bounded.dart:62-129` —
 //!   `TypeBoundedHelper`: the regular-bounded pass substitutes the type
@@ -73,8 +73,10 @@ pub fn instantiate_function(
     if arguments.is_empty() {
         return Ok(fn_ty);
     }
-    let map: Vec<(TypeParamId, TypeId)> =
-        parameters.into_iter().zip(arguments.iter().copied()).collect();
+    let map: Vec<(TypeParamId, TypeId)> = parameters
+        .into_iter()
+        .zip(arguments.iter().copied())
+        .collect();
     let positional: Vec<TypeId> = (0..sig.positional.len())
         .map(|i| table.arg(sig.positional.offset() + i))
         .map(|ty| table.substitute(ty, &map))
@@ -154,7 +156,10 @@ fn process_top_bottom(
                 })
                 .collect();
             sys.table().intern(
-                UninternedType::Interface { decl, args: new_args },
+                UninternedType::Interface {
+                    decl,
+                    args: new_args,
+                },
                 sys.table().get(ty).is_nullable(),
             )
         }
@@ -166,8 +171,10 @@ fn process_top_bottom(
             if new_base == base {
                 ty
             } else {
-                sys.table()
-                    .intern(UninternedType::FutureOr { base: new_base }, sys.table().get(ty).is_nullable())
+                sys.table().intern(
+                    UninternedType::FutureOr { base: new_base },
+                    sys.table().get(ty).is_nullable(),
+                )
             }
         }
         TypeKind::Function { signature } => {
@@ -244,6 +251,11 @@ pub struct TypeArgumentIssue {
 /// official alias arm (well_bounded.dart:80-85) is unreachable here and
 /// only interface instantiations carry parameters — other kinds answer
 /// with no issues (well_bounded.dart:89-91).
+///
+/// # Panics
+///
+/// Panics if `ty`'s declaration is missing from the hierarchy — impossible
+/// for a well-formed interface type; the `expect` pins that invariant.
 #[must_use]
 pub fn regular_bounded_issues(
     sys: &TypeSystem<'_>,
@@ -259,9 +271,14 @@ pub fn regular_bounded_issues(
         .expect("declared owner")
         .type_parameters
         .clone();
-    let arguments: Vec<TypeId> = (0..args.len()).map(|i| sys.table().arg(args.offset() + i)).collect();
-    let map: Vec<(TypeParamId, TypeId)> =
-        parameters.iter().copied().zip(arguments.iter().copied()).collect();
+    let arguments: Vec<TypeId> = (0..args.len())
+        .map(|i| sys.table().arg(args.offset() + i))
+        .collect();
+    let map: Vec<(TypeParamId, TypeId)> = parameters
+        .iter()
+        .copied()
+        .zip(arguments.iter().copied())
+        .collect();
     let mut issues = Vec::new();
     for (i, (&parameter, &argument)) in parameters.iter().zip(arguments.iter()).enumerate() {
         let Some(declared_bound) = facts.get(parameter).bound else {
@@ -331,8 +348,8 @@ pub enum Boundedness {
 mod tests {
     use super::*;
     use crate::hierarchy::{CoreDecls, TypeHierarchy};
-    use crate::variance::ParamFacts;
     use crate::ids::TypeDeclId;
+    use crate::variance::ParamFacts;
 
     const OBJECT: TypeDeclId = TypeDeclId::from_raw(1);
     const FUTURE: TypeDeclId = TypeDeclId::from_raw(2);
@@ -426,7 +443,10 @@ mod tests {
         let int = itf(&table, INT, &[]);
         assert!(matches!(
             instantiate_function(&table, identity, &[int, int]),
-            Err(TypeError::FunctionInstantiationArity { expected: 1, actual: 2 })
+            Err(TypeError::FunctionInstantiationArity {
+                expected: 1,
+                actual: 2
+            })
         ));
         assert!(matches!(
             instantiate_function(&table, int, &[int]),
@@ -437,7 +457,10 @@ mod tests {
         // is the ArgumentError.
         assert!(matches!(
             instantiate_function(&table, identity, &[]),
-            Err(TypeError::FunctionInstantiationArity { expected: 1, actual: 0 })
+            Err(TypeError::FunctionInstantiationArity {
+                expected: 1,
+                actual: 0
+            })
         ));
         // The empty short-circuit (type.dart:316-318) fires only for
         // non-generic functions: the receiver returns itself.

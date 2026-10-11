@@ -155,7 +155,7 @@ impl WalkScratch {
 ///   only ever held across a single lookup/insert, never across a recursive
 ///   query, so re-entrancy cannot arise.
 /// - `type_operation_depth`: the oracle's `_typeOperationDepth`
-///   (type_system.dart:85, :372-382) — one shared recursion budget across
+///   (`type_system.dart:85`, `:372-382`) — one shared recursion budget across
 ///   the subtype and LUB faces, so a subtype leg inside a LUB continues the
 ///   same count. A trip answers `false` from the tripped subtype entry and
 ///   unwinds the LUB to its outermost frame, which answers `Object?`.
@@ -367,6 +367,9 @@ impl<'a> TypeSystem<'a> {
     /// - `resolveToBound` on the interface/type-parameter paths is the
     ///   identity (declared bounds are M2).
     #[must_use]
+    // Port of the official subtype decision cascade (type_system.dart
+    // :157-286); the arm order is the oracle's.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     pub fn can_be_subtype_of(&self, left: TypeId, right: TypeId) -> bool {
         let a = self.table.get(left);
         let b = self.table.get(right);
@@ -392,10 +395,10 @@ impl<'a> TypeSystem<'a> {
         let left_functional =
             |decl: TypeDeclId| decl == self.core().function || decl == self.core().object;
         match (a.kind(), b.kind()) {
-            (TypeKind::Function { .. }, TypeKind::Interface { decl, .. }) => {
-                return left_functional(decl);
-            }
-            (TypeKind::Interface { decl, .. }, TypeKind::Function { .. }) => {
+            // The two symmetric faces agree (`left_functional` answers
+            // either side's decl): one merged arm.
+            (TypeKind::Function { .. }, TypeKind::Interface { decl, .. })
+            | (TypeKind::Interface { decl, .. }, TypeKind::Function { .. }) => {
                 return left_functional(decl);
             }
             _ => {}
@@ -465,10 +468,10 @@ impl<'a> TypeSystem<'a> {
             // Symmetric: if we know all subtypes of the right, only they can
             // implement the left (type_system.dart:263-278).
             if let Some(subclasses) = self.hierarchy.direct_subclasses(right_decl) {
-                if let Some(as_left) = self.as_instance_of(right, left_decl) {
-                    if self.can_be_subtype_of_interfaces(left, as_left) {
-                        return true;
-                    }
+                if let Some(as_left) = self.as_instance_of(right, left_decl)
+                    && self.can_be_subtype_of_interfaces(left, as_left)
+                {
+                    return true;
                 }
                 for &sub in subclasses {
                     let sub_ty = self.this_type(sub);
@@ -505,24 +508,27 @@ impl<'a> TypeSystem<'a> {
         if let (TypeKind::Record { shape: sub }, TypeKind::Record { shape: sup }) =
             (a.kind(), b.kind())
         {
-            let sub_shape = self.table.record_shape(sub);
-            let sup_shape = self.table.record_shape(sup);
-            if sub_shape.positional.len() != sup_shape.positional.len() {
+            let left_record = self.table.record_shape(sub);
+            let right_record = self.table.record_shape(sup);
+            if left_record.positional.len() != right_record.positional.len() {
                 return false;
             }
-            for i in 0..sub_shape.positional.len() {
+            for i in 0..left_record.positional.len() {
                 if !self.can_be_subtype_of(
-                    self.table.arg(sub_shape.positional.offset() + i),
-                    self.table.arg(sup_shape.positional.offset() + i),
+                    self.table.arg(left_record.positional.offset() + i),
+                    self.table.arg(right_record.positional.offset() + i),
                 ) {
                     return false;
                 }
             }
-            if sub_shape.named.len() != sup_shape.named.len() {
+            if left_record.named.len() != right_record.named.len() {
                 return false;
             }
-            for i in 0..sub_shape.named.len() {
-                let (x, y) = (sub_shape.named.offset() + i, sup_shape.named.offset() + i);
+            for i in 0..left_record.named.len() {
+                let (x, y) = (
+                    left_record.named.offset() + i,
+                    right_record.named.offset() + i,
+                );
                 if self.table.named_names_cmp(x, y) != std::cmp::Ordering::Equal {
                     return false;
                 }
@@ -1535,6 +1541,9 @@ mod can_be_subtype_tests {
     }
 
     #[test]
+    // A flat pin table: every row is one oracle decision, and the flat
+    // form keeps the coverage list scannable against the official tests.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn can_be_subtype_of_official_pins() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);
@@ -1713,6 +1722,9 @@ mod can_be_subtype_tests {
     /// and "the pattern never matches" mutually exclusive on the pairs the
     /// diagnostics see.
     #[test]
+    // Corpus-wide law sweep: the value is the exhaustive flat iteration;
+    // splitting it would hide which fixtures the law covers.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn mutual_exclusion_law_over_fixture_corpus() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);

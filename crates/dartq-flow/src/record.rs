@@ -295,8 +295,11 @@ impl ParserListener for Flow<'_> {
         self.exec_begin(true);
     }
 
-    fn end_local_function_declaration(&mut self, _end: Token) {
+    fn end_local_function_declaration(&mut self, end: Token) {
         self.exec_end(false);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
@@ -401,12 +404,28 @@ impl ParserListener for Flow<'_> {
     fn end_assert(
         &mut self,
         _begin: Token,
-        _kind: AssertKind,
+        kind: AssertKind,
         _left_paren: Token,
         _comma: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
         self.record(Ev::AssertEnd);
+        // The hook's `end` is the closing `)` (official `endAssert`
+        // delivers the endGroup paren, parser_impl.dart:11137); the
+        // statement's `;` rides no hook, so the completion event reads it
+        // from the token table when the statement is well-formed (the
+        // official dead-assert row spans through the `;` —
+        // dead_code_test.dart `test_assert`, 14 carets over
+        // `assert (true);`).
+        let stmt_end = if matches!(kind, AssertKind::Statement)
+            && let Some(next) = self.tokens.get(end.id as usize + 1)
+            && next.kind == dartq_scanner::TokenKind::Semicolon
+        {
+            next.utf16_offset + 1
+        } else {
+            end.range.end()
+        };
+        self.record(Ev::StmtEnd { end: stmt_end });
     }
 
     // —— formal parameters ——————————————————————————————————————————————
@@ -462,8 +481,13 @@ impl ParserListener for Flow<'_> {
         });
     }
 
-    fn end_variables_declaration(&mut self, _count: usize, _end: Option<Token>) {
+    fn end_variables_declaration(&mut self, _count: usize, end: Option<Token>) {
         self.record(Ev::VarDeclEnd);
+        if let Some(end) = end {
+            self.record(Ev::StmtEnd {
+                end: end.range.end(),
+            });
+        }
     }
 
     fn begin_initialized_identifier(&mut self, token: Token) {
@@ -492,9 +516,12 @@ impl ParserListener for Flow<'_> {
         &mut self,
         keyword: Token,
         _equals: Token,
-        _semicolon: Token,
+        semicolon: Token,
     ) {
         self.record(Ev::PatternVarDeclStmt { span: keyword });
+        self.record(Ev::StmtEnd {
+            end: semicolon.range.end(),
+        });
     }
 
     // —— types ——————————————————————————————————————————————————————————
@@ -545,8 +572,11 @@ impl ParserListener for Flow<'_> {
 
     // —— statements ——————————————————————————————————————————————————————
 
-    fn handle_expression_statement(&mut self, begin: Token, _end: Token) {
+    fn handle_expression_statement(&mut self, begin: Token, end: Token) {
         self.record(Ev::ExprStmt { span: begin });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_if_statement(&mut self, token: Token) {
@@ -561,9 +591,12 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::ElseBegin);
     }
 
-    fn end_if_statement(&mut self, _token: Token, else_kw: Option<Token>, _end: Token) {
+    fn end_if_statement(&mut self, _token: Token, else_kw: Option<Token>, end: Token) {
         self.record(Ev::IfEnd {
             has_else: else_kw.is_some(),
+        });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
         });
     }
 
@@ -579,8 +612,11 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::WhileBodyEnd);
     }
 
-    fn end_while_statement(&mut self, _token: Token, _end: Token) {
+    fn end_while_statement(&mut self, _token: Token, end: Token) {
         self.record(Ev::WhileEnd);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_do_while_statement(&mut self, token: Token) {
@@ -617,6 +653,9 @@ impl ParserListener for Flow<'_> {
                 length: end.range.end() - while_start,
             },
         });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_for_statement(&mut self, token: Token) {
@@ -645,8 +684,11 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::ForBodyEnd);
     }
 
-    fn end_for_statement(&mut self, _end: Token) {
+    fn end_for_statement(&mut self, end: Token) {
         self.record(Ev::ForEnd);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn handle_for_in_loop_parts(
@@ -676,18 +718,27 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::ForInBodyEnd);
     }
 
-    fn end_for_in(&mut self, _end: Token) {
+    fn end_for_in(&mut self, end: Token) {
         self.record(Ev::ForInEnd);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
-    fn end_return_statement(&mut self, has_expression: bool, begin: Token, _end: Token) {
+    fn end_return_statement(&mut self, has_expression: bool, begin: Token, end: Token) {
         self.record(Ev::ReturnBegin { span: begin });
         self.record(Ev::ReturnEnd { has_expression });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
-    fn end_yield_statement(&mut self, begin: Token, _star: Option<Token>, _end: Token) {
+    fn end_yield_statement(&mut self, begin: Token, _star: Option<Token>, end: Token) {
         self.record(Ev::YieldBegin { span: begin });
         self.record(Ev::YieldEnd);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_await_expression(&mut self, _token: Token) {
@@ -698,19 +749,25 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::AwaitEnd);
     }
 
-    fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, _end: Token) {
+    fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
         let label = self.take_label(has_target);
         self.record(Ev::Break {
             label,
             span: break_kw,
         });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
-    fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, _end: Token) {
+    fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {
         let label = self.take_label(has_target);
         self.record(Ev::Continue {
             label,
             span: continue_kw,
+        });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
         });
     }
 
@@ -771,10 +828,13 @@ impl ParserListener for Flow<'_> {
         _count: usize,
         _begin: Token,
         finally_kw: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
         self.record(Ev::TryEnd {
             has_finally: finally_kw.is_some(),
+        });
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
         });
     }
 
@@ -827,8 +887,11 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::CaseEnd { statement_count });
     }
 
-    fn end_switch_statement(&mut self, _token: Token, _end: Token) {
+    fn end_switch_statement(&mut self, _token: Token, end: Token) {
         self.record(Ev::SwitchEnd);
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 
     fn begin_switch_expression(&mut self, token: Token) {
@@ -1302,7 +1365,9 @@ mod tests {
         flow.end_labeled_statement(1);
 
         let events = flow.buffer.as_ref().unwrap();
-        assert_eq!(events.len(), 7);
+        // 5 framed events + two breaks, each of which also records its
+        // statement-completion `StmtEnd`.
+        assert_eq!(events.len(), 9);
         let Ev::LabeledBegin { label: first_a, .. } = events[0] else {
             panic!("expected LabeledBegin, got {:?}", events[0]);
         };
@@ -1316,9 +1381,9 @@ mod tests {
         assert_eq!(label, first_a, "the break target carries its label id");
         let Ev::LabeledBegin {
             label: second_a, ..
-        } = events[4]
+        } = events[5]
         else {
-            panic!("expected LabeledBegin, got {:?}", events[4]);
+            panic!("expected LabeledBegin, got {:?}", events[5]);
         };
         assert_eq!(
             second_a, first_a,

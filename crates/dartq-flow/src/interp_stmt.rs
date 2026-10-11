@@ -28,6 +28,16 @@ impl Interp<'_> {
                     self.exprs.pop();
                 }
             }
+            Ev::StmtEnd { end } => {
+                // A statement completed: an open dead-code interval runs
+                // to the statement's end, its trailing `;` included (the
+                // official close trims the covering list to its last
+                // statement and reports `node.end - offset` —
+                // dead_code_verifier.dart:253-279, :326-332).
+                if let Some(window) = &mut self.dead {
+                    window.extend(*end);
+                }
+            }
             Ev::IfBegin { span }
             | Ev::ReturnBegin { span }
             | Ev::YieldBegin { span }
@@ -57,8 +67,14 @@ impl Interp<'_> {
             }
             Ev::ElseBegin => {
                 // The then branch's end covers its intervals (official
-                // `handle_ifStatement_thenEnd`'s `flowEnd`).
-                self.flow_end(crate::interp::Covered::Strict);
+                // `handle_ifStatement_thenEnd`'s `flowEnd(ifTrue)`,
+                // type_analyzer.dart:1199-1206). The containment gate
+                // accepts the close node itself (`_containsFirstDeadNode`,
+                // dead_code_verifier.dart:453-459 — the walk starts at the
+                // first dead node and matches on equality), so a wholly
+                // dead branch anchored at its own block is covered:
+                // `Covered::Body`'s `>=`, not `Strict`.
+                self.flow_end(crate::interp::Covered::Body);
                 let after_then = self.current.clone();
                 if let Some(Frame::If {
                     branch,
@@ -72,8 +88,11 @@ impl Interp<'_> {
             Ev::IfEnd { has_else } => {
                 // The last branch's end covers its intervals (official
                 // `handle_ifStatement_thenEnd` without an else, else
-                // `handle_ifStatement_elseEnd`).
-                self.flow_end(crate::interp::Covered::Strict);
+                // `handle_ifStatement_elseEnd`). As at `ElseBegin`, the
+                // official containment accepts the close node itself
+                // (dead_code_verifier.dart:453-459), covering a wholly
+                // dead branch anchored at its own block (`Covered::Body`).
+                self.flow_end(crate::interp::Covered::Body);
                 let Some(Frame::If { branch, after_then }) = self.stack.pop() else {
                     return true;
                 };

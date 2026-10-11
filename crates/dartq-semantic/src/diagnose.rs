@@ -289,6 +289,7 @@ use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::bounds::{Bounds, Clause, TypeTree};
 use crate::codes::{ExecKind, SemanticCode, SuperShape};
 use crate::collector::container_modifiers;
 use crate::const_eval::{
@@ -1316,6 +1317,33 @@ struct Engine<'a> {
     /// parameter — `type_arguments_verifier.dart:711-735`). Cross-file
     /// containers and fully-bounded ones stay out: no fact, no report.
     container_unbounded: FxHashMap<StringId, u16>,
+    /// The #610 boundedness capture (the `bounds` module): the parse-time
+    /// type-tree index plus the lazy `dartq_types` snapshot the checks run
+    /// against.
+    bounds: Bounds<'a>,
+    /// The explicit type-argument sites and enum declarations awaiting the
+    /// end-of-unit boundedness checks, in source order — the snapshot must
+    /// see every in-file container, so nothing checks before the parse
+    /// completes.
+    pending_bounded_checks: Vec<PendingBoundedCheck>,
+    /// The `strict_raw_type` report sites (name, anchor): their
+    /// instantiated-to-bounds displays need the whole-file snapshot too.
+    raw_type_sites: Vec<(StringId, SourceRange)>,
+}
+
+/// One deferred boundedness check (the [`Engine::pending_bounded_checks`]
+/// entries, captured in source order).
+enum PendingBoundedCheck {
+    /// The enum `name` declared at `range` (the name-token anchor): its
+    /// values-field face runs at the finalize pass.
+    Enum { name: StringId, range: SourceRange },
+    /// An explicit type-argument group at `head`: the captured argument
+    /// trees and the type parameters in scope at the site.
+    Site {
+        head: StringId,
+        args: Vec<TypeTree>,
+        in_scope: Vec<StringId>,
+    },
 }
 
 /// The bound accounting of one open type-variables window.
@@ -1393,6 +1421,9 @@ impl<'a> Engine<'a> {
             frames: Vec::new(),
             type_params: Vec::new(),
             pending_type_params: Vec::new(),
+            bounds: Bounds::new(),
+            pending_bounded_checks: Vec::new(),
+            raw_type_sites: Vec::new(),
             armed_ty: None,
             pending_decl_ty: None,
             group_heads: Vec::new(),
@@ -2125,8 +2156,10 @@ impl<'a> Engine<'a> {
         if unbounded == 0 {
             return;
         }
-        let display = self.strings.resolve(name).to_string();
-        self.stage_usage(SemanticCode::StrictRawType, range, &display);
+        // The row defers: the oracle's `{0}` display is the
+        // instantiated-to-bounds form (`Box<dynamic>`), which the whole-file
+        // bounds snapshot renders at the finalize pass.
+        self.raw_type_sites.push((name, range));
     }
 
     /// Opens a type-variables window (`begin_type_variables`): the
@@ -2156,7 +2189,19 @@ impl<'a> Engine<'a> {
     /// generic function) can never have its count adopted, so no boundary
     /// drops are needed. An unnamed container (`extension on Foo`) owns no
     /// raw verdict — its window is never consulted by name.
-    fn note_container_type_variables(&mut self, name: Option<Token>) {
+    ///
+    /// The same event feeds the #610 bounds capture (the parameter bounds
+    /// and the enum/extension-type flags) and opens the container's header
+    /// window, so its supertype clauses capture from here to the body.
+    fn note_container_type_variables(
+        &mut self,
+        name: Option<Token>,
+        is_enum: bool,
+        is_extension_type: bool,
+    ) {
+        if let Some(id) = name.and_then(|token| self.name_of(token)) {
+            self.bounds.open_header(id);
+        }
         let Some((unbounded, window_end)) = self.pending_tv.take() else {
             return;
         };
@@ -2166,8 +2211,66 @@ impl<'a> Engine<'a> {
         if token.range.offset >= window_end {
             return;
         }
-        if let Some(id) = self.name_of(token) {
-            self.container_unbounded.entry(id).or_insert(unbounded);
+        let Some(id) = self.name_of(token) else {
+            return;
+        };
+        self.container_unbounded.entry(id).or_insert(unbounded);
+        self.bounds.note_container(
+            Some(id),
+            token.range.offset,
+            window_end,
+            is_extension_type,
+            is_enum,
+        );
+    }
+
+    /// The end-of-unit boundedness checks (#610): the deferred explicit
+    /// type-argument sites and enum values-field faces, in source order,
+    /// against the whole-file snapshot; then the deferred
+    /// `strict_raw_type` rows, their `{0}` display rendered from the
+    /// instantiated-to-bounds form. Runs after the parse, when every
+    /// in-file container is captured.
+    fn finalize_bounds(&mut self) {
+        let strings = self.strings;
+        for check in std::mem::take(&mut self.pending_bounded_checks) {
+            match check {
+                PendingBoundedCheck::Site {
+                    head,
+                    args,
+                    in_scope,
+                } => {
+                    let issues = self.bounds.check_site(strings, head, args, &in_scope);
+                    for issue in issues {
+                        self.emit3(
+                            SemanticCode::TypeArgumentNotMatchingBounds,
+                            issue.range,
+                            &issue.argument,
+                            &issue.parameter,
+                            &issue.bound,
+                        );
+                    }
+                }
+                PendingBoundedCheck::Enum { name, range } => {
+                    if self.bounds.check_enum_values(strings, name) {
+                        let code = SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded;
+                        self.report.diagnostics.push(Diagnostic::new(
+                            code.severity(),
+                            code.code_info(),
+                            code.message("", ""),
+                            self.file,
+                            range,
+                            code.correction_message(""),
+                        ));
+                    }
+                }
+            }
+        }
+        for (name, range) in std::mem::take(&mut self.raw_type_sites) {
+            let display = self
+                .bounds
+                .raw_display(strings, name)
+                .unwrap_or_else(|| self.strings.resolve(name).to_string());
+            self.stage_usage(SemanticCode::StrictRawType, range, &display);
         }
     }
 
@@ -6058,6 +6161,17 @@ impl<'a> Engine<'a> {
             offset: begin.range.offset,
             length: end.range.end() - begin.range.offset,
         };
+        // The #610 site capture: the site's own group closed with a root —
+        // record the check for the finalize pass (the whole-file snapshot).
+        if let Some(mut roots) = self.bounds.end_group(range)
+            && let Some(tree) = roots.pop()
+        {
+            self.pending_bounded_checks.push(PendingBoundedCheck::Site {
+                head: tree.head,
+                args: tree.args,
+                in_scope: self.type_params.clone(),
+            });
+        }
         // A type head makes the group an annotation or a creation type
         // reference.
         let (head, base) = self.group_heads.pop().unwrap_or((None, 0));
@@ -8518,6 +8632,10 @@ pub fn diagnose_with(
         .expect("the parser released its listener")
         .into_inner();
     engine.resolve_rows();
+    // The #610 boundedness faces run after the parse — the snapshot must
+    // see every in-file container — folding the deferred sites, the enum
+    // values-field checks, and the `strict_raw_type` displays.
+    engine.finalize_bounds();
     // The usage cluster's library-level pass runs after every use indexed:
     // declaration sites and import directives walk the index, staging into
     // the report; the staged emissions merge source-ordered into the tail.
@@ -8896,7 +9014,7 @@ impl ParserListener for DiagnoseListener<'_> {
             &anchors,
         );
         let name_range = name.range;
-        engine.note_container_type_variables(Some(name));
+        engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
         if let Some(name) = name {
@@ -8907,7 +9025,9 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
     }
 
     fn begin_named_mixin_application(
@@ -8954,7 +9074,7 @@ impl ParserListener for DiagnoseListener<'_> {
             &anchors,
         );
         let name_range = name.range;
-        engine.note_container_type_variables(Some(name));
+        engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
         if let Some(name) = name {
@@ -8972,7 +9092,9 @@ impl ParserListener for DiagnoseListener<'_> {
         _implements: Option<Token>,
         _end: Token,
     ) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
     }
 
     fn begin_mixin_declaration(
@@ -8998,7 +9120,7 @@ impl ParserListener for DiagnoseListener<'_> {
             );
         }
         let name_range = name.range;
-        engine.note_container_type_variables(Some(name));
+        engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Mixin, name);
         if let Some(name) = name {
@@ -9009,7 +9131,9 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
     }
 
     fn begin_enum_declaration(
@@ -9021,12 +9145,20 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
-        engine.note_container_type_variables(Some(name));
+        engine.note_container_type_variables(Some(name), true, false);
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Enum, name);
         if let Some(name) = name {
             engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_face_inheritance(name, ContainerKind::Enum, name_range);
+            // The values-field face runs at the finalize pass (the source
+            // order here precedes the body's sites).
+            engine
+                .pending_bounded_checks
+                .push(PendingBoundedCheck::Enum {
+                    name,
+                    range: name_range,
+                });
         }
     }
 
@@ -9038,7 +9170,9 @@ impl ParserListener for DiagnoseListener<'_> {
         _member_count: usize,
         _end: Token,
     ) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
     }
 
     fn begin_extension_declaration(
@@ -9048,7 +9182,7 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Option<Token>,
     ) {
         let mut engine = self.engine.borrow_mut();
-        engine.note_container_type_variables(name);
+        engine.note_container_type_variables(name, false, false);
         let name = name.and_then(|token| engine.name_of(token));
         engine.push_container_frame(ContainerKind::Extension, name);
     }
@@ -9060,7 +9194,9 @@ impl ParserListener for DiagnoseListener<'_> {
         _on: Option<Token>,
         _end: Token,
     ) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
     }
 
     fn begin_extension_type_declaration(
@@ -9071,7 +9207,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
-        engine.note_container_type_variables(Some(name));
+        engine.note_container_type_variables(Some(name), false, true);
         let name = engine.name_of(name);
         // The representation checks read the element model (complete since
         // `collect`) and anchor at this name token.
@@ -9090,7 +9226,79 @@ impl ParserListener for DiagnoseListener<'_> {
         _type_keyword: Token,
         _end: Token,
     ) {
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.bounds.drop_header();
+        engine.pop_frame();
+    }
+
+    // —— the #610 boundedness capture: header clauses, bodies, poison ————
+    // A clause event fires after its types parse, so each claims the header
+    // sink's roots since the previous claim (`Clause`'s count checks). A
+    // body begin finalizes the header; a declaration end is the safety-net
+    // drop (handled in the `end_*_declaration` events above).
+
+    fn handle_class_extends(&mut self, extends: Option<Token>, count: usize) {
+        // The absent-clause events fire with `None` (count 0 or a recovery
+        // count) — no roots to claim.
+        if extends.is_some() {
+            self.engine
+                .borrow_mut()
+                .bounds
+                .header_clause(Clause::Extends(count));
+        }
+    }
+
+    fn handle_implements(&mut self, implements: Option<Token>, count: usize) {
+        if implements.is_some() {
+            self.engine
+                .borrow_mut()
+                .bounds
+                .header_clause(Clause::Implements(count));
+        }
+    }
+
+    fn handle_class_with_clause(&mut self, _with_keyword: Token) {
+        self.engine.borrow_mut().bounds.header_clause(Clause::With);
+    }
+
+    fn handle_named_mixin_application_with_clause(&mut self, _with_keyword: Token) {
+        self.engine.borrow_mut().bounds.header_clause(Clause::With);
+    }
+
+    fn handle_enum_with_clause(&mut self, _with_keyword: Token) {
+        self.engine.borrow_mut().bounds.header_clause(Clause::With);
+    }
+
+    fn handle_mixin_with_clause(&mut self, _with_keyword: Token) {
+        self.engine.borrow_mut().bounds.header_clause(Clause::With);
+    }
+
+    fn handle_mixin_on(&mut self, on: Option<Token>, count: usize) {
+        if on.is_some() {
+            self.engine
+                .borrow_mut()
+                .bounds
+                .header_clause(Clause::On(count));
+        }
+    }
+
+    fn begin_class_or_mixin_or_extension_body(&mut self, _kind: DeclarationKind, _token: Token) {
+        self.engine.borrow_mut().bounds.finish_header();
+    }
+
+    fn begin_enum_body(&mut self, _token: Token) {
+        self.engine.borrow_mut().bounds.finish_header();
+    }
+
+    fn begin_function_type(&mut self, _begin: Token) {
+        // Function-type shapes are outside the capture's model: poison the
+        // open windows (a function-type bound's leaves also fail the
+        // one-root claim — this is the belt to those braces).
+        self.engine.borrow_mut().bounds.poison();
+    }
+
+    fn begin_record_type(&mut self, _left_paren: Token) {
+        self.engine.borrow_mut().bounds.poison();
     }
 
     // —— frames: executables ——————————————————————————————————————————
@@ -9567,10 +9775,29 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pending_type_params.clear();
         // The header's bound counts open with it.
         engine.open_type_variables();
+        engine.bounds.begin_type_variables();
+    }
+
+    fn end_type_variable(
+        &mut self,
+        token: Token,
+        _index: usize,
+        extends_or_super: Option<Token>,
+        _variance: Option<Token>,
+    ) {
+        let mut engine = self.engine.borrow_mut();
+        let Some(name) = engine.name_of(token) else {
+            return;
+        };
+        engine
+            .bounds
+            .end_type_variable(name, extends_or_super.is_some());
     }
 
     fn end_type_variables(&mut self, _begin: Token, end: Token) {
-        self.engine.borrow_mut().close_type_variables(end);
+        let mut engine = self.engine.borrow_mut();
+        engine.close_type_variables(end);
+        engine.bounds.end_type_variables();
     }
 
     // —— identifiers ——————————————————————————————————————————————————
@@ -9857,6 +10084,21 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(name) else {
             return;
         };
+        // The #610 capture: every completed type head is a leaf of the open
+        // window (the parser re-fires a parameterized head after its group,
+        // carrying the trailing `?` — the sink merges that completion).
+        let leaf_id = engine.strings.intern(text);
+        engine.bounds.leaf(
+            leaf_id,
+            question.is_some(),
+            match question {
+                Some(q) => SourceRange {
+                    offset: name.range.offset,
+                    length: q.range.end() - name.range.offset,
+                },
+                None => name.range,
+            },
+        );
         // `dynamic` is a top type and `Null` is the null-type singleton —
         // both have dedicated [`Ty`] shapes.
         let ty = match text {
@@ -9894,6 +10136,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().handle_void_keyword(_token);
 
         let mut engine = self.engine.borrow_mut();
+        // A `void` type argument (`List<void>`) is a leaf of the open #610
+        // capture like any named head.
+        let void_id = engine.strings.intern("void");
+        engine.bounds.leaf(void_id, false, _token.range);
         engine.armed_ty = Some(Ty::Void);
     }
 
@@ -10855,6 +11101,10 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_type_arguments(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
         let head = engine.pending_type_head.take();
+        // The #610 capture: a type-reference group outside the capture
+        // windows opens the site capture (a headless group is never a
+        // site — bounds requires the head).
+        engine.bounds.begin_group(head, true);
         let base = engine.rows.len();
         engine.group_heads.push((head, base));
     }
@@ -16515,20 +16765,13 @@ mod tests {
     }
 
     /// One wide row per dead interval: the row anchors at the first dead
-    /// statement and its span runs toward the covering statement list's
-    /// last statement (the official interval model —
-    /// `dead_code_verifier.dart:253-279` trims the enclosing construct to
-    /// `node.statements.last` and the report spans `node.end - offset`,
-    /// :326-332; the flow fact twin is the flow crate's
-    /// `dead_interval_folds_sequential_statements`).
-    ///
-    /// OPEN (follow-up against dartq-flow): official `node.end` includes
-    /// the last statement's trailing `;` — `2;`, length 5 here — while
-    /// the flow fact's token-anchored span excludes it (length 4, the
-    /// flow module's documented token-precision boundary). The row below
-    /// asserts the fact-derived span, the single source the report
-    /// mounts; if the flow boundary widens to the semicolon, this pin
-    /// follows.
+    /// statement and its span runs to the covering statement list's last
+    /// statement's end, trailing `;` included — the official interval
+    /// model (`dead_code_verifier.dart:253-279` trims the enclosing
+    /// construct to `node.statements.last` and the report spans
+    /// `node.end - offset`, :326-332). The flow fact widens to that
+    /// boundary via `Ev::StmtEnd` (the flow crate's
+    /// `dead_interval_folds_sequential_statements` twin).
     #[test]
     fn dead_code_reports_one_row_per_dead_interval() {
         let source = "void f() { return; 1; 2; }";
@@ -16541,9 +16784,9 @@ mod tests {
             .expect("dead_code present");
         assert_eq!(dead.range.offset, offset_of(source, "1;"));
         assert_eq!(
-            dead.range.length, 4,
-            "the row spans `1; 2` (the flow fact's token-precision end; \
-             official `node.end` would include the trailing `;` — see the doc)"
+            dead.range.length, 5,
+            "the row spans `1; 2;` — official `node.end` includes the \
+             trailing `;` (dead_code_verifier.dart:330: `node.end - offset`)"
         );
     }
 
@@ -17915,7 +18158,10 @@ mod tests {
     /// oracle fires exactly when a type argument instantiates to `dynamic`,
     /// `_isMissingTypeArguments`, `type_arguments_verifier.dart:711-735`);
     /// explicit type arguments and fully-bounded containers stay clean, and
-    /// the mode is off by default.
+    /// the mode is off by default. The `{0}` display is the oracle's
+    /// resolved-type face — the instantiated-to-bounds form
+    /// (`Box<dynamic>`, the `instantiateToBounds` projection) — and the
+    /// correction template reuses `{0}` (diagnostic.g.dart:15797-15801).
     #[test]
     fn strict_raw_types_reports_the_unbounded_generic_only() {
         let src = "class int {} \
@@ -17939,11 +18185,11 @@ mod tests {
         );
         assert_eq!(
             on.diagnostics[0].message,
-            "The generic type 'Box' should have explicit type arguments but doesn't."
+            "The generic type 'Box<dynamic>' should have explicit type arguments but doesn't."
         );
         assert_eq!(
             on.diagnostics[0].correction.as_deref(),
-            Some("Use explicit type arguments for 'Box'.")
+            Some("Use explicit type arguments for 'Box<dynamic>'.")
         );
         assert_eq!(on.diagnostics[0].severity, Severity::Warning);
         assert!(report(src).diagnostics.is_empty());
@@ -18110,7 +18356,7 @@ mod tests {
         );
         assert_eq!(
             on.diagnostics[0].message,
-            "The generic type 'Box' should have explicit type arguments but doesn't."
+            "The generic type 'Box<dynamic>' should have explicit type arguments but doesn't."
         );
         // The default posture: nothing reports.
         assert!(report(src).diagnostics.is_empty());
@@ -18142,7 +18388,7 @@ mod tests {
         );
         assert_eq!(
             on.diagnostics[0].message,
-            "The generic type 'Box' should have explicit type arguments but doesn't."
+            "The generic type 'Box<dynamic>' should have explicit type arguments but doesn't."
         );
         assert!(report(src).diagnostics.is_empty());
     }

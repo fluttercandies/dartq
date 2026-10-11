@@ -36,7 +36,7 @@ impl TypeSystem<'_> {
     }
 
     /// One `getLeastUpperBound` frame: enters the shared depth cell (the
-    /// oracle re-enters per recursion level, least_upper_bound.dart:379) and
+    /// oracle re-enters per recursion level, `least_upper_bound.dart:379`) and
     /// runs the rule table. `Err` is the oracle's rethrow
     /// (least_upper_bound.dart:383-385) — it unwinds every nested frame to
     /// the outermost entry, which is [`TypeSystem::least_upper_bound`].
@@ -50,6 +50,9 @@ impl TypeSystem<'_> {
     /// `_computeLeastUpperBound` (least_upper_bound.dart:391-672) with the
     /// documented M1 fallbacks; recursion goes through [`Self::lub_step`] so
     /// every level re-enters the shared depth cell.
+    // Port of least_upper_bound.dart's recursive case analysis; the arm
+    // order is the oracle's, so the body stays one function.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn lub_compute(&self, a: TypeId, b: TypeId) -> Result<TypeId, DepthLimitExceeded> {
         // UP(T, T) = T (least_upper_bound.dart:393-395).
         if a == b {

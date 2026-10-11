@@ -67,6 +67,7 @@ struct TableState {
     fn_type_parameters: Vec<TypeParamId>,
 }
 
+#[derive(Clone, Copy)]
 struct PoolMark {
     types: usize,
     args: usize,

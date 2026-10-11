@@ -175,6 +175,25 @@ pub enum SemanticCode {
     /// `wrong_number_of_type_arguments_element`; `{0}` is the executable's
     /// oracle display kind).
     WrongNumberOfTypeArgumentsElement(ExecKind),
+    /// `'{0}' doesn't conform to the bound '{2}' of the type parameter
+    /// '{1}'.` — an explicit type argument violating its parameter's
+    /// substituted bound (`_checkForTypeArgumentNotMatchingBounds`,
+    /// `type_arguments_verifier.dart:342-540`; the template and argument
+    /// order are `typeArgumentNotMatchingBounds`, diagnostic.g.dart
+    /// :16320-16330 + the `_withArguments` face :22369-22381). `{0}` is the
+    /// offending argument's display, `{1}` the parameter name, `{2}` the
+    /// substituted bound — under allowed super-boundedness the still-failing
+    /// *inverted* arguments report (`well_bounded.dart:62-129` through the
+    /// #601 `is_well_bounded` face).
+    TypeArgumentNotMatchingBounds,
+    /// `The result of instantiating the enum to bounds is not
+    /// well-bounded.` — the enum's implicit `values` field type's single
+    /// argument (the enum instantiated to bounds) is not well-bounded
+    /// (`_checkForEnumInstantiatedToBoundsIsNotWellBounded`,
+    /// error_verifier.dart:5060-5076; the template is
+    /// `enumInstantiatedToBoundsIsNotWellBounded`, diagnostic.g.dart
+    /// :4910-4919).
+    EnumInstantiatedToBoundsIsNotWellBounded,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
     /// `The argument type '{0}' can't be assigned to the parameter type
@@ -524,10 +543,10 @@ pub enum SemanticCode {
     /// `The generic type '{0}' should have explicit type arguments but
     /// doesn't.` — the `strict-raw-types` mode's raw-type row
     /// (`type_arguments_verifier.dart:303-336` `_checkForRawTypeName`).
-    /// `{0}` renders the type name as written; the oracle's
-    /// instantiated-to-bounds display (`Box<dynamic>`) is a documented text
-    /// divergence (the M1 [`crate::model::Ty`] cannot render an
-    /// instantiation).
+    /// `{0}` renders the type with its instantiated-to-bounds arguments
+    /// (`Box<dynamic>` — the oracle's resolved-`type` display, the
+    /// `instantiateToBounds` face), which the file's bounds capture
+    /// (the `bounds` module) supplies at the fold.
     StrictRawType,
     /// `The return type of '{0}' can't be inferred.` — the `strict-inference`
     /// mode's declaration-shape row (`best_practices_verifier.dart:1587-1606`
@@ -653,6 +672,14 @@ impl SemanticCode {
             Self::WrongNumberOfTypeArgumentsElement(_) => (
                 "wrong_number_of_type_arguments_element",
                 "WRONG_NUMBER_OF_TYPE_ARGUMENTS_ELEMENT",
+            ),
+            Self::TypeArgumentNotMatchingBounds => (
+                "type_argument_not_matching_bounds",
+                "TYPE_ARGUMENT_NOT_MATCHING_BOUNDS",
+            ),
+            Self::EnumInstantiatedToBoundsIsNotWellBounded => (
+                "enum_instantiated_to_bounds_is_not_well_bounded",
+                "ENUM_INSTANTIATED_TO_BOUNDS_IS_NOT_WELL_BOUNDED",
             ),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
             Self::ArgumentTypeNotAssignable => (
@@ -944,6 +971,9 @@ impl SemanticCode {
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
+            // The three-placeholder bounds row routes through `message3`
+            // (real emissions go through `emit3`).
+            Self::TypeArgumentNotMatchingBounds => self.message3(a0, a1, ""),
             // The #504 usage cluster (unused_local_elements_verifier.dart)
             // and the #505 import/flow rows: one-argument messages over the
             // declaration's name; the flow rows carry none.
@@ -1026,6 +1056,11 @@ impl SemanticCode {
             ),
             Self::InferenceFailureOnFunctionReturnType => {
                 format!("The return type of '{a0}' can't be inferred.")
+            }
+            // The #610 bounds rows: the enum face carries no arguments
+            // (diagnostic.g.dart:4913-4914).
+            Self::EnumInstantiatedToBoundsIsNotWellBounded => {
+                "The result of instantiating the enum to bounds is not well-bounded.".to_string()
             }
             // The #314 residue family: the one-argument rows and the four
             // no-argument member faces, verbatim
@@ -1278,6 +1313,12 @@ impl SemanticCode {
                     "The type of this function is '{a0}', which has {a1} type parameters, but {a2} type arguments were given."
                 )
             }
+            // The argument leads ({0}), then the parameter ({1}) and the
+            // substituted bound ({2}) — the `_withArguments` face's order
+            // (diagnostic.g.dart:22369-22381).
+            Self::TypeArgumentNotMatchingBounds => {
+                format!("'{a0}' doesn't conform to the bound '{a2}' of the type parameter '{a1}'.")
+            }
             Self::InvalidAssignment => {
                 format!("A value of type '{a0}' can't be assigned to a variable of type '{a1}'.")
             }
@@ -1404,6 +1445,15 @@ impl SemanticCode {
     #[must_use]
     pub fn correction_message(self, a2: &str) -> Option<String> {
         match self {
+            // The #610 bounds rows' verbatim oracle correctionMessages
+            // (diagnostic.g.dart:16324 and :4915); the ITB face's `{2}` is
+            // the substituted bound.
+            Self::TypeArgumentNotMatchingBounds => {
+                Some(format!("Try using a type that is or is a subclass of '{a2}'."))
+            }
+            Self::EnumInstantiatedToBoundsIsNotWellBounded => {
+                Some("Try using different bounds for type parameters.".to_string())
+            }
             Self::NonExhaustiveSwitchStatement => Some(format!(
                 "Try adding a default case or cases that match '{a2}'."
             )),

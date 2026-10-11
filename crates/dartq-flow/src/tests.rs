@@ -190,14 +190,14 @@ fn interp_of(events: &[crate::ev::Ev]) -> crate::interp::Interp<'static> {
 #[test]
 fn dead_after_return() {
     let source = "void f() { return; 1; }";
-    assert_eq!(dead_snippets(source), ["1"]);
+    assert_eq!(dead_snippets(source), ["1;"]);
 }
 
 #[test]
 fn dead_after_return_in_if_branches() {
     // Both branches return: the join leaves nothing reachable.
     let source = "void f(bool b) { if (b) { return; } else { return; } 1; }";
-    assert_eq!(dead_snippets(source), ["1"]);
+    assert_eq!(dead_snippets(source), ["1;"]);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn live_after_if_without_else_return() {
 #[test]
 fn do_true_body_return_kills_exit() {
     let source = "void f() { do { return; } while (true); 1; }";
-    assert_eq!(dead_snippets(source), ["} while (true);", "1"]);
+    assert_eq!(dead_snippets(source), ["} while (true);", "1;"]);
 }
 
 #[test]
@@ -287,11 +287,19 @@ fn for_break_after_assignment() {
 /// this degraded to nearest-jump-target resolution: the break then exited
 /// the INNER loop, `x = 1;` stayed live and the exit read came out
 /// assigned.
+/// A labeled break's dead tail: `break a` exits the OUTER loop, so the
+/// assignment after the INNER while is the dead statement (official
+/// `test_breakOutFromLoop` containment), and the covering close is the
+/// outer while's `flowEnd(node.body)` (type_analyzer.dart:4901) trimmed
+/// to the body block's last statement `x = 1;` — its `;` included
+/// (dead_code_verifier.dart:269-271, :326-332). The trailing `x;` is
+/// alive (the break joins the outer exit) — it reads definitely
+/// unassigned instead.
 #[test]
 fn labeled_break_targets_labeled_loop_not_nearest() {
     let source =
         "void f(bool b) { int x; a: while (true) { while (true) { break a; } x = 1; } x; }";
-    assert_eq!(dead_snippets(source), ["x"]);
+    assert_eq!(dead_snippets(source), ["x = 1;"]);
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
@@ -305,12 +313,14 @@ fn labeled_break_targets_labeled_switch_through_loop() {
 
 /// A multi-label statement resolves a jump to ANY of its labels
 /// (`a: b: s` — the official scans every label of the labeled statement;
-/// `break b` must match through the recorded `LabelDecl`).
+/// `break b` must match through the recorded `LabelDecl`). The dead
+/// statement is the assignment after the inner while — same shape as
+/// `labeled_break_targets_labeled_loop_not_nearest`.
 #[test]
 fn labeled_break_matches_any_label_of_the_statement() {
     let source =
         "void f(bool b) { int x; a: b: while (true) { while (true) { break b; } x = 1; } x; }";
-    assert_eq!(dead_snippets(source), ["x"]);
+    assert_eq!(dead_snippets(source), ["x = 1;"]);
     assert_eq!(unassigned_snippets(source), ["x"]);
 }
 
@@ -359,7 +369,7 @@ fn switch_case_falls_through_end() {
 #[test]
 fn switch_all_cases_exit() {
     let source = "void f(int i) { switch (i) { case 1: return; default: return; } 1; }";
-    assert_eq!(dead_snippets(source), ["1"]);
+    assert_eq!(dead_snippets(source), ["1;"]);
 }
 
 /// official reachability/data/switch.dart `case_never_completes`: dead
@@ -367,7 +377,7 @@ fn switch_all_cases_exit() {
 #[test]
 fn switch_case_inner_dead_code() {
     let source = "void f(bool b, int i) { switch (i) { case 1: 1; if (b) { return; } else { return; } 2; } 3; }";
-    assert_eq!(dead_snippets(source), ["2"]);
+    assert_eq!(dead_snippets(source), ["2;"]);
 }
 
 /// official `definite_assignment/data/closure.dart`: writes inside closures
@@ -578,7 +588,7 @@ fn short_circuit_and_no_facts() {
 #[test]
 fn literal_true_condition() {
     let source = "void f() { if (true) { return; } 1; }";
-    assert_eq!(dead_snippets(source), ["1"]);
+    assert_eq!(dead_snippets(source), ["1;"]);
 }
 
 /// official reachability/data/while.dart shape: `while (true)` with no
@@ -586,7 +596,7 @@ fn literal_true_condition() {
 #[test]
 fn while_true_no_break_kills_exit() {
     let source = "void f() { while (true) { 1; } 2; }";
-    assert_eq!(dead_snippets(source), ["2"]);
+    assert_eq!(dead_snippets(source), ["2;"]);
 }
 
 /// Pattern variable declaration statement: the declared variables are
@@ -667,7 +677,7 @@ fn closure_in_loop_no_facts() {
 #[test]
 fn finally_return_kills_exit() {
     let source = "void f() { try { 1; } finally { return; } 2; }";
-    assert_eq!(dead_snippets(source), ["2"]);
+    assert_eq!(dead_snippets(source), ["2;"]);
 }
 
 #[test]
@@ -1886,11 +1896,13 @@ fn assert_statement_forwarded_to_the_recorder() {
 }
 
 /// A dead assert statement reports dead code: the assert events reach the
-/// interpreter's dead-code check (the `AssertBegin` span anchors).
+/// interpreter's dead-code check (the `AssertBegin` span anchors), the
+/// row running to the statement's `;` (`node.end` —
+/// dead_code_verifier.dart:326-332).
 #[test]
 fn dead_assert_statement_reports_dead_code() {
     let source = "void f() { return; assert(true); }";
-    assert_eq!(dead_snippets(source), ["assert"]);
+    assert_eq!(dead_snippets(source), ["assert(true);"]);
 }
 
 /// A dead plain block reports one row spanning the whole block extent,
@@ -1907,47 +1919,51 @@ fn dead_statement_block_reports_outermost_row() {
 // —— interval model (official flowEnd corpus, dead_code_test.dart) ———
 // One row per dead interval: the first unreachable node anchors it,
 // later unreachable nodes extend it, and the covering construct's end
-// (`flowEnd`) closes it, trimmed to the last dead statement. Blocks,
-// labels, and do-while conditions end without a covering close, so
-// their intervals run to the enclosing close. Row ends carry the
-// engine's token-level precision where the recorder has no statement
-// end (the trailing `;` of a token-anchored statement is not recorded).
+// (`flowEnd`) closes it, trimmed to the covering list's last
+// statement. Blocks, labels, and do-while conditions end without a
+// covering close, so their intervals run to the enclosing close. The
+// row's end is that statement's `node.end` — the trailing `;`
+// included where present (`StmtEnd` events; official
+// dead_code_verifier.dart:253-279 trim, :326-332 length).
 
 /// official `test_afterReturn`/`test_inElse` shape: sequential dead
-/// statements fold into ONE wide row, not one row per statement.
+/// statements fold into ONE wide row, not one row per statement; the
+/// row's end carries the last statement's `;` (`node.end`,
+/// dead_code_verifier.dart:326-332).
 #[test]
 fn dead_interval_folds_sequential_statements() {
     let source = "void f() { return; 1; 2; }";
-    assert_eq!(dead_snippets(source), ["1; 2"]);
+    assert_eq!(dead_snippets(source), ["1; 2;"]);
 }
 
 /// official `test_flowEnd_ifStatement` with a nested dead block: one
-/// outermost row spanning the whole dead compound.
+/// outermost row spanning the whole dead compound (the last statement
+/// is the inner block — its `}` ends the row, no `;` to include).
 #[test]
 fn dead_interval_folds_nested_blocks() {
     let source = "void f() { return; {1; {2;}} }";
     assert_eq!(dead_snippets(source), ["{1; {2;}}"]);
 }
 
-/// A dead `if` statement is one row: the anchor rides the `if` keyword
-/// and the interval runs through the branch's dead tail; the branch's
-/// own close (`IfEnd`) does not cover the statement itself (official
-/// `flowEnd(ifTrue)` containment).
+/// official `test_flowEnd_ifStatement` with a dead `if`: the covering
+/// list's last statement is the `if` itself, whose `node.end` includes
+/// the then-branch's `;` (dead_code_verifier.dart:253-279, :326-332).
 #[test]
 fn dead_interval_if_statement_is_one_row() {
     let source = "void f(bool c) { return; if (c) 1; }";
-    assert_eq!(dead_snippets(source), ["if (c) 1"]);
+    assert_eq!(dead_snippets(source), ["if (c) 1;"]);
 }
 
 /// official `test_flowEnd_tryStatement_finally` (length-11 row): the
 /// finally block ends without a covering close, so the interval runs
 /// through the try's closing brace into the statement after it and
-/// closes at the declaration exit.
+/// closes at the declaration exit — trimmed to that statement's
+/// `node.end`, its `;` included (the official row's 11th character).
 #[test]
 fn dead_interval_try_finally_spans_through_the_close() {
     let source =
         "main() {\n  try {\n    1;\n  } finally {\n    2;\n    return;\n    3;\n  }\n  4;\n}\n";
-    assert_eq!(dead_snippets(source), ["3;\n  }\n  4"]);
+    assert_eq!(dead_snippets(source), ["3;\n  }\n  4;"]);
 }
 
 /// official `test_flowEnd_nestedBlock_forStatement_updaters` (length-8
@@ -1962,11 +1978,13 @@ fn dead_interval_loop_body_trims_to_last_statement_block() {
 
 /// official `test_doWhile`: two ranges in one close — the `while (c);`
 /// part, then the tail from the first dead statement after the
-/// do-while (official `parent is DoStatement`, :292-308).
+/// do-while, its `;` included (official `parent is DoStatement`,
+/// :292-308; the tail's end is the covering list's last statement's
+/// `node.end`).
 #[test]
 fn dead_interval_do_while_splits_two_ranges() {
     let source = "void f(bool c) { do { print(c); return; } while (c); print('2'); }";
-    assert_eq!(dead_snippets(source), ["} while (c);", "print"]);
+    assert_eq!(dead_snippets(source), ["} while (c);", "print('2');"]);
 }
 
 /// official `test_doWhile_break`: a break exiting the do-while makes the
@@ -1983,7 +2001,7 @@ fn dead_interval_do_while_break_drops_the_tail() {
 #[test]
 fn dead_interval_switch_members_report_per_group() {
     let source = "void f(int i) { switch (i) { case 1: return; 2; case 3: return; 4; } }";
-    assert_eq!(dead_snippets(source), ["2", "4"]);
+    assert_eq!(dead_snippets(source), ["2;", "4;"]);
 }
 
 /// official `test_doWhile_break_outerLabel` shape: a labeled statement
@@ -1995,7 +2013,132 @@ fn dead_interval_switch_members_report_per_group() {
 #[test]
 fn dead_interval_labeled_statement_runs_to_the_tail() {
     let source = "void f(bool c) { return; L: while (c) { continue L; } 1; }";
-    assert_eq!(dead_snippets(source), ["while (c) { continue L; } 1"]);
+    assert_eq!(dead_snippets(source), ["while (c) { continue L; } 1;"]);
+}
+
+/// A dead local declaration as the covering list's last statement: the
+/// row runs to its `;` (official `node.end`,
+/// dead_code_verifier.dart:326-332). The row STARTS at the declared
+/// name — the fact layer's declaration anchor (the parser delivers the
+/// name token to `beginVariablesDeclaration`), the documented divergence
+/// the semantic twin pin `dead_local_declaration_emits_at_its_name`
+/// fixes at the name, not the declaration head.
+#[test]
+fn dead_interval_declaration_widens_to_the_semicolon() {
+    let source = "void f() { return; var x = 1; }";
+    assert_eq!(dead_snippets(source), ["x = 1;"]);
+}
+
+/// The covering list's last statement without a trailing `;` — a block
+/// — ends the row at its `}`: the statement end carries no `;` to
+/// include (official `node.end` of the block; the `if`'s own `;` still
+/// widens the first segment).
+#[test]
+fn dead_interval_last_statement_block_ends_at_the_brace() {
+    let source = "void f() { return; if (c) 1; { 2; } }";
+    assert_eq!(dead_snippets(source), ["if (c) 1; { 2; }"]);
+}
+
+// —— #636 spec residuals: dead loop/branch/switch heads (official
+// dead_code_test.dart shapes) ————————————————————————————————————————
+
+/// official `test_forStatement` (11 carets): the close is
+/// `visitForStatement`'s `flowEnd(node.body)` (type_analyzer.dart:3194);
+/// the body block is EMPTY, so the trim's `statements.isNotEmpty` guard
+/// keeps the block itself (dead_code_verifier.dart:269-271) and the row
+/// ends at its `}`.
+#[test]
+fn dead_interval_for_empty_body_runs_to_the_brace() {
+    let source = "void f() { return; for (;;) {} }";
+    assert_eq!(dead_snippets(source), ["for (;;) {}"]);
+}
+
+/// `visitWhileStatement`'s `flowEnd(node.body)` (type_analyzer.dart:4901)
+/// with an empty body block: the trim keeps the block, the row ends at
+/// its `}`.
+#[test]
+fn dead_interval_while_empty_body_runs_to_the_brace() {
+    let source = "void f(bool c) { return; while (c) {} }";
+    assert_eq!(dead_snippets(source), ["while (c) {}"]);
+}
+
+/// A non-block loop body is the body statement itself: the trim target
+/// is that statement (no `statements.last` step — it is not a Block) and
+/// its `node.end` carries the `;`.
+#[test]
+fn dead_interval_while_expression_body_widens_to_the_semicolon() {
+    let source = "void f(bool c) { return; while (c) x(); }";
+    assert_eq!(dead_snippets(source), ["while (c) x();"]);
+}
+
+/// An empty statement as the loop body: `node.end` is the body's `;`.
+#[test]
+fn dead_interval_while_empty_statement_body_widens_to_the_semicolon() {
+    let source = "void f(bool c) { return; while (c); }";
+    assert_eq!(dead_snippets(source), ["while (c);"]);
+}
+
+/// A dead for-in with an empty body block: same body-close shape as the
+/// C-style `for` — the row ends at the body's `}`.
+#[test]
+fn dead_interval_for_in_empty_body_runs_to_the_brace() {
+    let source = "void f(l) { return; for (var x in l) {} }";
+    assert_eq!(dead_snippets(source), ["for (var x in l) {}"]);
+}
+
+/// `flowEnd(ifTrue)` (type_analyzer.dart:1199-1206) with an empty then
+/// block: the trim keeps the block, the row ends at its `}`.
+#[test]
+fn dead_interval_if_empty_branch_runs_to_the_brace() {
+    let source = "void f(bool c) { return; if (c) {} }";
+    assert_eq!(dead_snippets(source), ["if (c) {}"]);
+}
+
+/// A case-less dead switch: no member close covers the anchor, so the
+/// declaration exit trims to the covering list's last statement — the
+/// switch itself, whose `node.end` is the block's `}`.
+#[test]
+fn dead_interval_switch_without_members_runs_to_the_brace() {
+    let source = "void f(int i) { return; switch (i) {} }";
+    assert_eq!(dead_snippets(source), ["switch (i) {}"]);
+}
+
+/// official row anchor of a dead labeled statement: the LABELED
+/// STATEMENT's first token — the label (`a`) — because
+/// `firstDead.firstToken` reads the AST node (dead_code_verifier.dart
+/// `_visitNode`/`flowEnd` :325-332), while fasta's
+/// `beginLabeledStatement(next, …)` (parser_impl.dart:6909) delivers the
+/// statement PAST the labels as the event marker. Our recorder anchors
+/// on the event token, so the `a: ` prefix is expected OUTSIDE the row
+/// today — this pin states the official extent.
+#[ignore = "adjudicated: official row starts at the first label (dead_code_verifier.dart:325-332); production fix ticketed #641, lands after the parser lane settles"]
+#[test]
+fn dead_interval_labeled_statement_starts_at_the_label() {
+    let source = "void f(bool c) { return; a: while (c) {} }";
+    assert_eq!(dead_snippets(source), ["a: while (c) {}"]);
+}
+
+/// Masking guard for the empty-body shapes above: the dead tail AFTER a
+/// dead empty-bodied loop folds into the SAME row (one interval, the
+/// declaration exit trims to the last statement `1;`) — a fix that clips
+/// the row at the loop's brace breaks this.
+#[test]
+fn dead_interval_empty_body_loop_folds_the_tail() {
+    let source = "void f() { return; for (;;) {} 1; }";
+    assert_eq!(dead_snippets(source), ["for (;;) {} 1;"]);
+}
+
+/// official `test_forLoop_noUpdaters` (dead_code_test.dart:212-220,
+/// column 15, length 29) ported verbatim: the interval anchors at the
+/// condition's `(` — the for's `flowEnd(node.body)` does NOT cover it
+/// (`_containsFirstDeadNode` fails: the body block is not an ancestor of
+/// the condition, dead_code_verifier.dart:453-459) — and folds through
+/// the body `{}` and `return i;` to the function exit's last statement.
+#[ignore = "adjudicated: needs Never-returning call-type facts; ticketed #642"]
+#[test]
+fn official_for_loop_no_updaters_folds_through_the_return() {
+    let source = "Never foo() => throw \"Never\";\n\ntest() {\n  int i = 0;\n  for (foo(); (i = 42) < 0;) {}\n  return i;\n}\n";
+    assert_eq!(dead_snippets(source), ["(i = 42) < 0;) {}\n  return i;"]);
 }
 
 /// A wholly dead branch block anchors at the block itself — official

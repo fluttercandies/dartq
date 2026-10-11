@@ -106,6 +106,7 @@
 //! diagnostic tickets; when the parser's directive milestone lands, the
 //! fold moves behind this API without changing its shape.
 
+pub mod bounds;
 pub mod codes;
 pub mod collector;
 pub mod const_eval;
