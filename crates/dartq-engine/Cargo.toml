@@ -23,6 +23,7 @@ dartq-semantic = { workspace = true }
 dartq-sdk = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
+libc = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }

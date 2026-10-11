@@ -21,6 +21,7 @@ use dartq_source::{FileId, FileTable, StringTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::budget;
 use crate::cancel::{CancellationToken, Cancelled};
 use crate::event::EngineEvent;
 use crate::l1;
@@ -84,6 +85,18 @@ pub(crate) fn analyze(
     let dirty = std::mem::take(&mut state.invalidated);
     let order = topo_order(state, &dirty);
 
+    // Phase-boundary budget poll (PRD §17.1): the ladder's first chance to
+    // descend after the apply/capture phase. Armed engines pay one `Option`
+    // test here; unarmed ones a no-op. Rows anchor at the first dirty
+    // library's defining file (any live library when nothing is dirty; no
+    // library — an empty workspace — sheds nothing worth reporting).
+    let mut budget_rows: Vec<Diagnostic> = Vec::new();
+    if let Some((tier, limit_mib)) = state.poll_budget()
+        && let Some(file) = budget_anchor(state, &order)
+    {
+        budget_rows.push(budget::degraded_diagnostic(tier, limit_mib, file));
+    }
+
     // Parallel recompute: per-library diagnosis is a pure function of the
     // (already fresh) facts and the resolution graph, so the dirty set runs
     // in one fan-out; ordering matters only for event delivery. The token
@@ -143,9 +156,15 @@ pub(crate) fn analyze(
             .results
             .insert(*library, LibraryResult { diagnostics });
         let info = state.libraries.info(*library).expect("live library");
+        let defining = info.defining;
         let surface = library_surface(state, resolved, *library, info);
         state.library_surfaces.insert(*library, surface);
         completed.insert(*library);
+        // Library-boundary budget poll (PRD §17.1): sustained pressure walks
+        // the ladder across these sequential boundaries, one tier each.
+        if let Some((tier, limit_mib)) = state.poll_budget() {
+            budget_rows.push(budget::degraded_diagnostic(tier, limit_mib, defining));
+        }
         on_event(EngineEvent::LibraryAnalyzed {
             library: *library,
             from_cache: false,
@@ -194,7 +213,25 @@ pub(crate) fn analyze(
     merge_canonical(&state.files, &runs, |diagnostic| {
         out.push(diagnostic.clone());
     });
+    // The budget rows join last and re-sort the (rare, cold) addition into
+    // the canonical order — the options-diagnostic face's shape. Empty when
+    // the engine is unarmed: the output set is exactly the unbudgeted run's.
+    if !budget_rows.is_empty() {
+        out.extend(budget_rows);
+        out.sort_by(|a, b| compare_canonical(&state.files, a, b));
+    }
     Ok(out)
+}
+
+/// The file a budget row anchors at: the first dirty library's defining
+/// file, else any live library's — `None` only for an empty workspace,
+/// where there is nothing to shed and nothing to report against.
+fn budget_anchor(state: &EngineState, order: &[LibraryId]) -> Option<FileId> {
+    let defining = |library: LibraryId| state.libraries.info(library).map(|info| info.defining);
+    order
+        .iter()
+        .find_map(|library| defining(*library))
+        .or_else(|| state.libraries.live().find_map(defining))
 }
 
 /// Diagnoses one library: the member files' syntax + URI-layer diagnostics,

@@ -235,6 +235,13 @@ struct AnalyzeArgs {
     /// Off by default (`--fatal-infos` sets it) — mirrors the oracle.
     #[arg(long)]
     fatal_infos: bool,
+    /// Memory budget in MiB (PRD §17.1): RSS is sampled at phase and
+    /// library boundaries; over budget the engine degrades tier-by-tier
+    /// and reports each step as an INFO `dartq/memory_degraded` row
+    /// (diagnostics stay complete at every tier). Unset = unlimited —
+    /// the output is byte-identical to an unbudgeted run.
+    #[arg(long, value_name = "MiB")]
+    memory_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -542,6 +549,7 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    engine.set_memory_limit(args.memory_limit);
     let run = match under_crash_tier(|| {
         dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&dir))
     }) {
@@ -566,6 +574,7 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    engine.set_memory_limit(args.memory_limit);
     let overlays = match load_overlays(&args.overlays, &args.dir) {
         Ok(overlays) => overlays,
         Err(error) => {
@@ -1394,6 +1403,7 @@ mod tests {
         assert!(args.metrics_json.is_none() && args.sdk.is_none());
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
+        assert_eq!(args.memory_limit, None, "unlimited by default");
         assert_eq!(args.dir, PathBuf::from("/pkg"));
 
         let parsed = parse_args_of(&[
@@ -1408,6 +1418,8 @@ mod tests {
             "/sdk",
             "--no-fatal-warnings",
             "--fatal-infos",
+            "--memory-limit",
+            "2048",
             "/pkg",
         ])
         .expect("parse")
@@ -1427,6 +1439,11 @@ mod tests {
             "repeatable --overlay specs"
         );
         assert!(args.no_fatal_warnings && args.fatal_infos);
+        assert_eq!(
+            args.memory_limit,
+            Some(2048),
+            "--memory-limit MiB parses and plumbs"
+        );
     }
 
     /// Throwaway pub workspace + synthetic dart:core-only SDK — the same
@@ -1482,6 +1499,7 @@ mod tests {
             sdk: Some(root.join("sdk")),
             no_fatal_warnings: false,
             fatal_infos: false,
+            memory_limit: None,
         }
     }
 

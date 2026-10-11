@@ -21,7 +21,8 @@
 //! # Module layout (§1.6)
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
-//! (analyze), `event`, `cancel`, `query` (the `query symbol` face, PRD
+//! (analyze), `budget` (the §17.1 memory-budget runtime), `event`, `cancel`,
+//! `query` (the `query symbol` face, PRD
 //! §20.3), `semdiag` (the default semantic diagnoser, #236),
 //! `analysis_options` (the merged per-root options, PRD §12), `context` +
 //! `scheduler` (the multi-context runtime substrate — contexts, overlays,
@@ -39,6 +40,7 @@
 //! families and nothing else.
 
 pub mod analysis_options;
+mod budget;
 pub mod cancel;
 pub mod context;
 pub mod event;
@@ -183,6 +185,19 @@ impl Engine {
             graph: None,
             semdiag,
         })
+    }
+
+    /// Arms (or disarms) the memory-budget runtime (PRD §17.1). A limit
+    /// turns on sampled-RSS accounting at the phase and library boundaries
+    /// of every later [`Self::analyze`]: over budget, the engine descends
+    /// the degradation ladder one tier per boundary — shedding
+    /// documented-recomputable caches and reporting each step as a
+    /// `dartq/memory_degraded` diagnostic — while diagnostics stay
+    /// complete at every tier. `None` (the default) short-circuits every
+    /// check: the sampler never runs and the output face is byte-identical
+    /// to an unbudgeted run.
+    pub fn set_memory_limit(&mut self, limit_mib: Option<u64>) {
+        self.state.budget = limit_mib.map(budget::MemoryBudget::new);
     }
 
     /// Enqueues a content override. Only touches the pending overlay — no

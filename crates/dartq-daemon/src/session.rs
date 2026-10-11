@@ -148,6 +148,12 @@ use crate::uri;
 /// wakes to save — no timer thread.
 pub(crate) const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// The per-runtime memory budget every session context runs under (PRD
+/// §17.1's `memory.limit_mib` default, 2048 in the config sample): over
+/// budget, each context's engine degrades tier-by-tier and reports each
+/// step as `dartq/memory_degraded` instead of growing without bound.
+const DEFAULT_MEMORY_LIMIT_MIB: u64 = 2048;
+
 /// The read-parallel contract (#487): a view group's coalesced requests
 /// answer across the shared engine view on the answer workers, so the
 /// engine must be `Sync`. Writes stay single-owner (`&mut`, the exclusive
@@ -468,10 +474,15 @@ impl Session {
         let open =
             |runtime: &mut Runtime, engine: EngineConfig| -> Result<ContextId, EngineError> {
                 let id = runtime.open_context(ContextConfig { engine, flags: 0 })?;
+                let engine = runtime
+                    .context_state_mut(id)
+                    .expect("the context opened above");
+                // The per-runtime budget default (PRD §17.1): every context
+                // arms the ladder at assembly; a limit that never bites is
+                // indistinguishable from an unlimited run beyond one
+                // `Option` test per boundary.
+                engine.set_memory_limit(Some(DEFAULT_MEMORY_LIMIT_MIB));
                 if let Some(store) = &store {
-                    let engine = runtime
-                        .context_state_mut(id)
-                        .expect("the context opened above");
                     let header = engine.snapshot_header();
                     if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
                         engine.ingest_facts_snapshot(snapshot);

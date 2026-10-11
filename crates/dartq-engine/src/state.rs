@@ -586,6 +586,10 @@ pub(crate) struct EngineState {
     /// signal of [`GC_DEAD_THRESHOLD`] (never a liveness decision; the sweep
     /// itself checks real references).
     gc_debt: usize,
+    /// The memory-budget runtime (PRD §17.1), `None` when no limit is set —
+    /// the zero-cost shape (the poll short-circuits at one `Option` test,
+    /// the sampler never runs). Armed through [`crate::Engine::set_memory_limit`].
+    pub(crate) budget: Option<crate::budget::MemoryBudget>,
 }
 
 impl EngineState {
@@ -647,6 +651,7 @@ impl EngineState {
             library_surfaces: BTreeMap::new(),
             capture_dirty: Vec::new(),
             gc_debt: 0,
+            budget: None,
         })
     }
 
@@ -731,6 +736,14 @@ impl EngineState {
         if self.gc_debt < GC_DEAD_THRESHOLD {
             return;
         }
+        self.sweep_store();
+    }
+
+    /// One unconditional mark-sweep over the content store (the amortized
+    /// path's body and the budget ladder's tier-3 shed): every store entry
+    /// neither residency nor the facts cache references goes. See
+    /// [`Self::collect_garbage`] for the liveness rule's authority note.
+    fn sweep_store(&mut self) {
         self.gc_debt = 0;
         let mut live: FxHashSet<ContentId> = FxHashSet::with_capacity_and_hasher(
             self.residency.len() + self.facts_cache.len(),
@@ -740,6 +753,34 @@ impl EngineState {
         live.extend(self.facts_cache.keys().map(|key| key.content));
         self.store
             .collect_garbage(&|id: ContentId| live.contains(&id));
+    }
+
+    /// The phase-boundary budget poll (PRD §17.1): descends at most one
+    /// ladder tier and applies its shed — facts cache (tier 1), scanned
+    /// faces (tier 2), warm-start staging + canonical-URI memo + an eager
+    /// store sweep (tier 3). Every shed target is documented-evictable
+    /// recomputable state; residency, results, captures, and surfaces are
+    /// never touched, so diagnostics stay complete at the bottom tier.
+    /// `None` when unarmed, under the limit, or without an RSS reading —
+    /// the caller pays one `Option` test per boundary.
+    pub(crate) fn poll_budget(&mut self) -> Option<(crate::budget::Tier, u64)> {
+        let (tier, limit_mib) = crate::budget::poll(&mut self.budget)?;
+        match tier {
+            crate::budget::Tier::LazyParse => {
+                self.facts_cache.clear();
+                self.facts_order.clear();
+            }
+            crate::budget::Tier::SemanticSlices => {
+                self.scanned.clear();
+                self.scanned_order.clear();
+            }
+            crate::budget::Tier::AstCold => {
+                self.warm_start.clear();
+                self.canonical_uris.clear();
+                self.sweep_store();
+            }
+        }
+        Some((tier, limit_mib))
     }
 
     /// A URI resolver over the engine's package table, SDK snapshot, and file
