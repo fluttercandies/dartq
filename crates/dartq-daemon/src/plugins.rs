@@ -32,6 +32,9 @@
 //!   spent budget is terminal for the session.
 //! - A crash row recorded while the session has no anchor file is withheld,
 //!   not dropped: it publishes on the first cycle that has one.
+//! - A plugin row whose offsets fall outside the resident file (the classic
+//!   stale row surviving a shrink edit) clamps to the file's UTF-16 end in
+//!   [`to_lsp`]: the row publishes degraded, it never panics the mapping.
 
 use std::path::Path;
 use std::time::Duration;
@@ -41,7 +44,7 @@ use dartq_plugin::{
     PluginDiagnostic, PluginRuntime, RuntimeError, Severity as PluginSeverity, SpawnSpec,
     crash_diagnostic, discover,
 };
-use dartq_source::{FileTable, LineIndex};
+use dartq_source::{FileTable, LineIndex, utf16_len_of};
 use rustc_hash::FxHashSet;
 
 use crate::lsp;
@@ -318,9 +321,17 @@ pub fn resolve_findings<'a>(
 /// Converts one wire row to the LSP shape: severity mapped to the LSP
 /// 1/2/3 scale, UTF-16 offsets mapped through the line index to zero-based
 /// positions, the plugin's manifest name as the `source` tag.
+///
+/// Plugin offsets are untrusted (the §14.3 isolation posture): a stale row
+/// can predate an edit that shrank the file. Both bounds clamp to the
+/// text's UTF-16 length before mapping — the file-end degradation
+/// [`wire_offset`] starts — so a malformed row degrades to zero-width at
+/// the end instead of tripping [`LineIndex::line_col_utf16`]'s
+/// engine-internal assert. The monotone clamp keeps `start <= end`.
 fn to_lsp(plugin: &str, row: &PluginDiagnostic, index: &LineIndex, text: &str) -> lsp::Diagnostic {
-    let start = wire_offset(row.offset);
-    let end = wire_offset(row.offset.saturating_add(row.length));
+    let total = utf16_len_of(text);
+    let start = wire_offset(row.offset).min(total);
+    let end = wire_offset(row.offset.saturating_add(row.length)).min(total);
     let (start_line, start_column) = index.line_col_utf16(text, start);
     let (end_line, end_column) = index.line_col_utf16(text, end);
     let severity = match row.severity {
@@ -346,8 +357,8 @@ fn to_lsp(plugin: &str, row: &PluginDiagnostic, index: &LineIndex, text: &str) -
     }
 }
 
-/// Clamps a wire offset into the engine's u32 UTF-16 range; a plugin that
-/// claims offsets beyond any resident file degrades to the file end.
+/// Clamps a wire offset into the engine's u32 UTF-16 range; the resident
+/// text's UTF-16-length bound is applied on top in [`to_lsp`].
 fn wire_offset(offset: u64) -> u32 {
     u32::try_from(offset).unwrap_or(u32::MAX)
 }
@@ -598,6 +609,83 @@ mod tests {
         assert_eq!(row.diagnostic.source, "echo");
         assert_eq!(row.diagnostic.message, "watch out");
         assert_eq!(resident_never.index(), 1, "the interned id is exercised");
+    }
+
+    #[test]
+    fn resolve_findings_clamps_out_of_range_offset_to_file_end() {
+        let mut files = FileTable::new();
+        let a = files.intern(Path::new("a.dart"));
+
+        let index = LineIndex::new("ab\ncd\ne");
+        let text = "ab\ncd\ne";
+        let resident = |file: FileId| (file == a).then_some((&index, text));
+
+        // The classic stale row: offsets taken before an edit shrank the
+        // file far below them. The mapping must degrade, not panic.
+        let batches = [PluginBatch {
+            name: "echo".to_owned(),
+            rows: vec![wire_row("a.dart", "echo/stale", 10_000_000, 4)],
+        }];
+
+        let findings = resolve_findings(&batches, &files, resident);
+        assert_eq!(findings.len(), 1, "the row publishes degraded");
+        // Both bounds clamp to the file's UTF-16 end (7 units): zero-width
+        // at EOF ("e" is line 3, so the 1-based (3, 2) answers LSP (2, 1)).
+        let eof = lsp::Position {
+            line: 2,
+            character: 1,
+        };
+        assert_eq!(findings[0].diagnostic.range.start, eof);
+        assert_eq!(findings[0].diagnostic.range.end, eof);
+    }
+
+    #[test]
+    fn resolve_findings_clamps_bounds_crossing_the_file_end() {
+        let mut files = FileTable::new();
+        let a = files.intern(Path::new("a.dart"));
+
+        let index = LineIndex::new("ab\ncd\ne");
+        let text = "ab\ncd\ne";
+        let resident = |file: FileId| (file == a).then_some((&index, text));
+
+        // Start in range with the length running past EOF, and start beyond
+        // EOF with the end further still — the clamp keeps `start <= end`
+        // in both shapes.
+        let batches = [PluginBatch {
+            name: "echo".to_owned(),
+            rows: vec![
+                wire_row("a.dart", "echo/long_tail", 5, 1_000_000),
+                wire_row("a.dart", "echo/past_end", 100, 200),
+            ],
+        }];
+
+        let findings = resolve_findings(&batches, &files, resident);
+        assert_eq!(findings.len(), 2);
+        let eof = lsp::Position {
+            line: 2,
+            character: 1,
+        };
+        let range_of = |code: &str| {
+            &findings
+                .iter()
+                .find(|f| f.diagnostic.code == code)
+                .expect("row present")
+                .diagnostic
+                .range
+        };
+        // Offset 5 survives intact (the newline ending line 2 → LSP (1, 2));
+        // the out-of-range end clamps to EOF.
+        assert_eq!(
+            range_of("echo/long_tail").start,
+            lsp::Position {
+                line: 1,
+                character: 2
+            }
+        );
+        assert_eq!(range_of("echo/long_tail").end, eof);
+        // Both bounds past EOF: zero-width at the end.
+        assert_eq!(range_of("echo/past_end").start, eof);
+        assert_eq!(range_of("echo/past_end").end, eof);
     }
 
     fn dead_set(reason: &str) -> PluginSet {
