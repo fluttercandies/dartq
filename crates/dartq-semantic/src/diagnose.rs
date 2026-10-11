@@ -1111,6 +1111,22 @@ struct Engine<'a> {
     /// The open declaration group is `const` (locals or fields) — its
     /// initializer expressions are const contexts.
     const_group: bool,
+    /// A member field group is open (`begin_fields` … `end_fields`): the
+    /// group's initializer windows close on the field face
+    /// ([`Engine::finish_const_initializer`]'s `local: false`), never the
+    /// local face. Top-level groups leave this false — their initializers
+    /// route by the file-scope test at the close site instead.
+    field_group_open: bool,
+    /// The frame-stack depth when the field group opened (the container
+    /// frame's depth): a variable initializer that began deeper — a
+    /// closure-local inside a field initializer's closure — closes on the
+    /// local face even while the group is open.
+    field_group_depth: usize,
+    /// The frame-stack depth when the current initializer began: a deeper
+    /// stack at close means a function frame opened inside (a closure's
+    /// own locals) — those close on the local face regardless (`#511`'s
+    /// misroute guard).
+    init_frame_depth: usize,
     /// The const group's declared names, in initializer order.
     const_group_names: Vec<StringId>,
     /// The next const-group name an initializer window consumes.
@@ -1362,6 +1378,9 @@ impl<'a> Engine<'a> {
             const_capture: ConstCapture::new(identical_id),
             const_scopes: vec![FxHashMap::default()],
             const_group: false,
+            field_group_open: false,
+            field_group_depth: 0,
+            init_frame_depth: 0,
             const_group_names: Vec::new(),
             const_group_cursor: 0,
             nonconst_top_level: FxHashSet::default(),
@@ -8572,6 +8591,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().begin_variable_initializer(_token);
 
         let mut engine = self.engine.borrow_mut();
+        engine.init_frame_depth = engine.frames.len();
         engine.init_mark = Some(engine.rows.len());
         engine.open_const_initializer();
     }
@@ -8580,7 +8600,22 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().end_variable_initializer(_token);
 
         let mut engine = self.engine.borrow_mut();
-        engine.close_const_initializer();
+        // The const close face: a member field group's own initializers
+        // (began at the group's frame depth) and file-scope initializers
+        // close on the field face — the value joins `const_field_values` /
+        // the file scope, and no local var-type binding is written. A
+        // function frame opened inside the initializer, or a
+        // closure-local's own window (deeper than the group), closes on
+        // the local face regardless (#511's misroute guard).
+        let in_field_group =
+            engine.field_group_open && engine.init_frame_depth == engine.field_group_depth;
+        let at_file_scope = !engine.field_group_open && engine.init_frame_depth == 0;
+        let no_function_opened = engine.frames.len() == engine.init_frame_depth;
+        if (in_field_group || at_file_scope) && no_function_opened {
+            engine.close_const_field_initializer();
+        } else {
+            engine.close_const_initializer();
+        }
         engine.check_decl_initializer();
     }
 
@@ -10166,6 +10201,12 @@ impl ParserListener for DiagnoseListener<'_> {
         _last_consumed: Token,
     ) {
         let mut engine = self.engine.borrow_mut();
+        // The member field group is open: its const initializers close on
+        // the field face (`const_field_values`), not the local face. The
+        // group's frame depth discriminates its own initializers from a
+        // closure-local inside one of them.
+        engine.field_group_open = true;
+        engine.field_group_depth = engine.frames.len();
         if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
             engine.arm_const_group();
         }
@@ -10186,6 +10227,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin: Token,
         _end: Token,
     ) {
+        self.engine.borrow_mut().field_group_open = false;
         self.engine.borrow_mut().disarm_const_group();
     }
 
@@ -10202,6 +10244,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin: Token,
         _end: Token,
     ) {
+        self.engine.borrow_mut().field_group_open = false;
         self.engine.borrow_mut().disarm_const_group();
     }
 
@@ -14214,6 +14257,45 @@ mod tests {
             "{:?}",
             code_names(&rep)
         );
+    }
+
+    /// A member static const's value joins `const_field_values` (#511: the
+    /// field-context routing): `A.x` folds through it, `y` binds a real
+    /// value in the file const scope, and the fold is observable at a
+    /// value-dependent consumer — `z` divides by `y - 4`, zero exactly
+    /// when `y` folded to 4. Before the routing fix `A.x` degraded to the
+    /// symbolic `Verdict::Constant`, `y` never folded, and this fixture
+    /// was silent.
+    #[test]
+    fn static_const_field_folds_through_the_const_environment() {
+        let rep = report(
+            "class int {} class A { static const x = 1 + 2; } \
+             const y = A.x + 1; \
+             const z = 1 ~/ (y - 4);",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_throws_idbze"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A non-const field group never arms the const window: `j`'s
+    /// initializer closes with nothing pending and no `(C, j)` entry.
+    #[test]
+    fn non_const_field_group_stays_out_of_the_const_environment() {
+        let rep = report("class int {} class C { int j = 1 + 2; }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// A closure inside a field initializer carries its own locals: `a`'s
+    /// window opens deeper than the field group and closes on the local
+    /// face (the #511 misroute guard) — no const face, no entry, no row.
+    #[test]
+    fn closure_locals_inside_field_initializers_stay_local() {
+        let rep = report("class int {} class C { int i = (() { int a = 1; return a; })(); }");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// Const-creation arguments check per argument with
