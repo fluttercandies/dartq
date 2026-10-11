@@ -726,10 +726,13 @@ mod tests {
                 enum_constants: Vec::new(),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,
-                ctor_formals: [(name("named"), Box::new(Formals {
-                    positional: Box::new([]),
-                    named: Box::new([]),
-                }))]
+                ctor_formals: [(
+                    name("named"),
+                    Box::new(Formals {
+                        positional: Box::new([]),
+                        named: Box::new([]),
+                    }),
+                )]
                 .into_iter()
                 .collect(),
             },

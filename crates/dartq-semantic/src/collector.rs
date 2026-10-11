@@ -1500,9 +1500,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             named: Vec::new(),
             has_unnamed: true,
         });
-        builder.pending_ctor_formals = builder
-            .capture_name(_name)
-            .map(|(key, _)| (key, None));
+        builder.pending_ctor_formals = builder.capture_name(_name).map(|(key, _)| (key, None));
     }
 
     fn end_constructor(

@@ -704,9 +704,12 @@ enum FrameKind {
     /// `ret` carries the declared return type, the oracle host word, and the
     /// host name when the declaration shape exposes them (constructors and
     /// local functions stay `None` — their return checks under-report).
+    /// `super_invoked` is the per-element `invokesSuperSelf` face: any
+    /// `super` expression while this frame is the innermost executable.
     Executable {
         instance: bool,
         ret: Option<ExecReturn>,
+        super_invoked: bool,
     },
     /// A statement block, catch clause, or typedef body.
     Block,
@@ -773,6 +776,18 @@ struct InterfaceView<'a> {
     names: Vec<StringId>,
     representative: FxHashMap<StringId, FaceEntry<'a>>,
     implemented: FxHashSet<StringId>,
+    /// Every face's linearized hits in face order (the
+    /// concrete-implementation and `@mustBeOverridden` walks re-read them).
+    face_hits: Vec<Vec<FaceEntry<'a>>>,
+    /// The faces behind [`InterfaceView::face_hits`], same order (the
+    /// concrete-implementation scan needs the per-face split to apply the
+    /// oracle's mixin-before-superclass source order).
+    face_sources: Vec<StringId>,
+    /// A concrete `noSuchMethod` on the implemented sources implements every
+    /// interface name. The completeness check returns on it; the
+    /// concrete-implementation loop ignores it (the oracle's dispatch runs
+    /// the interface loop before any noSuchMethod reasoning).
+    no_such_method_gate: bool,
 }
 
 /// The implicit extension-application outcome for one member access
@@ -853,9 +868,7 @@ enum LocalKind {
     /// visitCatchClause auto-use (a plain `catch` without an `on` type, or
     /// a stack-trace sibling present) — patched in at `handle_catch_block`
     /// once both facts are known.
-    CatchException {
-        auto: bool,
-    },
+    CatchException { auto: bool },
     /// A catch clause's stack trace variable.
     CatchStack,
     /// A named local function (reports as `unused_element`).
@@ -865,7 +878,7 @@ enum LocalKind {
 /// One library-level declaration site of this file (the usage cluster's
 /// library-level side), captured at the declaration events with the name
 /// token's span.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DeclSite {
     /// Lookup spelling — setters under `name=` (the model's convention;
     /// use checks compare against the bare name).
@@ -875,6 +888,9 @@ struct DeclSite {
     /// Any metadata annotation was present (the pragma/JS exemption gates'
     /// under-report superset: an annotated declaration is never reported).
     annotated: bool,
+    /// The annotation names themselves (the `@mustCallSuper` /
+    /// `@mustBeOverridden` / `@override` inheritance gates read these).
+    annotations: Box<[StringId]>,
 }
 
 /// The library-level declaration kinds the usage cluster reports on.
@@ -1057,6 +1073,13 @@ struct Engine<'a> {
     /// The five final primitives' interned names (the assignability table
     /// and the literal types compare ids, never text).
     primitive_ids: [StringId; 5],
+    /// [`CORE_SUPERTYPES`] pre-interned once per engine: the
+    /// subtyping BFS compares ids, never re-resolves/re-interns.
+    core_supertypes: [(StringId, StringId); 3],
+    /// The open method's `must_call_super` latch: the member's name span and
+    /// the declaring container of the `@mustCallSuper` ancestor, probed at
+    /// the declaration head and adjudicated at the body's end.
+    pending_must_call_super: Option<(SourceRange, StringId)>,
     /// The open constructor-initializer list depth (`super.named()` in an
     /// initializer is the `undefined_constructor_in_initializer` shape).
     initializer_depth: u32,
@@ -1282,6 +1305,7 @@ impl<'a> Engine<'a> {
         let builtin_types = BUILTIN_TYPES.map(|m| strings.intern(m));
         let primitive_ids = FINAL_PRIMITIVES.map(|m| strings.intern(m));
         let identical_id = strings.intern("identical");
+        let core_supertypes = CORE_SUPERTYPES.map(|(b, p)| (strings.intern(b), strings.intern(p)));
         Self {
             graph,
             namespaces,
@@ -1331,6 +1355,8 @@ impl<'a> Engine<'a> {
             builtin_types,
             setter_ids: FxHashMap::default(),
             primitive_ids,
+            core_supertypes,
+            pending_must_call_super: None,
             initializer_depth: 0,
             annotation_at: None,
             const_capture: ConstCapture::new(identical_id),
@@ -1556,10 +1582,7 @@ impl<'a> Engine<'a> {
             // (`unused_element_parameter`); they never emit per se.
             if let LocalKind::Parameter { site: Some(site) } = kind {
                 if uses > 0 {
-                    self.site_param_uses
-                        .entry(site)
-                        .or_default()
-                        .insert(name);
+                    self.site_param_uses.entry(site).or_default().insert(name);
                 }
                 continue;
             }
@@ -1647,25 +1670,23 @@ impl<'a> Engine<'a> {
     /// The name-level subtype relation over semantic types
     /// ([`NameWorld::is_subtype_of`], the declared-edge lattice).
     fn name_subtype(&self, sub: Ty, sup: Ty) -> bool {
-        self.name_world().is_subtype_of(
-            &NameTy::from_semantic(sub),
-            &NameTy::from_semantic(sup),
-        )
+        self.name_world()
+            .is_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
     }
 
     /// The name-level `canBeSubtypeOf`
     /// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion).
     fn name_can_be_subtype(&self, sub: Ty, sup: Ty) -> bool {
-        self.name_world().can_be_subtype_of(
-            &NameTy::from_semantic(sub),
-            &NameTy::from_semantic(sup),
-        )
+        self.name_world()
+            .can_be_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
     }
 
     /// The name-level `_canBeEqual` ([`NameWorld::can_be_equal`]).
     fn name_can_be_equal(&self, constant: Ty, value: Ty) -> bool {
-        self.name_world()
-            .can_be_equal(&NameTy::from_semantic(constant), &NameTy::from_semantic(value))
+        self.name_world().can_be_equal(
+            &NameTy::from_semantic(constant),
+            &NameTy::from_semantic(value),
+        )
     }
 
     /// The nearest operand row below the type-use rows the `is`/`as` type
@@ -1731,7 +1752,9 @@ impl<'a> Engine<'a> {
                 return;
             }
         } else {
-            let Some(operand) = self.operand_row() else { return };
+            let Some(operand) = self.operand_row() else {
+                return;
+            };
             if operand.ty == Ty::Unknown {
                 return;
             }
@@ -1792,7 +1815,9 @@ impl<'a> Engine<'a> {
         let Some((mark, _op_range)) = self.null_cmp_groups.pop() else {
             return;
         };
-        let Some(right) = self.rows.last() else { return };
+        let Some(right) = self.rows.last() else {
+            return;
+        };
         let Some(left) = mark.checked_sub(1).and_then(|index| self.rows.get(index)) else {
             return;
         };
@@ -1839,7 +1864,9 @@ impl<'a> Engine<'a> {
         if !self.case_sink_open || self.pattern_stack.len() != 1 {
             return;
         }
-        let Some(ctx) = self.switches.last() else { return };
+        let Some(ctx) = self.switches.last() else {
+            return;
+        };
         let matched = ctx.scrutinee;
         if matched == Ty::Unknown {
             return;
@@ -1869,7 +1896,9 @@ impl<'a> Engine<'a> {
         if !self.case_sink_open || self.pattern_stack.len() != 1 {
             return;
         }
-        let Some(ctx) = self.switches.last() else { return };
+        let Some(ctx) = self.switches.last() else {
+            return;
+        };
         let matched = ctx.scrutinee;
         if matched == Ty::Unknown {
             return;
@@ -1891,7 +1920,9 @@ impl<'a> Engine<'a> {
         if !self.case_sink_open || self.pattern_stack.len() != 1 {
             return;
         }
-        let Some(ctx) = self.switches.last() else { return };
+        let Some(ctx) = self.switches.last() else {
+            return;
+        };
         if !ctx.scrutinee.is_strictly_non_nullable() {
             return;
         }
@@ -1918,11 +1949,15 @@ impl<'a> Engine<'a> {
     /// suppress — their matched type is the property column, which the
     /// name level does not descend into (the under-report).
     fn check_constant_pattern(&mut self, constant: Option<Ty>, at: Option<SourceRange>) {
-        let (Some(constant), Some(at)) = (constant, at) else { return };
+        let (Some(constant), Some(at)) = (constant, at) else {
+            return;
+        };
         if !self.case_sink_open || !self.pattern_stack.iter().skip(1).all(|f| f.binary) {
             return;
         }
-        let Some(ctx) = self.switches.last() else { return };
+        let Some(ctx) = self.switches.last() else {
+            return;
+        };
         let matched = ctx.scrutinee;
         if matched == Ty::Unknown {
             return;
@@ -1938,7 +1973,12 @@ impl<'a> Engine<'a> {
         }
         let a0 = self.ty_display(matched);
         let a1 = self.ty_display(constant);
-        self.stage_typed(SemanticCode::ConstantPatternNeverMatchesValueType, at, &a0, &a1);
+        self.stage_typed(
+            SemanticCode::ConstantPatternNeverMatchesValueType,
+            at,
+            &a0,
+            &a1,
+        );
     }
 
     /// The bare lookup spelling of a site name (setters live under `name=`
@@ -1964,7 +2004,7 @@ impl<'a> Engine<'a> {
     /// unmodelable corner suppresses (the under-report direction).
     fn finalize_usage(&mut self) {
         for site_index in 0..self.decl_sites.len() {
-            let site = self.decl_sites[site_index];
+            let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
             let name_text = self.strings.resolve(site.name).to_string();
             match site.kind {
@@ -2099,11 +2139,16 @@ impl<'a> Engine<'a> {
     /// suppressed).
     fn report_optional_parameters(&mut self, site_index: usize, site: DeclSite) {
         let (member_kind, container) = match site.kind {
-            DeclKind::Member { kind, container, .. } => (Some(kind), Some(container)),
+            DeclKind::Member {
+                kind, container, ..
+            } => (Some(kind), Some(container)),
             DeclKind::Constructor { container } => (None, Some(container)),
             _ => (None, None),
         };
-        if matches!(member_kind, Some(MemberKind::Field) | Some(MemberKind::Setter)) {
+        if matches!(
+            member_kind,
+            Some(MemberKind::Field) | Some(MemberKind::Setter)
+        ) {
             return;
         }
         let formals = match container {
@@ -2133,7 +2178,9 @@ impl<'a> Engine<'a> {
             container.and_then(|c| f.container(c)).map(|x| {
                 (
                     x.type_params > 0,
-                    x.members.get(&site.name).map_or(false, |m| m.type_params > 0),
+                    x.members
+                        .get(&site.name)
+                        .map_or(false, |m| m.type_params > 0),
                 )
             })
         });
@@ -2219,9 +2266,9 @@ impl<'a> Engine<'a> {
             }
             let is_used = match prefix {
                 Some(prefix) => self.used_names.contains(&prefix),
-                None => used
-                    .iter()
-                    .any(|&n| edge.combinators.allows(n) && self.graph.exported(target, n).is_some()),
+                None => used.iter().any(|&n| {
+                    edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
+                }),
             };
             if !is_used {
                 self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
@@ -2249,9 +2296,7 @@ impl<'a> Engine<'a> {
             return Some(*name);
         }
         self.frames.last().and_then(|f| match &f.kind {
-            FrameKind::Executable {
-                ret: Some(ret), ..
-            } => Some(ret.name),
+            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.name),
             _ => None,
         })
     }
@@ -2264,26 +2309,51 @@ impl<'a> Engine<'a> {
             || self.container_context().is_some_and(|(c, _)| c == name)
     }
 
-    /// Consumes the pending annotation latch: any metadata annotation
-    /// since the last declaration site marks it exempt (the pragma/JS
-    /// entry-point gates' under-report superset).
-    fn take_annotated(&mut self) -> bool {
-        let annotated = !self.pending_annotations.is_empty();
-        self.pending_annotations.clear();
-        annotated
+    /// Drains the pending annotation latch: the annotation names since the
+    /// last declaration site (`@override`-family gates compare these;
+    /// non-empty marks the pragma/JS exemption gates' under-report
+    /// superset).
+    fn take_annotations(&mut self) -> Box<[StringId]> {
+        std::mem::take(&mut self.pending_annotations).into_boxed_slice()
     }
 
     /// Pushes one library-level declaration site (the usage cluster's
     /// library-level side) and returns its index.
     fn note_decl_site(&mut self, name: StringId, range: SourceRange, kind: DeclKind) -> usize {
-        let annotated = self.take_annotated();
+        let annotations = self.take_annotations();
+        let annotated = !annotations.is_empty();
         self.decl_sites.push(DeclSite {
             name,
             range,
             kind,
             annotated,
+            annotations,
         });
         self.decl_sites.len() - 1
+    }
+
+    /// Whether one of the pending annotations carries the spelling (the
+    /// `@override`-family gates read the latch before any site drains it).
+    fn pending_annotation_is(&self, spelling: &str) -> bool {
+        self.pending_annotations
+            .iter()
+            .any(|a| self.strings.resolve(*a) == spelling)
+    }
+
+    /// Whether the already-collected declaration site of `member` in
+    /// `container` carries the annotation (`@mustCallSuper` /
+    /// `@mustBeOverridden` lookups against the walk's ancestors). Sites
+    /// exist for this file's declarations only — cross-file ancestors
+    /// under-report.
+    fn site_annotation(&self, container: StringId, member: StringId, spelling: &str) -> bool {
+        self.decl_sites.iter().any(|site| {
+            matches!(site.kind, DeclKind::Member { container: c, .. } if c == container)
+                && site.name == member
+                && site
+                    .annotations
+                    .iter()
+                    .any(|a| self.strings.resolve(*a) == spelling)
+        })
     }
 
     /// A local variable declaration (`LocalVariableDeclaration`): the
@@ -2296,11 +2366,18 @@ impl<'a> Engine<'a> {
     /// tracked local joins its declaration site for the
     /// `unused_element_parameter` body-reference rule.
     fn note_parameter(&mut self, name: StringId, range: SourceRange) {
-        self.add_tracked_local(name, range, LocalKind::Parameter {
-            site: self.open_exec_site,
-        });
+        self.add_tracked_local(
+            name,
+            range,
+            LocalKind::Parameter {
+                site: self.open_exec_site,
+            },
+        );
         if let Some(site) = self.open_exec_site {
-            self.site_params.entry(site).or_default().push((name, range));
+            self.site_params
+                .entry(site)
+                .or_default()
+                .push((name, range));
         }
     }
 
@@ -2429,12 +2506,12 @@ impl<'a> Engine<'a> {
             })
             .collect();
         let discarded = if read {
-            let head_op = self.text_of(begin).is_some_and(|text| {
-                matches!(text, "!" | "-" | "~" | "++" | "--")
+            let head_op = self
+                .text_of(begin)
+                .is_some_and(|text| matches!(text, "!" | "-" | "~" | "++" | "--"));
+            let tail_op = window_ops.iter().any(|(offset, text)| {
+                *offset == row_range.end() && matches!(*text, "!" | "++" | "--")
             });
-            let tail_op = window_ops
-                .iter()
-                .any(|(offset, text)| *offset == row_range.end() && matches!(*text, "!" | "++" | "--"));
             head_op || tail_op
         } else if read_write {
             // A compound assignment discards; `??=` never does
@@ -2443,7 +2520,8 @@ impl<'a> Engine<'a> {
                 matches!(
                     *text,
                     "+=" | "-="
-                        | "*=" | "/="
+                        | "*="
+                        | "/="
                         | "%="
                         | "~/="
                         | "&="
@@ -2646,7 +2724,9 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find_map(|f| match &f.kind {
-                FrameKind::Executable { instance, ret: _ } => Some(*instance),
+                FrameKind::Executable {
+                    instance, ret: _, ..
+                } => Some(*instance),
                 _ => None,
             })
             .unwrap_or(false)
@@ -2756,7 +2836,29 @@ impl<'a> Engine<'a> {
         self.push_frame(FrameKind::Executable {
             instance,
             ret: None,
+            super_invoked: false,
         });
+    }
+
+    /// A `super` expression while the innermost executable frame is open:
+    /// latches that frame's `invokesSuperSelf` face (nested function
+    /// literals carry their own frame, so their supers never satisfy the
+    /// enclosing method's gate).
+    fn note_super_expression(&mut self) {
+        if let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable { super_invoked, .. } = &mut frame.kind
+        {
+            *super_invoked = true;
+        }
+    }
+
+    /// The innermost executable frame's `invokesSuperSelf` face (`None`
+    /// outside any executable).
+    fn top_executable_super_invoked(&self) -> Option<bool> {
+        self.frames.last().and_then(|f| match &f.kind {
+            FrameKind::Executable { super_invoked, .. } => Some(*super_invoked),
+            _ => None,
+        })
     }
 
     /// Latches the armed declared type as the innermost executable's return
@@ -3223,19 +3325,180 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `@override` presence face (`override_verifier.dart`): an
+    /// `@override`-annotated instance member must override *something* — the
+    /// oracle's `_isOverride` is the name-level `getOverridden(name) !=
+    /// null` across every superinterface, so any same-named non-static
+    /// super member spares the report regardless of kind. Fields spare on
+    /// either half (getter or, for a non-final field, the setter spelling);
+    /// Object members always override (every class's superinterface carries
+    /// them), so skipping them is exact. Extensions never join the oracle's
+    /// `_currentClass` walk — every `@override` member there reports.
+    /// Top-level shapes: plain functions fall through the oracle's switch
+    /// (silent) while its getters/setters report, but this event cannot
+    /// separate them — suppressed, the under-report direction.
+    fn check_override_annotation(&mut self, spelling: StringId, range: SourceRange) {
+        if !self.pending_annotation_is("override") {
+            return;
+        }
+        let Some((container, kind)) = self.container_context() else {
+            return;
+        };
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        let Some(entry) = decl.members.get(&spelling) else {
+            return;
+        };
+        // A duplicate declaration's span is not the model entry's.
+        if elements
+            .duplicates()
+            .iter()
+            .any(|d| d.name == spelling && d.range == range)
+        {
+            return;
+        }
+        if self.object_members.contains(&spelling) {
+            return;
+        }
+        let in_extension = matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        );
+        let mut spared = !in_extension && self.face_member_any(decl, spelling);
+        if !spared && !in_extension && entry.kind == MemberKind::Field {
+            let setter = self.setter_spelling(spelling);
+            spared = self.face_member_any(decl, setter);
+        }
+        if spared {
+            return;
+        }
+        let code = match entry.kind {
+            MemberKind::Field => SemanticCode::OverrideOnNonOverridingField,
+            MemberKind::Getter => SemanticCode::OverrideOnNonOverridingGetter,
+            MemberKind::Setter => SemanticCode::OverrideOnNonOverridingSetter,
+            MemberKind::Method => SemanticCode::OverrideOnNonOverridingMethod,
+        };
+        self.emit(code, range, "", "");
+    }
+
+    /// Whether any direct super-face carries a same-named non-static member
+    /// (the oracle's transitive `getOverridden`, via [`Engine::face_member`]'s
+    /// per-face climb). An unresolvable face simply contributes nothing.
+    fn face_member_any(&self, decl: &Container, spelling: StringId) -> bool {
+        let mut faces = Vec::new();
+        faces.extend(decl.superclass);
+        faces.extend(decl.with_clause.iter().copied());
+        faces.extend(decl.implements_clause.iter().copied());
+        faces.extend(decl.on_clause.iter().copied());
+        faces
+            .into_iter()
+            .any(|face| self.face_member(face, spelling).is_some())
+    }
+
+    /// The `must_call_super` probe (`must_call_super_verifier.dart:19-175`),
+    /// run at the declaration head: an instance member overriding a
+    /// `@mustCallSuper`-annotated member latches the verdict for the body's
+    /// end. The walk covers the mixin/superclass faces only (never
+    /// `implements`), mixins before the supertype, transitively with the
+    /// visited-set climb [`Engine::face_entries`] supplies; the concrete
+    /// gate is the oracle's `_hasConcreteSuperMethod` /
+    /// `lookupInheritedConcreteMember` pair, approximated by the same
+    /// concrete hit. Annotation lookups read this file's collected
+    /// declaration sites — ancestors from other files, or later in the
+    /// unit, under-report.
+    fn probe_must_call_super(&mut self, spelling: StringId, range: SourceRange) {
+        self.pending_must_call_super = None;
+        let Some((container, kind)) = self.container_context() else {
+            return;
+        };
+        if matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        ) {
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        let Some(entry) = decl.members.get(&spelling) else {
+            return;
+        };
+        if entry.is_static || entry.is_abstract {
+            return;
+        }
+        if elements
+            .duplicates()
+            .iter()
+            .any(|d| d.name == spelling && d.range == range)
+        {
+            return;
+        }
+        let mut faces: Vec<StringId> = decl.with_clause.iter().copied().collect();
+        faces.extend(decl.superclass);
+        let mut annotated_owner: Option<StringId> = None;
+        let mut concrete = false;
+        for face in faces {
+            let Some(hits) = self.face_entries(face, true) else {
+                continue;
+            };
+            for hit in hits {
+                if hit.name != spelling {
+                    continue;
+                }
+                if annotated_owner.is_none()
+                    && hit.owner_file == self.file
+                    && self.site_annotation(hit.owner_name, spelling, "mustCallSuper")
+                {
+                    annotated_owner = Some(hit.owner_name);
+                }
+                if !hit.entry.is_abstract {
+                    concrete = true;
+                }
+            }
+        }
+        if let (Some(owner), true) = (annotated_owner, concrete) {
+            self.pending_must_call_super = Some((range, owner));
+        }
+    }
+
+    /// The body's-end adjudication of the [`Engine::probe_must_call_super`]
+    /// latch: the report fires when the body never touched `super` (the
+    /// per-frame `invokesSuperSelf` face — nested function literals carry
+    /// their own frame). The `{0}` slot is the annotated ancestor's
+    /// container name.
+    fn finish_must_call_super(&mut self, super_invoked: Option<bool>) {
+        let Some((range, owner)) = self.pending_must_call_super.take() else {
+            return;
+        };
+        if super_invoked != Some(false) {
+            return;
+        }
+        let text = self.strings.resolve(owner);
+        self.emit(SemanticCode::MustCallSuper, range, &text, "");
+    }
+
     // —— abstract completeness + interface conflicts (#498) ———————————
 
-    /// Mounts both container-face families at the container's name event:
-    /// the same-name super-interface conflicts (`inconsistent_inheritance*`)
-    /// and the concrete class/enum abstract completeness
-    /// (`non_abstract_class_inherits_abstract_member`, five tiers). The
-    /// element model is complete (`collect` parsed before this pass) and the
-    /// name token anchors the emissions. Extensions and extension types have
-    /// no inheritance faces; a mixin declaration participates in the
-    /// conflicts only (the official completeness loop is
-    /// `ClassElementImpl && !isAbstract || EnumElementImpl`,
-    /// `inheritance_override.dart:412`). Both checks suppress on any
-    /// unresolvable face chain — the under-report direction.
+    /// Mounts the container-face families at the container's name event:
+    /// the same-name super-interface conflicts (`inconsistent_inheritance*`),
+    /// the concrete class/enum abstract completeness
+    /// (`non_abstract_class_inherits_abstract_member`, five tiers), the
+    /// concrete-implementation face (`invalid_implementation_override`), and
+    /// the `@mustBeOverridden` walk. The element model is complete
+    /// (`collect` parsed before this pass) and the name token anchors the
+    /// emissions. Extensions and extension types have no inheritance faces;
+    /// a mixin declaration participates in the conflicts only (the official
+    /// completeness loop is `ClassElementImpl && !isAbstract ||
+    /// EnumElementImpl`, `inheritance_override.dart:412`). Every check
+    /// suppresses on any unresolvable face chain — the under-report
+    /// direction.
     fn check_face_inheritance(
         &mut self,
         container: StringId,
@@ -3263,7 +3526,14 @@ impl<'a> Engine<'a> {
             return;
         };
         if kind != ContainerKind::Mixin {
-            self.abstract_completeness(kind, decl, &conflicted, name_range);
+            // The official loop's gate: concrete classes and enums only
+            // (`ClassElementImpl && !isAbstract || EnumElementImpl`).
+            let concrete_target = kind == ContainerKind::Enum || !decl.is_abstract;
+            if concrete_target && let Some(view) = self.collect_interface(decl) {
+                self.abstract_completeness(kind, decl, &conflicted, &view, name_range);
+                self.implementation_overrides(decl, &view, name_range);
+                self.must_be_overridden(decl, &view, name_range);
+            }
         }
     }
 
@@ -3562,11 +3832,9 @@ impl<'a> Engine<'a> {
         kind: ContainerKind,
         decl: &Container,
         conflicted: &FxHashSet<StringId>,
+        view: &InterfaceView<'a>,
         name_range: SourceRange,
     ) {
-        if kind == ContainerKind::Class && decl.is_abstract {
-            return;
-        }
         // The concrete-superclass exemption's face: the direct superclass
         // resolved, concrete, and carrying the name in its interface. A
         // broken chain suppresses the whole check.
@@ -3615,24 +3883,20 @@ impl<'a> Engine<'a> {
                 implemented.insert(*name);
             }
         }
-        let Some(InterfaceView {
-            names,
-            representative,
-            implemented: face_implemented,
-        }) = self.collect_interface(decl)
-        else {
+        if view.no_such_method_gate {
             return;
-        };
-        implemented.extend(face_implemented);
+        }
+        implemented.extend(view.implemented.iter().copied());
         // An enum's synthesized `values` pair is always implemented.
         let values = self.enum_synth_members[0];
         let values_setter = self.setter_spelling(values);
-        let descriptions: Vec<String> = names
-            .into_iter()
+        let descriptions: Vec<String> = view
+            .names
+            .iter()
             .filter(|name| !blocked.contains(name))
             .filter(|name| !self.object_members.contains(name))
             .filter(|name| {
-                kind != ContainerKind::Enum || (*name != values && *name != values_setter)
+                kind != ContainerKind::Enum || (**name != values && **name != values_setter)
             })
             .filter(|name| {
                 concrete_super_names
@@ -3645,14 +3909,14 @@ impl<'a> Engine<'a> {
                 // `isAccessibleFor`: a *private* name inherited from another
                 // library can never be implemented — the oracle skips it.
                 // Public names are accessible from any importing library.
-                if !self.strings.resolve(*name).starts_with('_') {
+                if !self.strings.resolve(**name).starts_with('_') {
                     return true;
                 }
-                let hit = &representative[name];
+                let hit = &view.representative[name];
                 hit.owner_file == self.file
-                    || self.owner_library_of(hit.owner_file, *name) == Some(self.lib)
+                    || self.owner_library_of(hit.owner_file, **name) == Some(self.lib)
             })
-            .map(|name| self.member_description(&representative[&name], name))
+            .map(|name| self.member_description(&view.representative[name], *name))
             .collect();
         self.emit_missing_members(descriptions, name_range);
     }
@@ -3661,9 +3925,12 @@ impl<'a> Engine<'a> {
     /// names (a non-final field carries its setter half), the first face in
     /// order supplying the representative hit, and the names a concrete
     /// source implements. `None` suppresses the whole check — a broken face
-    /// chain, or the noSuchMethod forwarder gate: a concrete noSuchMethod on
+    /// chain. The noSuchMethod forwarder gate — a concrete noSuchMethod on
     /// the implemented sources (own members, mixins, the super chain — never
-    /// an `implements` face) implements every interface name.
+    /// an `implements` face) implements every interface name — rides the
+    /// view as a flag: the completeness check returns on it while the
+    /// concrete-implementation loop ignores it, matching the oracle's
+    /// dispatch order.
     fn collect_interface(&mut self, decl: &Container) -> Option<InterfaceView<'a>> {
         let mut faces: Vec<(StringId, bool)> = Vec::new();
         faces.extend(decl.superclass.iter().map(|s| (*s, true)));
@@ -3671,11 +3938,13 @@ impl<'a> Engine<'a> {
         faces.extend(decl.implements_clause.iter().map(|i| (*i, false)));
         faces.extend(decl.on_clause.iter().map(|o| (*o, false)));
         let mut face_hits: Vec<Vec<FaceEntry<'a>>> = Vec::with_capacity(faces.len());
+        let mut face_sources: Vec<StringId> = Vec::with_capacity(faces.len());
         for (face, contributes) in faces {
+            face_sources.push(face);
             face_hits.push(self.face_entries(face, contributes)?);
         }
         let no_such_method = self.object_members[3];
-        let forwarder_gate = decl
+        let no_such_method_gate = decl
             .members
             .get(&no_such_method)
             .is_some_and(|e| !e.is_static && !e.is_abstract)
@@ -3683,9 +3952,6 @@ impl<'a> Engine<'a> {
                 .iter()
                 .flatten()
                 .any(|h| h.name == no_such_method && h.concrete_source && !h.entry.is_abstract);
-        if forwarder_gate {
-            return None;
-        }
         let mut representative: FxHashMap<StringId, FaceEntry<'a>> = FxHashMap::default();
         let mut names: Vec<StringId> = Vec::new();
         let mut implemented: FxHashSet<StringId> = FxHashSet::default();
@@ -3724,7 +3990,234 @@ impl<'a> Engine<'a> {
             names,
             representative,
             implemented,
+            face_hits,
+            face_sources,
+            no_such_method_gate,
         })
+    }
+
+    /// The interface loop's concrete-implementation face
+    /// (`inheritance_override.dart:412-481`): for every interface name with
+    /// an *inherited* concrete implementation — the first concrete hit over
+    /// the superclass and `with` faces — that member must be a valid
+    /// override of the interface map's most-specific member of the same
+    /// name. This is the residue the per-member `invalid_override` pass
+    /// cannot reach (no own declaration exists); the class's own concrete
+    /// members stay that pass's exclusive business — the oracle's interface
+    /// loop also re-reports own-member shapes, a duplication its TODO
+    /// (`inheritance_override.dart:463-469`) calls out as an artifact this
+    /// port does not replicate. When no candidate validly overrides all the
+    /// others (the conflict shapes) the pass skips — the conflict
+    /// diagnostics own those. Emissions anchor at the container's name (the
+    /// oracle's `classNameToken`, whose placement its own TODO calls out).
+    /// Kind mismatches skip (the oracle routes them to the member-kind
+    /// verifier), and a field entry never carries the setter face (its
+    /// getter-shaped type would compare with the wrong variance).
+    fn implementation_overrides(
+        &mut self,
+        decl: &Container,
+        view: &InterfaceView<'a>,
+        name_range: SourceRange,
+    ) {
+        for name in &view.names {
+            let setter_face = self.strings.resolve(*name).ends_with('=');
+            let mut hits: Vec<&FaceEntry<'a>> = view
+                .face_hits
+                .iter()
+                .flatten()
+                .filter(|h| h.name == *name)
+                .collect();
+            if setter_face {
+                let bare = self
+                    .strings
+                    .intern(self.strings.resolve(*name).strip_suffix('=').unwrap_or(""));
+                hits.extend(view.face_hits.iter().flatten().filter(|h| {
+                    h.name == bare && h.entry.kind == MemberKind::Field && !h.entry.is_final
+                }));
+            }
+            let Some(specific) = Self::most_specific(&hits) else {
+                continue;
+            };
+            let Some(concrete) = self.inherited_concrete_implementation(decl, view, *name) else {
+                continue;
+            };
+            if concrete.entry.kind != specific.entry.kind {
+                continue;
+            }
+            if setter_face && concrete.entry.kind == MemberKind::Field {
+                continue;
+            }
+            if std::ptr::eq(concrete.entry, specific.entry) {
+                continue;
+            }
+            if !Self::override_broken(concrete.entry, specific.entry) {
+                continue;
+            }
+            let display = self.strings.resolve(*name);
+            let display = display.strip_suffix('=').unwrap_or(display);
+            let concrete_text = self.strings.resolve(concrete.owner_name);
+            let concrete_sig = self.override_signature_text(concrete.entry);
+            let specific_text = self.strings.resolve(specific.owner_name);
+            let specific_sig = self.override_signature_text(specific.entry);
+            let code = if concrete.entry.kind == MemberKind::Setter {
+                SemanticCode::InvalidImplementationOverrideSetter
+            } else {
+                SemanticCode::InvalidImplementationOverride
+            };
+            self.emit5(
+                code,
+                name_range,
+                display,
+                concrete_text,
+                &concrete_sig,
+                specific_text,
+                &specific_sig,
+            );
+        }
+    }
+
+    /// The name's most-specific interface member: the unique candidate that
+    /// validly overrides every other hit (the oracle's interface-map
+    /// selection at name level). `None` when the candidates do not
+    /// linearize — conflict territory.
+    fn most_specific<'e>(hits: &[&'e FaceEntry<'e>]) -> Option<&'e FaceEntry<'e>> {
+        hits.iter().copied().find(|candidate| {
+            hits.iter().all(|other| {
+                std::ptr::eq(*candidate, *other)
+                    || !Self::override_broken(candidate.entry, other.entry)
+            })
+        })
+    }
+
+    /// The name's inherited concrete implementation, `_addImplemented`'s
+    /// source order: the `with` mixins first, then the superclass chain
+    /// (never an `implements` face — its hits are interface members only).
+    /// The mixin-before-superclass order is load-bearing: the oracle's
+    /// concrete resolution for `C extends A with M implements I` is the
+    /// *mixin's* member, and the superclass's would manufacture a conflict
+    /// the oracle resolves away. The class's own members are deliberately
+    /// absent: the per-member `invalid_override` pass owns their faces.
+    fn inherited_concrete_implementation(
+        &self,
+        decl: &Container,
+        view: &InterfaceView<'a>,
+        name: StringId,
+    ) -> Option<FaceEntry<'a>> {
+        let hits_of = |face: StringId| {
+            view.face_sources
+                .iter()
+                .position(|f| *f == face)
+                .and_then(|i| view.face_hits.get(i))
+        };
+        for face in decl.with_clause.iter().copied().chain(decl.superclass) {
+            if let Some(hit) = hits_of(face)
+                .and_then(|hits| hits.iter().find(|h| h.name == name && !h.entry.is_abstract))
+            {
+                return Some(hit.clone());
+            }
+        }
+        None
+    }
+
+    /// The `@mustBeOverridden` walk (`inheritance_override.dart:1050-1168`):
+    /// a concrete class/enum must override every `@mustBeOverridden`-annotated
+    /// super-interface member with a concrete member of its own, per face
+    /// kind — a getter face is satisfied by an own getter or field, a setter
+    /// face by an own setter or non-final field, a field face by both halves.
+    /// The report groups the missing names into the three registry tiers at
+    /// the container's name (`classNameToken`); the oracle's
+    /// insertion-ordered set becomes a sorted display (the completeness
+    /// pass's precedent). A concrete own `noSuchMethod` gates the whole walk
+    /// (own members only — stricter than the completeness forwarder gate).
+    /// Annotations resolve from this file's collected declaration sites —
+    /// cross-file or later-declared ancestors under-report.
+    fn must_be_overridden(
+        &mut self,
+        decl: &Container,
+        view: &InterfaceView<'a>,
+        name_range: SourceRange,
+    ) {
+        let no_such_method = self.object_members[3];
+        if let Some(entry) = decl.members.get(&no_such_method)
+            && !entry.is_static
+            && !entry.is_abstract
+        {
+            return;
+        }
+        let mut missing: Vec<StringId> = Vec::new();
+        for hit in view.face_hits.iter().flatten() {
+            if hit.owner_file != self.file
+                || !self.site_annotation(hit.owner_name, hit.name, "mustBeOverridden")
+                || missing.contains(&hit.name)
+            {
+                continue;
+            }
+            let bare = self.strings.intern(
+                self.strings
+                    .resolve(hit.name)
+                    .strip_suffix('=')
+                    .unwrap_or(""),
+            );
+            let concrete_own = |e: &MemberEntry| {
+                matches!(
+                    e.kind,
+                    MemberKind::Getter | MemberKind::Field | MemberKind::Method
+                ) && !e.is_abstract
+            };
+            let satisfied = match hit.entry.kind {
+                MemberKind::Method => decl
+                    .members
+                    .get(&hit.name)
+                    .is_some_and(|e| e.kind == MemberKind::Method && !e.is_abstract),
+                MemberKind::Getter => decl.members.get(&hit.name).is_some_and(concrete_own),
+                MemberKind::Setter => {
+                    decl.members
+                        .get(&hit.name)
+                        .is_some_and(|e| e.kind == MemberKind::Setter && !e.is_abstract)
+                        || decl.members.get(&bare).is_some_and(|e| {
+                            e.kind == MemberKind::Field && !e.is_final && !e.is_abstract
+                        })
+                }
+                MemberKind::Field => {
+                    let getter_ok = decl.members.get(&hit.name).is_some_and(concrete_own);
+                    let setter_ok = hit.entry.is_final
+                        || decl
+                            .members
+                            .get(&self.setter_spelling(hit.name))
+                            .is_some_and(|e| e.kind == MemberKind::Setter && !e.is_abstract)
+                        || decl.members.get(&hit.name).is_some_and(|e| {
+                            e.kind == MemberKind::Field && !e.is_final && !e.is_abstract
+                        });
+                    getter_ok && setter_ok
+                }
+            };
+            if !satisfied {
+                missing.push(hit.name);
+            }
+        }
+        let mut displays: Vec<String> = missing
+            .iter()
+            .map(|n| {
+                let text = self.strings.resolve(*n);
+                text.strip_suffix('=').unwrap_or(text).to_string()
+            })
+            .collect();
+        displays.sort();
+        displays.dedup();
+        let code = match displays.len() {
+            0 => return,
+            1 => SemanticCode::MissingOverrideOfMustBeOverriddenOne,
+            2 => SemanticCode::MissingOverrideOfMustBeOverriddenTwo,
+            _ => SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus,
+        };
+        match displays.len() {
+            1 => self.emit(code, name_range, &displays[0], ""),
+            2 => self.emit3(code, name_range, &displays[0], &displays[1], ""),
+            _ => {
+                let extra = (displays.len() - 2).to_string();
+                self.emit3(code, name_range, &displays[0], &displays[1], &extra);
+            }
+        }
     }
 
     /// The description text of one missing member: `Enclosing.member`, the
@@ -4106,7 +4599,8 @@ impl<'a> Engine<'a> {
         // a reference to the enclosing container or the enclosing executable
         // itself never marks that declaration used. The row offset joins the
         // skip set so the resolve-time marking obeys the same rule.
-        if self.exec_self_name() == Some(name) || self.container_context().map_or(false, |(c, _)| c == name)
+        if self.exec_self_name() == Some(name)
+            || self.container_context().map_or(false, |(c, _)| c == name)
         {
             self.self_scope_rows.insert(range.offset);
         }
@@ -4895,7 +5389,9 @@ impl<'a> Engine<'a> {
                     | Receiver::Container {
                         name: container, ..
                     }
-                    | Receiver::Created { name: container, .. } => Some(container),
+                    | Receiver::Created {
+                        name: container, ..
+                    } => Some(container),
                     _ => None,
                 };
                 let Some(container) = container else {
@@ -5246,9 +5742,7 @@ impl<'a> Engine<'a> {
                     // A write alone never uses a local variable (the
                     // official `_useAssignmentTargetElement` early return);
                     // the plain-write hit cancels.
-                    if !compound
-                        && let Some(hit) = self.local_hits.remove(&row.range.offset)
-                    {
+                    if !compound && let Some(hit) = self.local_hits.remove(&row.range.offset) {
                         self.locals[hit as usize].uses -= 1;
                     }
                     row.intent = if compound {
@@ -5543,6 +6037,7 @@ impl<'a> Engine<'a> {
             file: self.file,
             strings: self.strings,
             bool_id: self.intern("bool"),
+            core_supertypes: self.core_supertypes,
             unknowns: std::cell::Cell::new(0),
         }
     }
@@ -5711,7 +6206,14 @@ impl<'a> Engine<'a> {
     /// face (`isDartCoreBool`/enum/`isSealed`) and is nullability-agnostic
     /// — `S?` of a sealed `S` stays always-exhaustive, the null half being
     /// the space model's nullable split rather than this gate (`dynamic`
-    /// has no element and stays `false`).
+    /// has no element and stays `false`). The official check carries three
+    /// arms this name-level port does not model: extension types (erased to
+    /// the representation type, then recursed — the candidate belongs to the
+    /// extension-type member-model ticket, not this site), `FutureOr<T>`
+    /// (recursed into the type argument), and promoted type parameters
+    /// (recursed into the promoted bound, then the declared bound). All
+    /// three fall to the `false` arm here — under-report, never a false
+    /// positive.
     fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
         match ty {
             NameTy::Null => true,
@@ -7626,11 +8128,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // The representation checks read the element model (complete since
         // `collect`) and anchor at this name token.
         if let Some(name) = name {
-            engine.note_decl_site(
-                name,
-                name_range,
-                DeclKind::Container,
-            );
+            engine.note_decl_site(name, name_range, DeclKind::Container);
             engine.check_extension_type(name, name_range);
         }
         engine.push_container_frame(ContainerKind::Extension, name);
@@ -7698,6 +8196,11 @@ impl ParserListener for DiagnoseListener<'_> {
             name
         };
         engine.check_override(spelling, name_range);
+        // The `@override` presence face and the `@mustCallSuper` probe read
+        // the pending annotation latch before any site registration drains
+        // it; the probe's verdict adjudicates at the body's end.
+        engine.check_override_annotation(spelling, name_range);
+        engine.probe_must_call_super(spelling, name_range);
     }
 
     fn end_method(
@@ -7718,7 +8221,12 @@ impl ParserListener for DiagnoseListener<'_> {
             _end,
         );
 
-        self.engine.borrow_mut().pop_frame();
+        let mut engine = self.engine.borrow_mut();
+        // The `must_call_super` verdict reads the body's super face before
+        // the executable frame closes.
+        let super_invoked = engine.top_executable_super_invoked();
+        engine.finish_must_call_super(super_invoked);
+        engine.pop_frame();
     }
 
     fn begin_top_level_method(
@@ -8330,6 +8838,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.const_decl_name(name, true);
                     if context == C::FieldDeclaration {
                         engine.check_override(name, token.range);
+                        // The `@override` presence face reads the pending
+                        // annotation latch before the site drains it.
+                        engine.check_override_annotation(name, token.range);
                         if let Some((container, _)) = engine.container_context() {
                             let is_static = engine.open_member_static;
                             engine.note_decl_site(
@@ -8431,6 +8942,7 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_super_expression(token, _context);
 
         self.engine.borrow_mut().push_keyword_receiver(token, true);
+        self.engine.borrow_mut().note_super_expression();
         self.engine
             .borrow_mut()
             .const_capture
@@ -9993,7 +10505,9 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_labeled_statement(&mut self, label_count: usize) {
         self.flow.borrow_mut().end_labeled_statement(label_count);
 
-        self.engine.borrow_mut().finish_labeled_statement(label_count);
+        self.engine
+            .borrow_mut()
+            .finish_labeled_statement(label_count);
     }
 
     fn end_pattern_guard(&mut self, token: Token) {
@@ -10380,6 +10894,9 @@ struct NameWorld<'a> {
     /// The interned `bool` spelling (`BoolValue` subtyping compares ids,
     /// never re-interns per query).
     bool_id: StringId,
+    /// The core chain pre-interned ([`CORE_SUPERTYPES`] → id pairs): the
+    /// BFS compares ids, never re-resolving/re-interning per dequeued node.
+    core_supertypes: [(StringId, StringId); 3],
     unknowns: std::cell::Cell<u64>,
 }
 
@@ -10583,8 +11100,7 @@ impl NameWorld<'_> {
         if left_nullable && right_nullable {
             return true;
         }
-        let (Some(left_name), Some(right_name)) =
-            (self.head_name(left), self.head_name(right))
+        let (Some(left_name), Some(right_name)) = (self.head_name(left), self.head_name(right))
         else {
             // `Never` (already a subtype of everything), top, and unknown
             // shapes stay undecided.
@@ -10810,14 +11326,13 @@ impl NameWorld<'_> {
                     queue.push_back(edge);
                 }
             }
-            for (base, parent) in CORE_SUPERTYPES {
-                if self.strings.resolve(name) == base {
-                    let parent_id = self.strings.intern(parent);
-                    if parent_id == sup {
+            for (base, parent) in self.core_supertypes {
+                if name == base {
+                    if parent == sup {
                         return true;
                     }
-                    if seen.insert(parent_id) {
-                        queue.push_back(parent_id);
+                    if seen.insert(parent) {
+                        queue.push_back(parent);
                     }
                 }
             }
@@ -11669,10 +12184,7 @@ mod tests {
         // reports `unused_local_variable` after the arity row.
         assert_eq!(
             code_names(&report),
-            [
-                "wrong_number_of_type_arguments",
-                "unused_local_variable",
-            ],
+            ["wrong_number_of_type_arguments", "unused_local_variable",],
             "{:?}",
             code_names(&report)
         );
@@ -13087,7 +13599,10 @@ mod tests {
         // row anchors after it in source order.
         assert_eq!(
             code_names(&self_cycle),
-            ["unused_local_variable", "constant_pattern_never_matches_value_type"],
+            [
+                "unused_local_variable",
+                "constant_pattern_never_matches_value_type"
+            ],
             "{:?}",
             code_names(&self_cycle)
         );
@@ -13100,7 +13615,10 @@ mod tests {
         );
         assert_eq!(
             code_names(&mutual_cycle),
-            ["unused_local_variable", "constant_pattern_never_matches_value_type"],
+            [
+                "unused_local_variable",
+                "constant_pattern_never_matches_value_type"
+            ],
             "{:?}",
             code_names(&mutual_cycle)
         );
@@ -13410,6 +13928,7 @@ mod tests {
             file,
             strings: &strings,
             bool_id: strings.intern("bool"),
+            core_supertypes: CORE_SUPERTYPES.map(|(b, p)| (strings.intern(b), strings.intern(p))),
             unknowns: std::cell::Cell::new(0),
         };
         let c = strings.intern("C");
@@ -14139,6 +14658,214 @@ mod tests {
         );
     }
 
+    // —— #314: the annotation-driven override residue ————————————————
+
+    /// `@override` on a member no superinterface carries reports
+    /// `override_on_non_overriding_member` at the member's name; the same
+    /// annotation on a genuine override stays silent.
+    #[test]
+    fn override_annotation_on_non_member_reports() {
+        let rep = report(
+            "class int {} class A { void f() {} } class B extends A { @override void g() {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["override_on_non_overriding_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "The method doesn't override an inherited method."
+        );
+        let spare = report(
+            "class int {} class A { void f() {} } class B extends A { @override void f() {} }",
+        );
+        assert!(code_names(&spare).is_empty(), "{:?}", code_names(&spare));
+    }
+
+    /// The field face spares on either half: an inherited field (getter
+    /// name) spares, an unrelated name reports the field text; the setter
+    /// face swaps the message text.
+    #[test]
+    fn override_annotation_field_and_setter_faces() {
+        let spare = report(
+            "class int {} class A { int x = 1; } class B extends A { @override int x = 2; }",
+        );
+        assert!(code_names(&spare).is_empty(), "{:?}", code_names(&spare));
+        let rep = report(
+            "class int {} class A { void f() {} } class B extends A { @override int y = 2; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["override_on_non_overriding_member"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "The field doesn't override an inherited getter or setter."
+        );
+        let setter = report(
+            "class int {} class A { void f() {} } class B extends A { @override set s(int v) {} }",
+        );
+        assert_eq!(
+            code_names(&setter),
+            ["override_on_non_overriding_member"],
+            "{:?}",
+            code_names(&setter)
+        );
+        assert_eq!(
+            setter.diagnostics[0].message,
+            "The setter doesn't override an inherited setter."
+        );
+    }
+
+    /// Overriding a `@mustCallSuper`-annotated member without touching
+    /// `super` reports `must_call_super` at the overriding member's name
+    /// (a static warning); the body's `super.f()` invocation spares it.
+    #[test]
+    fn must_call_super_requires_the_super_invocation() {
+        let source = "class int {} class mustCallSuper { const mustCallSuper(); } \
+             class A { @mustCallSuper void f() {} } \
+             class B extends A { void f() {} }";
+        let rep = report(source);
+        assert_eq!(
+            code_names(&rep),
+            ["must_call_super"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.message,
+            "This method overrides a method annotated as '@mustCallSuper' in 'A', but doesn't invoke the overridden method."
+        );
+        // The name-token anchor (the oracle's `node.name`).
+        assert_eq!(
+            d.range.offset,
+            offset_of(source, "class B extends A { void ")
+                + "class B extends A { void ".len() as u32
+        );
+        let spared = report(
+            "class int {} class mustCallSuper { const mustCallSuper(); } \
+             class A { @mustCallSuper void f() {} } \
+             class B extends A { void f() { super.f(); } }",
+        );
+        assert!(code_names(&spared).is_empty(), "{:?}", code_names(&spared));
+    }
+
+    /// The `@mustBeOverridden` walk: a concrete subclass without the member
+    /// reports the missing-override row at the class name; a concrete
+    /// override spares it.
+    #[test]
+    fn must_be_overridden_requires_a_concrete_member() {
+        let rep = report(
+            "class int {} class mustBeOverridden { const mustBeOverridden(); } \
+             class A { @mustBeOverridden void f() {} } \
+             class B extends A {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["missing_override_of_must_be_overridden"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(rep.diagnostics[0].severity, Severity::Warning);
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "Missing a required override of 'f'."
+        );
+        let spared = report(
+            "class int {} class mustBeOverridden { const mustBeOverridden(); } \
+             class A { @mustBeOverridden void f() {} } \
+             class B extends A { void f() {} }",
+        );
+        assert!(code_names(&spared).is_empty(), "{:?}", code_names(&spared));
+    }
+
+    /// The concrete-implementation face across the two inherited shapes: the
+    /// mixin application (`C with M implements I`) and the superclass pair
+    /// (`C extends A implements I`) report at the applying class's name
+    /// when the inherited concrete signature does not satisfy the more
+    /// specific interface member. The conflict axis is nullability — the
+    /// model's `Ty` decides it both ways (`int?` accepts `int` makes `I.f`
+    /// the unique most-specific member; `int` rejects `int?` breaks the
+    /// concrete face) — two distinct named types stay undecidable at the
+    /// name level (`assignable_from` answers `None`, the suppression
+    /// direction). An own declaration never double-reports (the per-member
+    /// `invalid_override` pass owns that face).
+    #[test]
+    fn mixin_application_conflict_emits_invalid_implementation_override() {
+        let rep = report(
+            "class int {} class I { void f(int? x) {} } \
+             mixin M { void f(int x) {} } \
+             class C with M implements I {}",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_implementation_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(
+            d.message,
+            "'M.f' ('void Function(int)') isn't a valid concrete implementation of 'I.f' ('void Function(int?)')."
+        );
+        let canonical = report(
+            "class int {} class A { void f(int x) {} } \
+             class I { void f(int? x) {} } \
+             class C extends A implements I {}",
+        );
+        assert_eq!(
+            code_names(&canonical),
+            ["invalid_implementation_override"],
+            "{:?}",
+            code_names(&canonical)
+        );
+        assert_eq!(
+            canonical.diagnostics[0].message,
+            "'A.f' ('void Function(int)') isn't a valid concrete implementation of 'I.f' ('void Function(int?)')."
+        );
+    }
+
+    /// `invalid_override` reaches through every super-face kind: the
+    /// `implements` path (an interface member against an own declaration)
+    /// and the applied-mixin path emit like the superclass one.
+    #[test]
+    fn invalid_override_hits_the_implements_and_mixin_paths() {
+        let rep = report(
+            "class int {} class A { void f() {} } class B implements A { void f(int x) {} }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "'B.f' ('void Function(int)') isn't a valid override of 'A.f' ('void Function()')."
+        );
+        let applied = report(
+            "class int {} class A { void f() {} } mixin M { void f(int x) {} } \
+             class C extends A with M { void f() {} }",
+        );
+        assert_eq!(
+            code_names(&applied),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&applied)
+        );
+        assert_eq!(
+            applied.diagnostics[0].message,
+            "'C.f' ('void Function()') isn't a valid override of 'M.f' ('void Function(int)')."
+        );
+    }
+
     /// The residency widening pays off: a superclass in another resident
     /// library (same package, two files) resolves through the namespace
     /// hop, so the override verdict fires across the file seam.
@@ -14702,10 +15429,7 @@ mod tests {
         let report = report(source);
         // `h` is never read (the official read-only use rule), before the
         // dead-statement row inside the closure.
-        assert_eq!(
-            code_names(&report),
-            ["unused_local_variable", "dead_code"]
-        );
+        assert_eq!(code_names(&report), ["unused_local_variable", "dead_code"]);
         assert_eq!(dead_code_offsets(&report), [offset_of(source, "1;")]);
     }
 
@@ -15253,7 +15977,12 @@ mod tests {
         // declares no `+`, so the operator read reports the oracle's
         // `undefined_operator` at the site.
         let r = report("class int {} void main() { int v = 0; v; v + 1; }");
-        assert_eq!(code_names(&r), ["undefined_operator"], "{:?}", code_names(&r));
+        assert_eq!(
+            code_names(&r),
+            ["undefined_operator"],
+            "{:?}",
+            code_names(&r)
+        );
     }
 
     /// The wildcard-variables face: an all-underscores name never reports;
@@ -15261,7 +15990,12 @@ mod tests {
     #[test]
     fn wildcard_locals_never_report() {
         let r = report("class int {} void main() { var _ = 1; int _z = 2; }");
-        assert_eq!(code_names(&r), ["unused_local_variable"], "{:?}", code_names(&r));
+        assert_eq!(
+            code_names(&r),
+            ["unused_local_variable"],
+            "{:?}",
+            code_names(&r)
+        );
         assert!(
             r.diagnostics[0].message.contains("'_z'"),
             "{}",
@@ -15283,7 +16017,9 @@ mod tests {
         // The local `int` stands in for the core type (the harness has no
         // seeded dart:core); the read of `a` spares the whole pattern group
         // (official visitPatternVariableDeclaration all-or-nothing).
-        let r2 = report("class int {} void take(int x) {} void main() { var (a, b) = (1, 2); take(a); }");
+        let r2 = report(
+            "class int {} void take(int x) {} void main() { var (a, b) = (1, 2); take(a); }",
+        );
         assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
     }
 
@@ -15409,9 +16145,7 @@ mod tests {
              void main() { _D.named(1); _D.other(); }",
         );
         assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
-        let r2 = report(
-            "class int {} class _C { _C([int x = 0]); } void main() { _C(); }",
-        );
+        let r2 = report("class int {} class _C { _C([int x = 0]); } void main() { _C(); }");
         assert_eq!(
             code_names(&r2),
             ["unused_element_parameter"],
@@ -15422,9 +16156,7 @@ mod tests {
             r2.diagnostics[0].message,
             "A value for optional parameter 'x' isn't ever given."
         );
-        let r3 = report(
-            "class int {} class _C { _C([int x = 0]); } void main() { _C(1); }",
-        );
+        let r3 = report("class int {} class _C { _C([int x = 0]); } void main() { _C(1); }");
         assert!(code_names(&r3).is_empty(), "{:?}", code_names(&r3));
     }
 
@@ -15596,9 +16328,8 @@ mod tests {
     /// reports at its own statement end.
     #[test]
     fn unused_labels_report() {
-        let r = report(
-            "void main() { used: for (;;) { break used; } dead: for (;;) { break used; } }",
-        );
+        let r =
+            report("void main() { used: for (;;) { break used; } dead: for (;;) { break used; } }");
         assert_eq!(code_names(&r), ["unused_label"], "{:?}", code_names(&r));
         assert_eq!(r.diagnostics[0].message, "The label 'dead' isn't used.");
     }
@@ -15648,9 +16379,8 @@ mod tests {
     /// over a subtype operand, `x is! T` reports the complement row.
     #[test]
     fn unnecessary_type_check_polarity() {
-        let r = report(
-            "class int {} void main() { int x = 1; if (x is int) {} if (x is! int) {} }",
-        );
+        let r =
+            report("class int {} void main() { int x = 1; if (x is int) {} if (x is! int) {} }");
         assert_eq!(
             code_names(&r),
             ["unnecessary_type_check", "unnecessary_type_check"],
@@ -15804,7 +16534,10 @@ mod tests {
         );
         assert_eq!(
             code_names(&r),
-            ["unnecessary_null_check_pattern", "unnecessary_null_assert_pattern"],
+            [
+                "unnecessary_null_check_pattern",
+                "unnecessary_null_assert_pattern"
+            ],
             "{:?}",
             code_names(&r)
         );

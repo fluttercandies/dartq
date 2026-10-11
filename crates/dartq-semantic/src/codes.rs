@@ -275,6 +275,50 @@ pub enum SemanticCode {
     /// ('{4}').` — the same verdict for setters (`invalidOverrideSetter`,
     /// `diagnostic.g.dart:9616-9631`): one code name, dedicated text.
     InvalidOverrideSetter,
+    /// `'{1}.{0}' ('{2}') isn't a valid concrete implementation of '{3}.{0}'
+    /// ('{4}').` — the interface loop's concrete-implementation face
+    /// (`inheritance_override.dart:412-481`): an inherited concrete member
+    /// (own, mixin, or super chain) whose name-level signature is decuably
+    /// incompatible with the interface map's most-specific member of the
+    /// same name (`diagnostic.g.dart:9055-9084`).
+    InvalidImplementationOverride,
+    /// `The setter '{1}.{0}' ('{2}') isn't a valid concrete implementation of
+    /// '{3}.{0}' ('{4}').` — the setter face of the same verdict; one code
+    /// name, dedicated text (`invalidImplementationOverrideSetter`,
+    /// `diagnostic.g.dart:9107-9130`).
+    InvalidImplementationOverrideSetter,
+    // —— #314: the annotation-driven override residue family ———————————————
+    /// `This method overrides a method annotated as '@mustCallSuper' in
+    /// '{0}', but doesn't invoke the overridden method.` — an instance
+    /// member overriding a `@mustCallSuper`-annotated member found on its
+    /// mixin/superclass walk without touching `super` in its body
+    /// (`must_call_super_verifier.dart:19-194`;
+    /// `diagnostic.g.dart:12055-12068`, `STATIC_WARNING`).
+    MustCallSuper,
+    /// `Missing a required override of '{0}'.` — a concrete class leaves a
+    /// `@mustBeOverridden`-annotated super member un-overridden
+    /// (`inheritance_override.dart:1050-1168`). One registry code, three
+    /// message tiers by list length (the `sharedName` split).
+    MissingOverrideOfMustBeOverriddenOne,
+    /// `Missing a required override of '{0}' and '{1}'.` — the two-member
+    /// tier of [`SemanticCode::MissingOverrideOfMustBeOverriddenOne`].
+    MissingOverrideOfMustBeOverriddenTwo,
+    /// `Missing a required override of '{0}', '{1}', and {2} more.` — the
+    /// three-or-more tier.
+    MissingOverrideOfMustBeOverriddenThreePlus,
+    /// `The field doesn't override an inherited getter or setter.` — a
+    /// `@override`-annotated field whose name level no superinterface
+    /// carries (`override_verifier.dart`). One registry code
+    /// (`override_on_non_overriding_member`), four message faces.
+    OverrideOnNonOverridingField,
+    /// `The getter doesn't override an inherited getter.` — the getter face
+    /// of [`SemanticCode::OverrideOnNonOverridingField`].
+    OverrideOnNonOverridingGetter,
+    /// `The method doesn't override an inherited method.` — the method face
+    /// (operators included — the oracle types them as methods).
+    OverrideOnNonOverridingMethod,
+    /// `The setter doesn't override an inherited setter.` — the setter face.
+    OverrideOnNonOverridingSetter,
     // —— #449: the flow-analysis family ————————————————————————————————————
     /// `Dead code.` — a statement entered while the current control-flow
     /// path is unreachable (`diagnostic.g.dart:3542-3552`, a
@@ -664,6 +708,31 @@ impl SemanticCode {
             Self::InvalidOverride | Self::InvalidOverrideSetter => {
                 ("invalid_override", "INVALID_OVERRIDE")
             }
+            // The concrete-implementation face: one code name, two message
+            // texts (the `uniqueName` split,
+            // `invalid_implementation_override_setter`).
+            Self::InvalidImplementationOverride | Self::InvalidImplementationOverrideSetter => (
+                "invalid_implementation_override",
+                "INVALID_IMPLEMENTATION_OVERRIDE",
+            ),
+            Self::MustCallSuper => ("must_call_super", "MUST_CALL_SUPER"),
+            // One registry code across the three tiers (the `sharedName`
+            // split); the tier lives in the message shape.
+            Self::MissingOverrideOfMustBeOverriddenOne
+            | Self::MissingOverrideOfMustBeOverriddenTwo
+            | Self::MissingOverrideOfMustBeOverriddenThreePlus => (
+                "missing_override_of_must_be_overridden",
+                "MISSING_OVERRIDE_OF_MUST_BE_OVERRIDDEN",
+            ),
+            // One registry code across the four member faces (the
+            // `sharedName` split); the face lives in the message shape.
+            Self::OverrideOnNonOverridingField
+            | Self::OverrideOnNonOverridingGetter
+            | Self::OverrideOnNonOverridingMethod
+            | Self::OverrideOnNonOverridingSetter => (
+                "override_on_non_overriding_member",
+                "OVERRIDE_ON_NON_OVERRIDING_MEMBER",
+            ),
             Self::DeadCode => ("dead_code", "DEAD_CODE"),
             // One code name with two message texts (the `uniqueName` split,
             // `ambiguous_extension_member_access_two` / `_three_or_more`).
@@ -813,7 +882,15 @@ impl SemanticCode {
             | Self::PatternNeverMatchesValueType
             | Self::UnnecessaryCastPattern
             | Self::UnnecessaryNullCheckPattern
-            | Self::UnnecessaryNullAssertPattern => DiagnosticType::StaticWarning,
+            | Self::UnnecessaryNullAssertPattern
+            | Self::MustCallSuper
+            | Self::MissingOverrideOfMustBeOverriddenOne
+            | Self::MissingOverrideOfMustBeOverriddenTwo
+            | Self::MissingOverrideOfMustBeOverriddenThreePlus
+            | Self::OverrideOnNonOverridingField
+            | Self::OverrideOnNonOverridingGetter
+            | Self::OverrideOnNonOverridingMethod
+            | Self::OverrideOnNonOverridingSetter => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -906,6 +983,27 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => {
                 "The null-assert pattern will have no effect because the matched type isn't nullable."
                     .to_string()
+            }
+            // The #314 residue family: the one-argument rows and the four
+            // no-argument member faces, verbatim
+            // (diagnostic.g.dart:12061/:13806-13855).
+            Self::MustCallSuper => format!(
+                "This method overrides a method annotated as '@mustCallSuper' in '{a0}', but doesn't invoke the overridden method."
+            ),
+            Self::MissingOverrideOfMustBeOverriddenOne => {
+                format!("Missing a required override of '{a0}'.")
+            }
+            Self::OverrideOnNonOverridingField => {
+                "The field doesn't override an inherited getter or setter.".to_string()
+            }
+            Self::OverrideOnNonOverridingGetter => {
+                "The getter doesn't override an inherited getter.".to_string()
+            }
+            Self::OverrideOnNonOverridingMethod => {
+                "The method doesn't override an inherited method.".to_string()
+            }
+            Self::OverrideOnNonOverridingSetter => {
+                "The setter doesn't override an inherited setter.".to_string()
             }
             Self::UndefinedAnnotation => {
                 format!("Undefined name '{a0}' used as an annotation.")
@@ -1090,9 +1188,16 @@ impl SemanticCode {
             // (the kind word leads); real emissions go through `emit4`.
             Self::WrongNumberOfTypeArgumentsElement(kind) => self.message4(kind.word(), a0, a1, ""),
             // The five-placeholder override rows route through `message5`.
-            Self::InvalidOverride | Self::InvalidOverrideSetter => {
+            Self::InvalidOverride
+            | Self::InvalidOverrideSetter
+            | Self::InvalidImplementationOverride
+            | Self::InvalidImplementationOverrideSetter => {
                 self.message5(a0, a1, "", "", "")
             }
+            // The two/three-tier `mustBeOverridden` rows route through
+            // `message3`; real emissions go through `emit3`.
+            Self::MissingOverrideOfMustBeOverriddenTwo
+            | Self::MissingOverrideOfMustBeOverriddenThreePlus => self.message3(a0, a1, ""),
         }
     }
 
@@ -1200,6 +1305,14 @@ impl SemanticCode {
             }
             Self::InheritsAbstractMemberThree => {
                 format!("Missing concrete implementations of '{a0}', '{a1}', and '{a2}'.")
+            }
+            // The #314 mustBeOverridden tiers (diagnostic.g.dart:11045-11092):
+            // the third slot carries the remaining-member count.
+            Self::MissingOverrideOfMustBeOverriddenTwo => {
+                format!("Missing a required override of '{a0}' and '{a1}'.")
+            }
+            Self::MissingOverrideOfMustBeOverriddenThreePlus => {
+                format!("Missing a required override of '{a0}', '{a1}', and {a2} more.")
             }
             Self::InconsistentInheritanceGetterAndMethod => format!(
                 "'{a0}' is inherited as a getter (from '{a1}') and also a method (from '{a2}')."
@@ -1318,6 +1431,23 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => Some(
                 "Try replacing the null-assert pattern with its nested pattern.".to_string(),
             ),
+            // The #314 residue family's corrections (diagnostic.g.dart
+            // :11045-11092/:13806-13855); `mustCallSuper` and the
+            // concrete-implementation pair carry none.
+            Self::MissingOverrideOfMustBeOverriddenOne => {
+                Some("Try overriding the missing member.".to_string())
+            }
+            Self::MissingOverrideOfMustBeOverriddenTwo
+            | Self::MissingOverrideOfMustBeOverriddenThreePlus => {
+                Some("Try overriding the missing members.".to_string())
+            }
+            Self::OverrideOnNonOverridingField
+            | Self::OverrideOnNonOverridingGetter
+            | Self::OverrideOnNonOverridingMethod
+            | Self::OverrideOnNonOverridingSetter => Some(
+                "Try updating this class to match the superclass, or removing the override annotation."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -1353,6 +1483,17 @@ impl SemanticCode {
             }
             Self::InvalidOverrideSetter => format!(
                 "The setter '{a1}.{a0}' ('{a2}') isn't a valid override of '{a3}.{a0}' ('{a4}')."
+            ),
+            // The concrete-implementation face (diagnostic.g.dart:9067/:9107):
+            // the same slots as invalid_override, the "concrete
+            // implementation" verdict text.
+            Self::InvalidImplementationOverride => {
+                format!(
+                    "'{a1}.{a0}' ('{a2}') isn't a valid concrete implementation of '{a3}.{a0}' ('{a4}')."
+                )
+            }
+            Self::InvalidImplementationOverrideSetter => format!(
+                "The setter '{a1}.{a0}' ('{a2}') isn't a valid concrete implementation of '{a3}.{a0}' ('{a4}')."
             ),
             Self::InheritsAbstractMemberFivePlus => {
                 format!(
@@ -1433,6 +1574,16 @@ mod tests {
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
+            SemanticCode::InvalidImplementationOverride,
+            SemanticCode::InvalidImplementationOverrideSetter,
+            SemanticCode::MustCallSuper,
+            SemanticCode::MissingOverrideOfMustBeOverriddenOne,
+            SemanticCode::MissingOverrideOfMustBeOverriddenTwo,
+            SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus,
+            SemanticCode::OverrideOnNonOverridingField,
+            SemanticCode::OverrideOnNonOverridingGetter,
+            SemanticCode::OverrideOnNonOverridingMethod,
+            SemanticCode::OverrideOnNonOverridingSetter,
             SemanticCode::DeadCode,
             SemanticCode::AmbiguousExtensionMemberTwo,
             SemanticCode::AmbiguousExtensionMemberThreeOrMore,
@@ -1602,6 +1753,16 @@ mod tests {
         SemanticCode::RecursiveCompileTimeConstant,
         SemanticCode::InvalidOverride,
         SemanticCode::InvalidOverrideSetter,
+        SemanticCode::InvalidImplementationOverride,
+        SemanticCode::InvalidImplementationOverrideSetter,
+        SemanticCode::MustCallSuper,
+        SemanticCode::MissingOverrideOfMustBeOverriddenOne,
+        SemanticCode::MissingOverrideOfMustBeOverriddenTwo,
+        SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus,
+        SemanticCode::OverrideOnNonOverridingField,
+        SemanticCode::OverrideOnNonOverridingGetter,
+        SemanticCode::OverrideOnNonOverridingMethod,
+        SemanticCode::OverrideOnNonOverridingSetter,
         SemanticCode::DeadCode,
         SemanticCode::AmbiguousExtensionMemberTwo,
         SemanticCode::AmbiguousExtensionMemberThreeOrMore,
@@ -1788,6 +1949,62 @@ mod tests {
                 "void Function(int)"
             ),
             "The setter 'B.foo' ('void Function(int?)') isn't a valid override of 'A.foo' ('void Function(int)')."
+        );
+        // The #314 residue templates: the concrete-implementation pair, the
+        // must-call-super row, the mustBeOverridden tiers, and the four
+        // non-overriding member faces (diagnostic.g.dart:9067/:9107/:12061/
+        // :11045-11092/:13806-13855).
+        assert_eq!(
+            SemanticCode::InvalidImplementationOverride.message5(
+                "foo",
+                "B",
+                "void Function(int)",
+                "A",
+                "void Function(num)"
+            ),
+            "'B.foo' ('void Function(int)') isn't a valid concrete implementation of 'A.foo' ('void Function(num)')."
+        );
+        assert_eq!(
+            SemanticCode::InvalidImplementationOverrideSetter.message5(
+                "foo",
+                "B",
+                "void Function(int?)",
+                "A",
+                "void Function(num)"
+            ),
+            "The setter 'B.foo' ('void Function(int?)') isn't a valid concrete implementation of 'A.foo' ('void Function(num)')."
+        );
+        assert_eq!(
+            SemanticCode::MustCallSuper.message("A", ""),
+            "This method overrides a method annotated as '@mustCallSuper' in 'A', but doesn't invoke the overridden method."
+        );
+        assert_eq!(
+            SemanticCode::MissingOverrideOfMustBeOverriddenOne.message("m", ""),
+            "Missing a required override of 'm'."
+        );
+        assert_eq!(
+            SemanticCode::MissingOverrideOfMustBeOverriddenTwo.message3("m", "n", ""),
+            "Missing a required override of 'm' and 'n'."
+        );
+        assert_eq!(
+            SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus.message3("m", "n", "2"),
+            "Missing a required override of 'm', 'n', and 2 more."
+        );
+        assert_eq!(
+            SemanticCode::OverrideOnNonOverridingField.message("", ""),
+            "The field doesn't override an inherited getter or setter."
+        );
+        assert_eq!(
+            SemanticCode::OverrideOnNonOverridingGetter.message("", ""),
+            "The getter doesn't override an inherited getter."
+        );
+        assert_eq!(
+            SemanticCode::OverrideOnNonOverridingMethod.message("", ""),
+            "The method doesn't override an inherited method."
+        );
+        assert_eq!(
+            SemanticCode::OverrideOnNonOverridingSetter.message("", ""),
+            "The setter doesn't override an inherited setter."
         );
     }
 
