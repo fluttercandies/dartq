@@ -5,8 +5,8 @@
 //! UTF-16 offset (line/column are monotone in it), so no line-column
 //! computation is spent on sorting.
 
+use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -85,8 +85,8 @@ pub struct AnalyzeRun<'a> {
 }
 
 /// Runs the analyze face over an assembled engine. `roots` are the
-/// workspace's package roots (the lint stage resolves per-root enable sets
-/// against them).
+/// workspace's package roots (the lint stage resolves per-subtree enable
+/// sets beneath them).
 ///
 /// # Errors
 ///
@@ -106,7 +106,7 @@ pub fn run<'a>(engine: &'a mut Engine, roots: &[PathBuf]) -> Result<AnalyzeRun<'
 /// path, so overlay content must enqueue after it), then each `(path,
 /// bytes)` replaces the analyzed bytes via [`Engine::set_content`] — the
 /// workspace on disk is never touched — then one analyze pass, the lint
-/// stage over the resident files (per-root enable sets via the passed
+/// stage over the resident files (per-subtree enable sets via the passed
 /// package roots), and the same yield as [`run`]: the oracle display order
 /// plus the run facts the metrics faces report. An empty `overlays` is the
 /// plain run. The callers address discovered files by their canonical
@@ -171,7 +171,7 @@ pub fn run_overlaid<'a>(
 /// attributed to the options file itself. Distinct loaded files yield once
 /// (two roots sharing one options file are one parse, officially too).
 fn undefined_lint_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut rows = Vec::new();
     for root in roots {
         let Some(options) = engine.options_for_root(root) else {

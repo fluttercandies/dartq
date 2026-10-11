@@ -6,8 +6,9 @@
 //!
 //! # Selection
 //!
-//! [`enable_set`] resolves one run's enable set from a root's merged
-//! options ([`AnalysisOptions::lint_rules`], the include-chain merge):
+//! [`enable_set`] resolves one enable set from one governing entry's
+//! merged options ([`AnalysisOptions::lint_rules`], the include-chain
+//! merge):
 //!
 //! * No options file in the root's ancestry (`None`) — the default
 //!   posture is the whole `package:lints` slice dartq-lints implements
@@ -48,12 +49,13 @@
 //! `session::run_group`, both before their display sorts. The check face
 //! stays lint-free by design (scan+parse only).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
 use dartq_engine::Engine;
+use dartq_engine::analysis_options::AnalysisOptions;
 use dartq_lints::{EnableSet, Features, Group, Lint, RULES, RuleId, Unit, parse_unit, run};
 use dartq_source::FileId;
 
@@ -73,10 +75,10 @@ fn default_set() -> EnableSet {
     set
 }
 
-/// The enable set one lint run executes under: `None` (no options file in
-/// the root's ancestry) selects the default `package:lints` posture, a
-/// present options file's effective rule list replaces it. See the module
-/// docs for the selection semantics.
+/// The enable set one governing entry selects: `None` (no options file in
+/// the governed file's ancestry) selects the default `package:lints`
+/// posture, a present options file's effective rule list replaces it. See
+/// the module docs for the selection semantics.
 #[must_use]
 pub fn enable_set(rules: Option<&[String]>) -> EnableSet {
     static DEFAULT: LazyLock<EnableSet> = LazyLock::new(default_set);
@@ -134,12 +136,14 @@ pub fn diagnose(file: FileId, unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Diagn
 /// file's rows, one transient parse per file (the bridge's
 /// zero-persistent-memory ruling — nothing enters engine residency).
 ///
-/// Per-file enable set: the longest `roots` entry containing the file's
-/// path wins (multi-package workspaces); the first root is the fallback,
-/// matching the engine's discovery attribution for root-level files. An
-/// empty resolved set skips the file without parsing (opt-in cost ruling).
-/// Files that are no longer resident or are not UTF-8 are skipped — the
-/// engine's own pass already reported nothing for them.
+/// Per-subtree enable sets: each file runs under the options entry its own
+/// ancestry governs ([`governing_options`]) — the same deepest-governing
+/// resolution the engine's severity and exclude faces apply, so a nested
+/// options file's `linter.rules` section refines its subtree here too.
+/// Sets are resolved once per distinct file directory. An empty resolved
+/// set skips the file without parsing (opt-in cost ruling). Files that are
+/// no longer resident or are not UTF-8 are skipped — the engine's own pass
+/// already reported nothing for them.
 #[must_use]
 pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     let mut files: Vec<FileId> = engine
@@ -150,10 +154,9 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     files.sort_unstable();
     files.dedup();
 
-    // Per-root enable sets, resolved once (the engine's options table
-    // carries a default entry for roots without a file, so the no-options
-    // posture is decided by `find_for_dir`, not by `options_for_root`).
-    let mut enabled: HashMap<PathBuf, EnableSet> = HashMap::new();
+    // One enable set per distinct file directory (governance is by
+    // ancestry, so one directory always maps to one entry).
+    let mut enabled: FxHashMap<PathBuf, EnableSet> = FxHashMap::default();
 
     let mut out = Vec::new();
     for file in files {
@@ -166,22 +169,15 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
         let Ok(text) = std::str::from_utf8(bytes) else {
             continue;
         };
-        let root = containing_root(path, roots);
-        let set = match enabled.get(root) {
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let set = match enabled.get(dir) {
             Some(set) => *set,
             None => {
-                let set = match dartq_engine::analysis_options::AnalysisOptions::find_for_dir(root)
-                {
-                    // No options file in the root's ancestry: the whole
-                    // `package:lints` slice (the mount's default posture).
-                    None => enable_set(None),
-                    Some(_) => enable_set(
-                        engine
-                            .options_for_root(root)
-                            .map(|options| options.lint_rules.as_slice()),
-                    ),
-                };
-                enabled.insert(root.to_path_buf(), set);
+                let set = enable_set(
+                    governing_options(engine, dir, roots)
+                        .map(|options| options.lint_rules.as_slice()),
+                );
+                enabled.insert(dir.to_path_buf(), set);
                 set
             }
         };
@@ -194,12 +190,33 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     out
 }
 
-/// The longest `roots` entry that is a byte-prefix directory of `path`, or
+/// The options entry governing a file in `dir`: the nearest
+/// `analysis_options.yaml` at or above `dir`
+/// ([`AnalysisOptions::find_for_dir`]) names the governing directory, and
+/// the engine's options table is keyed by exactly those directories — the
+/// package roots plus every nested options directory the workspace
+/// assembly registered ([`AnalysisOptions::for_roots`]). An options file
+/// above the package root (the repository-wide shape) carries no key of
+/// its own; its entry is the containing root's, which loaded it. `None` —
+/// no options file in the ancestry — is the default `package:lints`
+/// posture.
+fn governing_options<'a>(
+    engine: &'a Engine,
+    dir: &Path,
+    roots: &[PathBuf],
+) -> Option<&'a AnalysisOptions> {
+    let options_file = AnalysisOptions::find_for_dir(dir)?;
+    engine
+        .options_for_root(options_file.parent()?)
+        .or_else(|| engine.options_for_root(containing_root(dir, roots)))
+}
+
+/// The longest `roots` entry that is a byte-prefix directory of `dir`, or
 /// the first root (single-root workspaces are the dominant shape).
-fn containing_root<'a>(path: &Path, roots: &'a [PathBuf]) -> &'a Path {
+fn containing_root<'a>(dir: &Path, roots: &'a [PathBuf]) -> &'a Path {
     let mut best: Option<&Path> = None;
     for root in roots {
-        if path.starts_with(root)
+        if dir.starts_with(root)
             && best.is_none_or(|longest| root.components().count() > longest.components().count())
         {
             best = Some(root);
@@ -217,7 +234,7 @@ fn containing_root<'a>(path: &Path, roots: &'a [PathBuf]) -> &'a Path {
 mod tests {
     use std::path::Path;
 
-    use dartq_diagnostics::{DiagnosticType, Severity};
+    use dartq_diagnostics::{DiagnosticType, FileLayoutProvider as _, Severity};
     use dartq_engine::Engine;
     use dartq_engine::analysis_options::AnalysisOptions;
     use dartq_lints::rule_by_name;
@@ -363,6 +380,66 @@ mod tests {
         assert!(
             rows.contains(&("undefined_identifier".to_owned(), Severity::Error, 31)),
             "the semantic row still flows: {rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nested options refine the enable set per subtree (#595): the root's
+    /// `linter.rules` run outside the nested directory, the nested file's
+    /// replace them inside it — the deepest-governing resolution the
+    /// engine's severity and exclude faces already apply, now at the lint
+    /// face too.
+    #[test]
+    fn nested_options_refine_the_subtree_enable_sets() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_nested",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_new\n",
+                ),
+                (
+                    "lib/sub/analysis_options.yaml",
+                    "linter:\n  rules:\n    - avoid_empty_else\n",
+                ),
+                ("lib/root_side.dart", "var x = new Object();\n"),
+                (
+                    "lib/sub/nested_side.dart",
+                    "var y = new Object();\nvoid f(bool c) {\n  if (c) ; else ;\n}\n",
+                ),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(String, String)> = run
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    run.layout.file_path(d.file).to_string_lossy().into_owned(),
+                    d.code.name.to_owned(),
+                )
+            })
+            .collect();
+        let fires = |file: &str, code: &str| {
+            rows.iter()
+                .any(|(path, name)| path.ends_with(file) && name == code)
+        };
+        // Outside the subtree the root's set runs: `unnecessary_new` reports.
+        assert!(fires("lib/root_side.dart", "unnecessary_new"), "{rows:?}");
+        // Inside it the nested set replaces the root's: its own rule
+        // reports and the root's does not, despite the same `new` shape.
+        assert!(
+            fires("lib/sub/nested_side.dart", "avoid_empty_else"),
+            "{rows:?}"
+        );
+        assert!(
+            !fires("lib/sub/nested_side.dart", "unnecessary_new"),
+            "{rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
