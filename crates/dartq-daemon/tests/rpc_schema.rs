@@ -10,10 +10,11 @@
 //! Face → domain map (dartq-schema `Domain`): `dartq/query` → `Query`,
 //! `dartq/impact` → `Impact` (tier-invariant), `dartq/compat` → `Compat`,
 //! `dartq/explain` → `Explain`, `dartq/fix` → `FixPatch` per per-file patch
-//! document (the daemon envelope is the JSONL batch convention).
-//! `dartq/check`, `dartq/analyze`, `dartq/index`, and `dartq/assists` carry
-//! the `schema_version` stamp with no published domain yet — the stamp-only
-//! pin below documents that gap (#632).
+//! document (the daemon envelope is the JSONL batch convention),
+//! `dartq/check` → `Check`, `dartq/analyze` → `Analyze`,
+//! `dartq/index` → `Index` (tier-invariant), and `dartq/assists` →
+//! `Assists`. Every stamped face carries a published domain — the #632
+//! gap (a stamp with no validating contract) is closed and pinned below.
 
 mod common;
 
@@ -458,54 +459,112 @@ fn dartq_fix_documents_validate_with_their_provenance() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// The four faces without a published domain — `dartq/check`'s machine-row
-/// JSON, `dartq/analyze`'s LSP entries, `dartq/index`'s tallies,
-/// `dartq/assists`'s plugin document — carry the `schema_version` stamp with
-/// nothing to validate it against: the stamp asserts a contract dartq-schema
-/// never froze (the #623 discovered gap; follow-up ticket = publish their
-/// domains). Pinned here at the single-stamp rule; no `validate` wiring is
-/// possible without inventing a contract to mask the gap.
+/// Every stamped face carries a published domain (#632 closed): the four
+/// session faces the original gap named validate live over the broken
+/// fixture — `dartq/check` → `Check` and `dartq/analyze` → `Analyze` at
+/// every tier (the tier-exact check enforces the minimal red line on the
+/// wire, and the broken fixture keeps the row shapes honest),
+/// `dartq/assists` → `Assists` at every tier (the fixture carries no
+/// plugin manifests, so the document validates at its envelope — the row
+/// scene is the plugin dispatch's), and `dartq/index` → `Index`,
+/// tier-invariant. Each answer carries exactly one stamp — its producer's
+/// own; the daemon assembly adds none.
 #[test]
-fn domain_less_faces_carry_exactly_one_stamp() {
+fn every_stamped_face_validates_against_its_published_domain() {
     let workspace = Workspace::new(BROKEN_MAIN);
-    let mut h = spawn(&workspace, &store_root("schema-domain-less"));
+    let mut h = spawn(&workspace, &store_root("schema-stamped-faces"));
     handshake(&mut h, 1);
 
-    h.step(
-        &request(
-            2,
-            "dartq/check",
-            json!({ "paths": [workspace.path("lib")] }),
-        ),
+    for (id, tier) in [
+        (2, Verbosity::Minimal),
+        (3, Verbosity::Compact),
+        (4, Verbosity::Full),
+    ] {
+        h.step(
+            &request(
+                id,
+                "dartq/check",
+                json!({ "paths": [workspace.path("lib")], "verbosity": tier.to_string() }),
+            ),
+            1,
+        );
+        let result = answer_result(&h, id);
+        assert!(
+            !result["diagnostics"]
+                .as_array()
+                .expect("check rows")
+                .is_empty(),
+            "the broken fixture keeps the row shape honest: {result}"
+        );
+        let payload = assert_valid_at_tier(&result, Domain::Check, tier);
+        assert_eq!(
+            payload.matches("\"schema_version\"").count(),
+            1,
+            "check: {payload}"
+        );
+    }
+
+    for (id, tier) in [
+        (5, Verbosity::Minimal),
+        (6, Verbosity::Compact),
+        (7, Verbosity::Full),
+    ] {
+        h.step(
+            &request(
+                id,
+                "dartq/analyze",
+                json!({ "verbosity": tier.to_string() }),
+            ),
+            1,
+        );
+        let result = answer_result(&h, id);
+        assert!(
+            !result["diagnostics"]
+                .as_array()
+                .expect("analyze entries")
+                .is_empty(),
+            "the analyzed view keeps the entry shape honest: {result}"
+        );
+        let payload = assert_valid_at_tier(&result, Domain::Analyze, tier);
+        assert_eq!(
+            payload.matches("\"schema_version\"").count(),
+            1,
+            "analyze: {payload}"
+        );
+    }
+
+    h.step(&request(8, "dartq/index", json!({})), 1);
+    let result = answer_result(&h, 8);
+    let payload = assert_valid_at_tier(&result, Domain::Index, Verbosity::Compact);
+    assert_eq!(
+        payload.matches("\"schema_version\"").count(),
         1,
+        "index: {payload}"
     );
-    let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(stamp_count(&result), 1, "check: {result}");
 
-    h.step(&request(3, "dartq/analyze", json!({})), 1);
-    let result = answer_result(&h, 3);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(stamp_count(&result), 1, "analyze: {result}");
+    for (id, tier) in [
+        (9, Verbosity::Minimal),
+        (10, Verbosity::Compact),
+        (11, Verbosity::Full),
+    ] {
+        h.step(
+            &request(
+                id,
+                "dartq/assists",
+                json!({ "path": workspace.path("lib/main.dart"), "verbosity": tier.to_string() }),
+            ),
+            1,
+        );
+        let result = answer_result(&h, id);
+        let payload = assert_valid_at_tier(&result, Domain::Assists, tier);
+        assert_eq!(
+            payload.matches("\"schema_version\"").count(),
+            1,
+            "assists: {payload}"
+        );
+    }
 
-    h.step(&request(4, "dartq/index", json!({})), 1);
-    let result = answer_result(&h, 4);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(stamp_count(&result), 1, "index: {result}");
-
-    h.step(
-        &request(
-            5,
-            "dartq/assists",
-            json!({ "path": workspace.path("lib/main.dart") }),
-        ),
-        1,
-    );
-    let result = answer_result(&h, 5);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(stamp_count(&result), 1, "assists: {result}");
-
-    h.step(&request(9, "shutdown", json!(null)), 1);
+    h.step(&request(12, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();

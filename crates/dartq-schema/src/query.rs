@@ -86,7 +86,8 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "length": { "type": "integer", "minimum": 0 },
                     // Additive optional on frozen v1 (#361): the use-site
                     // file of the row, present when the producer knows it.
-                    // Absent-tolerant — v1 producers never emit it.
+                    // The query producers emit it (wired with the freeze);
+                    // absent-tolerant for other producers.
                     "file": { "type": "string" },
                 },
             }},
