@@ -177,6 +177,14 @@ enum Command {
     Version,
 }
 
+/// Scan + parse only (the M0 differential face, engine-api-spec §4.1).
+///
+/// Analysis-options boundary: this face consumes no analysis_options.yaml —
+/// no `exclude:` on the walk, no `errors:` remaps, no lint rules. Options
+/// are the engine/analyze face's concern (`dartq-engine`'s
+/// `AnalysisOptions`, whose loader needs the package universe this face
+/// deliberately lacks); differential corpora driving this face must be
+/// options-free.
 #[derive(Args)]
 struct CheckArgs {
     #[arg(long, value_enum, default_value_t = CheckFormat::Machine)]
@@ -502,6 +510,28 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     }
 }
 
+/// One engine analyze pass under the crash tier (engine-api-spec §4.2, the
+/// `check` face's shape): a panic anywhere in the pipeline exits 4 with
+/// stdout untouched — the harness's auto-bisect keys the Panic signature on
+/// exit 4 + empty stdout, and a partial diagnostic set must never masquerade
+/// as a valid {0,1,2,3} result. A run `Err` stays the internal tier with the
+/// error on stderr; both reports are stderr-only.
+fn under_crash_tier<T>(
+    pass: impl FnOnce() -> Result<T, dartq_commands::analyze::AnalyzeError>,
+) -> Result<T, u8> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+        Ok(Ok(run)) => Ok(run),
+        Ok(Err(error)) => {
+            eprintln!("dartq: internal error: {error}");
+            Err(exit::INTERNAL_ERROR)
+        }
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            Err(exit::INTERNAL_ERROR)
+        }
+    }
+}
+
 /// The plain path: the shared run, byte-pinned.
 fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
@@ -512,12 +542,11 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    let run = match dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&dir)) {
+    let run = match under_crash_tier(|| {
+        dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&dir))
+    }) {
         Ok(run) => run,
-        Err(error) => {
-            eprintln!("dartq: internal error: {error}");
-            return exit::INTERNAL_ERROR;
-        }
+        Err(code) => return code,
     };
     analyze_finish(args, &run, started, out)
 }
@@ -544,14 +573,11 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    let run =
-        match dartq_commands::analyze::run_overlaid(&mut engine, &overlays, std::slice::from_ref(&dir))
-        {
+    let run = match under_crash_tier(|| {
+        dartq_commands::analyze::run_overlaid(&mut engine, &overlays, std::slice::from_ref(&dir))
+    }) {
         Ok(run) => run,
-        Err(error) => {
-            eprintln!("dartq: internal error: {error}");
-            return exit::INTERNAL_ERROR;
-        }
+        Err(code) => return code,
     };
     analyze_finish(args, &run, started, out)
 }
@@ -708,7 +734,10 @@ fn write_human(
         }
     }
     match diags.len() {
-        0 => writeln!(out, "No issues found."),
+        // The oracle's clean-set tail carries the exclamation mark
+        // (`dart analyze`, 3.13.1: `No issues found!`); the counted tails
+        // keep the period (`N issues found.`).
+        0 => writeln!(out, "No issues found!"),
         1 => writeln!(out, "1 issue found."),
         n => writeln!(out, "{n} issues found."),
     }
@@ -1460,11 +1489,12 @@ mod tests {
     /// oracle machine bytes on stdout, error-tier exit code, metrics JSON at
     /// exit.
     ///
-    /// Hand trace against `tests/harness/src/machine.rs` (`parse_machine` +
-    /// GOLDEN): 8 `|`-separated fields; `void f() { x }` puts `x` at UTF-16
-    /// offset 11 → line 1, column 12, length 1 — the same geometry the
-    /// `machine_line_parity_with_harness` check test pins, and none of the
-    /// four field escapes (`\n`, `\r`, `\\`, `\|`) fire on this text.
+    /// Hand trace against the serial oracle probe (dart 3.13.1, machine) and
+    /// `tests/harness/src/machine.rs` (`parse_machine`): 8 `|`-separated
+    /// fields; `void f() { x }` puts `x` at UTF-16 offset 11 → line 1,
+    /// column 12, length 1 on BOTH rows — the syntax row ("Expected to find
+    /// ';'.") and the semantic row ("Undefined name 'x'.") share the token's
+    /// span and order by the message tie-break.
     #[test]
     fn analyze_runs_engine_over_temp_workspace() {
         let root = analyze_fixture(
@@ -1485,10 +1515,12 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("stdout is UTF-8"),
             format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n",
+                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
+                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'x'.\n",
+                broken.display(),
                 broken.display()
             ),
-            "oracle machine bytes (emitMachineFormat field order)"
+            "oracle machine bytes (emitMachineFormat field order; serial oracle probe)"
         );
         assert_eq!(code, exit::ERRORS, "any ERROR → 3 (analyze.dart:398)");
 
@@ -1496,7 +1528,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(metrics_path).expect("metrics at exit"))
                 .expect("one JSON object");
         assert_eq!(metrics["files"], 2, "both lib files discovered");
-        assert_eq!(metrics["diagnostics"], 1);
+        assert_eq!(metrics["diagnostics"], 2);
         assert_eq!(metrics["libraries_analyzed"], 2, "cold run recompute");
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64(), "getrusage hook wired");
@@ -1506,7 +1538,11 @@ mod tests {
     }
 
     /// Clean set → exit 0 with empty machine output (the oracle empty edge);
-    /// human format groups by file with the issue-count tail.
+    /// the human clean edge carries no per-file heading (nothing to group)
+    /// and ends in the oracle tail — over the broken fixture both oracle
+    /// rows appear under the one file heading (oracle display order,
+    /// message tie-break within the shared token span) and the tail counts
+    /// both.
     #[test]
     fn analyze_clean_and_human_faces() {
         let root = analyze_fixture("faces", &[("lib/clean.dart", "var ok = 1;\n")]);
@@ -1522,11 +1558,44 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Human, None), &mut out);
         assert_eq!(code, exit::CLEAN);
+        // The whole oracle clean shape in one pin: no `lib/clean.dart`
+        // heading (the oracle prints none on a clean set), no
+        // `Analyzing ...` preamble from this face, and the exact tail
+        // spelling (`dart analyze`, 3.13.1).
         let text = String::from_utf8(out).expect("UTF-8");
-        assert!(text.contains("lib/clean.dart"), "grouped by file: {text}");
-        assert!(text.contains("No issues found."), "empty-set tail: {text}");
+        assert_eq!(text, "No issues found!\n", "oracle clean human output");
 
         fs::remove_dir_all(&root).ok();
+
+        // The broken twin: both oracle rows under the file heading.
+        let broken_root =
+            analyze_fixture("faces-broken", &[("lib/broken.dart", "void f() { x }\n")]);
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(
+            &analyze_args(&broken_root, AnalyzeFormat::Human, None),
+            &mut out,
+        );
+        assert_eq!(code, exit::ERRORS);
+        let text = String::from_utf8(out).expect("UTF-8");
+        let heading = broken_root
+            .canonicalize()
+            .expect("root")
+            .join("lib/broken.dart");
+        assert!(
+            text.contains(heading.to_string_lossy().as_ref()),
+            "file heading: {text}"
+        );
+        assert!(
+            text.contains("• expected_token • Expected to find ';'.")
+                && text.contains("• undefined_identifier • Undefined name 'x'."),
+            "both oracle rows under the heading, in display order: {text}"
+        );
+        assert!(
+            text.contains("2 issues found."),
+            "the tail counts both rows: {text}"
+        );
+
+        fs::remove_dir_all(&broken_root).ok();
     }
 
     /// Usage tier: missing dir, missing package config, and unusable SDK all
@@ -1552,6 +1621,32 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&no_config).ok();
+    }
+
+    /// The analyze face's crash tier: a panic anywhere in the engine pass
+    /// maps to exit 4 — the exit half of the harness's Panic signature
+    /// (exit 4 + empty stdout; stdout stays empty structurally because the
+    /// writers run only after the pass succeeds, the `check` face's
+    /// `catch_unwind` shape) — a run `Err` stays the internal tier, and a
+    /// clean pass passes through with no exit override.
+    #[test]
+    fn analyze_crash_tier_maps_panic_to_internal_exit() {
+        use dartq_commands::analyze::AnalyzeError;
+
+        let panicked = under_crash_tier(|| -> Result<(), AnalyzeError> { panic!("injected") });
+        assert!(
+            matches!(panicked, Err(exit::INTERNAL_ERROR)),
+            "panic → exit 4, not the runtime's 101"
+        );
+
+        let failed = under_crash_tier(|| Err::<(), _>(AnalyzeError::Cancelled));
+        assert!(matches!(failed, Err(exit::INTERNAL_ERROR)), "run Err → 4");
+
+        assert_eq!(
+            under_crash_tier(|| Ok::<_, AnalyzeError>(7_u8)),
+            Ok(7_u8),
+            "a clean pass passes through"
+        );
     }
 
     /// The `--overlay` face (PRD §16.3): the analyzed file's content is
@@ -1590,8 +1685,11 @@ mod tests {
 
         // Broken overlay: the errors surface against the analyzed path in
         // the oracle machine geometry (engine-canonical → oracle display
-        // order; `y` at UTF-16 offset 11 → line 1, column 12, length 1 —
-        // the semantic row precedes the syntax row at offset 13).
+        // order; serial oracle probe on `void g() { y }`: `y` at UTF-16
+        // offset 11 → line 1, column 12, length 1 on BOTH rows — the syntax
+        // row ("Expected to find ';'.") and the semantic row ("Undefined
+        // name 'y'.") share the token's span and order by the message
+        // tie-break).
         let mut out: Vec<u8> = Vec::new();
         let broken_overlay = AnalyzeArgs {
             overlays: vec![format!("{}={}", target.display(), broken.display())],
@@ -1601,8 +1699,8 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("stdout is UTF-8"),
             format!(
-                "ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'y'.\n\
-                 ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|14|1|Expected ';' after this.\n",
+                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
+                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'y'.\n",
                 target.canonicalize().expect("root").display(),
                 target.canonicalize().expect("root").display()
             ),

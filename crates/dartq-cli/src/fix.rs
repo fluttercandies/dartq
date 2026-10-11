@@ -87,11 +87,7 @@ fn edits_of(set: &FileFixSet) -> Vec<fix::Edit> {
     set.fixes
         .iter()
         .map(|f| f.edit.clone())
-        .chain(
-            set.plugin
-                .iter()
-                .flat_map(|p| p.edits.iter().cloned()),
-        )
+        .chain(set.plugin.iter().flat_map(|p| p.edits.iter().cloned()))
         .collect()
 }
 
@@ -229,7 +225,10 @@ fn launch_hosts() -> PluginHosts {
 /// The hosts' terminal failures surface on stderr — never silently.
 fn report_errors(hosts: &mut PluginHosts) {
     for error in hosts.take_errors() {
-        eprintln!("dartq: plugin `{}` unavailable: {}", error.plugin, error.message);
+        eprintln!(
+            "dartq: plugin `{}` unavailable: {}",
+            error.plugin, error.message
+        );
     }
 }
 
@@ -606,7 +605,10 @@ mod tests {
         let mut out = Vec::new();
         let args = parse(&["assists", path.to_str().expect("utf-8")]);
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
-        assert_eq!(String::from_utf8(out).expect("utf-8"), "No assists found.\n");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "No assists found.\n"
+        );
 
         let mut out = Vec::new();
         let args = parse(&["assists", "/nonexistent/dq_assists_target"]);
