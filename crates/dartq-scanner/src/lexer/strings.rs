@@ -3,14 +3,14 @@
 //! official `tokenizeString` / `tokenizeSingleLineString` /
 //! `tokenizeMultiLineString` / `tokenizeStringInterpolation`).
 //!
-//! Interpolation nesting is **iterative**: `${` pushes the current body onto a
-//! frame stack and the driver scans the expression in code mode; `}`
-//! (`Flow::CloseInterp`) pops back into the body. The official scanner is flat
-//! the same way (`tokenizeInterpolatedExpression` rides its grouping stack and
-//! reenters `bigSwitch`); the recursive alternative (body → interpolation →
-//! `code_step` → body) would grow the native call stack with the nesting
-//! level, so deeply nested input could overflow it — here the frames live on
-//! the heap and the driver is a flat loop.
+//! Interpolation nesting is **iterative** and the driver state lives on the
+//! [`Lexer`]: `${` pushes the current body frame onto `suspended` and the
+//! driver scans the expression in code mode; `}` (`Flow::CloseInterp`) pops
+//! back into the body. The official scanner is flat the same way
+//! (`tokenizeInterpolatedExpression` rides its grouping stack and reenters
+//! `bigSwitch`); keeping the frames in the lexer struct (not on the native
+//! stack) is what lets a recovery option run resume from a mid-string
+//! snapshot, and it also keeps interpolation nesting off the call stack.
 //!
 //! Escape sequences are validated against the official unescape rules
 //! (`.third/dart-sdk` `pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
@@ -41,9 +41,11 @@ use dartq_diagnostics::{
 };
 
 /// One string body suspended by an open `${`: everything needed to resume body
-/// scanning once the interpolation's `}` arrives.
+/// scanning once the interpolation's `}` arrives. Lives on the lexer (the
+/// current frame in [`Lexer::string_frame`], the suspended ones in
+/// [`Lexer::suspended`]) so the driver is resumable from a snapshot.
 #[derive(Clone, Copy)]
-struct StringFrame {
+pub(super) struct StringFrame {
     quote: char,
     raw: bool,
     triple: bool,
@@ -70,67 +72,61 @@ enum StringBody {
 }
 
 impl Lexer<'_> {
-    /// Scans one string literal to completion, including every interpolation
-    /// nested inside it. `quote_start` is the string start (including `r` for
-    /// raw); returns `Flow::Eof` when the scan ended at EOF with interpolation
-    /// frames still open (after their recovery), so `run` closes the groups.
-    pub(crate) fn scan_string(&mut self, quote_start: usize, raw: bool) -> Flow {
-        let Some(mut frame) = self.open_string(quote_start, raw) else {
-            return Flow::Next; // empty string `''`
-        };
-        // Bodies suspended by an open `${`. The stack mirrors the open SII
-        // begin groups 1:1, LIFO: a push coincides with every `begin_group(SII)`
-        // in `scan_dollar`, a pop with the `}` that closes one — so
-        // `Flow::CloseInterp` always resumes the body that opened the group.
-        // Empty until the first `${`: a plain string never allocates.
-        let mut suspended: Vec<StringFrame> = Vec::new();
-        // Each outer iteration scans one string body (content mode); each
-        // inner iteration scans interpolation expression code (code mode)
-        // until a body re-enters.
-        loop {
+    /// Drives string bodies and code mode to EOF (the flat equivalent of the
+    /// official `tokenize` loop, where every mode lives in one `bigSwitch`
+    /// cycle). The current body and the bodies suspended by open `${`s live
+    /// on the [`Lexer`] itself, so a recovery option run can resume scanning
+    /// from any mid-string snapshot.
+    pub(super) fn drive(&mut self) {
+        while self.drive_step() != Flow::Eof {}
+    }
+
+    /// One driver step: one string body (content mode) when one is current,
+    /// then one code-mode step.
+    pub(super) fn drive_step(&mut self) -> Flow {
+        if let Some(mut frame) = self.string_frame.take() {
             match self.scan_body(&mut frame) {
-                StringBody::Done => {
-                    // Fall back to the enclosing expression; with nothing
-                    // suspended the string is complete.
-                    if suspended.is_empty() {
-                        return Flow::Next;
-                    }
-                }
-                StringBody::Interpolation => suspended.push(frame),
-            }
-            loop {
-                match self.code_step() {
-                    Flow::Next => {}
-                    // A nested literal inside the expression (an empty string
-                    // `''` stays in code mode).
-                    Flow::BeginString { start, raw } => {
-                        if let Some(nested) = self.open_string(start, raw) {
-                            frame = nested;
-                            break;
-                        }
-                    }
-                    Flow::CloseInterp => {
-                        frame = suspended.pop().expect("SII close without a suspended body");
-                        frame.segment_start = self.pos;
-                        frame.escape_err = false;
-                        break;
-                    }
-                    Flow::Eof => {
-                        // Unwind innermost-first: every open level is a frame
-                        // on the stack (pushed at its `${`, not yet resumed),
-                        // and each emits its own unterminated recovery — the
-                        // order the recursive shape produced as its Eof
-                        // propagated out through one body per level. Then
-                        // report Eof so `run` closes the still-open SII
-                        // groups (synthetic `}` innermost first).
-                        while suspended.pop().is_some() {
-                            self.unterminated();
-                        }
-                        return Flow::Eof;
-                    }
-                }
+                // A completed body falls back to the enclosing expression's
+                // code mode; with nothing suspended the string is complete.
+                StringBody::Done => {}
+                StringBody::Interpolation => self.suspended.push(frame),
             }
         }
+        match self.code_step() {
+            Flow::Next => {}
+            // A nested literal inside the expression (an empty string `''`
+            // stays in code mode).
+            Flow::BeginString { start, raw } => {
+                if let Some(nested) = self.open_string(start, raw) {
+                    self.string_frame = Some(nested);
+                }
+            }
+            Flow::CloseInterp => self.resume_interpolation(),
+            Flow::Eof => {
+                // Unwind innermost-first: every open level is a frame on the
+                // stack (pushed at its `${`, not yet resumed), and each emits
+                // its own unterminated recovery. `run` then closes the
+                // still-open SII groups (synthetic `}` innermost first).
+                while self.suspended.pop().is_some() {
+                    self.unterminated();
+                }
+                return Flow::Eof;
+            }
+        }
+        Flow::Next
+    }
+
+    /// Pops the body suspended by the `${` whose `}` just closed and makes it
+    /// current (`Flow::CloseInterp` handling; the stack mirrors the open SII
+    /// begin groups 1:1, LIFO).
+    pub(super) fn resume_interpolation(&mut self) {
+        let mut frame = self
+            .suspended
+            .pop()
+            .expect("SII close without a suspended body");
+        frame.segment_start = self.pos;
+        frame.escape_err = false;
+        self.string_frame = Some(frame);
     }
 
     /// Consumes the opening quote(s); `quote_start` is the string start

@@ -13,6 +13,8 @@ mod numbers;
 mod operators;
 mod strings;
 
+use strings::StringFrame;
+
 use crate::diag::{ScanDiag, msg};
 use crate::keyword::{Keyword, keyword_from_str};
 use crate::token::{Token, TokenKind, TokenTable};
@@ -31,10 +33,10 @@ pub(crate) enum Flow {
     /// `}` closed a `${`: return to string body scanning (equivalent of the official `$STX` signal).
     CloseInterp,
     /// A string literal starts at `start` (`raw`: the `r` prefix is already
-    /// consumed). The caller enters string-body scanning instead of calling
-    /// `scan_string` right here — the recursive shape (body → interpolation →
-    /// `code_step` → body) grew the native call stack with the interpolation
-    /// nesting level and overflowed it on deeply nested input.
+    /// consumed). The driver opens the body frame instead of scanning it
+    /// inline — the whole scan is one flat loop (`Lexer::drive`), the same
+    /// shape as the official `tokenize` loop where every mode lives in one
+    /// `bigSwitch` cycle.
     BeginString { start: usize, raw: bool },
 }
 
@@ -45,6 +47,11 @@ pub(crate) enum Flow {
 /// EOF — the token stream shape never depends on the cap.
 const MAX_DIAGNOSTICS: usize = 10_000;
 
+/// The lexer state is snapshotted (a plain clone) at every deep-match closer
+/// so the official dual-option recovery can run both postures to EOF on
+/// cloned state; everything owned is cloned, `src`/`config`/`file` are
+/// shared/Copy. Error-path-only cost.
+#[derive(Clone)]
 pub(crate) struct Lexer<'s> {
     src: &'s str,
     config: ScanConfig,
@@ -73,6 +80,20 @@ pub(crate) struct Lexer<'s> {
     /// `{`/`${` the re-scan blames — see `curly_recovery`. Error-path-only
     /// bookkeeping; never set on a clean file.
     curly_recovery: Option<u32>,
+    /// Current string body frame (`None` in code mode) — the driver state
+    /// behind `Flow::BeginString`/`Flow::CloseInterp`, see `strings`.
+    string_frame: Option<StringFrame>,
+    /// Bodies suspended by open `${`s, LIFO (mirrors the open SII begin
+    /// groups 1:1). Empty until the first `${`: a plain string never allocates.
+    suspended: Vec<StringFrame>,
+    /// True inside a recovery option run (`inRecoveryOption`, official
+    /// `_recoveryOptionScanner`): nested deep matches skip the dual-option
+    /// comparison and insert unconditionally.
+    in_simulation: bool,
+    /// Official `recoveryCount` (:763 no-match/deep-match arm, :950 per
+    /// inserted synthetic closer): the yardstick the dual-option comparison
+    /// sums over each option run. Unobservable on the real pass.
+    recovery_count: u32,
 }
 
 impl<'s> Lexer<'s> {
@@ -93,6 +114,10 @@ impl<'s> Lexer<'s> {
             version_override: None,
             version_override_span: None,
             curly_recovery: None,
+            string_frame: None,
+            suspended: Vec::new(),
+            in_simulation: false,
+            recovery_count: 0,
         };
         lex.next = lex.peek_char(0);
         lex
@@ -122,21 +147,10 @@ impl<'s> Lexer<'s> {
     fn scan_once(&mut self) -> (ScanResult, Option<u32>) {
         let source_len = self.src.len();
         self.scan_header();
-        loop {
-            match self.code_step() {
-                Flow::Next => {}
-                // A top-level string literal: `scan_string` runs it to
-                // completion, including every interpolation nested inside it.
-                Flow::BeginString { start, raw } => {
-                    if self.scan_string(start, raw) == Flow::Eof {
-                        break;
-                    }
-                }
-                // CloseInterp is only consumed inside string interpolation scanning; it never reaches the top level.
-                // Eof ends the main loop.
-                Flow::Eof | Flow::CloseInterp => break,
-            }
-        }
+        // The flat driver runs every mode (string bodies, interpolation
+        // expressions, top-level code) to EOF — one loop, like the official
+        // `tokenize`.
+        self.drive();
         let curly_begin = self.close_unclosed_groups();
         self.emit(TokenKind::Eof, source_len, 0);
         let tokens = std::mem::take(&mut self.tokens);
@@ -837,6 +851,7 @@ impl<'s> Lexer<'s> {
             // A `}` still closes off the stack head at the closer (oracle `f(}`
             // → expected_token ')' @ the `}`, nothing at eof); begins below the
             // head stay queued for eof handling.
+            self.recovery_count += 1;
             if close == TokenKind::CloseCurly
                 && let Some(&begin_idx) = self.groups.last()
             {
@@ -846,14 +861,29 @@ impl<'s> Lexer<'s> {
             self.emit(close, start, self.pos - start);
             return Flow::Next;
         };
-        // Begins above the match: each is closed by a synthetic closer at the
-        // mismatching closer and reported there (official insertSyntheticClosers;
-        // oracle `var m = {[1};` → expected_token ']' @ the `}`).
-        while self.groups.len() > depth + 1 {
-            let begin_idx = self.groups.pop().unwrap();
-            self.report_unmatched_begin(begin_idx, start);
+        if depth + 1 == self.groups.len() {
+            return self.close_matched(close, start);
         }
-        let begin_idx = self.groups.pop().unwrap();
+        // Deep match: the matching begin sits below other unclosed begins.
+        // Official `discardBeginGroupUntil` (:763 fires on this arm too, then
+        // :787-826): both postures run to EOF on cloned state and the cheaper
+        // wins strictly; ties (and any nested deep match inside an option
+        // run) insert.
+        self.recovery_count += 1;
+        let insert = self.in_simulation || !self.drop_wins(close, start, depth);
+        if insert {
+            self.execute_insert(close, start, depth)
+        } else {
+            self.execute_drop(close, start)
+        }
+    }
+
+    /// Head match (the closest opener is the stack head): the real closer
+    /// pairs with it (official `appendEndGroupInternal` foundMatchingBrace =
+    /// true). Closing a `${` returns [`Flow::CloseInterp`] — the string body
+    /// resumes.
+    fn close_matched(&mut self, close: TokenKind, start: usize) -> Flow {
+        let begin_idx = self.groups.pop().expect("head match guarantees a begin");
         let idx = self.emit(close, start, self.pos - start);
         self.end_of[begin_idx as usize] = idx;
         if close == TokenKind::CloseCurly
@@ -862,6 +892,64 @@ impl<'s> Lexer<'s> {
             return Flow::CloseInterp;
         }
         Flow::Next
+    }
+
+    /// Insert posture: each begin above the match is closed by a synthetic
+    /// closer at the mismatching closer and reported there (official
+    /// `insertSyntheticClosers`; oracle `var m = {[1};` → expected_token ']'
+    /// @ the `}`), then the real closer closes the match.
+    fn execute_insert(&mut self, close: TokenKind, start: usize, depth: usize) -> Flow {
+        while self.groups.len() > depth + 1 {
+            let begin_idx = self.groups.pop().expect("depth bounds the stack walk");
+            self.report_unmatched_begin(begin_idx, start);
+        }
+        self.close_matched(close, start)
+    }
+
+    /// Drop posture: the closer is appended as an ordinary token and the
+    /// stack is left alone (official `appendEndGroupInternal`
+    /// foundMatchingBrace = false — "this end token is basically ignored").
+    fn execute_drop(&mut self, close: TokenKind, start: usize) -> Flow {
+        self.emit(close, start, self.pos - start);
+        Flow::Next
+    }
+
+    /// The dual-option comparison (official `discardBeginGroupUntil`
+    /// :787-826): both postures run the remaining input to EOF on cloned
+    /// state, then score `recoveryCount` + final grouping-stack size — option
+    /// 2 paying 1 extra for the ignored closer. Drop wins only STRICTLY
+    /// cheaper; ties keep insert (the official default). The option clones
+    /// drop the two-pass blamed-brace offset: official `_recoveryOptionScanner`
+    /// copies only the configuration and the grouping stack.
+    fn drop_wins(&mut self, close: TokenKind, start: usize, depth: usize) -> bool {
+        let base = self.clone();
+        let mut insert = base.clone();
+        insert.in_simulation = true;
+        insert.curly_recovery = None;
+        let insert_cost = insert.run_option(|opt| opt.execute_insert(close, start, depth));
+        let mut drop = base.clone();
+        drop.in_simulation = true;
+        drop.curly_recovery = None;
+        let drop_cost = drop.run_option(|opt| opt.execute_drop(close, start)) + 1;
+        *self = base;
+        drop_cost < insert_cost
+    }
+
+    /// Scores one option run: execute the posture, scan the tail to EOF under
+    /// the option cap (official `recoveryOptionTokenizer` :1063-1081 — 100
+    /// steps bound the comparison on pathological tails), then
+    /// `recoveryCount` + final stack size. The run's tokens and diagnostics
+    /// are discarded whole; only the counts matter.
+    fn run_option(mut self, posture: impl FnOnce(&mut Self) -> Flow) -> u32 {
+        if posture(&mut self) == Flow::CloseInterp {
+            self.resume_interpolation();
+        }
+        for _ in 0..100 {
+            if self.drive_step() == Flow::Eof {
+                break;
+            }
+        }
+        self.recovery_count + self.groups.len() as u32
     }
 
     /// Official `unmatchedBeginGroup`: the begin is closed by a synthetic
@@ -876,6 +964,7 @@ impl<'s> Lexer<'s> {
         let Some(close_kind) = begin_kind.matching_close() else {
             return;
         };
+        self.recovery_count += 1;
         self.emit_synthetic(close_kind, close_start, 0);
         let syn_idx = self.tokens.len() as u32 - 1;
         self.end_of[begin_idx as usize] = syn_idx;

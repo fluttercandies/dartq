@@ -787,11 +787,9 @@
     "augment": true
    },
    "language_version": null,
-   "diagnostics": [
-    "expected_token"
-   ],
+   "diagnostics": [],
    "line_starts": null,
-   "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartq maps that to the expected_token diagnostic encoded here"
+   "notes": "bad(): the mismatching ']' matches the '[' one begin down and the dual-option law drops it (#649): no scanner synthetic, no scanner diagnostic; the parser-level pair (missing_identifier + expected ')') arises at the ']' per upstream bracket_mismatch_00.dart.expect"
   },
   {
    "id": "077_await_outside_async",

@@ -43,8 +43,9 @@ pub use dartq_diagnostics::{
 };
 
 /// A diagnostic recorded during scanning (byte offsets; converted to UTF-16
-/// by the finish pass).
-#[derive(Debug)]
+/// by the finish pass). Cloned whole into recovery option runs (official
+/// `createRecoveryOptionScanner`), whose diagnostics are discarded.
+#[derive(Debug, Clone)]
 pub(crate) struct ScanDiag {
     pub code: CodeInfo,
     pub message: String,

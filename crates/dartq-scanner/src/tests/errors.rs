@@ -1,6 +1,6 @@
 //! Recovery strategies, diagnostic pinning, the @dart window, CRLF, BOM-as-content, dual-offset consistency.
 
-use super::{assert_codes, assert_kinds, codes, scan_src};
+use super::{assert_codes, assert_kinds, codes, scan_src, u32_of};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
 
@@ -324,6 +324,111 @@ fn paren_bracket_without_match_silent() {
     assert_eq!(r.tokens.matching_end(0), Some(4));
     let r = scan_src("main() { a]; }");
     assert!(r.diagnostics.is_empty());
+}
+
+#[test]
+fn deep_match_drop_official_example() {
+    // `[(])]` (official discardBeginGroupUntil comment, abstract_scanner.dart
+    // :775-776): at the `]` the `[` matches one begin down, so both postures
+    // run to EOF on cloned state. Insert = 1 synthetic `)` + no-match `)` +
+    // no-match `]` + empty EOF stack = 3 recoveries; drop = untouched stack,
+    // both later closers pair head-first, +1 for the ignored closer = 1.
+    // 1 < 3 strictly → drop: the closer stands alone, the begins pair with
+    // the LATER real closers, zero scanner diagnostics (upstream
+    // bracket_mismatch_00.dart.expect reports only the parser-level pair).
+    let r = scan_src("[(])]");
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
+    let t = &r.tokens;
+    // 0 [, 1 (, 2 ], 3 ), 4 ] — every closer a real token.
+    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert_eq!(t.matching_end(0), Some(4)); // `[` closed by the final `]`
+    assert_eq!(t.matching_end(1), Some(3)); // `(` closed by the first `)`
+}
+
+#[test]
+fn deep_match_drop_corpus_bracket_mismatch_00() {
+    // The `bracket_mismatch_00.dart` bad half: the `]` mismatches the `(` one
+    // begin down. Insert = synthetic `)` + no-match `)` + no-match `]` = 3
+    // recoveries; drop = all three closers pair with their real begins, +1 =
+    // 1 → drop (upstream .dart.expect: no scanner problem, the paren closes
+    // at the real `)`).
+    let src = "void bad() {\n  [\n    (\n    ])\n  ];\n}\n";
+    let r = scan_src(src);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
+    let t = &r.tokens;
+    // 0 void, 1 bad, 2 (, 3 ), 4 {, 5 [, 6 (, 7 ], 8 ), 9 ], 10 ;, 11 }.
+    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert_eq!(t.matching_end(4), Some(11)); // `{` — the final `}`
+    assert_eq!(t.matching_end(5), Some(9)); // `[` — the `]` of `];`
+    assert_eq!(t.matching_end(6), Some(8)); // `(` — the `)` right after the junk `]`
+    assert_eq!(t.get(7).unwrap().kind, K::CloseSquare);
+    assert_eq!(t.get(7).unwrap().byte_offset, 27); // the junk `]`, a plain token
+}
+
+#[test]
+fn deep_match_drop_corpus_bracket_mismatch_04() {
+    // `foo(() {bar());});` (the bracket_mismatch_04 body): the stray `)`)
+    // after `bar()` mismatches the `(` of `foo(` one begin down (the block
+    // `{` sits above it). Insert = synthetic `}` + no-match `)` + no-match
+    // `}` = 3 recoveries; drop = `}`/`)`/`}` all pair head-first, +1 = 1 →
+    // drop, zero scanner diagnostics (upstream bracket_mismatch_04.dart.expect
+    // reports only parser-level rows).
+    let r = scan_src("void foo() {\n  foo(() {bar());});\n}\n");
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
+    let t = &r.tokens;
+    // 0 void, 1 foo, 2 (, 3 ), 4 {, 5 foo, 6 (, 7 (, 8 ), 9 {, 10 bar,
+    // 11 (, 12 ), 13 ), 14 ;, 15 }, 16 ), 17 ;, 18 }.
+    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert_eq!(t.matching_end(4), Some(18)); // `void foo() {` body
+    assert_eq!(t.matching_end(6), Some(16)); // `foo(` — the `)` after the block `}`
+    assert_eq!(t.matching_end(9), Some(15)); // `{` — the block's own `}`
+}
+
+#[test]
+fn deep_match_insert_stays_when_not_strictly_cheaper() {
+    // Insert-stays shapes (option 2 not strictly cheaper → the default
+    // insert keeps the pre-port shape).
+    //
+    // `{[1};`: insert = 1 synthetic + 0 EOF stack = 1; drop = 0 + 2 unclosed
+    // + 1 = 3 → insert. The `[` is closed by a synthetic `]` at the `}` and
+    // reported there (existing `{[}` pin: errors::deeper_match…; `main() {
+    // f(} }` tie→insert pin: errors::unmatched_paren…).
+    let src = "{[1};";
+    let r = scan_src(src);
+    assert_codes(&r, &["expected_token"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 3); // the `}`
+    assert_eq!(d.range.length, 1);
+    assert!(d.message.contains("']'"), "{}", d.message);
+    let t = &r.tokens;
+    // 0 {, 1 [, 2 1, 3 synthetic ], 4 }.
+    assert_eq!(t.matching_end(0), Some(4));
+    assert_eq!(t.matching_end(1), Some(3));
+    assert!(t.get(3).unwrap().is_synthetic());
+
+    // EOF-truncated `void f() { [ (])`: insert = 1 synthetic + no-match `)`
+    // + 1 unclosed `{` at eof = 3; drop = 0 + 2 unclosed + 1 = 3 — a tie
+    // inserts (official default). The synthetic `)` lands at the `]`; the
+    // `[` is the insert match and closes at the REAL `]`, so only the `{`
+    // remains for eof (appendEofToken: one row per still-unclosed begin).
+    let src = "void f() { [ (])";
+    let r = scan_src(src);
+    assert_codes(&r, &["expected_token", "expected_token"]);
+    assert_eq!(r.diagnostics[0].range.offset, 14); // the `]`
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert!(
+        r.diagnostics[0].message.contains("')'"),
+        "{}",
+        r.diagnostics[0].message
+    );
+    assert_eq!(r.diagnostics[1].range.offset, u32_of(src.len())); // eof `{` row
+    let t = &r.tokens;
+    // 0 void, 1 f, 2 (, 3 ), 4 {, 5 [, 6 (, 7 synthetic ), 8 ], 9 ), 10 eof }.
+    assert_eq!(t.matching_end(6), Some(7));
+    assert!(t.get(7).unwrap().is_synthetic());
+    assert_eq!(t.matching_end(5), Some(8)); // `[` — the real `]` (insert match)
+    let eof_n = t.len();
+    assert_eq!(t.matching_end(4), Some(eof_n - 2)); // `{` — the eof synthetic
 }
 
 #[test]

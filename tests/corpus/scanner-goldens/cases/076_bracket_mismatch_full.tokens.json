@@ -128,13 +128,6 @@
    "("
   ],
   [
-   "CloseParen",
-   67,
-   1,
-   ")",
-   1
-  ],
-  [
    "CloseBracket",
    67,
    1,
@@ -165,14 +158,6 @@
    "}"
   ]
  ],
- "diagnostics": [
-  [
-   "expected_token",
-   67,
-   [
-    ")"
-   ]
-  ]
- ],
- "notes": "bad(): ']' with '(' on top pops it via synthetic ')' (official unmatchedBeginGroup, one UnmatchedToken in stream); dartq maps that to the expected_token diagnostic encoded here"
+ "diagnostics": [],
+ "notes": "bad(): the mismatching ']' matches the '[' one begin down; the official dual-option law (abstract_scanner.dart discardBeginGroupUntil :787-826) drops it — insert = synthetic ')' + two no-match closers = 3 recoveries, drop = every closer pairs with its real begin, +1 = 1 — so the scanner emits no synthetic and no diagnostic (upstream bracket_mismatch_00.dart.expect: parser-level rows only). Re-generated for #649."
 }

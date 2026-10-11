@@ -1,32 +1,31 @@
-//! M0-gate wave-6 regression pins (#606): the spill run of a primary
-//! bracket error drains silently instead of minting one `Unexpected text`
-//! row per stranded token (the `bracket_mismatch_*.dart` m0-syntax fixture
-//! class, where the oracle emits zero `unexpectedToken` rows). The official
-//! decision order (`parser_impl.dart`, Dart 3.15 main):
+//! M0-gate wave-6 regression pins (#606): the run of stranded closers behind
+//! a primary bracket error drains silently instead of minting one
+//! `Unexpected text` row per token (the `bracket_mismatch_*.dart` m0-syntax
+//! fixture class, where the oracle emits zero `unexpectedToken` rows). The
+//! official decision order (`parser_impl.dart`, Dart 3.15 main):
 //!
-//! * The scanner reports an unmatched begin at the first mismatching token
-//!   and parks a synthetic closer there (scanner `discardBeginGroupUntil` /
-//!   `insertSyntheticClosers`); the real closers behind the mismatch are
-//!   the spill the official enclosing group drains consume.
-//! * `ensureCloseParen` (:5028-5050): a missing `)` is reported once
-//!   (`expectedButGot`, surfaced as `EXPECTED_TOKEN` per the 3.13.1 oracle)
-//!   and the pointer jumps to the opener's scanner-guaranteed closer —
-//!   `moveSynthetic` silently when that closer is the scanner's synthetic
-//!   (:5034-5037, "the scanner has already reported"). The junk region
-//!   between is consumed by the jump, never row-per-token.
+//! * Under the official dual-option recovery (`abstract_scanner.dart`
+//!   `discardBeginGroupUntil` :787-826) the mismatching `]` of these
+//!   fixtures DROPS: both postures run to EOF on cloned state and dropping
+//!   is strictly cheaper (insert pays a synthetic closer plus no-match
+//!   closers; drop pays only its +1 penalty — upstream
+//!   `bracket_mismatch_00.dart.expect` reports no scanner problem). The
+//!   closer stands alone and every begin pairs with a later real closer.
+//! * `ensureCloseParen` (:5028-5050): with no scanner synthetic parked, the
+//!   `(`'s inner expression sees the junk `]` — `ensureIdentifier` reports
+//!   `missing_identifier` there and leaves it current
+//!   (`identifier_context_impl.dart`:427-458), then `ensureCloseParen`
+//!   reports `expectedButGot` once (`EXPECTED_TOKEN` per the 3.13.1 oracle)
+//!   and jumps to the REAL `)` behind the junk — the junk region between is
+//!   consumed by the jump, never row-per-token.
 //! * The collection drains share the shape: the list literal jumps to the
 //!   opener's endGroup for a non-entry follower (:8569-8575), the argument
 //!   list routes through `ensureCloseParen` (:9588-9600), and both re-enter
 //!   parsing instead when the follower looks like the next construct
 //!   (`looksLikeLiteralEntry` :8563 / `looksLikeExpressionStart` :9588).
-//! * A stranded token that official's chain DOES hand to the expression
-//!   engine reports `expectedIdentifier` there and nothing else beyond the
-//!   single jump row (`ExpressionIdentifierContext.ensureIdentifier`,
-//!   `identifier_context_impl.dart`:427-458 — excluded punctuation reports
-//!   and inserts without consuming).
 //! * The block statement loop's no-progress guard (:6618-6630) therefore
-//!   never fires on this class in the official chain; our chain leaves the
-//!   mismatch's spill to the statement loop, which drains it at the loop
+//!   never fires on this class in the official chain; our chain consumes the
+//!   junk through the same jumps, so the statement loop drains at the loop
 //!   head — before a stranded token can enter `parse_statement` and mint
 //!   the expression/semicolon rows the official jumps never emit.
 
@@ -70,40 +69,43 @@ fn assert_stream(source: &'static str, expected: &[(&str, u32, u32)], label: &st
 
 // —— the wave fixture (bracket_mismatch_00 / scanner_goldens/076) —————————
 
-/// The `bracket_mismatch_00.dart` shape: the `(` opens inside a list
-/// literal and the `]` mismatches it, stranding `)` and `]` behind the
-/// primary error. The scanner reports the unmatched `(` once at the `]`
-/// and the parser adopts its synthetic closer silently; the stranded `)`
-/// `]` never reach `parse_statement` (drained at the loop head), so the
-/// only parser row is the `ensureSemicolon` report anchored on the last
-/// real token before the synthetic `;` (offsets: `]`@67, `)`@68). Official
-/// — whose chain leaves the `]` unpaired so the paren's inner expression
-/// sees it — mints the pair at the same junk head (`missing_identifier`
-/// via `ensureIdentifier`, `identifier_context_impl.dart`:427-458, plus
-/// the `ensureCloseParen` `expectedButGot` :5043-5046); our scanner parks
-/// the synthetic closer inside the paren instead, making it an empty
-/// record, so the inner-expression row does not arise. Pre-fix this face
-/// minted `unexpected_token` at both stranded closers plus a stranded
-/// `missing_identifier` and a duplicated `expected_token`.
+/// The `bracket_mismatch_00.dart` shape: the `(` opens inside a list literal
+/// and the `]` mismatches it, stranding `)` and `]` behind the primary
+/// error. The scanner's dual-option law DROPS the `]` (insert = synthetic
+/// `)` + two no-match closers = 3 recoveries; drop = all closers pair, +1 =
+/// 1 — strictly cheaper; upstream `bracket_mismatch_00.dart.expect` reports
+/// no scanner problem), so zero scanner diagnostics arise and every closer
+/// stays a real token. The parser then faces the official pair at the junk
+/// head: the `(`'s inner expression reports `missing_identifier` at the `]`
+/// via `ensureIdentifier` (offsets: `]`@67), which leaves the `]` current,
+/// and `ensureCloseParen` (:5028-5050) reports `expectedButGot` ')' once and
+/// jumps to the REAL `)`@68 — no scanner synthetic, no `moveSynthetic` spill
+/// mark, no per-token rows. Pre-port (always-insert) this face minted a
+/// single `ensureSemicolon` row plus a scanner `expected_token`.
 #[test]
-fn bracket_mismatch_spill_drains_without_per_token_rows() {
+fn bracket_mismatch_drop_official_pair() {
     let source = "void good() {\n  [\n    ([\n    ])\n  ];\n}\n\nvoid bad() {\n  [\n    (\n    ])\n  ];\n}\n";
     let (listener, scan_diags) = parse_with_scan_diags(source);
     let got: Vec<(String, u32, u32)> = listener.errors.clone();
     assert_eq!(
         got,
-        vec![("expected_token".to_string(), 67, 68)],
-        "bracket mismatch spill drains: parser stream diverged"
+        vec![
+            ("missing_identifier".to_string(), 67, 68),
+            ("expected_token".to_string(), 67, 68),
+        ],
+        "bracket mismatch drop face: parser stream diverged"
     );
     assert_eq!(
         listener.texts,
-        ["Expected to find ';'."],
+        [
+            "Expected an identifier, but got ']'.",
+            "Expected to find ')'.",
+        ],
         "message templates diverged"
     );
-    assert_eq!(
-        scan_diags.len(),
-        1,
-        "scanner reports the unmatched `(` once"
+    assert!(
+        scan_diags.is_empty(),
+        "the dual-option law drops: no scanner rows, got {scan_diags:?}"
     );
 }
 
@@ -121,10 +123,12 @@ fn wellformed_bracket_nesting_stays_silent() {
 /// mismatches `D(d:` against a later `])`): whatever rows the argument and
 /// list drains carry, the stranded region behind the primary error mints
 /// no `unexpected_token` rows — pre-fix this file produced six of them.
-/// The argument list adopts the scanner's parked `)` at the `]` through
-/// its direct closer consumption (`parseArgumentsRest` :9534-9537 head /
-/// :9580-9587 tail — no `ensureCloseParen`), so the loop head locates the
-/// mark by the backward scan over the consumed block prefix.
+/// Under the dual-option law the second form also drops (upstream
+/// `bracket_mismatch_01.dart.expect`: no scanner problem), so the `D(d:`
+/// argument list sees the junk `]` after its three elements and
+/// `ensureCloseParen` (:9580-9587) reports once and jumps to the real `)`
+/// right behind it; the enclosing list and call drains then close on their
+/// real closers.
 #[test]
 fn constructor_form_spill_mints_no_unexpected_rows() {
     let source = "class C {\n  C({c});\n  C m() {\n    return C(\n      c: [\n        C(c: [\n          C(),\n          C(),\n          C(),\n        ]),\n        C(),\n        C(),\n      ],\n    );\n  }\n}\n\nclass D {\n  D({d});\n  D m() {\n    return D(\n      d: [\n        D(d:\n          D(),\n          D(),\n          D(),\n        ]),\n        D(),\n        D(),\n      ],\n    );\n  }\n}\n";

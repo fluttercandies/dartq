@@ -272,22 +272,31 @@ fn corpus_string_interpolation_2_recovers() {
     }
 }
 
-/// `bracket_mismatch_01` (#440 deferral, re-measured): the scanner emits the
-/// deep-match synthetic `)` for `D(d:`'s paren at the mismatching `]` —
-/// oracle: `expected_token` ')' @ the `]),` closer, len 1 (the paired
-/// `missing_identifier` there is parser-level). No EOF diagnostics: the
-/// recovered stream closes every remaining brace.
+/// `bracket_mismatch_01` (#440 deferral, re-measured under the dual-option
+/// law): the second form's `]` mismatches `D(d:`'s paren one begin down, and
+/// the drop posture wins strictly — insert = synthetic `)` + no-match `]` +
+/// no-match `)` = 3 recoveries, drop = every closer pairs with its real
+/// begin, +1 = 1 — so the scanner emits NOTHING at the `])` (upstream
+/// `bracket_mismatch_01.dart.expect` reports only the parser-level pair
+/// `Expected an identifier, but got ']'` / `Expected ')' before this`, both
+/// at the `]);` — no scanner problem). No EOF diagnostics: the recovered
+/// stream closes every remaining brace.
 #[test]
-fn corpus_bracket_mismatch_01_deep_match() {
+fn corpus_bracket_mismatch_01_deep_match_drops() {
     let Some(src) = corpus_file("bracket_mismatch_01.dart") else {
         eprintln!("skip: corpus file not present");
         return;
     };
     let r = scan_src(&src);
-    assert_eq!(codes(&r), ["expected_token"]);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
+    // Every begin pairs with a real closer; nothing synthetic anywhere.
+    let t = &r.tokens;
+    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
     let bracket = src.rfind("]),").expect("the mismatched `])` of class D");
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, u32_of(bracket));
-    assert_eq!(d.range.length, 1);
-    assert!(d.message.contains("')'"), "{}", d.message);
+    let junk = t
+        .as_slice()
+        .iter()
+        .find(|tok| tok.kind == K::CloseSquare && tok.byte_offset == u32_of(bracket))
+        .expect("the mismatching `]` is a plain token");
+    assert!(!junk.is_synthetic());
 }
