@@ -1,0 +1,10 @@
+# Analysis options for the dartq plugin host package.
+#
+# `samples/` holds runtime fixtures: standalone plugin packages that exercise
+# realistic plugin shapes against the analysis_server_plugin shim — including
+# deprecated APIs (`uniqueName`), deliberately unused locals, and internal
+# members. They are run against the wire, not analyzed; exclude them so
+# `dart analyze` reports only on the package's own sources (lib/ and test/).
+analyzer:
+  exclude:
+    - samples/**

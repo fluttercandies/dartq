@@ -1,0 +1,10 @@
+name: analysis_server_plugin
+description: >-
+  Import shim standing in for the official package:analysis_server_plugin on
+  the dartq plugin host (PRD section 14). A plugin written verbatim against
+  the official API imports this package unchanged; the host launcher maps the
+  `analysis_server_plugin` package name here via package_config. Never
+  published.
+version: 0.3.25
+environment:
+  sdk: ^3.10.0
