@@ -1,0 +1,53 @@
+# coverage-floors.tsv — per-crate line-coverage floors consumed by
+# scripts/coverage-gate.sh (--floors; rationale in coverage-gate-plan.md
+# section 6).
+#
+# Format: <crate-name><TAB><floor-percent>. Lines starting with '#' are
+# comments. Crate names must match the gate's lcov fold rows (workspace
+# member directory names under crates/). `default` is the fallback floor
+# for any measured crate without an explicit row; floor 0 never fails, so
+# unlisted crates stay advisory until they gain a row. The TOTAL row is
+# printed by the gate but always advisory (never enforced).
+#
+# Tier A — pure logic, dense unit pins (floor 80):
+#   state-machine / grammar / table code with direct unit pins;
+#   dartq-diagnostics measured at 99.15% today (plan section 4).
+# Tier B — semantic / engine, resolution-heavy (floor 65):
+#   exercised largely via harness and engine integration tests; the
+#   unit-visible share is lower.
+# Tier C — I/O and CLI boundary (floor 50):
+#   real-SDK loading and the process boundary are environment-dependent;
+#   only the pure parse/args core is floor-gated.
+#
+# Unlisted crates (no floor row => fall back to `default` 0 = advisory):
+#   - True empty stubs (1-line lib.rs; auto-dropped by the fold as LF:0
+#     rows): dartq-incremental, dartq-cache. Each MUST gain a real floor
+#     row in the same PR as its first real implementation.
+#   - Real code, no measured baseline yet: dartq-flow, dartq-snapshot,
+#     dartq-lints, dartq-ai, dartq-plugin, dartq-schema, dartq-commands,
+#     dartq-daemon. They ride `default` until the first full advisory run
+#     lands their numbers, then gain tier rows (plan section 7, work
+#     item 2) — numbers exist before any floor bites.
+#   - Test/tool members, measurement infrastructure not product code:
+#     tests/harness (measured as the "harness" row) and tools/corpus-gen;
+#     dartq-plugin-host is a Dart package (no Cargo.toml, never measured).
+#
+# Ratchet: raise a floor only together with the measured baseline that
+# proves it; land advisory first, flip the gate with --enforce once the
+# baseline is committed (plan section 6 enforcement posture).
+dartq-scanner	80
+dartq-parser	80
+dartq-source	80
+dartq-pub	80
+dartq-language	80
+dartq-diagnostics	80
+dartq-ast	80
+dartq-types	80
+dartq-semantic	65
+dartq-resolution	65
+dartq-engine	65
+dartq-index	65
+dartq-package	65
+dartq-sdk	50
+dartq-cli	50
+default	0
