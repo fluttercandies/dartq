@@ -885,6 +885,7 @@ impl<'a> Snapshot<'a> {
             }
             registry.insert(strings.intern(name), decl);
             decl_text.insert(decl, (*name).to_string());
+            builder = builder.decl(decl, param_ids.clone());
             decl_params.insert(decl, param_ids);
             builtin_edges.push((
                 decl,
@@ -916,6 +917,7 @@ impl<'a> Snapshot<'a> {
             }
             registry.insert(*name, decl);
             decl_text.insert(decl, strings.resolve(*name).to_string());
+            builder = builder.decl(decl, param_ids.clone());
             decl_params.insert(decl, param_ids);
             file_scopes.insert(decl, scope);
         }
@@ -991,6 +993,9 @@ impl<'a> Snapshot<'a> {
         // The in-file supertype edges. A tree that fails to map (or a
         // nullable one — the hierarchy rejects nullable supertypes)
         // leaves the capture unfaithful: the declaration goes unsafe.
+        // Faithful edges also join the hierarchy — the subtype walk reads
+        // the closure, so an argument satisfies its bound through an
+        // in-file edge only when the edge is fed.
         let mut edges_of: FxHashMap<TypeDeclId, Vec<TypeDeclId>> = FxHashMap::default();
         let mut unsafe_decls: FxHashSet<TypeDeclId> = FxHashSet::default();
         for (name, capture) in &index.containers {
@@ -1005,6 +1010,7 @@ impl<'a> Snapshot<'a> {
                 continue;
             }
             let mut targets = Vec::new();
+            let mut edge_types = Vec::new();
             let mut faithful = true;
             for tree in &capture.supers {
                 if tree.nullable {
@@ -1013,7 +1019,10 @@ impl<'a> Snapshot<'a> {
                 }
                 match ctx.map_tree(tree, scope) {
                     Some(ty) => match table.get(ty).kind() {
-                        TypeKind::Interface { decl: target, .. } => targets.push(target),
+                        TypeKind::Interface { decl: target, .. } => {
+                            targets.push(target);
+                            edge_types.push(ty);
+                        }
                         // A valid hierarchy edge is always an interface;
                         // anything else means the capture was not one.
                         _ => faithful = false,
@@ -1022,6 +1031,9 @@ impl<'a> Snapshot<'a> {
                 }
             }
             if faithful {
+                for ty in edge_types {
+                    builder = builder.supertype(decl, ty);
+                }
                 edges_of.insert(decl, targets);
             } else {
                 unsafe_decls.insert(decl);
@@ -1182,5 +1194,157 @@ fn parse_written_type(text: &str, strings: &StringTable) -> Option<TypeTree> {
             Some(tree)
         }
         None => Some(TypeTree::leaf(strings.intern(text), false, range)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(offset: u32, length: u32) -> SourceRange {
+        SourceRange { offset, length }
+    }
+
+    /// One unbounded type variable (`class C<T>`): the window opens and
+    /// closes around the completion event, and the container's begin event
+    /// adopts the latch.
+    fn unbounded_variable(bounds: &mut Bounds<'_>, name: StringId) {
+        bounds.begin_type_variables();
+        bounds.end_type_variable(name, false);
+        bounds.end_type_variables();
+    }
+
+    /// One parameterized type reference (`Box<int>`) inside the open
+    /// window: the head travels in the group's begin event (the engine's
+    /// `pending_type_head`), the arguments fire `handle_type` inside, and
+    /// the parser's trailing head re-fire merges into the completed node —
+    /// a no-op for a non-nullable head, omitted here.
+    fn parameterized(bounds: &mut Bounds<'_>, head: StringId, arg: StringId, head_offset: u32) {
+        bounds.begin_group(Some((head, range(head_offset, 3))), true);
+        bounds.leaf(arg, false, range(head_offset + 4, 3));
+        bounds.end_group(range(head_offset + 7, 1));
+    }
+
+    /// Closes the site capture and peels the root the way the engine's
+    /// `end_type_arguments` does: the check receives the head and its
+    /// argument subtrees, not the whole root tree.
+    fn close_site(bounds: &mut Bounds<'_>, end: SourceRange) -> (StringId, Vec<TypeTree>) {
+        let mut roots = bounds
+            .end_group(end)
+            .expect("the site capture closes with its root");
+        let site = roots.pop().expect("the site root");
+        (site.head, site.args)
+    }
+
+    /// The snapshot declares every registered name into the hierarchy —
+    /// builtin and in-file alike. Missing declarations fail the builder's
+    /// `validate_edge` (`UndeclaredDecl`), the build falls back to the
+    /// bare core, and every check silently suppresses.
+    #[test]
+    fn snapshot_declares_builtin_and_in_file_decls() {
+        let strings = StringTable::new();
+        let c = strings.intern("C");
+        let t = strings.intern("T");
+        let int = strings.intern("int");
+        let mut bounds = Bounds::new();
+        // `class C<T extends int> {}`
+        bounds.begin_type_variables();
+        bounds.leaf(int, false, range(13, 3));
+        bounds.end_type_variable(t, true);
+        bounds.end_type_variables();
+        bounds.note_container(Some(c), 6, 21, false, false);
+
+        let snapshot = bounds.snapshot(&strings);
+        let decl = snapshot
+            .registry
+            .get(&c)
+            .copied()
+            .expect("in-file decl registered");
+        let info = snapshot
+            .hierarchy
+            .decl(decl)
+            .expect("in-file decl declared in the hierarchy");
+        assert_eq!(info.type_parameters, snapshot.decl_params[&decl]);
+        let list = *snapshot
+            .registry
+            .get(&strings.intern("List"))
+            .expect("builtin registered");
+        assert!(
+            snapshot.hierarchy.decl(list).is_some(),
+            "builtin decl declared in the hierarchy"
+        );
+    }
+
+    /// An argument satisfying its parameter's bound through an in-file
+    /// supertype edge stays silent: `class IntBox<X> extends Box<int>`
+    /// makes `C<IntBox>` well-bounded for `C<T extends Box<int>>`.
+    /// Without the in-file edge feed the hierarchy closure holds only the
+    /// implicit `Object` and the site false-positives.
+    #[test]
+    fn in_file_supertype_edge_satisfies_the_bound() {
+        let strings = StringTable::new();
+        let box_ = strings.intern("Box");
+        let t = strings.intern("T");
+        let int = strings.intern("int");
+        let int_box = strings.intern("IntBox");
+        let x = strings.intern("X");
+        let c = strings.intern("C");
+        let mut bounds = Bounds::new();
+        // `class Box<T> {}`
+        unbounded_variable(&mut bounds, t);
+        bounds.note_container(Some(box_), 6, 7, false, false);
+        // `class IntBox<X> extends Box<int> {}`
+        unbounded_variable(&mut bounds, x);
+        bounds.note_container(Some(int_box), 18, 19, false, false);
+        bounds.open_header(int_box);
+        parameterized(&mut bounds, box_, int, 32);
+        bounds.header_clause(Clause::Extends(1));
+        bounds.finish_header();
+        // `class C<T extends Box<int>> {}`
+        bounds.begin_type_variables();
+        parameterized(&mut bounds, box_, int, 52);
+        bounds.end_type_variable(t, true);
+        bounds.end_type_variables();
+        bounds.note_container(Some(c), 48, 62, false, false);
+        // `void f(C<IntBox> c) {}`
+        bounds.begin_group(Some((c, range(70, 1))), true);
+        bounds.leaf(int_box, false, range(72, 6));
+        let (head, args) = close_site(&mut bounds, range(78, 1));
+        let issues = bounds.check_site(&strings, head, args, &[]);
+        assert!(issues.is_empty());
+    }
+
+    /// A genuine violation against an in-file bound reports at the
+    /// argument: `String` does not satisfy `C<T extends Box<int>>`'s
+    /// bound, and the issue carries the written argument, the parameter,
+    /// and the substituted bound.
+    #[test]
+    fn in_file_bound_violation_reports_at_the_argument() {
+        let strings = StringTable::new();
+        let box_ = strings.intern("Box");
+        let t = strings.intern("T");
+        let int = strings.intern("int");
+        let string = strings.intern("String");
+        let c = strings.intern("C");
+        let mut bounds = Bounds::new();
+        // `class Box<T> {}`
+        unbounded_variable(&mut bounds, t);
+        bounds.note_container(Some(box_), 6, 7, false, false);
+        // `class C<T extends Box<int>> {}`
+        bounds.begin_type_variables();
+        parameterized(&mut bounds, box_, int, 21);
+        bounds.end_type_variable(t, true);
+        bounds.end_type_variables();
+        bounds.note_container(Some(c), 18, 31, false, false);
+        // `void f(C<String> c) {}`
+        bounds.begin_group(Some((c, range(39, 1))), true);
+        bounds.leaf(string, false, range(41, 6));
+        let (head, args) = close_site(&mut bounds, range(47, 1));
+        let issues = bounds.check_site(&strings, head, args, &[]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].argument, "String");
+        assert_eq!(issues[0].parameter, "T");
+        assert_eq!(issues[0].bound, "Box<int>");
+        assert_eq!(issues[0].range.offset, 41);
     }
 }
