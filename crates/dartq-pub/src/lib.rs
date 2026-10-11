@@ -61,6 +61,10 @@ pub enum PubError {
     /// A version or constraint string is outside the pub_semver subset.
     #[error("version: {0}")]
     Version(String),
+    /// Workspace discovery found no pubspec anywhere on the walk — the
+    /// typed face of the "Found no `pubspec.yaml`" case.
+    #[error("workspace: {0}")]
+    NoRoot(String),
     /// Workspace discovery or artifact validation failed.
     #[error("workspace: {0}")]
     Workspace(String),

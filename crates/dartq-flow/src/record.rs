@@ -151,6 +151,15 @@ impl<'t> Flow<'t> {
         facts
     }
 
+    /// Records the `handleExit` contract: a subexpression's static type is
+    /// Never, so the flow state goes unreachable from the expression's end
+    /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
+    /// Fired by the engine once it resolves a subexpression's type to
+    /// Never; the parser listener alone cannot know it.
+    pub fn handle_exit(&mut self, end: TokenSpan) {
+        self.record(Ev::Exit { end });
+    }
+
     fn record(&mut self, ev: Ev) {
         if let Some(buffer) = self.buffer.as_mut() {
             buffer.push(ev);

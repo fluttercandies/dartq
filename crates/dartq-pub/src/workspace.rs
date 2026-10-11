@@ -47,8 +47,9 @@ pub struct WorkspaceLayout {
 ///
 /// # Errors
 ///
-/// Returns [`PubError::Workspace`] when no pubspec exists anywhere on the
-/// walk, when the first pubspec met carries an explicit `resolution` and is
+/// Returns [`PubError::NoRoot`] when no pubspec exists anywhere on the
+/// walk, [`PubError::Workspace`] when the first pubspec met carries an
+/// explicit `resolution` and is
 /// not the root or a workspace member (pub's "found a pubspec but no
 /// workspace root" FileException in `_loadWorkspace`,
 /// entrypoint.dart:127-152), when a member pubspec is
@@ -118,7 +119,7 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
             Some(parent) => dir = parent.to_path_buf(),
             None => {
                 return Err(match first_met {
-                    None => PubError::Workspace(format!(
+                    None => PubError::NoRoot(format!(
                         "Found no `pubspec.yaml` file in `{}` or parent directories",
                         from.display()
                     )),
@@ -573,7 +574,7 @@ mod tests {
         let dir = temp_dir("empty");
         assert!(matches!(
             find_workspace_root(&dir),
-            Err(PubError::Workspace(_))
+            Err(PubError::NoRoot(_))
         ));
     }
 

@@ -137,6 +137,13 @@ impl LineIndex {
     /// recorded sparsely per line, so pure-ASCII sources allocate nothing
     /// beyond the line starts.
     ///
+    /// Pass structure: a word-chunked `is_ascii` gate picks between two
+    /// shapes. Pure-ASCII sources (the dominant case) never decode UTF-8 —
+    /// wide-char recording is a no-op there, so a second `memchr2` pass
+    /// replays the count scan and pushes the line starts directly. Any byte
+    /// ≥ 0x80 falls through to the `char_indices` walk below, which decodes
+    /// and records wide characters; it pays only the gate pass extra.
+    ///
     /// # Panics
     ///
     /// Panics when `source` exceeds [`u32::MAX`] bytes; offsets in this
@@ -145,6 +152,10 @@ impl LineIndex {
     pub fn new(source: &str) -> Self {
         let source_len = u32::try_from(source.len()).expect("source exceeds u32::MAX bytes");
         let bytes = source.as_bytes();
+        // Word-chunked gate: a pure-ASCII source makes wide-char recording a
+        // no-op, so the UTF-8 decode walk below is pure overhead — line
+        // starts come straight from the same `memchr2` scan the count uses.
+        let is_ascii = bytes.is_ascii();
         let mut line_start_count = 0usize;
         let mut pos = 0usize;
         while let Some(found) = memchr::memchr2(b'\n', b'\r', &bytes[pos..]) {
@@ -159,6 +170,28 @@ impl LineIndex {
         }
         let mut line_starts = Vec::with_capacity(line_start_count + 1);
         line_starts.push(0);
+        if is_ascii {
+            // Fill pass: replays the count scan candidate-by-candidate, so it
+            // pushes exactly `line_start_count` starts and the exact-
+            // allocation invariant (`capacity() == len()`, audit #99 F5)
+            // holds by construction. Break semantics mirror the char walk:
+            // a `\r\n` pair records one start, at its `\n` (the `\r` is
+            // skipped); a lone `\n` or `\r` records one at itself.
+            let mut pos = 0usize;
+            while let Some(found) = memchr::memchr2(b'\n', b'\r', &bytes[pos..]) {
+                let i = pos + found;
+                pos = i + 1;
+                if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    continue;
+                }
+                line_starts.push(u32::try_from(i + 1).expect("line start exceeds u32::MAX"));
+            }
+            return Self {
+                line_starts,
+                wide_lines: Vec::new(),
+                source_len,
+            };
+        }
         let mut wide_lines = Vec::new();
         let mut wide_chars: Vec<WideChar> = Vec::new(); // wide chars of the line being scanned
         let mut deficit = 0u32; // running deficit through the previous line

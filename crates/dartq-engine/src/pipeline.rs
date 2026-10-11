@@ -17,7 +17,7 @@ use dartq_resolution::{
     DUPLICATE_SHOWN_NAME, ExportEdge, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
     ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
-use dartq_semantic::MicroKind;
+use dartq_semantic::{ElementIndex, MicroKind};
 use dartq_source::{FileId, FileTable, SourceRange, StringTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -149,15 +149,21 @@ pub(crate) fn analyze(
     // The semantic seam's shared context (#236): the import namespaces every
     // per-library fold resolves through, built once per graph generation and
     // shared by the surface rebuilds below — a per-library or per-analyze
-    // build would multiply the cost, and a clean workset needs none. The
-    // element models stay un-cloned here: the fold indexes only its own
-    // library's members (see `semdiag`), so no per-analyze workspace-wide
-    // copy exists.
-    let seam = (semdiag.is_some() && !order.is_empty()).then(|| {
+    // build would multiply the cost, and a clean workset needs none.
+    let folding = semdiag.is_some() && !order.is_empty();
+    let seam = folding.then(|| {
         resolved
             .expect("graph exists when libraries exist")
             .namespaces()
     });
+    // The fold's element index (#775): every resident file's model, indexed
+    // once per analyze and shared by reference through the whole fan-out —
+    // the retired per-library rebuild over the full residency cost
+    // O(libraries × residency) hash inserts on a cold analyze, plus a
+    // transient residency-sized map per worker. The facts cannot move under
+    // the fold (the jobs read `&EngineState`), so the index is a stable
+    // snapshot; entries are the facts' own `Arc`s (see `semdiag`).
+    let index = folding.then(|| crate::semdiag::build_index(&state.residency));
 
     let computed: Vec<Option<(Duration, Vec<Diagnostic>)>> = order
         .par_iter()
@@ -172,6 +178,7 @@ pub(crate) fn analyze(
                 resolved.expect("graph exists when libraries exist"),
                 semdiag,
                 seam,
+                index.as_ref(),
                 *library,
             );
             Some((start.elapsed(), diagnostics))
@@ -306,6 +313,7 @@ fn diagnose_library(
     resolved: &ResolvedGraph,
     semdiag: Option<&dyn SemanticDiagnoser>,
     seam: Option<&Namespaces>,
+    index: Option<&ElementIndex>,
     library: LibraryId,
 ) -> Vec<Diagnostic> {
     let info = state.libraries.info(library).expect("live library");
@@ -381,12 +389,13 @@ fn diagnose_library(
     }
     if let Some(diagnoser) = semdiag {
         let namespaces = seam.expect("seam context exists when a diagnoser is configured");
+        let index = index.expect("element index exists when a diagnoser is configured");
         // The persisted scan faces of the members (apply-phase recompute):
         // hits ride in as refcount bumps, misses fall back to a local scan
         // inside the fold — no per-member re-scan on the hot path either way.
         let scanned: FxHashMap<FileId, Arc<ScannedFace>> = members
             .iter()
-            .filter_map(|&file| scanned_face(state, file).map(|face| (file, face)))
+            .filter_map(|&file| state.settled_face(file).map(|face| (file, face)))
             .collect();
         let view = LibraryView {
             library,
@@ -401,6 +410,7 @@ fn diagnose_library(
             file_table: &state.files,
             grants: &state.feature_grants,
             namespaces,
+            index,
             // The defining file's strict modes govern the fold (#588 item
             // 4): the `analyzer.language.strict-*` flags resolved through
             // the governing options entry.
@@ -466,14 +476,6 @@ fn diagnose_library(
         }
     }
     out
-}
-
-/// The persisted scan face of a resident file, under the exact key the apply
-/// recompute stored it under ([`l1::facts_key`]).
-fn scanned_face(state: &EngineState, file: FileId) -> Option<Arc<ScannedFace>> {
-    let facts = state.residency.get(&file)?;
-    let key = l1::facts_key(&state.grants(), file, facts.content);
-    state.cached_scanned(key)
 }
 
 /// Rebuilds a library's symbol-index reference surface at its
@@ -1285,7 +1287,12 @@ mod tests {
 
     use super::*;
 
-    fn diagnostic(files: &mut FileTable, path: &str, offset: u32, message: &str) -> Diagnostic {
+    fn diagnostic(
+        files: &mut FileTable,
+        path: &str,
+        offset: u32,
+        message: &'static str,
+    ) -> Diagnostic {
         let file = files.intern(Path::new(path));
         Diagnostic::new(
             Severity::Error,
@@ -1304,7 +1311,7 @@ mod tests {
 
     /// A stored run: diagnostics of one library, canonically sorted — the
     /// shape `LibraryResult::diagnostics` has since #234.
-    fn run(files: &mut FileTable, entries: &[(&str, u32, &str)]) -> Vec<Diagnostic> {
+    fn run(files: &mut FileTable, entries: &[(&str, u32, &'static str)]) -> Vec<Diagnostic> {
         let mut run: Vec<Diagnostic> = entries
             .iter()
             .map(|&(path, offset, message)| diagnostic(files, path, offset, message))

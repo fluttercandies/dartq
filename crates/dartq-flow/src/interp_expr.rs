@@ -489,6 +489,19 @@ impl Interp<'_> {
                 let _ = self.exprs.pop();
                 self.unreachable_cur();
             }
+            Ev::Exit { .. } => {
+                // Never-typed subexpression (official `handleExit`): the
+                // flow state goes unreachable at the expression's end. No
+                // pop: the official call site fires with the subexpression
+                // still on the stack ("Stack: (Expression)",
+                // type_analyzer.dart:815-819) and the enclosing construct's
+                // own close event consumes it — popping here would
+                // underflow e.g. `ArgumentsEnd` for `f(neverFn())`. The
+                // recorded `end` offset mirrors the official trace payload;
+                // only `self.current` mutates, so a collect run rolls the
+                // effect back through its snapshot exactly like Throw.
+                self.unreachable_cur();
+            }
             Ev::Rethrow => {
                 self.unreachable_cur();
             }

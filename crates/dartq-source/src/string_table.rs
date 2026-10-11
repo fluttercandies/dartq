@@ -1,10 +1,8 @@
 //! Strings interned to small stable integers (ast-layout-spec §5).
 
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use rustc_hash::FxHashMap;
-
-use crate::content_id::ContentId;
 
 /// A small stable integer naming one interned string.
 ///
@@ -30,31 +28,40 @@ impl StringId {
 ///
 /// `intern` dedups by content: the same text always yields the same
 /// [`StringId`], and ids are handed out from 0 in first-intern order. The
-/// table is append-only with immortal ids — there is no remove or eviction,
-/// because ids already recorded in results or snapshots must keep resolving;
-/// bounded-memory duty stays with the higher layers, and the §5 reclamation
-/// story (PRD §17 mark-sweep) is deferred.
+/// table is append-only with immortal ids — ids already recorded in
+/// results, facts, and snapshots must keep resolving for the whole
+/// session. No reclamation can soundly retire them: a live structure's
+/// names cannot be attributed to one content whose death would prove the
+/// names dead, because the same text arrives from many files and from
+/// synthesized spellings (setter names, prefixed imports), so the holder
+/// of a dedup hit is not the recorded first interner. The deferred §17
+/// mark-sweep story is thereby closed in favor of a session ceiling:
+/// memory grows with distinct interned strings at the measured ~93 B/entry
+/// (ast-layout-spec §5, #128), [`len`](Self::len) exposes the count
+/// against that bound, and overshoot is accepted — interning past any
+/// nominal bound costs memory, never truth.
 ///
-/// Interning is [`Mutex`]-guarded so one table can be shared by worker
-/// threads; sharding is deferred until a measured contention signal.
+/// Locking: a read/write split for the worker parallelism at 10⁵-file
+/// scale. [`resolve`](Self::resolve) and intern hits take the read lock —
+/// parallel and allocation-free, a hit is one hash lookup; a miss releases
+/// it, takes the write lock, and re-checks, so racing workers still mint
+/// one id per text. Sharding stays deferred until a measured contention
+/// signal.
 ///
 /// Storage: text is copied once into the table and leaked as `&'static str`
 /// (the rust-analyzer `symbol.rs` shape minus the tagged pointer, with u32
-/// ids). The leak is the price of [`resolve`](Self::resolve) returning slices
-/// without unsafe under interior mutability; the measured per-entry footprint
-/// is recorded in ast-layout-spec §5. `ContentId` origins recorded through
-/// [`intern_with_origin`](Self::intern_with_origin) are kept for that future
-/// sweep; plain [`intern`](Self::intern) records none.
+/// ids). The leak is the price of [`resolve`](Self::resolve) returning
+/// slices without unsafe under interior mutability; the measured per-entry
+/// footprint is recorded in ast-layout-spec §5.
 #[derive(Debug, Default)]
 pub struct StringTable {
-    inner: Mutex<Inner>,
+    inner: RwLock<Inner>,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     ids_by_str: FxHashMap<&'static str, StringId>,
     strings: Vec<&'static str>,
-    origins: Vec<Option<ContentId>>,
 }
 
 impl StringTable {
@@ -64,32 +71,54 @@ impl StringTable {
     }
 
     /// Returns the [`StringId`] for `s`, allocating the next id on first
-    /// sight. Repeated interning of the same text is pure hashing.
+    /// sight. Repeated interning of the same text is a read-locked hash
+    /// lookup; only the first sight takes the write lock.
     ///
     /// # Panics
     ///
     /// Panics when interning more than [`u32::MAX`] distinct strings, which
-    /// would exhaust the [`StringId`] space, or when the table mutex is
+    /// would exhaust the [`StringId`] space, or when the table lock is
     /// poisoned by a panic in an earlier call (both are program bugs).
     #[must_use]
     pub fn intern(&self, s: &str) -> StringId {
-        let mut inner = self.inner.lock().expect("StringTable mutex poisoned");
-        intern_locked(&mut inner, s, None)
+        {
+            let inner = self.inner.read().expect("StringTable lock poisoned");
+            if let Some(&id) = inner.ids_by_str.get(s) {
+                return id;
+            }
+        }
+        let mut inner = self.inner.write().expect("StringTable lock poisoned");
+        if let Some(&id) = inner.ids_by_str.get(s) {
+            return id; // A concurrent worker minted it while we upgraded.
+        }
+        let id = StringId(
+            u32::try_from(inner.strings.len()).expect("more than u32::MAX strings interned"),
+        );
+        let text: &'static str = Box::leak(Box::from(s));
+        inner.ids_by_str.insert(text, id);
+        inner.strings.push(text);
+        id
     }
 
-    /// Like [`intern`](Self::intern), but records `origin` as the [`ContentId`]
-    /// the string was first seen with. Origins are the input of the deferred
-    /// mark-sweep reclamation (ast-layout-spec §5); they have no observable
-    /// effect today. Interning the same text with and without an origin
-    /// yields one id — the first call's origin wins.
-    ///
-    /// # Panics
-    ///
-    /// Same conditions as [`intern`](Self::intern).
+    /// How many distinct strings the table holds — the count the session
+    /// ceiling's memory bound scales with (~93 B/entry, ast-layout-spec §5).
     #[must_use]
-    pub fn intern_with_origin(&self, s: &str, origin: ContentId) -> StringId {
-        let mut inner = self.inner.lock().expect("StringTable mutex poisoned");
-        intern_locked(&mut inner, s, Some(origin))
+    pub fn len(&self) -> usize {
+        self.inner
+            .read()
+            .expect("StringTable lock poisoned")
+            .strings
+            .len()
+    }
+
+    /// Whether the table holds no strings.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .expect("StringTable lock poisoned")
+            .strings
+            .is_empty()
     }
 
     /// The interned text behind `id`.
@@ -101,30 +130,14 @@ impl StringTable {
     /// one rather than reported as a lookup miss.
     #[must_use]
     pub fn resolve(&self, id: StringId) -> &str {
-        let inner = self.inner.lock().expect("StringTable mutex poisoned");
+        let inner = self.inner.read().expect("StringTable lock poisoned");
         inner.strings[id.index() as usize]
     }
-}
-
-/// Lock-held intern core shared by [`StringTable::intern`] and
-/// [`StringTable::intern_with_origin`].
-fn intern_locked(inner: &mut Inner, s: &str, origin: Option<ContentId>) -> StringId {
-    if let Some(&id) = inner.ids_by_str.get(s) {
-        return id;
-    }
-    let id =
-        StringId(u32::try_from(inner.strings.len()).expect("more than u32::MAX strings interned"));
-    let text: &'static str = Box::leak(Box::from(s));
-    inner.ids_by_str.insert(text, id);
-    inner.strings.push(text);
-    inner.origins.push(origin);
-    id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content_hash;
     use std::sync::Arc;
 
     #[test]
@@ -132,7 +145,6 @@ mod tests {
         let table = StringTable::new();
         let hello = table.intern("hello");
         assert_eq!(table.intern("hello"), hello);
-        assert_eq!(table.intern_with_origin("hello", content_hash(b"x")), hello);
         assert_eq!(table.resolve(hello), "hello");
     }
 
@@ -202,26 +214,61 @@ mod tests {
         }
     }
 
+    /// The session ceiling's observability face: `len` counts distinct
+    /// strings only — re-interning and dedup leave it untouched.
     #[test]
-    fn intern_with_origin_records_content_origin() {
+    fn len_counts_distinct_strings_only() {
         let table = StringTable::new();
-        let origin = content_hash(b"lib.dart");
-        let id = table.intern_with_origin("MyClass", origin);
-        assert_eq!(
-            table.intern("MyClass"),
-            id,
-            "origin variants dedup together"
-        );
-
-        // All interning must happen before locking: the mutex is not
-        // reentrant, so an intern call under the guard would self-deadlock.
-        let plain = table.intern("plain");
-        let inner = table.inner.lock().expect("unpoisoned in test");
-        assert_eq!(inner.origins[id.index() as usize], Some(origin));
-        assert_eq!(inner.origins[plain.index() as usize], None);
+        assert!(table.is_empty());
+        let a = table.intern("a");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.intern("a"), a, "re-interning does not grow the table");
+        assert_eq!(table.intern("b").index(), 1);
+        assert_eq!(table.len(), 2);
+        assert!(!table.is_empty());
     }
 
-    /// The Mutex-guarded sharing contract: threads racing to intern the same
+    /// The read/write lock split under contention: resolver threads reading
+    /// pre-interned ids run concurrently with interners growing the table,
+    /// every resolve stays byte-exact (ids are immortal however much the
+    /// table grows around them), and the write path still mints exactly one
+    /// slot per distinct text.
+    #[test]
+    fn resolves_run_concurrently_with_interning() {
+        let table = Arc::new(StringTable::new());
+        let seeded: Vec<StringId> = (0..64_u32)
+            .map(|i| table.intern(&format!("seed_{i}")))
+            .collect();
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let table = Arc::clone(&table);
+                let seeded = seeded.clone();
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        for (i, &id) in seeded.iter().enumerate() {
+                            assert_eq!(table.resolve(id), format!("seed_{i}"));
+                        }
+                    }
+                });
+            }
+            for t in 0..2_u32 {
+                let table = Arc::clone(&table);
+                s.spawn(move || {
+                    for i in 0..1000_u32 {
+                        let _ = table.intern(&format!("t{t}_s{i}"));
+                    }
+                });
+            }
+        });
+
+        assert_eq!(table.len(), 64 + 2 * 1000, "one slot per distinct text");
+        for (i, &id) in seeded.iter().enumerate() {
+            assert_eq!(table.resolve(id), format!("seed_{i}"));
+        }
+    }
+
+    /// The RwLock-guarded sharing contract: threads racing to intern the same
     /// texts all observe one id per text, and the table holds exactly one
     /// slot per distinct text (no double-insert between lookup and insert).
     #[test]
@@ -256,7 +303,7 @@ mod tests {
                 assert_eq!(*id, evens[i / 2], "pre-interned texts keep their ids");
             }
         }
-        let inner = table.inner.lock().expect("unpoisoned in test");
+        let inner = table.inner.read().expect("unpoisoned in test");
         assert_eq!(inner.strings.len(), 500, "one slot per distinct text");
     }
 }

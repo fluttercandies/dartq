@@ -283,6 +283,15 @@ pub enum Ev {
     Throw,
     /// `rethrow` (no operand on the expression stack).
     Rethrow,
+    /// A subexpression's static type is Never (official
+    /// `FlowAnalysis.handleExit`, fired with the expression's end offset —
+    /// flow_analysis.dart:919-925): the flow state goes unreachable from
+    /// there. The subexpression's value stays on the expression stack; the
+    /// enclosing construct's own close event consumes it.
+    Exit {
+        /// The subexpression's end offset.
+        end: TokenSpan,
+    },
     ParenBegin,
     ParenEnd,
     RecordLitEnd {

@@ -568,7 +568,7 @@ void main() {}
                 diagnostic.range.offset,
                 diagnostic.range.length,
                 diagnostic.code.name,
-                diagnostic.message.clone(),
+                diagnostic.message.clone().into_owned(),
             )
         })
         .collect();

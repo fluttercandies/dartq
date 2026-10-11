@@ -3,6 +3,34 @@
 //! §15.7: the diagnostics/patch/impact report schemas ship with the version,
 //! in-crate, so tooling can check outputs against their published shapes).
 //!
+//! # Schema freeze (v1)
+//!
+//! The v1 surface this crate documents is **frozen**: every
+//! `SCHEMA_VERSION_*` constant in this crate is 1 and stays 1 for the whole
+//! v1 line. `scripts/schema-freeze-sweep.sh` is the enforcement gate — it
+//! drives the frozen shapes end-to-end across faces (the CLI machine and
+//! JSON faces, the daemon's `initialize` capability map, the `dartq/check`
+//! tier answers with the short-id table, the `dartq/fix` intake answer, and
+//! the `dartq/assists` document) and fails on any drift. Run it in the
+//! serial phase before any release cut.
+//!
+//! * **v1.x is additive-only.** A new optional field, a new enum spelling,
+//!   or a new face keeps the major: the schema document, the validator, and
+//!   the sweep grow in the same change as the first emitter.
+//! * **What forces v2.** Removing or renaming a field, changing a field's
+//!   JSON type or an enum spelling, making a field mandatory, reusing a
+//!   field with a new meaning, or moving a version constant — anything a
+//!   frozen v1 consumer could break on. A v2 bump moves every affected
+//!   `SCHEMA_VERSION_*` and every producer in one release.
+//! * **The short-id clause.** The session symbol table's *form* is frozen:
+//!   keys are `s1`, `s2`, … assigned in first-seen order; values are the
+//!   substituted-out strings (`label|name` entity paths, or the file-path
+//!   table's own paths). The *assignment* is session-scoped — an id is
+//!   meaningful only alongside the `symbols` table in the same answer, so
+//!   consumers resolve through the table and never hardcode an id. Whether
+//!   a given answer carries the table stays the emitter's byte-economics
+//!   decision (PRD §15.8) and is not a shape break.
+//!
 //! # Versioning discipline (PRD §15.7)
 //!
 //! * Every versioned output carries its contract version under

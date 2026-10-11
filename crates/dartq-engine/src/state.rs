@@ -58,6 +58,12 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// the duplicate-combinator check's per-clause seen-set); v7 payloads
 /// merged adjacent same-kind clauses, so a warm start would over-report
 /// duplicate combinators and equate `show a show b` with `show a, b`.
+/// v9: the capture interns written type arguments into the unit's
+/// `ArgPool` (#728) — no payload-layout delta (the args columns already
+/// round-trip), but a v8 payload decodes every declared type
+/// argument-less, so a warm start would diverge from a fresh capture
+/// without any error; the bump forks the generation header and forces
+/// re-capture.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -73,8 +79,10 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// extend the history above, re-pin. (Mirror-enum *variant* additions are
 /// already forced through a compile review by the exhaustive `of`/`restore`
 /// matches; they change the on-disk schema all the same, so they bump this
-/// version too.)
-const FACTS_SHAPE_VERSION: u32 = 8;
+/// version too.) The bump lane also forks on capture-behavior changes with
+/// no layout delta: a payload the old producer wrote must not be served to
+/// a producer whose capture output diverges from it.
+const FACTS_SHAPE_VERSION: u32 = 9;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component, PRD
 /// §5.6 `EngineSemanticVersion`): the engine facts shape folded with
@@ -640,7 +648,9 @@ pub(crate) struct EngineState {
     /// Workspace paths → `FileId`s.
     pub files: FileTable,
     /// Declaration-name interning, shared with dartq-semantic and the
-    /// resolution graph.
+    /// resolution graph. Ids are immortal; the table is bounded by its
+    /// documented session ceiling, never swept (see [`StringTable`] and
+    /// [`Self::sweep_store`]).
     pub strings: StringTable,
 
     /// Live files: content id + current facts. Removed files leave the map
@@ -915,6 +925,21 @@ impl EngineState {
         self.scanned.get(&key).cloned()
     }
 
+    /// The persisted scan face of a resident file, addressed under the exact
+    /// key the apply recompute stored it under ([`crate::l1::facts_key`] —
+    /// the content + granted-feature-fingerprint triple): the one shared
+    /// read by file, so no consumer can hit an entry under a key it was
+    /// never stored under. `None` when the file is not resident or its face
+    /// was capped out of the cache; a file whose facts were served entirely
+    /// from warm start also has none, because `scanned_to_cache` only pushes
+    /// faces computed by a cold recompute — every caller falls back to
+    /// re-deriving the pure face locally.
+    pub(crate) fn settled_face(&self, file: FileId) -> Option<Arc<ScannedFace>> {
+        let facts = self.residency.get(&file)?;
+        let key = crate::l1::facts_key(&self.grants(), file, facts.content);
+        self.cached_scanned(key)
+    }
+
     /// Scanned-face insert with the facts cache's oldest-first cap
     /// eviction. No GC tally: a scanned face holds interned ids and token
     /// tables, never a store `ContentId`, so its eviction cannot orphan
@@ -956,6 +981,13 @@ impl EngineState {
     /// `LibraryResult::content`) hold `ContentId`s too, but only compare
     /// them — no byte reads — so eviction under them is safe: content
     /// addressing reproduces the same id if the bytes ever return.
+    ///
+    /// The interned-string table is deliberately excluded: its ids are held
+    /// by live facts and results whose names no single content accounts for
+    /// (one text arrives from many files and from synthesized spellings, and
+    /// a dedup hit keeps only the first interner's origin), so no
+    /// origin-based liveness over strings is sound. The table rides its
+    /// documented session ceiling ([`StringTable`] in dartq-source) instead.
     ///
     /// Called at the end of every non-empty apply (l1 `apply`), after
     /// residency has been rewritten, so replaced contents are already

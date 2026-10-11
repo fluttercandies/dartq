@@ -572,7 +572,7 @@ impl PersistedDiagnostic {
                 DiagnosticType::Tool => PersistedDiagnosticType::Tool,
             },
             code_published: diagnostic.code.has_published_docs,
-            message: diagnostic.message.clone(),
+            message: diagnostic.message.clone().into_owned(),
             file: files.id(diagnostic.file),
             range: PersistedRange::of(diagnostic.range),
             correction: diagnostic.correction.clone(),

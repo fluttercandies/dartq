@@ -222,6 +222,80 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
+/// A Never-typed subexpression records `Ev::Exit` (official
+/// `FlowAnalysis.handleExit`, flow_analysis.dart:919-925): the flow state
+/// goes unreachable from the expression's end, so the following statement
+/// anchors a dead-code row at itself — the first unreachable node, not the
+/// Never expression. Hand-driven: only the engine can resolve a
+/// subexpression's type to Never, so the parser pipeline cannot produce
+/// this buffer yet. The anchor doubles as the collect-rollback pin:
+/// `Interp::run` collect-runs the whole buffer first, and a leaked Exit
+/// would open the real run's window at the FIRST statement instead.
+#[test]
+fn never_typed_subexpression_exit_kills_the_rest() {
+    use crate::facts::FlowFact;
+    // `void f() { never(); 1; }` — offsets: `never()` at 11-17, the `;` at
+    // 18, `1;` at 20-21. The recorded grammar per expression statement:
+    // `ExprStmt` + `StmtEnd` at the statement's begin, then the body
+    // expression's events (record.rs `handle_expression_statement`); the
+    // engine appends Exit after resolving the call's type (official call
+    // site fires with the expression still on the stack).
+    let events: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+        ],
+        // `never();` — the call's type resolves to Never.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 19 },
+            crate::ev::Ev::OtherExpr { span: tspan(11) },
+            crate::ev::Ev::Exit { end: tspan(18) },
+        ],
+        // `1;` — unreachable from here.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(20) },
+            crate::ev::Ev::StmtEnd { end: 22 },
+            crate::ev::Ev::OtherExpr { span: tspan(20) },
+        ],
+        vec![
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(24),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    // One row: anchored at `1;` (the first unreachable node), spanning to
+    // its `;` (offset 20, length 2). The body cannot complete normally.
+    assert_eq!(interp.facts.len(), 1, "{:?}", interp.facts);
+    match &interp.facts[0] {
+        FlowFact::DeadCode { span } => {
+            assert_eq!(span.range.offset, 20, "anchor is the first dead node");
+            assert_eq!(span.range.length, 2, "the row runs to the `;`");
+        }
+        other => panic!("expected a DeadCode row, got {other:?}"),
+    }
+    // Control: the same buffer without Exit stays live (the body then
+    // completes normally) — the Exit event is what kills reachability.
+    let live: Vec<crate::ev::Ev> = events
+        .iter()
+        .copied()
+        .filter(|ev| !matches!(ev, crate::ev::Ev::Exit { .. }))
+        .collect();
+    let interp = interp_of(&live);
+    assert!(
+        matches!(
+            interp.facts.as_slice(),
+            [FlowFact::BodyMayCompleteNormally { .. }]
+        ),
+        "{:?}",
+        interp.facts
+    );
+}
+
 /// official `test_doWhile` (`dead_code_test.dart`): a dead do-while back
 /// edge anchors the interval on the condition, and the close splits into
 /// the `while (c);` part plus the tail after the statement (official
@@ -2245,7 +2319,7 @@ fn dead_interval_empty_body_loop_folds_the_tail() {
 /// (`_containsFirstDeadNode` fails: the body block is not an ancestor of
 /// the condition, dead_code_verifier.dart:453-459) — and folds through
 /// the body `{}` and `return i;` to the function exit's last statement.
-#[ignore = "adjudicated: needs Never-returning call-type facts; ticketed #642"]
+#[ignore = "adjudicated: needs the engine half of #642 (Never-returning call-type facts near consume_send); the flow-crate Ev::Exit half has landed"]
 #[test]
 fn official_for_loop_no_updaters_folds_through_the_return() {
     let source = "Never foo() => throw \"Never\";\n\ntest() {\n  int i = 0;\n  for (foo(); (i = 42) < 0;) {}\n  return i;\n}\n";

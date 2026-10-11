@@ -324,11 +324,8 @@ fn recompute_facts(
     // and materializes against the live tables. Grouped by key so a
     // same-content batch (one payload, several consumers) removes it once;
     // the extras clone the payload (identical bytes at two paths, rare and
-    // bounded by the batch). The staging map is single-shot: whatever no
-    // changed file claimed was stale against this batch and drops here —
-    // stale entries never survive an apply (bounded memory; the next
-    // ingest re-seeds). Grow-only: ingestion seeds recomputes, it never
-    // touches residency (#377).
+    // bounded by the batch). Grow-only: ingestion seeds recomputes, it
+    // never touches residency (#377).
     let mut warmed: Vec<(usize, UnitFacts)> = Vec::with_capacity(warm.len());
     if !warm.is_empty() {
         // One registry per load: materialize runs per entry, and a
@@ -364,8 +361,14 @@ fn recompute_facts(
                 }
             }
         }
-        state.warm_start.clear();
     }
+    // The staging map is single-shot, and this — after the last read in the
+    // pass — is its drain: whatever no changed file claimed, including the
+    // entire staged set when this batch matched no snapshot file, was stale
+    // against this batch and drops here unconditionally. Stale entries never
+    // survive an apply (the contract on `EngineState::warm_start`), so the
+    // payloads never pin residency past the pass; the next ingest re-seeds.
+    state.warm_start.clear();
 
     // Sequential URI resolution over the shared FileTable: each template
     // resolves for its own file, then each sibling derives from the
@@ -962,7 +965,7 @@ impl ParserListener for DiagCollector {
             message.text,
             self.file,
             start.range,
-            None,
+            message.correction,
         ));
     }
 }
@@ -2828,6 +2831,32 @@ mod tests {
         assert_eq!(diagnostic.range.length, "'c.dart'".len() as u32);
     }
 
+    /// The parser's registry-verbatim correctionMessage rides through the
+    /// DiagCollector into engine diagnostics (#727): the `base_enum`
+    /// modifier row carries "Try removing the keyword 'base'." unmodified.
+    #[test]
+    fn parse_diagnostic_carries_the_registry_correction() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let main = set(
+            &mut state,
+            &fixture.root.join("lib/main.dart"),
+            "base enum E { a }\n",
+        );
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+        let diagnostic = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "base_enum")
+            .expect("the base modifier row fires");
+        assert_eq!(diagnostic.message, "Enums can't be declared to be 'base'.");
+        assert_eq!(
+            diagnostic.correction.as_deref(),
+            Some("Try removing the keyword 'base'."),
+        );
+    }
+
     /// Bounded canonical-URI memo (audit #398 F10): a file leaving residency
     /// drops its memo; a returning file recomputes the identical string from
     /// its immutable interned path, so the memo tracks the resident set
@@ -3026,6 +3055,53 @@ mod tests {
         );
     }
 
+    /// The settled per-file face reads back through the accessor (#722
+    /// seam): a `// @dart = 2.19` library inside the 3.x package settles to
+    /// the pinned baseline (patterns closed) while its unpinned neighbor
+    /// keeps the package posture, and a not-yet-resident file answers
+    /// `None` — the commands layer's fallback signal.
+    #[test]
+    fn at_dart_override_settles_the_per_file_accessor() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let pinned = set(
+            &mut state,
+            &lib.join("pinned.dart"),
+            "// @dart = 2.19\nvoid f() {}\n",
+        );
+        let modern = set(&mut state, &lib.join("modern.dart"), "void g() {}\n");
+        assert!(
+            state.settled_face(pinned).is_none(),
+            "interned but not resident: nothing settled yet"
+        );
+        apply(&mut state, &mut |_| {});
+
+        let settled = state
+            .settled_face(pinned)
+            .expect("a resident file has a persisted face");
+        assert!(
+            !settled.features.is_enabled(Feature::Patterns),
+            "the 2.19 pin closes patterns inside the 3.x package"
+        );
+        assert_eq!(
+            settled.features.fingerprint(),
+            FeatureSet::for_language_version(LanguageVersion {
+                major: 2,
+                minor: 19
+            })
+            .fingerprint(),
+            "no grants in this fixture: the plain pinned baseline"
+        );
+        let baseline = state
+            .settled_face(modern)
+            .expect("a resident file has a persisted face");
+        assert!(
+            baseline.features.is_enabled(Feature::Patterns),
+            "the unpinned neighbor keeps the package baseline"
+        );
+    }
+
     /// The structural graph face of the live library set: membership,
     /// defining file, parts, deps, and part targets — everything the delta
     /// must keep exact except the per-member content identity (which moves
@@ -3180,6 +3256,47 @@ mod tests {
         assert!(
             !state.library_surfaces.contains_key(&owner),
             "the reference surface went with the retirement"
+        );
+    }
+
+    /// The warm-start staging map is single-shot per apply: a batch that
+    /// matches no staged entry must still drain it. Otherwise a snapshot
+    /// ingest whose payloads go unconsumed — an apply touching no snapshot
+    /// file — pins the entire staged payload set for the session (a second
+    /// full residency copy), and only the budget's tier-3 path would ever
+    /// clear it. The staged key here is the real shape ingest seeds (facts
+    /// projected off a resident file) with the content hash corrupted, so
+    /// no batch can ever claim it.
+    #[test]
+    fn warm_start_drains_when_the_batch_touches_no_snapshot_file() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = set(&mut state, &lib.join("main.dart"), "void main() {}\n");
+        apply(&mut state, &mut |_| {});
+
+        // Stage an ingest-shaped payload under a key no batch can match:
+        // the resident file's own entry key with its content hash flipped.
+        let content = state.residency[&main].content;
+        let mut staged = snapshot_key(facts_key(&state.grants(), main, content));
+        staged.content_hash[0] ^= 0xff;
+        let payload = crate::state::persist::PersistedFacts::of(
+            &state.residency[&main],
+            &state.strings,
+            &state.files,
+        );
+        state.warm_start.insert(staged, payload);
+        assert_eq!(state.warm_start.len(), 1, "the payload is staged");
+
+        // An apply whose batch claims none of it: `other.dart` computes
+        // cold (cache and staging both miss) — and the staging map must
+        // still come out drained.
+        let other = set(&mut state, &lib.join("other.dart"), "library other;\n");
+        apply(&mut state, &mut |_| {});
+        assert!(state.residency.contains_key(&other), "the apply ran");
+        assert!(
+            state.warm_start.is_empty(),
+            "unclaimed staged payloads never survive an apply"
         );
     }
 }

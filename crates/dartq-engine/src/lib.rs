@@ -58,6 +58,7 @@ use std::sync::Arc;
 
 use dartq_diagnostics::Diagnostic;
 use dartq_index::{FileCapture, LibraryIndex};
+use dartq_language::FeatureSet;
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
@@ -68,6 +69,7 @@ use dartq_snapshot::{
 use dartq_source::{
     FileId, FileTable, LineIndex, MemorySourceStore, PooledSourceStore, SourceStore, StringTable,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
@@ -353,7 +355,7 @@ impl Engine {
     fn capture_pubspecs(&mut self) {
         let table = &self.state.packages;
         let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Some(root) = table.get(table.root().as_str()) {
+        if let Some(root) = table.root().and_then(|name| table.get(name.as_str())) {
             dirs.push(root.root.clone());
         }
         if let Some(members) = table.workspace_members() {
@@ -466,6 +468,18 @@ impl Engine {
             .collect()
     }
 
+    /// The settled per-file feature face (#722): the feature set `file`
+    /// analyzes under — the `@dart` override applied, the allowed-experiment
+    /// grants merged (`l1::scan_unit`'s settled output) — read from the
+    /// scan face the last apply/analyze persisted, never re-derived per
+    /// query. `None` when the file is not resident or its face was capped
+    /// out of the cache: the caller falls back to its own (package-version)
+    /// derivation, the same posture for a file outside the analyzed set.
+    #[must_use]
+    pub fn settled_features(&self, file: FileId) -> Option<FeatureSet> {
+        self.state.settled_face(file).map(|face| face.features)
+    }
+
     /// The `query symbol` face (PRD §20.3): every declaration of `name`
     /// across the workspace plus every resolved reference to those
     /// declarations, answered from the maintained index state (the per-file
@@ -542,22 +556,14 @@ impl Engine {
                     .any(|(key, options)| path.starts_with(key) && options.is_excluded(path))
             };
             // The four declared surfaces; directly-in-root dart files are
-            // interned below, never queued (the walk's `read_dir` on a file
+            // collected below, never queued (the walk's `read_dir` on a file
             // is ENOTDIR and would silently drop them).
             let mut queue: Vec<PathBuf> =
                 SURFACES.iter().map(|surface| root.join(surface)).collect();
-            // Reads, counts, and interns one accepted `.dart` file — the
-            // shared tail of the root pass and the walk below.
-            let mut intern_file = |path: &Path| -> std::io::Result<()> {
-                let bytes = std::fs::read(path)?;
-                stats.loc_total += u64::from(
-                    u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
-                        .unwrap_or(u32::MAX),
-                );
-                stats.file_count += 1;
-                self.set_content(path, &bytes);
-                Ok(())
-            };
+            // Accepts one `.dart` file — the shared tail of the root pass
+            // and the walk below. Reading and enqueueing happen after the
+            // walk, parallelized over the sorted path list.
+            let mut accepted: Vec<PathBuf> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(root) {
                 for entry in entries.flatten() {
                     let Ok(file_type) = entry.file_type() else {
@@ -576,7 +582,7 @@ impl Engine {
                                 && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())))
                         && !is_excluded(&path)
                     {
-                        intern_file(&path)?;
+                        accepted.push(path);
                     }
                 }
             }
@@ -617,8 +623,55 @@ impl Engine {
                                     .is_ok_and(|meta| meta.is_file())))
                         && !is_excluded(&path)
                     {
-                        intern_file(&path)?;
+                        accepted.push(path);
                     }
+                }
+            }
+            // `read_dir` yields entries in platform-dependent order, so the
+            // serial walk's enqueue order was never stable run-to-run;
+            // sorting pins discovery to one deterministic path order.
+            accepted.sort();
+            // Cold-path I/O: read every accepted file's bytes and count its
+            // LOC in parallel — `fs::read` is I/O-bound and rayon's blocking
+            // pool absorbs that (the sanctioned parallel form, same as the
+            // l1 batch fan-out). The walk and its acceptance predicate stay
+            // serial on purpose: the predicate is pure and the walk's
+            // `queue` stack is inherently sequential. Reads run in bounded
+            // batches of 256, each batch enqueued and dropped before the
+            // next one reads: peak transient memory is one batch's bytes,
+            // not the whole workspace's (~2x source bytes on a cold load,
+            // on top of the pending store's standing 1x). Sorting precedes
+            // chunking, so the enqueue order, the byte-stable differential
+            // face, and the first-failure-in-sorted-order error surface are
+            // unchanged; per file the intern/`set_content` path and the
+            // stats are identical to the unbatched form.
+            for batch in accepted.chunks(256) {
+                let reads: Vec<std::io::Result<(Vec<u8>, u64)>> = batch
+                    .par_iter()
+                    .map(|path| {
+                        std::fs::read(path).map(|bytes| {
+                            let loc = u64::from(
+                                u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
+                                    .unwrap_or(u32::MAX),
+                            );
+                            (bytes, loc)
+                        })
+                    })
+                    .collect();
+                // Enqueue in the same sorted order the reads were issued in.
+                // The pending overlay is last-wins per path, so content would
+                // land identically in any order, but a fixed enqueue order
+                // keeps the differential harness byte-stable. A read failure
+                // surfaces at its sorted position with everything before it
+                // already enqueued — the surfaced error is the first in sorted
+                // order (the old serial version surfaced whichever read failed
+                // first in platform-dependent read_dir order, itself never
+                // stable).
+                for (path, read) in batch.iter().zip(reads) {
+                    let (bytes, loc) = read?;
+                    stats.loc_total += loc;
+                    stats.file_count += 1;
+                    self.set_content(path, &bytes);
                 }
             }
         }
@@ -980,6 +1033,11 @@ pub struct LibraryView<'a> {
     /// The import namespaces of the current graph (built once per graph
     /// generation).
     pub namespaces: &'a dartq_resolution::Namespaces,
+    /// The element models of every resident file, indexed by [`FileId`] —
+    /// built once per analyze over the whole residency and shared by every
+    /// per-library fold (#775). Entries are the facts' own `Arc`s, so the
+    /// share costs refcount bumps, never clones.
+    pub index: &'a dartq_semantic::ElementIndex,
     /// The language-strictness modes governing the library (the defining
     /// file's analysis options, `unwrap_or(false)` per flag — the official
     /// off posture): the `analyzer.language.strict-*` config → gate face
@@ -1039,6 +1097,10 @@ pub(crate) fn strip_one_bom(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use dartq_language::Feature;
+    use dartq_pub::{LockFile, Pubspec, build_graph};
 
     #[test]
     fn bom_stripped_once() {
@@ -1051,6 +1113,7 @@ mod tests {
     fn double_bom_leaves_second_as_content() {
         assert_eq!(
             strip_one_bom("\u{FEFF}\u{FEFF}x".as_bytes()),
+            // One BOM dropped, the second survives as content (EF BB BF 78).
             "\u{FEFF}x".as_bytes()
         );
     }
@@ -1058,5 +1121,103 @@ mod tests {
     #[test]
     fn bom_only_strips_to_empty() {
         assert_eq!(strip_one_bom("\u{FEFF}".as_bytes()), b"");
+    }
+
+    /// A throwaway single-package workspace + synthetic core-only SDK — the
+    /// l1/semdiag test fixture shape trimmed to what [`Engine::new`] binds —
+    /// backing the public-facade tests.
+    fn facade_engine() -> (PathBuf, Engine) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-facade-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // Canonicalize before the pub faces resolve it (the #287 spelling
+        // universe — macOS /var vs /private/var).
+        let root = root.canonicalize().expect("fixture root resolves");
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &std::collections::BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        let engine = Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: Arc::clone(&config),
+            config_dir,
+            semdiag: None,
+            target: DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+        })
+        .expect("engine");
+        (root, engine)
+    }
+
+    /// The public settled-face accessor (#722 seam) through the facade: a
+    /// `set_content`-interned but not-yet-applied file answers `None` (not
+    /// resident — the caller-fallback signal); after `apply_pending` the
+    /// same id answers the persisted face, the package-baseline feature set
+    /// for this fixture. Mirrors `l1`'s accessor test through the public
+    /// method instead of the internal state.
+    #[test]
+    fn settled_features_projects_the_persisted_face() {
+        let (root, mut engine) = facade_engine();
+        let file = engine.set_content(&root.join("lib/a.dart"), b"void f() {}\n");
+        assert!(
+            engine.settled_features(file).is_none(),
+            "interned but not resident: nothing settled yet"
+        );
+        engine.apply_pending(&mut |_| {});
+        let features = engine
+            .settled_features(file)
+            .expect("a resident file has a persisted face");
+        assert!(
+            features.is_enabled(Feature::Patterns),
+            "the unpinned 3.5 package keeps the baseline posture"
+        );
     }
 }
