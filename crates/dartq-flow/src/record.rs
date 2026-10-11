@@ -145,7 +145,8 @@ impl<'t> Flow<'t> {
         facts.sort_by_key(|fact| match fact {
             FlowFact::DeadCode { span }
             | FlowFact::UnassignedRead { span, .. }
-            | FlowFact::PromotedRead { span, .. } => span.range.offset,
+            | FlowFact::PromotedRead { span, .. }
+            | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
         });
         facts
     }
@@ -195,11 +196,14 @@ impl<'t> Flow<'t> {
     /// Executable end: closes the outermost recording and runs the
     /// pipeline over it. `is_expr` marks function-expression ends, which
     /// net one value for the consumer (crate contract, see
-    /// `SwitchExprBlockEnd`/`ListLitEnd`).
-    fn exec_end(&mut self, is_expr: bool) {
+    /// `SwitchExprBlockEnd`/`ListLitEnd`); `end` is the executable's end
+    /// token — recorded on the nested `ExecEnd` event, and the
+    /// completion fact's anchor for the outermost executable (which
+    /// records no framing events of its own).
+    fn exec_end(&mut self, is_expr: bool, end: Token) {
         self.exec_depth = self.exec_depth.saturating_sub(1);
         if self.exec_depth > 0 {
-            self.record(Ev::ExecEnd { is_expr });
+            self.record(Ev::ExecEnd { is_expr, end });
             return;
         }
         let Some(events) = self.buffer.take() else {
@@ -208,6 +212,14 @@ impl<'t> Flow<'t> {
         let ops = NameTypeOps;
         let mut interp = Interp::new(&ops);
         interp.run(&events);
+        // The outermost body's fall-through completion: after `run` the
+        // interpreter's current state IS the body's exit state (official
+        // `checkForBodyMayCompleteNormally`'s reachability gate,
+        // type_analyzer.dart:647-652; nested executables emit at their
+        // own `ExecEnd` inside the replay).
+        if interp.reachable() {
+            interp.emit(FlowFact::BodyMayCompleteNormally { span: end });
+        }
         self.facts.append(&mut interp.facts);
     }
 }
@@ -224,8 +236,8 @@ impl ParserListener for Flow<'_> {
         self.exec_begin(false);
     }
 
-    fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, _end: Token) {
-        self.exec_end(false);
+    fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, end: Token) {
+        self.exec_end(false, end);
     }
 
     fn begin_method(
@@ -250,9 +262,9 @@ impl ParserListener for Flow<'_> {
         _begin: Token,
         _begin_param: Token,
         _begin_initializers: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
-        self.exec_end(false);
+        self.exec_end(false, end);
     }
 
     fn begin_constructor(
@@ -278,9 +290,9 @@ impl ParserListener for Flow<'_> {
         _new_kw: Option<Token>,
         _begin_param: Token,
         _begin_initializers: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
-        self.exec_end(false);
+        self.exec_end(false, end);
     }
 
     fn begin_factory(
@@ -294,8 +306,8 @@ impl ParserListener for Flow<'_> {
         self.exec_begin(false);
     }
 
-    fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
-        self.exec_end(false);
+    fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, end: Token) {
+        self.exec_end(false, end);
     }
 
     fn begin_local_function_declaration(&mut self, _token: Token) {
@@ -303,7 +315,7 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_local_function_declaration(&mut self, end: Token) {
-        self.exec_end(false);
+        self.exec_end(false, end);
         self.record(Ev::StmtEnd {
             end: end.range.end(),
         });
@@ -313,16 +325,16 @@ impl ParserListener for Flow<'_> {
         self.exec_begin(true);
     }
 
-    fn end_function_expression(&mut self, _begin: Token, _end: Token) {
-        self.exec_end(true);
+    fn end_function_expression(&mut self, _begin: Token, end: Token) {
+        self.exec_end(true, end);
     }
 
     fn begin_named_function_expression(&mut self, _token: Token) {
         self.exec_begin(true);
     }
 
-    fn end_named_function_expression(&mut self, _end: Token) {
-        self.exec_end(true);
+    fn end_named_function_expression(&mut self, end: Token) {
+        self.exec_end(true, end);
     }
 
     // —— bodies ————————————————————————————————————————————————————————

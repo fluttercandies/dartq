@@ -268,6 +268,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, Severity};
+use dartq_flow::ty::{Base as FlowBase, Ty as FlowTy};
 use dartq_flow::{Flow, FlowFact};
 use dartq_parser::{
     AssertKind, BlockKind, ConstructorReferenceContext, DeclarationKind, ExperimentalFlag,
@@ -297,8 +298,8 @@ use crate::const_eval::{
 };
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, owner_library, resolve_container};
 use crate::model::{
-    ArityViolation, Container, ContainerKind, ExtensionFace, FileElements, Formals, MemberEntry,
-    MemberKind, MicroKind, TopDecl, Ty,
+    ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
+    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use dartq_types::{
     Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Witness as EngineWitness,
@@ -963,6 +964,14 @@ struct Engine<'a> {
     namespaces: &'a Namespaces,
     index: &'a ElementIndex,
     strings: &'a StringTable,
+    /// The unit's argument pool — the pool the file's own declared types
+    /// intern into ([`ElementIndex::get`] of `file`). Declared-type display
+    /// resolves slots through it. A type read from *another* unit's face
+    /// (a cross-file override source, a superclass member) carries that
+    /// unit's slots; while capture interns nothing every slot is the
+    /// reserved empty list, so the display is exact — the feeding ticket
+    /// owns the cross-unit ownership decision alongside the capture wiring.
+    unit_args: Option<&'a ArgPool>,
     source: &'a str,
     tokens: &'a TokenTable,
     file: FileId,
@@ -1329,6 +1338,11 @@ struct Engine<'a> {
     /// The `strict_raw_type` report sites (name, anchor): their
     /// instantiated-to-bounds displays need the whole-file snapshot too.
     raw_type_sites: Vec<(StringId, SourceRange)>,
+    /// The #477 S1 staged negative verdicts of the assignability families,
+    /// parse order: flow's promotion facts are not answerable mid-parse,
+    /// so the teardown re-decides each against the promoted-read staging
+    /// before the row emits.
+    staged_checks: Vec<StagedCheck>,
 }
 
 /// One deferred boundedness check (the [`Engine::pending_bounded_checks`]
@@ -1406,11 +1420,13 @@ impl<'a> Engine<'a> {
         let primitive_ids = FINAL_PRIMITIVES.map(|m| strings.intern(m));
         let identical_id = strings.intern("identical");
         let core_supertypes = CORE_SUPERTYPES.map(|(b, p)| (strings.intern(b), strings.intern(p)));
+        let unit_args = index.get(file).map(FileElements::type_args);
         Self {
             graph,
             namespaces,
             index,
             strings,
+            unit_args,
             source,
             tokens,
             file,
@@ -1424,6 +1440,7 @@ impl<'a> Engine<'a> {
             bounds: Bounds::new(),
             pending_bounded_checks: Vec::new(),
             raw_type_sites: Vec::new(),
+            staged_checks: Vec::new(),
             armed_ty: None,
             pending_decl_ty: None,
             group_heads: Vec::new(),
@@ -1576,6 +1593,74 @@ impl<'a> Engine<'a> {
             range,
             None,
         ));
+    }
+
+    /// Stages a negative assignability verdict (#477 S1): flow's promotion
+    /// facts are not answerable mid-parse (the recorder replays an
+    /// executable only at its end), so the emission defers to the teardown,
+    /// where a promoted-read fact on the expression can still clean the row
+    /// ([`Engine::filter_staged`]).
+    fn stage(&mut self, kind: StagedKind, range: SourceRange, from: Ty, to: Ty, literal: bool) {
+        self.staged_checks.push(StagedCheck {
+            kind,
+            range,
+            from,
+            to,
+            literal,
+        });
+    }
+
+    /// Re-decides the staged verdicts against the promotion staging and
+    /// emits the survivors (#477 S1). A promoted-read fact on the staged
+    /// expression's exact span substitutes its type — the official read's
+    /// static type IS the promoted one
+    /// (`property_element_resolver.dart:2158-2166`) — and the family's
+    /// matrix runs again; the emission is byte-identical to the parse-time
+    /// check it defers, with the (possibly promoted) source type displayed.
+    /// The survivors return offset-sorted for the report tail's
+    /// source-ordered merge.
+    fn filter_staged(&mut self, promotions: &PromotionStaging) -> Vec<Diagnostic> {
+        let mut survivors: Vec<Diagnostic> = Vec::new();
+        for check in std::mem::take(&mut self.staged_checks) {
+            let from = promotions.promoted(check.range).unwrap_or(check.from);
+            let verdict = match check.kind {
+                StagedKind::Return { .. } => self.return_verdict(from, check.to, check.literal),
+                _ => self.assignable(from, check.to, check.literal),
+            };
+            if verdict != Some(false) {
+                // Cleaned by the promotion, or the promoted type left the
+                // question undecidable — suppress (under-report).
+                continue;
+            }
+            let (code, a2) = match check.kind {
+                StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
+                StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
+                StagedKind::Return { host, name } => {
+                    (SemanticCode::ReturnOfInvalidType(host), Some(name))
+                }
+            };
+            let (a0, a1) = (self.ty_display(from), self.ty_display(check.to));
+            let message = match a2 {
+                Some(name) => {
+                    let a2 = self.strings.resolve(name).to_string();
+                    code.message3(&a0, &a1, &a2)
+                }
+                None => code.message3(&a0, &a1, ""),
+            };
+            survivors.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                message,
+                self.file,
+                check.range,
+                None,
+            ));
+        }
+        // Parse order is source order for the staging sites (nested
+        // assignments excepted); the sort keeps the merge invariant
+        // regardless.
+        survivors.sort_by_key(|d| d.range.offset);
+        survivors
     }
 
     /// The four-placeholder emit (`message4`).
@@ -3848,9 +3933,14 @@ impl<'a> Engine<'a> {
     }
 
     /// Resolves one written super-face name to its declaring handle and
-    /// library (#491 S2a attribution); `None` suppresses the face.
+    /// library (#491 S2a attribution); `None` suppresses the face. The
+    /// handle carries the *declaring* file — the same shape the fold walk's
+    /// hop produces — so `FoldHierarchy::library_of` attributes the super's
+    /// own library and the outside-library gates (`element.library !=
+    /// _currentLibrary`, error_verifier.dart:5619-5622/:5917-5921/:3725-3730)
+    /// compare the right pair.
     fn resolve_super(&self, name: StringId) -> Option<((FileId, StringId), LibraryId)> {
-        resolve_container(
+        let (_, owner) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -3858,8 +3948,8 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         )?;
-        let lib = owner_library(self.graph, self.lib, self.file, name).unwrap_or(self.lib);
-        Some(((self.file, name), lib))
+        let lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(self.lib);
+        Some(((owner, name), lib))
     }
 
     /// The use-site decisions, computed read-only and emitted by the caller:
@@ -5185,14 +5275,7 @@ impl<'a> Engine<'a> {
             Ty::Unknown | Ty::Dynamic => "dynamic".to_string(),
             Ty::Null => "Null".to_string(),
             Ty::Void => "void".to_string(),
-            Ty::Named { name, nullable } => {
-                let text = self.strings.resolve(name);
-                if nullable {
-                    format!("{text}?")
-                } else {
-                    text.to_string()
-                }
-            }
+            named @ Ty::Named { .. } => self.render_ty(named),
         }
     }
 
@@ -5722,7 +5805,6 @@ impl<'a> Engine<'a> {
             return;
         };
         let mut positional_index = 0usize;
-        let mut mismatches: Vec<(Ty, Ty, SourceRange)> = Vec::new();
         for (name, ty, literal, range) in &level.args {
             let formal = if let Some(n) = name {
                 formals.named_formal(*n)
@@ -5738,12 +5820,8 @@ impl<'a> Engine<'a> {
                 continue;
             };
             if self.assignable(*ty, formal.ty, *literal) == Some(false) {
-                mismatches.push((*ty, formal.ty, *range));
+                self.stage(StagedKind::Argument, *range, *ty, formal.ty, *literal);
             }
-        }
-        for (from, to, range) in mismatches {
-            let (a0, a1) = (self.ty_display(from), self.ty_display(to));
-            self.emit3(SemanticCode::ArgumentTypeNotAssignable, range, &a0, &a1, "");
         }
     }
 
@@ -6519,8 +6597,7 @@ impl<'a> Engine<'a> {
         let literal = Self::primitive_literal(rhs_row, &self.primitive_ids);
         let to = self.assignment_target_ty(&self.rows[target]);
         if self.assignable(from, to, literal) == Some(false) {
-            let (a0, a1) = (self.ty_display(from), self.ty_display(to));
-            self.emit3(SemanticCode::InvalidAssignment, range, &a0, &a1, "");
+            self.stage(StagedKind::Assignment, range, from, to, literal);
         }
     }
 
@@ -6540,18 +6617,14 @@ impl<'a> Engine<'a> {
         let row = &self.rows[mark];
         let literal = Self::primitive_literal(row, &self.primitive_ids);
         if self.assignable(row.ty, to, literal) == Some(false) {
-            let (a0, a1) = (self.ty_display(row.ty), self.ty_display(to));
-            self.emit3(SemanticCode::InvalidAssignment, row.range, &a0, &a1, "");
+            self.stage(StagedKind::Assignment, row.range, row.ty, to, literal);
         }
         self.init_mark = None;
     }
 
-    /// The return check (`rtv.dart:209-249` sync matrix): `void` hosts
-    /// accept `void`/`dynamic`/`Null`; `void`/`dynamic` expressions only
-    /// fit `void`/`dynamic` hosts; everything else defers to the
-    /// assignability decision (the return expression is the literal's
-    /// context, so `from_literal` feeds the conversion — `double f() => 1;`
-    /// is clean). Bare `return;` is a `void` expression.
+    /// The return check (`rtv.dart:209-249` sync matrix): the verdict is
+    /// [`Engine::return_verdict`]; a failing one stages — the teardown may
+    /// still clean it against the expression's promoted read.
     fn check_return(&mut self, from: Ty, range: SourceRange, from_literal: bool) {
         let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
             FrameKind::Executable { ret: Some(ret), .. } => Some((ret.ty, ret.host, ret.name)),
@@ -6560,7 +6633,26 @@ impl<'a> Engine<'a> {
             return;
         };
         let (to, host, name) = ret;
-        let verdict = match to {
+        if self.return_verdict(from, to, from_literal) == Some(false) {
+            self.stage(
+                StagedKind::Return { host, name },
+                range,
+                from,
+                to,
+                from_literal,
+            );
+        }
+    }
+
+    /// The return verdict matrix, shared by the parse-time stage and the
+    /// teardown re-decision: `void` hosts accept `void`/`dynamic`/`Null`;
+    /// `void`/`dynamic` expressions only fit `void`/`dynamic` hosts;
+    /// everything else defers to the assignability decision (the return
+    /// expression is the literal's context, so `from_literal` feeds the
+    /// conversion — `double f() => 1;` is clean). Bare `return;` is a
+    /// `void` expression.
+    fn return_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        match to {
             Ty::Void => match from {
                 Ty::Void | Ty::Dynamic | Ty::Null => Some(true),
                 Ty::Unknown => None,
@@ -6577,20 +6669,6 @@ impl<'a> Engine<'a> {
                 Ty::Dynamic => Some(matches!(to, Ty::Dynamic | Ty::Void) || !self.strict.casts),
                 _ => self.assignable(from, to, from_literal),
             },
-        };
-        if verdict == Some(false) {
-            let (a0, a1, a2) = (
-                self.ty_display(from),
-                self.ty_display(to),
-                self.strings.resolve(name).to_string(),
-            );
-            self.emit3(
-                SemanticCode::ReturnOfInvalidType(host),
-                range,
-                &a0,
-                &a1,
-                &a2,
-            );
         }
     }
 
@@ -6870,21 +6948,18 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Renders `ty` in the official display form through [`Ty::render`] —
+    /// the single named-type text source (the model owns the
+    /// `Name<Arg, ...>?` face; the diagnoser only supplies the tables). The
+    /// face-less fallback renders argument-less, exact while capture
+    /// interns nothing.
+    fn render_ty(&self, ty: Ty) -> String {
+        let fallback = ArgPool::default();
+        ty.render(self.strings, self.unit_args.unwrap_or(&fallback))
+    }
+
     fn ty_display(&self, ty: Ty) -> String {
-        match ty {
-            Ty::Unknown => String::new(),
-            Ty::Null => "Null".to_string(),
-            Ty::Dynamic => "dynamic".to_string(),
-            Ty::Void => "void".to_string(),
-            Ty::Named { name, nullable } => {
-                let text = self.strings.resolve(name);
-                if nullable {
-                    format!("{text}?")
-                } else {
-                    text.to_string()
-                }
-            }
-        }
+        self.render_ty(ty)
     }
 
     /// The M1 assignability decision ([`Ty::assignable_from`] plus the
@@ -6918,10 +6993,12 @@ impl<'a> Engine<'a> {
             Ty::Named {
                 name: from_name,
                 nullable: false,
+                ..
             },
             Ty::Named {
                 name: to_name,
                 nullable: false,
+                ..
             },
         ) = (from, to)
         else {
@@ -6958,6 +7035,7 @@ impl<'a> Engine<'a> {
         let Ty::Named {
             name,
             nullable: false,
+            ..
         } = row.ty
         else {
             return false;
@@ -8514,6 +8592,98 @@ fn merge_source_ordered(base: Vec<Diagnostic>, extra: Vec<Diagnostic>) -> Vec<Di
     merged
 }
 
+/// One deferred negative assignability verdict (#477 S1): the check ran on
+/// the unpromoted parse-time types and staged instead of emitting; the
+/// teardown re-decides it against the flow layer's promoted-read facts.
+struct StagedCheck {
+    /// The family: its re-check matrix and emission shape.
+    kind: StagedKind,
+    /// The source expression's own span — the join key. Only a fact on
+    /// exactly this range can stand for the expression: a promoted-read
+    /// fact spans the bare read's identifier token, and any compound shape
+    /// (`x.foo`, `x + 1`) spans wider and misses.
+    range: SourceRange,
+    /// The parse-time source type (the declared type of an unpromoted
+    /// read, or a compound expression's row type).
+    from: Ty,
+    /// The destination type (the check family's decided side).
+    to: Ty,
+    /// Whether `from` is a primitive literal (the int→double conversion
+    /// fact [`Engine::assignable`] consumes).
+    literal: bool,
+}
+
+/// The staging family ([`StagedCheck::kind`]).
+enum StagedKind {
+    /// `invalid_assignment` (`x = e` targets and declaration initializers).
+    Assignment,
+    /// `argument_type_not_assignable`.
+    Argument,
+    /// `return_of_invalid_type`: the host kind and executable name ride
+    /// along (the message's third placeholder).
+    Return { host: ExecKind, name: StringId },
+}
+
+/// The promoted-read staging (#477 S1): the flow facts' promotion rows as
+/// `(read span, promoted type)`, kept offset-sorted for the teardown join.
+#[derive(Default)]
+struct PromotionStaging {
+    rows: Vec<(SourceRange, Ty)>,
+}
+
+impl PromotionStaging {
+    /// Stages one promotion. One read event fires one fact, so equal
+    /// offsets are not expected; a diverging repeat (a loop body walked
+    /// under two states) would leave no single type that stands for the
+    /// span — poisoned, the join misses, the unpromoted verdict stands.
+    fn stage(&mut self, range: SourceRange, ty: Ty) {
+        match self
+            .rows
+            .binary_search_by(|(r, _)| r.offset.cmp(&range.offset))
+        {
+            Ok(index) => {
+                if self.rows[index] != (range, ty) {
+                    self.rows.remove(index);
+                }
+            }
+            Err(index) => self.rows.insert(index, (range, ty)),
+        }
+    }
+
+    /// The promoted type of the read at exactly `range`, when one staged.
+    fn promoted(&self, range: SourceRange) -> Option<Ty> {
+        let index = self
+            .rows
+            .binary_search_by(|(r, _)| r.offset.cmp(&range.offset))
+            .ok()?;
+        let (staged, ty) = self.rows[index];
+        (staged == range).then_some(ty)
+    }
+}
+
+/// A flow fact's promoted type in the semantic lattice; `None` for the
+/// promotions that never stage. A named flow type recovers its spelling
+/// through [`Flow::name_lexeme`] (the S0 parallel name table) and interns
+/// into the live string table, so repeat reads share one id.
+fn staged_promotion(ty: FlowTy, flow: &Flow<'_>, strings: &StringTable) -> Option<Ty> {
+    Some(match ty.base {
+        FlowBase::Name(id) => Ty::Named {
+            name: strings.intern(flow.name_lexeme(id)),
+            nullable: ty.nullable,
+            args: ArgListId::EMPTY,
+        },
+        FlowBase::Dynamic => Ty::Dynamic,
+        FlowBase::Null => Ty::Null,
+        FlowBase::Unknown => Ty::UNKNOWN,
+        // The drop rule: the official promotion only subtype-narrows
+        // (`type_system.dart:1729` `tryPromoteToType`), so a `void`
+        // promotion cannot arise, and a `Never` promotion marks a path
+        // this verifier does not reach — the M1 lattice has no such source
+        // type, and staging one would decide from a fiction.
+        FlowBase::Void | FlowBase::Never => return None,
+    })
+}
+
 /// The analyzer language-strictness scalars (`analysis_options.yaml`
 /// `analyzer.language.*`, PRD §12.1), consumed at the semantic verdict
 /// layer. Every mode defaults to `false` — the official posture
@@ -8626,6 +8796,38 @@ pub fn diagnose_with(
     );
     parser.parse_unit();
     drop(parser);
+    // The flow layer's facts fold in exactly once, before the engine
+    // unwraps (#477 S1): the promoted-read rows stage for the assignability
+    // families' teardown re-decision, the dead-code rows collect for the
+    // report tail's merge below.
+    let facts = flow.borrow_mut().take_facts();
+    let mut promotions = PromotionStaging::default();
+    let mut flow_diagnostics = Vec::new();
+    for fact in facts {
+        match fact {
+            FlowFact::DeadCode { span } => {
+                let code = SemanticCode::DeadCode;
+                flow_diagnostics.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message("", ""),
+                    file,
+                    span.range,
+                    code.correction_message(""),
+                ));
+            }
+            FlowFact::PromotedRead { span, ty } => {
+                if let Some(promoted) = staged_promotion(ty, &flow.borrow(), strings) {
+                    promotions.stage(span.range, promoted);
+                }
+            }
+            FlowFact::UnassignedRead { .. } => {}
+            // #676's body-completion fact has no S1 consumer — the staging
+            // join for `body_might_complete_normally_nullable` is the
+            // follow-up lane's face (goal #677, Producer B).
+            FlowFact::BodyMayCompleteNormally { .. } => {}
+        }
+    }
     // The parser held the only other strong reference and is gone, so the
     // unwrap cannot fail.
     let mut engine = Rc::into_inner(engine)
@@ -8641,27 +8843,17 @@ pub fn diagnose_with(
     // the report; the staged emissions merge source-ordered into the tail.
     engine.finalize_usage();
     let mut report = std::mem::take(&mut engine.report);
+    // The staged assignability verdicts re-decide against the promotions
+    // and merge ahead of the flow rows: the assignability families are
+    // resolution-phase diagnostics while the dead-code rows and the usage
+    // cluster are the verifier passes, so at a shared anchor the official
+    // collection order is assignability before dead_code before
+    // unused_local_variable — each merge's `<=` tie-break keeps that order
+    // into the final list.
+    let survivors = engine.filter_staged(&promotions);
+    report.diagnostics = merge_source_ordered(report.diagnostics, survivors);
     // The flow layer's dead-code facts join the source-ordered tail of the
     // report (both sides are offset-sorted; the merge keeps the invariant).
-    // The flow merge runs FIRST: dead_code is a resolution-phase diagnostic
-    // while the usage cluster is the post-resolution verifier, so at a
-    // shared anchor (dead `var x = 1;` and its unread `x`) the official
-    // collection order is dead_code before unused_local_variable — the
-    // `<=` tie-break below then keeps that order into the final list.
-    let mut flow_diagnostics = Vec::new();
-    for fact in flow.borrow_mut().take_facts() {
-        if let FlowFact::DeadCode { span } = fact {
-            let code = SemanticCode::DeadCode;
-            flow_diagnostics.push(Diagnostic::new(
-                code.severity(),
-                code.code_info(),
-                code.message("", ""),
-                file,
-                span.range,
-                code.correction_message(""),
-            ));
-        }
-    }
     report.diagnostics = merge_source_ordered(report.diagnostics, flow_diagnostics);
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
@@ -10107,6 +10299,7 @@ impl ParserListener for DiagnoseListener<'_> {
             _ => Ty::Named {
                 name: engine.strings.intern(text),
                 nullable: question.is_some(),
+                args: ArgListId::EMPTY,
             },
         };
         engine.armed_ty = Some(ty);
@@ -10660,7 +10853,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // `p as X` covers X's values (official `castPatternToSpace`).
         let leaf = match engine.armed_ty {
-            Some(Ty::Named { name, nullable }) => Restriction::Named(name, nullable),
+            Some(Ty::Named { name, nullable, .. }) => Restriction::Named(name, nullable),
             _ => Restriction::Unknown,
         };
         // The still-armed type is the cast target: the pair at
@@ -10751,10 +10944,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `visitConstantPattern`'s `_canBeEqual` inputs,
         // constant_verifier.dart:140-165).
         let constant = engine.pending_const_ty.take().or_else(|| match leaf {
-            Restriction::EnumValue(enum_name, _) => Some(Ty::Named {
-                name: enum_name,
-                nullable: false,
-            }),
+            Restriction::EnumValue(enum_name, _) => Some(Ty::named(enum_name)),
             _ => None,
         });
         let at = engine
@@ -10788,10 +10978,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // (type_analyzer.dart:723-756): the head type is the pattern's
         // required type.
         if let Some(head) = head {
-            let required = Ty::Named {
-                name: head,
-                nullable: false,
-            };
+            let required = Ty::named(head);
             engine.check_pattern_never_matches(first_identifier.range, required);
         }
         let fields = engine
@@ -10852,12 +11039,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 Some(Ty::Named {
                     name: ty_name,
                     nullable,
+                    ..
                 }) => {
                     engine.bind_var_type(
                         name,
                         Ty::Named {
                             name: ty_name,
                             nullable,
+                            args: ArgListId::EMPTY,
                         },
                     );
                     engine.pattern_leaf(Restriction::Named(ty_name, nullable));
@@ -10889,7 +11078,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(required) = engine.armed_ty {
             engine.check_pattern_never_matches(_wildcard.range, required);
         }
-        let Some(Ty::Named { name, nullable }) = engine.armed_ty.take() else {
+        let Some(Ty::Named { name, nullable, .. }) = engine.armed_ty.take() else {
             return;
         };
         engine.pattern_leaf(Restriction::Named(name, nullable));
@@ -11137,10 +11326,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // The constant-pattern face: an int literal's static type
         // (`hasPrimitiveEquality`, constant_verifier.dart:140-165).
         if engine.pattern_depth > 0 {
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[0],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[0]));
             engine.pending_const_at = Some(token.range);
         }
     }
@@ -11154,10 +11340,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.push_primitive_row(token, 0);
         engine.const_int_literal(token);
         if engine.pattern_depth > 0 {
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[0],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[0]));
             engine.pending_const_at = Some(token.range);
         }
     }
@@ -11169,10 +11352,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.push_primitive_row(token, 1);
         engine.const_double_literal(token);
         if engine.pattern_depth > 0 {
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[1],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[1]));
             engine.pending_const_at = Some(token.range);
         }
     }
@@ -11186,10 +11366,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.push_primitive_row(token, 1);
         engine.const_double_literal(token);
         if engine.pattern_depth > 0 {
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[1],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[1]));
             engine.pending_const_at = Some(token.range);
         }
     }
@@ -11201,10 +11378,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if engine.pattern_depth > 0 {
             let is_true = engine.text_of(token) == Some("true");
             engine.pending_const = Some(Restriction::BoolValue(is_true));
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[3],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[3]));
             engine.pending_const_at = Some(token.range);
         }
         engine.push_primitive_row(token, 3);
@@ -11257,10 +11431,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // interpolated one is not a `hasPrimitiveEquality` constant
         // (constant_verifier.dart:140-165).
         if engine.pattern_depth > 0 && interpolation_count == 0 {
-            engine.pending_const_ty = Some(Ty::Named {
-                name: engine.primitive_ids[4],
-                nullable: false,
-            });
+            engine.pending_const_ty = Some(Ty::named(engine.primitive_ids[4]));
             engine.pending_const_at = Some(end.range);
         }
     }
@@ -12162,7 +12333,9 @@ impl NameTy {
         match ty {
             Ty::Unknown | Ty::Dynamic | Ty::Void => NameTy::TopNullable,
             Ty::Null => NameTy::Null,
-            Ty::Named { name, nullable } => NameTy::Named(name, nullable),
+            // The S0 side channel keeps its name-level shape; the argument
+            // slot stays in the semantic lattice (`Ty`), not here.
+            Ty::Named { name, nullable, .. } => NameTy::Named(name, nullable),
         }
     }
 }
@@ -12820,6 +12993,140 @@ mod tests {
         );
     }
 
+    /// The promotion consumption (#477 S1): a read promoted by an `is`
+    /// test types its assignment sites with the promoted type, so the
+    /// promoted branch's `int y = x;` is clean while the identical
+    /// unpromoted shape still reports `invalid_assignment` against the
+    /// declared `int?` (the official read's static type IS the promoted
+    /// one, `property_element_resolver.dart:2158-2166`).
+    ///
+    /// Hand-trace: flow emits one `PromotedRead` on the branch's `x` read
+    /// (`int` narrows `int?`, no type arguments — the #611 gate open); the
+    /// teardown join keys on the read's exact span and substitutes, the
+    /// re-run verdict answers `Some(true)`, the staged row never emits.
+    #[test]
+    fn promotion_cleans_only_the_promoted_branch_assignment() {
+        let report = report(
+            "class int {} \
+             void promoted() { int? x = 1; if (x is int) { int y = x; } } \
+             void unpromoted() { int? x = 1; int y = x; }",
+        );
+        let assignments: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "invalid_assignment")
+            .collect();
+        assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
+        assert_eq!(
+            assignments[0].message,
+            "A value of type 'int?' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// The drop rule: a promotion to `Never` never stages
+    /// (`type_system.dart:1729` `tryPromoteToType` only subtype-narrows,
+    /// and the M1 lattice has no bottom source type), so the join misses
+    /// and the unpromoted verdict stands — under-report, never a
+    /// fabricated clean.
+    #[test]
+    fn never_promotion_does_not_clean_the_row() {
+        let report = report(
+            "class int {} class Never {} \
+             void f() { int? x = 1; if (x is Never) { int y = x; } }",
+        );
+        let assignments: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "invalid_assignment")
+            .collect();
+        assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
+    }
+
+    /// The conversion's drop rule at the seam: `void` and `Never` promoted
+    /// types return `None` (never stage); the special bases map one-to-one
+    /// onto the M1 lattice.
+    #[test]
+    fn staged_promotion_drops_void_and_never() {
+        let strings = StringTable::new();
+        let scanned = dartq_scanner::scan(
+            "",
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            FileTable::new().intern(Path::new("test.dart")),
+        );
+        let flow = Flow::new(&scanned.tokens, "");
+        let never_stages = |ty| staged_promotion(ty, &flow, &strings).is_none();
+        assert!(never_stages(FlowTy {
+            base: FlowBase::Void,
+            nullable: false
+        }));
+        assert!(never_stages(FlowTy {
+            base: FlowBase::Never,
+            nullable: false
+        }));
+        assert_eq!(
+            staged_promotion(
+                FlowTy {
+                    base: FlowBase::Dynamic,
+                    nullable: false
+                },
+                &flow,
+                &strings
+            ),
+            Some(Ty::Dynamic)
+        );
+        assert_eq!(
+            staged_promotion(
+                FlowTy {
+                    base: FlowBase::Null,
+                    nullable: true
+                },
+                &flow,
+                &strings
+            ),
+            Some(Ty::Null)
+        );
+    }
+
+    /// The join is span-exact: the same start with a wider span (a compound
+    /// expression headed by the promoted read, `x.foo`) never joins; an
+    /// empty staging misses everything; a diverging repeat poisons the
+    /// span; an identical repeat collapses.
+    #[test]
+    fn promotion_staging_joins_exact_spans_only() {
+        let strings = StringTable::new();
+        let int = strings.intern("int");
+        let mut staging = PromotionStaging::default();
+        let read = SourceRange {
+            offset: 4,
+            length: 1,
+        };
+        // No facts, no join.
+        assert_eq!(staging.promoted(read), None);
+        staging.stage(read, Ty::named(int));
+        assert_eq!(staging.promoted(read), Some(Ty::named(int)));
+        // `x.foo` starts at the promoted read but is not the bare read.
+        let wide = SourceRange {
+            offset: 4,
+            length: 5,
+        };
+        assert_eq!(staging.promoted(wide), None);
+        let other = SourceRange {
+            offset: 5,
+            length: 1,
+        };
+        assert_eq!(staging.promoted(other), None);
+        // Two walks disagreeing on the promoted type leave nothing that
+        // stands for the span.
+        staging.stage(read, Ty::Dynamic);
+        assert_eq!(staging.promoted(read), None);
+        // An identical repeat re-stages.
+        staging.stage(read, Ty::named(int));
+        assert_eq!(staging.promoted(read), Some(Ty::named(int)));
+    }
+
     /// The int→double literal conversion (`analyzeIntLiteral`'s
     /// `convertToDouble`): an int *literal* in a double context is clean on
     /// every context site the M1 facts check (declaration initializer,
@@ -13384,6 +13691,136 @@ mod tests {
         // The label's own span: the `b` in `c.m(b: 1)` (offset 51, length 1).
         assert_eq!(report.diagnostics[0].range.offset, 51);
         assert_eq!(report.diagnostics[0].range.length, 1);
+    }
+
+    /// The declaration-shape discriminator for the corpus miss
+    /// (`undefined_member_matrix.dart:17`): the pin above covers only the
+    /// `var`/`var` shape — its return the parser drops as a modifier
+    /// (members.rs:1070) — so no green pin exercised a typed return through
+    /// this face. The oracle runs the membership test on the resolved
+    /// invocation whatever the return type's spelling
+    /// (`type_analyzer.dart:5742-5822`), so `int m(int a) => a;` must
+    /// report the label exactly like `var m(var a) => a;`.
+    ///
+    /// Hand-trace: the label fires with the callee row still the qualified
+    /// placeholder sitting on its receiver (`c` binds `Typed{C}`), the walk
+    /// resolves `C.m` (the corpus diff shows no `undefined_method` for this
+    /// invocation), so the membership test runs on `C.m`'s captured formals
+    /// — positional `a`, no named entry → resolved, not defined → emit at
+    /// the `b` label.
+    ///
+    /// The fixture carries the harness's `class int {}` stub (`report()`
+    /// has no core library): without it the head's bare `int` lands as a
+    /// `TypeUse(Missing)` row — an `undefined_class` at pass 2 that would
+    /// crowd the exact-code pin (the #537 convention).
+    #[test]
+    fn named_argument_miss_reports_on_typed_member_callee() {
+        let report =
+            report("class int {} class C { int m(int a) => a; } void use(C c) { c.m(b: 1); }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_named_parameter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The named parameter 'b' isn't defined."
+        );
+        // The label's own span: the `b` in `c.m(b: 1)` (length 1 — the typed
+        // declaration is the var one's exact width; the 13-byte `class int
+        // {} ` stub shifts the label from the var pin's 51 to 64).
+        assert_eq!(report.diagnostics[0].range.offset, 64);
+        assert_eq!(report.diagnostics[0].range.length, 1);
+    }
+
+    /// The full `undefined_member_matrix.dart` corpus face in one engine
+    /// run: the member-undefined family on one nominal receiver — getter
+    /// read, setter write, bare invocation, an undeclared named label on a
+    /// declared method, and a binary operator the class declares none of.
+    /// `print` is declared locally because the unit harness has no
+    /// dart:core priming (its absence would add `undefined_function` rows
+    /// the SDK-backed oracle run never sees).
+    ///
+    /// The five codes assert in source order (offset-sorted; the
+    /// named-parameter row emits at label time during the walk, the other
+    /// four at pass 2, so the report's raw order interleaves differently).
+    /// The named-parameter row is #591's acceptance test: the corpus file
+    /// flips to matched once the typed member callee's captured formals
+    /// ride the membership read.
+    #[test]
+    fn undefined_member_matrix_corpus_matches_oracle() {
+        // The `class int {}` stub is the harness's core stand-in (`report()`
+        // has no dart:core priming — the #537 convention): without it every
+        // bare `int` in the declaration heads lands as a `TypeUse(Missing)`
+        // row, an `undefined_class` at pass 2 that crowds the five-code pin.
+        let source = "class int {}\n\
+             class C {\n\
+             \x20 int m(int a) => a;\n\
+             }\n\
+             \n\
+             void print(int x) {}\n\
+             \n\
+             void use(C c) {\n\
+             \x20 print(c.noSuchGetter);\n\
+             \x20 c.noSuchSetter = 1;\n\
+             \x20 c.noSuchMemberHere();\n\
+             \x20 c.m(b: 1);\n\
+             \x20 print(c + c);\n\
+             }\n";
+        // The named-parameter row anchors on the label: the `b` of
+        // `c.m(b: 1);` — the source prefix through the label's opening paren,
+        // so the expected offset derives from the fixture instead of a
+        // hand-count.
+        let label_head = "class int {}\n\
+             class C {\n\
+             \x20 int m(int a) => a;\n\
+             }\n\
+             \n\
+             void print(int x) {}\n\
+             \n\
+             void use(C c) {\n\
+             \x20 print(c.noSuchGetter);\n\
+             \x20 c.noSuchSetter = 1;\n\
+             \x20 c.noSuchMemberHere();\n\
+             \x20 c.m(";
+        let report = report(source);
+        let mut by_offset: Vec<(u32, &str)> = report
+            .diagnostics
+            .iter()
+            .map(|d| (d.range.offset, d.code.name))
+            .collect();
+        by_offset.sort_unstable_by_key(|(offset, _)| *offset);
+        let codes: Vec<&str> = by_offset.into_iter().map(|(_, code)| code).collect();
+        assert_eq!(
+            codes,
+            [
+                "undefined_getter",
+                "undefined_setter",
+                "undefined_method",
+                "undefined_named_parameter",
+                "undefined_operator",
+            ],
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| &d.code.name)
+                .collect::<Vec<_>>()
+        );
+        // The named-parameter row anchors on the label: the `b` of
+        // `c.m(b: 1);` — the label sits right after the fixture's `c.m(`
+        // prefix, so the expected offset derives from that prefix instead of
+        // a hand-count.
+        let named = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "undefined_named_parameter")
+            .expect("named-parameter row present");
+        let expected_offset = u32::try_from(label_head.len()).unwrap();
+        assert_eq!(named.range.offset, expected_offset);
+        assert_eq!(named.range.length, 1);
+        assert_eq!(named.message, "The named parameter 'b' isn't defined.");
     }
 
     /// The named-argument membership test runs only against a real

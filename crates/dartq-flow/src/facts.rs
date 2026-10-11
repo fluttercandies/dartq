@@ -45,4 +45,20 @@ pub enum FlowFact {
         /// The promoted type on this control-flow path (chain head).
         ty: Ty,
     },
+    /// The end of an executable body is reachable: the body can complete
+    /// normally by falling off its end. The pure reachability face of the
+    /// official `body_might_complete_normally` gate — the official first
+    /// decision is `if (!flow.isReachable)` (`type_analyzer.dart:647-652`),
+    /// before any return-type face. Every executable kind emits (method,
+    /// top-level function, constructor, factory, local function,
+    /// closure); the consumer owns the remaining gates (block-body shape,
+    /// void/`dynamic`/`null` return faces, nullability) and the
+    /// diagnostic's anchor remap (the official row reports at a block
+    /// body's left bracket, not the end token).
+    BodyMayCompleteNormally {
+        /// Span of the executable's end token: the closing `}` of a block
+        /// body, the end of an `=>` body's expression, or the `;` of an
+        /// empty body.
+        span: TokenSpan,
+    },
 }

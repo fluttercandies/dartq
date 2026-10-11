@@ -80,7 +80,7 @@ use dartq_source::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
+    ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
     FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
@@ -1158,6 +1158,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     _ => Ty::Named {
                         name: spelling,
                         nullable: question.is_some(),
+                        args: ArgListId::EMPTY,
                     },
                 });
     }
@@ -1983,6 +1984,7 @@ mod tests {
             Ty::Named {
                 name: id(&strings, "int"),
                 nullable: true,
+                args: ArgListId::EMPTY,
             }
         );
         let gg = elements
@@ -1992,6 +1994,49 @@ mod tests {
             .get(&id(&strings, "gg"))
             .unwrap();
         assert!(gg.formals.is_none());
+    }
+
+    /// #591 capture-half discriminator: the typed-return × plain-method
+    /// shape behind the `undefined_member_matrix` corpus miss must carry the
+    /// depth-0 formal table, exactly like the `void`-return and no-return
+    /// neighbors (the diagnoser's named-argument membership test reads
+    /// `MemberEntry::formals` verbatim).
+    ///
+    /// The control arms isolate the losing event should the typed arm miss:
+    /// `void m(...)` fires `handle_void_keyword` (no type-reference
+    /// identifier event), `plain(...)` fires `handle_no_type`, while
+    /// `int m(...)` fires the head's `handle_identifier(TypeReference)` +
+    /// `handle_type` pair before the name.
+    #[test]
+    fn typed_return_method_captures_formals() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C { \
+               int m(int a) => a; \
+               void v(int b) {} \
+               plain(int c) {} \
+             }",
+            &strings,
+        );
+        let member = |name: &str| {
+            elements
+                .container(id(&strings, "C"))
+                .unwrap()
+                .members
+                .get(&id(&strings, name))
+                .map(|entry| (entry.kind, entry.formals.as_deref()))
+        };
+        let (kind, formals) = member("m").expect("typed-return m captured");
+        assert_eq!(kind, MemberKind::Method);
+        let formals = formals.expect("typed-return m formals captured");
+        assert_eq!(formals.positional.len(), 1);
+        assert_eq!(formals.positional[0].name, id(&strings, "a"));
+        let (kind, formals) = member("v").expect("void-return v captured");
+        assert_eq!(kind, MemberKind::Method);
+        assert!(formals.is_some(), "void-return control");
+        let (kind, formals) = member("plain").expect("no-return plain captured");
+        assert_eq!(kind, MemberKind::Method);
+        assert!(formals.is_some(), "no-return control");
     }
 
     /// Type-parameter counts per declaration, from the depth-1 group only:
@@ -2051,6 +2096,7 @@ mod tests {
             Ty::Named {
                 name: id(&strings, "int"),
                 nullable: true,
+                args: ArgListId::EMPTY,
             }
         );
         assert_eq!(decl("make").return_ty, Ty::named(id(&strings, "C")));
@@ -2059,6 +2105,7 @@ mod tests {
             Ty::Named {
                 name: id(&strings, "C"),
                 nullable: true,
+                args: ArgListId::EMPTY,
             }
         );
         assert_eq!(decl("nothing").return_ty, Ty::Void);
@@ -2074,6 +2121,7 @@ mod tests {
             Ty::Named {
                 name: id(&strings, "int"),
                 nullable: true,
+                args: ArgListId::EMPTY,
             }
         );
     }

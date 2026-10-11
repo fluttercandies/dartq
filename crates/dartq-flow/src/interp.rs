@@ -1137,7 +1137,7 @@ impl Interp<'_> {
         });
     }
 
-    fn exec_end(&mut self, is_expr: bool) {
+    fn exec_end(&mut self, is_expr: bool, end: TokenSpan) {
         // The executable's end covers only the intervals anchored inside
         // it (official `flowEnd` on the declaration:
         // `_containsFirstDeadNode` fails for an anchor in the enclosing
@@ -1163,6 +1163,14 @@ impl Interp<'_> {
         if collecting {
             self.collect_pop(is_closure);
             return;
+        }
+        // The body's fall-through completion (official
+        // `checkForBodyMayCompleteNormally`'s first decision,
+        // type_analyzer.dart:647-652): the current state IS the body's
+        // exit state here — read before the closure restore below puts
+        // the enclosing state back.
+        if self.reachable() {
+            self.emit(FlowFact::BodyMayCompleteNormally { span: end });
         }
         if is_closure {
             self.current = saved;
@@ -1492,8 +1500,8 @@ impl Interp<'_> {
                 self.exec_begin(*is_closure, events, i, match_of);
                 Control::Continue
             }
-            Ev::ExecEnd { is_expr } => {
-                self.exec_end(*is_expr);
+            Ev::ExecEnd { is_expr, end } => {
+                self.exec_end(*is_expr, *end);
                 Control::Continue
             }
             Ev::ForBegin { span } => self.for_begin(*span, events, i, match_of),

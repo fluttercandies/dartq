@@ -48,8 +48,8 @@ use blake3::Hasher;
 use dartq_source::{StringId, StringTable};
 
 use crate::model::{
-    Container, ContainerKind, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind,
-    TopDecl, Ty,
+    ArgPool, Container, ContainerKind, FileElements, Formal, Formals, MemberEntry, MemberKind,
+    MicroKind, TopDecl, Ty,
 };
 
 /// The signature-composition version (PRD §5.6): bumped with any change to
@@ -58,8 +58,11 @@ use crate::model::{
 /// and member type-parameter names (#350 — the constructor-undefined faces).
 /// v3: the header-residue names per container and the extension faces with
 /// their `on` types (#491 S1 + #476 — the clause-attribution fix and the
-/// extension-application faces changed the hashed face).
-pub const SIGNATURE_VERSION: u32 = 3;
+/// extension-application faces changed the hashed face). v4: the explicit
+/// type arguments of every declared type (#701 — an argument edit is an
+/// element-face edit; arguments hash as content in declaration order, so
+/// interning order stays irrelevant).
+pub const SIGNATURE_VERSION: u32 = 4;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -102,7 +105,7 @@ impl FileElements {
     /// bump-invalidates-everything discipline.
     #[must_use]
     pub fn api_signature_with_version(&self, strings: &StringTable, version: u32) -> ApiSignature {
-        let mut face = Face::new(strings);
+        let mut face = Face::new(strings, &self.type_args);
         face.field("sig-v");
         face.uint(u64::from(version));
         face.top_decls(self);
@@ -141,15 +144,19 @@ struct Face<'a> {
     /// Sorted-name scratch, nested level (container members).
     inner: Vec<StringId>,
     strings: &'a StringTable,
+    /// The unit's argument pool — explicit type arguments hash as their
+    /// interned content (never as pool slots, which carry interning order).
+    args: &'a ArgPool,
 }
 
 impl<'a> Face<'a> {
-    fn new(strings: &'a StringTable) -> Self {
+    fn new(strings: &'a StringTable, args: &'a ArgPool) -> Self {
         Self {
             buf: Vec::with_capacity(256),
             names: Vec::new(),
             inner: Vec::new(),
             strings,
+            args,
         }
     }
 
@@ -204,8 +211,15 @@ impl<'a> Face<'a> {
             Ty::Null => self.field("Null"),
             Ty::Dynamic => self.field("dynamic"),
             Ty::Void => self.field("void"),
-            Ty::Named { name, nullable } => {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
                 self.field(self.strings.resolve(name));
+                for arg in self.args.get(args) {
+                    self.ty(*arg);
+                }
                 if nullable {
                     self.field("?");
                 }
@@ -587,5 +601,39 @@ mod tests {
         let live = elements.api_signature_with_version(&strings, SIGNATURE_VERSION);
         assert_eq!(elements.api_signature(&strings), live);
         assert_eq!(ApiSignature::as_bytes(&live).len(), 16);
+    }
+
+    /// An explicit type-argument edit flips the signature (the v4 face),
+    /// and the same arguments interned through two independent pool
+    /// histories hash equal — content rides the hash, never slots
+    /// (interning order must stay irrelevant, acceptance 282.c's law).
+    /// Each face interns through its own elements' pool — the one-pool-
+    /// one-universe contract (`ArgPool` module docs) the signature reads.
+    #[test]
+    fn argument_edits_flip_and_pool_history_stays_irrelevant() {
+        let strings = StringTable::new();
+        let (int, list) = (strings.intern("int"), strings.intern("List"));
+        let mut elements = FileElements::default();
+        let mut decl = TopDecl::bare(MicroKind::TopLevelVar);
+        decl.var_ty = Ty::named(list);
+        elements.decls.insert(strings.intern("f"), decl);
+        let bare = elements.api_signature(&strings);
+
+        let with_args = || {
+            let mut elements = FileElements::default();
+            let mut decl = TopDecl::bare(MicroKind::TopLevelVar);
+            decl.var_ty = elements
+                .type_args_mut()
+                .named(list, false, &[Ty::named(int)]);
+            elements.decls.insert(strings.intern("f"), decl);
+            elements.api_signature(&strings)
+        };
+        let with_int = with_args();
+        assert_ne!(bare, with_int, "an argument edit is an element-face edit");
+        assert_eq!(
+            with_int,
+            with_args(),
+            "same content, separate pools: equal face"
+        );
     }
 }

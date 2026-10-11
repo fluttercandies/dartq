@@ -28,9 +28,11 @@ pub enum Ev {
     },
     /// `is_expr`: the executable ended as an expression (function
     /// expression) and nets one value for its consumer; a local function
-    /// declaration ends as a statement and nets none.
+    /// declaration ends as a statement and nets none. `end`: the
+    /// executable's end token (the completion fact's anchor).
     ExecEnd {
         is_expr: bool,
+        end: TokenSpan,
     },
     BlockBodyBegin,
     BlockBodyEnd,

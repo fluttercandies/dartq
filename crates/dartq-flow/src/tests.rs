@@ -94,7 +94,9 @@ fn dead_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            FlowFact::UnassignedRead { .. } | FlowFact::PromotedRead { .. } => None,
+            FlowFact::UnassignedRead { .. }
+            | FlowFact::PromotedRead { .. }
+            | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
         .collect()
 }
@@ -109,8 +111,22 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
-            FlowFact::DeadCode { .. } | FlowFact::PromotedRead { .. } => None,
+            FlowFact::DeadCode { .. }
+            | FlowFact::PromotedRead { .. }
+            | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
+        .collect()
+}
+
+/// The read-face facts of a source (dead code, unassigned reads,
+/// promoted reads) without the body-completion rows: the assertion face
+/// of the tests that pin those three faces. A reachable executable
+/// emits a completion row by design (#676), so a whole-list emptiness
+/// check would observe it.
+fn read_facts_of(source: &str) -> Vec<FlowFact> {
+    facts_of(source)
+        .into_iter()
+        .filter(|fact| !matches!(fact, FlowFact::BodyMayCompleteNormally { .. }))
         .collect()
 }
 
@@ -475,12 +491,12 @@ fn promoted_read_emits_the_promoted_type() {
 fn unpromoted_and_demoted_reads_emit_nothing() {
     // No promotion ever applied.
     let plain = "void f(int x) { x; }";
-    assert!(facts_of(plain).is_empty());
+    assert!(read_facts_of(plain).is_empty());
     // Promoted, then written (demoted): the read after the write sees
     // the declared type again. The write target's own facts retract with
     // the assignment (the identifier is the write).
     let demoted = "void f(int? x) { if (x is int) { x = null; x; } }";
-    assert!(facts_of(demoted).is_empty());
+    assert!(read_facts_of(demoted).is_empty());
 }
 
 /// (c) The #611 suppression gate: a promotion whose tested type spelled
@@ -491,7 +507,7 @@ fn unpromoted_and_demoted_reads_emit_nothing() {
 fn arg_bearing_promotions_suppressed_arg_free_emitted() {
     // `x is List<int>`: real promotion, erased arguments — suppressed.
     let arg_bearing = "void f(List? x) { if (x is List<int>) { x; } }";
-    assert!(facts_of(arg_bearing).is_empty(), "{arg_bearing}");
+    assert!(read_facts_of(arg_bearing).is_empty(), "{arg_bearing}");
     // `x is List`: the same promotion shape, no arguments — emitted.
     let arg_free = "void f(List? x) { if (x is List) { x; } }";
     let promoted = promoted_tys(arg_free);
@@ -500,7 +516,7 @@ fn arg_bearing_promotions_suppressed_arg_free_emitted() {
     assert!(!promoted[0].nullable);
     // A multi-argument tested type suppresses too (same latch).
     let multi = "void f(Map? x) { if (x is Map<String, int>) { x; } }";
-    assert!(facts_of(multi).is_empty());
+    assert!(read_facts_of(multi).is_empty());
 }
 
 /// (d) The name-recovery face: `Base::Name(id)` round-trips through
@@ -531,20 +547,24 @@ fn name_lexeme_recovers_interned_spellings() {
 }
 
 /// (e) `take_facts` stays offset-sorted with the new variant mixed in
-/// (the sort arm covers all three fact kinds).
+/// (the sort arm covers all four fact kinds).
 #[test]
 fn take_facts_stays_offset_sorted_with_promotion_reads() {
     let source = "void f() { return; 1; } void g(num x) { if (x is int) { x; } }";
     let facts = facts_of(source);
-    assert_eq!(facts.len(), 2, "{facts:?}");
+    // f ends unreachable (no completion row); g falls through — its row
+    // anchors at the unit's last token, so it sorts last.
+    assert_eq!(facts.len(), 3, "{facts:?}");
     assert!(matches!(facts[0], FlowFact::DeadCode { .. }));
     assert!(matches!(facts[1], FlowFact::PromotedRead { .. }));
+    assert!(matches!(facts[2], FlowFact::BodyMayCompleteNormally { .. }));
     let offsets: Vec<u32> = facts
         .iter()
         .map(|fact| match fact {
             FlowFact::DeadCode { span }
             | FlowFact::UnassignedRead { span, .. }
-            | FlowFact::PromotedRead { span, .. } => span.range.offset,
+            | FlowFact::PromotedRead { span, .. }
+            | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
         })
         .collect();
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
@@ -562,7 +582,7 @@ fn take_facts_stays_offset_sorted_with_promotion_reads() {
 #[test]
 fn plain_assign_target_retracts_its_promoted_read() {
     let source = "void f() { String? x; if (x is String) { x = 'a'; } }";
-    let facts = facts_of(source);
+    let facts = read_facts_of(source);
     let target_offset = source.find("x = 'a'").expect("target in source") as u32;
     assert_eq!(facts.len(), 1, "{facts:?}");
     match &facts[0] {
@@ -574,6 +594,83 @@ fn plain_assign_target_retracts_its_promoted_read() {
         }
         other => panic!("expected only the condition's unassigned read, got {other:?}"),
     }
+}
+
+// —— body completion (BodyMayCompleteNormally) —————————————————————————————
+// The pure reachability face of the official body_might_complete gate
+// (`type_analyzer.dart:647-652`): the fact fires when the executable's
+// body end is reachable, for every executable kind; the consumer owns
+// the return-type, body-shape, and anchor faces.
+
+/// Offsets of the body-completion anchors (the executables' end tokens),
+/// offset-sorted by `take_facts`.
+fn completion_offsets(source: &str) -> Vec<u32> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::BodyMayCompleteNormally { span } => Some(span.range.offset),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A body that falls off its end completes normally; the anchor is the
+/// executable's end token — the body's closing brace (top-level function
+/// and class-method hooks).
+#[test]
+fn fall_through_body_completes_at_the_end_token() {
+    assert_eq!(completion_offsets("void f() { x; }"), [14]);
+    assert_eq!(completion_offsets("class C { void m() { x; } }"), [24]);
+}
+
+/// A body ending in `return` or `throw` never completes: no fact. The
+/// same holds when every branch of the last statement returns.
+#[test]
+fn never_completing_bodies_emit_no_completion() {
+    assert!(completion_offsets("void f() { return; }").is_empty());
+    assert!(completion_offsets("void f() { throw 0; }").is_empty());
+    assert!(
+        completion_offsets("void f(bool b) { if (b) { return; } else { return; } }").is_empty()
+    );
+}
+
+/// official reachability semantics for loop shapes: `while (true)` and
+/// `for (;;)` without a break make the body end unreachable; a break
+/// restores it; `do {} while (false)` completes (the condition-false
+/// exit is live).
+#[test]
+fn infinite_loop_shapes_decide_by_reachability() {
+    assert!(completion_offsets("void f() { while (true) {} }").is_empty());
+    assert!(completion_offsets("void f() { for (;;) {} }").is_empty());
+    assert_eq!(
+        completion_offsets("void f(bool b) { while (true) { if (b) break; } }"),
+        [48]
+    );
+    assert_eq!(
+        completion_offsets("void f() { do {} while (false); }"),
+        [32]
+    );
+}
+
+/// A closure body is its own executable: it completes independently of
+/// the enclosing body (the official gate fires per FunctionBody).
+#[test]
+fn closure_bodies_complete_independently() {
+    // Both the closure and the enclosing body fall through; the closure's
+    // `}` sorts before the outer one.
+    let source = "void f() { g(() { 1; }); }";
+    assert_eq!(completion_offsets(source), [21, 25]);
+    // A returning closure completes nothing; the outer body still does.
+    let source = "void f() { g(() { return; }); }";
+    assert_eq!(completion_offsets(source), [30]);
+}
+
+/// The pure reachability contract: an empty body's `;` is a reachable
+/// end and emits — the consumer owns the body-shape gate (the official
+/// reports only on block bodies).
+#[test]
+fn empty_body_completion_is_the_consumers_gate() {
+    assert_eq!(completion_offsets("class C { void m(); }"), [18]);
 }
 
 /// Boolean short-circuit join: `a && b` merges the false arms.
@@ -616,7 +713,7 @@ fn pattern_declaration_assigns() {
 fn cast_pattern_does_not_pop_the_expr_stack() {
     // Wildcard primary: nothing to pop, no crash, sound facts.
     let source = "void f(Object? o) { switch (o) { case _ as Object?: 1; } }";
-    assert!(facts_of(source).is_empty());
+    assert!(read_facts_of(source).is_empty());
     // Declared primary: the pattern variable is assigned on the matched
     // path and the case body runs under that state — a body read is
     // sound (the head's matched state reaches the body through
@@ -669,7 +766,7 @@ fn case_head_state_carries_into_the_body() {
 #[test]
 fn closure_in_loop_no_facts() {
     let source = "void f() { for (var i = 0; i < 3; i++) { g(() { i; }); } }";
-    assert!(facts_of(source).is_empty());
+    assert!(read_facts_of(source).is_empty());
 }
 
 /// A `try/finally` whose finally returns: the code after is dead
@@ -727,7 +824,7 @@ fn collection_for_in_initializer_write_reaches_later_reads() {
 #[test]
 fn labeled_case_group_terminates() {
     let source = "void f(int x) { switch (x) { foo: case 1: 1; } }";
-    assert!(facts_of(source).is_empty());
+    assert!(read_facts_of(source).is_empty());
 }
 
 /// An arrow body's value is consumed by the function and the function
@@ -938,7 +1035,10 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::WhileBegin { span: span(2) },
         Ev::WhileBodyBegin,
         Ev::WhileEnd,
-        Ev::ExecEnd { is_expr: false },
+        Ev::ExecEnd {
+            is_expr: false,
+            end: tspan(0),
+        },
         Ev::ReturnBegin { span: span(3) },
         Ev::ReturnEnd {
             has_expression: false,
@@ -949,7 +1049,12 @@ fn closure_collect_keeps_enclosing_loop_frame() {
     let mut interp = Interp::new(&NameTypeOps);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert!(interp.facts.is_empty());
+    // The closure body falls off its end: one completion row (the outer
+    // body's own end is behind this fixture's trailing return).
+    assert!(matches!(
+        interp.facts.as_slice(),
+        [FlowFact::BodyMayCompleteNormally { .. }]
+    ));
     assert!(interp.reachable());
 }
 
@@ -1669,7 +1774,10 @@ fn closure_await_demotes_captured_reads() {
         },
         Ev::SendNoArgs,
         Ev::AwaitEnd,
-        Ev::ExecEnd { is_expr: false },
+        Ev::ExecEnd {
+            is_expr: false,
+            end: tspan(0),
+        },
         // x = 1; — the anywhere-write that arms the demotion.
         Ev::Ident {
             name: 0,
@@ -1683,7 +1791,11 @@ fn closure_await_demotes_captured_reads() {
     let mut interp = Interp::new(&NameTypeOps);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert!(interp.facts.is_empty());
+    // The closure body falls off its end: one completion row.
+    assert!(matches!(
+        interp.facts.as_slice(),
+        [FlowFact::BodyMayCompleteNormally { .. }]
+    ));
     assert!(interp.reachable());
 }
 
@@ -1695,7 +1807,7 @@ fn closure_await_demotes_captured_reads() {
 fn closure_await_with_enclosing_write_no_facts() {
     let source =
         "void f(int? x, Future g()) async { var h = () async { await g(); x; }; x = 1; h(); }";
-    assert!(facts_of(source).is_empty());
+    assert!(read_facts_of(source).is_empty());
 }
 
 // —— for-in statements ————————————————————————————————————————————————————
@@ -2192,7 +2304,10 @@ fn assignment_demotion_keeps_the_least_specific_suffix() {
             // `x = other;`: the right-hand side is a `num` value.
             read(OTHER),
             Ev::Assign { plain: true },
-            Ev::ExecEnd { is_expr: false },
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(0),
+            },
         ],
     ]
     .concat();
@@ -2266,13 +2381,22 @@ fn bottom_remainder_marks_the_else_branch_unreachable() {
             Ev::ExprStmt { span: tspan(3) },
             Ev::OtherExpr { span: tspan(4) },
             Ev::IfEnd { has_else: true },
-            Ev::ExecEnd { is_expr: false },
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(0),
+            },
         ],
     ]
     .concat();
     let interp = interp_of(&events);
     assert!(
-        matches!(interp.facts.as_slice(), [FlowFact::DeadCode { .. }]),
+        matches!(
+            interp.facts.as_slice(),
+            [
+                FlowFact::DeadCode { .. },
+                FlowFact::BodyMayCompleteNormally { .. }
+            ]
+        ),
         "the else branch of `x is int?` on `int x` is provably dead: {:?}",
         interp.facts
     );
@@ -2338,7 +2462,10 @@ fn if_null_write_repromotes_via_types_of_interest() {
                 op: crate::ev::BinOp::IfNull,
             },
             Ev::Assign { plain: true },
-            Ev::ExecEnd { is_expr: false },
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(0),
+            },
         ],
     ]
     .concat();

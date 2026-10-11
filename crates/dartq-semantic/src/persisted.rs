@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
-    ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
+    ArgPool, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl, ExtensionFace,
     FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal, TopDecl, Ty,
 };
 
@@ -64,13 +64,25 @@ pub struct PersistedElements {
     pub arity_violations: Vec<PersistedArity>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The declared-type column. The `Named` arguments ride as nested content
+/// (the model's own canonical order), never as pool slots — slots carry
+/// interning order and would fork the payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedTy {
     Unknown,
     Null,
     Dynamic,
     Void,
-    Named { name: u32, nullable: bool },
+    Named {
+        name: u32,
+        nullable: bool,
+        /// Additive after the format shipped: `default` so payloads
+        /// persisted before the slot existed decode argument-less — exact,
+        /// since a pre-slot binary could not capture arguments (the #539
+        /// additive-field discipline; the #701 argument slot).
+        #[serde(default)]
+        args: Vec<PersistedTy>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +115,7 @@ pub enum PersistedContainerKind {
     ExtensionType,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedFormal {
     pub name: u32,
     pub ty: PersistedTy,
@@ -223,14 +235,18 @@ struct Slice<'a> {
     strings: &'a StringTable,
     values: Vec<String>,
     at: rustc_hash::FxHashMap<StringId, u32>,
+    /// The unit's argument pool: `Named` columns resolve their slots to
+    /// nested content through it.
+    type_args: &'a ArgPool,
 }
 
 impl<'a> Slice<'a> {
-    fn new(strings: &'a StringTable) -> Self {
+    fn new(strings: &'a StringTable, type_args: &'a ArgPool) -> Self {
         Self {
             strings,
             values: Vec::new(),
             at: rustc_hash::FxHashMap::default(),
+            type_args,
         }
     }
 
@@ -254,10 +270,18 @@ impl<'a> Slice<'a> {
             Ty::Null => PersistedTy::Null,
             Ty::Dynamic => PersistedTy::Dynamic,
             Ty::Void => PersistedTy::Void,
-            Ty::Named { name, nullable } => PersistedTy::Named {
-                name: self.id(name),
+            Ty::Named {
+                name,
                 nullable,
-            },
+                args,
+            } => {
+                let args = self.type_args.get(args).to_vec();
+                PersistedTy::Named {
+                    name: self.id(name),
+                    nullable,
+                    args: args.iter().map(|arg| self.ty(arg)).collect(),
+                }
+            }
         }
     }
 
@@ -305,7 +329,7 @@ impl PersistedElements {
     /// every name through `strings`.
     #[must_use]
     pub fn of(elements: &FileElements, strings: &StringTable) -> Self {
-        let mut s = Slice::new(strings);
+        let mut s = Slice::new(strings, &elements.type_args);
         let decls = elements
             .decls
             .iter()
@@ -372,7 +396,9 @@ impl PersistedElements {
     }
 
     /// Restores the element model, interning the string slice into `strings`
-    /// in order; every name column resolves through the interned ids.
+    /// in order; every name column resolves through the interned ids. The
+    /// `Named` argument columns re-intern into the model's fresh pool, so
+    /// equal contents land on equal slots regardless of payload order.
     #[must_use]
     pub fn into_elements(self, strings: &StringTable) -> FileElements {
         let ids: Vec<StringId> = self
@@ -381,16 +407,19 @@ impl PersistedElements {
             .map(|text| strings.intern(text))
             .collect();
         let at_name = |at: u32| ids[at as usize];
-        FileElements {
+        let mut type_args = ArgPool::default();
+        let elements = FileElements {
             decls: self
                 .decls
                 .into_iter()
-                .map(|(at, decl)| (at_name(at), decl.into_top_decl(&ids)))
+                .map(|(at, decl)| (at_name(at), decl.into_top_decl(&ids, &mut type_args)))
                 .collect(),
             containers: self
                 .containers
                 .into_iter()
-                .map(|(at, container)| (at_name(at), container.into_container(&ids)))
+                .map(|(at, container)| {
+                    (at_name(at), container.into_container(&ids, &mut type_args))
+                })
                 .collect(),
             container_order: self.container_order.iter().map(|&at| at_name(at)).collect(),
             extension_faces: self
@@ -402,7 +431,9 @@ impl PersistedElements {
                     members: face
                         .members
                         .into_iter()
-                        .map(|(at, entry)| (at_name(at), entry.into_member_entry(&ids)))
+                        .map(|(at, entry)| {
+                            (at_name(at), entry.into_member_entry(&ids, &mut type_args))
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -436,7 +467,9 @@ impl PersistedElements {
                     range: arity.range.source_range(),
                 })
                 .collect(),
-        }
+            type_args,
+        };
+        elements
     }
 }
 
@@ -464,7 +497,7 @@ impl PersistedTopDecl {
         }
     }
 
-    fn into_top_decl(self, ids: &[StringId]) -> TopDecl {
+    fn into_top_decl(self, ids: &[StringId], pool: &mut ArgPool) -> TopDecl {
         TopDecl {
             kind: match self.kind {
                 PersistedMicroKind::Class => MicroKind::Class,
@@ -478,11 +511,11 @@ impl PersistedTopDecl {
                 PersistedMicroKind::TypeParam => MicroKind::TypeParam,
             },
             type_params: self.type_params,
-            var_ty: into_ty(self.var_ty, ids),
-            return_ty: into_ty(self.return_ty, ids),
+            var_ty: into_ty(self.var_ty, ids, pool),
+            return_ty: into_ty(self.return_ty, ids, pool),
             formals: self
                 .formals
-                .map(|formals| Box::new(into_formals(*formals, ids))),
+                .map(|formals| Box::new(into_formals(*formals, ids, pool))),
         }
     }
 }
@@ -536,7 +569,7 @@ impl PersistedContainer {
         }
     }
 
-    fn into_container(self, ids: &[StringId]) -> Container {
+    fn into_container(self, ids: &[StringId], pool: &mut ArgPool) -> Container {
         Container {
             kind: match self.kind {
                 PersistedContainerKind::Class => ContainerKind::Class,
@@ -554,7 +587,7 @@ impl PersistedContainer {
             members: self
                 .members
                 .into_iter()
-                .map(|(at, entry)| (ids[at as usize], entry.into_member_entry(ids)))
+                .map(|(at, entry)| (ids[at as usize], entry.into_member_entry(ids, pool)))
                 .collect(),
             type_params: self.type_params,
             sealed: self.sealed,
@@ -580,7 +613,7 @@ impl PersistedContainer {
                 .map(|rep| RepFormal {
                     formal: Formal {
                         name: ids[rep.name as usize],
-                        ty: into_ty(rep.ty, ids),
+                        ty: into_ty(rep.ty, ids, pool),
                         required: rep.required,
                     },
                     name_range: SourceRange {
@@ -603,14 +636,19 @@ impl PersistedContainer {
             ctor_formals: self
                 .ctor_formals
                 .into_iter()
-                .map(|(at, formals)| (ids[at as usize], Box::new(into_formals(*formals, ids))))
+                .map(|(at, formals)| {
+                    (
+                        ids[at as usize],
+                        Box::new(into_formals(*formals, ids, pool)),
+                    )
+                })
                 .collect(),
         }
     }
 }
 
 impl PersistedMemberEntry {
-    fn into_member_entry(self, ids: &[StringId]) -> MemberEntry {
+    fn into_member_entry(self, ids: &[StringId], pool: &mut ArgPool) -> MemberEntry {
         MemberEntry {
             kind: match self.kind {
                 PersistedMemberKind::Method => MemberKind::Method,
@@ -628,44 +666,51 @@ impl PersistedMemberEntry {
                 .iter()
                 .map(|&at| ids[at as usize])
                 .collect(),
-            var_ty: into_ty(self.var_ty, ids),
-            return_ty: into_ty(self.return_ty, ids),
+            var_ty: into_ty(self.var_ty, ids, pool),
+            return_ty: into_ty(self.return_ty, ids, pool),
             formals: self
                 .formals
-                .map(|formals| Box::new(into_formals(*formals, ids))),
+                .map(|formals| Box::new(into_formals(*formals, ids, pool))),
         }
     }
 }
 
-fn into_ty(ty: PersistedTy, ids: &[StringId]) -> Ty {
+fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
     match ty {
         PersistedTy::Unknown => Ty::Unknown,
         PersistedTy::Null => Ty::Null,
         PersistedTy::Dynamic => Ty::Dynamic,
         PersistedTy::Void => Ty::Void,
-        PersistedTy::Named { name, nullable } => Ty::Named {
-            name: ids[name as usize],
+        PersistedTy::Named {
+            name,
             nullable,
-        },
+            args,
+        } => {
+            let args: Vec<Ty> = args
+                .into_iter()
+                .map(|arg| into_ty(arg, ids, pool))
+                .collect();
+            pool.named(ids[name as usize], nullable, &args)
+        }
     }
 }
 
-fn into_formals(formals: PersistedFormals, ids: &[StringId]) -> Formals {
-    let into = |formal: PersistedFormal| Formal {
+fn into_formals(formals: PersistedFormals, ids: &[StringId], pool: &mut ArgPool) -> Formals {
+    let mut into = |formal: PersistedFormal| Formal {
         name: ids[formal.name as usize],
-        ty: into_ty(formal.ty, ids),
+        ty: into_ty(formal.ty, ids, pool),
         required: formal.required,
     };
     Formals {
-        positional: formals.positional.into_iter().map(into).collect(),
-        named: formals.named.into_iter().map(into).collect(),
+        positional: formals.positional.into_iter().map(|f| into(f)).collect(),
+        named: formals.named.into_iter().map(|f| into(f)).collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MemberEntry;
+    use crate::model::{ArgListId, MemberEntry};
 
     /// A representative model — every column populated — survives the
     /// payload round trip: the API signature (which hashes the whole face)
@@ -678,7 +723,14 @@ mod tests {
             offset: 7,
             length: 3,
         };
-        let member = |text: &str| MemberEntry {
+        let mut elements = FileElements::default();
+        // One args-bearing declared type rides the round trip: the member's
+        // return type is `List<int>` (a nested payload column), the formal's
+        // `int?` stays argument-less (the reserved empty slot).
+        let int = Ty::named(name("int"));
+        let pool = elements.type_args_mut();
+        let list_int = pool.named(name("List"), false, std::slice::from_ref(&int));
+        let member = move |text: &str| MemberEntry {
             kind: MemberKind::Method,
             is_static: false,
             is_abstract: false,
@@ -687,16 +739,14 @@ mod tests {
             type_params: 1,
             type_param_names: Box::new([name(text)]),
             var_ty: Ty::Unknown,
-            return_ty: Ty::Named {
-                name: name("int"),
-                nullable: false,
-            },
+            return_ty: list_int,
             formals: Some(Box::new(Formals {
                 positional: Box::new([Formal {
                     name: name("x"),
                     ty: Ty::Named {
                         name: name("int"),
                         nullable: true,
+                        args: ArgListId::EMPTY,
                     },
                     required: true,
                 }]),
@@ -707,7 +757,6 @@ mod tests {
                 }]),
             })),
         };
-        let mut elements = FileElements::default();
         elements.decls.insert(
             name("main"),
             TopDecl {
@@ -803,5 +852,15 @@ mod tests {
         assert_eq!(restored_face.name, Some(name("E")));
         assert_eq!(restored_face.on_type, Some(name("int")));
         assert_eq!(restored_c.primary_formals[0].formal.name, name("rep"));
+        // The argument column round trips as content and re-interns onto a
+        // canonical slot: equal id, equal display (`List<int>`).
+        let restored_member = &restored_c.members[&name("m")];
+        assert_eq!(restored_member.return_ty, list_int);
+        assert_eq!(
+            restored_member
+                .return_ty
+                .render(&strings, restored.type_args()),
+            "List<int>"
+        );
     }
 }

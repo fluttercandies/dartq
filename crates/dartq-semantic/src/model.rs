@@ -42,20 +42,22 @@
 //!   are declaration-scoped in truth; consumers must not treat them as
 //!   top-level declarations.
 
-use dartq_source::{SourceRange, StringId};
+use dartq_source::{SourceRange, StringId, StringTable};
 use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 
 /// The M1 static type: the nullability dimension plus a name — the minimal
 /// shape the static-nullability codes decide on (types-nullability-spec
 /// §2.1–§2.3; the analyzer's `InvalidType` suppresses every question it
 /// touches, `subtype.dart:258-260`).
 ///
-/// This is the M1 stand-in for the `dartq-types` interned lattice: no type
-/// arguments, no hierarchy, no inference — declared types only, so every
-/// decision below is a pure nullability/name comparison. When the M2 type
-/// engine wires in, `Ty` folds into `TypeId` and `assignable_from` becomes
+/// This is the M1 stand-in for the `dartq-types` interned lattice: explicit
+/// type arguments ride along (the #611 verdict-A slot — a canonical
+/// [`ArgListId`] handle so `Ty` stays `Copy`), but there is still no
+/// hierarchy, no inference — declared types only. When the M2 type engine
+/// wires in, `Ty` folds into `TypeId` and `assignable_from` becomes
 /// `TypeSystem::is_assignable`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// No declared type (or a shape M1 does not model): every check
     /// suppresses. Mirrors the oracle's `InvalidType` (rule 0c).
@@ -76,6 +78,11 @@ pub enum Ty {
         name: StringId,
         /// The trailing `?` was present.
         nullable: bool,
+        /// The explicit type arguments, canonically interned
+        /// ([`ArgListId::EMPTY`] when absent). Equal lists share one id,
+        /// so derived equality is structural — `List<int> ==
+        /// List<int>` across interning orders.
+        args: ArgListId,
     },
 }
 
@@ -83,12 +90,52 @@ impl Ty {
     /// The every-check-suppresses sentinel.
     pub const UNKNOWN: Ty = Ty::Unknown;
 
-    /// A non-nullable named type.
+    /// A non-nullable named type without type arguments — the argument-less
+    /// shape every pre-#701 construction site keeps ([`ArgPool::named`] is
+    /// the with-arguments constructor).
     #[must_use]
     pub const fn named(name: StringId) -> Ty {
         Ty::Named {
             name,
             nullable: false,
+            args: ArgListId::EMPTY,
+        }
+    }
+
+    /// Renders the type in the official display form (`List<int>?`): the
+    /// head name, the explicit arguments `, `-joined, then the `?`
+    /// projection (the analyzer's `getDisplayName`, type.dart:1425-1467).
+    /// [`Ty::Unknown`] renders empty — the diagnoser's message slots for
+    /// unknown declared types.
+    #[must_use]
+    pub fn render(&self, strings: &StringTable, args: &ArgPool) -> String {
+        match *self {
+            Ty::Unknown => String::new(),
+            Ty::Null => "Null".to_string(),
+            Ty::Dynamic => "dynamic".to_string(),
+            Ty::Void => "void".to_string(),
+            Ty::Named {
+                name,
+                nullable,
+                args: list,
+            } => {
+                let mut text = strings.resolve(name).to_owned();
+                let list = args.get(list);
+                if !list.is_empty() {
+                    text.push('<');
+                    for (index, arg) in list.iter().enumerate() {
+                        if index > 0 {
+                            text.push_str(", ");
+                        }
+                        text.push_str(&arg.render(strings, args));
+                    }
+                    text.push('>');
+                }
+                if nullable {
+                    text.push('?');
+                }
+                text
+            }
         }
     }
 
@@ -142,12 +189,17 @@ impl Ty {
                 },
             ) => Some(false),
             // Same name, both non-nullable: assignable modulo type
-            // arguments (invariance ignored — suppression direction).
+            // arguments. The arguments are now *represented*
+            // ([`Ty::Named`]'s slot) but still not consulted: invariance
+            // stays the suppression direction until the consumption ticket
+            // wires the hierarchy in (`List<int>` vs `List<num>` is `None`,
+            // never a decidable `false`).
             (
                 Ty::Named { name: a, .. },
                 Ty::Named {
                     name: b,
                     nullable: false,
+                    ..
                 },
             ) => {
                 if a == b {
@@ -158,6 +210,127 @@ impl Ty {
             }
         }
     }
+}
+
+/// Identity of an interned type-argument list inside an [`ArgPool`] —
+/// [`Ty::Named`]'s argument slot (#611 verdict A: a pool handle keeps `Ty`
+/// `Copy`, and canonical interning decides equality, so the slot never
+/// degrades into position-comparing `PoolRange`-style fake equality).
+///
+/// Slot `0` is the reserved empty list: argument-less named types
+/// ([`Ty::named`]) carry it without touching any pool, so the empty face is
+/// one constant and the pre-slot constructors keep their exact identity.
+/// `Eq`/`Hash` on this newtype *is* structural list equality — the pool
+/// only hands out ids through canonical interning, the same contract as
+/// `dartq_types::TypeId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArgListId(u32);
+
+impl ArgListId {
+    /// The reserved empty argument list.
+    pub const EMPTY: ArgListId = ArgListId(0);
+}
+
+/// The canonical interner of type-argument lists backing
+/// [`Ty::Named`]'s slot. Equal lists share one [`ArgListId`] regardless of
+/// interning order or pool history, so derived equality on `Ty` is
+/// structural (`List<int> == List<int>`) without any string or deep-list
+/// comparison on the query path — the O(1) id comparison the interned
+/// lattice uses.
+///
+/// One pool belongs to one model universe ([`FileElements::type_args`]):
+/// ids are canonical *within their pool*, so [`Ty`] values compare equal
+/// only inside the universe that interned their arguments. Arguments are
+/// captured bottom-up (inner lists first), so an element's own slot is
+/// already canonical when its list interns — no recursion at intern or
+/// dedup time.
+#[derive(Clone, Debug)]
+pub struct ArgPool {
+    /// Interned lists; slot `0` is the reserved empty list.
+    lists: Vec<Box<[Ty]>>,
+    /// Structural hash → every slot with that hash. A hit is confirmed by
+    /// slice equality before reuse (64-bit hashes collide rarely; the
+    /// bucket keeps the answer exact rather than probabilistic).
+    at: FxHashMap<u64, Vec<u32>>,
+}
+
+impl Default for ArgPool {
+    fn default() -> Self {
+        Self {
+            lists: vec![Box::new([])],
+            at: FxHashMap::default(),
+        }
+    }
+}
+
+impl ArgPool {
+    /// Interns `args` canonically and returns the named type
+    /// `name<...>` (with its `?` when `nullable`) — the with-arguments
+    /// constructor; [`Ty::named`] is its argument-less constant shortcut
+    /// and produces the identical value for an empty `args`.
+    pub fn named(&mut self, name: StringId, nullable: bool, args: &[Ty]) -> Ty {
+        let args = self.intern(args);
+        Ty::Named {
+            name,
+            nullable,
+            args,
+        }
+    }
+
+    /// Interns one list and returns its canonical slot. The empty list is
+    /// the reserved slot `0` and never interns; a dedup hit reuses the
+    /// stored slot without appending.
+    fn intern(&mut self, args: &[Ty]) -> ArgListId {
+        if args.is_empty() {
+            return ArgListId::EMPTY;
+        }
+        let hash = hash_args(args);
+        if let Some(slots) = self.at.get(&hash) {
+            for &slot in slots {
+                if &*self.lists[slot as usize] == args {
+                    return ArgListId(slot);
+                }
+            }
+        }
+        let slot = u32::try_from(self.lists.len()).expect("argument pool exceeds u32::MAX");
+        self.lists.push(Box::from(args));
+        self.at.entry(hash).or_default().push(slot);
+        ArgListId(slot)
+    }
+
+    /// The interned list at `id`.
+    ///
+    /// # Panics
+    /// Panics when `id` did not come from this pool (an out-of-range slot
+    /// is a program bug, not a recoverable condition).
+    #[must_use]
+    pub fn get(&self, id: ArgListId) -> &[Ty] {
+        &self.lists[id.0 as usize]
+    }
+
+    /// Number of interned non-empty argument lists.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lists.len() - 1
+    }
+
+    /// Whether no non-empty list has been interned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lists.len() == 1
+    }
+}
+
+/// Folds every element's canonical identity — name, nullability, and its
+/// own (already interned) argument slot — into one 64-bit hash. Children
+/// are canonical, so their slot hashes their whole structure; no recursion
+/// here.
+fn hash_args(args: &[Ty]) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    for arg in args {
+        arg.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The micro-kind tag of a name in a library scope (adjudicated closed set).
@@ -481,6 +654,10 @@ pub struct FileElements {
     pub(crate) extension_faces: Vec<ExtensionFace>,
     pub(crate) duplicates: Vec<DuplicateDecl>,
     pub(crate) arity_violations: Vec<ArityDecl>,
+    /// The unit's canonical argument pool: every [`Ty::Named`] slot of
+    /// this model indexes into it. One pool per model universe — ids from
+    /// another unit's pool are meaningless here.
+    pub(crate) type_args: ArgPool,
 }
 
 impl FileElements {
@@ -553,5 +730,151 @@ impl FileElements {
     #[must_use]
     pub fn arity_violations(&self) -> &[ArityDecl] {
         &self.arity_violations
+    }
+
+    /// The unit's canonical argument pool ([`Ty::Named`] slots index into
+    /// it); capture feeds it through [`ArgPool::named`].
+    #[must_use]
+    pub fn type_args(&self) -> &ArgPool {
+        &self.type_args
+    }
+
+    /// The pool, mutable — the capture side's intern entry.
+    pub fn type_args_mut(&mut self) -> &mut ArgPool {
+        &mut self.type_args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dartq_source::StringTable;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    /// `int`, `String`, `List`, `Map` over one shared table/pool pair.
+    struct Fix {
+        strings: StringTable,
+        pool: ArgPool,
+        int: StringId,
+        string: StringId,
+        list: StringId,
+        map: StringId,
+    }
+
+    impl Fix {
+        fn new() -> Self {
+            let strings = StringTable::new();
+            let intern = |text: &str| strings.intern(text);
+            Self {
+                int: intern("int"),
+                string: intern("String"),
+                list: intern("List"),
+                map: intern("Map"),
+                strings,
+                pool: ArgPool::default(),
+            }
+        }
+
+        fn render(&self, ty: Ty) -> String {
+            ty.render(&self.strings, &self.pool)
+        }
+    }
+
+    /// Argument-less construction never touches the pool, and the
+    /// with-arguments constructor returns the identical value for an empty
+    /// list — the pre-slot construction face is preserved bit for bit.
+    #[test]
+    fn argument_less_types_never_touch_the_pool() {
+        let fix = Fix::new();
+        let mut pool = ArgPool::default();
+        let plain = Ty::named(fix.int);
+        let via_pool = pool.named(fix.int, false, &[]);
+        assert_eq!(plain, via_pool);
+        assert_eq!(via_pool, pool.named(fix.int, false, &[]));
+        assert!(pool.is_empty(), "the empty list must never intern");
+    }
+
+    /// Equal argument lists share one slot regardless of interning order —
+    /// derived `PartialEq`/`Hash` on `Ty` is structural equality
+    /// (`List<int> == List<int>`), the canonical-intern contract.
+    #[test]
+    fn equal_arguments_intern_to_one_slot() {
+        let fix = Fix::new();
+        let mut pool = ArgPool::default();
+        let int = Ty::named(fix.int);
+        let first = pool.named(fix.list, false, &[int]);
+        let second = pool.named(fix.list, false, &[int]);
+        assert_eq!(first, second);
+        assert_eq!(pool.len(), 1, "the second intern must dedup");
+
+        let (mut left, mut right) = (DefaultHasher::new(), DefaultHasher::new());
+        first.hash(&mut left);
+        second.hash(&mut right);
+        assert_eq!(left.finish(), right.finish());
+    }
+
+    /// Different arguments, argument count, or nullability are different
+    /// types: the slot compares, never collapses.
+    #[test]
+    fn different_arguments_are_different_types() {
+        let fix = Fix::new();
+        let mut pool = ArgPool::default();
+        let (int, string) = (Ty::named(fix.int), Ty::named(fix.string));
+        let list_int = pool.named(fix.list, false, &[int]);
+        assert_ne!(list_int, pool.named(fix.list, false, &[string]));
+        assert_ne!(
+            list_int,
+            pool.named(fix.list, false, &[int, string]),
+            "arity is part of the identity"
+        );
+        assert_ne!(
+            list_int,
+            pool.named(fix.list, true, &[int]),
+            "the ? projection is part of the identity"
+        );
+    }
+
+    /// Nested arguments (`Map<String, List<int>>`) dedup through the
+    /// inner slots: re-interning the same nest shares every slot, and a
+    /// one-bit inner difference (`List<int?>`) forks the outer slot.
+    #[test]
+    fn nested_arguments_are_canonical() {
+        let fix = Fix::new();
+        let mut pool = ArgPool::default();
+        let (int, string) = (Ty::named(fix.int), Ty::named(fix.string));
+
+        let list_int = pool.named(fix.list, false, &[int]);
+        let first = pool.named(fix.map, false, &[string, list_int]);
+
+        let list_int_again = pool.named(fix.list, false, &[int]);
+        let second = pool.named(fix.map, false, &[string, list_int_again]);
+        assert_eq!(first, second);
+
+        let list_intq = pool.named(fix.list, true, &[int]);
+        assert_ne!(first, pool.named(fix.map, false, &[string, list_intq]));
+        assert_eq!(
+            pool.len(),
+            3,
+            "slots: [int], [String, List<int>] (the twin deduped), [String, List<int>?]"
+        );
+    }
+
+    /// The display face renders the official `Name<Arg, ...>?` form. Every
+    /// type interns through the harness's own pool — the same pool the
+    /// render reads — per the one-pool-one-universe contract.
+    #[test]
+    fn display_renders_the_argument_face() {
+        let mut fix = Fix::new();
+        let (int, string) = (Ty::named(fix.int), Ty::named(fix.string));
+        let list_int = fix.pool.named(fix.list, false, &[int]);
+        let map = fix.pool.named(fix.map, false, &[string, list_int]);
+
+        assert_eq!(fix.render(Ty::named(fix.int)), "int");
+        assert_eq!(fix.render(list_int), "List<int>");
+        assert_eq!(fix.render(map), "Map<String, List<int>>");
+        let nullable_list = fix.pool.named(fix.list, true, &[int]);
+        assert_eq!(fix.render(nullable_list), "List<int>?");
+        assert_eq!(fix.render(Ty::Dynamic), "dynamic");
+        assert_eq!(fix.render(Ty::Unknown), "");
     }
 }
