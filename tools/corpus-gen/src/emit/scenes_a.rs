@@ -8,7 +8,10 @@ use crate::rng::SplitMix64;
 use std::fmt::Write as _;
 
 pub(super) fn class_modifiers(w: &mut String, id: u32, _rng: &mut SplitMix64) {
-    dw!(w, "\n/// Cell: class modifiers (abstract/base/final/interface/sealed/mixin class).\n");
+    dw!(
+        w,
+        "\n/// Cell: class modifiers (abstract/base/final/interface/sealed/mixin class).\n"
+    );
     dw!(
         w,
         "abstract class Shape{id} {{\n  double area();\n\n  String describe() => 'shape{id}';\n}}\n\n"
@@ -121,8 +124,14 @@ pub(super) fn enum_enhanced(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 pub(super) fn record_values(w: &mut String, id: u32, _rng: &mut SplitMix64) {
     dw!(w, "\n/// Cell: records (positional and named).\n");
     dw!(w, "(int, String) pair{id}() => (7, 'seven');\n\n");
-    dw!(w, "({{int width, int height}}) size{id}() => (width: 3, height: 4);\n\n");
-    dw!(w, "(int x, int y, {{String tag}}) point{id}() => (1, 2, tag: 'p');\n\n");
+    dw!(
+        w,
+        "({{int width, int height}}) size{id}() => (width: 3, height: 4);\n\n"
+    );
+    dw!(
+        w,
+        "(int x, int y, {{String tag}}) point{id}() => (1, 2, tag: 'p');\n\n"
+    );
     dw!(
         w,
         "int sum{id}() {{\n  final (a, b) = pair{id}();\n  final rect = size{id}();\n  return a + b + rect.width * rect.height;\n}}\n"
@@ -138,7 +147,10 @@ pub(super) fn operators(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 }
 
 pub(super) fn factory_ctor(w: &mut String, id: u32, _rng: &mut SplitMix64) {
-    dw!(w, "\n/// Cell: factory constructors (computed and redirecting).\n");
+    dw!(
+        w,
+        "\n/// Cell: factory constructors (computed and redirecting).\n"
+    );
     dw!(
         w,
         "class Connection{id} {{\n  final String url;\n\n  const Connection{id}._(this.url);\n\n  factory Connection{id}.https(String host) => Connection{id}._('https://$host');\n\n  factory Connection{id}.parse(String raw) {{\n    final trimmed = raw.trim();\n    return Connection{id}._(trimmed.isEmpty ? 'about:blank' : trimmed);\n  }}\n\n  const factory Connection{id}.constant(String url) = Connection{id}._;\n}}\n"

@@ -1,17 +1,17 @@
 //! Curly-bracket two-pass recovery (official `scan`/`scanString` re-scan,
 //! scanner.dart:90-108): decision gates, both recovery sites, and the
-//! oracle-pinned "user is typing" shapes from the with_outline corpus
-//! family (typing_01 / typing_04 / typing_string_interpolation_1/2,
+//! oracle-pinned "user is typing" shapes from the `with_outline` corpus
+//! family (`typing_01` / `typing_04` / `typing_string_interpolation_1`/2,
 //! condensed to their recovery-bearing lines).
 
-use super::{assert_codes, codes, scan_src};
+use super::{assert_codes, codes, scan_src, u32_of};
 use crate::TokenKind as K;
 
-/// typing_01 shape: the `if {` the user just typed stays open, so the `}`
+/// `typing_01` shape: the `if {` the user just typed stays open, so the `}`
 /// that should close `foo_method1` closes the `if` instead and `class Foo`'s
 /// brace reaches EOF alone. The re-scan blames the `if {` (indent 4 vs the
 /// closer's 2), pins a synthetic `}` at that closer, and the outer braces
-/// close correctly (oracle: expected_token '}' @ the `}` col 3, nothing at
+/// close correctly (oracle: `expected_token` '}' @ the `}` col 3, nothing at
 /// eof — exactly one diagnostic).
 #[test]
 fn two_pass_recovers_typed_open_if() {
@@ -37,9 +37,9 @@ fn two_pass_recovers_typed_open_if() {
     assert_eq!(t.matching_end(2), Some(15));
 }
 
-/// typing_04 shape: an unclosed map literal `var x = {` — the `= {` branch
+/// `typing_04` shape: an unclosed map literal `var x = {` — the `= {` branch
 /// of the indent heuristic blames it, and the closer `}` moves onto the
-/// enclosing `if` block (oracle shape: expected_token '}' @ the map's
+/// enclosing `if` block (oracle shape: `expected_token` '}' @ the map's
 /// closer, corrected outline above it).
 #[test]
 fn two_pass_recovers_unclosed_map_literal() {
@@ -62,11 +62,11 @@ fn two_pass_recovers_unclosed_map_literal() {
     assert_eq!(t.get(syn).unwrap().byte_offset, 58);
 }
 
-/// typing_string_interpolation_1 shape: the `${` swallows a `"` inside the
+/// `typing_string_interpolation_1` shape: the `${` swallows a `"` inside the
 /// expression, which (without recovery) leaks into code mode and cascades.
 /// The re-scan discards the `${`: synthetic `}` at the `$`, and the trailing
 /// `"` closes the literal again. Exactly one scanner diagnostic (oracle:
-/// expected_token '}' @ the `$`, no unterminated_string_literal at all).
+/// `expected_token` '}' @ the `$`, no `unterminated_string_literal` at all).
 #[test]
 fn two_pass_recovers_interpolation_start() {
     let src = "class B {\n  m1() {\n    print(\"${foo.length hello world\");\n  }\n}\n";
@@ -93,12 +93,12 @@ fn two_pass_recovers_interpolation_start() {
     assert_eq!(t.lexeme(src, syn + 1), "foo.length hello world\"");
 }
 
-/// typing_string_interpolation_2 shape: the `${` also spans a newline, so
+/// `typing_string_interpolation_2` shape: the `${` also spans a newline, so
 /// after discarding it the resumed body unterminates at the line end and the
 /// `");` line scans as its own unterminated string; the print `(` still
 /// closes synthetically at the method's `}`. Oracle pins (machine format):
-/// expected_token '}' @ the `$`, unterminated @ the `.`, unterminated @ the
-/// `;`, expected_token ')' @ the method `}` — nothing else scanner-level.
+/// `expected_token` '}' @ the `$`, unterminated @ the `.`, unterminated @ the
+/// `;`, `expected_token` ')' @ the method `}` — nothing else scanner-level.
 #[test]
 fn two_pass_interpolation_across_newline() {
     let src = "class B {\n  m1() {\n    print(\"${foo.\n    length hello world\");\n  }\n}\n";
@@ -146,7 +146,7 @@ fn same_indent_closer_does_not_rescan() {
     let r = scan_src(src);
     assert_codes(&r, &["expected_token"]);
     let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, src.len() as u32, "eof pin: no re-scan");
+    assert_eq!(d.range.offset, u32_of(src.len()), "eof pin: no re-scan");
     assert_eq!(d.range.length, 0);
 }
 
@@ -158,7 +158,7 @@ fn two_unclosed_braces_do_not_rescan() {
     let r = scan_src(src);
     assert_eq!(r.diagnostics.len(), 2, "one per unclosed brace, at eof");
     for d in &r.diagnostics {
-        assert_eq!(d.range.offset, src.len() as u32);
+        assert_eq!(d.range.offset, u32_of(src.len()));
         assert_eq!(d.range.length, 0);
     }
 }
@@ -204,7 +204,8 @@ fn corpus_typing_files_recover_to_single_expected_token() {
         assert_eq!(codes(&r), ["expected_token"], "{rel}: scanner diagnostics");
         let d = &r.diagnostics[0];
         assert_eq!(
-            d.range.offset, closer as u32,
+            d.range.offset,
+            u32_of(closer),
             "{rel}: pinned at the recovery closer"
         );
         assert_eq!(d.range.length, 1, "{rel}");
@@ -223,7 +224,7 @@ fn corpus_string_interpolation_1_recovers() {
     assert_eq!(codes(&r), ["expected_token"]);
     let dollar = src.find("${").expect("the `${` shape");
     let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, dollar as u32);
+    assert_eq!(d.range.offset, u32_of(dollar));
     assert_eq!(d.range.length, 1);
     // The only synthetic `}` in the stream is the discarded `${`'s closer:
     // the print call and both class braces pair up with real tokens (no EOF
@@ -235,7 +236,7 @@ fn corpus_string_interpolation_1_recovers() {
         .filter(|tok| tok.kind == K::CloseCurly && tok.is_synthetic())
         .map(|tok| tok.byte_offset)
         .collect();
-    assert_eq!(syn_closers, [dollar as u32]);
+    assert_eq!(syn_closers, [u32_of(dollar)]);
 }
 
 #[test]
@@ -266,15 +267,15 @@ fn corpus_string_interpolation_2_recovers() {
     ];
     for (d, (code, offset, len)) in r.diagnostics.iter().zip(expected) {
         assert_eq!(d.code.name, code);
-        assert_eq!(d.range.offset, offset as u32);
+        assert_eq!(d.range.offset, u32_of(offset));
         assert_eq!(d.range.length, len);
     }
 }
 
-/// bracket_mismatch_01 (#440 deferral, re-measured): the scanner emits the
+/// `bracket_mismatch_01` (#440 deferral, re-measured): the scanner emits the
 /// deep-match synthetic `)` for `D(d:`'s paren at the mismatching `]` —
-/// oracle: expected_token ')' @ the `]),` closer, len 1 (the paired
-/// missing_identifier there is parser-level). No EOF diagnostics: the
+/// oracle: `expected_token` ')' @ the `]),` closer, len 1 (the paired
+/// `missing_identifier` there is parser-level). No EOF diagnostics: the
 /// recovered stream closes every remaining brace.
 #[test]
 fn corpus_bracket_mismatch_01_deep_match() {
@@ -286,7 +287,7 @@ fn corpus_bracket_mismatch_01_deep_match() {
     assert_eq!(codes(&r), ["expected_token"]);
     let bracket = src.rfind("]),").expect("the mismatched `])` of class D");
     let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, bracket as u32);
+    assert_eq!(d.range.offset, u32_of(bracket));
     assert_eq!(d.range.length, 1);
     assert!(d.message.contains("')'"), "{}", d.message);
 }

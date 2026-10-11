@@ -16,6 +16,7 @@ pub enum Scale {
 }
 
 impl Scale {
+    #[must_use]
     pub fn parse(raw: &str) -> Option<Scale> {
         match raw {
             "1k" => Some(Scale::K1),
@@ -25,6 +26,7 @@ impl Scale {
         }
     }
 
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Scale::K1 => "1k",
@@ -50,6 +52,7 @@ pub enum PackageId {
 }
 
 impl PackageId {
+    #[must_use]
     pub fn name(self) -> String {
         match self {
             PackageId::Core => "core".to_string(),
@@ -75,9 +78,7 @@ pub enum FileKind {
     RootPubspec,
     PackagePubspec(PackageId),
     MainEntry,
-    Rotation {
-        header: Header,
-    },
+    Rotation { header: Header },
     FeatureBarrel(PackageId),
     FacetHub(u32),
     FacetStub(u32),
@@ -85,14 +86,8 @@ pub enum FileKind {
     AnchorModel(u32),
     NarrowGateway(u32),
     Gateway(u32),
-    WidgetHost {
-        package: u32,
-        index: usize,
-    },
-    WidgetPart {
-        package: u32,
-        index: usize,
-    },
+    WidgetHost { package: u32, index: usize },
+    WidgetPart { package: u32, index: usize },
     CoreBarrel,
     LazyLib,
     PlatformHub,
@@ -156,13 +151,21 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Builds the file plan for `scale`.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the package count exceeds `u32::MAX` — impossible at
+    /// every scale (the clamp caps it at 400); the `expect` pins that.
+    #[must_use]
     pub fn build(scale: Scale) -> Plan {
         let total = scale.target_files();
         let app_total = total / 10; // pubspec.yaml + lib/main.dart + wiring
         let core_total = total * 15 / 100;
         let tests = total * 15 / 100;
         let features = total - app_total - core_total - tests;
-        let packages = ((features / 60).max(4).min(400)) as u32;
+        let packages =
+            u32::try_from((features / 60).clamp(4, 400)).expect("package count fits u32");
         let per_package = features / packages as usize;
         let extra_last_package = features % packages as usize;
         let wiring = app_total - 2;
@@ -196,6 +199,7 @@ impl Plan {
 
     /// Total files of feature package `index` (the last package absorbs the
     /// distribution remainder).
+    #[must_use]
     pub fn package_file_count(&self, index: usize) -> usize {
         let mut count = self.per_package;
         if index + 1 == self.packages as usize {
@@ -204,6 +208,7 @@ impl Plan {
         count
     }
 
+    #[must_use]
     pub fn iter(&self) -> PlanIter<'_> {
         PlanIter {
             plan: self,
@@ -225,6 +230,15 @@ impl Plan {
     }
 }
 
+impl<'a> IntoIterator for &'a Plan {
+    type Item = FileSpec;
+    type IntoIter = PlanIter<'a>;
+
+    fn into_iter(self) -> PlanIter<'a> {
+        self.iter()
+    }
+}
+
 /// Feature-package `lib/src` rotation budgets derived from the package file
 /// count: `(models, repositories, services, widgets)`. The budget also covers
 /// the barrel, the 3 facet files, and the pubspec (4 + 1), so a package
@@ -232,6 +246,7 @@ impl Plan {
 /// part siblings included (the widget step is file-count-driven). Invariant:
 /// `package_files >= 10`, so `models >= 2` and `services >= 1`, keeping the
 /// anchor/gateway special slots disjoint from plain rotation files.
+#[must_use]
 pub fn feature_dir_counts(package_files: usize) -> (usize, usize, usize, usize) {
     debug_assert!(package_files >= 10);
     let rest = package_files - 5; // barrel + 3 facet files + pubspec
@@ -274,7 +289,7 @@ pub struct PlanIter<'a> {
     rotation_counter: usize,
 }
 
-impl<'a> Iterator for PlanIter<'a> {
+impl Iterator for PlanIter<'_> {
     type Item = FileSpec;
 
     fn next(&mut self) -> Option<FileSpec> {
@@ -362,7 +377,7 @@ impl<'a> Iterator for PlanIter<'a> {
     }
 }
 
-impl<'a> PlanIter<'a> {
+impl PlanIter<'_> {
     fn next_package_file(&mut self) -> Option<FileSpec> {
         // Package cursor 0 is `core` (sorts before `feature_NNNN`), cursor
         // `1..=packages` are the feature packages.
@@ -374,7 +389,7 @@ impl<'a> PlanIter<'a> {
     }
 
     fn rotation(&mut self) -> FileKind {
-        let header = if self.rotation_counter % 4 == 0 {
+        let header = if self.rotation_counter.is_multiple_of(4) {
             Header::Core
         } else {
             Header::Plain
@@ -386,9 +401,12 @@ impl<'a> PlanIter<'a> {
     /// Steps through one feature package. Step transitions loop internally:
     /// `None` is returned only after the pubspec, so the caller never
     /// misreads a mid-package transition as end-of-package.
+    // The step arms mirror the emitted file order (barrel, facets, models,
+    // repositories, ...); a split would scatter the transition table.
+    #[expect(clippy::too_many_lines, reason = "see above")]
     fn next_feature_file(&mut self) -> Option<FileSpec> {
-        let p = (self.package - 1) as u32;
-        let root = format!("packages/feature_{p:04}");
+        let package_index = u32::try_from(self.package - 1).expect("in-range package");
+        let root = format!("packages/feature_{package_index:04}");
         if self.step == 0 && self.index == 0 && !self.part_pending {
             self.pkg_files = self.plan.package_file_count(self.package - 1);
             let (m, v, s, w) = feature_dir_counts(self.pkg_files);
@@ -403,13 +421,16 @@ impl<'a> PlanIter<'a> {
                 0 => {
                     self.step = 1;
                     return Some(spec(
-                        format!("{root}/lib/feature_{p:04}.dart"),
-                        FileKind::FeatureBarrel(PackageId::Feature(p)),
+                        format!("{root}/lib/feature_{package_index:04}.dart"),
+                        FileKind::FeatureBarrel(PackageId::Feature(package_index)),
                     ));
                 }
                 1 => {
                     self.step = 2;
-                    return Some(spec(format!("{root}/lib/src/facets/accel.dart"), FileKind::FacetHub(p)));
+                    return Some(spec(
+                        format!("{root}/lib/src/facets/accel.dart"),
+                        FileKind::FacetHub(package_index),
+                    ));
                 }
                 // Facet trio emits in lexicographic name order: accel.dart <
                 // accel_io.dart < accel_stub.dart ('.' sorts before '_').
@@ -417,14 +438,14 @@ impl<'a> PlanIter<'a> {
                     self.step = 3;
                     return Some(spec(
                         format!("{root}/lib/src/facets/accel_io.dart"),
-                        FileKind::FacetIo(p),
+                        FileKind::FacetIo(package_index),
                     ));
                 }
                 3 => {
                     self.step = 4;
                     return Some(spec(
                         format!("{root}/lib/src/facets/accel_stub.dart"),
-                        FileKind::FacetStub(p),
+                        FileKind::FacetStub(package_index),
                     ));
                 }
                 4 => {
@@ -432,13 +453,16 @@ impl<'a> PlanIter<'a> {
                         let i = self.index;
                         self.index += 1;
                         let kind = if i == 0 {
-                            FileKind::AnchorModel(p)
+                            FileKind::AnchorModel(package_index)
                         } else if i == self.m - 1 {
-                            FileKind::NarrowGateway(p)
+                            FileKind::NarrowGateway(package_index)
                         } else {
                             self.rotation()
                         };
-                        return Some(spec(format!("{root}/lib/src/models/model_{i:05}.dart"), kind));
+                        return Some(spec(
+                            format!("{root}/lib/src/models/model_{i:05}.dart"),
+                            kind,
+                        ));
                     }
                     self.step = 5;
                     self.index = 0;
@@ -460,11 +484,14 @@ impl<'a> PlanIter<'a> {
                         let i = self.index;
                         self.index += 1;
                         let kind = if i == self.s - 1 {
-                            FileKind::Gateway(p)
+                            FileKind::Gateway(package_index)
                         } else {
                             self.rotation()
                         };
-                        return Some(spec(format!("{root}/lib/src/services/service_{i:05}.dart"), kind));
+                        return Some(spec(
+                            format!("{root}/lib/src/services/service_{i:05}.dart"),
+                            kind,
+                        ));
                     }
                     self.step = 7;
                     self.index = 0;
@@ -481,7 +508,10 @@ impl<'a> PlanIter<'a> {
                         self.index += 1;
                         return Some(spec(
                             format!("{root}/lib/src/widgets/widget_{i:05}_part.dart"),
-                            FileKind::WidgetPart { package: p, index: i },
+                            FileKind::WidgetPart {
+                                package: package_index,
+                                index: i,
+                            },
                         ));
                     }
                     if self.widget_emitted < self.w {
@@ -492,7 +522,10 @@ impl<'a> PlanIter<'a> {
                             self.widget_emitted += 2;
                             return Some(spec(
                                 format!("{root}/lib/src/widgets/widget_{i:05}.dart"),
-                                FileKind::WidgetHost { package: p, index: i },
+                                FileKind::WidgetHost {
+                                    package: package_index,
+                                    index: i,
+                                },
                             ));
                         }
                         self.index += 1;
@@ -506,7 +539,10 @@ impl<'a> PlanIter<'a> {
                 }
                 8 => {
                     self.step = 9;
-                    return Some(spec(format!("{root}/pubspec.yaml"), FileKind::PackagePubspec(PackageId::Feature(p))));
+                    return Some(spec(
+                        format!("{root}/pubspec.yaml"),
+                        FileKind::PackagePubspec(PackageId::Feature(package_index)),
+                    ));
                 }
                 _ => return None,
             }
@@ -538,7 +574,10 @@ impl<'a> PlanIter<'a> {
                 3 => {
                     self.step = 4;
                     self.index = 0;
-                    return Some(spec(format!("{base}/src/containers/registry_box.dart"), FileKind::RegistryBox));
+                    return Some(spec(
+                        format!("{base}/src/containers/registry_box.dart"),
+                        FileKind::RegistryBox,
+                    ));
                 }
                 4 => {
                     if let Some(item) = self.rotation_dir(1, "extensions", "extension") {
@@ -589,7 +628,10 @@ impl<'a> PlanIter<'a> {
                 }
                 10 => {
                     self.step = 11;
-                    return Some(spec(format!("{base}/src/typedefs/function_types.dart"), FileKind::FunctionTypes));
+                    return Some(spec(
+                        format!("{base}/src/typedefs/function_types.dart"),
+                        FileKind::FunctionTypes,
+                    ));
                 }
                 11 => {
                     if let Some(item) = self.rotation_dir(5, "typedefs", "typedef") {
@@ -598,7 +640,10 @@ impl<'a> PlanIter<'a> {
                 }
                 12 => {
                     self.step = 13;
-                    return Some(spec(format!("{base}/src/values/core_value.dart"), FileKind::CoreValueLib));
+                    return Some(spec(
+                        format!("{base}/src/values/core_value.dart"),
+                        FileKind::CoreValueLib,
+                    ));
                 }
                 13 => {
                     if let Some(item) = self.rotation_dir(6, "values", "value") {
@@ -607,7 +652,10 @@ impl<'a> PlanIter<'a> {
                 }
                 14 => {
                     self.step = 15;
-                    return Some(spec("packages/core/pubspec.yaml".to_string(), FileKind::PackagePubspec(PackageId::Core)));
+                    return Some(spec(
+                        "packages/core/pubspec.yaml".to_string(),
+                        FileKind::PackagePubspec(PackageId::Core),
+                    ));
                 }
                 _ => return None,
             }

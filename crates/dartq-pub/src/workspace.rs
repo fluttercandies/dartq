@@ -55,6 +55,13 @@ pub struct WorkspaceLayout {
 /// duplicate inclusion, duplicate member names, duplicate or
 /// workspace-targeting overrides, or a stray interstitial pubspec
 /// (package.dart:486-592).
+///
+/// # Panics
+///
+/// Panics if the root branch is reached without a previously met pubspec —
+/// impossible by construction (the branch only runs after `load_pubspec`
+/// succeeded, which is what sets `first_met`); the `expect` pins that
+/// invariant.
 pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
     let mut dir = from.to_path_buf();
     // The first pubspec met on the walk, for the no-root error.
@@ -239,10 +246,10 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<PathBuf>, PubError
 }
 
 /// Expands one pubspec's `workspace:` entries into (child, parent) stack
-/// slots, in pop order. Glob entries (wildcard characters, language version
-/// >= 3.11) are listed on the filesystem; both modes fail when the entry
-/// yields zero packages, with pub's wording and — below 3.11 — its hint
-/// (package.dart:183-238).
+/// slots, in pop order. Glob entries (wildcard characters, language
+/// version `>= 3.11`) are listed on the filesystem; both modes fail when
+/// the entry yields zero packages, with pub's wording and — below 3.11 —
+/// its hint (package.dart:183-238).
 fn expand_entries(
     dir: &Path,
     spec: &Pubspec,

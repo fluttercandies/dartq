@@ -330,18 +330,17 @@ fn add_components(root: &mut TreeNode, components: &[Sequence]) {
             current.validator.push(component.clone());
             return;
         }
-        let position = match current
+        let position = if let Some(position) = current
             .children
             .iter()
             .position(|(seq, _)| seq == component)
         {
-            Some(position) => position,
-            None => {
-                current
-                    .children
-                    .push((component.clone(), TreeNode::default()));
-                current.children.len() - 1
-            }
+            position
+        } else {
+            current
+                .children
+                .push((component.clone(), TreeNode::default()));
+            current.children.len() - 1
         };
         current = &mut current.children[position].1;
     }
@@ -368,13 +367,13 @@ fn join(components: &[Sequence]) -> Sequence {
 /// glue onto the component before them. The root literal itself is dropped:
 /// workspace entries are always relative, so no tree is ever rooted there.
 fn split(sequence: Sequence) -> Vec<Sequence> {
-    let mut components: Vec<Sequence> = Vec::new();
-    let mut current: Option<Vec<Node>> = None;
     fn flush(current: &mut Option<Vec<Node>>, components: &mut Vec<Sequence>) {
         if let Some(nodes) = current.take() {
             components.push(Sequence(nodes));
         }
     }
+    let mut components: Vec<Sequence> = Vec::new();
+    let mut current: Option<Vec<Node>> = None;
     for node in sequence.0 {
         match node {
             Node::Literal(text) if text.contains('/') => {

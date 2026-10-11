@@ -6,6 +6,7 @@
 //! by design; see the crate README for the full contract.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 /// FNV-1a 64-bit hash.
 pub struct Fnv64 {
@@ -13,6 +14,7 @@ pub struct Fnv64 {
 }
 
 impl Fnv64 {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: 0xcbf2_9ce4_8422_2325,
@@ -26,6 +28,7 @@ impl Fnv64 {
         }
     }
 
+    #[must_use]
     pub fn finish(&self) -> u64 {
         self.state
     }
@@ -52,26 +55,29 @@ pub struct Manifest {
 impl Manifest {
     /// Renders the manifest as deterministic JSON (sorted keys, trailing
     /// newline).
+    #[must_use]
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(512);
         out.push_str("{\n");
-        out.push_str(&format!("  \"files\": {},\n", self.files));
+        writeln!(out, "  \"files\": {},", self.files).expect("string write");
         out.push_str("  \"files_per_top_level_dir\": {");
         for (index, (dir, count)) in self.files_per_top_level_dir.iter().enumerate() {
             if index > 0 {
                 out.push(',');
             }
-            out.push_str(&format!("\n    \"{dir}\": {count}"));
+            write!(out, "\n    \"{dir}\": {count}").expect("string write");
         }
         out.push_str("\n  },\n");
-        out.push_str(&format!(
-            "  \"fingerprint\": \"fnv1a64:{:016x}\",\n",
+        writeln!(
+            out,
+            "  \"fingerprint\": \"fnv1a64:{:016x}\",",
             self.fingerprint
-        ));
+        )
+        .expect("string write");
         out.push_str("  \"generator\": \"corpus-gen\",\n");
-        out.push_str(&format!("  \"lines\": {},\n", self.lines));
-        out.push_str(&format!("  \"scale\": \"{}\",\n", self.scale));
-        out.push_str(&format!("  \"seed\": {}\n", self.seed));
+        writeln!(out, "  \"lines\": {},", self.lines).expect("string write");
+        writeln!(out, "  \"scale\": \"{}\",", self.scale).expect("string write");
+        writeln!(out, "  \"seed\": {}", self.seed).expect("string write");
         out.push_str("}\n");
         out
     }

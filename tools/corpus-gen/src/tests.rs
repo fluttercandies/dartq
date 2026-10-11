@@ -5,9 +5,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::coverage::{CELL_COUNT, CELL_CORE_VALUE_USE, CELL_LIST, CELL_NAMES};
-use crate::generator::{generate, Config};
-use crate::plan::{Plan, Scale, CORE_FIXED};
+use crate::coverage::{CELL_CORE_VALUE_USE, CELL_COUNT, CELL_LIST, CELL_NAMES};
+use crate::generator::{Config, generate};
+use crate::plan::{CORE_FIXED, Plan, Scale};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("corpus-gen-{tag}-{}", std::process::id()));
@@ -24,6 +24,8 @@ fn config(dir: PathBuf, scale: Scale, seed: u64) -> Config {
     }
 }
 
+// Test ratio helper; f64 rounding at corpus sizes is irrelevant.
+#[expect(clippy::cast_precision_loss, reason = "see above")]
 fn ratio(value: usize, total: usize) -> f64 {
     value as f64 / total as f64
 }
@@ -37,9 +39,18 @@ fn cell_tables_stay_in_sync() {
 
 #[test]
 fn plan_hits_scale_targets_and_distribution() {
-    for (scale, target) in [(Scale::K1, 1_000), (Scale::K10, 10_000), (Scale::K100, 100_000)] {
+    for (scale, target) in [
+        (Scale::K1, 1_000),
+        (Scale::K10, 10_000),
+        (Scale::K100, 100_000),
+    ] {
         let plan = Plan::build(scale);
-        assert_eq!(plan.total_files, target, "file target for {}", scale.label());
+        assert_eq!(
+            plan.total_files,
+            target,
+            "file target for {}",
+            scale.label()
+        );
 
         let features = plan.packages as usize * plan.per_package + plan.extra_last_package;
         let core = CORE_FIXED + 1 + plan.core_dir_counts.iter().sum::<usize>(); // +1 core pubspec
@@ -65,7 +76,7 @@ fn plan_yields_sorted_unique_paths() {
     let plan = Plan::build(Scale::K1);
     let mut previous: Option<String> = None;
     let mut seen = 0;
-    for item in plan.iter() {
+    for item in &plan {
         if let Some(previous) = &previous {
             assert!(
                 previous.as_str() < item.path.as_str(),

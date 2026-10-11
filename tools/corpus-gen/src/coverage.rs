@@ -147,6 +147,7 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             counts: [0; CELL_COUNT],
@@ -157,12 +158,19 @@ impl Coverage {
         self.counts[cell as usize] += 1;
     }
 
+    #[must_use]
     pub fn count(&self, cell: Cell) -> u32 {
         self.counts[cell as usize]
     }
 
     /// Lowest per-cell count; the coverage gate compares this against the
     /// per-cell minimum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `CELL_COUNT` is zero — excluded by construction; the
+    /// `expect` pins that invariant.
+    #[must_use]
     pub fn minimum(&self) -> u32 {
         self.counts
             .iter()

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corpus_gen::generator::{generate, Config};
+use corpus_gen::generator::{Config, generate};
 use corpus_gen::plan::Scale;
 
 const USAGE: &str = "\
@@ -75,12 +75,16 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    if argv.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
+    if argv
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let args = match parse_args(&argv) {
-        Ok(args) => args,
+    let parsed = match parse_args(&argv) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("error: {message}");
             eprintln!("{USAGE}");
@@ -88,9 +92,9 @@ fn main() -> ExitCode {
         }
     };
     let config = Config {
-        out: args.out,
-        scale: args.scale,
-        seed: args.seed,
+        out: parsed.out,
+        scale: parsed.scale,
+        seed: parsed.seed,
     };
     match generate(&config) {
         Ok(stats) => {

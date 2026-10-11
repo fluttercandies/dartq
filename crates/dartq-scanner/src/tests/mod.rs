@@ -68,3 +68,10 @@ pub(crate) fn assert_kinds(r: &ScanResult, expected: &[crate::TokenKind]) {
 pub(crate) fn assert_codes(r: &ScanResult, expected: &[&str]) {
     assert_eq!(codes(r), expected, "codes mismatch");
 }
+
+/// Fixture byte offset as a `u32` (the token-table position domain).
+/// Panics on absurd fixtures rather than truncating silently.
+#[track_caller]
+pub(crate) fn u32_of(v: usize) -> u32 {
+    u32::try_from(v).expect("fixture offset fits u32")
+}

@@ -1,14 +1,15 @@
-//! Seeded PRNG (SplitMix64) driving all content variation.
+//! Seeded PRNG (`SplitMix64`) driving all content variation.
 //!
 //! Std-only and fully deterministic: the same seed yields the same sequence
 //! on every platform. No system entropy, no time sources.
 
-/// SplitMix64 generator (fixed 64-bit state).
+/// `SplitMix64` generator (fixed 64-bit state).
 pub struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
+    #[must_use]
     pub fn new(seed: u64) -> Self {
         Self { state: seed }
     }
@@ -23,10 +24,6 @@ impl SplitMix64 {
 
     /// Uniform value in `0..n` (0 when `n` is 0).
     pub fn below(&mut self, n: u64) -> u64 {
-        if n == 0 {
-            0
-        } else {
-            self.next_u64() % n
-        }
+        if n == 0 { 0 } else { self.next_u64() % n }
     }
 }

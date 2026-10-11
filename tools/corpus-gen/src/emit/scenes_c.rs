@@ -50,9 +50,15 @@ pub(super) fn async_stream(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 
 pub(super) fn typedef_function_type(w: &mut String, id: u32, _rng: &mut SplitMix64) {
     dw!(w, "\n/// Cell: typedefs and generic function types.\n");
-    dw!(w, "typedef Reducer{id} = int Function(int state, int action);\n\n");
+    dw!(
+        w,
+        "typedef Reducer{id} = int Function(int state, int action);\n\n"
+    );
     dw!(w, "typedef Predicate<T> = bool Function(T value);\n\n");
-    dw!(w, "typedef Formatter<T> = String Function(T value, {{String prefix}});\n\n");
+    dw!(
+        w,
+        "typedef Formatter<T> = String Function(T value, {{String prefix}});\n\n"
+    );
     dw!(
         w,
         "int foldOver{id}(List<int> items, Reducer{id} reducer, int seed) {{\n  var state = seed;\n  for (final item in items) {{\n    state = reducer(state, item);\n  }}\n  return state;\n}}\n\n"
@@ -61,7 +67,10 @@ pub(super) fn typedef_function_type(w: &mut String, id: u32, _rng: &mut SplitMix
         w,
         "bool anyMatch<T>(List<T> items, Predicate<T> test) {{\n  for (final item in items) {{\n    if (test(item)) {{\n      return true;\n    }}\n  }}\n  return false;\n}}\n\n"
     );
-    dw!(w, "String show{id}<T>(T value, Formatter<T> format) => format(value);\n");
+    dw!(
+        w,
+        "String show{id}<T>(T value, Formatter<T> format) => format(value);\n"
+    );
 }
 
 pub(super) fn cascade(w: &mut String, id: u32, _rng: &mut SplitMix64) {
@@ -77,7 +86,10 @@ pub(super) fn cascade(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 }
 
 pub(super) fn string_interpolation(w: &mut String, id: u32, _rng: &mut SplitMix64) {
-    dw!(w, "\n/// Cell: string interpolation and adjacent strings.\n");
+    dw!(
+        w,
+        "\n/// Cell: string interpolation and adjacent strings.\n"
+    );
     dw!(
         w,
         "String banner{id}(String name, int version) {{\n  final single = 'app=$name v$version';\n  final adjacent = 'first part '\n      'second part ${{name.toUpperCase()}} '\n      \"third part $single\";\n  final raw = r'temp${{not interpolated}}';\n  return '$adjacent (${{single.length}}) $raw';\n}}\n"
@@ -86,7 +98,10 @@ pub(super) fn string_interpolation(w: &mut String, id: u32, _rng: &mut SplitMix6
 
 pub(super) fn numbers(w: &mut String, id: u32, rng: &mut SplitMix64) {
     let extra = rng.below(0xF0);
-    dw!(w, "\n/// Cell: numeric literals (decimal, hex, exponent).\n");
+    dw!(
+        w,
+        "\n/// Cell: numeric literals (decimal, hex, exponent).\n"
+    );
     dw!(
         w,
         "class Metrics{id} {{\n  static const int mask = 0xFF00;\n\n  static const double epsilon = 1.5e-8;\n\n  static const double halfPi = 3.14159e-1;\n\n  final int width;\n\n  final double scale;\n\n  const Metrics{id}(this.width, this.scale);\n\n  int get masked => width & mask;\n\n  double get scaled => width * scale + 2.5e2 + 0x{extra:X};\n}}\n"

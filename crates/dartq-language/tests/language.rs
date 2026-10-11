@@ -2,7 +2,7 @@
 //! `FeatureSet`. Expected values are pinned to the vendored
 //! `data/experimental_features.yaml` snapshot.
 
-use std::collections::HashSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, FEATURE_COUNT, FEATURES, Feature, FeatureSet, LanguageVersion,
@@ -114,7 +114,7 @@ fn registry_follows_yaml_order() {
 
 #[test]
 fn registry_names_round_trip() {
-    let mut names = HashSet::with_capacity(FEATURE_COUNT);
+    let mut names = FxHashSet::with_capacity_and_hasher(FEATURE_COUNT, FxBuildHasher);
     for feature in Feature::ALL {
         assert_eq!(
             Feature::try_from(feature.meta().name),

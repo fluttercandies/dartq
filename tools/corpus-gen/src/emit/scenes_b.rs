@@ -25,7 +25,10 @@ pub(super) fn pattern_record(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 }
 
 pub(super) fn pattern_list_map(w: &mut String, id: u32, _rng: &mut SplitMix64) {
-    dw!(w, "\n/// Cell: list and map patterns in a switch statement.\n");
+    dw!(
+        w,
+        "\n/// Cell: list and map patterns in a switch statement.\n"
+    );
     dw!(
         w,
         "String classify{id}(Object value) {{\n  switch (value) {{\n    case []:\n      return 'empty';\n    case [int first, ...var rest] when rest.isEmpty:\n      return 'one:$first';\n    case <int>[_, _, _]:\n      return 'triple ints';\n    case {{'name': String name}}:\n      return 'named:$name';\n    case {{0: var head, 1: var tail}}:\n      return 'headtail:$head/$tail';\n    default:\n      return 'other';\n  }}\n}}\n"
@@ -49,7 +52,10 @@ pub(super) fn pattern_logical(w: &mut String, id: u32, _rng: &mut SplitMix64) {
 }
 
 pub(super) fn collection_control_flow(w: &mut String, id: u32, _rng: &mut SplitMix64) {
-    dw!(w, "\n/// Cell: collection literals with control flow and spreads.\n");
+    dw!(
+        w,
+        "\n/// Cell: collection literals with control flow and spreads.\n"
+    );
     dw!(
         w,
         "List<int> expand{id}(List<int> input, bool keepEven) {{\n  return [\n    for (final value in input)\n      if (keepEven ? value.isEven : value.isOdd) value * 2,\n    ...input.reversed,\n    ...?input.isEmpty ? const <int>[0] : null,\n  ];\n}}\n\n"
@@ -66,7 +72,10 @@ pub(super) fn collection_control_flow(w: &mut String, id: u32, _rng: &mut SplitM
 
 pub(super) fn core_value_use(w: &mut String, id: u32, rng: &mut SplitMix64) {
     let k = rng.below(1_000);
-    dw!(w, "\n/// Cell: cross-package usage of the shared core types.\n");
+    dw!(
+        w,
+        "\n/// Cell: cross-package usage of the shared core types.\n"
+    );
     dw!(w, "final CoreValue sharedValue{id} = CoreValue({k});\n\n");
     dw!(
         w,

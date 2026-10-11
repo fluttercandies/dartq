@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::coverage::Coverage;
-use crate::emit::{render, RenderCtx};
+use crate::emit::{RenderCtx, render};
 use crate::manifest::{Fnv64, Manifest};
 use crate::plan::{Plan, Scale};
 use crate::rng::SplitMix64;
@@ -28,6 +28,11 @@ pub struct Stats {
 /// Generates the corpus under `config.out` and writes `manifest.json` next to
 /// it. Existing files with colliding names are overwritten; stale files from
 /// earlier runs are not removed (callers should target a fresh directory).
+///
+/// # Errors
+///
+/// Returns any `io::Error` from creating directories or writing corpus and
+/// manifest files, propagated verbatim with no partial-run retry.
 pub fn generate(config: &Config) -> io::Result<Stats> {
     fs::create_dir_all(&config.out)?;
     let plan = Plan::build(config.scale);
@@ -38,7 +43,7 @@ pub fn generate(config: &Config) -> io::Result<Stats> {
     let mut files = 0usize;
     let mut lines = 0usize;
     let mut rotation_ordinal = 0usize;
-    for item in plan.iter() {
+    for item in &plan {
         let mut ctx = RenderCtx {
             plan: &plan,
             rng: &mut rng,

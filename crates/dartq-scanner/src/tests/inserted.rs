@@ -3,7 +3,7 @@
 //! and leaves every original token untouched — the contiguous unified table
 //! the AST's span derivation reads.
 
-use super::scan_src;
+use super::{scan_src, u32_of};
 use crate::{Token, TokenKind, TokenTable};
 
 /// `(kind, byte_offset, byte_len, utf16_offset, is_synthetic)` per token.
@@ -33,9 +33,9 @@ fn split_fixture() -> (Token, Token) {
         Token::inserted(TokenKind::Gt, 4, 1, 4, false),
         Token::inserted(
             TokenKind::Semicolon,
-            SRC.len() as u32,
+            u32_of(SRC.len()),
             0,
-            SRC.len() as u32,
+            u32_of(SRC.len()),
             true,
         ),
     )

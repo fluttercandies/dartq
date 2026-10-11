@@ -337,8 +337,8 @@ mod tests {
     use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet};
     use dartq_parser::ParserFeatures;
     use dartq_scanner::{ScanConfig, scan};
+    use rustc_hash::FxHashMap;
     use serde_json::json;
-    use std::collections::HashMap;
     use std::fs;
 
     /// A retired library slot is invisible to the report (#558): removing a
@@ -440,7 +440,7 @@ mod tests {
         ));
         let captured = capture(file, text, &scanned.tokens, features, strings);
         let mut slice: Vec<String> = Vec::new();
-        let mut slots: HashMap<String, u32> = HashMap::new();
+        let mut slots: FxHashMap<String, u32> = FxHashMap::default();
         let top_decl = |kind: &str| {
             json!({
                 "kind": kind,
@@ -570,7 +570,7 @@ mod tests {
         // The save side: one payload per workspace file, keyed by the exact
         // content the store's entry key pins.
         let strings = StringTable::new();
-        let mut persisted: HashMap<String, PersistedFacts> = HashMap::new();
+        let mut persisted: FxHashMap<String, PersistedFacts> = FxHashMap::default();
         for relative in [
             "lib/main.dart",
             "lib/extra.dart",
@@ -662,7 +662,7 @@ mod tests {
 
         // Entries exist — but only for files outside the seed library.
         let strings = StringTable::new();
-        let mut persisted: HashMap<String, PersistedFacts> = HashMap::new();
+        let mut persisted: FxHashMap<String, PersistedFacts> = FxHashMap::default();
         for relative in ["lib/other.dart", "test/main_test.dart"] {
             let path = root.join(relative);
             let text = fs::read_to_string(&path).expect("fixture file");
