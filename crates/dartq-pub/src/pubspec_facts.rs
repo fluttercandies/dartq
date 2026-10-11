@@ -20,9 +20,11 @@
 //! - anchors/aliases and merge keys.
 //!
 //! Quoted *values* are read (single-quoted `''` doubling, double-quoted
-//! `\"`/`\\` escapes cooked; the rest of the double-quote escape set passes
-//! through — no URL or package name in practice carries one). Spans mirror
-//! the official `YamlNode.span`: the raw scalar extent, quotes included.
+//! `\"`/`\\` escapes cooked). Any other double-quote escape (`\n`, `\t`,
+//! `\u...`, ...) fails the scalar closed and yields no row: cooking
+//! `\<char>` verbatim would misreport (a URL like `"\u0041.example"`
+//! would read as `u0041.example`). Spans mirror the official
+//! `YamlNode.span`: the raw scalar extent, quotes included.
 
 use core::ops::Range;
 
@@ -186,9 +188,12 @@ fn scalar(rest: &str, abs: usize) -> (Range<usize>, String) {
         Some(b'\'') => quoted(trimmed, abs, b'\''),
         Some(b'"') => quoted(trimmed, abs, b'"'),
         _ => {
+            // A `#` after any whitespace ends a plain scalar (`a#b` has no
+            // comment). The plain arm never sees a leading `#`, so every
+            // match has a preceding byte.
             let end = trimmed
-                .match_indices(" #")
-                .next()
+                .match_indices('#')
+                .find(|&(i, _)| matches!(trimmed.as_bytes()[i - 1], b' ' | b'\t'))
                 .map_or(trimmed.len(), |(i, _)| i);
             let value = trimmed[..end].trim_end();
             (abs..abs + value.len(), value.to_owned())
@@ -198,8 +203,9 @@ fn scalar(rest: &str, abs: usize) -> (Range<usize>, String) {
 
 /// A quoted scalar: the raw extent spans the quotes; the cooked value is
 /// the content with YAML's quote escapes resolved (single: `''` doubling;
-/// double: the backslash escape consumes the next char). An unterminated
-/// literal is block form — upstream parsing rejects it anyway.
+/// double: only `\"` and `\\` — any other escape fails the scalar closed,
+/// see the module doc). An unterminated literal is block form — upstream
+/// parsing rejects it anyway.
 fn quoted(trimmed: &str, abs: usize, quote: u8) -> (Range<usize>, String) {
     let b = trimmed.as_bytes();
     let mut value = String::new();
@@ -207,10 +213,14 @@ fn quoted(trimmed: &str, abs: usize, quote: u8) -> (Range<usize>, String) {
     while i < b.len() {
         match b[i] {
             // The escape consumes the closing candidate (double-quote form).
-            b'\\' if quote == b'"' && i + 1 < b.len() => {
-                value.push(b[i + 1] as char);
-                i += 2;
-            }
+            b'\\' if quote == b'"' && i + 1 < b.len() => match b[i + 1] {
+                b'"' | b'\\' => {
+                    value.push(b[i + 1] as char);
+                    i += 2;
+                }
+                // Unhandled escape: fail closed (no row for this scalar).
+                _ => return (abs..abs, String::new()),
+            },
             c if c == quote => {
                 if quote == b'\'' && b.get(i + 1) == Some(&quote) {
                     value.push(quote as char);
@@ -228,4 +238,42 @@ fn quoted(trimmed: &str, abs: usize, quote: u8) -> (Range<usize>, String) {
         }
     }
     (abs..abs, String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn urls(text: &str) -> Vec<String> {
+        scan(text)
+            .urls
+            .into_iter()
+            .map(|scalar| scalar.value)
+            .collect()
+    }
+
+    #[test]
+    fn double_quote_escapes_fail_closed() {
+        // An unhandled escape emits no row for the scalar.
+        assert_eq!(
+            urls("homepage: \"http://a\\u0041.example\"\n"),
+            Vec::<String>::new()
+        );
+        // The handled pair still cooks.
+        assert_eq!(urls("homepage: \"a\\\\b\"\n"), vec!["a\\b"]);
+        assert_eq!(urls("homepage: \"say \\\"hi\\\"\"\n"), vec!["say \"hi\""]);
+        // Plain values are unaffected.
+        assert_eq!(
+            urls("homepage: http://a.example\n"),
+            vec!["http://a.example"]
+        );
+    }
+
+    #[test]
+    fn plain_scalar_comment_ends_at_whitespace_hash() {
+        assert_eq!(urls("homepage: url\t# c\n"), vec!["url"]);
+        assert_eq!(urls("homepage: url # c\n"), vec!["url"]);
+        // No whitespace before the `#`: part of the value.
+        assert_eq!(urls("homepage: url#frag\n"), vec!["url#frag"]);
+    }
 }

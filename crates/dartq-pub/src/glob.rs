@@ -126,7 +126,16 @@ impl Glob {
     /// list_tree.dart:408-414, 429-435).
     pub(crate) fn list_sync(&self, root_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();
-        self.root.list(root_dir, &mut out)?;
+        // The canonical paths of the open descent chain: a symlink cycle
+        // revisits an ancestor's resolved path and is cut there. Scoping to
+        // the chain (not the whole walk) keeps dart:io's behavior on
+        // acyclic trees, where a shared directory is still listed once per
+        // reaching path; only true cycles terminate.
+        let mut ancestors = Vec::new();
+        if let Ok(canonical) = std::fs::canonicalize(root_dir) {
+            ancestors.push(canonical);
+        }
+        self.root.list(root_dir, &mut ancestors, &mut out)?;
         // The seen-set of `ListTree.listSync` (list_tree.dart:209-215) only
         // filters when the same path can come out of two tree branches
         // (`_computeCanOverlap`, list_tree.dart:171-179); otherwise the
@@ -175,9 +184,14 @@ impl TreeNode {
         self.recursive = true;
     }
 
-    fn list(&self, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    fn list(
+        &self,
+        dir: &Path,
+        ancestors: &mut Vec<PathBuf>,
+        out: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
         if self.recursive {
-            return self.list_recursive(dir, "", out);
+            return self.list_recursive(dir, "", ancestors, out);
         }
         // Don't list directories whose children are all literal names
         // (list_tree.dart:328-338); missing ones are silently skipped.
@@ -186,7 +200,11 @@ impl TreeNode {
                 let Node::Literal(text) = &sequence.0[0] else {
                     unreachable!("intermediate children are single literals");
                 };
-                child.list(&dir.join(text), out)?;
+                let next = dir.join(text);
+                if enter_dir(&next, ancestors) {
+                    child.list(&next, ancestors, out)?;
+                    ancestors.pop();
+                }
             }
             return Ok(());
         }
@@ -217,12 +235,13 @@ impl TreeNode {
                 Ok(file_type) => file_type.is_dir(),
                 Err(_) => false,
             };
-            if is_dir {
+            if is_dir && enter_dir(&path, ancestors) {
                 for (sequence, child) in &self.children {
                     if matches(&sequence.0, &basename) {
-                        child.list(&path, out)?;
+                        child.list(&path, ancestors, out)?;
                     }
                 }
+                ancestors.pop();
             }
         }
         Ok(())
@@ -230,11 +249,13 @@ impl TreeNode {
 
     /// `Directory.listSync(recursive: true, followLinks: true)` filtered by
     /// the validator, pre-order: each entity is emitted (if it matches)
-    /// before its contents are walked (list_tree.dart:404-414).
+    /// before its contents are walked (list_tree.dart:404-414). Symlink
+    /// cycles are cut at the revisit (dart:io itself loops forever).
     fn list_recursive(
         &self,
         dir: &Path,
         relative: &str,
+        ancestors: &mut Vec<PathBuf>,
         out: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
         let entries = match std::fs::read_dir(dir) {
@@ -275,9 +296,10 @@ impl TreeNode {
                 Ok(file_type) => file_type.is_dir(),
                 Err(_) => false,
             };
-            if is_dir {
+            if is_dir && enter_dir(&path, ancestors) {
                 let nested = format!("{child_relative}/");
-                self.list_recursive(&path, &nested, out)?;
+                self.list_recursive(&path, &nested, ancestors, out)?;
+                ancestors.pop();
             }
         }
         Ok(())
@@ -603,6 +625,25 @@ fn matches_from(
 /// Decodes the char at byte offset `pos`, `None` past the end.
 fn char_at(text: &str, pos: usize) -> Option<char> {
     text[pos..].chars().next()
+}
+
+/// The symlink-cycle guard for the follow-links walk: `dir` is entered only
+/// when its canonical path is not already on the open descent chain
+/// (`ancestors`). A cycle must pass through a symlink, whose resolution is
+/// exactly what `canonicalize` reads, so this cuts every loop while leaving
+/// acyclic trees untouched (a shared directory reached by two paths is not
+/// on one chain and stays listed twice, as dart:io lists it). Unresolvable
+/// paths enter as before — the read_dir guards reject them. Returns whether
+/// the caller entered, so it can pop the chain afterwards.
+fn enter_dir(dir: &Path, ancestors: &mut Vec<PathBuf>) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return true;
+    };
+    if ancestors.contains(&canonical) {
+        return false;
+    }
+    ancestors.push(canonical);
+    true
 }
 
 /// A `StringScanner` over chars (parser.dart uses UTF-16 offsets; the
@@ -948,6 +989,32 @@ mod tests {
         assert!(found.contains(&"a/pkg.dart".to_owned()));
         assert!(found.contains(&"a/inner/deep.dart".to_owned()));
         assert!(!found.contains(&"a".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_cycle_terminates() {
+        // `a/loop -> b -> a`: dart:io's follow-links walk loops forever on
+        // this shape; the canonical-chain guard cuts the revisit while the
+        // acyclic entries still list.
+        let dir = std::env::temp_dir().join(format!("dartq-glob-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).expect("mkdir");
+        std::fs::write(dir.join("a").join("pkg.dart"), "").expect("write");
+        std::os::unix::fs::symlink(dir.join("a"), dir.join("b")).expect("symlink");
+        std::os::unix::fs::symlink(dir.join("b"), dir.join("a").join("loop")).expect("symlink");
+
+        let mut found = listed("a/**", &dir);
+        found.sort();
+        assert_eq!(found, vec!["a/loop", "a/pkg.dart"]);
+
+        // The non-recursive descent cuts the same cycle (inside `a`, `loop`
+        // resolves back onto `a`), while the shared-directory listing keeps
+        // dart:io's shape: `b` is a symlink to `a` and its contents list
+        // under `b/` too — only the true cycle is cut.
+        let mut found = listed("*/*.dart", &dir);
+        found.sort();
+        assert_eq!(found, vec!["a/pkg.dart", "b/pkg.dart"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

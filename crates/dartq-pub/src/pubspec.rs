@@ -68,7 +68,7 @@ pub enum DependencySpec {
         name: Option<String>,
         version: Option<VersionConstraint>,
     },
-    /// `git: <url>` or `{git: {url, ref?, path?, tag-pattern?}}`.
+    /// `git: <url>` or `{git: {url, ref?, path?, tag_pattern?}}`.
     Git {
         url: String,
         /// Branch, commit or tag; mutually exclusive with `tag_pattern`.
@@ -222,7 +222,7 @@ impl Pubspec {
         };
 
         let dep = |key: &str| -> Result<BTreeMap<String, DependencySpec>, PubError> {
-            parse_dependency_map(root.get(key), key, &name, &invalid)
+            parse_dependency_map(root.get(key), key, &name, language_version, &invalid)
         };
         let dependencies = dep("dependencies")?;
         let dev_dependencies = dep("dev_dependencies")?;
@@ -232,9 +232,13 @@ impl Pubspec {
         // (package.dart:531-555). Both origins are checked against the
         // pubspec's own name (pubspec.dart:179, 190).
         let dependency_overrides = match overrides.and_then(|map| map.get("dependency_overrides")) {
-            Some(node) => {
-                parse_dependency_map(Some(node), "dependency_overrides", &name, &invalid)?
-            }
+            Some(node) => parse_dependency_map(
+                Some(node),
+                "dependency_overrides",
+                &name,
+                language_version,
+                &invalid,
+            )?,
             None => dep("dependency_overrides")?,
         };
 
@@ -464,6 +468,7 @@ fn parse_dependency_map(
     value: Option<&serde_yaml::Value>,
     section: &str,
     package_name: &str,
+    language_version: LanguageVersion,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<BTreeMap<String, DependencySpec>, PubError> {
     let Some(value) = value else {
@@ -497,7 +502,7 @@ fn parse_dependency_map(
                 "A package may not list itself as a dependency.".into(),
             ));
         }
-        let parsed = parse_dependency_spec(spec, invalid)?;
+        let parsed = parse_dependency_spec(spec, language_version, invalid)?;
         deps.insert(name.to_owned(), parsed);
     }
     Ok(deps)
@@ -505,6 +510,7 @@ fn parse_dependency_map(
 
 fn parse_dependency_spec(
     spec: &serde_yaml::Value,
+    language_version: LanguageVersion,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<DependencySpec, PubError> {
     match spec {
@@ -550,7 +556,7 @@ fn parse_dependency_spec(
                     version,
                 }),
                 [("hosted", value)] => parse_hosted(value, version, invalid),
-                [("git", value)] => parse_git(value, invalid),
+                [("git", value)] => parse_git(value, language_version, invalid),
                 [("path", value)] => {
                     let path = value
                         .as_str()
@@ -599,6 +605,7 @@ fn parse_hosted(
 
 fn parse_git(
     value: &serde_yaml::Value,
+    language_version: LanguageVersion,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<DependencySpec, PubError> {
     let (url, reference, tag_pattern, path) = match value {
@@ -607,14 +614,35 @@ fn parse_git(
         serde_yaml::Value::Mapping(map) => {
             let url = optional_field(map, "url")?
                 .ok_or_else(|| invalid("git dependency needs a `url`".into()))?;
+            // pub reads and type-checks `ref`, `path` and `tag_pattern` in
+            // this order, then applies the gates (git.dart:58-119).
             let reference = optional_field(map, "ref")?;
-            let tag_pattern = optional_field(map, "tag-pattern")?;
+            let path = optional_field(map, "path")?;
+            let tag_pattern = optional_field(map, "tag_pattern")?;
+            if tag_pattern.is_some() && language_version < LanguageVersion::FIRST_WITH_TAG_PATTERN {
+                return Err(invalid(format!(
+                    "`tag_pattern` requires at least language version {}",
+                    LanguageVersion::FIRST_WITH_TAG_PATTERN
+                )));
+            }
             if reference.is_some() && tag_pattern.is_some() {
                 return Err(invalid(
-                    "a git dependency may not have both `ref` and `tag-pattern`".into(),
+                    "a git dependency may not have both `ref` and `tag_pattern`".into(),
                 ));
             }
-            let path = optional_field(map, "path")?;
+            // From 3.7 on pub rejects every description key outside its
+            // whitelist (git.dart:117-123); below that unknown keys are
+            // ignored. Non-string keys stay skipped (the documented
+            // non-string key debt face).
+            if language_version >= LanguageVersion::FIRST_FORBIDDING_UNKNOWN_DESCRIPTION_KEYS {
+                for key in map.keys() {
+                    if let Some(key) = key.as_str()
+                        && !matches!(key, "url" | "ref" | "path" | "tag_pattern")
+                    {
+                        return Err(invalid(format!("unknown git description key `{key}`")));
+                    }
+                }
+            }
             (url, reference, tag_pattern, path)
         }
         _ => return Err(invalid("`git` must be a URL string or a mapping".into())),
@@ -761,9 +789,49 @@ dev_dependencies:
             Pubspec::parse(two_sources),
             Err(PubError::Pubspec(_))
         ));
-        let ref_and_tag = "name: a\ndependencies:\n  x:\n    git:\n      url: /r\n      ref: main\n      tag-pattern: 'v*'\n";
+        let ref_and_tag = |sdk: &str, key: &str| {
+            format!(
+                "name: a\nenvironment:\n  sdk: '{sdk}'\ndependencies:\n  x:\n    git:\n      url: /r\n      ref: main\n      {key}: 'v*'\n"
+            )
+        };
+        // ^3.9: `tag_pattern` accepted standalone (the
+        // tag_pattern_test.dart fixture shape), but mutually exclusive
+        // with `ref`.
+        let ok = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      tag_pattern: '{{version}}'\n";
+        let spec = Pubspec::parse(ok).expect("ok");
         assert!(matches!(
-            Pubspec::parse(ref_and_tag),
+            spec.dependencies["x"],
+            DependencySpec::Git {
+                tag_pattern: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            Pubspec::parse(&ref_and_tag("^3.9.0", "tag_pattern")),
+            Err(PubError::Pubspec(_))
+        ));
+        // ^3.8: `tag_pattern` below the 3.9 gate, the dash spelling an
+        // unknown description key — both rejected.
+        assert!(matches!(
+            Pubspec::parse(&ref_and_tag("^3.8.0", "tag_pattern")),
+            Err(PubError::Pubspec(_))
+        ));
+        assert!(matches!(
+            Pubspec::parse(&ref_and_tag("^3.8.0", "tag-pattern")),
+            Err(PubError::Pubspec(_))
+        ));
+        // 3.8 rejects unknown keys; 2.7 (the no-constraint default) ignores
+        // them, so a dash spelling pairs with `ref` unnoticed.
+        assert!(matches!(
+            Pubspec::parse(&ref_and_tag("^3.7.0", "tag-pattern")),
+            Err(PubError::Pubspec(_))
+        ));
+        // Three-part bound versions: a two-part `2.19` would fail version
+        // parsing first (pub rejects those too).
+        assert!(Pubspec::parse(&ref_and_tag(">=2.19.0 <3.0.0", "tag-pattern")).is_ok());
+        let unknown_key = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      branch: main\n";
+        assert!(matches!(
+            Pubspec::parse(unknown_key),
             Err(PubError::Pubspec(_))
         ));
         let unknown_source = "name: a\ndependencies:\n  x:\n    cvs: whatever\n";

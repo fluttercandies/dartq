@@ -249,7 +249,9 @@ impl Freshness {
                 }
                 // pub treats a missing generatorVersion as a different SDK.
                 (_, None) => false,
-                (None, Some(_)) => true, // unparsable input: skip the check
+                // An unparsable version cannot be shown equal either: report
+                // the mismatch rather than silently skipping the check.
+                (None, Some(_)) => false,
             };
             if !matches {
                 reasons.push(StaleReason::GeneratorSdkMismatch {
@@ -275,6 +277,10 @@ impl Freshness {
             if is_cache_member(&config, &package_dir) {
                 continue; // pub-cache packages: no mtime check (facts §6.5)
             }
+            // Documented divergence, stricter than pub: pub mtime-gates
+            // pubspec.yaml only; dartiq also gates on
+            // pubspec_overrides.yaml, so an untouched-since-`pub get`
+            // overrides file can never hide a dependency change.
             for file in ["pubspec.yaml", "pubspec_overrides.yaml"] {
                 let path = package_dir.join(file);
                 let mtime = match modified(&path) {
@@ -579,6 +585,44 @@ mod tests {
         };
         let report = Freshness::check(&root, &patch, None);
         assert!(report.is_fresh(), "unexpected: {:?}", report.stale_reasons);
+    }
+
+    #[test]
+    fn unparsable_dart_version_reports_sdk_mismatch() {
+        let root = temp_dir("unparsable-dart");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(&root.join(".dart_tool").join("package_config.json"), CONFIG);
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(3_000, 0),
+        )
+        .expect("set mtime");
+
+        // An unparsable env version cannot be shown equal to the recorded
+        // generatorVersion: the mismatch is reported, not skipped.
+        let env = EnvSnapshot {
+            dart_version: Some("not-a-version".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert_eq!(
+            report.stale_reasons,
+            vec![StaleReason::GeneratorSdkMismatch {
+                config: "3.13.1".into(),
+                current: "not-a-version".into(),
+            }]
+        );
     }
 
     #[test]

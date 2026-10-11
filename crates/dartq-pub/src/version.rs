@@ -370,7 +370,11 @@ fn scan_comparison(text: &str) -> Option<(Option<Bound>, Option<Bound>, &str)> {
 }
 
 /// Scans a bare version at the start of `text` (three numeric dot groups,
-/// then optional pre-release/build), returning it with the remainder.
+/// then optional pre-release/build), returning it with the remainder. A
+/// two-part bare version (`>=2.19`) is rejected: pub_semver's 2.1.1
+/// tightening removed the loose partial-version grammar, and current pub
+/// and pub_semver both error on sdk constraints like `>=2.19 <3.0.0`
+/// ("Invalid version constraint").
 fn scan_bare_version(text: &str) -> Option<(Version, &str)> {
     let bytes = text.as_bytes();
     let mut parts = [""; 3];
@@ -475,9 +479,16 @@ impl LanguageVersion {
     pub const PUB_DEFAULT: LanguageVersion = LanguageVersion::new(2, 7);
     /// `firstVersionWithWorkspaces` — gates `workspace:`/`resolution:`.
     pub const FIRST_WITH_WORKSPACES: LanguageVersion = LanguageVersion::new(3, 5);
+    /// `firstVersionForbidingUnknownDescriptionKeys` — gates rejection of
+    /// unknown source description keys (language_version.dart:117).
+    pub const FIRST_FORBIDDING_UNKNOWN_DESCRIPTION_KEYS: LanguageVersion =
+        LanguageVersion::new(3, 7);
     /// `firstVersionWithWorkspaceGlobs` — gates glob expansion of
     /// `workspace:` entries (language_version.dart:115).
     pub const FIRST_WITH_WORKSPACE_GLOBS: LanguageVersion = LanguageVersion::new(3, 11);
+    /// `firstVersionWithTagPattern` — gates the git `tag_pattern` key
+    /// (language_version.dart:116).
+    pub const FIRST_WITH_TAG_PATTERN: LanguageVersion = LanguageVersion::new(3, 9);
     /// dartq's chain bottom (PRD §8.3 level 4): the current SDK default,
     /// taken from the vendored registry's `DEFAULT_LANGUAGE_VERSION` (3.15).
     pub const SDK_DEFAULT: LanguageVersion = LanguageVersion::new(
@@ -672,6 +683,11 @@ mod tests {
                 include_max: false,
             })
         );
+        // Two-part bare versions are rejected: pub_semver's 2.1.1 tightening
+        // removed the loose partial-version grammar, so current pub and
+        // pub_semver both error on `>=2.19 <3.0.0` ("Invalid version
+        // constraint") instead of padding `2.19` to `2.19.0`.
+        assert!(VersionConstraint::parse(">=2.19 <3.0.0").is_err());
     }
 
     #[test]
