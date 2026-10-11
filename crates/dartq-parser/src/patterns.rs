@@ -701,9 +701,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener.handle_no_name(before);
                 colon = Some(self.peek_span());
                 self.cursor.advance();
-            } else if kind != TokenKind::OpenParen
-                && self.cursor.look_kind(1) == TokenKind::Colon
-            {
+            } else if kind != TokenKind::OpenParen && self.cursor.look_kind(1) == TokenKind::Colon {
                 was_record = true;
                 let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
                 colon = Some(name);

@@ -209,7 +209,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         n: usize,
         in_declaration: bool,
     ) -> TypeParamOrArg {
-        if self.cursor.peek_kind_ahead(n) != TokenKind::Lt {
+        if self.cursor.look_kind(n) != TokenKind::Lt {
             return TypeParamOrArg::None;
         }
         if let Some(closer) = simple1_closer(self, self.cursor.real_pos() + n) {
@@ -217,7 +217,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         // `<(`: only a group when the parenthesized content is a record
         // type (type_info.dart:454-468).
-        if self.cursor.peek_kind_ahead(n + 1) == TokenKind::OpenParen {
+        if self.cursor.look_kind(n + 1) == TokenKind::OpenParen {
             let paren_id = self.real_id(self.cursor.real_pos() + n + 1);
             let paired = self
                 .cursor
@@ -933,7 +933,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     fn peek_ahead_is_name(&self, n: usize) -> bool {
-        let kind = self.cursor.peek_kind_ahead(n);
+        let kind = self.cursor.look_kind(n);
         is_identifier(kind)
     }
 
@@ -973,7 +973,7 @@ fn looks_like_type_param_member(parser: &Parser<'_, '_, impl ParserListener>) ->
         return false;
     }
     matches!(
-        parser.cursor.peek_kind_ahead(1),
+        parser.cursor.look_kind(1),
         TokenKind::Identifier
             | TokenKind::Keyword(_)
             | TokenKind::Comma

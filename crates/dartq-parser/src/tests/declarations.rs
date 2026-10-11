@@ -266,7 +266,10 @@ fn positional_default_with_colon_reports() {
     // `wrongSeparatorForPositionalParameter`, r5 corpus
     // wrong_separator_for_positional_parameter.dart).
     let c = parse("class C { void m([int a: 1]) {} }");
-    assert_eq!(c.error_codes(), ["wrong_separator_for_positional_parameter"]);
+    assert_eq!(
+        c.error_codes(),
+        ["wrong_separator_for_positional_parameter"]
+    );
 }
 
 #[test]
@@ -538,9 +541,7 @@ fn switch_expression_missing_body_reports_on_close_paren() {
 /// carries a scanner-level `expected_token(')')` (the same fixture class as
 /// `unclosed_formal_relocation`, whose rig is
 /// `gate_m0_wave3.rs::assert_codes_with_scanner`).
-fn parse_off_with_scanner(
-    source: &'static str,
-) -> (super::collector::Collector, Vec<String>) {
+fn parse_off_with_scanner(source: &'static str) -> (super::collector::Collector, Vec<String>) {
     let config = dartq_scanner::ScanConfig {
         enable_triple_shift: true,
         enable_augmentations: true,
@@ -558,7 +559,12 @@ fn parse_off_with_scanner(
     let features = crate::ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(3, 9),
     ));
-    let mut p = Parser::new(text, table, features, super::collector::Collector::default());
+    let mut p = Parser::new(
+        text,
+        table,
+        features,
+        super::collector::Collector::default(),
+    );
     p.parse_unit();
     (p.listener, scanner_codes)
 }

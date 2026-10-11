@@ -441,8 +441,7 @@ fn parse_complex_plain_type(
         return parse_void(parser);
     }
     let is_prefixed = parser.peek_kind() == TokenKind::Period
-        || (is_identifier(parser.peek_kind())
-            && parser.cursor.peek_kind_ahead(1) == TokenKind::Period);
+        || (is_identifier(parser.peek_kind()) && parser.cursor.look_kind(1) == TokenKind::Period);
     if is_prefixed {
         name = parser.ensure_identifier(IdentifierContext::PrefixedTypeReference);
         let period = {
@@ -507,7 +506,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             if parameter_count == 0
                 && kind == TokenKind::Comma
-                && self.cursor.peek_kind_ahead(1) == TokenKind::CloseParen
+                && self.cursor.look_kind(1) == TokenKind::CloseParen
             {
                 illegal_trailing_comma = Some(self.peek_span());
                 self.cursor.advance();

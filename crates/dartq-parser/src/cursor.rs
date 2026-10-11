@@ -19,6 +19,16 @@
 //! `TokenTable::len()`. Speculation saves/restores the cursor and truncates
 //! the side table, matching the official undoable rewriter
 //! (`token_stream_rewriter.dart:433`).
+//!
+//! * **EOF & length reads (audit #180 F9, documented route)** — `at_eof` is
+//!   a kind-only read (`peek().kind == Eof`): O(1), no span materialization,
+//!   and the EOF token is always the table's last element so the answer is
+//!   stable across queue state. Token UTF-16 lengths route through
+//!   `utf16_len_of_token`'s fixed-lexeme fast path (fixed-lexeme kinds
+//!   return `byte_len` directly, no scan); the char-walk fallback runs only
+//!   for non-ASCII identifier text. Recovery synthetics are zero-width by
+//!   construction, so `range.length == 0` identifies them without the
+//!   synthetic flag.
 
 use dartq_scanner::{Token, TokenKind, TokenTable};
 use dartq_source::SourceRange;
@@ -169,6 +179,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
 
     /// Monotonic consumed-progress measure for no-progress guards: counts
     /// real tokens (weight 2) plus queued inserted tokens ahead of `pos`.
+    #[inline]
     pub(crate) fn progress(&self) -> u64 {
         let queue_pending = (self.inserted.len()
             - if self.head == QUEUE_EMPTY {
@@ -182,6 +193,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     // --- resolution -----------------------------------------------------------
 
     /// Id of the current (peeked) token without consuming.
+    #[inline]
     pub(crate) fn peek_id(&self) -> TokenId {
         if self.head == QUEUE_EMPTY {
             self.pos as TokenId
@@ -195,6 +207,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Ids always come from `peek`/`advance`/`insert_synthetic` of this same
     /// cursor; a garbage id from a rolled-back speculation must never reach
     /// here (that is the caller side of the [`Self::reset`] contract).
+    #[inline]
     pub(crate) fn resolve(&self, id: TokenId) -> (TokenKind, bool) {
         let index = id as usize;
         if index < self.table.len() {
@@ -207,6 +220,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     }
 
     /// UTF-16 span of any id (see [`Self::resolve`] for the id contract).
+    #[inline]
     pub(crate) fn span(&self, id: TokenId) -> SourceRange {
         let index = id as usize;
         if index < self.table.len() {
@@ -223,6 +237,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Lexeme of any id. Inserted tokens have fixed lexemes — except the
     /// synthetic identifier, whose lexeme is the empty string (official
     /// synthetic identifiers are zero-width).
+    #[inline]
     pub(crate) fn lexeme(&self, id: TokenId) -> &'s str {
         let index = id as usize;
         if index < self.table.len() {
@@ -236,6 +251,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     // --- core movement ----------------------------------------------------------
 
     /// Current token without consuming.
+    #[inline]
     pub(crate) fn peek(&self) -> TokenView {
         let id = self.peek_id();
         let (kind, is_synthetic) = self.resolve(id);
@@ -249,13 +265,22 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Kind of the token `n` positions ahead in the *real* stream (no queue
     /// involvement; valid only where nothing can be queued — i.e. right
     /// after a clean consume). Lookahead past EOF yields `TokenKind::Eof`.
+    #[inline]
     pub(crate) fn peek_kind_ahead(&self, n: usize) -> TokenKind {
+        // Blind table read: same discipline as `jump_to` — a queued inserted
+        // token would be silently skipped, so callers in queue-ambiguous
+        // positions must use [`Self::look_kind`].
+        debug_assert!(
+            self.head == QUEUE_EMPTY,
+            "peek_kind_ahead with queued inserted tokens skips them; use look_kind"
+        );
         self.table
             .get(self.pos + n)
             .map_or(TokenKind::Eof, |t| t.kind)
     }
 
     /// Kind at an absolute real-stream offset (EOF-pinned past the end).
+    #[inline]
     pub(crate) fn peek_kind_ahead_abs(&self, offset: usize) -> TokenKind {
         self.table.get(offset).map_or(TokenKind::Eof, |t| t.kind)
     }
@@ -263,6 +288,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Kind of the token `n` positions ahead, queued inserted tokens first,
     /// then the real stream (the linked-list `token.next!..` walk of the
     /// official parser). Valid everywhere, unlike [`Self::peek_kind_ahead`].
+    #[inline]
     pub(crate) fn look_kind(&self, n: usize) -> TokenKind {
         if self.head == QUEUE_EMPTY {
             return self.peek_kind_ahead(n);
@@ -354,6 +380,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
 
     /// Consumes the current token and returns its id. Consuming EOF is
     /// idempotent (the cursor stays pinned at the end).
+    #[inline]
     pub(crate) fn advance(&mut self) -> TokenId {
         let id = self.peek_id();
         self.last_consumed = Some(id);
@@ -368,6 +395,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
         id
     }
 
+    #[inline]
     pub(crate) fn at_eof(&self) -> bool {
         self.peek().kind == TokenKind::Eof
     }
@@ -376,6 +404,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
 
     /// Official `optional(lexeme, token)` (`util.dart:17`): consumes on
     /// lexeme match, silently returns `None` otherwise.
+    #[inline]
     pub(crate) fn opt_lexeme(&mut self, lexeme: &str) -> Option<TokenId> {
         if self.at_eof() {
             return None;
@@ -389,6 +418,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     }
 
     /// Consumes the current token when it has `kind`.
+    #[inline]
     pub(crate) fn opt_kind(&mut self, kind: TokenKind) -> Option<TokenId> {
         if self.peek().kind == kind {
             Some(self.advance())
@@ -418,6 +448,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// queueing for subsequent peeks. Returns the consumed `>` id.
     ///
     /// The caller must have checked [`Self::peek_is_closer`].
+    #[inline]
     pub(crate) fn consume_closer(&mut self) -> TokenId {
         debug_assert!(self.peek_is_closer(), "consume_closer requires a closer");
         let head = self.peek();
@@ -676,5 +707,21 @@ mod tests {
         cursor.reset(mark);
         assert_eq!(cursor.peek().kind, TokenKind::Identifier);
         let _ = features();
+    }
+
+    #[test]
+    fn advance_at_eof_is_idempotent() {
+        // F6 (audit #180): consuming EOF pins the cursor at the end —
+        // repeated `advance` calls return the same EOF id and make no
+        // progress. The `no_progress`/`force_advance` guards rely on this
+        // invariant to terminate their loops.
+        let (mut cursor, _src) = cursor("");
+        assert!(cursor.at_eof());
+        let before = cursor.progress();
+        let first = cursor.advance();
+        let second = cursor.advance();
+        assert_eq!(first, second);
+        assert_eq!(cursor.progress(), before);
+        assert!(cursor.at_eof());
     }
 }

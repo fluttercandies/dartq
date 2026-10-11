@@ -401,7 +401,11 @@ fn await_expression_events_split_by_async_state() {
         "{:?}",
         c.log
     );
-    assert!(!c.log.contains(&("begin", "await_expression")), "{:?}", c.log);
+    assert!(
+        !c.log.contains(&("begin", "await_expression")),
+        "{:?}",
+        c.log
+    );
 
     // Async context: the plain end event.
     let c = parse("void f() async { await x; }");
@@ -586,10 +590,7 @@ fn collection_for_pattern_head_lands_on_in() {
     // (`for ( pattern = expression ; ... ; ... )`).
     let c = parse("void f() { var l = [for (var (a, b) = pair; c; i++) a]; }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    c.assert_sequence(&[
-        ("begin", "for_control_flow"),
-        ("end", "for_control_flow"),
-    ]);
+    c.assert_sequence(&[("begin", "for_control_flow"), ("end", "for_control_flow")]);
 
     // A set/map element takes the same head machinery.
     let c = parse("void f() { var m = {for (var (k, v) in pairs) k: v}; }");
@@ -972,4 +973,21 @@ fn typing_inside_interpolation_multiline_content_recovers() {
             "{junk} must not cascade: {codes:?}"
         );
     }
+}
+
+// —— audit #180: `>`-family residue ordering ———————————————————————————————
+
+#[test]
+fn gt_family_operators_in_statement_position() {
+    // Test gap (audit #180): `>`-family operators reach expressions as
+    // single tokens (`>`, `>=`, `>>=`) and as consume_closer split residue
+    // after type arguments; each statement shape parses with both operand
+    // reads intact and no diagnostics.
+    let c = parse("void f() { a > b; a >= b; a >>= b; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("handle", "expression_statement"),
+        ("handle", "expression_statement"),
+        ("handle", "expression_statement"),
+    ]);
 }

@@ -613,3 +613,40 @@ fn statement_as_is_rescue_keeps_the_leading_operand() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     c.assert_sequence(&[("handle", "expression_statement")]);
 }
+
+// —— audit #180: ensure_semicolon synthetic + as/is rescue ————————————————
+
+#[test]
+fn ensure_semicolon_synthetic_is_zero_width_anchored_on_last_consumed() {
+    // F1: the inserted `;` is a zero-width synthetic — recovery artifacts
+    // never own real width (closer-split remainders are the width-keeping
+    // case). F4: the report anchors on the last consumed token
+    // (`findPreviousNonZeroLengthToken`, parser_impl.dart:5106/:11400) —
+    // here the `++` at offsets 2..4.
+    let mut p = setup("x ++");
+    p.cursor.advance(); // `x`
+    p.cursor.advance(); // `++`
+    let semi = p.ensure_semicolon();
+    assert_eq!(semi.range.length, 0);
+    assert_eq!(p.listener.errors[0], ("expected_token".to_string(), 2, 4));
+}
+
+#[test]
+fn ensure_identifier_leaves_separators_for_the_grammar() {
+    // F2 (identifier_context_impl.dart:581-618, formalParameterDeclaration):
+    // a `,` in name position takes the insert-without-consuming branch and
+    // the synthetic is drained to, so the parameter list resumes at the
+    // separator. The official composition reports the run of empty
+    // parameters ONCE: the first `int` reads as param 1's whole parameter
+    // (computeType with inDeclaration: false returns noType for `int,` —
+    // type_info.dart:376-384 — and the provisional name-take at
+    // parser_impl.dart:2228 survives the parseType re-derive at :2352), so
+    // only the genuinely empty param 2 reports at the second comma, then
+    // the loop consumes it and `int b` parses clean. Oracle 3.13.1
+    // (`dart analyze --format=machine`): exactly one row,
+    // MISSING_IDENTIFIER at 1|12|1, text "Expected an identifier.".
+    let c = parse("void f(int,, int b) {}");
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
+    assert_eq!((c.errors[0].1, c.errors[0].2), (11, 12), "{:?}", c.errors);
+    assert_eq!(c.texts, ["Expected an identifier."]);
+}

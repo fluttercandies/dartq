@@ -162,10 +162,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// `isGeneralizedFunctionType` at cursor-relative offset `n`.
     pub(crate) fn is_generalized_function_type_at(&self, n: usize) -> bool {
-        is_generalized_function_type(
-            self.cursor.peek_kind_ahead(n),
-            self.cursor.peek_kind_ahead(n + 1),
-        )
+        is_generalized_function_type(self.cursor.look_kind(n), self.cursor.look_kind(n + 1))
     }
 
     /// `isGeneralizedFunctionType` at an absolute id.
@@ -192,10 +189,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// `looksLikeName` (`type_info_impl.dart:487`) at cursor-relative offset `n`.
     pub(crate) fn looks_like_name_at(&self, n: usize) -> bool {
-        Self::looks_like_name_kind(
-            self.cursor.peek_kind_ahead(n),
-            self.cursor.peek_kind_ahead(n + 1),
-        )
+        Self::looks_like_name_kind(self.cursor.look_kind(n), self.cursor.look_kind(n + 1))
     }
 
     pub(crate) fn looks_like_name_at_id(&self, id: TokenId) -> bool {
@@ -250,7 +244,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         accept_keyword: bool,
     ) -> TypeInfo {
         let next = self.peek_kind();
-        let next_next = self.cursor.peek_kind_ahead(1);
+        let next_next = self.cursor.look_kind(1);
         if !is_valid_non_record_type_reference(next, next_next)
             && !self.peek_is_possible_record_type()
         {
@@ -372,7 +366,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return TypeInfo::Simple;
         } else if accept_keyword
             && crate::members::is_keyword_or_identifier(next_next)
-            && Self::is_ok_next_value_in_formal(self.cursor.peek_kind_ahead(2))
+            && Self::is_ok_next_value_in_formal(self.cursor.look_kind(2))
         {
             // `TYPE <reserved word> <ok-next>` (type_info.dart:376-382 with
             // acceptKeywordForSimpleType): the keyword serves as the name.
@@ -514,8 +508,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// The `id.` branch of `computeType` (type_info.dart:307-353).
     fn compute_prefixed_shape(&mut self, required: bool, in_declaration: bool) -> TypeInfo {
-        let cont = self.cursor.peek_kind_ahead(2);
-        if is_valid_non_record_type_reference(cont, self.cursor.peek_kind_ahead(3)) {
+        let cont = self.cursor.look_kind(2);
+        if is_valid_non_record_type_reference(cont, self.cursor.look_kind(3)) {
             // The group is computed at the continuation token
             // (type_info.dart:319 computes at `next` after two steps), so
             // the `<` sits at cursor+3.
@@ -523,7 +517,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if matches!(type_param, TypeParamOrArg::None) {
                 // Fast decision on what follows the continuation.
                 let mut follower = 3;
-                let has_question = self.cursor.peek_kind_ahead(3) == TokenKind::Question;
+                let has_question = self.cursor.look_kind(3) == TokenKind::Question;
                 if has_question {
                     follower += 1;
                 }
@@ -595,7 +589,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     kw,
                     Keyword::Get | Keyword::Set | Keyword::Factory | Keyword::Operator
                 ) || (matches!(kw, Keyword::Typedef)
-                    && is_identifier(self.cursor.peek_kind_ahead(1)));
+                    && is_identifier(self.cursor.look_kind(1)));
                 if !is_decl_introducer {
                     let mut complex = self.complex_from_here(TypeParamOrArg::None);
                     complex.end = complex.start;
@@ -617,7 +611,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             if kw == Keyword::Var
                 && matches!(
-                    self.cursor.peek_kind_ahead(1),
+                    self.cursor.look_kind(1),
                     TokenKind::Lt | TokenKind::Comma | TokenKind::Gt
                 )
             {

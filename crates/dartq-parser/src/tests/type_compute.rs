@@ -24,9 +24,11 @@ fn parse(source: &'static str) -> Collector {
 /// pair — the pattern subtree proper. Parameter/return types and the
 /// scrutinee fire outside it, so negative assertions are scoped here.
 fn pattern_window<'a>(c: &'a Collector, label: &str) -> &'a [Logged] {
-    let start = c.log.iter().position(|e| *e == ("begin", "pattern")).unwrap_or_else(
-        || panic!("{label}: no pattern events; log: {:?}", c.log),
-    );
+    let start = c
+        .log
+        .iter()
+        .position(|e| *e == ("begin", "pattern"))
+        .unwrap_or_else(|| panic!("{label}: no pattern events; log: {:?}", c.log));
     let mut depth = 0usize;
     for (i, e) in c.log.iter().enumerate().skip(start) {
         if *e == ("begin", "pattern") {

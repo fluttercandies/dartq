@@ -191,8 +191,7 @@ fn keyword_blocker_inside_record_pattern_reports_closer() {
     // + `expected ')'` before it, record with 2 fields).
     let mut p = setup("(_, if)");
     let _ = p.parse_pattern_entry(PatternContext::Matching);
-    p.listener
-        .assert_sequence(&[("handle", "record_pattern")]);
+    p.listener.assert_sequence(&[("handle", "record_pattern")]);
     assert_eq!(
         sorted_pattern_codes("(_, if)"),
         ["expected_token", "missing_identifier"],
@@ -209,8 +208,7 @@ fn keyword_blocker_inside_map_pattern_spawns_entry_recovery() {
     // `expected ','` + `expected ':'`.
     let mut p = setup("{0: if}");
     let _ = p.parse_pattern_entry(PatternContext::Matching);
-    p.listener
-        .assert_sequence(&[("handle", "map_pattern")]);
+    p.listener.assert_sequence(&[("handle", "map_pattern")]);
     assert_eq!(
         sorted_pattern_codes("{0: if}"),
         [

@@ -625,8 +625,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 break;
             }
             // Named argument: `id:`.
-            let named =
-                self.peek_is_identifier() && self.cursor.look_kind(1) == TokenKind::Colon;
+            let named = self.peek_is_identifier() && self.cursor.look_kind(1) == TokenKind::Colon;
             if named {
                 let name = self.peek_span();
                 self.cursor.advance();
@@ -905,8 +904,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         // shorthand's operand/end.
                         let dot = self.peek_span();
                         self.cursor.advance();
-                        let end =
-                            self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                        let end = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
                         self.listener.handle_dot_shorthand_head(dot);
                         self.listener.handle_dot_shorthand_context(dot);
                         end

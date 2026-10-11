@@ -1268,8 +1268,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             let close = self.synthetic(TokenKind::CloseCurly, offset);
             self.listener
                 .begin_class_or_mixin_or_extension_body(DeclarationKind::Class, open);
-            self.listener
-                .end_class_or_mixin_or_extension_body(DeclarationKind::Class, 0, open, close);
+            self.listener.end_class_or_mixin_or_extension_body(
+                DeclarationKind::Class,
+                0,
+                open,
+                close,
+            );
             while self.cursor.advance() != close.id {}
         }
         let end = self.peek_span();

@@ -165,7 +165,10 @@ fn conditional_uri_payloads_in_source_order() {
 fn conditional_uri_payloads_missing_candidate_uri() {
     let listener = ConditionalPayloads::of("import 'a.dart' if (x);");
     assert_eq!(listener.errors, ["expected_string_literal"]);
-    assert_eq!(listener.clauses, vec![("x".to_owned(), vec![String::new()])]);
+    assert_eq!(
+        listener.clauses,
+        vec![("x".to_owned(), vec![String::new()])]
+    );
 }
 
 /// Garbage between the condition and the closer (official :1124-1136): the

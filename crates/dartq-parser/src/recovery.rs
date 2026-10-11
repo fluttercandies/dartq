@@ -212,14 +212,35 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         {
             return self.ensure_expression_identifier(context);
         }
-        // Official recovery template for identifiers: report and insert a
-        // synthetic (identifier_context_impl.dart recovery templates); the
-        // synthetic is consumed so the caller's next token is the real one.
+        // Official recovery template, three branches
+        // (identifier_context_impl.dart:25-45): statement-start / `,` / `)`
+        // / EOF → insert the synthetic WITHOUT consuming (branch 2 — the
+        // offending token belongs to the caller's grammar); other junk →
+        // consume it for progress and insert (branch 3, "when in doubt,
+        // consume the token"). Identifier-shaped heads never reach here.
         self.report(msg::missing_identifier(), peek.span);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
-        self.cursor.advance();
+        let leave_for_grammar = matches!(
+            peek.kind,
+            TokenKind::Comma | TokenKind::CloseParen | TokenKind::Eof
+        ) || self.looks_like_statement_start_at(0);
+        if leave_for_grammar {
+            // Branch 2: the official `insertSyntheticIdentifier(token)`
+            // (token_stream_rewriter.dart:238) inserts after the anchor and
+            // RETURNS the synthetic, so the official parse resumes with the
+            // synthetic as the current token and the offending follower as
+            // `token.next`. Drain to the queued synthetic (the
+            // ensureSemicolon idiom) for the same posture — an undrained
+            // queue resurfaces the zero-width identifier as a phantom
+            // parse: `void f(int,, int b)` then re-enters the parameter
+            // loop's tail recovery and stacks an `expected_token` on the
+            // oracle's single missing_identifier.
+            while self.cursor.advance() != id {}
+        } else {
+            self.cursor.advance();
+        }
         self.span_of(id)
     }
 
