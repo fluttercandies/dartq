@@ -59,4 +59,9 @@ for member in $members; do
     fi
 done
 
+# Heavyweight phases (test suites, coverage, differential gates) are NOT run
+# here: they execute real processes over the whole workspace and are reserved
+# for the serial verification phase (AGENTS.md resource discipline):
+#   scripts/coverage-gate.sh — llvm-cov coverage gate (serial phase only)
+#   scripts/m1-gate.sh       — M1 differential gate (serial phase only)
 echo "ci: gate passed"
