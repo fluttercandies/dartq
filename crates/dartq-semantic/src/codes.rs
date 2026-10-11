@@ -40,9 +40,14 @@
 //! `_function` fires only when the instantiation operand is a *function-typed
 //! expression* (`type_instantiation_target.dart`,
 //! `InvocationTargetFunctionTypedExpression`) and its message displays the
-//! function *type* — a display the M1 [`crate::model::Ty`] cannot render, so
-//! the row is implemented here but has no emit site (suppress,
-//! under-report). The older 8.4.1 registry split carried a dedicated
+//! function *type* — rendered from the captured member signature (the
+//! diagnose layer's `function_type_display` face; the M1
+//! [`crate::model::Ty`] cannot render it). The row is implemented with a
+//! live emit site on the property-access tear-off shapes, pinned verbatim
+//! against this template in the `diagnose` tests; the bare
+//! function-reference site (`g<int>;` in statement position) stays dormant —
+//! suppressed, under-report — pending the parser's statement-position
+//! fallback (#351). The older 8.4.1 registry split carried a dedicated
 //! `_method` row instead of `_element`; the pinned oracle no longer has it,
 //! so a `_method` emission could never match the differential gate.
 //!
@@ -79,7 +84,11 @@ use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
 /// verbatim oracle message, parameterized at the emit site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SemanticCode {
-    /// `The name '{0}' is already defined.`
+    /// `The name '{0}' is already defined.` — the scope is per-file (the
+    /// capture's duplicates log): a name duplicated across two files of one
+    /// library (a part-file collision) is not detected yet. The per-library
+    /// fold is a documented milestone deferral — an under-report, never a
+    /// false positive.
     DuplicateDefinition,
     /// `Undefined name '{0}' used as an annotation.` — the emit site is
     /// [`crate::diagnose`]'s annotation check (a fully missing
@@ -156,7 +165,10 @@ pub enum SemanticCode {
     WrongNumberOfTypeArgumentsExtension,
     /// `The type of this function is '{0}', which has {1} type parameters,
     /// but {2} type arguments were given.` — `{0}` is the function type
-    /// itself; M1 cannot render function types, so no emit site fires.
+    /// itself, rendered from the captured member signature. The emit site
+    /// fires on the property-access tear-off shapes (pinned in the
+    /// `diagnose` tests); the bare function-reference shape stays dormant
+    /// pending #351.
     WrongNumberOfTypeArgumentsFunction,
     /// `The {0} '{1}' is declared with {2} type parameters, but {3}
     /// type arguments are given.` (analyzerCode
@@ -692,17 +704,15 @@ impl SemanticCode {
             Self::UnusedLocalVariable => ("unused_local_variable", "UNUSED_LOCAL_VARIABLE"),
             Self::UnusedElement => ("unused_element", "UNUSED_ELEMENT"),
             Self::UnusedField => ("unused_field", "UNUSED_FIELD"),
-            Self::UnusedElementParameter => (
-                "unused_element_parameter",
-                "UNUSED_ELEMENT_PARAMETER",
-            ),
+            Self::UnusedElementParameter => {
+                ("unused_element_parameter", "UNUSED_ELEMENT_PARAMETER")
+            }
             Self::UnusedCatchClause => ("unused_catch_clause", "UNUSED_CATCH_CLAUSE"),
             Self::UnusedCatchStack => ("unused_catch_stack", "UNUSED_CATCH_STACK"),
             Self::UnusedImport => ("unused_import", "UNUSED_IMPORT"),
-            Self::DeadNullAwareExpression => (
-                "dead_null_aware_expression",
-                "DEAD_NULL_AWARE_EXPRESSION",
-            ),
+            Self::DeadNullAwareExpression => {
+                ("dead_null_aware_expression", "DEAD_NULL_AWARE_EXPRESSION")
+            }
             Self::DeadCodeCatchFollowingCatch => (
                 "dead_code_catch_following_catch",
                 "DEAD_CODE_CATCH_FOLLOWING_CATCH",
@@ -721,10 +731,7 @@ impl SemanticCode {
             Self::TypeCheckWithNull | Self::TypeCheckWithNotNull => {
                 ("type_check_with_null", "TYPE_CHECK_WITH_NULL")
             }
-            Self::NullCheckAlwaysFails => (
-                "null_check_always_fails",
-                "NULL_CHECK_ALWAYS_FAILS",
-            ),
+            Self::NullCheckAlwaysFails => ("null_check_always_fails", "NULL_CHECK_ALWAYS_FAILS"),
             Self::UnnecessaryNullComparisonFalse | Self::UnnecessaryNullComparisonTrue => {
                 ("unnecessary_null_comparison", "UNNECESSARY_NULL_COMPARISON")
             }
@@ -737,10 +744,9 @@ impl SemanticCode {
                 "pattern_never_matches_value_type",
                 "PATTERN_NEVER_MATCHES_VALUE_TYPE",
             ),
-            Self::UnnecessaryCastPattern => (
-                "unnecessary_cast_pattern",
-                "UNNECESSARY_CAST_PATTERN",
-            ),
+            Self::UnnecessaryCastPattern => {
+                ("unnecessary_cast_pattern", "UNNECESSARY_CAST_PATTERN")
+            }
             Self::UnnecessaryNullCheckPattern => (
                 "unnecessary_null_check_pattern",
                 "UNNECESSARY_NULL_CHECK_PATTERN",
