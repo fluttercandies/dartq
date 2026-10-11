@@ -455,8 +455,11 @@ pub trait ParserListener {
         has_named_fields: bool,
     ) {
     }
-    fn begin_record_type_entry(&mut self) {}
-    fn end_record_type_entry(&mut self) {}
+    /// The official events are tokenless (`listener.dart:1639/:1647`);
+    /// the entry's token bounds ride along so span-building listeners need
+    /// no private token stack (the official AstBuilder keeps one).
+    fn begin_record_type_entry(&mut self, first: Token) {}
+    fn end_record_type_entry(&mut self, last: Token) {}
     fn handle_no_name(&mut self, token: Token) {}
     fn begin_record_type_named_fields(&mut self, left_brace: Token) {}
     fn end_record_type_named_fields(&mut self, count: usize, left_brace: Token) {}
