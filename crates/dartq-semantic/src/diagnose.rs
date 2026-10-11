@@ -990,7 +990,10 @@ struct Engine<'a> {
     /// Per open argument list, the argument types collected so far.
     arg_levels: Vec<ArgLevel>,
     /// The enclosing enum constant's declared type-parameter count (the
-    /// `_enum` code's declared side).
+    /// `_enum` code's declared side). Consulted only by a type-argument
+    /// group at the constant's own position — outside any open argument
+    /// list (`end_type_arguments`); groups inside the constructor
+    /// arguments check their own heads.
     in_enum_element: Option<u16>,
     /// The row-stack mark where the current function body's expression
     /// began (the arrow-body return check reads it).
@@ -5706,8 +5709,15 @@ impl<'a> Engine<'a> {
             self.check_annotation_arity(head, count, range);
             return;
         }
-        // An enum constant's constructor arguments (`a<int>()`).
-        if let Some(declared) = self.in_enum_element
+        // An enum constant's constructor type arguments (`a<int>()`,
+        // `a.named<int>()`): the group at the constant's own position —
+        // before its `(` opens an argument list — checks against the
+        // enclosing enum's declared count. Groups inside the constructor
+        // arguments (`a(h<int>())`) run while that list is open and check
+        // their own heads instead; the snapshot itself clears at
+        // [`Engine::leave_enum_element`].
+        if self.arg_levels.is_empty()
+            && let Some(declared) = self.in_enum_element
             && declared != count
         {
             self.emit3(
@@ -12631,6 +12641,41 @@ mod tests {
         );
     }
 
+    /// The `_enum` snapshot owns only the constant's own type-argument
+    /// group: a generic invocation inside the constructor arguments checks
+    /// its own head (`h<A>` matches `h`'s declared count) — the enum's
+    /// declared count never leaks into it.
+    ///
+    /// Hand-trace: `a`'s `(` opens an argument list before `h<A>`'s group
+    /// closes, so the group runs with `arg_levels` non-empty and the
+    /// `in_enum_element` arm skips; `end_implicit_creation` checks `h`
+    /// (declares 1, given 1 — silent). The constant's own group is absent,
+    /// so no `_enum` either.
+    #[test]
+    fn enum_constant_argument_groups_check_their_own_heads() {
+        let report = report("class A {} void h<T>() {} enum E<T, U> { a(h<A>()); }");
+        assert!(
+            code_names(&report)
+                .iter()
+                .all(|name| !name.starts_with("wrong_number_of_type_arguments")),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The selector phrase checks the same snapshot: the constant's type
+    /// arguments attach to the HEAD identifier (`a<int, int>.other()`,
+    /// `parseEnumElement` parses one group at the head —
+    /// parser_impl.dart:2904-2947; type arguments after the selector are
+    /// the `constructorWithTypeArguments` recovery error,
+    /// parser_impl.dart:8884-8899, never a semantic code). 2 declared,
+    /// 2 given, and the declared selector stay silent.
+    #[test]
+    fn enum_constant_selector_type_args_check_the_enum_count() {
+        let report = report("class int {} enum E<T, U> { a<int, int>.other(); const E.other(); }");
+        assert!(code_names(&report).is_empty());
+    }
+
     /// An invoked generic function with explicit type arguments reports
     /// `_element` with the `function` kind word (the oracle's target
     /// dispatch, `type_instantiation_target.dart`: the invocation syntax
@@ -15802,17 +15847,36 @@ mod tests {
         assert_eq!(dead_code_offsets(&report), [offset_of(source, "1;")]);
     }
 
-    /// Each statement entered while unreachable reports its own anchor: the
-    /// fact layer's per-statement contract (the oracle folds each dead
-    /// region into one diagnostic — see the module docs).
+    /// One wide row per dead interval: the row anchors at the first dead
+    /// statement and its span runs toward the covering statement list's
+    /// last statement (the official interval model —
+    /// `dead_code_verifier.dart:253-279` trims the enclosing construct to
+    /// `node.statements.last` and the report spans `node.end - offset`,
+    /// :326-332; the flow fact twin is the flow crate's
+    /// `dead_interval_folds_sequential_statements`).
+    ///
+    /// OPEN (follow-up against dartq-flow): official `node.end` includes
+    /// the last statement's trailing `;` — `2;`, length 5 here — while
+    /// the flow fact's token-anchored span excludes it (length 4, the
+    /// flow module's documented token-precision boundary). The row below
+    /// asserts the fact-derived span, the single source the report
+    /// mounts; if the flow boundary widens to the semicolon, this pin
+    /// follows.
     #[test]
-    fn dead_code_reports_per_statement() {
+    fn dead_code_reports_one_row_per_dead_interval() {
         let source = "void f() { return; 1; 2; }";
         let report = report(source);
-        assert_eq!(code_names(&report), ["dead_code", "dead_code"]);
+        assert_eq!(code_names(&report), ["dead_code"]);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_code")
+            .expect("dead_code present");
+        assert_eq!(dead.range.offset, offset_of(source, "1;"));
         assert_eq!(
-            dead_code_offsets(&report),
-            [offset_of(source, "1;"), offset_of(source, "2;")]
+            dead.range.length, 4,
+            "the row spans `1; 2` (the flow fact's token-precision end; \
+             official `node.end` would include the trailing `;` — see the doc)"
         );
     }
 
