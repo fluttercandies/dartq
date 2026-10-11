@@ -197,6 +197,10 @@
 //!   authoritative constant).
 //! * [`Domain::RunMetrics`] — the `--metrics-json` run summary
 //!   ([`run_metrics_schema`]).
+//! * The §15.9 workspace config — `dartq.yaml` ([`config_schema`]) — is
+//!   published without a [`Domain`]: it is an input document, and its
+//!   enforcement point is the lenient reader in `dartq-commands`, not a
+//!   payload validator (the config module's docs carry the division).
 //!
 //! # What [`validate`] checks — and what it does not
 //!
@@ -226,6 +230,7 @@ use std::fmt;
 use serde_json::Value;
 
 mod compat;
+mod config;
 mod diagnostics;
 mod explain;
 mod fix_patch;
@@ -235,6 +240,7 @@ mod run_metrics;
 mod support;
 
 pub use compat::{ERROR_KINDS, SCHEMA_VERSION_COMPAT, compat_schema};
+pub use config::{SCHEMA_VERSION_CONFIG, TARGET_KINDS, config_schema};
 pub use diagnostics::{SCHEMA_VERSION_DIAGNOSTICS, diagnostics_schema};
 pub use explain::{SCHEMA_VERSION_EXPLAIN, explain_schema};
 pub use fix_patch::{SCHEMA_VERSION_FIX_PATCH, fix_patch_schema};
