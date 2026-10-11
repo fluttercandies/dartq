@@ -245,12 +245,12 @@ impl ParserListener for SharedFlow<'_> {
             .end_record_type(left_paren, question, count, has_named_fields);
     }
 
-    fn begin_record_type_entry(&mut self) {
-        self.0.borrow_mut().begin_record_type_entry();
+    fn begin_record_type_entry(&mut self, first: Token) {
+        self.0.borrow_mut().begin_record_type_entry(first);
     }
 
-    fn end_record_type_entry(&mut self) {
-        self.0.borrow_mut().end_record_type_entry();
+    fn end_record_type_entry(&mut self, last: Token) {
+        self.0.borrow_mut().end_record_type_entry(last);
     }
 
     fn handle_no_name(&mut self, token: Token) {
