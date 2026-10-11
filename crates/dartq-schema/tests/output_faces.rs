@@ -6,8 +6,8 @@
 //! in `tests/alignment.rs`.
 
 use dartq_schema::{
-    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_FIX_PATCH, SCHEMA_VERSION_QUERY,
-    SCHEMA_VERSION_RUN_METRICS, Verbosity, validate, validate_at_tier,
+    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_FIX_PATCH, SCHEMA_VERSION_INDEX,
+    SCHEMA_VERSION_QUERY, SCHEMA_VERSION_RUN_METRICS, Verbosity, validate, validate_at_tier,
 };
 
 /// The v1 freeze: every dartq-native face ships at contract version 1.
@@ -19,6 +19,7 @@ fn dartq_native_faces_are_frozen_at_v1() {
     assert_eq!(SCHEMA_VERSION_QUERY, 1);
     assert_eq!(SCHEMA_VERSION_COMPAT, 1);
     assert_eq!(SCHEMA_VERSION_RUN_METRICS, 1);
+    assert_eq!(SCHEMA_VERSION_INDEX, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,14 +167,15 @@ fn fix_missing_file_is_named() {
 // Query answer (§15.2 `query symbol`)
 // ---------------------------------------------------------------------------
 
-/// Transcript of `write_query_json`
-/// (`crates/dartq-cli/src/main.rs:954-997`): `name` + `declarations` +
-/// `references`, snake_case fields. `container` is a total column — null for
-/// the top-level row (main.rs:967), spelled `-` on the machine face
-/// (main.rs:931); `qualified` is a plain string on every row (main.rs:982).
-/// `schema_version` is the §15.7 v1 addition (maintainer ruling: every
-/// dartq-native face carries it); the writer at main.rs:991 does not emit
-/// it yet — a tracked CLI-lane gap, not a schema liberty.
+/// Transcript of `to_json` (`crates/dartq-commands/src/query.rs`): `name` +
+/// `declarations` + `references`, snake_case fields. `container` is a total
+/// column — null for the top-level row, spelled `-` on the machine face.
+/// `qualified` is the optional qualified-name convenience spelling: the
+/// writer omits it today because the index row carries only the
+/// `isQualified` bit, not the qualifier spelling. Each reference row names
+/// its use file. `schema_version` is the §15.7 v1 addition (maintainer
+/// ruling: every dartq-native face carries it); the writer stamps
+/// `crate::SCHEMA_VERSION`.
 #[test]
 fn compact_query_answer_passes_validation() {
     let doc = serde_json::json!({
@@ -203,7 +205,7 @@ fn compact_query_answer_passes_validation() {
             {
                 "target_file": "/w/lib/b.dart",
                 "kind": "invoked",
-                "qualified": "fb.fma()",
+                "file": "/w/lib/c.dart",
                 "offset": 42,
                 "length": 2,
             },
@@ -529,12 +531,10 @@ fn compat_failure_without_message_is_named() {
 // Run metrics (check/analyze `--metrics-json`)
 // ---------------------------------------------------------------------------
 
-/// Transcript of `RunMetrics::json`
-/// (`crates/dartq-cli/src/main.rs:477-489`). `schema_version` is the §15.7
-/// v1 addition (maintainer ruling: the check/analyze machine faces carry
-/// it); the writer does not emit it yet — a tracked CLI-lane gap. The null
-/// `max_rss_bytes` spelling is the getrusage-failure shape (main.rs:473,
-/// `Option<u64>`).
+/// Transcript of `RunMetrics::json` (`crates/dartq-cli`), which stamps
+/// `dartq_commands::SCHEMA_VERSION` — the §15.7 v1 addition (maintainer
+/// ruling: the check/analyze machine faces carry it). The null
+/// `max_rss_bytes` spelling is the getrusage-failure shape (`Option<u64>`).
 #[test]
 fn compact_run_metrics_passes_validation() {
     let doc = serde_json::json!({
@@ -603,6 +603,59 @@ fn run_metrics_bad_files_type_is_named() {
     });
     let violation = violation_of(&doc.to_string(), Domain::RunMetrics);
     assert_eq!(violation.path, "files");
+    assert_eq!(violation.expected, "an integer");
+}
+
+// ---------------------------------------------------------------------------
+// Index run summary (`dartq index`)
+// ---------------------------------------------------------------------------
+
+/// Transcript of `IndexRun::to_json` (`crates/dartq-commands/src/index.rs`),
+/// with the hand-traced fixture totals its own unit test pins (3 member
+/// files over 3 libraries, 5 declaration rows, 3 resolved references). The
+/// writer stamps the shared `dartq_commands::SCHEMA_VERSION` — equal to
+/// `SCHEMA_VERSION_INDEX` at v1; mirroring the domain constant is the
+/// recorded writer-side follow-up (schema module docs, "Writer alignment").
+#[test]
+fn compact_index_run_passes_validation() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_INDEX,
+        "files": 3,
+        "libraries": 3,
+        "symbols": 5,
+        "references": 3,
+    });
+    validate_ok(&doc.to_string(), Domain::Index);
+}
+
+/// The empty-workspace run (the writer's zero totals) and the red line: an
+/// undeclared column is rejected, a non-count slot is named.
+#[test]
+fn index_run_zero_totals_pass_and_extras_fail() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_INDEX,
+        "files": 0,
+        "libraries": 0,
+        "symbols": 0,
+        "references": 0,
+    });
+    validate_ok(&doc.to_string(), Domain::Index);
+
+    let extra = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_INDEX,
+        "files": 0,
+        "libraries": 0,
+        "symbols": 0,
+        "references": 0,
+        "unresolved": 7,
+    });
+    let violation = violation_of(&extra.to_string(), Domain::Index);
+    assert_eq!(violation.path, "unresolved");
+
+    let mut wrong = doc;
+    wrong["symbols"] = serde_json::json!("5");
+    let violation = violation_of(&wrong.to_string(), Domain::Index);
+    assert_eq!(violation.path, "symbols");
     assert_eq!(violation.expected, "an integer");
 }
 
@@ -725,6 +778,83 @@ fn run_metrics_are_tier_invariant() {
             "run metrics must validate at the {tier} tier"
         );
     }
+}
+
+/// Tier-invariant face like run metrics: the index summary is four totals —
+/// no locator, no prose, nothing a tier trims (crate docs, "Verbosity
+/// tiers").
+#[test]
+fn index_run_is_tier_invariant() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_INDEX,
+        "files": 3,
+        "libraries": 3,
+        "symbols": 5,
+        "references": 3,
+    });
+    for tier in [Verbosity::Minimal, Verbosity::Compact, Verbosity::Full] {
+        assert!(
+            validate_at_tier(&doc.to_string(), Domain::Index, tier).is_ok(),
+            "index run must validate at the {tier} tier"
+        );
+    }
+}
+
+/// The reserved query kind arrays (crate docs, query table): present, the
+/// answer is exact at compact and full — implementations rows carry the
+/// declaration-row contract, dependencies rows the explain `DependencyRow`
+/// shape — and a minimal answer drops them. Without the arrays the minimal
+/// shape is today's writer shape, unchanged.
+#[test]
+fn query_reserved_kind_arrays_are_exact_at_their_tier() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_QUERY,
+        "name": "fb",
+        "declarations": [{
+            "file": "/w/lib/a.dart",
+            "container": null,
+            "kind": "class",
+            "name": "fb",
+            "line": 3,
+            "column": 7,
+            "length": 2,
+        }],
+        "references": [],
+        "implementations": [{
+            "file": "/w/lib/sub.dart",
+            "container": "Sub",
+            "kind": "class",
+            "name": "Sub",
+            "line": 4,
+            "column": 7,
+            "length": 3,
+        }],
+        "dependencies": [{ "path": "/w/lib/app.dart" }],
+    });
+    assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Compact).is_ok());
+    assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Full).is_ok());
+    let violation = validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Minimal)
+        .expect_err("minimal must not carry the reserved arrays");
+    assert_eq!(violation.path, "implementations");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+
+    // The arrays' declared-but-unwritten posture: absent from a minimal
+    // answer — which also trims the `container` convenience spelling (crate
+    // docs, query table) — the payload is today's frozen v1 shape.
+    let mut minimal = doc;
+    minimal
+        .as_object_mut()
+        .expect("object")
+        .remove("implementations");
+    minimal
+        .as_object_mut()
+        .expect("object")
+        .remove("dependencies");
+    minimal["declarations"][0]
+        .as_object_mut()
+        .expect("object")
+        .remove("container");
+    assert!(validate_at_tier(&minimal.to_string(), Domain::Query, Verbosity::Minimal).is_ok());
 }
 
 fn validate_ok(payload: &str, domain: Domain) {

@@ -1,7 +1,8 @@
 //! The `--metrics-json` run summary shared by `dartq check` and
-//! `dartq analyze` (`crates/dartq-cli/src/main.rs:464-490`): one JSON object
-//! at exit, the engine-api-spec §3 benchmark face. Tier-invariant (crate
-//! docs, "Verbosity tiers") — a benchmark sidecar has no trimmable prose.
+//! `dartq analyze` (`RunMetrics::json` in `crates/dartq-cli`): one JSON
+//! object at exit, the engine-api-spec §3 benchmark face. Tier-invariant
+//! (crate docs, "Verbosity tiers") — a benchmark sidecar has no trimmable
+//! prose.
 
 use std::sync::LazyLock;
 
@@ -12,9 +13,9 @@ use crate::support::{
     exact_fields, field, non_negative, non_negative_or_null, object, pinned_version,
 };
 
-/// The run-metrics envelope's contract version. The CLI writer does not
-/// emit the field today (§15.7 gap tracked for the CLI lane); the value is
-/// pinned by the fixtures in `tests/output_faces.rs`.
+/// The run-metrics envelope's contract version. The CLI writer stamps
+/// `dartq_commands::SCHEMA_VERSION`; the fixtures in
+/// `tests/output_faces.rs` pin the shape.
 pub const SCHEMA_VERSION_RUN_METRICS: u32 = 1;
 
 /// The published run-metrics schema (JSON Schema draft-07 subset).

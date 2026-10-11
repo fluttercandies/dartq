@@ -155,7 +155,14 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
                 "target_file": run.layout.file_path(reference.target_file).display().to_string(),
                 "kind": ref_kind_name(reference.kind),
                 "file": run.layout.file_path(reference.file).display().to_string(),
-                "qualified": reference.qualified,
+                // The §15.2 `qualified` column is the qualified NAME string,
+                // but the row model carries only the `isQualified` bit
+                // (`RefHit::qualified: bool`) — the use-site qualifier
+                // spelling is dropped at the index boundary. The field is
+                // the schema's optional convenience column, so it stays
+                // omitted rather than emitting a boolean (or an invented
+                // spelling); it returns when the qualifier is plumbed
+                // through `RefRow` → `RefHit`.
                 "offset": reference.range.offset,
                 "length": reference.range.length,
             })
@@ -307,6 +314,35 @@ mod tests {
             ],
             "each row names the member file its use site sits in"
         );
+
+        fs_remove(&root);
+    }
+
+    /// The JSON face is the frozen v1 query contract: the real writer
+    /// output passes the domain validator at the compact and full tiers the
+    /// face claims, and the envelope version is the schema crate's pinned
+    /// constant.
+    #[test]
+    fn json_face_passes_the_query_contract() {
+        let root = fixture("query_json");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = symbol(&mut engine, "Foo").expect("query");
+        let json = to_json(&run, "Foo");
+        assert_eq!(json["schema_version"], dartq_schema::SCHEMA_VERSION_QUERY);
+        // The `qualified` convenience spelling stays omitted: the row model
+        // carries only the is-qualified bit, and the contract types the
+        // column as the qualified name string — no boolean may leak in.
+        assert!(json["references"][0].get("qualified").is_none());
+        let text = json.to_string();
+        dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
+        for tier in [
+            dartq_schema::Verbosity::Compact,
+            dartq_schema::Verbosity::Full,
+        ] {
+            dartq_schema::validate_at_tier(&text, dartq_schema::Domain::Query, tier)
+                .expect("schema-valid at every tier the writer claims");
+        }
 
         fs_remove(&root);
     }

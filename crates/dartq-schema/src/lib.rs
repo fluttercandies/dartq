@@ -127,9 +127,16 @@
 //! | `references[].kind`            | ●       | ●       | ●    |
 //! | `references[].offset`/`length` | ●       | ●       | ●    |
 //! | `references[].qualified`       |         | ●       | ●    |
+//! | `implementations[]` (reserved) |         | opt     | opt  |
+//! | `dependencies[]` (reserved)    |         | opt     | opt  |
 //!
 //! `symbols` and `since` are session fields, tier-independent — see "Token
-//! economics".
+//! economics". The two reserved kind arrays are declared on frozen v1 for
+//! the future query kinds — `implementations` the subclass/implementation
+//! declaration rows (§15.2's `query implementations`, typed on the shared
+//! declaration-row shape), `dependencies` the reverse-import-graph rows
+//! (`path`, typed on `dartq-ai::explain`'s `DependencyRow`) — with no
+//! writer yet; `minimal` drops them (non-locating detail sections).
 //!
 //! Compatibility matrix rows (§15.5; the verdict + axis identity are the
 //! red line — evidence is one `check` away):
@@ -156,9 +163,10 @@
 //! | `counts`                 | ●       |         |      |
 //!
 //! Tier-invariant faces: the impact report (every field is a locator or a
-//! verdict — nothing prose-like to trim; `since` is its token lever) and
-//! the run-metrics sidecar (a benchmark artifact, emitted complete or not
-//! at all).
+//! verdict — nothing prose-like to trim; `since` is its token lever), the
+//! run-metrics sidecar (a benchmark artifact, emitted complete or not at
+//! all), and the index run summary (four totals off the maintained index —
+//! no locator, no prose, nothing to trim).
 //!
 //! # Token economics (PRD §15.8)
 //!
@@ -170,7 +178,12 @@
 //!   session's first answer attaches it; later answers may back-reference
 //!   by replacing a row's path-valued string with its short id (still a
 //!   string to this validator, by design — resolving ids is the consumer's
-//!   table lookup, not a schema concern).
+//!   table lookup, not a schema concern). The faces whose economics dedup
+//!   their own path-valued rows spell the same table id → FILE path — the
+//!   values are the very strings substituted out of the rows, a different
+//!   value domain than the entity-reference table. `Domain::Explain`
+//!   validates that spelling (`support::path_session_fields`); the daemon's
+//!   check/analyze faces ride it too, domain-less today.
 //! * **Delta mode** — a repeat query may carry `since: <epoch>`; the answer
 //!   restricted to changed rows keeps its envelope shape and echoes the
 //!   cursor in the optional `since` field (absent = full answer).
@@ -197,6 +210,7 @@
 //!   authoritative constant).
 //! * [`Domain::RunMetrics`] — the `--metrics-json` run summary
 //!   ([`run_metrics_schema`]).
+//! * [`Domain::Index`] — the §15.1 index run summary ([`index_schema`]).
 //! * The §15.9 workspace config — `dartq.yaml` ([`config_schema`]) — is
 //!   published without a [`Domain`]: it is an input document, and its
 //!   enforcement point is the lenient reader in `dartq-commands`, not a
@@ -235,6 +249,7 @@ mod diagnostics;
 mod explain;
 mod fix_patch;
 mod impact;
+mod index;
 mod query;
 mod run_metrics;
 mod support;
@@ -245,6 +260,7 @@ pub use diagnostics::{SCHEMA_VERSION_DIAGNOSTICS, diagnostics_schema};
 pub use explain::{SCHEMA_VERSION_EXPLAIN, explain_schema};
 pub use fix_patch::{SCHEMA_VERSION_FIX_PATCH, fix_patch_schema};
 pub use impact::{SCHEMA_VERSION_IMPACT, impact_schema};
+pub use index::{SCHEMA_VERSION_INDEX, index_schema};
 pub use query::{DECL_KINDS, REF_KINDS, SCHEMA_VERSION_QUERY, query_schema};
 pub use run_metrics::{SCHEMA_VERSION_RUN_METRICS, run_metrics_schema};
 
@@ -265,6 +281,8 @@ pub enum Domain {
     Compat,
     /// The `--metrics-json` run summary (`dartq check` / `dartq analyze`).
     RunMetrics,
+    /// The §15.1 index run summary (`dartq index`).
+    Index,
 }
 
 /// A §15.1/§15.8.1 verbosity tier — the `--verbosity` spelling a face
@@ -345,6 +363,7 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::Explain => explain::validate_explain(&value),
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
+        Domain::Index => index::validate_index(&value),
     }
 }
 
@@ -357,8 +376,9 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
 /// Presence beyond the red line is not enforced: the ● cells past the
 /// locating floor are the emitter's fixture obligation (§15.8.5 omission
 /// conventions make legitimate absences indistinguishable from violations).
-/// The tier-invariant faces ([`Domain::Impact`], [`Domain::RunMetrics`])
-/// ignore the tier — every field is a locator or a verdict.
+/// The tier-invariant faces ([`Domain::Impact`], [`Domain::RunMetrics`],
+/// [`Domain::Index`]) ignore the tier — every field is a locator, a
+/// verdict, or a summary count.
 ///
 /// # Errors
 ///
@@ -377,6 +397,7 @@ pub fn validate_at_tier(
     match (domain, tier) {
         (Domain::Impact, _) => impact::validate_impact(&value),
         (Domain::RunMetrics, _) => run_metrics::validate_run_metrics(&value),
+        (Domain::Index, _) => index::validate_index(&value),
         (Domain::Diagnostics, tier) => diagnostics::validate_diagnostics_at_tier(&value, tier),
         (Domain::FixPatch, tier) => fix_patch::validate_fix_patch_at_tier(&value, tier),
         (Domain::Query, tier) => query::validate_query_at_tier(&value, tier),

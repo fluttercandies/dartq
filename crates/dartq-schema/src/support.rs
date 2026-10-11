@@ -139,6 +139,19 @@ pub(crate) fn rows<'v>(
     Ok(array(field(root, key, "")?, key)?.iter().enumerate())
 }
 
+/// Same contract as [`rows`], but the array is optional: absent yields no
+/// rows instead of a missing-field violation (the reserved additive arrays'
+/// absent-tolerant posture).
+pub(crate) fn rows_optional<'v>(
+    root: &'v Map<String, Value>,
+    key: &str,
+) -> Result<Vec<(usize, &'v Value)>, SchemaViolation> {
+    match root.get(key) {
+        Some(value) => Ok(array(value, key)?.iter().enumerate().collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
 pub(crate) fn enum_spelling(
     value: &Value,
     path: &str,
@@ -245,6 +258,27 @@ pub(crate) fn session_fields(obj: &Map<String, Value>) -> Result<(), SchemaViola
         let table = object(table, path)?;
         for (id, entry) in table {
             symbol_ref(entry, &join(path, id))?;
+        }
+    }
+    if let Some(cursor) = obj.get("since") {
+        non_negative(cursor, "since")?;
+    }
+    Ok(())
+}
+
+/// The §15.8 economics applied to a face's own path-valued rows (the
+/// daemon's full-tier `explain` short-id table): `symbols` maps short ids
+/// to FILE paths — the values are the very strings substituted out of the
+/// rows, a different value domain than the query/impact table's
+/// `label|name` entity references (the split the daemon's session-economics
+/// contract pins; §15.8-2's entity-reference table stays the pin above).
+/// `since` is the same delta cursor. Both absent-tolerant.
+pub(crate) fn path_session_fields(obj: &Map<String, Value>) -> Result<(), SchemaViolation> {
+    if let Some(table) = obj.get("symbols") {
+        let path = "symbols";
+        let table = object(table, path)?;
+        for (id, entry) in table {
+            string(entry, &join(path, id))?;
         }
     }
     if let Some(cursor) = obj.get("since") {

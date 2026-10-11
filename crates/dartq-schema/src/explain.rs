@@ -25,7 +25,10 @@
 //!
 //! Ranges are the §15.8.5 `[startOffset, endOffset)` pair form (this face
 //! is new — no legacy spelling to keep). The §15.8 session fields
-//! (`symbols`/`since`) are declared absent-tolerant like every daemon face.
+//! (`symbols`/`since`) are declared absent-tolerant like every daemon face;
+//! the face's `symbols` table is the id → FILE path spelling — the
+//! economics over this face's own path-valued rows — not query/impact's
+//! `label|name` entity-reference table.
 
 use std::sync::LazyLock;
 
@@ -36,7 +39,7 @@ use crate::Verbosity;
 use crate::query::{DECL_KINDS, REF_KINDS};
 use crate::support::{
     absent, array, boolean, enum_spelling, exact_fields, field, join, non_negative, object,
-    pinned_version, range_pair, session_fields, string,
+    path_session_fields, pinned_version, range_pair, string,
 };
 
 /// The explain report's output contract version (PRD §15.7). Mirrors the
@@ -219,7 +222,7 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
     exact_fields(root, EXPLAIN_TOP, EXPLAIN_OPTIONAL, "")?;
     pinned_version(root, "schema_version", SCHEMA_VERSION_EXPLAIN)?;
     string(field(root, "symbol", "")?, "symbol")?;
-    session_fields(root)?;
+    path_session_fields(root)?;
     if let Some(declaration) = root.get("declaration") {
         let p = "declaration";
         let obj = object(declaration, p)?;
