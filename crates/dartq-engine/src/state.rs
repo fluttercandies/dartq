@@ -590,6 +590,16 @@ pub(crate) struct EngineState {
     /// the zero-cost shape (the poll short-circuits at one `Option` test,
     /// the sampler never runs). Armed through [`crate::Engine::set_memory_limit`].
     pub(crate) budget: Option<crate::budget::MemoryBudget>,
+    /// The `--trace-events` JSONL sink (PRD §17.4), `None` when unset —
+    /// the zero-cost shape (no sink object, no per-event work). Armed
+    /// through [`crate::Engine::set_trace_sink`].
+    pub(crate) trace: Option<crate::event::TraceSink>,
+    /// The L3 content-addressed store (PRD §17.2), `None` when not armed —
+    /// the zero-cost shape (the write-batch flush short-circuits at one
+    /// `Option` test). Armed through
+    /// [`crate::Engine::open_content_store`]; every apply batch persists
+    /// its changed contents and flushes (pipeline's `flush_l3`).
+    pub(crate) l3: Option<crate::store::ContentStore>,
 }
 
 impl EngineState {
@@ -652,6 +662,8 @@ impl EngineState {
             capture_dirty: Vec::new(),
             gc_debt: 0,
             budget: None,
+            trace: None,
+            l3: None,
         })
     }
 

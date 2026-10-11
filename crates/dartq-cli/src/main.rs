@@ -242,6 +242,24 @@ struct AnalyzeArgs {
     /// the output is byte-identical to an unbudgeted run.
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
+    /// JSONL trace sink (PRD §17.4): the engine appends one JSON object per
+    /// engine event — §17.4 taxonomy names, stable field order, flushed per
+    /// event so a killed CI run keeps its tail. Unset = no sink and zero
+    /// event work: the output face is byte-identical to an untraced run.
+    #[arg(long, value_name = "PATH")]
+    trace_events: Option<PathBuf>,
+    /// Hard cap for the L3 content store (PRD §17.2), the persistent
+    /// cross-session cache under `~/.cache/dartq/`: after each write batch
+    /// the store evicts least-recently-touched, unreferenced contents until
+    /// the stored total is at or under this size. Grammar: NUMBER
+    /// [KiB|MiB|GiB] — suffix case-insensitive, a bare number is bytes
+    /// (512MiB, 10GiB, 4096). Unset = the 10 GiB default.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = dartq_engine::store::parse_size_limit
+    )]
+    cache_size_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -550,6 +568,17 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         }
     };
     engine.set_memory_limit(args.memory_limit);
+    engine.set_trace_sink(match &args.trace_events {
+        Some(path) => match dartq_engine::event::TraceSink::create(path) {
+            Ok(sink) => Some(sink),
+            Err(error) => {
+                eprintln!("error: trace events: {error}");
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    });
+    arm_content_store(&mut engine, args.cache_size_limit);
     let run = match under_crash_tier(|| {
         dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&dir))
     }) {
@@ -557,6 +586,25 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Err(code) => return code,
     };
     analyze_finish(args, &run, started, out)
+}
+
+/// Arms the L3 content store (PRD §17.2) at the default cache root with
+/// `size_limit` (unset = the 10 GiB default): analyze persists each apply
+/// batch's changed contents cross-session and the store evicts down to the
+/// cap. An unwritable store warns on stderr and leaves the engine unarmed
+/// — the cache is an accelerator, never a dependency; no home directory
+/// (nowhere to put it) stays silently unarmed.
+fn arm_content_store(engine: &mut dartq_engine::Engine, size_limit: Option<u64>) {
+    let Some(root) = dartq_engine::store::default_root() else {
+        return;
+    };
+    let config = dartq_engine::store::StoreConfig {
+        root,
+        size_limit: size_limit.unwrap_or(dartq_engine::store::DEFAULT_SIZE_LIMIT),
+    };
+    if let Err(error) = engine.open_content_store(config) {
+        eprintln!("warning: content store disabled: {error}");
+    }
 }
 
 /// The `--overlay` path (PRD §16.3): the specs decode here (relative paths
@@ -575,6 +623,17 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         }
     };
     engine.set_memory_limit(args.memory_limit);
+    engine.set_trace_sink(match &args.trace_events {
+        Some(path) => match dartq_engine::event::TraceSink::create(path) {
+            Ok(sink) => Some(sink),
+            Err(error) => {
+                eprintln!("error: trace events: {error}");
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    });
+    arm_content_store(&mut engine, args.cache_size_limit);
     let overlays = match load_overlays(&args.overlays, &args.dir) {
         Ok(overlays) => overlays,
         Err(error) => {
@@ -1404,6 +1463,11 @@ mod tests {
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
         assert_eq!(args.memory_limit, None, "unlimited by default");
+        assert_eq!(args.trace_events, None, "untraced by default");
+        assert_eq!(
+            args.cache_size_limit, None,
+            "unset = the 10 GiB default cap"
+        );
         assert_eq!(args.dir, PathBuf::from("/pkg"));
 
         let parsed = parse_args_of(&[
@@ -1420,6 +1484,8 @@ mod tests {
             "--fatal-infos",
             "--memory-limit",
             "2048",
+            "--trace-events",
+            "/tmp/dartq-trace.jsonl",
             "/pkg",
         ])
         .expect("parse")
@@ -1444,6 +1510,37 @@ mod tests {
             Some(2048),
             "--memory-limit MiB parses and plumbs"
         );
+        assert_eq!(
+            args.trace_events,
+            Some(PathBuf::from("/tmp/dartq-trace.jsonl")),
+            "--trace-events parses and plumbs"
+        );
+    }
+
+    /// The `--cache-size-limit` grammar rides the engine's
+    /// `parse_size_limit` through the clap value parser: suffixed and bare
+    /// sizes parse to bytes; a typo is a clap usage error carrying the
+    /// accepted spelling.
+    #[test]
+    fn cache_size_limit_flag_parses_through_the_grammar() {
+        let parsed = |text: &str| {
+            let args = parse_args_of(&["analyze", "--cache-size-limit", text, "/pkg"])
+                .expect("parse")
+                .expect("subcommand");
+            let Command::Analyze(args) = args else {
+                panic!("expected analyze command")
+            };
+            args.cache_size_limit
+        };
+        assert_eq!(parsed("512MiB"), Some(512 * 1024 * 1024));
+        assert_eq!(parsed("10GiB"), Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(parsed("4096"), Some(4096), "a bare number is bytes");
+        for text in ["10TiB", "1.5GiB", "huge"] {
+            assert!(
+                parse_args_of(&["analyze", "--cache-size-limit", text, "/pkg"]).is_err(),
+                "`{text}` must be a usage error"
+            );
+        }
     }
 
     /// Throwaway pub workspace + synthetic dart:core-only SDK — the same
@@ -1500,6 +1597,8 @@ mod tests {
             no_fatal_warnings: false,
             fatal_infos: false,
             memory_limit: None,
+            trace_events: None,
+            cache_size_limit: None,
         }
     }
 

@@ -21,8 +21,9 @@
 //! # Module layout (§1.6)
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
-//! (analyze), `budget` (the §17.1 memory-budget runtime), `event`, `cancel`,
-//! `query` (the `query symbol` face, PRD
+//! (analyze), `budget` (the §17.1 memory-budget runtime), `store` (the §17.2
+//! L3 content-addressed store), `event`, `cancel`, `query` (the `query
+//! symbol` face, PRD
 //! §20.3), `semdiag` (the default semantic diagnoser, #236),
 //! `analysis_options` (the merged per-root options, PRD §12), `context` +
 //! `scheduler` (the multi-context runtime substrate — contexts, overlays,
@@ -50,6 +51,7 @@ pub mod query;
 pub mod scheduler;
 pub mod semdiag;
 pub mod state;
+pub mod store;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,6 +202,56 @@ impl Engine {
         self.state.budget = limit_mib.map(budget::MemoryBudget::new);
     }
 
+    /// Arms (or disarms) the `--trace-events` JSONL sink (PRD §17.4): every
+    /// later apply/analyze appends one JSON object per engine event — §17.4
+    /// taxonomy names, stable field order, flushed per event so a killed CI
+    /// run keeps its tail. `None` (the default) constructs nothing and the
+    /// output face is byte-identical to an untraced run.
+    pub fn set_trace_sink(&mut self, sink: Option<event::TraceSink>) {
+        self.state.trace = sink;
+    }
+
+    /// Arms (or re-arms) the L3 content-addressed store (PRD §17.2): the
+    /// persistent, cross-session global under `config.root` that every
+    /// later apply batch's changed contents persist into (write batch =
+    /// puts, then flush — manifest save + cap enforcement). Opening
+    /// degrades gracefully — a torn manifest rebuilds by mtime and never
+    /// blocks startup — so the only failure is a store directory that
+    /// cannot exist; a caller that treats that as a warning keeps
+    /// analyzing disarmed. Re-arming replaces the handle (flush the old
+    /// store through [`Self::content_store_mut`] first if its books carry
+    /// unsaved pins).
+    ///
+    /// # Errors
+    ///
+    /// [`store::StoreError::CreateDir`] when the store directory cannot
+    /// exist.
+    pub fn open_content_store(
+        &mut self,
+        config: store::StoreConfig,
+    ) -> Result<(), store::StoreError> {
+        self.state.l3 = Some(store::ContentStore::open(config)?);
+        Ok(())
+    }
+
+    /// The armed L3 store, read-only face (`None` when disarmed — the
+    /// default): lookups, blob reads, and the observability counters the
+    /// daemon's diagnostics assemble over.
+    #[must_use]
+    pub fn content_store(&self) -> Option<&store::ContentStore> {
+        self.state.l3.as_ref()
+    }
+
+    /// The armed L3 store, mutating face (`None` when disarmed): the
+    /// daemon's reference-counting surface — [`store::ContentStore::retain`]
+    /// pins a workspace's contents against eviction,
+    /// [`store::ContentStore::release`] drops the pin when the workspace
+    /// closes, and a final [`store::ContentStore::flush`] persists the
+    /// pins.
+    pub fn content_store_mut(&mut self) -> Option<&mut store::ContentStore> {
+        self.state.l3.as_mut()
+    }
+
     /// Enqueues a content override. Only touches the pending overlay — no
     /// derived state is invalidated here. Interns `path` if new and returns
     /// its `FileId`. Last write per path wins; `set_content` then
@@ -250,6 +302,7 @@ impl Engine {
     /// (§3.2 steps 1–5). Events fire only for a non-empty queue.
     pub fn apply_pending(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> AffectedReport {
         let outcome = l1::apply(&mut self.state, on_event);
+        pipeline::flush_l3(&mut self.state, &outcome.changed);
         AffectedReport {
             changed: outcome.changed,
             removed: outcome.removed,

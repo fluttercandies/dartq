@@ -23,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::budget;
 use crate::cancel::{CancellationToken, Cancelled};
-use crate::event::EngineEvent;
+use crate::event::{EngineEvent, duration_us};
 use crate::l1;
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, FactsKey, LibraryId, LibraryInfo, LibraryResult,
@@ -57,6 +57,31 @@ impl ResolvedGraph {
     }
 }
 
+/// The L3 write batch (PRD §17.2): the apply's changed contents persist
+/// into the armed content store, then the batch flushes (manifest save +
+/// cap enforcement). Store failures degrade inside the store — nothing
+/// here can fail an analysis (the accelerator invariant). Runs on the
+/// engine's two apply sites ([`l1::apply`] via [`crate::Engine`]'s
+/// `apply_pending` and the analyze driver) so no content batch can slip
+/// between them unflushed.
+pub(crate) fn flush_l3(state: &mut EngineState, changed: &[FileId]) {
+    let mut l3 = match state.l3.take() {
+        Some(l3) => l3,
+        None => return,
+    };
+    for file in changed {
+        let bytes = state
+            .residency
+            .get(file)
+            .and_then(|facts| state.store.get(facts.content));
+        if let Some(bytes) = bytes {
+            l3.put(bytes);
+        }
+    }
+    l3.flush();
+    state.l3 = Some(l3);
+}
+
 /// The analyze driver (engine-api-spec §1.3): phase 1 is always
 /// [`l1::apply`] (an explicit earlier apply sees an empty queue and emits
 /// nothing); phase 2 recomputes the dirty libraries in import-edge
@@ -70,7 +95,12 @@ pub(crate) fn analyze(
     on_event: &mut dyn FnMut(EngineEvent),
     cancel: &CancellationToken,
 ) -> Result<Vec<Diagnostic>, Cancelled> {
-    l1::apply(state, on_event);
+    let applied = l1::apply(state, on_event);
+    // The L3 write batch (PRD §17.2): the batch's new contents persist
+    // before the recompute — a cancelled analyze still leaves its bytes
+    // cross-session (the store is content-addressed; correctness never
+    // depends on it). Disarmed engines pay one `Option` test.
+    flush_l3(state, &applied.changed);
     // The maintained index inputs refresh before anything consumes them:
     // changed files recapture (declaration spans move under body edits the
     // L2 gate keeps library-clean), so the query faces and the dirty
@@ -95,6 +125,16 @@ pub(crate) fn analyze(
         && let Some(file) = budget_anchor(state, &order)
     {
         budget_rows.push(budget::degraded_diagnostic(tier, limit_mib, file));
+        if let Some(sink) = state.trace.as_mut()
+            && let Some(path) = state.files.path(file)
+        {
+            sink.memory_degrade(tier.key(), limit_mib, &path.to_string_lossy());
+        }
+        on_event(EngineEvent::MemoryDegrade {
+            tier: tier.key(),
+            limit_mib,
+            file,
+        });
     }
 
     // Parallel recompute: per-library diagnosis is a pure function of the
@@ -164,6 +204,21 @@ pub(crate) fn analyze(
         // the ladder across these sequential boundaries, one tier each.
         if let Some((tier, limit_mib)) = state.poll_budget() {
             budget_rows.push(budget::degraded_diagnostic(tier, limit_mib, defining));
+            if let Some(sink) = state.trace.as_mut()
+                && let Some(path) = state.files.path(defining)
+            {
+                sink.memory_degrade(tier.key(), limit_mib, &path.to_string_lossy());
+            }
+            on_event(EngineEvent::MemoryDegrade {
+                tier: tier.key(),
+                limit_mib,
+                file: defining,
+            });
+        }
+        if let Some(sink) = state.trace.as_mut()
+            && let Some(path) = state.files.path(defining)
+        {
+            sink.library_analyzed(&path.to_string_lossy(), false, duration_us(duration));
         }
         on_event(EngineEvent::LibraryAnalyzed {
             library: *library,
@@ -192,6 +247,14 @@ pub(crate) fn analyze(
     clean_targets.sort_unstable();
     clean_targets.dedup();
     for library in clean_targets {
+        if let Some(sink) = state.trace.as_mut()
+            && let Some(path) = state
+                .libraries
+                .info(library)
+                .and_then(|info| state.files.path(info.defining))
+        {
+            sink.library_analyzed(&path.to_string_lossy(), true, 0);
+        }
         on_event(EngineEvent::LibraryAnalyzed {
             library,
             from_cache: true,
@@ -278,15 +341,16 @@ fn diagnose_library(
             // reported root cause and replaces the combinator symptom). Each
             // clause kind picks its code face (`hide` →
             // `undefined_hidden_name`, `show` → `undefined_shown_name`).
-            if matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export)
-                && directive.combinators.written().next().is_some()
+            if matches!(
+                directive.kind,
+                DirectiveKind::Import | DirectiveKind::Export
+            ) && directive.combinators.written().next().is_some()
                 && let Some((target, library_uri)) =
                     combinator_check_target(state, resolved, directive)
             {
-                for found in
-                    resolved
-                        .graph
-                        .undefined_combinator_names(Some(target), &directive.combinators)
+                for found in resolved
+                    .graph
+                    .undefined_combinator_names(Some(target), &directive.combinators)
                 {
                     let info = if found.hidden {
                         UNDEFINED_HIDDEN_NAME
