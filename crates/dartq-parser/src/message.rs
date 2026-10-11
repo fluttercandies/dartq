@@ -61,12 +61,6 @@ pub(crate) mod msg {
         VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
     };
     use dartq_diagnostics::{
-        ABSTRACT_FINAL_BASE_CLASS, ABSTRACT_FINAL_INTERFACE_CLASS, ABSTRACT_SEALED_CLASS,
-        EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER, MISSING_KEYWORD_OPERATOR,
-        MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES, MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
-        PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
-    };
-    use dartq_diagnostics::{
         ABSTRACT_LATE_FIELD, ABSTRACT_STATIC_FIELD, ANNOTATION_SPACE_BEFORE_PARENTHESIS,
         ASYNC_KEYWORD_USED_AS_IDENTIFIER, CONST_CLASS, CONST_CONSTRUCTOR_WITH_BODY, CONST_FACTORY,
         DEFAULT_VALUE_IN_FUNCTION_TYPE, DUPLICATE_LABEL_IN_SWITCH_STATEMENT,
@@ -110,6 +104,11 @@ pub(crate) mod msg {
         IMPORT_DIRECTIVE_AFTER_PART_DIRECTIVE, LIBRARY_DIRECTIVE_NOT_FIRST,
         MISSING_PREFIX_IN_DEFERRED_IMPORT, MULTIPLE_LIBRARY_DIRECTIVES,
         MULTIPLE_PART_OF_DIRECTIVES, NON_PART_OF_DIRECTIVE_IN_PART, PREFIX_AFTER_COMBINATOR,
+    };
+    use dartq_diagnostics::{
+        EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER, MISSING_KEYWORD_OPERATOR,
+        MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES, MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
+        PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
     };
 
     /// `expectedToken` / `expectedButGot` / `expectedAfterButGot` all surface
@@ -1324,27 +1323,6 @@ pub(crate) mod msg {
         Message::new(
             local_code("typedef_augmentation", "TYPEDEF_AUGMENTATION"),
             "Type aliases can't be augmented.",
-        )
-    }
-
-    pub(crate) fn abstract_sealed_class() -> Message {
-        Message::new(
-            ABSTRACT_SEALED_CLASS,
-            "Classes can't be declared both 'abstract' and 'sealed'.",
-        )
-    }
-
-    pub(crate) fn abstract_final_base_class() -> Message {
-        Message::new(
-            ABSTRACT_FINAL_BASE_CLASS,
-            "Classes can't be declared both 'abstract' and 'final' and 'base'.",
-        )
-    }
-
-    pub(crate) fn abstract_final_interface_class() -> Message {
-        Message::new(
-            ABSTRACT_FINAL_INTERFACE_CLASS,
-            "Classes can't be declared both 'abstract' and 'final' and 'interface'.",
         )
     }
 

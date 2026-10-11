@@ -543,9 +543,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             if kind == TokenKind::OpenCurly {
                 has_named_fields = true;
                 self.parse_record_type_named_fields();
-                self.ensure_close_paren(start);
-                end = self.peek_span();
-                self.cursor.advance();
+                // `ensureCloseParen` consumes the `)` in every arm (real,
+                // relocated-synthetic, skipped, or inserted) and returns its
+                // span with the cursor already past it — the official named
+                // arm consumes `token.next!` directly
+                // (parser_impl.dart:1747-1907). Re-peeking after the consume
+                // minted `end` from the FOLLOWING token and the trailing
+                // advance swallowed it (`({int a}) t;` lost the `t`).
+                end = self.ensure_close_paren(start);
                 break;
             }
             self.parse_record_type_field(true);
@@ -596,17 +601,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseRecordTypeField`
     /// (`recordTypeField ::= metadata type identifier?`).
     fn parse_record_type_field(&mut self, identifier_is_optional: bool) {
-        self.listener.begin_record_type_entry();
+        let first = self.peek_span();
+        self.listener.begin_record_type_entry(first);
         self.parse_metadata_star();
         let type_info = self.compute_type(true, false);
-        type_info.ensure_type_or_void(self);
+        let mut last = type_info.ensure_type_or_void(self);
         if self.peek_is_identifier() || !identifier_is_optional {
-            self.ensure_identifier(IdentifierContext::RecordFieldDeclaration);
+            last = self.ensure_identifier(IdentifierContext::RecordFieldDeclaration);
         } else {
             let next = self.look_span_at(1);
             self.listener.handle_no_name(next);
         }
-        self.listener.end_record_type_entry();
+        self.listener.end_record_type_entry(last);
     }
 
     /// Official `parseRecordTypeNamedFields`

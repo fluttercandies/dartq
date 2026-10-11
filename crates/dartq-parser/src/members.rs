@@ -100,6 +100,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
 
         let mut name_is_recovered = false;
+        let mut synthetic_name: Option<TokenSpan> = None;
         // Recovery: `<return type>? <reserved word> <method-or-field token>`
         // (official `parseTopLevelMemberImpl` :4304-4320 — the reserved check
         // reads `next.next`, two past the un-consumed type start). The
@@ -154,14 +155,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         self.parse_invalid_top_level_declaration();
                         return;
                     }
-                    // Declaration missing its identifier: synthesize one.
+                    // Declaration missing its identifier: synthesize one and
+                    // hand it to the member parse as the name (official
+                    // insertSyntheticIdentifier then fall-through — the
+                    // synthetic flows into parseFields as the name token,
+                    // parser_impl.dart:4367/:4398, so the name slot must not
+                    // re-report).
                     let at = self.peek_span();
                     self.report(msg::missing_identifier(), at);
                     let id = self
                         .cursor
                         .insert_synthetic(TokenKind::Identifier, at.range.offset);
                     self.cursor.advance();
-                    let _ = id;
+                    synthetic_name = Some(self.span_of(id));
                 }
                 _ => {}
             }
@@ -217,7 +223,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 mods,
                 before_type,
                 type_info,
-                None,
+                synthetic_name,
                 name_is_recovered,
             );
         }
@@ -388,6 +394,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     ) {
         self.parse_metadata_star();
 
+        // Official `beforeStart` (:5295) predates the modifier walk, and
+        // `recoverFromInvalidMember`'s no-progress check is
+        // `token == beforeStart` (:11352) — a modifier-headed junk member
+        // (`late;`) has consumed progress and must fall into `parseFields`'
+        // recovery, not `expectedClassMember`.
+        let member_start = self.cursor.mark();
         let mods = self.walk_class_member_modifiers();
         // Official `parseClassMemberModifiers`: `required` is always
         // extraneous on a class member (it belongs to named parameters).
@@ -590,6 +602,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         kind,
                         enclosing_declaration_name,
                         mods,
+                        member_start,
                         before_type,
                         type_info,
                         get_or_set,
@@ -609,6 +622,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         kind,
                         enclosing_declaration_name,
                         mods,
+                        member_start,
                         before_type,
                         type_info,
                         get_or_set,
@@ -630,6 +644,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         kind,
                         enclosing_declaration_name,
                         mods,
+                        member_start,
                         before_type,
                         type_info,
                         get_or_set,
@@ -650,6 +665,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         kind,
                         enclosing_declaration_name,
                         mods,
+                        member_start,
                         before_type,
                         type_info,
                         get_or_set,
@@ -1488,6 +1504,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         kind: DeclarationKind,
         enclosing_declaration_name: Option<&'s str>,
         mods: MemberModifiers,
+        member_start: crate::cursor::CursorMark,
         before_type: crate::cursor::CursorMark,
         type_info: TypeInfo,
         get_or_set: Option<TokenSpan>,
@@ -1553,7 +1570,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 new_kw,
                 false,
             );
-        } else if self.cursor.progress() == crate::cursor::TokenCursor::progress_at(before_type)
+        } else if self.cursor.progress() == crate::cursor::TokenCursor::progress_at(member_start)
             && !matches!(next_kind, TokenKind::CloseCurly)
         {
             self.report(

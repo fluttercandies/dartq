@@ -323,10 +323,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             if let Some(s) = sealed {
                                 self.report(msg::sealed_mixin(), s);
                             }
-                            // `base` is consumed and reported by the dispatch lookahead.
-                            let base_kw = None;
                             self.check_declaration();
-                            self.parse_mixin(begin, mods.augment, base_kw, keyword);
+                            self.parse_mixin(begin, mods.augment, base, keyword);
                         }
                     }
                     TokenKind::Keyword(Keyword::Extension) => {
@@ -1156,17 +1154,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let type_param = self.compute_type_param_or_arg_on_lt(false);
         type_param.parse_variables(self, true);
 
-        if abstract_kw.is_some() {
-            if let Some(s) = sealed {
-                self.report(msg::abstract_sealed_class(), s);
-            } else if let Some(f) = final_kw {
-                if let Some(b) = base {
-                    self.report_with_end(msg::abstract_final_base_class(), f, b);
-                } else if let Some(i) = interface {
-                    self.report_with_end(msg::abstract_final_interface_class(), f, i);
-                }
-            }
-        }
+        // The abstract+final/interface/sealed modifier trio is owned by the
+        // semantic layer (dartq-resolution modifiers.rs, check_modifier_
+        // declaration) — the only emitter that can carry corrections. The
+        // parser must not re-report it.
 
         if self.peek_kind() == TokenKind::Eq {
             if let Some(c) = const_keyword {
