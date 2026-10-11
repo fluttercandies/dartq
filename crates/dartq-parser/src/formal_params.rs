@@ -589,16 +589,38 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             type_info.parse_type(self);
         }
 
-        // Name.
+        // Name. A TRUE-JUNK name slot behind a real type takes the official
+        // `handleNoName` posture: 3.13.1 `parseFormalParameter` consumes a
+        // typed parameter's name only `if (next.isIdentifier)`
+        // (parser_impl.dart:2229) with no recovery report — the junk stays
+        // current for the parameter list's tail, whose `ensureCloseParen`
+        // carries the single row anchored on the junk (oracle probe
+        // `void f(int 5) {}`: exactly one `expected_token` `Expected to
+        // find ')'.` at the `5`; no `missing_identifier`). Every other
+        // non-identifier face keeps the #184 template route (oracle
+        // probes): a reserved word reports
+        // `expected_identifier_but_got_keyword` and is consumed even
+        // behind a type (`void t1(int assert)`); a no-type junk token
+        // (`void f(5) {}`) reports `missing_identifier` at the junk;
+        // separators keep the insert-without-consuming branch. Named
+        // parameters in function types keep the 3.15 arm this crate
+        // already pinned, and `this.`/`super.` formals (`FieldInitializer`
+        // context) always ensure a name (parser_impl.dart:2371).
         let name = if let Some(n) = inline_name {
             n
-        } else if in_function_type
-            && !matches!(
-                parameter_kind,
-                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
-            )
+        } else if before_inline_function_type.is_none()
+            && name_context == IdentifierContext::FormalParameterDeclaration
+            && !matches!(type_info, TypeInfo::NoType)
             && !is_identifier(self.peek_kind())
-            && before_inline_function_type.is_none()
+            && !matches!(
+                self.peek_kind(),
+                TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+            )
+            && !(in_function_type
+                && matches!(
+                    parameter_kind,
+                    FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+                ))
         {
             let next = self.peek_span();
             self.listener.handle_no_name(next);

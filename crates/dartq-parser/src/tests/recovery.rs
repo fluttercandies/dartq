@@ -104,6 +104,74 @@ fn parse_collected(source: &'static str, table: &dartq_scanner::TokenTable) -> (
 }
 
 #[test]
+fn junk_formal_name_reports_the_parameter_group_tail_only() {
+    // 3.13.1 oracle probe of `void f(int 5) {}` (machine format): exactly
+    // one row — `EXPECTED_TOKEN` `Expected to find ')'.` spanning the `5`
+    // (1|12|1). The name slot takes the official `handleNoName` posture
+    // (3.13.1 `parseFormalParameter` consumes a name only
+    // `if (next.isIdentifier)`, parser_impl.dart:2229 — no recovery
+    // report), and the parameter list's tail `ensureCloseParen` carries
+    // the single row anchored on the real junk token. The 3.15 context
+    // template (identifier_context_impl.dart:604-611) would add a
+    // `missing_identifier` — the 3.13.1 oracle output is the arbiter and
+    // has no such row.
+    let source = "void f(int 5) {}";
+    let (table, scan_diags) = scan_leaked(source);
+    assert!(scan_diags.is_empty(), "{scan_diags:?}");
+    let (listener, at_eof) = parse_collected(source, table);
+    assert_eq!(
+        listener.errors,
+        vec![("expected_token".to_string(), 11, 12)],
+        "one row, anchored on the junk `5`"
+    );
+    assert_eq!(listener.texts, vec!["Expected to find ')'."]);
+    assert!(at_eof, "parse reaches EOF");
+}
+
+#[test]
+fn no_type_junk_formal_reports_missing_identifier_at_the_junk() {
+    // 3.13.1 oracle probe of `void f(5) {}` (machine format): exactly one
+    // row — `MISSING_IDENTIFIER` "Expected an identifier." spanning the
+    // `5` (1|8|1) — the official template's consume-in-doubt branch; the
+    // no-type name slot rides the #184 recovery route (report at the
+    // junk, synthetic consumed as the name event).
+    let source = "void f(5) {}";
+    let (table, scan_diags) = scan_leaked(source);
+    assert!(scan_diags.is_empty(), "{scan_diags:?}");
+    let (listener, at_eof) = parse_collected(source, table);
+    assert_eq!(
+        listener.errors,
+        vec![("missing_identifier".to_string(), 7, 8)],
+        "one row, anchored on the junk `5`"
+    );
+    assert_eq!(listener.texts, vec!["Expected an identifier."]);
+    assert!(at_eof, "parse reaches EOF");
+}
+
+#[test]
+fn reserved_word_formal_name_reports_the_keyword_face() {
+    // 3.13.1 oracle probe of `void f(assert) {}` (machine format): exactly
+    // one row — `EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD` spanning `assert`
+    // (1|8|6) — the keyword is consumed as the name and no tail row
+    // follows. The keyword route is context-independent: it fires with no
+    // type parsed here and behind one (`void t1(int assert)`).
+    let source = "void f(assert) {}";
+    let (table, scan_diags) = scan_leaked(source);
+    assert!(scan_diags.is_empty(), "{scan_diags:?}");
+    let (listener, at_eof) = parse_collected(source, table);
+    assert_eq!(
+        listener.errors,
+        vec![("expected_identifier_but_got_keyword".to_string(), 7, 13)],
+        "one row spanning the keyword"
+    );
+    assert_eq!(
+        listener.texts,
+        vec!["'assert' can't be used as an identifier because it's a keyword."]
+    );
+    assert!(at_eof, "parse reaches EOF");
+}
+
+#[test]
 fn unclosed_block_body_at_eof_is_reported_once_by_the_scanner() {
     // `void main() {` — the block never closes. Official pipeline: the
     // scanner's `unmatchedBeginGroup` inserts the synthetic `}` and reports

@@ -508,12 +508,15 @@ fn conditional_uri_garbage_before_close() {
 
 #[test]
 fn library_name_missing() {
-    // The synthetic name lands before `5`, so the semicolon recovery
-    // reports against it (official order: missing_identifier, then the
-    // `expected ';'`); the leftover `5;` then member-parses with its own
-    // recovery tail.
-    let codes = error_codes("library 5;");
-    assert_eq!(&codes[..2], ["missing_identifier", "expected_token"]);
+    // 3.13.1 oracle probe (`dart analyze --format=machine`): exactly one
+    // row — `MISSING_IDENTIFIER` "Expected an identifier." spanning the
+    // `5` (1|9|1). The LibraryIdentifierContext template consumes
+    // non-keyword junk in the name slot ("when in doubt, consume the
+    // token", identifier_context_impl.dart:991-1000), so the junk is gone
+    // behind the synthetic name and no semicolon-recovery tail follows.
+    let c = parse("library 5;");
+    assert_eq!(c.errors, [("missing_identifier".to_string(), 8, 9)]);
+    assert_eq!(c.texts, ["Expected an identifier."]);
 }
 
 #[test]

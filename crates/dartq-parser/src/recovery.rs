@@ -213,18 +213,43 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return self.ensure_expression_identifier(context);
         }
         // Official recovery template, three branches
-        // (identifier_context_impl.dart:25-45): statement-start / `,` / `)`
-        // / EOF → insert the synthetic WITHOUT consuming (branch 2 — the
-        // offending token belongs to the caller's grammar); other junk →
-        // consume it for progress and insert (branch 3, "when in doubt,
-        // consume the token"). Identifier-shaped heads never reach here.
+        // (identifier_context_impl.dart:25-45): follower keep-sets route to
+        // insert-WITHOUT-consuming (branch 2 — the offending token belongs
+        // to the caller's grammar); other junk takes the consume-in-doubt
+        // branch (branch 3, "when in doubt, consume the token", :39-42).
+        // Identifier-shaped heads never reach here.
+        //
+        // The keep set joins the official `_isOneOfFollowingValues` grammar
+        // followers (:572-584, formalParameterDeclaration: `:` `=` `,` `(`
+        // `)` `[` `]` `{` `}` EOF) with `;`/`>` (the same follower class)
+        // and the generic statement-start probe: kept tokens leave the
+        // junk current, the synthetic riding in front of it. The consume
+        // posture is PER-CONTEXT (#564 r4): only the templates whose
+        // official else-branch consumes true junk take it —
+        // formalParameterDeclaration (:604-611, oracle `void f(5) {}`: one
+        // `missing_identifier` at the `5`, junk consumed) and the
+        // library/part name template (:991-1000, oracle `library 5;`: one
+        // `missing_identifier` at the `5`); every other context keeps the
+        // leave posture so the caller's cascade stands (oracle
+        // `class C { new = 42; }`: two rows at the `42`).
         self.report(msg::missing_identifier(), peek.span);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
         let leave_for_grammar = matches!(
             peek.kind,
-            TokenKind::Comma | TokenKind::CloseParen | TokenKind::Eof
+            TokenKind::Comma
+                | TokenKind::CloseParen
+                | TokenKind::Colon
+                | TokenKind::Semicolon
+                | TokenKind::Eq
+                | TokenKind::Gt
+                | TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::CloseSquare
+                | TokenKind::OpenCurly
+                | TokenKind::CloseCurly
+                | TokenKind::Eof
         ) || self.looks_like_statement_start_at(0);
         if leave_for_grammar {
             // Branch 2: the official `insertSyntheticIdentifier(token)`
@@ -238,7 +263,20 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             // loop's tail recovery and stacks an `expected_token` on the
             // oracle's single missing_identifier.
             while self.cursor.advance() != id {}
+        } else if matches!(
+            context,
+            crate::listener::IdentifierContext::FormalParameterDeclaration
+                | crate::listener::IdentifierContext::LibraryName
+        ) {
+            // Branch 3, aligned: the rewriter splices the synthetic after
+            // the junk (insertToken, :84), so the junk lands behind the
+            // parse pointer. Drain to the synthetic, then consume the junk
+            // for the same stream shape.
+            while self.cursor.advance() != id {}
+            self.cursor.advance();
         } else {
+            // Leave posture (the pre-#564 branch-3 shape): the junk stays
+            // current; the caller's grammar cascades against it.
             self.cursor.advance();
         }
         self.span_of(id)
@@ -403,6 +441,15 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// Official `ensureCloseParen` (`parser_impl.dart:5028`): consumes `)`
     /// and returns its span.
     ///
+    /// The row text is the shared `EXPECTED_TOKEN` problem text `Expected
+    /// to find ')'.`: the 3.13.1 oracle's machine output for the
+    /// parameter-group face (`void f(int 5) {}` probe — one row at the
+    /// junk); 3.15's source passes `diag.expectedButGot` (:5040), whose
+    /// `pseudoSharedCode: PseudoSharedCode.expectedToken`
+    /// (diagnostic.g.dart:646-652) surfaces as the same analyzer code, and
+    /// the ensureSemicolon adjudication (#459) fixed the same divergence
+    /// for `;`.
+    ///
     /// Missing `)` with a scanner-synthesized closer for the group: adopt it
     /// (`moveSynthetic`) without re-reporting — the scanner already reported
     /// the unclosed group. A well-formed but distant `)` is reported once and
@@ -428,7 +475,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 return self.span_of(id);
             }
             let at = self.peek_span();
-            self.report(msg::expected_but_got(")"), at);
+            self.report(msg::expected_token(")"), at);
             self.skip_to_token(close_id);
             let close = self.peek_span();
             self.cursor.advance();
@@ -436,7 +483,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         }
         // No matching closer at all: report and synthesize here.
         let at = self.peek_span();
-        self.report(msg::expected_but_got(")"), at);
+        self.report(msg::expected_token(")"), at);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::CloseParen, at.range.offset);
