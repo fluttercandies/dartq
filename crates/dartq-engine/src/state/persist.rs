@@ -489,26 +489,32 @@ impl PersistedDirective {
             if desynced {
                 Combinators::unfiltered()
             } else {
-                Combinators::with_spans(clauses.into_iter().map(|clause| {
-                    // Written order and duplicates ride verbatim; the
-                    // constructor re-expands the `name=` setter spellings
-                    // and re-sorts the clause sets exactly as the cold
-                    // capture did (l1.rs walk_import_export → the same
-                    // `with_spans` face).
-                    let names: Box<[StringId]> =
-                        clause.names.iter().map(|text| strings.intern(text)).collect();
-                    let spans: Box<[SourceRange]> = clause
-                        .name_spans
-                        .iter()
-                        .map(|span| span.source_range())
-                        .collect();
-                    let combinator = if clause.hide {
-                        CombinatorClause::Hide(names)
-                    } else {
-                        CombinatorClause::Show(names)
-                    };
-                    (combinator, spans)
-                }), strings)
+                Combinators::with_spans(
+                    clauses.into_iter().map(|clause| {
+                        // Written order and duplicates ride verbatim; the
+                        // constructor re-expands the `name=` setter spellings
+                        // and re-sorts the clause sets exactly as the cold
+                        // capture did (l1.rs walk_import_export → the same
+                        // `with_spans` face).
+                        let names: Box<[StringId]> = clause
+                            .names
+                            .iter()
+                            .map(|text| strings.intern(text))
+                            .collect();
+                        let spans: Box<[SourceRange]> = clause
+                            .name_spans
+                            .iter()
+                            .map(|span| span.source_range())
+                            .collect();
+                        let combinator = if clause.hide {
+                            CombinatorClause::Hide(names)
+                        } else {
+                            CombinatorClause::Show(names)
+                        };
+                        (combinator, spans)
+                    }),
+                    strings,
+                )
             }
         };
         DirectiveFacts {
