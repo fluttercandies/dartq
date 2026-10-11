@@ -161,12 +161,15 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
-/// official reachability/data/do.dart `do_true`/`do_false`: a `do` body
-/// runs once; with a `true` condition only `break` reaches the exit.
+/// official `test_doWhile` (dead_code_test.dart): a dead do-while back
+/// edge anchors the interval on the condition, and the close splits into
+/// the `while (c);` part plus the tail after the statement (official
+/// `parent is DoStatement`, dead_code_verifier.dart:292-308) — two rows,
+/// not one per statement.
 #[test]
 fn do_true_body_return_kills_exit() {
     let source = "void f() { do { return; } while (true); 1; }";
-    assert_eq!(dead_snippets(source), ["1"]);
+    assert_eq!(dead_snippets(source), ["} while (true);", "1"]);
 }
 
 #[test]
@@ -616,7 +619,12 @@ fn unmatched_construct_begins_do_not_panic() {
         Ev::ExprStmt { span: span(2) },
         // Do without DoEnd (its frame closes through the exit handler).
         Ev::DoBegin { span: span(3) },
-        Ev::DoEnd,
+        Ev::DoEnd {
+            while_range: dartq_source::SourceRange {
+                offset: 4,
+                length: 1,
+            },
+        },
         // Try without TryEnd.
         Ev::TryBegin { span: span(4) },
         Ev::CatchClauseBegin,
@@ -1709,6 +1717,115 @@ fn dead_assert_statement_reports_dead_code() {
 fn dead_statement_block_reports_outermost_row() {
     let source = "void f() { return; { var x = 1; x; } }";
     assert_eq!(dead_snippets(source), ["{ var x = 1; x; }"]);
+}
+
+// —— interval model (official flowEnd corpus, dead_code_test.dart) ———
+// One row per dead interval: the first unreachable node anchors it,
+// later unreachable nodes extend it, and the covering construct's end
+// (`flowEnd`) closes it, trimmed to the last dead statement. Blocks,
+// labels, and do-while conditions end without a covering close, so
+// their intervals run to the enclosing close. Row ends carry the
+// engine's token-level precision where the recorder has no statement
+// end (the trailing `;` of a token-anchored statement is not recorded).
+
+/// official `test_afterReturn`/`test_inElse` shape: sequential dead
+/// statements fold into ONE wide row, not one row per statement.
+#[test]
+fn dead_interval_folds_sequential_statements() {
+    let source = "void f() { return; 1; 2; }";
+    assert_eq!(dead_snippets(source), ["1; 2"]);
+}
+
+/// official `test_flowEnd_ifStatement` with a nested dead block: one
+/// outermost row spanning the whole dead compound.
+#[test]
+fn dead_interval_folds_nested_blocks() {
+    let source = "void f() { return; {1; {2;}} }";
+    assert_eq!(dead_snippets(source), ["{1; {2;}}"]);
+}
+
+/// A dead `if` statement is one row: the anchor rides the `if` keyword
+/// and the interval runs through the branch's dead tail; the branch's
+/// own close (`IfEnd`) does not cover the statement itself (official
+/// `flowEnd(ifTrue)` containment).
+#[test]
+fn dead_interval_if_statement_is_one_row() {
+    let source = "void f(bool c) { return; if (c) 1; }";
+    assert_eq!(dead_snippets(source), ["if (c) 1"]);
+}
+
+/// official `test_flowEnd_tryStatement_finally` (length-11 row): the
+/// finally block ends without a covering close, so the interval runs
+/// through the try's closing brace into the statement after it and
+/// closes at the declaration exit.
+#[test]
+fn dead_interval_try_finally_spans_through_the_close() {
+    let source =
+        "main() {\n  try {\n    1;\n  } finally {\n    2;\n    return;\n    3;\n  }\n  4;\n}\n";
+    assert_eq!(dead_snippets(source), ["3;\n  }\n  4"]);
+}
+
+/// official `test_flowEnd_nestedBlock_forStatement_updaters` (length-8
+/// row, minus the updaters row this engine does not anchor): the row
+/// ends at the inner block's closing brace — the last statement of the
+/// covering loop body — while the body block itself never extends.
+#[test]
+fn dead_interval_loop_body_trims_to_last_statement_block() {
+    let source = "void f() {\n  for (;;) {\n    {\n      return;\n      2;\n    }\n  }\n}\n";
+    assert_eq!(dead_snippets(source), ["2;\n    }"]);
+}
+
+/// official `test_doWhile`: two ranges in one close — the `while (c);`
+/// part, then the tail from the first dead statement after the
+/// do-while (official `parent is DoStatement`, :292-308).
+#[test]
+fn dead_interval_do_while_splits_two_ranges() {
+    let source = "void f(bool c) { do { print(c); return; } while (c); print('2'); }";
+    assert_eq!(dead_snippets(source), ["} while (c);", "print"]);
+}
+
+/// official `test_doWhile_break`: a break exiting the do-while makes the
+/// tail reachable, so only the `while (c);` part reports.
+#[test]
+fn dead_interval_do_while_break_drops_the_tail() {
+    let source = "void f(bool c) { do { if (c) break; return; } while (c); 1; }";
+    assert_eq!(dead_snippets(source), ["} while (c);"]);
+}
+
+/// One window per switch member: each case group's close emits its own
+/// row and the next group starts fresh (official
+/// `handleMergedStatementCase`'s `flowEnd` on the member).
+#[test]
+fn dead_interval_switch_members_report_per_group() {
+    let source = "void f(int i) { switch (i) { case 1: return; 2; case 3: return; 4; } }";
+    assert_eq!(dead_snippets(source), ["2", "4"]);
+}
+
+/// official `test_doWhile_break_outerLabel` shape: a labeled statement
+/// ends without a covering close, so the interval anchored inside runs
+/// through the label's closing brace to the enclosing close. The
+/// recorded anchor is the statement past the labels (official
+/// `beginLabeledStatement(next, …)`), so the `L: ` prefix sits outside
+/// the row.
+#[test]
+fn dead_interval_labeled_statement_runs_to_the_tail() {
+    let source = "void f(bool c) { return; L: while (c) { continue L; } 1; }";
+    assert_eq!(dead_snippets(source), ["while (c) { continue L; } 1"]);
+}
+
+/// A wholly dead branch block anchors at the block itself — official
+/// `_firstDead` takes the outermost unreachable node, so the row spans
+/// the full block extent (`flowEnd(ifTrue)` with `node ==
+/// firstDeadNode`: no trim) — and the statement after the if stays
+/// live. The branch is provably dead through the cast pattern's
+/// promotion (`x` is `int`, so `x is! int` cannot hold — the same
+/// stimulus as `case_head_state_carries_into_the_body`; a bare
+/// `num n` / `n is! int` is NOT dead, `num` includes `double`).
+#[test]
+fn dead_interval_dead_branch_block_reports_full_extent() {
+    let source =
+        "void f(Object? o) { switch (o) { case var x as int: if (x is! int) { return; 1; } x; } }";
+    assert_eq!(dead_snippets(source), ["{ return; 1; }"]);
 }
 
 /// A live try/finally block produces no fact: its `begin_block` fires with

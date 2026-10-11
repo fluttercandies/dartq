@@ -38,7 +38,7 @@ impl<'o> Interp<'o> {
                     }
                 }
                 let _ = &self.pattern;
-                let cond = self.exprs.pop().expect("if condition");
+                let cond = self.pop_value();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::If {
                     branch: if_false,
@@ -47,6 +47,9 @@ impl<'o> Interp<'o> {
                 self.current = if_true;
             }
             Ev::ElseBegin => {
+                // The then branch's end covers its intervals (official
+                // `handle_ifStatement_thenEnd`'s `flowEnd`).
+                self.flow_end(crate::interp::Covered::Strict);
                 let after_then = self.current.clone();
                 if let Some(Frame::If {
                     branch,
@@ -58,9 +61,11 @@ impl<'o> Interp<'o> {
                 }
             }
             Ev::IfEnd { has_else } => {
-                let frame = self.stack.pop().expect("if frame");
-                let Frame::If { branch, after_then } = frame else {
-                    self.stack.push(frame);
+                // The last branch's end covers its intervals (official
+                // `handle_ifStatement_thenEnd` without an else, else
+                // `handle_ifStatement_elseEnd`).
+                self.flow_end(crate::interp::Covered::Strict);
+                let Some(Frame::If { branch, after_then }) = self.stack.pop() else {
                     return true;
                 };
                 let then_state = if *has_else { after_then } else { None };
@@ -107,7 +112,12 @@ impl<'o> Interp<'o> {
                 }
                 self.current = if_true;
             }
-            Ev::WhileEnd => self.loop_exit(false),
+            Ev::WhileEnd => {
+                // The loop statement's end covers body intervals (official
+                // `visitWhileStatement`'s `flowEnd` on the body).
+                self.flow_end(crate::interp::Covered::Strict);
+                self.loop_exit(false)
+            }
             Ev::DoBegin { span } => {
                 self.dead_code(*span);
                 if self.collecting() {
@@ -141,8 +151,12 @@ impl<'o> Interp<'o> {
                     _ => None,
                 };
                 self.current = self.join(Some(self.current.clone()), continue_model);
+                // A dead back edge makes the condition the first dead node
+                // (official: `parent is DoStatement` anchors the two-range
+                // split); the `while` part arrives with `DoEnd`.
+                self.dead_do_condition();
             }
-            Ev::DoEnd => {
+            Ev::DoEnd { while_range } => {
                 if self.collecting() {
                     return true;
                 }
@@ -155,6 +169,16 @@ impl<'o> Interp<'o> {
                     *cond_false = Some(if_false);
                 }
                 self.loop_exit(false);
+                // Attach the `while (c);` part to the interval the do's
+                // back edge opened, and drop the tail row when a break
+                // makes the code after the do-while reachable (official
+                // `hasBreakStatement`).
+                let tail_reachable = self.reachable();
+                if let Some(window) = &mut self.dead {
+                    if window.awaiting_split() {
+                        window.attach_split(*while_range, tail_reachable);
+                    }
+                }
             }
             Ev::ReturnBegin { span } => self.dead_code(*span),
             Ev::ReturnEnd { has_expression } => {
@@ -222,12 +246,18 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                let frame = self.stack.pop().expect("label frame");
-                if let Frame::Labeled { break_model, .. } = frame {
-                    let joined = self.join(break_model, Some(self.current.clone()));
-                    self.current = joined;
-                } else {
-                    self.stack.push(frame);
+                match self.stack.pop() {
+                    Some(Frame::Labeled { break_model, .. }) => {
+                        let joined = self.join(break_model, Some(self.current.clone()));
+                        self.current = joined;
+                    }
+                    other => {
+                        // A frame-less close (unbalanced recovery buffer) is
+                        // a no-op; a mismatched frame goes back.
+                        if let Some(frame) = other {
+                            self.stack.push(frame);
+                        }
+                    }
                 }
             }
             Ev::TryBegin { span } => {
@@ -266,6 +296,10 @@ impl<'o> Interp<'o> {
                 });
             }
             Ev::CatchClauseBegin => {
+                // The try body's end covers its intervals (official
+                // `visitTryStatement`'s `flowEnd` on the body, fired before
+                // the catch clauses run).
+                self.flow_end(crate::interp::Covered::Strict);
                 self.scopes.push(Scope::new());
                 if self.collecting() {
                     return true;
@@ -315,6 +349,9 @@ impl<'o> Interp<'o> {
                 self.current = entry;
             }
             Ev::CatchClauseEnd => {
+                // The catch body's end covers its intervals (official
+                // `flowEnd` on the catch clause body, before the exit join).
+                self.flow_end(crate::interp::Covered::Strict);
                 if self.collecting() {
                     return true;
                 }
@@ -331,21 +368,23 @@ impl<'o> Interp<'o> {
                 self.scopes.pop();
             }
             Ev::FinallyBlock => {
+                // The try body's end covers its intervals (official
+                // `visitTryStatement`'s `flowEnd` on the body); the finally
+                // block itself ends without a covering close.
+                self.flow_end(crate::interp::Covered::Strict);
                 if self.collecting() {
                     return true;
                 }
                 // Close the catch context and open the finally context
                 // (official `tryFinallyStatement_finallyBegin`).
-                let frame = self.stack.pop().expect("try frame");
-                let Frame::TryCatch {
+                let Some(Frame::TryCatch {
                     pre,
                     wrote,
                     captured,
                     after,
                     ..
-                } = frame
+                }) = self.stack.pop()
                 else {
-                    self.stack.push(frame);
                     return true;
                 };
                 // The try-catch exit: body normal exit joined with every
@@ -370,25 +409,41 @@ impl<'o> Interp<'o> {
                     return true;
                 }
                 if *has_finally {
-                    let frame = self.stack.pop().expect("finally frame");
-                    if let Frame::TryFinally {
+                    if let Some(Frame::TryFinally {
                         before_finally,
                         after_try,
                         ..
-                    } = frame
+                    }) = self.stack.pop()
                     {
-                        let after_try = after_try.expect("after try");
-                        let before_finally = before_finally.expect("before finally");
-                        self.current =
-                            attach_finally(self, after_try, before_finally, self.current.clone());
+                        // A frame missing its accumulated states (unbalanced
+                        // recovery buffer) leaves the current state alone.
+                        if let (Some(after_try), Some(before_finally)) = (after_try, before_finally)
+                        {
+                            self.current = attach_finally(
+                                self,
+                                after_try,
+                                before_finally,
+                                self.current.clone(),
+                            );
+                        }
                     }
                 } else {
-                    let frame = self.stack.pop().expect("try frame");
-                    if let Frame::TryCatch { after, .. } = frame {
-                        let joined = self.join(after, Some(self.current.clone()));
-                        self.current = joined.unsplit(&mut self.reach);
-                    } else {
-                        self.stack.push(frame);
+                    // No finally: the try body's end covers its intervals
+                    // when no catch clause ran (official `flowEnd` on the
+                    // body); catch windows closed at their own ends.
+                    self.flow_end(crate::interp::Covered::Strict);
+                    match self.stack.pop() {
+                        Some(Frame::TryCatch { after, .. }) => {
+                            let joined = self.join(after, Some(self.current.clone()));
+                            self.current = joined.unsplit(&mut self.reach);
+                        }
+                        other => {
+                            // A frame-less close (unbalanced recovery buffer)
+                            // is a no-op; a mismatched frame goes back.
+                            if let Some(frame) = other {
+                                self.stack.push(frame);
+                            }
+                        }
                     }
                 }
             }
@@ -624,13 +679,11 @@ impl<'o> Interp<'o> {
                 if self.collecting() {
                     return true;
                 }
-                let frame = self.stack.pop().expect("assert frame");
-                let Frame::Assert {
+                let Some(Frame::Assert {
                     previous,
                     exprs_base,
-                } = frame
+                }) = self.stack.pop()
                 else {
-                    self.stack.push(frame);
                     return true;
                 };
                 // The first expression since begin is the condition; the
@@ -715,9 +768,37 @@ impl<'o> Interp<'o> {
                     scopes_base: self.scopes.len() - 1,
                 });
             }
-            Ev::EndBlock => {
+            Ev::EndBlock { end } => {
                 if let Some(Frame::Block { scopes_base }) = self.stack.last() {
                     let scopes_base = *scopes_base;
+                    // A statement block's own end trims the interval to the
+                    // official last-statement end; a construct's body block
+                    // (loop/try/catch/branch/switch — the parent frame
+                    // below) is the covering node itself and never extends.
+                    // The stack can be shallow here — the outermost
+                    // executable records no Exec frame — so the parent is
+                    // looked up guarded; a missing parent is a statement
+                    // block.
+                    let parent = self
+                        .stack
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|index| self.stack.get(index));
+                    let is_body_block = matches!(
+                        parent,
+                        Some(
+                            Frame::While { .. }
+                                | Frame::TryCatch { .. }
+                                | Frame::TryFinally { .. }
+                                | Frame::If { .. }
+                                | Frame::Switch { .. }
+                        )
+                    );
+                    if !is_body_block {
+                        if let Some(window) = &mut self.dead {
+                            window.extend(*end);
+                        }
+                    }
                     self.stack.pop();
                     self.scopes.truncate(scopes_base);
                 }
@@ -840,6 +921,10 @@ impl<'o> Interp<'o> {
         if !body_open {
             return;
         }
+        // The case group's end covers its body intervals (official
+        // `handleMergedStatementCase`'s `flowEnd` on the member): one
+        // window per member, never across groups.
+        self.flow_end(crate::interp::Covered::Body);
         let reachable = self.reachable();
         if reachable {
             let exit = self.current.clone();

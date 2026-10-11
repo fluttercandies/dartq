@@ -281,6 +281,106 @@ impl Expr {
     }
 }
 
+/// One open dead-code interval (official `_DeadCodeStart` plus the
+/// emission state its covering `flowEnd` needs).
+#[derive(Clone, Copy)]
+pub(crate) struct DeadWindow {
+    /// Replay-frame depth when the interval opened: a construct-end close
+    /// covers the anchor exactly when the anchor's frames are all still on
+    /// the stack (official `_containsFirstDeadNode`).
+    depth: usize,
+    /// The first dead node's first token: the row's anchor.
+    anchor: TokenSpan,
+    /// End of the interval so far: the furthest dead statement end seen
+    /// (the official trim to the covering block's last statement — the
+    /// last statement of a dead tail is its furthest dead statement).
+    end: u32,
+    /// Do-while split (official `parent is DoStatement`): the interval's
+    /// anchor is a do-while condition whose back edge is dead, so the
+    /// close emits the `while (c);` part first and the tail second.
+    split: Option<SourceRange>,
+    /// The interval opened on a do-while back edge and still waits for
+    /// the statement's `while` part (`DoEnd` attaches it).
+    awaiting: bool,
+    /// The split's second row starts at the first dead statement after
+    /// the do-while (official `semicolon.next`).
+    split_start: Option<u32>,
+    /// The split's second row is suppressed: a break exits the do-while,
+    /// so the code after it is reachable (official `hasBreakStatement`).
+    split_broken: bool,
+}
+
+impl DeadWindow {
+    /// Opens the interval at the first dead node.
+    fn at(depth: usize, anchor: TokenSpan) -> Self {
+        Self {
+            depth,
+            anchor,
+            end: anchor.range.end(),
+            split: None,
+            awaiting: false,
+            split_start: None,
+            split_broken: false,
+        }
+    }
+
+    /// Opens the interval for a do-while condition (the anchor arrives
+    /// with the statement's `while` part at `DoEnd`).
+    fn awaiting_do(depth: usize) -> Self {
+        Self {
+            depth,
+            anchor: TokenSpan {
+                id: 0,
+                range: SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+            },
+            end: 0,
+            split: None,
+            awaiting: true,
+            split_start: None,
+            split_broken: false,
+        }
+    }
+
+    /// Whether the interval waits for its do-while's `while` part.
+    pub(crate) fn awaiting_split(&self) -> bool {
+        self.awaiting
+    }
+
+    /// Grows the interval's end to a later dead statement's end (the
+    /// official trim to the covering block's last statement).
+    pub(crate) fn extend(&mut self, end: u32) {
+        if end > self.end {
+            self.end = end;
+        }
+    }
+
+    /// Attaches the do-while's `while (c);` part and records whether a
+    /// break makes the post-do tail reachable (official
+    /// `hasBreakStatement`).
+    pub(crate) fn attach_split(&mut self, while_part: SourceRange, tail_reachable: bool) {
+        self.split = Some(while_part);
+        self.awaiting = false;
+        self.split_broken = tail_reachable;
+    }
+}
+
+/// How a construct end covers an open dead-code interval
+/// (official `_containsFirstDeadNode`).
+#[derive(Clone, Copy)]
+pub(crate) enum Covered {
+    /// The anchor must sit strictly inside the construct that ends here
+    /// (branch, loop body, try/catch body).
+    Strict,
+    /// An anchor at the closing depth is covered too (a switch case body
+    /// keeps no frame of its own).
+    Body,
+    /// The declaration exit: covers everything.
+    Exec,
+}
+
 /// The interpreter over one executable's event buffer.
 pub(crate) struct Interp<'o> {
     pub(crate) ops: &'o dyn TypeOps,
@@ -324,15 +424,14 @@ pub(crate) struct Interp<'o> {
     pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
     pub(crate) anywhere: Effects,
-    /// The replay-frame depth a dead-code row was last emitted at.
-    /// Constructs nested inside the reported statement run strictly
-    /// deeper, so their rows are implied — official dead_code folds a
-    /// dead compound into one diagnostic and does not descend
-    /// (`dead_code_verifier.dart` `_firstDead`). Sequential statements
-    /// at the reporting depth are separate dead statements and each
-    /// report (official dead_code per statement); any reachable
-    /// statement resets the memory.
-    dead_region: Option<usize>,
+    /// The open dead-code interval (official
+    /// `NullSafetyDeadCodeVerifier._firstDead`): the first unreachable
+    /// node anchors one row; every later unreachable node continues the
+    /// same interval until a covering construct ends (`flowEnd`), and the
+    /// row then spans the anchor through the last dead statement.
+    /// Blocks, labels, and do-while conditions end without a covering
+    /// close, so their intervals run out to the enclosing construct.
+    pub(crate) dead: Option<DeadWindow>,
 
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
@@ -346,7 +445,7 @@ struct Snapshot {
     scopes_len: usize,
     vars_len: usize,
     facts_len: usize,
-    dead_region: Option<usize>,
+    dead: Option<DeadWindow>,
 }
 
 impl<'o> Interp<'o> {
@@ -380,7 +479,7 @@ impl<'o> Interp<'o> {
             as_base: 0,
             for_header_depth: 0,
             anywhere: Effects::default(),
-            dead_region: None,
+            dead: None,
             collect: None,
             snapshot: None,
         }
@@ -399,6 +498,12 @@ impl<'o> Interp<'o> {
                 Control::Jump(to) => i = to,
             }
         }
+        // The declaration exit for the OUTERMOST executable: the recorder
+        // records no trailing ExecEnd for it (the pipeline runs from its
+        // own `exec_end`), so the close covering every interval still open
+        // fires at the end of the buffer. Nested executables closed their
+        // windows at their recorded ExecEnd.
+        self.flow_end(Covered::Exec);
     }
 
     // —— variables ——————————————————————————————————————————————————————
@@ -441,7 +546,13 @@ impl<'o> Interp<'o> {
     /// writes.
     pub(crate) fn write_var(&mut self, var: u32, written: Ty, promote_to_interest: bool) {
         self.record_write(var);
-        let declared = self.vars[var as usize].ty;
+        // A stale id (a collect rollback can strand effect-set entries and
+        // scope bindings past their variable) degrades to the unknown
+        // declared type; the state write itself is model-bounds-safe.
+        let declared = self
+            .vars
+            .get(var as usize)
+            .map_or(Ty::UNKNOWN, |meta| meta.ty);
         self.current = self.current.clone().write(
             self.ops,
             &mut self.lists,
@@ -528,26 +639,106 @@ impl<'o> Interp<'o> {
         }
     }
 
+    /// The first unreachable node opens the dead-code interval (official
+    /// `_visitNode`): every later unreachable node continues the same
+    /// interval — no row of its own — and the interval's end tracks the
+    /// furthest dead statement so the close can trim the row to the last
+    /// one (official `Block.statements.last`). Reachable nodes keep the
+    /// interval open: only a covering close retires it.
     pub(crate) fn dead_code(&mut self, span: TokenSpan) {
         if self.reachable() {
-            self.dead_region = None;
             return;
         }
-        // Inside the statement a row was already reported for: implied.
-        if self
-            .dead_region
-            .is_some_and(|depth| self.stack.len() > depth)
-        {
+        let end = span.range.end();
+        if let Some(window) = &mut self.dead {
+            if end > window.end {
+                window.end = end;
+            }
+            if window.split.is_some() && window.split_start.is_none() {
+                window.split_start = Some(span.range.offset);
+            }
             return;
         }
-        self.dead_region = Some(self.stack.len());
-        self.emit(FlowFact::DeadCode { span });
+        self.dead = Some(DeadWindow::at(self.stack.len(), span));
     }
 
-    /// Reads of definitely-unassigned locals (official `isUnassigned`).
+    /// Opens the interval for a dead do-while back edge (official: the
+    /// do-while's condition is the first dead node and its parent is the
+    /// `DoStatement`, so the close splits into the `while` part and the
+    /// tail). Only when no interval is open: an earlier anchor continues
+    /// to own the reporting.
+    pub(crate) fn dead_do_condition(&mut self) {
+        if self.dead.is_none() && !self.reachable() {
+            self.dead = Some(DeadWindow::awaiting_do(self.stack.len()));
+        }
+    }
+
+    /// Closes the dead-code interval at a construct end (official
+    /// `flowEnd`). `Covered::Strict` closes only when the anchor sits
+    /// strictly inside the construct that ends here; `Covered::Body` also
+    /// accepts an anchor at the closing depth (a switch case body has no
+    /// frame of its own); `Covered::Exec` closes unconditionally (the
+    /// declaration exit covers everything, trimmed to the body's last
+    /// statement). A do-while split emits the `while (c);` part first and
+    /// the tail from the first dead statement after the do-while, the
+    /// tail dropped when a break makes it reachable.
+    pub(crate) fn flow_end(&mut self, covered: Covered) {
+        let Some(window) = self.dead else {
+            return;
+        };
+        let covers = match covered {
+            Covered::Strict => window.depth > self.stack.len(),
+            Covered::Body => window.depth >= self.stack.len(),
+            Covered::Exec => true,
+        };
+        if !covers {
+            return;
+        }
+        if let Some(while_part) = window.split {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: window.anchor.id,
+                    range: while_part,
+                },
+            });
+            if !window.split_broken {
+                if let Some(start) = window.split_start {
+                    if window.end > start {
+                        self.emit(FlowFact::DeadCode {
+                            span: TokenSpan {
+                                id: window.anchor.id,
+                                range: SourceRange {
+                                    offset: start,
+                                    length: window.end - start,
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+        } else if window.end > window.anchor.range.offset {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: window.anchor.id,
+                    range: SourceRange {
+                        offset: window.anchor.range.offset,
+                        length: window.end - window.anchor.range.offset,
+                    },
+                },
+            });
+        }
+        self.dead = None;
+    }
+
+    /// Reads of definitely-unassigned locals (official `isUnassigned`). A
+    /// stale id (a scope binding stranded past its variable by a collect
+    /// rollback) emits no fact: the fact's metadata would name the wrong
+    /// variable.
     pub(crate) fn check_unassigned_read(&mut self, span: TokenSpan, var: u32) {
+        let Some(meta) = self.vars.get(var as usize) else {
+            return;
+        };
         if self.reachable() && !self.current.model(var).assigned {
-            let meta = &self.vars[var as usize];
             self.emit(FlowFact::UnassignedRead {
                 span,
                 is_late: meta.late,
@@ -578,7 +769,7 @@ impl<'o> Interp<'o> {
             scopes_len: self.scopes.len(),
             vars_len: self.vars.len(),
             facts_len: self.facts.len(),
-            dead_region: self.dead_region,
+            dead: self.dead,
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
@@ -593,15 +784,20 @@ impl<'o> Interp<'o> {
             }
         }
         let frames = self.collect.take().unwrap_or_default();
-        // Roll back interpreter state.
-        let s = self.snapshot.take().expect("collect snapshot");
+        // Roll back interpreter state. The snapshot is the rollback's
+        // source of truth; a missing one (unbalanced nesting) still
+        // restores the enclosing collect before returning.
+        let Some(s) = self.snapshot.take() else {
+            self.collect = outer;
+            return Effects::default();
+        };
         self.exprs.truncate(s.exprs_len);
         self.stack.truncate(s.frames_len);
         self.scopes.truncate(s.scopes_len);
         self.vars.truncate(s.vars_len);
         self.facts.truncate(s.facts_len);
         self.current = s.current;
-        self.dead_region = s.dead_region;
+        self.dead = s.dead;
         self.collect = outer;
         frames.into_iter().next().unwrap_or_default()
     }
@@ -663,12 +859,12 @@ impl<'o> Interp<'o> {
     // —— conservative-join plumbing —————————————————————————————————————
 
     /// The final variables among `written` (promotions on finals survive
-    /// conservative joins).
+    /// conservative joins). Stale ids filter out with the rest.
     pub(crate) fn finals_of(&self, written: &FxHashSet<u32>) -> FxHashSet<u32> {
         written
             .iter()
             .copied()
-            .filter(|&var| self.vars[var as usize].is_final)
+            .filter(|&var| self.vars.get(var as usize).is_some_and(|m| m.is_final))
             .collect()
     }
 
@@ -913,8 +1109,17 @@ impl<'o> Interp<'o> {
     }
 
     fn exec_end(&mut self, is_expr: bool) {
+        // The executable's end covers only the intervals anchored inside
+        // it (official `flowEnd` on the declaration:
+        // `_containsFirstDeadNode` fails for an anchor in the enclosing
+        // scope, which keeps running to its own close).
+        self.flow_end(Covered::Body);
         let collecting = self.collect.is_some();
-        let frame = self.stack.pop().expect("exec frame");
+        let Some(frame) = self.stack.pop() else {
+            // A frame-less close (unbalanced recovery buffer): nothing to
+            // close, no value to net.
+            return;
+        };
         let Frame::Exec {
             is_closure,
             scopes_base,
@@ -1069,6 +1274,9 @@ impl<'o> Interp<'o> {
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
         self.exprs.truncate(base);
         if !collection {
+            // The loop statement's end covers body intervals (official
+            // `visitForStatement`'s `flowEnd` on the body).
+            self.flow_end(Covered::Strict);
             // Exit: condition-false joined with breaks (no back-edge join).
             self.pop_loop_and_exit(frame);
         }
@@ -1267,6 +1475,9 @@ impl<'o> Interp<'o> {
                 Control::Continue
             }
             Ev::ForInEnd => {
+                // The loop statement's end covers body intervals (official
+                // `forEach_end`'s covering close).
+                self.flow_end(Covered::Strict);
                 self.loop_exit(false);
                 Control::Continue
             }
@@ -1324,7 +1535,7 @@ fn build_match_map(events: &[Ev]) -> Vec<u32> {
                 }
             }
             DoBegin { .. } => do_stack.push(i),
-            DoEnd => {
+            DoEnd { .. } => {
                 if let Some(begin) = do_stack.pop() {
                     match_of[begin] = i as u32;
                     match_of[i] = begin as u32;

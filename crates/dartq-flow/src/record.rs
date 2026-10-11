@@ -42,6 +42,11 @@ pub struct Flow<'t> {
     buffer: Option<Vec<Ev>>,
     /// Open `Ev::Block` event indices, for end-of-block span widening.
     block_events: Vec<usize>,
+    /// The do-while body's last token: distinguishes the block-body
+    /// `while`-part start (the closing brace) from the keyword start.
+    do_body_end: Option<Token>,
+    /// The open do-while body is a block (its `{` opened the body).
+    do_body_is_block: bool,
     /// Executable nesting depth inside the active recording.
     exec_depth: usize,
     facts: Vec<FlowFact>,
@@ -57,6 +62,8 @@ impl<'t> Flow<'t> {
             pending_labels: Vec::new(),
             buffer: None,
             block_events: Vec::new(),
+            do_body_end: None,
+            do_body_is_block: false,
             exec_depth: 0,
             facts: Vec::new(),
         }
@@ -309,6 +316,13 @@ impl<'t> ParserListener for Flow<'t> {
     // —— blocks and asserts ——————————————————————————————————————————————
 
     fn begin_block(&mut self, token: Token, kind: BlockKind) {
+        // The finally marker rides the finally block's BEGIN (official
+        // `tryFinallyStatement_finallyBegin`): the finally context must be
+        // open before the body's events replay. The parser's own
+        // `handle_finally_block` fires only after the block has parsed.
+        if matches!(kind, BlockKind::FinallyClause) {
+            self.record(Ev::FinallyBlock);
+        }
         // Narrow to the recorded subset: only plain statement blocks carry
         // the dead-code check; catch blocks still scope their locals; try,
         // finally, and switch blocks (and function bodies, which frame
@@ -340,7 +354,14 @@ impl<'t> ParserListener for Flow<'t> {
                 };
             }
         }
-        self.record(Ev::EndBlock);
+        // Inside a do-while block body this is the body's own close (the
+        // last-wins order makes inner blocks yield to it).
+        if self.do_body_is_block {
+            self.do_body_end = Some(end);
+        }
+        self.record(Ev::EndBlock {
+            end: end.range.end(),
+        });
     }
 
     fn begin_assert(&mut self, token: Token, _kind: AssertKind) {
@@ -530,16 +551,36 @@ impl<'t> ParserListener for Flow<'t> {
         self.record(Ev::DoBegin { span: token });
     }
 
-    fn begin_do_while_statement_body(&mut self, _token: Token) {
+    fn begin_do_while_statement_body(&mut self, token: Token) {
         self.record(Ev::DoBodyBegin);
+        // The official `while` part starts at a block body's closing brace
+        // (dead_code_verifier.dart:292-308); a non-block body starts at
+        // the `while` keyword itself. The hook's own token is the body's
+        // first token — a `{` means the body is the block whose `}` (the
+        // last `end_block` inside the body) carries the part's start.
+        self.do_body_is_block = self.kind(token) == Some(dartq_scanner::TokenKind::OpenCurly);
+        self.do_body_end = None;
     }
 
     fn end_do_while_statement_body(&mut self, _end: Token) {
+        // The hook's token is the one past the body (`while`), so the
+        // brace comes from `end_block` above.
         self.record(Ev::DoBodyEnd);
     }
 
-    fn end_do_while_statement(&mut self, _token: Token, _while_kw: Token, _end: Token) {
-        self.record(Ev::DoEnd);
+    fn end_do_while_statement(&mut self, _token: Token, while_kw: Token, end: Token) {
+        let while_start = match self.do_body_end.take() {
+            Some(body_end) if self.kind(body_end) == Some(dartq_scanner::TokenKind::CloseCurly) => {
+                body_end.range.offset
+            }
+            _ => while_kw.range.offset,
+        };
+        self.record(Ev::DoEnd {
+            while_range: dartq_source::SourceRange {
+                offset: while_start,
+                length: end.range.end() - while_start,
+            },
+        });
     }
 
     fn begin_for_statement(&mut self, token: Token) {
@@ -685,7 +726,8 @@ impl<'t> ParserListener for Flow<'t> {
     }
 
     fn handle_finally_block(&mut self, _finally_kw: Token) {
-        self.record(Ev::FinallyBlock);
+        // Already recorded at the finally block's begin (official
+        // `tryFinallyStatement_finallyBegin` position — before the body).
     }
 
     fn end_try_statement(

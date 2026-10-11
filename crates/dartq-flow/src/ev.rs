@@ -68,7 +68,13 @@ pub enum Ev {
         kind: BlockKind,
         span: TokenSpan,
     },
-    EndBlock,
+    /// The block's end offset: a statement block's end trims a dead-code
+    /// interval to the official last-statement end (the covering
+    /// construct's own body block never extends — its parent frame says
+    /// which).
+    EndBlock {
+        end: u32,
+    },
 
     // —— types ——
     Type {
@@ -105,7 +111,13 @@ pub enum Ev {
     },
     DoBodyBegin,
     DoBodyEnd,
-    DoEnd,
+    /// The `while (c);` part's range (officially the do-while has no
+    /// `flowEnd` of its own: a dead back edge anchors the interval on the
+    /// condition, and the part rides the event so the covering close can
+    /// emit the official two-range split).
+    DoEnd {
+        while_range: dartq_source::SourceRange,
+    },
     ForBegin {
         span: TokenSpan,
     },
