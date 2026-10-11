@@ -23,7 +23,7 @@
 //! builds stop on the array bounds check.
 //!
 //! The read side is equally strict. An out-of-range `lib` in
-//! [`RevImportGraph::importers_of`] or [`RevImportGraph::has_importers`]
+//! [`RevImportGraph::importers_of`]
 //! panics too — a lenient empty slice would read as "nothing imports it"
 //! and silently misstate impact, which is exactly the caller bug the
 //! contract exists to catch.
@@ -58,6 +58,10 @@ impl RevImportGraph {
     /// (debug builds assert first, naming the offending target; release
     /// builds stop on the array bounds check) — the CSR never drops or
     /// wraps an edge.
+    ///
+    /// Panics when the edge count exceeds [`u32::MAX`] — like the library
+    /// cap, a workspace that size is a program bug to surface, not
+    /// truncate (the counters are checked adds, never wrapping).
     #[must_use]
     pub fn build<'a>(library_count: usize, imports_of: impl Fn(u32) -> &'a [u32]) -> Self {
         let count = u32::try_from(library_count).expect("more than u32::MAX libraries");
@@ -68,11 +72,18 @@ impl RevImportGraph {
                     target < count,
                     "import target {target} out of range 0..{count}"
                 );
-                offsets[target as usize + 1] += 1;
+                let slot = &mut offsets[target as usize + 1];
+                *slot = slot
+                    .checked_add(1)
+                    .expect("more than u32::MAX import edges");
             }
         }
         for i in 1..offsets.len() {
-            offsets[i] += offsets[i - 1];
+            let prev = offsets[i - 1];
+            let slot = &mut offsets[i];
+            *slot = slot
+                .checked_add(prev)
+                .expect("more than u32::MAX import edges");
         }
         let mut importers = vec![0u32; offsets[library_count] as usize];
         let mut fill: Vec<u32> = offsets[..library_count].to_vec();
@@ -111,22 +122,6 @@ impl RevImportGraph {
         );
         &self.importers[self.offsets[lib] as usize..self.offsets[lib + 1] as usize]
     }
-
-    /// Whether anything imports `lib` — the row probe without the slice.
-    ///
-    /// # Panics
-    ///
-    /// Same range contract as [`Self::importers_of`]: out-of-range `lib`
-    /// is a caller bug and panics.
-    #[must_use]
-    pub fn has_importers(&self, lib: usize) -> bool {
-        debug_assert!(
-            lib < self.library_count(),
-            "library {lib} out of range 0..{}",
-            self.library_count()
-        );
-        self.offsets[lib] != self.offsets[lib + 1]
-    }
 }
 
 #[cfg(test)]
@@ -159,10 +154,6 @@ mod tests {
         assert_eq!(g.importers_of(1), &[2]);
         assert!(g.importers_of(2).is_empty());
         assert!(g.importers_of(3).is_empty());
-        assert!(g.has_importers(0));
-        assert!(g.has_importers(1));
-        assert!(!g.has_importers(2));
-        assert!(!g.has_importers(3));
     }
 
     /// The empty graph: zero libraries — a single `[0]` offset, no edges.
@@ -183,16 +174,13 @@ mod tests {
         let _ = g.importers_of(0);
     }
 
-    /// The single-edge graph: `b=1` imports `a=0` — exactly one row entry,
-    /// and the probe agrees.
+    /// The single-edge graph: `b=1` imports `a=0` — exactly one row entry.
     #[test]
     fn single_edge_graph_answers_one_importer() {
         let imports: [&[u32]; 2] = [&[], &[0]];
         let g = RevImportGraph::build(2, |lib| imports[lib as usize]);
         assert_eq!(g.importers_of(0), &[1]);
         assert!(g.importers_of(1).is_empty());
-        assert!(g.has_importers(0));
-        assert!(!g.has_importers(1));
     }
 
     /// An out-of-range read is a caller bug that panics with the id named
@@ -204,14 +192,6 @@ mod tests {
         let imports: [&[u32]; 2] = [&[], &[0]];
         let g = RevImportGraph::build(2, |lib| imports[lib as usize]);
         let _ = g.importers_of(2);
-    }
-
-    #[test]
-    #[should_panic(expected = "out of range")]
-    fn out_of_range_has_importers_panics() {
-        let imports: [&[u32]; 2] = [&[], &[0]];
-        let g = RevImportGraph::build(2, |lib| imports[lib as usize]);
-        let _ = g.has_importers(9);
     }
 
     /// A build-time edge beyond the id space is a caller bug that panics
