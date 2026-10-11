@@ -1167,15 +1167,17 @@ struct Engine<'a> {
     /// useless-read cancellations and the receiver merge (the row stack
     /// shifts, so rows carry no back-pointer).
     local_hits: FxHashMap<u32, u32>,
-    /// The open pattern-variable-declaration group window (a locals-stack
-    /// base): every pattern-declared variable since the base joins the
-    /// group, and one used member spares the whole group (official
+    /// The open pattern-variable-declaration group window: the group id
+    /// every pattern-declared variable joins until the window closes (one
+    /// used member spares the whole group; official
     /// `visitPatternVariableDeclaration`, unused_local_elements_verifier.
     /// dart:856-884). The window opens at the first declared variable after
-    /// the previous statement boundary and closes at
-    /// `handle_pattern_variable_declaration_statement` — case-pattern
-    /// variables keep `group = None` and report independently.
-    pattern_group_mark: Option<usize>,
+    /// a boundary and closes at any statement boundary, case head,
+    /// intervening non-pattern local, or frame pop — a group can never span
+    /// frames, so the id never outlives the locals that hold its members.
+    /// (An earlier index-keyed window survived frame pops and read a
+    /// truncated locals slot.)
+    pattern_group_open: Option<u32>,
     /// The pattern-group sequence (group ids).
     pattern_group_seq: u32,
     /// The parameters of the executable declaration in flight attach to
@@ -1398,7 +1400,7 @@ impl<'a> Engine<'a> {
             locals: Vec::new(),
             frame_local_marks: Vec::new(),
             local_hits: FxHashMap::default(),
-            pattern_group_mark: None,
+            pattern_group_open: None,
             pattern_group_seq: 0,
             open_exec_site: None,
             decl_sites: Vec::new(),
@@ -1579,6 +1581,9 @@ impl<'a> Engine<'a> {
     /// unused_local_elements_verifier.dart:1259-1280); the emissions stage
     /// for the end-of-pass source-order merge.
     fn close_frame_locals(&mut self, _frame: Frame) {
+        // The pop can remove the open window's members: a group never spans
+        // frames, so the window dies with its frame.
+        self.pattern_group_open = None;
         let mark = self.frame_local_marks.pop().unwrap_or(self.locals.len());
         if mark >= self.locals.len() {
             self.locals.truncate(mark);
@@ -2488,7 +2493,7 @@ impl<'a> Engine<'a> {
     fn check_statement_use(&mut self, begin: Token, end: Token) {
         // The statement boundary closes the pattern-declaration window: a
         // later group is its own all-or-nothing set.
-        self.pattern_group_mark = None;
+        self.pattern_group_open = None;
         let w0 = begin.range.offset;
         let w1 = end.range.end();
         // The window's single non-value row (value rows are literals,
@@ -2797,22 +2802,25 @@ impl<'a> Engine<'a> {
     fn add_tracked_local(&mut self, name: StringId, range: SourceRange, kind: LocalKind) {
         self.add_local(name);
         // A pattern-variable-declaration window claims the pattern-declared
-        // variables since its last statement boundary: the first opens it,
-        // the rest join its group (one used member spares all).
+        // variables of one declaration: the first opens it, the rest join
+        // its group (one used member spares all). The window is the GROUP
+        // ID, never a locals index — an index outlived frame pops and read
+        // a truncated slot.
         let group = if matches!(kind, LocalKind::PatternVariable) {
-            match self.pattern_group_mark {
-                Some(base) => self.locals[base].group,
+            match self.pattern_group_open {
+                Some(group) => Some(group),
                 None => {
                     self.pattern_group_seq += 1;
+                    self.pattern_group_open = Some(self.pattern_group_seq);
                     Some(self.pattern_group_seq)
                 }
             }
         } else {
+            // A non-pattern declaration closes the window: a group spans
+            // consecutive pattern-declared variables only.
+            self.pattern_group_open = None;
             None
         };
-        if group.is_some() && self.pattern_group_mark.is_none() {
-            self.pattern_group_mark = Some(self.locals.len());
-        }
         self.locals.push(LocalDecl {
             name,
             range,
@@ -10424,7 +10432,7 @@ impl ParserListener for DiagnoseListener<'_> {
             .begin_switch_case(label_count, expression_count, token);
 
         // A case's pattern variables form their own group window.
-        self.engine.borrow_mut().pattern_group_mark = None;
+        self.engine.borrow_mut().pattern_group_open = None;
     }
 
     fn begin_then_statement(&mut self, token: Token) {
@@ -10738,7 +10746,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         // The statement boundary closes the group window (the next
         // declaration is its own all-or-nothing set).
-        self.engine.borrow_mut().pattern_group_mark = None;
+        self.engine.borrow_mut().pattern_group_open = None;
     }
 
     fn handle_recoverable_error(&mut self, _p0: Message, _p1: Token, _p2: Token) {
@@ -16155,6 +16163,57 @@ mod tests {
             "class int {} void take(int x) {} void main() { var (a, b) = (1, 2); take(a); }",
         );
         assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+    }
+
+    /// A pattern window dies with its frame: `f`'s if-case opens the
+    /// window, `f` pops (truncating the locals stack), and `g`'s if-case
+    /// must open a fresh group — not read the popped frame's slot (the
+    /// index-keyed window panicked `self.locals[base]` here, "the len is 1
+    /// but the index is 1").
+    #[test]
+    fn pattern_window_closes_at_frame_pop() {
+        let r = report(
+            "class int {} void f(int p) { if (p case int a) {} } \
+             void g(int q) { if (q case int b) {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_local_variable", "unused_local_variable"],
+            "{:?}",
+            code_names(&r)
+        );
+        // Each window is its own all-or-nothing set: using `a` spares only
+        // `a`'s group; `g`'s unused `b` still reports.
+        let r2 = report(
+            "class int {} void take(int x) {} \
+             void f(int p) { if (p case int a) { take(a); } } \
+             void g(int q) { if (q case int b) {} }",
+        );
+        assert_eq!(
+            code_names(&r2),
+            ["unused_local_variable"],
+            "{:?}",
+            code_names(&r2)
+        );
+    }
+
+    /// An intervening non-pattern local closes the window: two adjacent
+    /// if-case windows separated by a plain local are two independent
+    /// all-or-nothing sets, not one.
+    #[test]
+    fn pattern_window_closes_on_intervening_local() {
+        let r = report(
+            "class int {} void take(int x) {} void f(int p) { \
+             if (p case int a) { take(a); } int q = 1; if (p case int b) {} }",
+        );
+        // `q` and `b` each report; `a`'s use does not spare `b` (the
+        // index-keyed window joined `b` into `a`'s group here).
+        assert_eq!(
+            code_names(&r),
+            ["unused_local_variable", "unused_local_variable"],
+            "{:?}",
+            code_names(&r)
+        );
     }
 
     /// An unreferenced local function reports `unused_element`; its own
