@@ -128,6 +128,14 @@ pub(crate) mod probe {
         /// Same seam for the write-task arm (the apply path's containment
         /// pin): one-shot, thread-local.
         static WRITE_PANIC: Cell<bool> = const { Cell::new(false) };
+        /// One-shot panic trigger for the plugin-weave containment test (a
+        /// real plugin-path panic cannot be conjured deterministically from
+        /// RPC input). Thread-local, same discipline as READ_PANIC.
+        static WEAVE_PANIC: Cell<bool> = const { Cell::new(false) };
+        /// How many read groups the armed READ_PANIC lets pass before it
+        /// fires: the #690 containment tests need a later group surviving an
+        /// earlier group's panic, so the trigger must target a group.
+        static READ_PANIC_SKIP: Cell<usize> = const { Cell::new(0) };
         /// Only the measuring test's thread counts, so concurrent tests on
         /// other threads (parallel harnesses) never pollute the numbers.
         static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -216,10 +224,34 @@ pub(crate) mod probe {
     /// Arms the next read group's execution to panic once.
     pub(crate) fn arm_read_panic() {
         READ_PANIC.with(|armed| armed.set(true));
+        READ_PANIC_SKIP.with(|skip| skip.set(0));
+    }
+
+    /// [`arm_read_panic`], firing on the (n+1)th read group of the turn
+    /// instead of the first — group targeting for the containment tests
+    /// (groups sort base first, then agents in first-appearance order).
+    pub(crate) fn arm_read_panic_on_group(skip: usize) {
+        READ_PANIC.with(|armed| armed.set(true));
+        READ_PANIC_SKIP.with(|left| left.set(skip));
     }
 
     pub(crate) fn take_read_panic() -> bool {
+        let skip = READ_PANIC_SKIP.with(Cell::get);
+        if skip > 0 {
+            READ_PANIC_SKIP.with(|left| left.set(skip - 1));
+            return false;
+        }
         READ_PANIC.with(|armed| armed.replace(false))
+    }
+
+    /// Arms the next plugin weave's execution to panic once (the weave-level
+    /// containment pin, inside the group boundary).
+    pub(crate) fn arm_weave_panic() {
+        WEAVE_PANIC.with(|armed| armed.set(true));
+    }
+
+    pub(crate) fn take_weave_panic() -> bool {
+        WEAVE_PANIC.with(|armed| armed.replace(false))
     }
 
     /// Arms the next write task's apply to panic once (the write path's

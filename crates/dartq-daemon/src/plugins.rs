@@ -231,6 +231,28 @@ impl PluginSet {
         cycle
     }
 
+    /// Disables every live plugin for the rest of the session (#690's
+    /// daemon-side repeat-offender penalty): each runtime is dropped
+    /// kill-only — the exact posture restart-budget exhaustion leaves — and
+    /// its slot records the failure, so the next cycle emits the plugin's
+    /// one-shot `dartq/plugin_crashed` row through the normal path
+    /// (withheld until an anchor exists, never repeated). Already-dead
+    /// slots keep their recorded state. Returns `true` when at least one
+    /// live plugin was disabled — exactly once per session; later calls
+    /// find nothing live and change nothing.
+    pub fn disable_for_session(&mut self, cause: &str) -> bool {
+        let mut disabled = false;
+        for slot in &mut self.plugins {
+            if slot.runtime.take().is_some() {
+                slot.pending_crash = Some(Box::new(RuntimeError::Crashed {
+                    reason: format!("disabled for the session after {cause}"),
+                }));
+                disabled = true;
+            }
+        }
+        disabled
+    }
+
     /// The graceful session-end teardown: `shutdown` per live runtime (the
     /// graceful handshake; `Drop` alone is kill-only). Errors are logged,
     /// never propagated — teardown quality does not affect the session's
@@ -741,6 +763,69 @@ mod tests {
 
         let again = set.cycle(&[], &files, Some(a));
         assert!(again.crashes.is_empty(), "still once per session");
+    }
+
+    #[test]
+    fn disable_for_session_spares_dead_slots_and_reports_nothing_live() {
+        let mut files = FileTable::new();
+        let a = files.intern(Path::new("a.dart"));
+        let mut set = dead_set("restart budget of 3 exhausted");
+
+        assert!(!set.disable_for_session("repeated analysis panics"));
+        // The recorded failure survived untouched: the row still publishes
+        // once, exactly as it would have without the penalty.
+        let cycle = set.cycle(&[], &files, Some(a));
+        assert_eq!(cycle.crashes.len(), 1);
+        assert!(
+            cycle.crashes[0].message.contains("restart budget"),
+            "the original reason is kept: {}",
+            cycle.crashes[0].message
+        );
+    }
+
+    /// Serial phase: the live half of the penalty — a real plugin runtime
+    /// is dropped kill-only and its slot records the crash, which the next
+    /// cycle surfaces as the one-shot row; a second disable finds nothing
+    /// live. The dead-set test above pins the slot math without a process.
+    #[test]
+    #[ignore = "serial phase: spawns a real dart plugin process"]
+    fn disable_for_session_drops_a_live_runtime_and_records_its_penalty_crash() {
+        let dart_ok = std::process::Command::new("dart")
+            .arg("--version")
+            .output()
+            .is_ok();
+        assert!(dart_ok, "dart is not on PATH");
+
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host/bin/echo_plugin.dart");
+        let workspace = TempWorkspace::new("disable");
+        let manifest = format!(
+            r#"{{"name": "echo", "version": "0.1.0", "entrypoint": "{}",
+                "timeouts": {{"callback_ms": 30000, "request_ms": 120000, "request_retries": 3}}}}"#,
+            script.display(),
+        );
+        workspace.write_plugin("echo", &[("dartq_plugin.json", &manifest)]);
+
+        let mut set = PluginSet::launch(workspace.path());
+        assert!(!set.is_empty(), "the echo fixture discovered and launched");
+
+        let mut files = FileTable::new();
+        let a = files.intern(&workspace.path().join("lib").join("a.dart"));
+        assert!(set.disable_for_session("repeated analysis panics"));
+        let cycle = set.cycle(&[], &files, Some(a));
+        assert_eq!(cycle.crashes.len(), 1);
+        assert!(
+            cycle.crashes[0]
+                .message
+                .contains("disabled for the session after repeated analysis panics"),
+            "the penalty reason rides the row: {}",
+            cycle.crashes[0].message
+        );
+        assert!(
+            !set.disable_for_session("again"),
+            "nothing live the second time"
+        );
+        set.shutdown();
     }
 
     #[test]

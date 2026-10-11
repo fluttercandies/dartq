@@ -86,12 +86,20 @@
 //! exclusively and every engine call runs on the main-loop thread through
 //! `&mut self`, so a panic cannot poison a shared mutex and there is
 //! nothing to recover with `into_inner`. What a panic taints is engine
-//! state, so the boundary treats it as untrusted for the rest of the turn
-//! — the remaining view groups answer `INTERNAL_ERROR` without analyzing,
-//! and a best-effort base restore (itself panic-contained) hands the next
-//! turn the cleanest view achievable. Nothing is masked: the panic is
-//! logged to stderr with its payload, and the affected requests see the
-//! internal-error tier.
+//! state, so the boundary treats it as untrusted: the panicking view group
+//! answers its requests `INTERNAL_ERROR`, a best-effort base restore
+//! (itself panic-contained) hands the next group the cleanest view
+//! achievable, and the turn's remaining groups still analyze and answer —
+//! containment is per group (#690), never session-wide. The plugin weave
+//! (its only plugin-row exposure) is contained a level finer still: a
+//! panic there skips the cycle's findings but keeps the group's engine
+//! rows flowing, and it is attributable, so it penalizes immediately.
+//! Repeat offenders, and any panic that keeps recurring on the
+//! plugin-bearing group ([`PLUGIN_PANIC_LIMIT`] strikes, never reset),
+//! disable the whole plugin set for the session through the same
+//! one-shot-crash-row degrade the transport's restart-budget exhaustion
+//! uses. Nothing is masked: every panic is logged to stderr with its
+//! payload, and the affected requests see the internal-error tier.
 //!
 //! # Tier mapping (PRD §16.5 — the one place it is defined)
 //!
@@ -182,6 +190,13 @@ const GC_CONTENTS_THRESHOLD: usize = 64;
 /// `overlay.clear`, session end — evict deterministically; the cap only
 /// stops a client from growing the table without bound.
 const MAX_AGENTS: usize = 256;
+
+/// The repeat-offender ladder (#690): unattributable panics on the
+/// plugin-bearing group (the default context's base view) tolerate this
+/// many strikes before the whole plugin set is disabled for the session.
+/// Small by design — a panic re-fires deterministically — and the count
+/// never resets, mirroring the transport's never-resetting restart budget.
+const PLUGIN_PANIC_LIMIT: u32 = 3;
 
 /// One agent's staged view (PRD §16.3): the files whose content the agent's
 /// requests see instead of the base view. Base bytes are never stored here —
@@ -383,6 +398,12 @@ pub struct Session {
     /// workspace declares none — the per-cycle weave skips its drain
     /// budget with it.
     plugins: PluginSet,
+    /// The repeat-offender ladder (#690): panics on the plugin-bearing
+    /// group — the default context's base view, the only analysis a
+    /// plugin's rows ride — counted toward [`PLUGIN_PANIC_LIMIT`]. The
+    /// group-level containment bounds each panic to its own group; this
+    /// ladder is the session-level answer to one that keeps coming back.
+    plugin_path_panics: u32,
     /// The `dartq/fix`/`dartq/assists` host set: lazily launched at the
     /// first plugin-needing request (a session that never fixes never pays
     /// the spawn handshakes). Session-owned so the graceful teardown covers
@@ -526,6 +547,7 @@ impl Session {
             reads: Vec::new(),
             cancelled: Vec::new(),
             plugins,
+            plugin_path_panics: 0,
             fix_hosts: None,
             snapshot: SnapshotSink {
                 store,
@@ -1128,44 +1150,51 @@ impl Session {
         let has_base = groups.iter().any(|(agent, _)| agent.is_none());
         let publishes_here = pending.context == self.default_context;
         if publishes_here && (groups.is_empty() || (self.publishes_due && !has_base)) {
-            self.publishes_due = false;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.run_group(self.default_context, None, Vec::new(), turn)
             }));
-            if outcome.is_err() {
-                eprintln!("dartq-daemon: base analysis panicked; the publish diff did not drain");
-                self.restore_base_view();
+            match outcome {
+                // The drain happened (run_group clears `publishes_due` at
+                // the publish plan), or the task cancelled — the next write
+                // re-arms the diff anyway.
+                Ok(()) => self.publishes_due = false,
+                Err(payload) => {
+                    eprintln!(
+                        "dartq-daemon: base analysis panicked ({}); the publish diff retries on \
+                         the next intake",
+                        panic_message(&payload)
+                    );
+                    self.note_plugin_path_panic(pending.context, None);
+                    self.restore_base_view_contained();
+                }
             }
         }
 
-        let mut poisoned = false;
+        // Containment is per group (#690): a panicking group answers its
+        // own requests `INTERNAL_ERROR` and hands the next group a
+        // restored base view; the turn's remaining groups still analyze
+        // and answer. One group's panic — engine or plugin — never
+        // converts the rest of the turn into internal errors or defers
+        // the publish diff.
         for (agent, requests) in groups {
             let ids: Vec<RequestId> = requests.iter().map(|(id, _)| id.clone()).collect();
-            if poisoned {
-                self.answer_panicked(turn, ids);
-                continue;
-            }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.run_group(pending.context, agent.as_deref(), requests, turn)
             }));
             if let Err(payload) = outcome {
-                // The engine's state is untrustworthy after a panic: the
-                // remaining groups answer without analyzing, and the best-
-                // effort restore below (itself contained) hands the next
-                // turn the cleanest base view achievable.
-                poisoned = true;
                 eprintln!(
                     "dartq-daemon: analysis panicked ({}); answering the group internal error",
                     panic_message(&payload)
                 );
                 self.answer_panicked(turn, ids);
-                self.restore_base_view();
+                self.note_plugin_path_panic(pending.context, agent.as_deref());
+                self.restore_base_view_contained();
             }
         }
     }
 
-    /// Answers ids `INTERNAL_ERROR` after a panicking turn (the catch
-    /// boundary's degraded answer; finding 5).
+    /// Answers a panicking group's ids `INTERNAL_ERROR` (the catch
+    /// boundary's degraded answer).
     fn answer_panicked(&mut self, turn: &mut Turn, ids: Vec<RequestId>) {
         for id in ids {
             turn.answers.push((
@@ -1244,7 +1273,7 @@ impl Session {
         // is withheld by the cycle, not dropped: it publishes on the first
         // cycle that has one.
         let mut plugin_findings = Vec::new();
-        if context == self.default_context && agent.is_none() && !self.plugins.is_empty() {
+        if self.carries_plugins(context, agent) {
             let anchor: Option<FileId> = self.published.keys().copied().min();
             // Direct field access (not `self.engine`): the plugins' mutable
             // borrow and the engine's read must stay disjoint field borrows.
@@ -1252,19 +1281,39 @@ impl Session {
                 .runtime
                 .context_state(context)
                 .expect("the read task's context lives for the session");
-            let cycle = self
-                .plugins
-                .cycle(&diagnostics, engine.file_table(), anchor);
-            diagnostics.extend(cycle.crashes);
-            plugin_findings =
-                plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
-                    let index = engine.line_index(file)?;
-                    let text = engine.content(file)?;
-                    Some((
-                        index,
-                        std::str::from_utf8(text).expect("engine content is valid UTF-8"),
-                    ))
-                });
+            // The weave is contained a level finer than the group (#690):
+            // it is the group's only plugin-row exposure, so a panic here
+            // is attributable and penalizes immediately — while the group's
+            // engine rows still convert, publish, and answer. The skipped
+            // cycle's rows re-feed on the next cycle; a crash recorded by
+            // the penalty surfaces there through the normal one-shot path.
+            let woven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if crate::probe::take_weave_panic() {
+                    panic!("test-armed plugin weave panic");
+                }
+                let cycle = self
+                    .plugins
+                    .cycle(&diagnostics, engine.file_table(), anchor);
+                diagnostics.extend(cycle.crashes);
+                plugin_findings =
+                    plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
+                        let index = engine.line_index(file)?;
+                        let text = engine.content(file)?;
+                        Some((
+                            index,
+                            std::str::from_utf8(text).expect("engine content is valid UTF-8"),
+                        ))
+                    });
+            }));
+            if let Err(payload) = woven {
+                eprintln!(
+                    "dartq-daemon: the plugin cycle panicked ({}); this cycle's findings are \
+                     skipped",
+                    panic_message(&payload)
+                );
+                self.penalize_plugins("a panic in the plugin cycle");
+            }
         }
         // The one conversion pass per group (the engine→LSP shape change is
         // the expensive half — #347's convert-once discipline, per view):
@@ -1274,7 +1323,6 @@ impl Session {
             .map(|diagnostic| self.convert(context, diagnostic))
             .collect();
         if context == self.default_context && agent.is_none() {
-            self.publishes_due = false;
             let engine_rows =
                 diagnostics
                     .iter()
@@ -1295,6 +1343,10 @@ impl Session {
                 .cloned()
                 .collect();
             turn.publishes.extend(self.plan_publishes(merged, retained));
+            // The diff drained: future writes re-arm it. Kept after the
+            // plan so a panic mid-plan leaves the diff due — the next
+            // intake retries it (the containment posture, #690).
+            self.publishes_due = false;
         }
         // dartq/analyze answers keep the CLI analyze face's printed order
         // (severity-first before writing; the shared key lives in
@@ -1452,6 +1504,56 @@ impl Session {
             results.push((index, id, answer));
         }
         results
+    }
+
+    /// True when this view group is the plugin-bearing one: the default
+    /// context's base view — the only analysis the plugin weave (and thus a
+    /// plugin's rows) rides. Agent views and forked contexts never see it.
+    fn carries_plugins(&self, context: ContextId, agent: Option<&str>) -> bool {
+        context == self.default_context && agent.is_none() && !self.plugins.is_empty()
+    }
+
+    /// One panic on the plugin-bearing group (#690's repeat-offender
+    /// ladder): counted toward [`PLUGIN_PANIC_LIMIT`], never reset — the
+    /// transport's restart budget never resets either (PRD §14.3), and a
+    /// panic that recurs is deterministic enough to re-fire every cycle.
+    /// At the limit the whole plugin set is disabled for the session: the
+    /// group-level containment bounds each panic to its own group, this is
+    /// the session-level answer to one that keeps coming back. The panic
+    /// may be the engine's, not a plugin's — with attribution below group
+    /// granularity unavailable cheaply, disabling the set is the accepted
+    /// conservative posture (the audit's fallback trigger).
+    fn note_plugin_path_panic(&mut self, context: ContextId, agent: Option<&str>) {
+        if !self.carries_plugins(context, agent) {
+            return;
+        }
+        self.plugin_path_panics = self.plugin_path_panics.saturating_add(1);
+        if self.plugin_path_panics >= PLUGIN_PANIC_LIMIT {
+            self.penalize_plugins(&format!("{PLUGIN_PANIC_LIMIT} repeated analysis panics"));
+        }
+    }
+
+    /// Disables the plugin set for the session: each live plugin drops
+    /// kill-only (the restart-budget-exhaustion posture) and emits its
+    /// one-shot `dartq/plugin_crashed` row on the next cycle through the
+    /// crash machinery — anchored, withheld until an anchor exists, never
+    /// repeated. Logged once; later calls find nothing live.
+    fn penalize_plugins(&mut self, cause: &str) {
+        if self.plugins.disable_for_session(cause) {
+            eprintln!("dartq-daemon: every plugin disabled for the session: {cause}");
+        }
+    }
+
+    /// The post-panic base restore, contained (the module's containment
+    /// contract): the engine state is untrusted at this point, so a restore
+    /// that itself panics must not escape the turn and kill the remaining
+    /// groups — it is logged and the turn moves on.
+    fn restore_base_view_contained(&mut self) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.restore_base_view()));
+        if outcome.is_err() {
+            eprintln!("dartq-daemon: the post-panic base restore panicked; continuing without it");
+        }
     }
 
     /// Restores the worn context's base view after agent wear: sets every
@@ -3085,6 +3187,132 @@ mod tests {
         );
     }
 
+    /// Containment is per group (#690): a panicking base group answers its
+    /// own requests `INTERNAL_ERROR` while the turn's agent group still
+    /// analyzes and answers — one group's panic no longer poisons the rest
+    /// of the turn.
+    #[test]
+    fn a_panicking_base_group_leaves_the_agent_group_answering() {
+        let (workspace, mut session) = fixture("panic-groups-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage A");
+        let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
+        session.queue_command(id_a, a);
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        // Groups sort base first, so the armed trigger fires on the base
+        // group; the agent group runs after it in the same turn.
+        crate::probe::arm_read_panic();
+        let turn = session.service();
+
+        let by_id = |wanted: i64| {
+            &turn
+                .answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .expect("answer present")
+                .1
+        };
+        assert!(
+            matches!(by_id(3), Err(SessionError::Internal(message)) if message.contains("panicked")),
+            "the panicking base group answers INTERNAL_ERROR: {:?}",
+            by_id(3)
+        );
+        assert!(
+            matches!(by_id(2), Ok(_)),
+            "the agent group still answered in the same turn: {:?}",
+            by_id(2)
+        );
+
+        // And the session carries on.
+        session.queue_command(
+            RequestId::Num(4),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Ok(_)),
+            "the session survives: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// A panic in a LATER group (an agent view) leaves the same turn's
+    /// publish diff intact: the base group sorts first and drains the
+    /// write's diff before the agent group ever runs (#690).
+    #[test]
+    fn an_agent_group_panic_keeps_the_turns_publish_diff() {
+        let (workspace, mut session) = fixture("panic-publish-unit");
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session
+            .set_overlay("A", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .expect("stage A");
+        let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
+        session.queue_command(id_a, a);
+        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        // The agent group is the turn's second (base sorts first): the
+        // armed trigger skips past the base group and fires there.
+        crate::probe::arm_read_panic_on_group(1);
+        let turn = session.service();
+
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the write's diff drained in the same turn: {:?}",
+            turn.publishes
+        );
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the push is the base view, never the agent's rows: {:?}",
+            turn.publishes[0]
+        );
+        let by_id = |wanted: i64| {
+            &turn
+                .answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .expect("answer present")
+                .1
+        };
+        assert!(
+            matches!(by_id(3), Ok(_)),
+            "the base group answered before the panic: {:?}",
+            by_id(3)
+        );
+        assert!(
+            matches!(by_id(2), Err(SessionError::Internal(message)) if message.contains("panicked")),
+            "the panicking agent group answers INTERNAL_ERROR: {:?}",
+            by_id(2)
+        );
+    }
+
     /// The write path's containment: a panicking apply does not lose the
     /// client's staged edits — they are restaged (last-wins) and the next
     /// real intake's write task applies them. Re-enqueueing immediately
@@ -3651,6 +3879,157 @@ mod tests {
             "the crash row never repeats: {:?}",
             turn.publishes
         );
+    }
+
+    /// The weave is contained a level finer than the group (#690): a panic
+    /// in the plugin cycle skips that cycle's findings but the group's
+    /// engine rows still answer and publish — and the penalty's crash row
+    /// surfaces on the next cycle through the normal one-shot path, exactly
+    /// like a transport-side death.
+    #[test]
+    fn a_panicking_plugin_cycle_keeps_the_group_alive_and_the_row_comes_once() {
+        let (_workspace, mut session) = fixture("weave-panic-unit");
+        session.inject_plugins(PluginSet::with_dead_plugin(
+            "dead",
+            "restart budget of 3 exhausted",
+        ));
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert!(
+            turn.publishes.len() == 1
+                && turn.publishes[0]
+                    .diagnostics
+                    .iter()
+                    .all(|row| row.code != dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
+            "the first cycle withheld the crash (no anchor): {:?}",
+            turn.publishes
+        );
+
+        // The weave panics at the cycle's entry: no findings, no crash row
+        // this cycle — but the group answers, so the engine rows flow.
+        crate::probe::arm_weave_panic();
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Ok(_)),
+            "the group survived the weave panic: {:?}",
+            turn.answers[0]
+        );
+        assert!(
+            turn.publishes.is_empty(),
+            "the panicking cycle skipped its rows: {:?}",
+            turn.publishes
+        );
+
+        // The next cycle runs: the anchor exists (turn 1 published), so the
+        // held crash row publishes once, merged after the engine rows.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let rows = &turn
+            .publishes
+            .first()
+            .expect("the crash row publishes on the recovered cycle")
+            .diagnostics;
+        assert_eq!(
+            rows.last().expect("row present").code,
+            dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name,
+            "the crash row rides the merge: {rows:?}"
+        );
+
+        // Once per session: the cycle after is clean again.
+        session.queue_command(
+            RequestId::Num(4),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "subsequent turns are clean: {:?}",
+            turn.publishes
+        );
+    }
+
+    /// The repeat-offender ladder (#690): panics on the plugin-bearing
+    /// group count one per turn, the count never resets, and the third
+    /// strike disables the plugin set (its disable transition is pinned by
+    /// plugins.rs's own tests; this gate pins the ladder semantics).
+    #[test]
+    fn repeated_plugin_path_panics_climb_the_ladder_to_the_penalty() {
+        let (_workspace, mut session) = fixture("panic-ladder-unit");
+        session.inject_plugins(PluginSet::with_dead_plugin(
+            "dead",
+            "restart budget of 3 exhausted",
+        ));
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert_eq!(session.plugin_path_panics, 0);
+
+        for strike in 0..PLUGIN_PANIC_LIMIT {
+            crate::probe::arm_read_panic();
+            session.queue_command(
+                RequestId::Num(i64::from(strike) + 2),
+                Request::Analyze {
+                    verbosity: Verbosity::Compact,
+                    agent: None,
+                    context: None,
+                },
+            );
+            let turn = session.service();
+            assert!(
+                matches!(&turn.answers[0].1, Err(SessionError::Internal(_))),
+                "strike {strike} answers INTERNAL_ERROR: {:?}",
+                turn.answers[0]
+            );
+            assert_eq!(
+                session.plugin_path_panics,
+                strike + 1,
+                "the ladder climbs one strike per turn"
+            );
+        }
+
+        // The count never resets: a healthy cycle leaves it, a further
+        // panic keeps climbing (saturating).
+        session.queue_command(
+            RequestId::Num(5),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let _ = session.service();
+        assert_eq!(session.plugin_path_panics, PLUGIN_PANIC_LIMIT);
+        crate::probe::arm_read_panic();
+        session.queue_command(
+            RequestId::Num(6),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let _ = session.service();
+        assert_eq!(session.plugin_path_panics, PLUGIN_PANIC_LIMIT + 1);
     }
 
     /// `overlay.commit` (PRD §16.3's merge): the agent's staged buffer
