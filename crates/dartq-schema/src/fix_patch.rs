@@ -8,12 +8,13 @@ use serde_json::{Value, json};
 use crate::SchemaViolation;
 use crate::Verbosity;
 use crate::support::{
-    absent, boolean, exact_fields, field, join, non_negative, object, one_based, pinned_version,
-    rows, string,
+    absent, boolean, describe, exact_fields, field, join, non_negative, object, one_based,
+    pinned_version, rows, string, violation,
 };
 
-/// The patch document's contract version. Mirrors the CLI fix face's
-/// `SCHEMA_VERSION` (`crates/dartq-cli/src/fix.rs:71`), which has no pub
+/// The patch document's contract version. Mirrors the fix face's
+/// `SCHEMA_VERSION` (`crates/dartq-commands/src/fix.rs:87`, the one
+/// implementation the CLI and daemon faces share), which has no pub
 /// constant to align against — the value is pinned by the fixtures in
 /// `tests/output_faces.rs` instead.
 pub const SCHEMA_VERSION_FIX_PATCH: u32 = 1;
@@ -38,13 +39,20 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "edits": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["offset", "length", "replacement"],
+                "required": ["offset", "length", "replacement", "source"],
                 "properties": {
                     "offset": { "type": "integer", "minimum": 0 },
                     "length": { "type": "integer", "minimum": 0 },
                     "replacement": { "type": "string" },
+                    // The provenance tag (`edit_floor`,
+                    // crates/dartq-commands/src/fix.rs:744-751): `builtin-lint`
+                    // for the built-in rule rows, the plugin's manifest name
+                    // for plugin rows. Never dropped — every tier emits it
+                    // (§15.8: minimal trims prose, never location).
+                    "source": { "type": "string" },
                     // The §15.6 drift-correction locator: compact/full emit
-                    // it, minimal omits it (crate docs, "Verbosity tiers").
+                    // it, minimal omits it (crate docs, "Verbosity tiers";
+                    // fix.rs:766-768, 778-780).
                     "anchor": {
                         "type": "object",
                         "additionalProperties": false,
@@ -57,11 +65,18 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                             "context_after": { "type": "string" },
                         },
                     },
-                    // Reserved §15.6 surface, not yet emitted by the fix
-                    // face (the human row carries the rule; stale edits are
-                    // skipped rather than marked). Declared absent-tolerant
-                    // so enabling them is additive, not an unfreeze.
+                    // The full tier's human-name rows (fix.rs:769-772 for
+                    // the built-in rows, 781-784 for the plugin rows).
                     "rule": { "type": "string" },
+                    "message": { "type": "string" },
+                    // Plugin rows only ("lower sorts first" — may be
+                    // negative, fix.rs:139-141); structural validator, so
+                    // the row-kind split is the emitter's obligation.
+                    "priority": { "type": "integer" },
+                    // Reserved §15.6 surface, not yet emitted by the fix
+                    // face (stale edits are skipped rather than marked).
+                    // Declared absent-tolerant so enabling it is additive,
+                    // not an unfreeze.
                     "stale": { "type": "boolean" },
                 },
             }},
@@ -70,8 +85,8 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 });
 
 const PATCH_TOP: &[&str] = &["file", "schema_version", "edits"];
-const EDIT: &[&str] = &["offset", "length", "replacement"];
-const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "stale"];
+const EDIT: &[&str] = &["offset", "length", "replacement", "source"];
+const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "message", "priority", "stale"];
 const ANCHOR: &[&str] = &["line", "column"];
 const ANCHOR_OPTIONAL: &[&str] = &["context_before", "context_after"];
 
@@ -89,6 +104,7 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         let length = join(&p, "length");
         non_negative(field(obj, "length", &p)?, &length)?;
         string(field(obj, "replacement", &p)?, &join(&p, "replacement"))?;
+        string(field(obj, "source", &p)?, &join(&p, "source"))?;
         if let Some(anchor) = obj.get("anchor") {
             let ap = join(&p, "anchor");
             let anchor = object(anchor, &ap)?;
@@ -107,6 +123,17 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         if let Some(rule) = obj.get("rule") {
             string(rule, &join(&p, "rule"))?;
         }
+        if let Some(message) = obj.get("message") {
+            string(message, &join(&p, "message"))?;
+        }
+        if let Some(priority) = obj.get("priority") {
+            // Signed: "lower sorts first" (fix.rs:139-141), so negatives are
+            // legal plugin priorities — the shared `integer` helper is
+            // non-negative only.
+            priority
+                .as_i64()
+                .ok_or_else(|| violation(join(&p, "priority"), "an integer", describe(priority)))?;
+        }
         if let Some(stale) = obj.get("stale") {
             boolean(stale, &join(&p, "stale"))?;
         }
@@ -115,8 +142,9 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
 }
 
 /// The tier-exact check ([`crate::validate_at_tier`]): the anchor is the
-/// compact tier's drift-correction locator, `rule` is full-tier only; the
-/// red-line trio and `stale` ride every tier (crate docs, fix table).
+/// compact tier's drift-correction locator and the human-name rows
+/// (`rule`/`message`/`priority`) are full-tier only; the red-line trio,
+/// the provenance tag, and `stale` ride every tier (crate docs, fix table).
 pub(crate) fn validate_fix_patch_at_tier(
     value: &Value,
     tier: Verbosity,
@@ -131,6 +159,8 @@ pub(crate) fn validate_fix_patch_at_tier(
         }
         if tier != Verbosity::Full {
             absent(obj, "rule", &p, tier)?;
+            absent(obj, "message", &p, tier)?;
+            absent(obj, "priority", &p, tier)?;
         }
     }
     Ok(())
@@ -167,8 +197,9 @@ mod tests {
         assert_eq!(crate::support::schema_keys(anchor), anchor_fields);
     }
 
-    /// Tier exactness: the anchor is compact-tier content, `rule` full-tier
-    /// only; `stale` rides any tier.
+    /// Tier exactness: the anchor is compact-tier content, the human-name
+    /// rows (`rule`/`message`/`priority`) full-tier only; the provenance tag
+    /// and `stale` ride any tier.
     #[test]
     fn tiers_reject_higher_tier_fields() {
         let doc = serde_json::json!({
@@ -178,8 +209,11 @@ mod tests {
                 "offset": 123,
                 "length": 8,
                 "replacement": "Bar",
+                "source": "builtin-lint",
                 "anchor": {"line": 10, "column": 7},
                 "rule": "unnecessary_new",
+                "message": "Unnecessary 'new' keyword.",
+                "priority": 1,
                 "stale": true,
             }],
         });
@@ -195,11 +229,91 @@ mod tests {
 
         assert!(validate_fix_patch_at_tier(&doc, Verbosity::Full).is_ok());
 
+        // `message` and `priority` are full-tier too: without the rule the
+        // compact tier names them in turn.
+        let no_rule = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{
+                "offset": 123,
+                "length": 8,
+                "replacement": "Bar",
+                "source": "fixer",
+                "anchor": {"line": 10, "column": 7},
+                "message": "insert const",
+                "priority": 1,
+            }],
+        });
+        let violation = validate_fix_patch_at_tier(&no_rule, Verbosity::Compact)
+            .expect_err("compact must not carry the message");
+        assert_eq!(violation.path, "edits[0].message");
+        assert_eq!(violation.expected, "omitted at the compact tier");
+        let no_message = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{
+                "offset": 123,
+                "length": 8,
+                "replacement": "Bar",
+                "source": "fixer",
+                "anchor": {"line": 10, "column": 7},
+                "priority": -1,
+            }],
+        });
+        let violation = validate_fix_patch_at_tier(&no_message, Verbosity::Compact)
+            .expect_err("compact must not carry the priority");
+        assert_eq!(violation.path, "edits[0].priority");
+        assert_eq!(violation.expected, "omitted at the compact tier");
+
+        // The minimal floor: the red-line trio plus the provenance tag
+        // (`edit_floor` never drops it, fix.rs:744-751) — the anchor and
+        // the human names are the trims.
         let minimal = serde_json::json!({
             "file": "lib/foo.dart",
             "schema_version": SCHEMA_VERSION_FIX_PATCH,
-            "edits": [{"offset": 123, "length": 8, "replacement": "Bar", "stale": true}],
+            "edits": [{
+                "offset": 123,
+                "length": 8,
+                "replacement": "Bar",
+                "source": "builtin-lint",
+                "stale": true,
+            }],
         });
         assert!(validate_fix_patch_at_tier(&minimal, Verbosity::Minimal).is_ok());
+
+        // The provenance tag is required and a string; the priority is a
+        // signed integer.
+        let no_source = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"offset": 123, "length": 8, "replacement": "Bar"}],
+        });
+        let violation = validate_fix_patch(&no_source).expect_err("provenance is required");
+        assert_eq!(violation.path, "edits[0].source");
+        assert_eq!(violation.found, "missing");
+
+        let wrong_types = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"offset": 123, "length": 8, "replacement": "Bar", "source": 7}],
+        });
+        let violation = validate_fix_patch(&wrong_types).expect_err("source is a string");
+        assert_eq!(violation.path, "edits[0].source");
+        assert_eq!(violation.expected, "a string");
+
+        let wrong_types = serde_json::json!({
+            "file": "lib/foo.dart",
+            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{
+                "offset": 123,
+                "length": 8,
+                "replacement": "Bar",
+                "source": "fixer",
+                "priority": "high",
+            }],
+        });
+        let violation = validate_fix_patch(&wrong_types).expect_err("priority is an integer");
+        assert_eq!(violation.path, "edits[0].priority");
+        assert_eq!(violation.expected, "an integer");
     }
 }

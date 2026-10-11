@@ -26,10 +26,13 @@ fn dartq_native_faces_are_frozen_at_v1() {
 // Fix patch document (§15.6)
 // ---------------------------------------------------------------------------
 
-/// Transcript of `patch_json` (`crates/dartq-cli/src/fix.rs:354-385`):
-/// `file` + `schema_version` (the constant pinned at fix.rs:71) + `edits`
-/// with `anchor` objects; the second edit shows the empty-context omission
-/// at line boundaries (fix.rs:363-371, §15.8.5).
+/// Transcript of `patch_json` (`crates/dartq-commands/src/fix.rs:761-793`):
+/// `file` + `schema_version` (the constant pinned at fix.rs:87) + `edits`
+/// with `anchor` objects; every row carries its provenance tag
+/// (`edit_floor`, fix.rs:744-751 — `builtin-lint` for the built-in row,
+/// fix.rs:91, the plugin's manifest name for the plugin row, fix.rs:777);
+/// the second edit shows the empty-context omission at line boundaries
+/// (fix.rs:437-452, §15.8.5).
 #[test]
 fn compact_fix_patch_passes_validation() {
     let doc = serde_json::json!({
@@ -40,6 +43,7 @@ fn compact_fix_patch_passes_validation() {
                 "offset": 123,
                 "length": 8,
                 "replacement": "Bar",
+                "source": "builtin-lint",
                 "anchor": {
                     "line": 10,
                     "column": 7,
@@ -51,6 +55,7 @@ fn compact_fix_patch_passes_validation() {
                 "offset": 0,
                 "length": 4,
                 "replacement": "new",
+                "source": "fixer",
                 "anchor": {"line": 1, "column": 1},
             },
         ],
@@ -59,20 +64,29 @@ fn compact_fix_patch_passes_validation() {
 }
 
 /// The minimal tier (crate docs, "Verbosity tiers"): the anchor is the
-/// drift-correction extra; the directly-applicable trio is the red line.
+/// drift-correction extra; the directly-applicable trio is the red line,
+/// and the provenance tag rides it (`edit_floor` never drops it,
+/// fix.rs:744-751 — the writer's own minimal pin, fix.rs:1044-1050).
 #[test]
 fn minimal_fix_patch_passes_validation() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
         "schema_version": SCHEMA_VERSION_FIX_PATCH,
-        "edits": [{"offset": 123, "length": 8, "replacement": "Bar"}],
+        "edits": [{
+            "offset": 123,
+            "length": 8,
+            "replacement": "Bar",
+            "source": "builtin-lint",
+        }],
     });
     validate_ok(&doc.to_string(), Domain::FixPatch);
 }
 
-/// Full-tier extras declared absent-tolerant (crate docs): `rule` is the
-/// producing rule id (carried by the human face's `RuleFix`, fix.rs:121-126,
-/// not yet emitted on the machine document), `stale` the §15.6 marking.
+/// Full-tier extras (`patch_json`, fix.rs:769-772 for the built-in rows,
+/// 781-784 for the plugin rows): `rule` names the producing rule,
+/// `message` the human row, `priority` the plugin change's ordering
+/// (signed — "lower sorts first", fix.rs:139-141); `stale` stays the
+/// absent-tolerant §15.6 marking with no writer yet.
 #[test]
 fn full_tier_fix_extras_pass_validation() {
     let doc = serde_json::json!({
@@ -82,8 +96,11 @@ fn full_tier_fix_extras_pass_validation() {
             "offset": 123,
             "length": 8,
             "replacement": "Bar",
+            "source": "builtin-lint",
             "anchor": {"line": 10, "column": 7, "context_before": "final Fo"},
             "rule": "unnecessary_new",
+            "message": "Unnecessary 'new' keyword.",
+            "priority": 1,
             "stale": false,
         }],
     });
@@ -103,24 +120,18 @@ fn fix_edit_without_replacement_is_named() {
     assert_eq!(violation.found, "missing");
 }
 
-/// Internal ids never cross the boundary (§15.7): the edit's verified
-/// original slice (`Edit.source`, fix.rs:109-111, "deliberately not part of
-/// the §15.6 document") is rejected as undeclared.
+/// The provenance tag is required: an edit row without its `source` is
+/// never valid (`edit_floor` emits it at every tier, fix.rs:749).
 #[test]
-fn fix_internal_source_slice_is_undeclared() {
+fn fix_edit_without_provenance_is_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
         "schema_version": SCHEMA_VERSION_FIX_PATCH,
-        "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "new     ",
-        }],
+        "edits": [{"offset": 123, "length": 8, "replacement": "Bar"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
     assert_eq!(violation.path, "edits[0].source");
-    assert_eq!(violation.found, "an undeclared field");
+    assert_eq!(violation.found, "missing");
 }
 
 #[test]
@@ -132,6 +143,7 @@ fn fix_anchor_without_line_is_named() {
             "offset": 123,
             "length": 8,
             "replacement": "Bar",
+            "source": "builtin-lint",
             "anchor": {"column": 7},
         }],
     });
@@ -664,7 +676,9 @@ fn index_run_zero_totals_pass_and_extras_fail() {
 // ---------------------------------------------------------------------------
 
 /// Tier exactness on the fix face: the anchor is compact-tier content and
-/// `rule` full-tier only, so a tier violation names the field and its tier.
+/// the human-name rows (`rule`/`message`/`priority`) full-tier only, so a
+/// tier violation names the field and its tier; the provenance tag rides
+/// every tier (`patch_json`, fix.rs:749).
 #[test]
 fn fix_patch_is_exact_at_its_tier() {
     let compact = serde_json::json!({
@@ -674,6 +688,7 @@ fn fix_patch_is_exact_at_its_tier() {
             "offset": 123,
             "length": 8,
             "replacement": "Bar",
+            "source": "builtin-lint",
             "anchor": {"line": 10, "column": 7},
         }],
     });
@@ -682,6 +697,47 @@ fn fix_patch_is_exact_at_its_tier() {
         .expect_err("minimal must not carry the anchor");
     assert_eq!(violation.path, "edits[0].anchor");
     assert_eq!(violation.expected, "omitted at the minimal tier");
+
+    // The full tier's human-name rows: exact at full, named at compact in
+    // turn (`rule`, then `message`, then `priority` — fix.rs:769-784).
+    let full = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "edits": [{
+            "offset": 123,
+            "length": 8,
+            "replacement": "Bar",
+            "source": "fixer",
+            "anchor": {"line": 10, "column": 7},
+            "rule": "unnecessary_new",
+            "message": "insert const",
+            "priority": 1,
+        }],
+    });
+    assert!(validate_at_tier(&full.to_string(), Domain::FixPatch, Verbosity::Full).is_ok());
+    let violation = validate_at_tier(&full.to_string(), Domain::FixPatch, Verbosity::Compact)
+        .expect_err("compact must not carry the rule");
+    assert_eq!(violation.path, "edits[0].rule");
+    assert_eq!(violation.expected, "omitted at the compact tier");
+
+    let mut no_rule = full;
+    no_rule["edits"][0]
+        .as_object_mut()
+        .expect("edit row")
+        .remove("rule");
+    let violation = validate_at_tier(&no_rule.to_string(), Domain::FixPatch, Verbosity::Compact)
+        .expect_err("compact must not carry the message");
+    assert_eq!(violation.path, "edits[0].message");
+    assert_eq!(violation.expected, "omitted at the compact tier");
+
+    no_rule["edits"][0]
+        .as_object_mut()
+        .expect("edit row")
+        .remove("message");
+    let violation = validate_at_tier(&no_rule.to_string(), Domain::FixPatch, Verbosity::Compact)
+        .expect_err("compact must not carry the priority");
+    assert_eq!(violation.path, "edits[0].priority");
+    assert_eq!(violation.expected, "omitted at the compact tier");
 }
 
 /// Tier exactness on the query face: minimal omits `container` and

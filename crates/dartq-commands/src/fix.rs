@@ -987,7 +987,10 @@ mod tests {
     /// `replacement`/`anchor`/`source` — the anchor carrying `line`/
     /// `column`/`context_before`/`context_after`, an empty context
     /// omitted (§15.7), and `source` naming the row's fix source
-    /// (builtin rows `builtin-lint`, plugin rows the manifest name).
+    /// (builtin rows `builtin-lint`, plugin rows the manifest name). Each
+    /// tier's document passes the published schema contract
+    /// (`dartq-schema`'s `Domain::FixPatch`) at the tier the writer
+    /// claims — the provenance surface stays schema-valid.
     #[test]
     fn schema_pins_section_15_6_fields() {
         let source = "void f() { var a = new B(); }\n";
@@ -1007,6 +1010,14 @@ mod tests {
         assert_eq!(keys, ["edits", "file", "schema_version"]);
         assert_eq!(doc["schema_version"], 1);
         assert_eq!(doc["file"], "/abs/t.dart");
+        let text = doc.to_string();
+        dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
+        dartq_schema::validate_at_tier(
+            &text,
+            dartq_schema::Domain::FixPatch,
+            dartq_schema::Verbosity::Compact,
+        )
+        .expect("schema-valid at the compact tier");
 
         let edits = doc["edits"].as_array().expect("edits array");
         assert_eq!(
@@ -1048,6 +1059,12 @@ mod tests {
             .keys()
             .collect();
         assert_eq!(keys, ["length", "offset", "replacement", "source"]);
+        dartq_schema::validate_at_tier(
+            &minimal.to_string(),
+            dartq_schema::Domain::FixPatch,
+            dartq_schema::Verbosity::Minimal,
+        )
+        .expect("schema-valid at the minimal tier");
 
         let full = patch_json(&set, Verbosity::Full);
         let builtin: Vec<_> = full["edits"][0]
@@ -1087,6 +1104,12 @@ mod tests {
         );
         assert_eq!(full["edits"][1]["message"], "insert const");
         assert_eq!(full["edits"][1]["priority"], 1);
+        dartq_schema::validate_at_tier(
+            &full.to_string(),
+            dartq_schema::Domain::FixPatch,
+            dartq_schema::Verbosity::Full,
+        )
+        .expect("schema-valid at the full tier");
 
         // An edit at a line start carries no context_before: the empty
         // string is omitted from the document (§15.7).
@@ -1108,6 +1131,8 @@ mod tests {
         let keys: Vec<_> = anchor.as_object().expect("anchor object").keys().collect();
         assert_eq!(keys, ["column", "context_after", "line"]);
         assert_eq!(anchor["context_after"], " a;");
+        dartq_schema::validate(&doc.to_string(), dartq_schema::Domain::FixPatch)
+            .expect("the omitted-context document is schema-valid");
     }
 
     /// Rules without a mechanical rewrite are never claimed: a hit of a

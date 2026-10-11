@@ -27,7 +27,9 @@
 //!   ids never leave the engine. The validator pins the `label|name` form
 //!   for the impact report's symbol refs and the session symbol table's
 //!   values. Internal-only data (e.g. the fix edit's verified original
-//!   slice, `fix.rs`'s `Edit.source`) is rejected as an undeclared field.
+//!   slice, `fix.rs`'s `Edit.source` — the edit row's declared `source`
+//!   key carries the provenance tag, a different value) is never emitted;
+//!   the validator rejects anything undeclared.
 //! * Enum spellings are the shortest unambiguous form: kebab-case tags for
 //!   impact levels, declaration families, and reference relations; the
 //!   oracle's UPPERCASE spellings for diagnostic severities and types.
@@ -95,7 +97,8 @@
 //! tiers bind the emitters that honor `--verbosity` (daemon/RPC faces).
 //!
 //! Fix patch documents (§15.6; per edit — `file`/`offset`/`length`/
-//! `replacement` are the red line):
+//! `replacement` are the red line, and the provenance tag never drops
+//! either):
 //!
 //! | field                 | minimal | compact | full |
 //! |-----------------------|---------|---------|------|
@@ -103,13 +106,19 @@
 //! | `edits[].offset`      | ●       | ●       | ●    |
 //! | `edits[].length`      | ●       | ●       | ●    |
 //! | `edits[].replacement` | ●       | ●       | ●    |
+//! | `edits[].source`      | ●       | ●       | ●    |
 //! | `edits[].anchor`      |         | ●       | ●    |
 //! | `edits[].rule`        |         |         | ●    |
+//! | `edits[].message`     |         |         | ●    |
+//! | `edits[].priority`    |         |         | ●    |
 //!
-//! `edits[].stale` may appear in any tier when an applier marks an edit
-//! instead of dropping it (§15.6). `rule` and `stale` are declared
-//! absent-tolerant today: the machine writer emits neither (the human face
-//! carries the rule; stale edits are skipped), so enabling them is additive.
+//! `edits[].source` is the row's provenance tag — `builtin-lint` or the
+//! plugin's manifest name (`edit_floor`, `dartq-commands` fix.rs:744-751);
+//! not to be confused with `fix.rs`'s internal `Edit.source` slice, which
+//! never leaves the engine. `edits[].stale` may appear in any tier when an
+//! applier marks an edit instead of dropping it (§15.6). `stale` is the one
+//! absent-tolerant field left: no writer emits it today, so enabling it is
+//! additive.
 //!
 //! Query answers (`query symbol`; row locators are the red line — `kind` is
 //! the row's semantic code):
