@@ -1543,6 +1543,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// `_tryRewriteNewToIdentifier` (:3684) makes it an identifier so it can
     /// name the unnamed constructor — and of recovery-spliced synthetic
     /// heads (the initializer synthetic-assignment stream).
+    ///
+    /// # Send-leaf span tiling (#585)
+    ///
+    /// For the bare shape (no argument list), the `handle_send` end — and
+    /// this function's return — is the *follower* token handed back by
+    /// [`Self::parse_arguments_opt`] (`;`, `=`, `)`, ...), left unconsumed.
+    /// A listener tiling the leaf as
+    /// `[begin.offset, end.offset + end.length)` therefore gets a span that
+    /// extends through that follower token; never assume a Send leaf's end
+    /// token is the send's own last token. This is load-bearing for anchors
+    /// that adopt the completed operand subtree: the Assignment bridge
+    /// reads `last_subtree_start` (the dartq-ast builder) over the
+    /// just-completed RHS, so in `x = y;` the anchored Assignment inherits
+    /// the RHS Send leaf's span and its extent includes the `;`. Tightening
+    /// the event to the own-token boundary would shift spans under every
+    /// such consumer (the r8 tiling evidence, #563).
     pub(crate) fn parse_send_from_identifier(&mut self, begin: TokenSpan) -> TokenSpan {
         let mut type_arg = TypeParamOrArg::None;
         if self.peek_kind() == TokenKind::Lt {
@@ -1563,13 +1579,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let end = if self.peek_kind() == TokenKind::OpenParen {
             self.parse_arguments_rest()
         } else {
+            // Bare shape: the unconsumed follower token is the event end
+            // (send-leaf span tiling, see this function's doc).
             self.parse_arguments_opt()
         };
         self.listener.handle_send(begin, end);
         end
     }
 
-    /// Official `parseArgumentsOpt` :9150.
+    /// Official `parseArgumentsOpt` :9494. Without an argument list, fires
+    /// `handle_no_arguments` with the *peeked follower* token (whatever
+    /// follows the send: `;`, `=`, `)`, ...) and returns that same span,
+    /// leaving the token unconsumed.
+    ///
+    /// The return is the send's event end, so a bare-name Send leaf tiles
+    /// through the follower — see [`Self::parse_send_from_identifier`] for
+    /// the consumer contract (#585).
     pub(crate) fn parse_arguments_opt(&mut self) -> TokenSpan {
         if self.peek_kind() == TokenKind::OpenParen {
             return self.parse_arguments_rest();

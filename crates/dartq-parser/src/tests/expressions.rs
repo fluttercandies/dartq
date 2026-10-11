@@ -18,6 +18,9 @@ use crate::token_id::TokenSpan;
 struct ExprLog {
     errors: Vec<String>,
     log: Vec<(&'static str, &'static str)>,
+    /// Send-leaf tiled spans `(begin.offset, end.offset + end.length)` in
+    /// UTF-16 — the tests/collector.rs recording convention (#585).
+    sends: Vec<(u32, u32)>,
 }
 
 impl ExprLog {
@@ -196,6 +199,11 @@ impl ParserListener for ExprLog {
     }
     fn handle_as_operator(&mut self, _: TokenSpan) {
         self.log.push(("handle", "as_operator"));
+    }
+    fn handle_send(&mut self, begin: TokenSpan, end: TokenSpan) {
+        self.log.push(("handle", "send"));
+        self.sends
+            .push((begin.range.offset, end.range.offset + end.range.length));
     }
 
     // Pattern events the switch-expression cases and pattern assignments
@@ -411,6 +419,48 @@ fn await_expression_events_split_by_async_state() {
     let c = parse("void f() async { await x; }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     c.assert_sequence(&[("begin", "await_expression"), ("end", "await_expression")]);
+}
+
+// —— send-leaf span tiling (#585) ————————————————————————————————————————
+
+/// A bare-name Send leaf's tiled span extends through its follower token:
+/// `parse_arguments_opt` hands back the peeked follower as the
+/// `handle_send` end, so `x;`'s leaf covers the `;` and the `x = 1` LHS
+/// leaf covers the `=`. Consumers must not assume leaf span == own token.
+#[test]
+fn bare_send_leaf_span_includes_follower_token() {
+    let src = "void f() { x; }";
+    let c = parse(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let x = src.find("x").unwrap() as u32;
+    let semi = src.find(';').unwrap() as u32;
+    assert_eq!(c.sends, [(x, semi + 1)]);
+
+    let src = "void f() { x = 1; }";
+    let c = parse(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let x = src.find("x").unwrap() as u32;
+    let eq = src.find('=').unwrap() as u32;
+    assert_eq!(c.sends, [(x, eq + 1)]);
+}
+
+/// The Assignment anchor adopts the just-completed RHS subtree via
+/// `last_subtree_start` (the dartq-ast builder read face), so the anchored
+/// Assignment's extent is the RHS Send leaf's tiled span — which includes
+/// the statement `;` (`x = y;` RHS leaf ends past the `;`).
+#[test]
+fn assignment_rhs_send_leaf_span_includes_semicolon() {
+    let src = "void f() { x = y; }";
+    let c = parse(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.count("handle", "assignment_expression"), 1);
+    let x = src.find("x").unwrap() as u32;
+    let eq = src.find('=').unwrap() as u32;
+    let y = src.find("y").unwrap() as u32;
+    let semi = src.find(';').unwrap() as u32;
+    // LHS leaf ends on the `=`; the RHS leaf — the subtree the Assignment
+    // anchor adopts — ends past the `;`.
+    assert_eq!(c.sends, [(x, eq + 1), (y, semi + 1)]);
 }
 
 // —— function literals ——————————————————————————————————————————————————
