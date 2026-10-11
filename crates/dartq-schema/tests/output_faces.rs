@@ -6,8 +6,9 @@
 //! in `tests/alignment.rs`.
 
 use dartq_schema::{
-    Domain, SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_FIX_PATCH, SCHEMA_VERSION_INDEX,
-    SCHEMA_VERSION_QUERY, SCHEMA_VERSION_RUN_METRICS, Verbosity, validate, validate_at_tier,
+    Domain, SCHEMA_VERSION_ANALYZE, SCHEMA_VERSION_ASSISTS, SCHEMA_VERSION_CHECK,
+    SCHEMA_VERSION_COMPAT, SCHEMA_VERSION_FIX_PATCH, SCHEMA_VERSION_INDEX, SCHEMA_VERSION_QUERY,
+    SCHEMA_VERSION_RUN_METRICS, Verbosity, validate, validate_at_tier,
 };
 
 /// The v1 freeze: every dartq-native face ships at contract version 1.
@@ -20,6 +21,9 @@ fn dartq_native_faces_are_frozen_at_v1() {
     assert_eq!(SCHEMA_VERSION_COMPAT, 1);
     assert_eq!(SCHEMA_VERSION_RUN_METRICS, 1);
     assert_eq!(SCHEMA_VERSION_INDEX, 1);
+    assert_eq!(SCHEMA_VERSION_CHECK, 1);
+    assert_eq!(SCHEMA_VERSION_ANALYZE, 1);
+    assert_eq!(SCHEMA_VERSION_ASSISTS, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +673,284 @@ fn index_run_zero_totals_pass_and_extras_fail() {
     let violation = violation_of(&wrong.to_string(), Domain::Index);
     assert_eq!(violation.path, "symbols");
     assert_eq!(violation.expected, "an integer");
+}
+
+// ---------------------------------------------------------------------------
+// Check answer (daemon `dartq/check`)
+// ---------------------------------------------------------------------------
+
+/// Transcript of `check_row` at its compact tier
+/// (`crates/dartq-daemon/src/commands.rs:972-981`) inside the
+/// `session_answer` envelope (commands.rs:1008): the machine line's field
+/// set as JSON rows, `severity`/`type` carrying the diagnostics domain's
+/// own spellings. `symbols`/`since` ride absent-tolerant (§15.8).
+#[test]
+fn compact_check_answer_passes_validation() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_CHECK,
+        "diagnostics": [
+            {
+                "file": "/w/lib/a.dart",
+                "severity": "ERROR",
+                "type": "COMPILE_TIME_ERROR",
+                "code": "undefined_identifier",
+                "line": 3,
+                "column": 7,
+                "length": 2,
+                "message": "Undefined name 'fa'.",
+            },
+            {
+                "file": "/w/lib/b.dart",
+                "severity": "WARNING",
+                "type": "STATIC_WARNING",
+                "code": "dead_null_aware_expression",
+                "line": 12,
+                "column": 3,
+                "length": 5,
+                "message": "The value of the expression is dead.",
+            },
+        ],
+        "since": 42,
+    });
+    validate_ok(&doc.to_string(), Domain::Check);
+}
+
+/// The minimal tier (check_row, commands.rs:965-971): the red line is the
+/// code plus the file locator; an undeclared column is rejected and the
+/// severity spelling is exact.
+#[test]
+fn minimal_check_rows_pass_and_negatives_are_named() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_CHECK,
+        "diagnostics": [{
+            "file": "/w/lib/a.dart",
+            "code": "undefined_identifier",
+            "line": 3,
+            "column": 7,
+            "length": 2,
+        }],
+    });
+    validate_ok(&doc.to_string(), Domain::Check);
+    assert!(validate_at_tier(&doc.to_string(), Domain::Check, Verbosity::Minimal).is_ok());
+
+    let extra = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_CHECK,
+        "diagnostics": [{
+            "file": "/w/lib/a.dart",
+            "code": "undefined_identifier",
+            "line": 3,
+            "column": 7,
+            "length": 2,
+            "correctionMessage": "use fb",
+        }],
+    });
+    let violation = violation_of(&extra.to_string(), Domain::Check);
+    assert_eq!(violation.path, "diagnostics[0].correctionMessage");
+
+    let wrong = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_CHECK,
+        "diagnostics": [{
+            "file": "/w/lib/a.dart",
+            "severity": "Fatal",
+            "code": "undefined_identifier",
+            "line": 3,
+            "column": 7,
+            "length": 2,
+        }],
+    });
+    let violation = violation_of(&wrong.to_string(), Domain::Check);
+    assert_eq!(violation.path, "diagnostics[0].severity");
+}
+
+// ---------------------------------------------------------------------------
+// Analyze answer (daemon `dartq/analyze`)
+// ---------------------------------------------------------------------------
+
+/// Transcript of the compact `analyze_answer` entry
+/// (`crates/dartq-daemon/src/commands.rs:934-936`) — the
+/// `lsp::AnalyzeEntry` serialization (lsp.rs:105-110 over the LSP
+/// §Diagnostic of lsp.rs:83-91). Positions are LSP: zero-based lines and
+/// UTF-16 columns, unlike the CLI faces' 1-based rows.
+#[test]
+fn compact_analyze_answer_passes_validation() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_ANALYZE,
+        "diagnostics": [{
+            "uri": "file:///w/lib/a.dart",
+            "range": {
+                "start": {"line": 2, "character": 6},
+                "end": {"line": 2, "character": 8},
+            },
+            "severity": 1,
+            "code": "undefined_identifier",
+            "source": "dartq",
+            "message": "Undefined name 'fa'.",
+        }],
+    });
+    validate_ok(&doc.to_string(), Domain::Analyze);
+}
+
+/// The minimal tier (analyze_answer, commands.rs:929-933): `uri` + `code` +
+/// `range`; the LSP severity is one of the produced values and undeclared
+/// entries fields are named.
+#[test]
+fn minimal_analyze_entries_pass_and_negatives_are_named() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_ANALYZE,
+        "diagnostics": [{
+            "uri": "file:///w/lib/a.dart",
+            "code": "undefined_identifier",
+            "range": {
+                "start": {"line": 2, "character": 6},
+                "end": {"line": 2, "character": 8},
+            },
+        }],
+    });
+    validate_ok(&doc.to_string(), Domain::Analyze);
+    assert!(validate_at_tier(&doc.to_string(), Domain::Analyze, Verbosity::Minimal).is_ok());
+
+    let wrong = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_ANALYZE,
+        "diagnostics": [{
+            "uri": "file:///w/lib/a.dart",
+            "code": "undefined_identifier",
+            "range": {
+                "start": {"line": 2, "character": 6},
+                "end": {"line": 2, "character": 8},
+            },
+            "severity": 4,
+        }],
+    });
+    let violation = violation_of(&wrong.to_string(), Domain::Analyze);
+    assert_eq!(violation.path, "diagnostics[0].severity");
+
+    let extra = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_ANALYZE,
+        "diagnostics": [{
+            "uri": "file:///w/lib/a.dart",
+            "code": "undefined_identifier",
+            "range": {
+                "start": {"line": 2, "character": 6},
+                "end": {"line": 2, "character": 8},
+            },
+            "tags": [1],
+        }],
+    });
+    let violation = violation_of(&extra.to_string(), Domain::Analyze);
+    assert_eq!(violation.path, "diagnostics[0].tags");
+}
+
+// ---------------------------------------------------------------------------
+// Assists document (`dartq assists` / daemon `dartq/assists`)
+// ---------------------------------------------------------------------------
+
+/// Transcript of `assists_json` at its compact tier
+/// (`crates/dartq-commands/src/fix.rs:801-850`): plugin rows in priority
+/// order, each carrying its provenance (`source`), title (`message`),
+/// priority, and anchored edits on the red-line floor; the second edit
+/// shows the empty-context omission at line boundaries, and the
+/// unserviceable host answers in `errors` (fix.rs:837-848).
+#[test]
+fn compact_assists_document_passes_validation() {
+    let doc = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "assists": [
+            {
+                "message": "Wrap in StatefulWidget",
+                "source": "assistant",
+                "priority": 1,
+                "edits": [{
+                    "offset": 19,
+                    "length": 4,
+                    "replacement": "StatefulWidget",
+                    "source": "assistant",
+                    "anchor": {
+                        "line": 2,
+                        "column": 16,
+                        "context_before": "class Foo ",
+                        "context_after": "{}",
+                    },
+                }],
+            },
+            {
+                "message": "Import 'package:flutter/widgets.dart'",
+                "source": "importer",
+                "priority": -2,
+                "edits": [{
+                    "offset": 0,
+                    "length": 0,
+                    "replacement": "import 'package:flutter/widgets.dart';\n",
+                    "source": "importer",
+                    "anchor": {"line": 1, "column": 1},
+                }],
+            },
+        ],
+        "errors": [{"plugin": "offline", "message": "manifest not found"}],
+    });
+    validate_ok(&doc.to_string(), Domain::Assists);
+}
+
+/// The minimal tier (assists_json, fix.rs:802, 824-828): the row priority
+/// and the edit anchors are the trims — the title and the provenance tag
+/// ride every tier; the patch-only `rule` column is not an assists field.
+#[test]
+fn minimal_assists_pass_and_negatives_are_named() {
+    let doc = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "assists": [{
+            "message": "Wrap in StatefulWidget",
+            "source": "assistant",
+            "edits": [{
+                "offset": 19,
+                "length": 4,
+                "replacement": "StatefulWidget",
+                "source": "assistant",
+            }],
+        }],
+    });
+    validate_ok(&doc.to_string(), Domain::Assists);
+    assert!(validate_at_tier(&doc.to_string(), Domain::Assists, Verbosity::Minimal).is_ok());
+
+    let full = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "assists": [{
+            "message": "Wrap in StatefulWidget",
+            "source": "assistant",
+            "priority": 1,
+            "edits": [{
+                "offset": 19,
+                "length": 4,
+                "replacement": "StatefulWidget",
+                "source": "assistant",
+                "anchor": {"line": 2, "column": 16},
+            }],
+        }],
+    });
+    let violation = validate_at_tier(&full.to_string(), Domain::Assists, Verbosity::Minimal)
+        .expect_err("minimal must not carry the priority");
+    assert_eq!(violation.path, "assists[0].priority");
+    assert_eq!(violation.expected, "omitted at the minimal tier");
+
+    let patch_row = serde_json::json!({
+        "file": "lib/foo.dart",
+        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "assists": [{
+            "message": "Wrap in StatefulWidget",
+            "source": "assistant",
+            "edits": [{
+                "offset": 19,
+                "length": 4,
+                "replacement": "StatefulWidget",
+                "source": "assistant",
+                "rule": "unnecessary_new",
+            }],
+        }],
+    });
+    let violation = violation_of(&patch_row.to_string(), Domain::Assists);
+    assert_eq!(violation.path, "assists[0].edits[0].rule");
 }
 
 // ---------------------------------------------------------------------------

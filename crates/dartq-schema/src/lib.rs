@@ -171,6 +171,60 @@
 //! | `references[].qualified` | (count) | ●       | ●    |
 //! | `counts`                 | ●       |         |      |
 //!
+//! Check answer rows (the daemon's `dartq/check`; the row's code + file
+//! locator are the red line — `line`/`column`/`length` locate, `file`
+//! names the document. `severity`/`type` reuse the diagnostics envelope's
+//! spellings):
+//!
+//! | field              | minimal | compact | full |
+//! |--------------------|---------|---------|------|
+//! | `file`             | ●       | ●       | ●    |
+//! | `code`             | ●       | ●       | ●    |
+//! | `line`/`column`    | ●       | ●       | ●    |
+//! | `length`           | ●       | ●       | ●    |
+//! | `severity`         |         | ●       | ●    |
+//! | `type`             |         | ●       | ●    |
+//! | `message`          |         | ●       | ●    |
+//!
+//! `full` equals `compact` plus the session economics (`symbols` — the
+//! short-id table over the rows' file paths). The two views (disk
+//! pipeline, agent overlay) emit the same row shape.
+//!
+//! Analyze answer entries (the daemon's `dartq/analyze`; the entry's code
+//! + locator are the red line — LSP positions, zero-based, unlike the CLI
+//! faces' 1-based rows):
+//!
+//! | field                    | minimal | compact | full |
+//! |--------------------------|---------|---------|------|
+//! | `uri`                    | ●       | ●       | ●    |
+//! | `code`                   | ●       | ●       | ●    |
+//! | `range`                  | ●       | ●       | ●    |
+//! | `severity` (LSP 1/2/3)   |         | ●       | ●    |
+//! | `source`                 |         | ●       | ●    |
+//! | `message`                |         | ●       | ●    |
+//!
+//! `full` equals `compact` plus the session economics (`symbols` over the
+//! entry URIs). No writer emits `since` on this face — the pull face has
+//! no delta parameter — so none is declared.
+//!
+//! Assists documents (`dartq assists` / `dartq/assists`; per assist row —
+//! the row's provenance tag and title ride every tier, unlike the fix
+//! patch's human-name rows: the writer drops only the priority and the
+//! edit anchors at minimal):
+//!
+//! | field                 | minimal | compact | full |
+//! |-----------------------|---------|---------|------|
+//! | `assists[].message`   | ●       | ●       | ●    |
+//! | `assists[].source`    | ●       | ●       | ●    |
+//! | `assists[].edits[]`   | ● floor | ● floor | ● floor |
+//! | `assists[].priority`  |         | ●       | ●    |
+//! | `assists[].edits[].anchor` |    | ●       | ●    |
+//! | `errors[]`            | opt     | opt     | opt  |
+//!
+//! The edits' floor is the fix patch's own — `offset`/`length`/
+//! `replacement` plus the provenance tag (`source`, the plugin's manifest
+//! name). `errors` rides any tier when a host could not serve the request.
+//!
 //! Tier-invariant faces: the impact report (every field is a locator or a
 //! verdict — nothing prose-like to trim; `since` is its token lever), the
 //! run-metrics sidecar (a benchmark artifact, emitted complete or not at
@@ -190,9 +244,9 @@
 //!   table lookup, not a schema concern). The faces whose economics dedup
 //!   their own path-valued rows spell the same table id → FILE path — the
 //!   values are the very strings substituted out of the rows, a different
-//!   value domain than the entity-reference table. `Domain::Explain`
-//!   validates that spelling (`support::path_session_fields`); the daemon's
-//!   check/analyze faces ride it too, domain-less today.
+//!   value domain than the entity-reference table. [`Domain::Explain`],
+//!   [`Domain::Check`], and [`Domain::Analyze`] validate that spelling
+//!   (`support::path_session_fields`).
 //! * **Delta mode** — a repeat query may carry `since: <epoch>`; the answer
 //!   restricted to changed rows keeps its envelope shape and echoes the
 //!   cursor in the optional `since` field (absent = full answer).
@@ -220,6 +274,11 @@
 //! * [`Domain::RunMetrics`] — the `--metrics-json` run summary
 //!   ([`run_metrics_schema`]).
 //! * [`Domain::Index`] — the §15.1 index run summary ([`index_schema`]).
+//! * [`Domain::Check`] — the daemon's `dartq/check` answer
+//!   ([`check_schema`]).
+//! * [`Domain::Analyze`] — the daemon's `dartq/analyze` answer
+//!   ([`analyze_schema`]).
+//! * [`Domain::Assists`] — the assists document ([`assists_schema`]).
 //! * The §15.9 workspace config — `dartq.yaml` ([`config_schema`]) — is
 //!   published without a [`Domain`]: it is an input document, and its
 //!   enforcement point is the lenient reader in `dartq-commands`, not a
@@ -252,6 +311,9 @@ use std::fmt;
 
 use serde_json::Value;
 
+mod analyze;
+mod assists;
+mod check;
 mod compat;
 mod config;
 mod diagnostics;
@@ -263,6 +325,9 @@ mod query;
 mod run_metrics;
 mod support;
 
+pub use analyze::{SCHEMA_VERSION_ANALYZE, analyze_schema};
+pub use assists::{SCHEMA_VERSION_ASSISTS, assists_schema};
+pub use check::{SCHEMA_VERSION_CHECK, check_schema};
 pub use compat::{ERROR_KINDS, SCHEMA_VERSION_COMPAT, compat_schema};
 pub use config::{SCHEMA_VERSION_CONFIG, TARGET_KINDS, config_schema};
 pub use diagnostics::{SCHEMA_VERSION_DIAGNOSTICS, diagnostics_schema};
@@ -292,6 +357,12 @@ pub enum Domain {
     RunMetrics,
     /// The §15.1 index run summary (`dartq index`).
     Index,
+    /// The daemon's `dartq/check` answer (`schema_version` + machine rows).
+    Check,
+    /// The daemon's `dartq/analyze` answer (LSP diagnostic entries).
+    Analyze,
+    /// The assists document (`dartq assists` / `dartq/assists`).
+    Assists,
 }
 
 /// A §15.1/§15.8.1 verbosity tier — the `--verbosity` spelling a face
@@ -373,6 +444,9 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
         Domain::Index => index::validate_index(&value),
+        Domain::Check => check::validate_check(&value),
+        Domain::Analyze => analyze::validate_analyze(&value),
+        Domain::Assists => assists::validate_assists(&value),
     }
 }
 
@@ -412,5 +486,8 @@ pub fn validate_at_tier(
         (Domain::Query, tier) => query::validate_query_at_tier(&value, tier),
         (Domain::Compat, tier) => compat::validate_compat_at_tier(&value, tier),
         (Domain::Explain, tier) => explain::validate_explain_at_tier(&value, tier),
+        (Domain::Check, tier) => check::validate_check_at_tier(&value, tier),
+        (Domain::Analyze, tier) => analyze::validate_analyze_at_tier(&value, tier),
+        (Domain::Assists, tier) => assists::validate_assists_at_tier(&value, tier),
     }
 }

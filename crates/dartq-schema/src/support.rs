@@ -287,6 +287,41 @@ pub(crate) fn path_session_fields(obj: &Map<String, Value>) -> Result<(), Schema
     Ok(())
 }
 
+/// The §15.6 edit-row floor shared by the fix patch and assists documents:
+/// the red-line locator trio (`offset`/`length`/`replacement`) plus the
+/// provenance tag (`source` — the row never drops it, §15.8), and the
+/// optional compact-tier anchor (`line`/`column` plus the context flanks;
+/// empty context strings are omitted, §15.8.5). Callers run their own
+/// `exact_fields` first: the fix patch rows carry more optional columns
+/// (`rule`/`message`/`priority`/`stale`) than the assists rows.
+pub(crate) fn edit_floor(obj: &Map<String, Value>, p: &str) -> Result<(), SchemaViolation> {
+    let offset = join(p, "offset");
+    non_negative(field(obj, "offset", p)?, &offset)?;
+    let length = join(p, "length");
+    non_negative(field(obj, "length", p)?, &length)?;
+    string(field(obj, "replacement", p)?, &join(p, "replacement"))?;
+    string(field(obj, "source", p)?, &join(p, "source"))?;
+    if let Some(anchor) = obj.get("anchor") {
+        let ap = join(p, "anchor");
+        let anchor = object(anchor, &ap)?;
+        exact_fields(anchor, ANCHOR, ANCHOR_OPTIONAL, &ap)?;
+        let line = join(&ap, "line");
+        one_based(field(anchor, "line", &ap)?, &line)?;
+        let column = join(&ap, "column");
+        one_based(field(anchor, "column", &ap)?, &column)?;
+        if let Some(before) = anchor.get("context_before") {
+            string(before, &join(&ap, "context_before"))?;
+        }
+        if let Some(after) = anchor.get("context_after") {
+            string(after, &join(&ap, "context_after"))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const ANCHOR: &[&str] = &["line", "column"];
+pub(crate) const ANCHOR_OPTIONAL: &[&str] = &["context_before", "context_after"];
+
 #[cfg(test)]
 pub(crate) fn schema_keys(value: &Value) -> Vec<String> {
     let mut keys: Vec<String> = value["properties"]

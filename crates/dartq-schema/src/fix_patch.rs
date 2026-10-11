@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::SchemaViolation;
 use crate::Verbosity;
 use crate::support::{
-    absent, boolean, describe, exact_fields, field, join, non_negative, object, one_based,
-    pinned_version, rows, string, violation,
+    absent, boolean, describe, edit_floor, exact_fields, field, join, object, pinned_version, rows,
+    string, violation,
 };
 
 /// The patch document's contract version. Mirrors the fix face's
@@ -87,8 +87,6 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 const PATCH_TOP: &[&str] = &["file", "schema_version", "edits"];
 const EDIT: &[&str] = &["offset", "length", "replacement", "source"];
 const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "message", "priority", "stale"];
-const ANCHOR: &[&str] = &["line", "column"];
-const ANCHOR_OPTIONAL: &[&str] = &["context_before", "context_after"];
 
 pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
@@ -99,27 +97,9 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         let p = format!("edits[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, EDIT, EDIT_OPTIONAL, &p)?;
-        let offset = join(&p, "offset");
-        non_negative(field(obj, "offset", &p)?, &offset)?;
-        let length = join(&p, "length");
-        non_negative(field(obj, "length", &p)?, &length)?;
-        string(field(obj, "replacement", &p)?, &join(&p, "replacement"))?;
-        string(field(obj, "source", &p)?, &join(&p, "source"))?;
-        if let Some(anchor) = obj.get("anchor") {
-            let ap = join(&p, "anchor");
-            let anchor = object(anchor, &ap)?;
-            exact_fields(anchor, ANCHOR, ANCHOR_OPTIONAL, &ap)?;
-            let line = join(&ap, "line");
-            one_based(field(anchor, "line", &ap)?, &line)?;
-            let column = join(&ap, "column");
-            one_based(field(anchor, "column", &ap)?, &column)?;
-            if let Some(before) = anchor.get("context_before") {
-                string(before, &join(&ap, "context_before"))?;
-            }
-            if let Some(after) = anchor.get("context_after") {
-                string(after, &join(&ap, "context_after"))?;
-            }
-        }
+        // The red-line trio, the provenance tag, and the optional anchor —
+        // the shared §15.6 floor (support::edit_floor).
+        edit_floor(obj, &p)?;
         if let Some(rule) = obj.get("rule") {
             string(rule, &join(&p, "rule"))?;
         }
@@ -188,9 +168,9 @@ mod tests {
         edit_fields.sort_unstable();
         assert_eq!(crate::support::schema_keys(edit), edit_fields);
         let anchor = &edit["properties"]["anchor"];
-        let mut anchor_fields: Vec<String> = ANCHOR
+        let mut anchor_fields: Vec<String> = crate::support::ANCHOR
             .iter()
-            .chain(ANCHOR_OPTIONAL.iter())
+            .chain(crate::support::ANCHOR_OPTIONAL.iter())
             .map(|s| (*s).to_owned())
             .collect();
         anchor_fields.sort_unstable();

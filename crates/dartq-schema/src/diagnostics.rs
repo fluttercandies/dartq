@@ -97,8 +97,13 @@ const DIAGNOSTIC_OPTIONAL: &[&str] = &[
 const LOCATION: &[&str] = &["file", "range"];
 const RANGE: &[&str] = &["start", "end"];
 const POSITION: &[&str] = &["offset", "line", "column"];
-const SEVERITIES: &[&str] = &["INFO", "WARNING", "ERROR"];
-const DIAGNOSTIC_TYPES: &[&str] = &[
+/// The machine severity spellings (`Severity::as_machine_str`,
+/// `crates/dartq-diagnostics/src/model.rs:35`) — shared with the check
+/// domain, whose rows carry the same field.
+pub(crate) const SEVERITIES: &[&str] = &["INFO", "WARNING", "ERROR"];
+/// The machine `TYPE` spellings (`DiagnosticType::as_str`, model.rs:79) —
+/// shared with the check domain, whose rows carry the same field.
+pub(crate) const DIAGNOSTIC_TYPES: &[&str] = &[
     "SYNTACTIC_ERROR",
     "COMPILE_TIME_ERROR",
     "STATIC_WARNING",
