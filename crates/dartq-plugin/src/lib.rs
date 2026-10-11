@@ -45,8 +45,10 @@
 //! **intersection** of both sides' `capabilities`; unknown capability names
 //! on either side mean "not enabled", never an error. Diagnostics may flow
 //! only after the handshake completed — a diagnostic arriving earlier is
-//! rejected, never queued. `shutdown` is the final exchange; after its reply
-//! the session is over.
+//! rejected, never queued. `shutdown` is the final exchange: a diagnostic
+//! the host wrote before it could see the shutdown request crosses it
+//! legitimately on the wire and is queued, never fatal; after the shutdown
+//! reply the session is over.
 //!
 //! Any session error is fatal: the core tears the plugin process down and
 //! reports a `plugin_crashed` diagnostic (PRD §14.3 crash isolation). There

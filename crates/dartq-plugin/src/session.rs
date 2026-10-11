@@ -19,6 +19,12 @@
 //!   with [`SessionError::UnexpectedFrame`] — never queued. Queueing would
 //!   hide a protocol violation and add an unbounded buffer; the host tears
 //!   the plugin down instead (PRD §14.3).
+//! - A diagnostic arriving while the shutdown reply is awaited
+//!   ([`SessionState::AwaitingShutdownReply`]) is queued, not rejected: the
+//!   host wrote it before it could have seen the shutdown request, so it is
+//!   legitimate in-flight traffic crossing the request on the wire. After
+//!   the reply ([`SessionState::Terminated`]) a diagnostic is a violation
+//!   again.
 //! - Any `Err` from [`Session::handle`] is fatal: the caller must discard the
 //!   session and kill the plugin process. The session never resynchronizes.
 
@@ -345,13 +351,23 @@ impl Session {
         let state = self.state.as_str();
         match method_kind(&frame.method) {
             MethodKind::Diagnostic => {
-                // Diagnostics are legal only once the handshake completed;
-                // they are rejected (never queued) in every other state.
+                // Diagnostics are legal once the handshake completed. They
+                // also ride out the shutdown window: a diagnostic the host
+                // wrote before it saw the shutdown request legitimately
+                // crosses that request on the wire, and the request-send
+                // flip is local — unobservable to the host — so rejecting
+                // it would manufacture a crash out of in-flight traffic
+                // (the official host tolerates the same window: it sends
+                // `plugin.shutdown` and simply waits out the reply). After
+                // the reply (`Terminated`) the reader is gone; a diagnostic
+                // there is a violation again.
                 match self.state {
-                    SessionState::Ready => Ok(Incoming::Diagnostic(parse_payload(
-                        &frame.method,
-                        std::mem::take(&mut frame.params),
-                    )?)),
+                    SessionState::Ready | SessionState::AwaitingShutdownReply => {
+                        Ok(Incoming::Diagnostic(parse_payload(
+                            &frame.method,
+                            std::mem::take(&mut frame.params),
+                        )?))
+                    }
                     _ => Err(SessionError::UnexpectedFrame {
                         method: frame.method,
                         state,
@@ -703,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_after_shutdown_request_are_rejected() {
+    fn diagnostic_crossing_the_shutdown_request_is_queued_not_fatal() {
         let mut session = Session::new(CapabilitySet::all());
         let init = session.send_initialize().expect("send initialize");
         session
@@ -713,13 +729,40 @@ mod tests {
                 1,
             ))
             .expect("handshake");
-        session.send_shutdown().expect("send shutdown");
-        let notification = FakePlugin::diagnostic("lib/main.dart", "late");
+        let shutdown = session.send_shutdown().expect("send shutdown");
+
+        // The host answered the last work batch without having seen the
+        // shutdown request: the finding legitimately crosses it on the wire
+        // and must ride out the window, not tear the session down.
+        let crossing = FakePlugin::diagnostic("lib/main.dart", "in flight");
         assert_eq!(
-            session.handle(notification).unwrap_err(),
+            session.handle(crossing).expect("crossing diagnostic queues"),
+            Incoming::Diagnostic(PluginDiagnostic {
+                file: "lib/main.dart".to_owned(),
+                severity: Severity::Warning,
+                code: "my_plugin/lint".to_owned(),
+                message: "in flight".to_owned(),
+                offset: 3,
+                length: 4,
+            })
+        );
+
+        // The shutdown reply still completes the session...
+        let reply = Frame::request(shutdown.id.expect("id"), METHOD_SHUTDOWN, Map::new());
+        assert_eq!(
+            session.handle(reply).expect("handle"),
+            Incoming::ShutdownComplete
+        );
+        assert_eq!(session.state(), SessionState::Terminated);
+
+        // ...and after the reply a diagnostic is a violation again: the
+        // session is over, the reader is gone.
+        let late = FakePlugin::diagnostic("lib/main.dart", "late");
+        assert_eq!(
+            session.handle(late).unwrap_err(),
             SessionError::UnexpectedFrame {
                 method: METHOD_DIAGNOSTIC_NOTIFICATION.to_owned(),
-                state: SessionState::AwaitingShutdownReply.as_str(),
+                state: SessionState::Terminated.as_str(),
             }
         );
     }

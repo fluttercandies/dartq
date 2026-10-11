@@ -19,6 +19,7 @@ pub struct PluginStats {
     frames_out: AtomicU64,
     bytes_out: AtomicU64,
     frames_dropped: AtomicU64,
+    rss_disarms: AtomicU64,
     restarts: AtomicU64,
 }
 
@@ -28,9 +29,12 @@ pub struct PluginStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PluginStatsSnapshot {
     /// Largest resident set the child process was ever seen holding, in
-    /// bytes. Linux reads the kernel's `VmHWM` high-water mark (exact); macOS
-    /// samples `proc_pid_rusage` `ri_resident_size` at a fixed poll interval;
-    /// other targets do not sample (stays 0).
+    /// bytes. Linux reads the kernel's `VmHWM` high-water mark — exact, no
+    /// allocation spike can escape it. macOS samples `proc_pid_rusage`
+    /// `ri_resident_size` at the monitor's poll interval, so the recorded
+    /// peak is a lower bound: a spike fitting between two samples is
+    /// invisible. Other targets do not sample (stays 0); every gap in this
+    /// face is counted in [`Self::rss_disarms`].
     pub peak_rss_bytes: u64,
     /// Complete frames received from the plugin (handshake replies, plugin
     /// diagnostics, shutdown reply).
@@ -41,10 +45,18 @@ pub struct PluginStatsSnapshot {
     pub frames_out: u64,
     /// Raw bytes written to the plugin's stdin, line terminators included.
     pub bytes_out: u64,
-    /// Frames rejected by the 16 MiB frame guard before buffering. Every
-    /// drop is fatal to the session (no resynchronization), so this counter
-    /// also explains restarts.
+    /// Frames rejected by the 16 MiB frame guard before they crossed the
+    /// wire. Inbound drops are fatal to the session (no resynchronization);
+    /// outbound drops are rejected at the handle with the same typed error
+    /// and leave the child running. Both explain an error the caller sees.
     pub frames_dropped: u64,
+    /// Times the monitor disarmed the RSS watch for a generation: once per
+    /// generation on platforms with no RSS sampler, or after repeated failed
+    /// samples on a live child (a bounded tolerance rides out transient
+    /// read failures first). Nonzero means the manifest's `memory_budget_mb`
+    /// was unenforced — and `peak_rss_bytes` frozen — for those generations;
+    /// the analyze callback clock stays armed regardless.
+    pub rss_disarms: u64,
     /// Times the child process died and was relaunched during this runtime's
     /// lifetime (PRD §14.3 crash isolation: a crash never takes the engine
     /// down; restarts beyond the manifest's retry budget end in
@@ -84,6 +96,13 @@ impl PluginStats {
         self.frames_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one disarm of the RSS watch: the memory row is unenforced
+    /// for that generation (no sampler on this platform, or sampling the
+    /// child failed past tolerance).
+    pub fn rss_disarm(&self) {
+        self.rss_disarms.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records one child relaunch.
     pub fn restart(&self) {
         self.restarts.fetch_add(1, Ordering::Relaxed);
@@ -100,6 +119,7 @@ impl PluginStats {
             frames_out: load(&self.frames_out),
             bytes_out: load(&self.bytes_out),
             frames_dropped: load(&self.frames_dropped),
+            rss_disarms: load(&self.rss_disarms),
             restarts: load(&self.restarts),
         }
     }
@@ -123,6 +143,7 @@ mod tests {
         stats.observe_rss(300);
         stats.observe_rss(200);
         stats.restart();
+        stats.rss_disarm();
 
         let snap = stats.snapshot();
         assert_eq!(snap.frames_in, 2);
@@ -132,5 +153,6 @@ mod tests {
         assert_eq!(snap.frames_dropped, 1);
         assert_eq!(snap.peak_rss_bytes, 300);
         assert_eq!(snap.restarts, 1);
+        assert_eq!(snap.rss_disarms, 1);
     }
 }

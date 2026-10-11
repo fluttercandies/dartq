@@ -43,18 +43,19 @@
 //!
 //! | Dimension | Mechanism here |
 //! | --- | --- |
-//! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. |
+//! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. Sampling loss never disarms the monitor: a platform without a sampler (or a live child that keeps failing its samples past a bounded tolerance) disarms only the RSS face — counted in `stats.rss_disarms` — while the thread stays on the analyze clock. |
 //! | CPU | `request/fixes` awaits its reply under the manifest's `callback_ms`; an overrun kills the child and consumes the restart budget. The analyze demand is enforced against the same budget: feeding engine diagnostics opens a clock in the monitor, closed when the child produces diagnostics (or dies); a demand still open past `callback_ms` kills the child through the same path. |
 //! | IPC | `initialize` and `shutdown` run under the manifest's `request_ms`; every stdin write is bounded by the same deadline (writer thread). |
 //! | Crash | Child death never propagates: the runtime relaunches within the manifest's retry budget (counted in `stats.restarts`), then reports [`RuntimeError::Crashed`] — the terminal form names the exhausted budget. |
-//! | Frame guard | Lines beyond [`MAX_FRAME_SIZE`] are dropped before buffering (counted) and tear the session down — the transport never resynchronizes. |
+//! | Frame guard | Both directions: inbound lines beyond [`MAX_FRAME_SIZE`] are dropped before buffering (counted) and tear the session down — the transport never resynchronizes; outbound frames beyond it are rejected at the handle with the same typed error before any write, counted, leaving the child untouched. |
 //!
 //! # Threading (std threads only, per the workspace runtime policy)
 //!
 //! Per generation (one child process): a reader thread owns the child's
 //! stdout, the [`Session`] state machine (behind a mutex shared with the
-//! handle), and the pending-diagnostics buffer; a monitor thread samples RSS
-//! and enforces the memory budget; a writer thread owns the child's stdin
+//! handle), and the pending-diagnostics buffer; a monitor thread enforces
+//! the memory budget (RSS samples) and the analyze demand's clock; a writer
+//! thread owns the child's stdin
 //! and is the only process writing to it — the handle (`&mut self`) feeds it
 //! frames and awaits per-write acks, which bounds every write without ever
 //! blocking the handle on a full pipe. All shared counters are atomics; the
@@ -114,6 +115,19 @@ const TEARDOWN_JOIN_BOUND: Duration = Duration::from_secs(1);
 /// join; `is_finished` + sleep bounds the wait without consuming the
 /// handle).
 const JOIN_POLL: Duration = Duration::from_millis(5);
+
+/// Whether this build has an RSS sampler at all (see `sample_rss` below).
+/// On a target without one the monitor does not exit — the analyze clock
+/// keeps its enforcement — and the RSS arm records its disarm in the stats
+/// once per generation instead of failing a sample on every tick.
+const RSS_SAMPLING_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// Consecutive failed RSS samples a live child's watch rides out before
+/// concluding the arm cannot run and disarming it, observably. Three ticks
+/// ≈ 300 ms at the poll interval: far above any transient scheduler or
+/// syscall hiccup, and a genuinely unreadable target exhausts it in one
+/// poll window instead of silently ending the enforcement.
+const RSS_SAMPLE_TOLERANCE: u32 = 3;
 
 /// Pending-diagnostics fuse: a plugin that queues more than this many
 /// un-drained diagnostics is torn down as a protocol violation instead of
@@ -668,6 +682,11 @@ impl PluginRuntime {
     ///
     /// A child already dead when `shutdown` is called surfaces its crash.
     ///
+    /// A plugin diagnostic still in flight when the request goes out (the
+    /// host wrote it before seeing the request) arrives while the reply is
+    /// awaited; it is queued and dropped with the runtime — tolerated, never
+    /// a crash.
+    ///
     /// # Errors
     ///
     /// [`RuntimeError::ShutdownTimeout`] (child killed), [`RuntimeError::Crashed`]
@@ -961,6 +980,21 @@ impl PluginRuntime {
         let mut bytes = encode_frame(frame)?;
         bytes.push(b'\n');
         let byte_len = bytes.len();
+        // Outbound twin of the inbound [`FrameDecoder`] guard, with the same
+        // raw-wire accounting (content plus terminator) and the same typed
+        // error: what passes here is exactly what the child's decoder accepts.
+        // An over-limit batch sent anyway would kill the child's decoder, and
+        // re-feeding it after the relaunch would kill the next child too — a
+        // deterministic restart loop burning the whole budget into a crash
+        // that blames the plugin. Rejecting on this side names the cause,
+        // counts the drop, and leaves the innocent child running.
+        if byte_len > MAX_FRAME_SIZE {
+            self.stats.frame_dropped();
+            return Err(ProtocolError::TooLarge {
+                limit: MAX_FRAME_SIZE,
+            }
+            .into());
+        }
         let commands = self.commands.as_ref().expect("writer present while alive");
         if commands.send(WriterCommand::Write(bytes)).is_err() {
             // The writer exited: the generation is winding down.
@@ -1204,6 +1238,53 @@ fn spawn_writer(
         .expect("spawn writer thread")
 }
 
+/// The monitor's RSS arm: armed at birth when the platform has a sampler,
+/// disarmed observably when sampling proves impossible. A sample can fail
+/// transiently on a healthy child (a racing proc read, an interrupted
+/// syscall), so the arm tolerates [`RSS_SAMPLE_TOLERANCE`] consecutive
+/// failures — any delivered sample resets the count — and only then gives
+/// up. A disarm covers the RSS face alone; the monitor thread keeps running
+/// the analyze clock either way.
+#[derive(Debug)]
+struct RssWatch {
+    armed: bool,
+    consecutive_failures: u32,
+}
+
+impl RssWatch {
+    fn new() -> Self {
+        Self {
+            armed: RSS_SAMPLING_SUPPORTED,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Whether a sample should be taken at all.
+    const fn armed(&self) -> bool {
+        self.armed
+    }
+
+    /// A delivered sample: the failure tolerance resets.
+    fn sampled(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// One failed sample on a live child. Returns `true` exactly once — when
+    /// the tolerance is spent and the arm disarms — so the caller records
+    /// the disarm in the stats at that point.
+    fn failed(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        self.consecutive_failures += 1;
+        if self.consecutive_failures > RSS_SAMPLE_TOLERANCE {
+            self.armed = false;
+            return true;
+        }
+        false
+    }
+}
+
 fn spawn_monitor(
     h: GenerationHandles,
     pid: u32,
@@ -1215,6 +1296,16 @@ fn spawn_monitor(
     std::thread::Builder::new()
         .name("dartq-plugin-monitor".to_owned())
         .spawn(move || {
+            // The RSS arm disarming (no sampler on this platform, or
+            // sampling this child keeps failing) must never take the thread
+            // down: the analyze-clock arm below is the other half of the
+            // §14.3 enforcement, and a monitor that quit on its first bad
+            // sample would silently drop both budgets for the generation.
+            // Disarms are counted in the stats instead.
+            let mut rss = RssWatch::new();
+            if !rss.armed() {
+                h.stats.rss_disarm();
+            }
             while h.running.load(Ordering::Relaxed) {
                 // §14.3 CPU row, analyze path: a fed demand that has produced
                 // no diagnostics for longer than the callback budget is the
@@ -1240,33 +1331,48 @@ fn spawn_monitor(
                     h.clock.close();
                     break;
                 }
-                match sample_rss(pid) {
-                    // A zero sample (process gone) never raises the peak.
-                    Some(rss) if rss > 0 => {
-                        h.stats.observe_rss(rss);
-                        if rss > memory_cap_bytes {
-                            // §14.3 memory enforcement: over-budget child
-                            // dies. Record the cause so the crash diagnostic
-                            // can name the memory row, and flip `alive` so
-                            // the next interaction restarts instead of
-                            // writing into the dying pipe; the reader's EOF
-                            // turns this into the ordinary crash path.
-                            *h.death.lock().expect("death lock") = Some(format!(
-                                "RSS sample {rss} exceeded the {memory_cap_bytes}-byte \
-                                 memory budget"
-                            ));
-                            h.alive.store(false, Ordering::Relaxed);
-                            if let Some(mut child) = child.lock().expect("child lock").take() {
-                                kill_and_reap(&mut child);
-                            }
-                            break;
-                        }
-                    }
-                    Some(_) => {}
-                    None => break,
-                }
+                // A dead generation is not a sampling failure: the reader's
+                // EOF (the ordinary death path) ends the monitor here, before
+                // the sample, so dead-child read failures cannot pollute the
+                // disarm counter.
                 if !h.alive.load(Ordering::Relaxed) {
                     break;
+                }
+                if rss.armed() {
+                    match sample_rss(pid) {
+                        // A zero sample (process gone) never raises the peak.
+                        Some(rss_bytes) if rss_bytes > 0 => {
+                            rss.sampled();
+                            h.stats.observe_rss(rss_bytes);
+                            if rss_bytes > memory_cap_bytes {
+                                // §14.3 memory enforcement: over-budget child
+                                // dies. Record the cause so the crash diagnostic
+                                // can name the memory row, and flip `alive` so
+                                // the next interaction restarts instead of
+                                // writing into the dying pipe; the reader's EOF
+                                // turns this into the ordinary crash path.
+                                *h.death.lock().expect("death lock") = Some(format!(
+                                    "RSS sample {rss_bytes} exceeded the {memory_cap_bytes}-byte \
+                                     memory budget"
+                                ));
+                                h.alive.store(false, Ordering::Relaxed);
+                                if let Some(mut child) = child.lock().expect("child lock").take() {
+                                    kill_and_reap(&mut child);
+                                }
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            if rss.failed() {
+                                // Tolerance spent on a live child: the memory
+                                // row is unenforceable for the rest of this
+                                // generation. Record it and keep the clock
+                                // armed.
+                                h.stats.rss_disarm();
+                            }
+                        }
+                    }
                 }
                 std::thread::sleep(RSS_POLL_INTERVAL);
             }
@@ -1276,11 +1382,19 @@ fn spawn_monitor(
 
 /// The child's resident set in bytes, `None` once the process is gone.
 ///
+/// The two samplers are deliberately **not** symmetric, and the recorded
+/// peak says so: Linux reads the kernel's monotone high-water mark, so no
+/// allocation spike can escape it; macOS reads an instantaneous value, so a
+/// spike fitting between two [`RSS_POLL_INTERVAL`] polls is invisible and
+/// `stats.peak_rss_bytes` is a lower bound there. The budget enforcement
+/// inherits the same shape — exact on Linux, sampled on macOS.
+///
 /// - Linux: `/proc/<pid>/status` `VmHWM`, the kernel's exact high-water mark.
 /// - macOS: `proc_pid_rusage` `ri_resident_size` (`rusage_info_v0`, ABI
 ///   pinned against the SDK's `libproc.h`/`sys/resource.h`; flavor
 ///   `RUSAGE_INFO_V0` == 0).
-/// - Other targets: unsampled (the counter stays 0, documented in
+/// - Other targets: unsampled (the counter stays 0 and the arm is disarmed,
+///   counted, in [`PluginStatsSnapshot::rss_disarms`]; documented in
 ///   [`PluginStatsSnapshot`]).
 #[cfg(target_os = "linux")]
 fn sample_rss(pid: u32) -> Option<u64> {
@@ -1471,6 +1585,32 @@ mod tests {
             None,
             "closed when diagnostics arrive or the generation dies"
         );
+    }
+
+    #[test]
+    fn rss_watch_tolerates_consecutive_failures_then_disarms_once() {
+        let mut watch = RssWatch::new();
+        if !RSS_SAMPLING_SUPPORTED {
+            // This build has no sampler: the arm starts disarmed, records
+            // nothing further, and the monitor runs on the clock alone.
+            assert!(!watch.armed());
+            assert!(!watch.failed(), "a disarmed watch reports nothing");
+            return;
+        }
+        assert!(watch.armed(), "armed at birth on a sampling platform");
+        for _ in 0..RSS_SAMPLE_TOLERANCE {
+            assert!(!watch.failed(), "a failure inside the tolerance keeps the arm");
+            assert!(watch.armed());
+        }
+        // One delivered sample resets the count: only *consecutive* failures
+        // can spend the tolerance — a flaky sampler never accumulates a disarm.
+        watch.sampled();
+        for _ in 0..RSS_SAMPLE_TOLERANCE {
+            assert!(!watch.failed());
+        }
+        assert!(watch.failed(), "the tick past the tolerance disarms");
+        assert!(!watch.armed(), "the RSS face is off after the disarm");
+        assert!(!watch.failed(), "the disarm is reported exactly once");
     }
 
     #[test]
