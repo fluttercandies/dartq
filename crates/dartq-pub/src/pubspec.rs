@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::PubError;
+use crate::git;
 use crate::version::{LanguageVersion, Version, VersionConstraint};
 
 /// `environment:` constraints by SDK name (`sdk` maps to Dart; anything
@@ -281,14 +282,25 @@ fn discovery_field<'a>(
 
 /// Reads a scalar string field, erroring when present but not a string.
 fn optional_field(root: &serde_yaml::Mapping, key: &str) -> Result<Option<String>, PubError> {
-    let value = root.get(key);
-    match value {
+    let message = format!("`{key}` must be a string");
+    description_field(root, key, &message)
+}
+
+/// Reads a pub source-description field, erroring with pub's per-field
+/// message when present but not a string (git.dart:58-90). An explicit
+/// `null` counts as absent (`is! String?` passes).
+fn description_field(
+    root: &serde_yaml::Mapping,
+    key: &str,
+    message: &str,
+) -> Result<Option<String>, PubError> {
+    match root.get(key) {
         None | Some(serde_yaml::Value::Null) => Ok(None),
         Some(value) => value
             .as_str()
             .map(str::to_owned)
             .map(Some)
-            .ok_or_else(|| PubError::Pubspec(format!("`{key}` must be a string"))),
+            .ok_or_else(|| PubError::Pubspec(message.to_owned())),
     }
 }
 
@@ -543,10 +555,14 @@ fn parse_dependency_spec(
                 }
             };
 
-            let sources: Vec<(&str, &serde_yaml::Value)> = map
+            // pubspec.dart:624-640: the entries besides `version` pick the
+            // source — more than one is an error before any key is
+            // inspected, a single non-string key fails the source-name
+            // check, none defaults to hosted.
+            let sources: Vec<(Option<&str>, &serde_yaml::Value)> = map
                 .iter()
                 .filter(|(key, _)| key.as_str() != Some("version"))
-                .map(|(key, value)| (key.as_str().unwrap_or(""), value))
+                .map(|(key, value)| (key.as_str(), value))
                 .collect();
             match sources.as_slice() {
                 // Map form without a source key defaults to hosted.
@@ -555,9 +571,9 @@ fn parse_dependency_spec(
                     name: None,
                     version,
                 }),
-                [("hosted", value)] => parse_hosted(value, version, invalid),
-                [("git", value)] => parse_git(value, language_version, invalid),
-                [("path", value)] => {
+                [(Some("hosted"), value)] => parse_hosted(value, version, invalid),
+                [(Some("git"), value)] => parse_git(value, language_version, invalid),
+                [(Some("path"), value)] => {
                     let path = value
                         .as_str()
                         .ok_or_else(|| invalid("`path` dependency must be a string".to_owned()))?;
@@ -565,7 +581,7 @@ fn parse_dependency_spec(
                         path: path.to_owned(),
                     })
                 }
-                [("sdk", value)] => {
+                [(Some("sdk"), value)] => {
                     let sdk = value
                         .as_str()
                         .ok_or_else(|| invalid("`sdk` dependency must be a string".to_owned()))?;
@@ -573,11 +589,21 @@ fn parse_dependency_spec(
                         sdk: sdk.to_owned(),
                     })
                 }
-                _ => Err(invalid("a dependency may only have one source".into())),
+                // pub accepts unknown sources at parse time (UnknownSource
+                // null object, system_cache.dart:86-90) and only fails at
+                // resolve time; dartq has no resolver, so the rejection
+                // moves to parse.
+                [(Some(name), _)] => Err(invalid(format!("unknown dependency source `{name}`"))),
+                // pubspec.dart:638-639: the single entry's key names the
+                // source; a non-string key never gets that far.
+                [(None, _)] => Err(invalid("A source name must be a string.".into())),
+                // pubspec.dart:628-629: more than one entry errors before
+                // any key is inspected, even non-string ones.
+                _ => Err(invalid("A dependency may only have one source.".into())),
             }
         }
         _ => Err(invalid(
-            "a dependency specification must be a string or a mapping".into(),
+            "A dependency specification must be a string or a mapping.".into(),
         )),
     }
 }
@@ -612,34 +638,56 @@ fn parse_git(
         // `git: <url>` shorthand.
         serde_yaml::Value::String(url) => (url.clone(), None, None, None),
         serde_yaml::Value::Mapping(map) => {
-            let url = optional_field(map, "url")?
-                .ok_or_else(|| invalid("git dependency needs a `url`".into()))?;
-            // pub reads and type-checks `ref`, `path` and `tag_pattern` in
-            // this order, then applies the gates (git.dart:58-119).
-            let reference = optional_field(map, "ref")?;
-            let path = optional_field(map, "path")?;
-            let tag_pattern = optional_field(map, "tag_pattern")?;
+            // pub reads and type-checks `url`, `ref`, `path` and
+            // `tag_pattern` in this order, then applies the gates
+            // (git.dart:58-116). A missing `url` is null, which fails the
+            // same type check as a non-string value.
+            const URL_MESSAGE: &str = "The 'url' field of a description must be a string.";
+            let url = description_field(map, "url", URL_MESSAGE)?
+                .ok_or_else(|| invalid(URL_MESSAGE.into()))?;
+            let reference = description_field(
+                map,
+                "ref",
+                "The 'ref' field of the description must be a string.",
+            )?;
+            let path = description_field(
+                map,
+                "path",
+                "The 'path' field of the description must be a string.",
+            )?;
+            let tag_pattern = description_field(
+                map,
+                "tag_pattern",
+                "The 'tag_pattern' field of the description must be a string or null.",
+            )?;
             if tag_pattern.is_some() && language_version < LanguageVersion::FIRST_WITH_TAG_PATTERN {
                 return Err(invalid(format!(
-                    "`tag_pattern` requires at least language version {}",
+                    "Using `git: {{tagPattern: }}` is only supported with a minimum SDK \
+                     constraint of {}.",
                     LanguageVersion::FIRST_WITH_TAG_PATTERN
                 )));
             }
+            // The marker check runs before the `ref` conflict (git.dart:
+            // 100 and 105-109).
+            if let Some(pattern) = &tag_pattern
+                && let Err(message) = git::validate_tag_pattern(pattern)
+            {
+                return Err(invalid(message));
+            }
             if reference.is_some() && tag_pattern.is_some() {
                 return Err(invalid(
-                    "a git dependency may not have both `ref` and `tag_pattern`".into(),
+                    "A git description cannot have both a ref and a `tag_pattern`.".into(),
                 ));
             }
             // From 3.7 on pub rejects every description key outside its
-            // whitelist (git.dart:117-123); below that unknown keys are
-            // ignored. Non-string keys stay skipped (the documented
-            // non-string key debt face).
+            // whitelist (git.dart:110-116); below that unknown keys are
+            // ignored. Keys are interpolated Dart-style, so a non-string
+            // key fails the whitelist under its stringified spelling.
             if language_version >= LanguageVersion::FIRST_FORBIDDING_UNKNOWN_DESCRIPTION_KEYS {
                 for key in map.keys() {
-                    if let Some(key) = key.as_str()
-                        && !matches!(key, "url" | "ref" | "path" | "tag_pattern")
-                    {
-                        return Err(invalid(format!("unknown git description key `{key}`")));
+                    let key = dart_key_string(key);
+                    if !matches!(key.as_str(), "url" | "ref" | "path" | "tag_pattern") {
+                        return Err(invalid(format!("Unknown key \"{key}\" in description.")));
                     }
                 }
             }
@@ -647,12 +695,36 @@ fn parse_git(
         }
         _ => return Err(invalid("`git` must be a URL string or a mapping".into())),
     };
+    // Both description forms construct `GitDescription`, whose factory
+    // validates the path before the URL (git.dart:125-134, 1160-1171).
+    if let Some(path) = &path
+        && let Err(message) = git::validate_path(path)
+    {
+        return Err(invalid(message));
+    }
+    if let Err(message) = git::validate_url(&url) {
+        return Err(invalid(message));
+    }
     Ok(DependencySpec::Git {
         url,
         reference,
         tag_pattern,
         path,
     })
+}
+
+/// Dart string interpolation of a YAML scalar key (`'Unknown key "$key"'`,
+/// git.dart:113): strings render bare, booleans and null as their Dart
+/// literals, numbers as serde_yaml renders them. Sequence and mapping keys
+/// are pathological; they fall back to their JSON spelling.
+fn dart_key_string(key: &serde_yaml::Value) -> String {
+    match key {
+        serde_yaml::Value::String(key) => key.clone(),
+        serde_yaml::Value::Number(number) => number.to_string(),
+        serde_yaml::Value::Bool(flag) => flag.to_string(),
+        serde_yaml::Value::Null => "null".to_owned(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_owned()),
+    }
 }
 
 impl DependencySpec {
@@ -791,12 +863,13 @@ dev_dependencies:
         ));
         let ref_and_tag = |sdk: &str, key: &str| {
             format!(
-                "name: a\nenvironment:\n  sdk: '{sdk}'\ndependencies:\n  x:\n    git:\n      url: /r\n      ref: main\n      {key}: 'v*'\n"
+                "name: a\nenvironment:\n  sdk: '{sdk}'\ndependencies:\n  x:\n    git:\n      url: /r\n      ref: main\n      {key}: '{{{{version}}}}'\n"
             )
         };
         // ^3.9: `tag_pattern` accepted standalone (the
         // tag_pattern_test.dart fixture shape), but mutually exclusive
-        // with `ref`.
+        // with `ref`. The fixture carries a valid marker so the conflict
+        // error is the one firing (pub validates the marker first).
         let ok = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      tag_pattern: '{{version}}'\n";
         let spec = Pubspec::parse(ok).expect("ok");
         assert!(matches!(
@@ -834,11 +907,74 @@ dev_dependencies:
             Pubspec::parse(unknown_key),
             Err(PubError::Pubspec(_))
         ));
+        // A non-string key fails the whitelist under its Dart-stringified
+        // spelling (git.dart:110-116).
+        let non_string_key = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      1: foo\n";
+        let err = Pubspec::parse(non_string_key).expect_err("int key");
+        assert!(
+            err.to_string().contains("Unknown key \"1\" in description."),
+            "unexpected error: {err}"
+        );
         let unknown_source = "name: a\ndependencies:\n  x:\n    cvs: whatever\n";
         assert!(matches!(
             Pubspec::parse(unknown_source),
             Err(PubError::Pubspec(_))
         ));
+        // pubspec.dart:638-639: a single non-string source key names no
+        // source. Two entries fail the count check even when one key is
+        // non-string (pubspec.dart:628-629).
+        let non_string_source = "name: a\ndependencies:\n  x:\n    1: whatever\n";
+        let err = Pubspec::parse(non_string_source).expect_err("int source key");
+        assert_eq!(
+            err.to_string(),
+            "pubspec.yaml: A source name must be a string.",
+            "unexpected error: {err}"
+        );
+        let mixed_two_sources =
+            "name: a\ndependencies:\n  x:\n    hosted: https://a\n    1: whatever\n";
+        let err = Pubspec::parse(mixed_two_sources).expect_err("two entries");
+        assert_eq!(
+            err.to_string(),
+            "pubspec.yaml: A dependency may only have one source.",
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_git_url_path_and_marker() {
+        // git.dart:201-211: a leading `-` is git option injection and an
+        // `ext:` scheme is command execution — both reject the URL at
+        // description construction, including the string shorthand form.
+        let injection = "name: a\ndependencies:\n  x:\n    git: --upload-pack=evil\n";
+        assert_eq!(
+            Pubspec::parse(injection).expect_err("injection").to_string(),
+            "pubspec.yaml: \"--upload-pack=evil\" is not a valid Git URL."
+        );
+        let ext = "name: a\ndependencies:\n  x:\n    git:\n      url: ext::sh -c touch /tmp/pwned @\n";
+        assert_eq!(
+            Pubspec::parse(ext).expect_err("ext scheme").to_string(),
+            "pubspec.yaml: \"ext::sh -c touch /tmp/pwned @\" is not a valid Git URL."
+        );
+        // git.dart:270-275: the path must be a relative URL inside the
+        // repository.
+        let escape = "name: a\ndependencies:\n  x:\n    git:\n      url: /r\n      path: ../outside\n";
+        assert_eq!(
+            Pubspec::parse(escape).expect_err("escape").to_string(),
+            "pubspec.yaml: The 'path' field of the description must not reach outside the repository."
+        );
+        let absolute =
+            "name: a\ndependencies:\n  x:\n    git:\n      url: /r\n      path: /subdir\n";
+        assert_eq!(
+            Pubspec::parse(absolute).expect_err("absolute").to_string(),
+            "pubspec.yaml: The 'path' field of the description must be a relative path URL."
+        );
+        // git.dart:1313-1323: the marker check runs at read time — an
+        // invalid `tag_pattern` is never accepted silently.
+        let marker = "name: a\nenvironment:\n  sdk: ^3.9.0\ndependencies:\n  x:\n    git:\n      url: /r\n      tag_pattern: v1.0.0\n";
+        assert_eq!(
+            Pubspec::parse(marker).expect_err("no marker").to_string(),
+            "pubspec.yaml: The `tag_pattern` must contain a single \"{{version}}\" to match different versions"
+        );
     }
 
     #[test]

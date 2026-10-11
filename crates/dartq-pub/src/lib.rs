@@ -25,6 +25,7 @@
 
 pub mod config;
 pub mod freshness;
+mod git;
 pub mod glob;
 pub mod graph;
 pub mod lock;

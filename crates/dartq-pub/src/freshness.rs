@@ -278,7 +278,7 @@ impl Freshness {
                 continue; // pub-cache packages: no mtime check (facts §6.5)
             }
             // Documented divergence, stricter than pub: pub mtime-gates
-            // pubspec.yaml only; dartiq also gates on
+            // pubspec.yaml only; dartq also gates on
             // pubspec_overrides.yaml, so an untouched-since-`pub get`
             // overrides file can never hide a dependency change.
             for file in ["pubspec.yaml", "pubspec_overrides.yaml"] {
