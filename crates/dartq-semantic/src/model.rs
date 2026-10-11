@@ -120,7 +120,9 @@ impl Ty {
             // Right Top (`subtype.dart:263-267`): everything assigns into
             // `dynamic`/`void`/`T?` — including `Null` and `void` sources;
             // and `dynamic` assigns into everything (`type_system.dart:930`,
-            // non-strict-casts mode).
+            // non-strict-casts mode — the `strict-casts` overlay rejects the
+            // downcast side at the diagnoser, [`crate::diagnose`]'s
+            // `Engine::assignable`).
             (Ty::Dynamic, _) | (_, Ty::Dynamic | Ty::Void | Ty::Named { nullable: true, .. }) => {
                 Some(true)
             }

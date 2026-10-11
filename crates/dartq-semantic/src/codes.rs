@@ -520,6 +520,23 @@ pub enum SemanticCode {
     /// [`SemanticCode::UnnecessaryNullCheckPattern`]
     /// (shared_type_analyzer.dart:129-133).
     UnnecessaryNullAssertPattern,
+    // —— #480: the analyzer language-strictness family (all `STATIC_WARNING`) ——
+    /// `The generic type '{0}' should have explicit type arguments but
+    /// doesn't.` — the `strict-raw-types` mode's raw-type row
+    /// (`type_arguments_verifier.dart:303-336` `_checkForRawTypeName`).
+    /// `{0}` renders the type name as written; the oracle's
+    /// instantiated-to-bounds display (`Box<dynamic>`) is a documented text
+    /// divergence (the M1 [`crate::model::Ty`] cannot render an
+    /// instantiation).
+    StrictRawType,
+    /// `The return type of '{0}' can't be inferred.` — the `strict-inference`
+    /// mode's declaration-shape row (`best_practices_verifier.dart:1587-1606`
+    /// `_checkStrictInferenceReturnType`), M1-decidable for top-level
+    /// functions and getters only: members stay deferred (the
+    /// override-exemption face needs the full supertype walk) and typedefs
+    /// and local functions follow their oracle exemptions
+    /// (the local-function visit is an upstream TODO there).
+    InferenceFailureOnFunctionReturnType,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -824,6 +841,15 @@ impl SemanticCode {
                 "unnecessary_null_assert_pattern",
                 "UNNECESSARY_NULL_ASSERT_PATTERN",
             ),
+            // The #480 language-strictness rows: the `strict-raw-types` and
+            // `strict-inference` modes' diagnostics, verbatim from the
+            // registry (`strictRawType` :15793-15806,
+            // `inferenceFailureOnFunctionReturnType` :8097-8115).
+            Self::StrictRawType => ("strict_raw_type", "STRICT_RAW_TYPE"),
+            Self::InferenceFailureOnFunctionReturnType => (
+                "inference_failure_on_function_return_type",
+                "INFERENCE_FAILURE_ON_FUNCTION_RETURN_TYPE",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -839,6 +865,10 @@ impl SemanticCode {
                 // `inconsistentInheritanceGetterAndMethod` carries no
                 // published docs (`messages.yaml` hasPublishedDocs: false).
                 | Self::InconsistentInheritanceGetterAndMethod
+                // `strictRawType` carries no `hasPublishedDocs` either
+                // (diagnostic.g.dart:15793-15806 — a doc comment, not the
+                // flag).
+                | Self::StrictRawType
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -890,7 +920,12 @@ impl SemanticCode {
             | Self::OverrideOnNonOverridingField
             | Self::OverrideOnNonOverridingGetter
             | Self::OverrideOnNonOverridingMethod
-            | Self::OverrideOnNonOverridingSetter => DiagnosticType::StaticWarning,
+            | Self::OverrideOnNonOverridingSetter
+            // The #480 language-strictness rows are `STATIC_WARNING` tier
+            // (`DiagnosticType.STATIC_WARNING`, diagnostic.g.dart:15804 and
+            // :8110).
+            | Self::StrictRawType
+            | Self::InferenceFailureOnFunctionReturnType => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -983,6 +1018,14 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => {
                 "The null-assert pattern will have no effect because the matched type isn't nullable."
                     .to_string()
+            }
+            // The #480 language-strictness rows, verbatim
+            // (diagnostic.g.dart:15800-15801 and :8104).
+            Self::StrictRawType => format!(
+                "The generic type '{a0}' should have explicit type arguments but doesn't."
+            ),
+            Self::InferenceFailureOnFunctionReturnType => {
+                format!("The return type of '{a0}' can't be inferred.")
             }
             // The #314 residue family: the one-argument rows and the four
             // no-argument member faces, verbatim
@@ -1431,6 +1474,13 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => Some(
                 "Try replacing the null-assert pattern with its nested pattern.".to_string(),
             ),
+            // The #480 language-strictness rows' corrections, verbatim
+            // (diagnostic.g.dart:15802 and :8105); `{a2}` carries the same
+            // name the problem message renders.
+            Self::StrictRawType => Some(format!("Use explicit type arguments for '{a2}'.")),
+            Self::InferenceFailureOnFunctionReturnType => {
+                Some(format!("Declare the return type of '{a2}'."))
+            }
             // The #314 residue family's corrections (diagnostic.g.dart
             // :11045-11092/:13806-13855); `mustCallSuper` and the
             // concrete-implementation pair carry none.

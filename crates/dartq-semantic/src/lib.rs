@@ -32,7 +32,13 @@
 //!   codes — the `undefined_*`/`duplicate_definition` family plus the
 //!   `wrong_number_of_*` family and the static-nullability four — recording
 //!   every other miss as the index names-table rows
-//!   ([`diagnose::FileReport::names`], index-design-spec §8).
+//!   ([`diagnose::FileReport::names`], index-design-spec §8). The analyzer
+//!   language-strictness scalars (#480, PRD §12.1) consume at the verdict
+//!   layer through [`diagnose_with`]: `strict-casts` rejects implicit
+//!   downcasts (the ordinary assignability codes mint), `strict-inference`
+//!   reports the untyped-declaration face of `inference_failure_on_*`, and
+//!   `strict-raw-types` reports `strict_raw_type` — all off by default, the
+//!   official posture.
 //!
 //! # What the `undefined_*` / `wrong_number_*` tickets (#120/#121) can
 //!   assume
@@ -110,7 +116,7 @@ pub mod persisted;
 pub mod signature;
 
 pub use collector::collect;
-pub use diagnose::{FileReport, NameRow, NameUse, diagnose};
+pub use diagnose::{FileReport, NameRow, NameUse, StrictModes, diagnose, diagnose_with};
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,
 };

@@ -1277,6 +1277,41 @@ struct Engine<'a> {
     /// `_enclosingExec` spelling for bodies inside a local function (a
     /// self-reference never marks the function used).
     local_fn_stack: Vec<(usize, StringId)>,
+    /// The #480 language-strictness modes the caller resolved from the
+    /// library's analysis options (all off = the official defaults).
+    strict: StrictModes,
+    /// The open type-variables window's bound accounting (`class C<T, S
+    /// extends num>`): each variable's name token lands here, and the
+    /// parser emits `handle_no_type` — anchored at that name token — for
+    /// an unbounded variable, so the unbounded count closes complete at
+    /// `end_type_variables`.
+    tv_window: Option<TvWindow>,
+    /// The just-closed type-variables window's unbounded count with the
+    /// group's closing offset, awaiting the declaration head it belongs to
+    /// (the window closes before `begin_class_declaration` and friends
+    /// name the declaration).
+    pending_tv: Option<(u16, u32)>,
+    /// This file's containers with at least one unbounded type parameter,
+    /// captured at the container heads of this pass (the
+    /// `strict_raw_type` decidable set: the oracle reports a raw use exactly
+    /// when some type argument instantiates to `dynamic` — an unbounded
+    /// parameter — `type_arguments_verifier.dart:711-735`). Cross-file
+    /// containers and fully-bounded ones stay out: no fact, no report.
+    container_unbounded: FxHashMap<StringId, u16>,
+}
+
+/// The bound accounting of one open type-variables window.
+#[derive(Default)]
+struct TvWindow {
+    /// The window's variable name tokens (`begin_type_variable`): an
+    /// in-window `handle_no_type` counts as an unbounded variable only
+    /// when anchored at one of them — the parser emits the variable's own
+    /// name token there — while a generic-function-type bound's absent
+    /// return type (`T extends Function()`) anchors elsewhere and must
+    /// not count.
+    vars: Vec<Token>,
+    /// Variables declared without a bound.
+    unbounded: u16,
 }
 
 /// A const-environment binding.
@@ -1316,6 +1351,7 @@ impl<'a> Engine<'a> {
         file: FileId,
         lib: LibraryId,
         primary_constructors_enabled: bool,
+        strict: StrictModes,
     ) -> Self {
         let guard = UndefinedGuard::build(graph, lib);
         let object_members = OBJECT_MEMBERS.map(|m| strings.intern(m));
@@ -1428,6 +1464,10 @@ impl<'a> Engine<'a> {
             last_block_end: None,
             pending_local_fn: None,
             local_fn_stack: Vec::new(),
+            strict,
+            tv_window: None,
+            pending_tv: None,
+            container_unbounded: FxHashMap::default(),
         }
     }
 
@@ -2020,6 +2060,80 @@ impl<'a> Engine<'a> {
         self.strings.resolve(name).starts_with('_')
     }
 
+    /// The `strict-raw-types` verdict for one group-less type-annotation
+    /// head (`_checkForRawTypeName`, `type_arguments_verifier.dart:303-336`):
+    /// the oracle reports when the resolved type is generic with no
+    /// explicit-or-inferred type arguments and at least one argument
+    /// instantiates to `dynamic` — an unbounded type parameter
+    /// (`_isMissingTypeArguments` :711-735). The M1-decidable set is this
+    /// file's containers with a captured unbounded parameter: cross-file
+    /// containers carry no bound facts and bounded-only ones fill no
+    /// `dynamic` — both suppress (under-report, never a false positive).
+    /// The oracle's noisy-parent list is honored where M1 can see it: `is` /
+    /// `as` type operands sit inside [`Engine::non_type_pos`], and pattern
+    /// type positions under-report with the whole pattern face.
+    fn check_raw_type(&mut self, name: StringId, range: SourceRange) {
+        if !self.strict.raw_types
+            || self.non_type_pos > 0
+            || self.pattern_depth > 0
+            // An in-scope type parameter shadows any container of the same
+            // name; a parameter is never a raw generic use.
+            || self.type_params.contains(&name)
+        {
+            return;
+        }
+        let Some(&unbounded) = self.container_unbounded.get(&name) else {
+            return;
+        };
+        if unbounded == 0 {
+            return;
+        }
+        let display = self.strings.resolve(name).to_string();
+        self.stage_usage(SemanticCode::StrictRawType, range, &display);
+    }
+
+    /// Opens a type-variables window (`begin_type_variables`): the
+    /// declaration header's `<T, S extends num>` is being parsed, and each
+    /// variable's name token lands in it for the unbounded anchoring.
+    fn open_type_variables(&mut self) {
+        self.tv_window = Some(TvWindow::default());
+    }
+
+    /// Closes the window and latches its unbounded count with the group's
+    /// closing offset (`end_type_variables`): the owning declaration's name
+    /// precedes that offset, so a container head adopts the latch by token
+    /// order alone.
+    fn close_type_variables(&mut self, window_end: Token) {
+        self.pending_tv = self
+            .tv_window
+            .take()
+            .map(|window| (window.unbounded, window_end.range.offset));
+    }
+
+    /// Attaches the latched window to a container head, keyed by name
+    /// (keep-first: a same-named duplicate's second header is the
+    /// `duplicate_definition` face's business). The latch is scoped to its
+    /// owner by token order: a declaring name always precedes its own
+    /// `<...>` group, while any later declaration's name sits after a
+    /// foreign window's close — a non-container owner (a typedef, a
+    /// generic function) can never have its count adopted, so no boundary
+    /// drops are needed. An unnamed container (`extension on Foo`) owns no
+    /// raw verdict — its window is never consulted by name.
+    fn note_container_type_variables(&mut self, name: Option<Token>) {
+        let Some((unbounded, window_end)) = self.pending_tv.take() else {
+            return;
+        };
+        let Some(token) = name else {
+            return;
+        };
+        if token.range.offset >= window_end {
+            return;
+        }
+        if let Some(id) = self.name_of(token) {
+            self.container_unbounded.entry(id).or_insert(unbounded);
+        }
+    }
+
     /// The usage cluster's library-level pass, after every use is indexed:
     /// the declaration sites of this file walk against the use index (the
     /// official `UnusedLocalElementsVerifier`), then the import directives
@@ -2031,6 +2145,28 @@ impl<'a> Engine<'a> {
             let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
             let name_text = self.strings.resolve(site.name).to_string();
+            // The `strict-inference` return-type face
+            // (`_checkStrictInferenceReturnType`,
+            // best_practices_verifier.dart:1587-1606): a top-level function
+            // or getter that declares no return type reports. Setters are
+            // exempt (`!node.isSetter`, and the getter visitor names
+            // `TopLevelGetterDeclaration` only); local functions are the
+            // oracle's own TODO (its visit skips them) and members stay
+            // deferred — the override exemption needs the full supertype
+            // walk M1's name edges cannot answer.
+            if self.strict.inference
+                && matches!(site.kind, DeclKind::TopLevelFn)
+                && !name_text.ends_with('=')
+                && self
+                    .top_level_decl(site.name)
+                    .is_some_and(|decl| decl.return_ty == Ty::Unknown)
+            {
+                self.stage_usage(
+                    SemanticCode::InferenceFailureOnFunctionReturnType,
+                    site.range,
+                    &name_text,
+                );
+            }
             match site.kind {
                 DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
                     // `_isUsedElement`'s else arm: a public name is used;
@@ -5953,7 +6089,12 @@ impl<'a> Engine<'a> {
             Ty::Unknown => None,
             _ => match from {
                 Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
-                Ty::Dynamic => Some(true),
+                // A `dynamic` return expression is a subtype only of the
+                // top-type hosts; the strict-casts mode rejects the rest
+                // (the same overlay [`Engine::assignable`] applies — the
+                // oracle's return verifier consults the identical
+                // `isAssignableTo` gate).
+                Ty::Dynamic => Some(matches!(to, Ty::Dynamic | Ty::Void) || !self.strict.casts),
                 _ => self.assignable(from, to, from_literal),
             },
         };
@@ -6282,6 +6423,15 @@ impl<'a> Engine<'a> {
     /// (under-report).
     fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
         if let Some(verdict) = to.assignable_from(from) {
+            // The strict-casts overlay (`type_system.dart:891-930`: with
+            // `strict-casts: true`, "the option disables all downcasts,
+            // including casts from `dynamic`"). A `dynamic` source is a
+            // subtype only of the top types — into any named target (the
+            // `?` projection included) or `Null` the assignment is a
+            // rejected downcast, reporting the ordinary assignability code.
+            if self.strict.casts && from == Ty::Dynamic && !matches!(to, Ty::Dynamic | Ty::Void) {
+                return Some(false);
+            }
             return Some(verdict);
         }
         let (
@@ -7884,13 +8034,40 @@ fn merge_source_ordered(base: Vec<Diagnostic>, extra: Vec<Diagnostic>) -> Vec<Di
     merged
 }
 
+/// The analyzer language-strictness scalars (`analysis_options.yaml`
+/// `analyzer.language.*`, PRD §12.1), consumed at the semantic verdict
+/// layer. Every mode defaults to `false` — the official posture
+/// (`AnalysisOptionsImpl`, `analysis_options.dart:44-52`).
+///
+/// * `casts` — `strict-casts` (`type_system.dart:891-930`): an implicit
+///   downcast rejects; the failure surfaces through the ordinary
+///   assignability codes (`invalid_assignment`,
+///   `argument_type_not_assignable`, `return_of_invalid_type`), exactly as
+///   the oracle reports through `isAssignableTo`'s `strictCasts` arm — the
+///   mode mints no code of its own.
+/// * `inference` — `strict-inference`: an inference failure reports its
+///   `inference_failure_on_*` row; the M1-decidable face is the
+///   declaration-shape one (untyped top-level functions/getters).
+/// * `raw_types` — `strict-raw-types`: a raw generic type annotation
+///   reports `strict_raw_type`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrictModes {
+    /// `analyzer.language.strict-casts`.
+    pub casts: bool,
+    /// `analyzer.language.strict-inference`.
+    pub inference: bool,
+    /// `analyzer.language.strict-raw-types`.
+    pub raw_types: bool,
+}
+
 /// Diagnoses one compilation unit against its library scope (#120, batch 1).
 ///
 /// The unit must already be collected and indexed: `index` carries the
 /// file's element model (its duplicate log folds into the front of the
 /// report as `duplicate_definition`s) and its non-type-parameter
 /// declarations are already declared into the library graph. The parse is a
-/// second pass over the same token table `collect` used.
+/// second pass over the same token table `collect` used. The language
+/// strictness modes are the official defaults (all off).
 ///
 /// # Panics
 ///
@@ -7908,6 +8085,43 @@ pub fn diagnose(
     namespaces: &Namespaces,
     index: &ElementIndex,
 ) -> FileReport {
+    diagnose_with(
+        source,
+        tokens,
+        features,
+        strings,
+        file,
+        lib,
+        graph,
+        namespaces,
+        index,
+        StrictModes::default(),
+    )
+}
+
+/// [`diagnose`] with the language-strictness modes the caller resolved from
+/// the library's analysis options (the engine maps
+/// `AnalysisOptions::{strict_casts, strict_inference, strict_raw_types}`
+/// onto these — `unwrap_or(false)`, the official off posture).
+///
+/// # Panics
+///
+/// Panics if the parser still holds the listener at teardown — impossible
+/// by construction (`parser` is dropped above), asserted with `expect`.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+#[allow(clippy::too_many_lines)] // one linear pipeline: parse, resolve, fold, merge
+pub fn diagnose_with(
+    source: &str,
+    tokens: &TokenTable,
+    features: ParserFeatures,
+    strings: &StringTable,
+    file: FileId,
+    lib: LibraryId,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    strict: StrictModes,
+) -> FileReport {
     let engine = Rc::new(RefCell::new(Engine::new(
         graph,
         namespaces,
@@ -7918,6 +8132,7 @@ pub fn diagnose(
         file,
         lib,
         features.primary_constructors_enabled,
+        strict,
     )));
     let flow = Rc::new(RefCell::new(Flow::new(tokens, source)));
     let mut parser = Parser::new(
@@ -8050,6 +8265,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
+        engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
         if let Some(name) = name {
@@ -8076,6 +8292,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
+        engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Class, name);
         if let Some(name) = name {
@@ -8105,6 +8322,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
+        engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Mixin, name);
         if let Some(name) = name {
@@ -8126,6 +8344,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
+        engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
         engine.push_container_frame(ContainerKind::Enum, name);
         if let Some(name) = name {
@@ -8152,6 +8371,7 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Option<Token>,
     ) {
         let mut engine = self.engine.borrow_mut();
+        engine.note_container_type_variables(name);
         let name = name.and_then(|token| engine.name_of(token));
         engine.push_container_frame(ContainerKind::Extension, name);
     }
@@ -8174,6 +8394,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let mut engine = self.engine.borrow_mut();
         let name_range = name.range;
+        engine.note_container_type_variables(Some(name));
         let name = engine.name_of(name);
         // The representation checks read the element model (complete since
         // `collect`) and anchor at this name token.
@@ -8652,15 +8873,27 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_type_variable(&mut self, token: Token) {
         let mut engine = self.engine.borrow_mut();
+        // The name token anchors this variable's unbounded declaration: an
+        // unbounded variable's `handle_no_type` fires against it.
+        if let Some(window) = engine.tv_window.as_mut() {
+            window.vars.push(token);
+        }
         if let Some(name) = engine.name_of(token) {
             engine.push_type_parameter(name);
         }
     }
 
     fn begin_type_variables(&mut self, _token: Token) {
+        let mut engine = self.engine.borrow_mut();
         // A new header started: a previous declaration's parked variables
         // never met their frame (a typedef's, say) — drop them.
-        self.engine.borrow_mut().pending_type_params.clear();
+        engine.pending_type_params.clear();
+        // The header's bound counts open with it.
+        engine.open_type_variables();
+    }
+
+    fn end_type_variables(&mut self, _begin: Token, end: Token) {
+        self.engine.borrow_mut().close_type_variables(end);
     }
 
     // —— identifiers ——————————————————————————————————————————————————
@@ -8939,7 +9172,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         // The type completed without a group; its head slot is consumed.
-        engine.pending_type_head = None;
+        // A `Some` here is a group-less simple type head (`Box`, `int`) —
+        // parameterized heads moved into `group_heads` at `<` and prefixed
+        // heads were consumed at `handle_no_type_arguments` — which is
+        // exactly the raw-type candidate set.
+        let head = engine.pending_type_head.take();
         let Some(text) = engine.text_of(name) else {
             return;
         };
@@ -8954,18 +9191,33 @@ impl ParserListener for DiagnoseListener<'_> {
             },
         };
         engine.armed_ty = Some(ty);
+        if let Some((head_name, head_range)) = head {
+            engine.check_raw_type(head_name, head_range);
+        }
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
         self.flow.borrow_mut().handle_no_type(_last_consumed);
 
-        self.engine.borrow_mut().armed_ty = None;
+        let mut engine = self.engine.borrow_mut();
+        // An unbounded type variable declares no bound (`class C<T>`); the
+        // parser anchors the event at the variable's own name token. A
+        // generic-function-type bound's absent return type (`T extends
+        // Function()`) anchors elsewhere — that variable is bounded, not
+        // unbounded.
+        if let Some(window) = engine.tv_window.as_mut()
+            && window.vars.contains(&_last_consumed)
+        {
+            window.unbounded += 1;
+        }
+        engine.armed_ty = None;
     }
 
     fn handle_void_keyword(&mut self, _token: Token) {
         self.flow.borrow_mut().handle_void_keyword(_token);
 
-        self.engine.borrow_mut().armed_ty = Some(Ty::Void);
+        let mut engine = self.engine.borrow_mut();
+        engine.armed_ty = Some(Ty::Void);
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
@@ -11520,6 +11772,20 @@ mod tests {
         source: &str,
         make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
     ) -> FileReport {
+        report_with(source, StrictModes::default(), make_edge)
+    }
+
+    /// [`report`] with the #480 language-strictness modes set.
+    fn report_strict(source: &str, strict: StrictModes) -> FileReport {
+        report_with(source, strict, |_| None)
+    }
+
+    /// The shared harness: one file, one library, the live pipeline.
+    fn report_with(
+        source: &str,
+        strict: StrictModes,
+        make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
+    ) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -11554,7 +11820,7 @@ mod tests {
         }
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
-        diagnose(
+        diagnose_with(
             source,
             &scanned.tokens,
             features,
@@ -11564,6 +11830,7 @@ mod tests {
             &graph,
             &namespaces,
             &index,
+            strict,
         )
     }
 
@@ -16794,5 +17061,358 @@ mod tests {
             r.diagnostics[1].message,
             "The matched value type 'int' can never be equal to this constant of type 'Null'."
         );
+    }
+
+    // —— #480: the analyzer language-strictness modes ——————————————————
+
+    /// `strict-casts` rejects the `dynamic`-source downcasts the default
+    /// posture silently allows, at every verdict site the oracle gates
+    /// through `isAssignableTo` (`type_system.dart:891-930`: the mode
+    /// "disables all downcasts, including casts from `dynamic`") — the
+    /// ordinary assignability codes mint, never a strict-casts code.
+    ///
+    /// Hand-trace (mode on): `return d` in `int g` answers the return
+    /// matrix's dynamic arm (`Some(false)` — `int` is no top type),
+    /// `f(d)` and `int y = d` answer [`Engine::assignable`]'s overlay; mode
+    /// off all three are `Some(true)` and the file is clean.
+    #[test]
+    fn strict_casts_rejects_dynamic_downcasts_at_every_verdict_site() {
+        let src = "class int {} \
+             void f(int x) {} \
+             int g(dynamic d) { return d; } \
+             void main() { dynamic d; f(d); int y = d; g(y); }";
+        let on = report_strict(
+            src,
+            StrictModes {
+                casts: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+                "invalid_assignment",
+            ],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[1].message,
+            "The argument type 'dynamic' can't be assigned to the parameter type 'int'. "
+        );
+        assert_eq!(
+            on.diagnostics[2].message,
+            "A value of type 'dynamic' can't be assigned to a variable of type 'int'."
+        );
+        // The default posture: every dynamic downcast is silent.
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// The strict-casts boundaries: `dynamic` and `void` stay top types
+    /// (assignable from `dynamic` even under the mode), while a nullable
+    /// named target is still a rejected downcast — at the assignment and
+    /// the argument call site alike. `d` is a local: the collector records
+    /// a top-level variable's annotation as written (`Ty::named("dynamic")`,
+    /// the element model's as-written shape), which the overlay's
+    /// canonical-source predicate cannot see; the local face types it
+    /// `Ty::Dynamic`. The fixture carries no `return` statement, so a
+    /// return verdict is structurally impossible, and both locals are read
+    /// (`f(y)`), so no unused-local row mints.
+    #[test]
+    fn strict_casts_keeps_the_top_types_and_rejects_nullable_targets() {
+        let src = "class int {} \
+             void f(int? x) {} \
+             void h(dynamic x) {} \
+             void t(void x) {} \
+             void main() { dynamic d; int? y = d; f(d); h(d); t(d); f(y); }";
+        let on = report_strict(
+            src,
+            StrictModes {
+                casts: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            [
+                // `int? y = d` is the assignment-site downcast, `f(d)` the
+                // argument-site one; `h(d)` and `t(d)` assign into the
+                // `dynamic`/`void` top types and stay clean.
+                "invalid_assignment",
+                "argument_type_not_assignable",
+            ],
+            "{:?}",
+            code_names(&on)
+        );
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// The collector element model canonicalizes the built-in spellings: a
+    /// TOP-LEVEL `dynamic d;` reads `Ty::Dynamic` (not the as-written
+    /// `Named`), so the strict-casts overlay sees it at every verdict site —
+    /// the assignment and the argument — while the `h(d)` call into the
+    /// canonical-`dynamic` formal target stays clean. A regression to the
+    /// as-written shape mutes the two rows (the overlay's canonical-source
+    /// predicate) and mints a third one (the `Named` target rejection).
+    #[test]
+    fn strict_casts_sees_a_top_level_dynamic_variable_canonically() {
+        let src = "class int {} \
+             void f(int? x) {} \
+             void h(dynamic x) {} \
+             dynamic d; \
+             void main() { int? y = d; f(d); h(d); f(y); }";
+        let on = report_strict(
+            src,
+            StrictModes {
+                casts: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["invalid_assignment", "argument_type_not_assignable",],
+            "{:?}",
+            code_names(&on)
+        );
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// `strict-raw-types` reports a group-less generic type annotation whose
+    /// declaring container keeps at least one unbounded type parameter (the
+    /// oracle fires exactly when a type argument instantiates to `dynamic`,
+    /// `_isMissingTypeArguments`, `type_arguments_verifier.dart:711-735`);
+    /// explicit type arguments and fully-bounded containers stay clean, and
+    /// the mode is off by default.
+    #[test]
+    fn strict_raw_types_reports_the_unbounded_generic_only() {
+        let src = "class int {} \
+             class Box<T> {} \
+             class Bound<T extends int> {} \
+             void f(Box a) {} \
+             void g(Box<int> b) {} \
+             void h(Bound c) {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                raw_types: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["strict_raw_type"],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[0].message,
+            "The generic type 'Box' should have explicit type arguments but doesn't."
+        );
+        assert_eq!(
+            on.diagnostics[0].correction.as_deref(),
+            Some("Use explicit type arguments for 'Box'.")
+        );
+        assert_eq!(on.diagnostics[0].severity, Severity::Warning);
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// The strict-raw-types boundaries: a raw type nested in type arguments
+    /// reports (the oracle's `parentEscapingTypeArguments` walk only exempts
+    /// the noisy parents), `is`/`as` operands never report, and an
+    /// in-scope type parameter shadows a same-named generic container.
+    #[test]
+    fn strict_raw_types_honors_the_nesting_and_suppression_faces() {
+        let src = "class Box<T> {} \
+             class Object {} \
+             class List<T> {} \
+             void nested(List<Box> x) {} \
+             void suppress(Object o) { if (o is Box) { o as Box; } } \
+             void shadow<Box>(Box p) {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                raw_types: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            // `nested`'s `Box` argument is the one raw use; the `is`/`as`
+            // operands sit in the suppression window and `shadow`'s `Box`
+            // resolves to its own type parameter.
+            ["strict_raw_type"],
+            "{:?}",
+            code_names(&on)
+        );
+    }
+
+    /// A raw generic bound reports too (`class W<T extends Box>` — the
+    /// bound is a NamedType the oracle checks; the window's bound count and
+    /// the raw verdict run off the same event without confusing each
+    /// other).
+    #[test]
+    fn strict_raw_types_reports_a_raw_bound() {
+        let src = "class Box<T> {} class W<T extends Box> {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                raw_types: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["strict_raw_type"],
+            "{:?}",
+            code_names(&on)
+        );
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// `strict-inference` reports a top-level function that declares no
+    /// return type (`_checkStrictInferenceReturnType`,
+    /// best_practices_verifier.dart:1587-1606); typed declarations and
+    /// setters stay clean, and the mode is off by default.
+    #[test]
+    fn strict_inference_reports_untyped_top_level_declarations() {
+        let src = "class int {} \
+             f() {} \
+             int t() { return 1; } \
+             int get g => 1; \
+             set s(int v) {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                inference: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["inference_failure_on_function_return_type"],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[0].message,
+            "The return type of 'f' can't be inferred."
+        );
+        assert_eq!(
+            on.diagnostics[0].correction.as_deref(),
+            Some("Declare the return type of 'f'.")
+        );
+        assert_eq!(on.diagnostics[0].severity, Severity::Warning);
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// The exemption: a local function never reports (the oracle's own
+    /// visit skips the declaration-statement form — an upstream TODO there).
+    #[test]
+    fn strict_inference_keeps_local_functions_silent() {
+        let on = report_strict(
+            "void main() { void local() {} local(); }",
+            StrictModes {
+                inference: true,
+                ..StrictModes::default()
+            },
+        );
+        assert!(on.diagnostics.is_empty(), "{:?}", code_names(&on));
+    }
+
+    /// The untyped pair: both the function and the getter report, each at
+    /// its own name.
+    #[test]
+    fn strict_inference_reports_both_untyped_declaration_kinds() {
+        let on = report_strict(
+            "f() {} get g => 1;",
+            StrictModes {
+                inference: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            [
+                "inference_failure_on_function_return_type",
+                "inference_failure_on_function_return_type"
+            ],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[0].message,
+            "The return type of 'f' can't be inferred."
+        );
+        assert_eq!(
+            on.diagnostics[1].message,
+            "The return type of 'g' can't be inferred."
+        );
+    }
+
+    /// The unbounded-window latch is scoped to its owner by token order: a
+    /// generic non-container declaration (`typedef F<T> = int;` — likewise
+    /// a bodyless generic function) closes a window no container head owns,
+    /// so the following non-generic `C` neither adopts its count nor
+    /// reports on a raw use; only the genuinely generic `Box` does.
+    #[test]
+    fn strict_raw_types_latch_never_reaches_a_later_non_generic_container() {
+        let src = "class int {} \
+             typedef F<T> = int; \
+             class C {} \
+             class Box<T> {} \
+             void g(C c) {} \
+             void f(Box a) {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                raw_types: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["strict_raw_type"],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[0].message,
+            "The generic type 'Box' should have explicit type arguments but doesn't."
+        );
+        // The default posture: nothing reports.
+        assert!(report(src).diagnostics.is_empty());
+    }
+
+    /// A generic-function-type bound declares a bound (`class W<T extends
+    /// Function()>`): the GFT's absent return type emits `handle_no_type`
+    /// inside the type-variables window anchored away from the variable's
+    /// name token, so it must not count as an unbounded variable — raw
+    /// uses of `W` stay silent while the generic `Box` still reports.
+    #[test]
+    fn strict_raw_types_keeps_a_generic_function_type_bound_bounded() {
+        let src = "class Box<T> {} \
+             class W<T extends Function()> {} \
+             void f(W w) {} \
+             void g(Box b) {}";
+        let on = report_strict(
+            src,
+            StrictModes {
+                raw_types: true,
+                ..StrictModes::default()
+            },
+        );
+        assert_eq!(
+            code_names(&on),
+            ["strict_raw_type"],
+            "{:?}",
+            code_names(&on)
+        );
+        assert_eq!(
+            on.diagnostics[0].message,
+            "The generic type 'Box' should have explicit type arguments but doesn't."
+        );
+        assert!(report(src).diagnostics.is_empty());
     }
 }

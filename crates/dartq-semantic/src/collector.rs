@@ -1061,10 +1061,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
         let mut builder = self.builder.borrow_mut();
-        builder.armed_ty = builder.name_of(name).map(|name| Ty::Named {
-            name,
-            nullable: question.is_some(),
-        });
+        // Built-in spellings canonicalize exactly like the diagnoser's
+        // listener: verdict consumers (`bare_info_of`, the formal tables)
+        // would otherwise hand assignability faces an as-written `Named`
+        // where the canonical `Ty` is the observable contract (the
+        // strict-casts overlay's source/target predicates, the nullability
+        // faces). Every other name stays as written.
+        builder.armed_ty =
+            builder
+                .name_of(name)
+                .map(|spelling| match builder.strings.resolve(spelling) {
+                    "dynamic" => Ty::Dynamic,
+                    "void" => Ty::Void,
+                    "Null" => Ty::Null,
+                    _ => Ty::Named {
+                        name: spelling,
+                        nullable: question.is_some(),
+                    },
+                });
     }
     fn handle_no_type(&mut self, _last_consumed: Token) {
         self.builder.borrow_mut().armed_ty = None;
