@@ -308,6 +308,120 @@ fn interface_mixin_reports() {
     assert_eq!(c.error_codes(), ["interface_mixin"]);
 }
 
+#[test]
+fn interface_enum_reports() {
+    let c = parse("interface enum E { a }");
+    assert_eq!(c.error_codes(), ["interface_enum"]);
+    c.assert_sequence(&[("begin", "enum_declaration"), ("end", "enum_declaration")]);
+}
+
+#[test]
+fn sealed_enum_reports() {
+    let c = parse("sealed enum E { a }");
+    assert_eq!(c.error_codes(), ["sealed_enum"]);
+}
+
+#[test]
+fn sealed_mixin_reports() {
+    let c = parse("sealed mixin M {}");
+    assert_eq!(c.error_codes(), ["sealed_mixin"]);
+}
+
+#[test]
+fn base_mixin_and_base_mixin_class_stay_clean() {
+    // `base` is the one modifier mixins and mixin classes accept
+    // (parser_impl.dart:794-797/:853-855 — it rides into `parseMixin` /
+    // `parseClassOrNamedMixinApplication` instead of a family row).
+    for src in ["base mixin M {}", "base mixin class M {}"] {
+        let c = parse(src);
+        assert!(c.errors.is_empty(), "{src}: {:?}", c.errors);
+    }
+}
+
+#[test]
+fn enum_family_rows_report_in_official_order() {
+    // Official family-row order on the enum head: base, final, interface,
+    // sealed (parser_impl.dart:689-701); the walk-level `extraneous_modifier`
+    // (abstract) lands first because `parseEnumModifiers` runs before the
+    // family block. Anchors: the walk's captured tokens and the dispatch
+    // scan's pseudo-keyword captures — each row on its own keyword token.
+    let c = parse("abstract final base enum E { v }");
+    assert_eq!(
+        c.errors,
+        [
+            ("extraneous_modifier".to_string(), 0, 8),
+            ("base_enum".to_string(), 15, 19),
+            ("final_enum".to_string(), 9, 14),
+        ],
+        "{:?}",
+        c.errors
+    );
+}
+
+#[test]
+fn modifier_rows_carry_registry_corrections() {
+    // The ten parser-owned rows carry the full registry face
+    // (messages.yaml `correctionMessage`s; 91.0.0 codes_generated.dart).
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "base enum E { v }",
+            "Enums can't be declared to be 'base'.",
+            "Try removing the keyword 'base'.",
+        ),
+        (
+            "final enum E { v }",
+            "Enums can't be declared to be 'final'.",
+            "Try removing the keyword 'final'.",
+        ),
+        (
+            "interface enum E { v }",
+            "Enums can't be declared to be 'interface'.",
+            "Try removing the keyword 'interface'.",
+        ),
+        (
+            "sealed enum E { v }",
+            "Enums can't be declared to be 'sealed'.",
+            "Try removing the keyword 'sealed'.",
+        ),
+        (
+            "final mixin M {}",
+            "A mixin can't be declared 'final'.",
+            "Try removing the 'final' keyword.",
+        ),
+        (
+            "interface mixin M {}",
+            "A mixin can't be declared 'interface'.",
+            "Try removing the 'interface' keyword.",
+        ),
+        (
+            "sealed mixin M {}",
+            "A mixin can't be declared 'sealed'.",
+            "Try removing the 'sealed' keyword.",
+        ),
+        (
+            "final mixin class M {}",
+            "A mixin class can't be declared 'final'.",
+            "Try removing the 'final' keyword.",
+        ),
+        (
+            "interface mixin class M {}",
+            "A mixin class can't be declared 'interface'.",
+            "Try removing the 'interface' keyword.",
+        ),
+        (
+            "sealed mixin class M {}",
+            "A mixin class can't be declared 'sealed'.",
+            "Try removing the 'sealed' keyword.",
+        ),
+    ];
+    for (src, problem, correction) in CASES {
+        let c = parse(src);
+        assert_eq!(c.error_codes().len(), 1, "{src}: {:?}", c.errors);
+        assert_eq!(&c.texts, &[problem.to_string()], "{src}");
+        assert_eq!(&c.corrections, &[Some(correction.to_string())], "{src}");
+    }
+}
+
 // —— header-clause recovery ———————————————————————————————————————————————
 
 #[test]

@@ -70,10 +70,9 @@ fn enum_element_type_arguments_recover_without_eating_closer() {
     );
     let mut parser = setup("enum E {\n  e<int>,\n  other\n}\n");
     parser.parse_unit();
-    parser.listener.assert_sequence(&[
-        ("begin", "enum_declaration"),
-        ("end", "enum_declaration"),
-    ]);
+    parser
+        .listener
+        .assert_sequence(&[("begin", "enum_declaration"), ("end", "enum_declaration")]);
 }
 
 /// `new Foo;` — the new-expression tail rides the same recovery: one
@@ -118,14 +117,8 @@ fn incomplete_const_dot_shorthand_eats_terminator() {
 /// accepted differential difference disclosed in #333).
 #[test]
 fn deep_paren_bomb_latches_bounded_bailout() {
-    let source: &'static str = Box::leak(
-        format!(
-            "var x = {}1{};\n",
-            "(".repeat(700),
-            ")".repeat(700)
-        )
-        .into_boxed_str(),
-    );
+    let source: &'static str =
+        Box::leak(format!("var x = {}1{};\n", "(".repeat(700), ")".repeat(700)).into_boxed_str());
     let mut parser = setup(source);
     parser.parse_unit();
     assert!(parser.is_bailed(), "the nesting cap must latch the bailout");
@@ -157,8 +150,7 @@ fn legacy_switch_case_constants_parse_clean() {
         "the legacy switch shape is diagnosis-free: {:?}",
         parser.listener.errors
     );
-    parser.listener.assert_sequence(&[
-        ("begin", "switch_statement"),
-        ("end", "switch_statement"),
-    ]);
+    parser
+        .listener
+        .assert_sequence(&[("begin", "switch_statement"), ("end", "switch_statement")]);
 }

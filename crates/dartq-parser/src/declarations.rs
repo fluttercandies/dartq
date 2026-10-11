@@ -202,11 +202,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             TokenKind::Keyword(Keyword::Enum) => {
                 self.check_declaration();
                 let mods = self.parse_declaration_modifiers(modifier_start, keyword);
-                if let Some(f) = mods.final_kw {
-                    self.report(msg::final_enum(), f);
-                }
+                // Official family-row order: base, final, interface, sealed
+                // ("Enums can't declare any explicit modifier",
+                // parser_impl.dart:689-701). `base`/`interface`/`sealed` are
+                // the dispatch scan's pseudo-keyword captures; `final` is the
+                // declaration walk's capture.
                 if let Some(b) = base {
                     self.report(msg::base_enum(), b);
+                }
+                if let Some(f) = mods.final_kw {
+                    self.report(msg::final_enum(), f);
                 }
                 if let Some(i) = interface {
                     self.report(msg::interface_enum(), i);

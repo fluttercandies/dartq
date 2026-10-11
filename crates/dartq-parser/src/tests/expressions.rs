@@ -901,16 +901,18 @@ fn const_record_lhs_reports_missing_selector() {
 #[test]
 fn const_dot_shorthand_incomplete_member_recovers() {
     // `Color c = const .;` (oracle dot_shorthands/const_no_identifier_recovery):
-    // the member after `.` is missing; the official reports one
-    // missing_identifier at the follower and the `;` survives as the
-    // variable-declaration terminator (CFE intertwined expect: report
-    // ExpectedIdentifier -> handleIdentifier -> handleDotShorthandHead ->
-    // endConstDotShorthand, `;` unconsumed).
+    // the member after `.` is missing. The pinned 3.13.1 oracle face is a
+    // single expected_token(';') — the incomplete shorthand consumes the
+    // follower `;` as its operand and the declaration terminator expect
+    // fires once at the real block closer (oracle r5 dump row
+    // expected_token x1; the 3.15 CFE template instead reports
+    // ExpectedIdentifier and keeps the `;` unconsumed — not the pinned
+    // face). See gate_m0_wave10 incomplete_const_dot_shorthand_eats_terminator.
     assert_eq!(
         sorted_unit_codes(
             "class Color {\n  final int x;\n  const Color.red(this.x);\n}\nvoid main() {\n  Color c = const .;\n}\n"
         ),
-        ["missing_identifier"],
+        ["expected_token"],
         "const dot-shorthand without a member"
     );
 }

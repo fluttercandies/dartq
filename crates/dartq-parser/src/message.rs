@@ -20,6 +20,8 @@ pub struct Message {
     pub code: CodeInfo,
     /// Formatted `problemMessage` text.
     pub text: String,
+    /// Formatted `correctionMessage` text, when the template provides one.
+    pub correction: Option<String>,
 }
 
 impl Message {
@@ -28,6 +30,21 @@ impl Message {
         Self {
             code,
             text: text.into(),
+            correction: None,
+        }
+    }
+
+    /// Builds a message whose template also carries a correctionMessage
+    /// (verbatim from the registry, same source as the problem text).
+    pub(crate) fn with_correction(
+        code: CodeInfo,
+        text: impl Into<String>,
+        correction: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            text: text.into(),
+            correction: Some(correction.into()),
         }
     }
 }
@@ -1095,52 +1112,88 @@ pub(crate) mod msg {
         )
     }
 
+    // The enum/mixin/mixin-class modifier rows are parser-owned end to end
+    // (the semantic layer has no keyword surface for them), so their Message
+    // carries the full registry face: problemMessage + correctionMessage
+    // verbatim (`_fe_analyzer_shared` messages.yaml; 91.0.0
+    // codes_generated.dart `codeBaseEnum`…`codeSealedMixinClass`).
     pub(crate) fn base_enum() -> Message {
-        Message::new(BASE_ENUM, "Enums can't be declared to be 'base'.")
+        Message::with_correction(
+            BASE_ENUM,
+            "Enums can't be declared to be 'base'.",
+            "Try removing the keyword 'base'.",
+        )
     }
 
     pub(crate) fn final_enum() -> Message {
-        Message::new(FINAL_ENUM, "Enums can't be declared to be 'final'.")
+        Message::with_correction(
+            FINAL_ENUM,
+            "Enums can't be declared to be 'final'.",
+            "Try removing the keyword 'final'.",
+        )
     }
 
     pub(crate) fn interface_enum() -> Message {
-        Message::new(INTERFACE_ENUM, "Enums can't be declared to be 'interface'.")
+        Message::with_correction(
+            INTERFACE_ENUM,
+            "Enums can't be declared to be 'interface'.",
+            "Try removing the keyword 'interface'.",
+        )
     }
 
     pub(crate) fn sealed_enum() -> Message {
-        Message::new(SEALED_ENUM, "Enums can't be declared to be 'sealed'.")
+        Message::with_correction(
+            SEALED_ENUM,
+            "Enums can't be declared to be 'sealed'.",
+            "Try removing the keyword 'sealed'.",
+        )
     }
 
     pub(crate) fn final_mixin() -> Message {
-        Message::new(FINAL_MIXIN, "A mixin can't be declared 'final'.")
+        Message::with_correction(
+            FINAL_MIXIN,
+            "A mixin can't be declared 'final'.",
+            "Try removing the 'final' keyword.",
+        )
     }
 
     pub(crate) fn interface_mixin() -> Message {
-        Message::new(INTERFACE_MIXIN, "A mixin can't be declared 'interface'.")
+        Message::with_correction(
+            INTERFACE_MIXIN,
+            "A mixin can't be declared 'interface'.",
+            "Try removing the 'interface' keyword.",
+        )
     }
 
     pub(crate) fn sealed_mixin() -> Message {
-        Message::new(SEALED_MIXIN, "A mixin can't be declared 'sealed'.")
+        Message::with_correction(
+            SEALED_MIXIN,
+            "A mixin can't be declared 'sealed'.",
+            "Try removing the 'sealed' keyword.",
+        )
     }
 
     pub(crate) fn final_mixin_class() -> Message {
-        Message::new(
+        Message::with_correction(
             FINAL_MIXIN_CLASS,
             "A mixin class can't be declared 'final'.",
+            "Try removing the 'final' keyword.",
         )
     }
 
     pub(crate) fn interface_mixin_class() -> Message {
-        Message::new(
+        Message::with_correction(
             INTERFACE_MIXIN_CLASS,
             "A mixin class can't be declared 'interface'.",
+            "Try removing the 'interface' keyword.",
         )
     }
 
     pub(crate) fn sealed_mixin_class() -> Message {
-        Message::new(
+        Message::with_correction(
             SEALED_MIXIN_CLASS,
             "A mixin class can't be declared 'sealed'.",
+            "Try removing the 'sealed' keyword.",
         )
     }
 
