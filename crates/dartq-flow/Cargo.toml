@@ -17,7 +17,6 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 dartq-language = { workspace = true }
-dartq-scanner = { workspace = true }
 
 [lints]
 workspace = true

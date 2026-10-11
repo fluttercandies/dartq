@@ -14,9 +14,9 @@ rustc-hash = { workspace = true }
 
 # plugin-overhead: the bench drives a live plugin through the runtime's
 # feed/drain faces; the batch is synthesized in the engine's diagnostic model.
-dartq-diagnostics = { path = "../../crates/dartq-diagnostics" }
-dartq-plugin = { path = "../../crates/dartq-plugin" }
-dartq-source = { path = "../../crates/dartq-source" }
+dartq-diagnostics = { workspace = true }
+dartq-plugin = { workspace = true }
+dartq-source = { workspace = true }
 
 # POSIX process-group kill for timed-out drivers (see oracle.rs kill_driver).
 [target.'cfg(unix)'.dependencies]
