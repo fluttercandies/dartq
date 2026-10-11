@@ -30,6 +30,16 @@
 # cost: every coverage run is a full cold rebuild — the gate lives in the
 # serial phase, where a cold build is the normal posture anyway.
 #
+# == target-dir isolation ==
+# The whole invocation builds into CARGO_TARGET_DIR=target/coverage-build,
+# never the shared target/: a coverage run compiles instrumented binaries,
+# and letting them land in the shared target/debug/ would overwrite the
+# exact dartq/harness binaries scripts/m2-gate.sh consumes as its gate
+# inputs (instrumented binaries also drop .profraw files into their cwd on
+# every run). The isolated tree sits inside the already-gitignored target/,
+# so no ignore-file change; the cost is a second cold build tree per run,
+# consistent with the sccache-bypassed cold-build posture above.
+#
 # SERIAL PHASE ONLY: this script executes the ENTIRE workspace test suite
 # rebuilt with coverage instrumentation. Never run it alongside
 # development-phase lanes (AGENTS.md memory-incident discipline); run it
@@ -48,7 +58,7 @@
 # from the per-crate policy table scripts/coverage-floors.tsv (tier
 # gradient: pure-logic crates 80, semantic/engine 65, I/O/CLI boundary 50;
 # `default` fallback 0; rationale and ratchet discipline live inside the
-# table and coverage-gate-plan.md section 6). --floor N overrides the table
+# table and docs/plans/coverage-gate.md section 6). --floor N overrides the table
 # with one global floor. TOTAL is printed but always advisory — a global
 # percentage is gameable by stub growth and mixes I/O crates with pure
 # logic. Default posture is advisory: below-floor rows are reported, exit
@@ -89,7 +99,7 @@
 #   --enforce      fail (exit 1) when a crate row is below its floor.
 #                  Default: advisory — below-floor rows are reported on
 #                  stderr, exit stays 0; flip once the measured baseline is
-#                  committed (coverage-gate-plan.md section 6).
+#                  committed (docs/plans/coverage-gate.md section 6).
 #   --html         write the browsable HTML report under target/coverage/html
 #                  instead of the lcov pass; prints the report pointer,
 #                  evaluates no gate.
@@ -109,6 +119,13 @@
 # report.
 
 set -euo pipefail
+
+# Coverage builds are isolated from the shared target/ (rationale in the
+# target-dir isolation section of the header): instrumented binaries must
+# never leak into the gate-consumed target/debug face. The relative path
+# resolves under the workspace root — the script cd's there before any
+# cargo call.
+export CARGO_TARGET_DIR="target/coverage-build"
 
 FLOOR_DEFAULT="0.0"
 REPORT_DEFAULT="target/coverage/coverage.lcov"
@@ -257,6 +274,7 @@ if [ "$MODE" != "report" ]; then
   printf '  %-14s %s\n' "suite" "cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
   printf '  %-14s %s\n' "threads" "-- --test-threads=1 (serial, deterministic traces)"
   printf '  %-14s %s\n' "wrapper" "RUSTC_WRAPPER='' for this invocation (sccache bypassed — see header)"
+  printf '  %-14s %s\n' "target-dir" "target/coverage-build (isolated from the shared target/ — see header)"
 
   if [ "$DRY_RUN" = 1 ]; then
     echo "== dry run: plan resolved, nothing executed"
@@ -266,7 +284,10 @@ if [ "$MODE" != "report" ]; then
   # Serial execution: one workspace pass, test binaries pinned to a single
   # thread via the forwarded arg (see the serial-phase note in the header).
   # RUSTC_WRAPPER="" unsets the workspace's sccache wrapper for this
-  # invocation only (see the sccache section in the header).
+  # invocation only (see the sccache section in the header). --offline
+  # assumes a dev host with a warm cargo registry: on a machine with no
+  # populated registry the run fails (accepted — serial-phase,
+  # dev-host-only tooling).
   rc=0
   if [ "$MODE" = "html" ]; then
     mkdir -p "$HTML_DIR"
@@ -282,7 +303,7 @@ if [ "$MODE" != "report" ]; then
 
   banner="$(rustc --version) / $(cargo llvm-cov --version)"
 
-  # §19.5 seal (coverage-gate-plan.md section 5): stamp the run's
+  # §19.5 seal (docs/plans/coverage-gate.md section 5): stamp the run's
   # environment identity from repro-tuple.sh — the single source of the
   # identity computation, so the summary stamp and tuple.json agree field
   # for field. A clean tree hashes the empty diff (sha256 of zero bytes),
@@ -384,7 +405,7 @@ printf '%s\n' "$TABLE"
 # environment is unknown, so neither is stamped) + the table. LC_ALL=C row
 # ordering and the pinned decimal point keep this byte-stable run over run:
 # same committed HEAD + same worktree patch + same toolchain ⇒ byte-identical
-# summary.txt (coverage-gate-plan.md section 5).
+# summary.txt (docs/plans/coverage-gate.md section 5).
 {
   [ -z "$banner" ] || printf '%s\n' "$banner"
   if [ -n "$GIT_HEAD" ]; then
