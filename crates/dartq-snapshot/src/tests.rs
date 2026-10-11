@@ -271,8 +271,16 @@ fn context_salt_splits_generation_directories() {
     let base = test_header();
     let mut salted = test_header();
     salted.context_salt = [5; 16];
-    assert_ne!(base.dir_id(), salted.dir_id(), "a salt change forks the dir");
-    assert_eq!(base.dir_id(), test_header().dir_id(), "equal headers share the dir");
+    assert_ne!(
+        base.dir_id(),
+        salted.dir_id(),
+        "a salt change forks the dir"
+    );
+    assert_eq!(
+        base.dir_id(),
+        test_header().dir_id(),
+        "equal headers share the dir"
+    );
 }
 
 /// A single corrupt entry demotes the whole generation: a manifest-named
