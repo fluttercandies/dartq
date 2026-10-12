@@ -1119,6 +1119,59 @@ fn class_named_section_formals_off_stay_formals() {
     );
 }
 
+/// `mixin M(int x);` at 2.12 (live 3.13.1 probe, #989): mixin formals take
+/// the parser-side face, not the Class/Enum AST-gate row —
+/// `unexpected_token` "Unexpected text '('." on the `(` (the
+/// `parsePrimaryConstructorOpt` mixin arm) plus parseMixin's `;`-body
+/// `experiment_not_enabled` row, and nothing anchored on the `(`. The
+/// oracle's `endPrimaryConstructor` `TopLevel|Mixin|Extension` arm is
+/// silent, so the kind-blind gate row the class pins hold is absent here.
+#[test]
+fn mixin_formal_off_two_row_parser_face() {
+    let (c, scanner) = parse_off_with_scanner("mixin M(int x);");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert_eq!(
+        c.errors,
+        [
+            ("unexpected_token".to_string(), 7, 8),
+            ("experiment_not_enabled".to_string(), 14, 14),
+        ],
+        "{:?}",
+        c.texts
+    );
+    assert_eq!(c.texts[0], "Unexpected text '('.");
+}
+
+/// `extension E(int x) {}` at 2.12: per the oracle's silent
+/// `TopLevel|Mixin|Extension` `endPrimaryConstructor` arm (ast_builder.dart),
+/// extension formals carry no `(`-anchored experiment row — only the
+/// parser-side `unexpected_token` from the `parsePrimaryConstructorOpt`
+/// extension arm, and no experiment row anywhere else (a `{}` body has no
+/// `;`-body row). The unrelated `on`-clause recovery rows are out of scope
+/// here; only the gate face is pinned.
+#[test]
+fn extension_formal_off_no_paren_experiment_row() {
+    let (c, scanner) = parse_off_with_scanner("extension E(int x) {}");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert!(
+        !c.errors
+            .iter()
+            .any(|(code, _, _)| code == "experiment_not_enabled"),
+        "{:?}",
+        c.errors
+    );
+    assert!(
+        c.errors
+            .contains(&("unexpected_token".to_string(), 11, 12,))
+    );
+    let i = c
+        .errors
+        .iter()
+        .position(|e| e.0 == "unexpected_token" && e.1 == 11)
+        .unwrap();
+    assert_eq!(c.texts[i], "Unexpected text '('.");
+}
+
 /// (code, start, end) rows in emission order for `source`.
 fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
     let (table, text) = scan_ok(source);

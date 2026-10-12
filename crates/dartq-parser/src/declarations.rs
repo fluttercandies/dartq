@@ -2106,18 +2106,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     crate::listener::MemberKind::PrimaryConstructor,
                 );
             }
-            // AstBuilder `endPrimaryConstructor`'s non-extension-type arm
-            // (the 3.13.1 oracle): a *parsed* primary constructor is gated
-            // at the AST layer and reports `experimentNotEnabled` anchored
-            // on the begin token (`(` or `.`) when the file's language
-            // version predates the feature. The shared parser itself never
-            // gates the Class/Enum formals parse, so `class C(int x);` at
-            // 2.12 stays a clean parse whose whole face is this row plus
-            // parseClass's `;`-body row. Mixin/Extension ride the same
-            // kind-blind arm in the oracle; their extra parser-side
-            // reports above are a different anchor face.
+            // AstBuilder `endPrimaryConstructor`'s Class/Enum arm (the 3.13.1
+            // oracle): a *parsed* primary constructor is gated at the AST
+            // layer and reports `experimentNotEnabled` anchored on the begin
+            // token (`(` or `.`) when the file's language version predates
+            // the feature. The shared parser itself never gates the
+            // Class/Enum formals parse, so `class C(int x);` at 2.12 stays a
+            // clean parse whose whole face is this row plus parseClass's
+            // `;`-body row. Mixin/Extension hit the `TopLevel|Mixin|Extension`
+            // arm, which is silent here ("error reported in the parser") —
+            // live 3.13.1 confirms `mixin M(int x);` at 2.12 emits only the
+            // parser-side rows, no `(`-anchored experiment line.
             if !self.features.primary_constructors_enabled
-                && !matches!(kind, DeclarationKind::ExtensionType)
+                && matches!(kind, DeclarationKind::Class | DeclarationKind::Enum)
             {
                 self.report_experiment_not_enabled(begin);
             }
