@@ -1,0 +1,7 @@
+name: corpus_acceptance
+description: >-
+  Valid-syntax acceptance corpus. Every file is valid Dart for the 3.15
+  grammar window; scripts/acceptance-gate.sh asserts the engine reports zero
+  diagnostics over this directory. Read-only corpus; see README.md.
+environment:
+  sdk: ^3.15.0
