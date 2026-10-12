@@ -26,14 +26,29 @@
 //! # Fix sources
 //!
 //! Patches materialize from the dartq-lints layer's diagnostic rows (its
-//! `run` face): each wired rule maps a hit to a span-exact rewrite whose
-//! source slice is verified before the patch is offered —
-//! `unnecessary_new` and `unnecessary_late` drop the keyword plus its
-//! trailing horizontal whitespace, `avoid_empty_else` rewrites the else
-//! `;` to `{}`, `unnecessary_brace_in_string_interps` drops the braces of
-//! a simple interpolation. Rules without a mechanical rewrite are never
+//! `run` face): each wired rule whose official fix is a single-span
+//! mechanical rewrite maps a hit to a span-exact rewrite whose source
+//! slice is verified before the patch is offered — the keyword drops
+//! (`unnecessary_new`, `unnecessary_late`, `unnecessary_const`,
+//! `unnecessary_this`, `unnecessary_constructor_name`,
+//! `unnecessary_string_escapes`), the syntax drops (`avoid_empty_else`,
+//! `unnecessary_brace_in_string_interps`,
+//! `unnecessary_string_interpolations`, `unnecessary_null_in_if_null_operators`,
+//! `unnecessary_null_aware_assignments`,
+//! `unnecessary_nullable_for_final_variable_declarations`), and the
+//! rewrites (`prefer_adjacent_string_concatenation`,
+//! `prefer_interpolation_to_compose_strings`, `prefer_if_null_operators`,
+//! `prefer_null_aware_operators`, `prefer_is_not_operator`,
+//! `prefer_contains`, `prefer_collection_literals`, `prefer_inlined_adds`,
+//! `prefer_function_declarations_over_variables`, `avoid_init_to_null`)
+//! — each mirroring its official `dart fix` producer's edit behavior
+//! (removals, insertions, and replacements of the same spans; whitespace
+//! never crosses a line). Rules without a mechanical rewrite are never
 //! claimed, and a wired hit whose slice no longer verifies is dropped
-//! rather than patched on faith.
+//! rather than patched on faith. The structural rewrites verify against
+//! the token stream (keyword positions are quote-safe only there); the
+//! parse is paid once per `from_lints` call and only when one of their
+//! hits is present.
 //!
 //! The rows reach [`from_lints`] through the lints layer's diagnostic
 //! face: [`collect_set`] parses each discovered file once through the
@@ -86,6 +101,7 @@ use dartq_plugin::{
     discover as discover_plugins,
 };
 use dartq_pub::PackageConfig;
+use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{LineIndex, normalize_path, utf16_len_of, utf16_offset_to_byte};
 use rustc_hash::FxHashMap;
 
@@ -418,7 +434,11 @@ pub fn collect_set(
             continue;
         };
         let parsed = parse_unit(&text, unit_features(table.as_ref(), path));
-        let hits: Vec<Lint> = run(&parsed.unit(Some(path)), set);
+        // The empty unignorable posture: the fix face reports no
+        // `unignorable_ignore` rows of its own (the analyze face's
+        // computation is the owning lane's wiring point).
+        let unignorable = rustc_hash::FxHashSet::default();
+        let hits: Vec<Lint> = run(&parsed.unit(Some(path)), set, &unignorable);
         let patches = from_lints(&hits, &text, &parsed.lines);
         let plugin = dispatch_fixes(hosts, path, &text, &parsed.lines, &hits);
         if !patches.is_empty() || !plugin.is_empty() {
@@ -673,14 +693,71 @@ pub fn apply(text: &str, edits: &[Edit]) -> (String, Vec<EditOutcome>) {
 /// dropped rather than patched on faith.
 #[must_use]
 pub fn from_lints(hits: &[Lint], text: &str, lines: &LineIndex) -> Vec<RuleFix> {
+    // The structural rewriters verify against the token stream (keyword
+    // positions are quote-safe only there); the parse is paid once per
+    // call, and only when one of their hits is present.
+    let needs_tokens = hits.iter().any(|hit| {
+        matches!(
+            RULES[hit.rule.0 as usize].name,
+            "prefer_is_not_operator"
+                | "prefer_if_null_operators"
+                | "prefer_null_aware_operators"
+                | "prefer_contains"
+                | "prefer_interpolation_to_compose_strings"
+                | "prefer_collection_literals"
+                | "prefer_inlined_adds"
+                | "prefer_function_declarations_over_variables"
+        )
+    });
+    let tokens = needs_tokens.then(|| parse_unit(text, Features::default()).tokens);
     hits.iter()
         .filter_map(|hit| {
             let rule = RULES[hit.rule.0 as usize].name;
             let (offset, length, replacement) = match rule {
                 "unnecessary_new" => drop_keyword(text, hit.range.start, "new")?,
                 "unnecessary_late" => drop_keyword(text, hit.range.start, "late")?,
+                "unnecessary_const" => drop_keyword(text, hit.range.start, "const")?,
                 "avoid_empty_else" => replace_exact(text, &hit.range, ";", "{}")?,
                 "unnecessary_brace_in_string_interps" => unbrace(text, &hit.range)?,
+                "unnecessary_this" => drop_this_qualifier(text, hit.range.start)?,
+                "unnecessary_string_escapes" => replace_exact(text, &hit.range, "\\", "")?,
+                "unnecessary_string_interpolations" => {
+                    unwrap_string_interpolation(text, &hit.range)?
+                }
+                "unnecessary_null_in_if_null_operators" => drop_if_null_null(text, &hit.range)?,
+                "unnecessary_null_aware_assignments" => {
+                    remove_null_aware_assignment(text, &hit.range)?
+                }
+                "unnecessary_nullable_for_final_variable_declarations" => {
+                    drop_type_question_mark(text, hit.range.start)?
+                }
+                "avoid_init_to_null" => drop_null_initializer(text, &hit.range)?,
+                "unnecessary_constructor_name" => drop_dot_new(text, hit.range.start)?,
+                "prefer_adjacent_string_concatenation" => drop_keyword(text, hit.range.start, "+")?,
+                "prefer_is_not_operator" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, is_not_operator)?
+                }
+                "prefer_if_null_operators" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, if_null_operators)?
+                }
+                "prefer_null_aware_operators" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, null_aware_operators)?
+                }
+                "prefer_contains" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, contains_call)?
+                }
+                "prefer_interpolation_to_compose_strings" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, compose_interpolation)?
+                }
+                "prefer_collection_literals" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, collection_literal)?
+                }
+                "prefer_inlined_adds" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, inlined_adds)?
+                }
+                "prefer_function_declarations_over_variables" => {
+                    token_rewrite(tokens.as_ref(), text, &hit.range, function_declaration)?
+                }
                 _ => return None,
             };
             Some(RuleFix {
@@ -809,6 +886,1378 @@ fn unbrace(text: &str, range: &core::ops::Range<u32>) -> Option<(u32, u32, Strin
         return None;
     }
     Some((range.start, range.end - range.start, format!("${inner}")))
+}
+
+/// The UTF-16 length of a string slice (the edits' currency).
+fn utf16_count(slice: &str) -> u32 {
+    u32::try_from(slice.chars().map(char::len_utf16).sum::<usize>()).unwrap_or(u32::MAX)
+}
+
+/// The byte slice of `text` under the UTF-16 `range`.
+fn slice16<'s>(text: &'s str, range: &core::ops::Range<u32>) -> Option<&'s str> {
+    text.get(utf16_offset_to_byte(text, range.start)..utf16_offset_to_byte(text, range.end))
+}
+
+/// The leading (or trailing) run of `quote` bytes.
+fn quote_run(bytes: &[u8], quote: u8, trailing: bool) -> usize {
+    if trailing {
+        bytes.iter().rev().take_while(|&&b| b == quote).count()
+    } else {
+        bytes.iter().take_while(|&&b| b == quote).count()
+    }
+}
+
+/// A width-0 `this` hit: the rewrite drops the `this.` qualifier — the
+/// keyword plus horizontal whitespace and the dot (the official
+/// `RemoveThisExpression` deletes from the keyword through the operator;
+/// a newline never joins).
+fn drop_this_qualifier(text: &str, offset16: u32) -> Option<(u32, u32, String)> {
+    let start = utf16_offset_to_byte(text, offset16);
+    let rest = text.get(start..)?.strip_prefix("this")?;
+    let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if !rest[ws..].starts_with('.') {
+        return None;
+    }
+    Some((offset16, 4 + u32::try_from(ws).ok()? + 1, String::new()))
+}
+
+/// The whole-literal hit of an interpolation of one string literal
+/// (`''${'x'}''`): the rewrite keeps the inner literal verbatim (the
+/// official producer deletes the wrapper ranges around it). The empty
+/// quote-run wrappers and the `${…}` group are verified first.
+fn unwrap_string_interpolation(
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let bytes = slice16(text, range)?.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let lead = quote_run(bytes, quote, false);
+    let trail = quote_run(bytes, quote, true);
+    // 1/3 quotes: the plain and triple-quote wrappers; 2: the empty
+    // adjacent-string face (`''${'x'}''`). The runs must match.
+    if lead != trail || !matches!(lead, 1..=3) {
+        return None;
+    }
+    let body = bytes.get(lead..bytes.len() - trail)?.strip_prefix(b"${")?;
+    if body.last() != Some(&b'}') {
+        return None;
+    }
+    // The kept expression is the string literal between `${` and the
+    // final `}`: it opens with its own quote (optionally raw) and closes
+    // with the matching one.
+    let inner = &body[..body.len() - 1];
+    let open = match inner.first()? {
+        b'\'' | b'"' => inner.first()?,
+        b'r' => inner.get(1)?,
+        _ => return None,
+    };
+    if *open != b'\'' && *open != b'"' {
+        return None;
+    }
+    if inner.last() != Some(open) || inner.len() < 2 {
+        return None;
+    }
+    let start = utf16_offset_to_byte(text, range.start);
+    let first = start + lead + 2;
+    let last = start + bytes.len() - trail - 1;
+    Some((
+        range.start,
+        range.end - range.start,
+        text[first..last].to_owned(),
+    ))
+}
+
+/// A `null`-operand hit under `??`: the rewrite drops the operator with
+/// the operand (`a ?? null` → `a`, `null ?? a` → `a`; the official
+/// deletion spans operator and operand together). The intervening
+/// whitespace is horizontal only — a newline stays.
+fn drop_if_null_null(text: &str, range: &core::ops::Range<u32>) -> Option<(u32, u32, String)> {
+    replace_exact(text, range, "null", "")?;
+    let start = utf16_offset_to_byte(text, range.start);
+    let end = utf16_offset_to_byte(text, range.end);
+    // Right operand (`a ?? null`): the deletion starts at the whitespace
+    // before the operator — the official span runs from the left operand's
+    // end through the null.
+    if let Some(head) = text.get(..start) {
+        let op_ws = head.len() - head.trim_end_matches([' ', '\t']).len();
+        if head[..head.len() - op_ws].ends_with("??") {
+            let before = &head[..head.len() - op_ws - 2];
+            let lead = before.len() - before.trim_end_matches([' ', '\t']).len();
+            let at = u32::try_from(start - op_ws - 2 - lead).ok()?;
+            return Some((at, range.end - at, String::new()));
+        }
+    }
+    // Left operand (`null ?? a`): the text after opens with the operator.
+    let rest = text.get(end..)?;
+    let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let after = &rest[ws..];
+    if after.starts_with("??") {
+        let tail = &after[2..];
+        let tail_ws = tail.len() - tail.trim_start_matches([' ', '\t']).len();
+        return Some((
+            range.start,
+            4 + u32::try_from(ws + 2 + tail_ws).ok()?,
+            String::new(),
+        ));
+    }
+    None
+}
+
+/// The whole-assignment hit of `x ??= null`: a lone expression-statement
+/// line loses the whole line (the official `getLinesRange` face); any
+/// other context loses `??= null`.
+fn remove_null_aware_assignment(
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let slice = slice16(text, range)?;
+    let eq = u32::try_from(slice.find("??=")?).ok()?;
+    let rhs = slice.get(eq as usize + 3..)?;
+    if rhs.trim() != "null" || slice[..eq as usize].trim().is_empty() {
+        return None;
+    }
+    let start = utf16_offset_to_byte(text, range.start);
+    let end = utf16_offset_to_byte(text, range.end);
+    // The statement-line face: nothing but whitespace before the hit on
+    // its line, and `;` plus horizontal whitespace to the line end after.
+    // The whole line goes — the official `getLinesRange` includes the
+    // line's own indentation — through the line terminator.
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    if text[line_start..start].trim().is_empty()
+        && let Some(rest) = text.get(end..)
+    {
+        let after = rest.trim_start_matches([' ', '\t']);
+        if let Some(after_semi) = after.strip_prefix(';') {
+            let trailing = after_semi.len() - after_semi.trim_start_matches([' ', '\t']).len();
+            let tail = &after_semi[trailing..];
+            let eol = if tail.starts_with("\r\n") {
+                2
+            } else if tail.starts_with('\n') {
+                1
+            } else {
+                tail.is_empty().then_some(0)?
+            };
+            let deleted = utf16_count(&text[line_start..end + 1 + trailing + eol]);
+            return Some((
+                u32::try_from(utf16_count(&text[..line_start])).ok()?,
+                deleted,
+                String::new(),
+            ));
+        }
+    }
+    // The expression face: the official deletion runs from the left-hand
+    // side's end through the value's — the whitespace before the operator
+    // goes with it.
+    let head = &slice[..eq as usize];
+    let ws = head.len() - head.trim_end_matches([' ', '\t']).len();
+    let at = range.start + eq - u32::try_from(ws).ok()?;
+    Some((at, range.end - at, String::new()))
+}
+
+fn drop_null_initializer(text: &str, range: &core::ops::Range<u32>) -> Option<(u32, u32, String)> {
+    let slice = slice16(text, range)?;
+    let eq = u32::try_from(slice.rfind('=')?).ok()?;
+    // The initializer is exactly `null` and nothing before the `=` reads
+    // as an assignment of its own. The deletion carries the whitespace
+    // before the `=` (the official deletion runs from the name's end).
+    if slice.get(eq as usize + 1..)?.trim() != "null" || slice[..eq as usize].contains('=') {
+        return None;
+    }
+    let head = &slice[..eq as usize];
+    let ws = head.len() - head.trim_end_matches([' ', '\t']).len();
+    let at = range.start + eq - u32::try_from(ws).ok()?;
+    Some((at, range.end - at, String::new()))
+}
+
+/// A width-0 variable-name hit under a final/const declaration with a
+/// nullable written type: the rewrite deletes the type's trailing `?`
+/// (the official `RemoveQuestionMark` deletes the question token of the
+/// written type, never a type argument's).
+fn drop_type_question_mark(text: &str, offset16: u32) -> Option<(u32, u32, String)> {
+    let start = utf16_offset_to_byte(text, offset16);
+    let head = text.get(..start)?;
+    let ws = head.len() - head.trim_end_matches([' ', '\t']).len();
+    if !head[..head.len() - ws].ends_with('?') {
+        return None;
+    }
+    Some((offset16 - u32::try_from(ws).ok()? - 1, 1, String::new()))
+}
+
+/// A width-0 `new` hit: the rewrite drops the `.new` (the official
+/// `RemoveConstructorName` deletes from the period through the name).
+fn drop_dot_new(text: &str, offset16: u32) -> Option<(u32, u32, String)> {
+    let start = utf16_offset_to_byte(text, offset16);
+    let rest = text.get(start..)?.strip_prefix("new")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let head = text.get(..start)?;
+    let ws = head.len() - head.trim_end_matches([' ', '\t']).len();
+    if !head[..head.len() - ws].ends_with('.') {
+        return None;
+    }
+    let at = u32::try_from(start - ws - 1).ok()?;
+    Some((at, u32::try_from(ws + 4).ok()?, String::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Token-verified rewrites
+//
+// The structural rewrites rebuild their replacement from the token
+// stream: keyword and operator positions are quote-safe only there (a
+// naive text scan would rewrite `'is'` or split on the `+` inside a
+// string). Every rewriter re-verifies the shape its rule reports before
+// composing — an unverifiable hit drops, never patches on faith.
+// ---------------------------------------------------------------------------
+
+/// Runs a token-verified rewriter; a missing token table (no parse was
+/// needed by any hit) drops the fix.
+fn token_rewrite(
+    tokens: Option<&TokenTable>,
+    text: &str,
+    range: &core::ops::Range<u32>,
+    rewrite: fn(&TokenTable, &str, &core::ops::Range<u32>) -> Option<(u32, u32, String)>,
+) -> Option<(u32, u32, String)> {
+    rewrite(tokens?, text, range)
+}
+
+/// The `[first, last]` token-index window of a hit range. Only real
+/// tokens count — the scanner-recovery tail (the phantom bracket pair
+/// behind the `[]` index token, `Eof`) is zero-width and unsorted, so a
+/// binary search over the stream cannot close the window.
+fn hit_tokens(tokens: &TokenTable, range: &core::ops::Range<u32>) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for index in 0..tokens.as_slice().len() {
+        let token = tokens.get(index)?;
+        if token.byte_len == 0 || token.utf16_offset < range.start {
+            continue;
+        }
+        if token.utf16_offset >= range.end {
+            break;
+        }
+        if first.is_none() {
+            first = Some(index);
+        }
+        last = Some(index);
+    }
+    Some((first?, last?))
+}
+
+/// The UTF-16 `[offset, length)` covering tokens `first..=last`.
+fn span_over(text: &str, tokens: &TokenTable, first: usize, last: usize) -> Option<(u32, u32)> {
+    let start = tokens.get(first)?.utf16_offset;
+    let end = tokens.get(last)?.utf16_offset
+        + u32::try_from(tokens.lexeme(text, last).encode_utf16().count()).ok()?;
+    Some((start, end.checked_sub(start)?))
+}
+
+fn kind_of(tokens: &TokenTable, index: usize) -> Option<TokenKind> {
+    tokens.get(index).map(|token| token.kind)
+}
+
+/// The token's byte-end position.
+fn token_end(token: &dartq_scanner::Token) -> usize {
+    token.byte_offset as usize + token.byte_len as usize
+}
+
+/// A word-shaped token with the exact lexeme (plain identifiers and
+/// pseudo keywords both qualify — the scanner's split between
+/// `Identifier` and contextual `Keyword` is contextual).
+fn word_at(tokens: &TokenTable, text: &str, index: usize, word: &str) -> bool {
+    matches!(
+        kind_of(tokens, index),
+        Some(TokenKind::Identifier) | Some(TokenKind::Keyword(_))
+    ) && tokens.lexeme(text, index) == word
+}
+
+fn is_null_token(tokens: &TokenTable, index: usize) -> bool {
+    kind_of(tokens, index) == Some(TokenKind::Keyword(Keyword::Null))
+}
+
+/// The first depth-0 token in `from..to` matching `pred`, over the `()`,
+/// `[]`, `{}`, and `${}` nesting (`<` is not a group here — comparisons
+/// and type arguments must not disturb the balance).
+fn depth0_find(
+    tokens: &TokenTable,
+    text: &str,
+    from: usize,
+    to: usize,
+    pred: impl Fn(TokenKind, &str) -> bool,
+) -> Option<usize> {
+    let mut depth = 0u32;
+    for index in from..to {
+        let token = tokens.get(index)?;
+        match token.kind {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            _ => {}
+        }
+        if depth == 0 && pred(token.kind, tokens.lexeme(text, index)) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Whether the token before `!(…)` lets the parentheses go: the official
+/// face keeps them exactly when the `!`'s parent binds at relational
+/// strength or tighter (prefix operators, selectors, the relational and
+/// bitwise families) — everything delimiter- or low-precedence-flanked
+/// drops them.
+fn paren_removable(kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::Semicolon
+        | TokenKind::OpenCurly
+        | TokenKind::CloseCurly
+        | TokenKind::OpenParen
+        | TokenKind::OpenSquare
+        | TokenKind::Comma
+        | TokenKind::Colon
+        | TokenKind::Question
+        | TokenKind::Eq
+        | TokenKind::PlusEq
+        | TokenKind::MinusEq
+        | TokenKind::StarEq
+        | TokenKind::SlashEq
+        | TokenKind::PercentEq
+        | TokenKind::TildeSlashEq
+        | TokenKind::LtLtEq
+        | TokenKind::GtGtEq
+        | TokenKind::GtGtGtEq
+        | TokenKind::AmpersandEq
+        | TokenKind::BarEq
+        | TokenKind::CaretEq
+        | TokenKind::QuestionQuestionEq
+        | TokenKind::Function
+        | TokenKind::AmpersandAmpersand
+        | TokenKind::BarBar
+        | TokenKind::EqEq
+        | TokenKind::BangEq
+        | TokenKind::QuestionQuestion => true,
+        TokenKind::Keyword(kw) => matches!(
+            kw,
+            Keyword::Return
+                | Keyword::Throw
+                | Keyword::Yield
+                | Keyword::Case
+                | Keyword::In
+                | Keyword::Else
+                | Keyword::Do
+        ),
+        _ => false,
+    }
+}
+
+/// `!(x is T)` → `x is! T` (or `!(x is! T)` where the parentheses must
+/// stay): the `!` goes and an `!` lands after the `is` — the official
+/// `ConvertIntoIsNot` deletions and insertion folded into one
+/// whole-span replacement.
+fn is_not_operator(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    if kind_of(tokens, first)? != TokenKind::Bang {
+        return None;
+    }
+    let lparen = first + 1;
+    if kind_of(tokens, lparen)? != TokenKind::OpenParen || tokens.matching_end(lparen)? != last {
+        return None;
+    }
+    let is = depth0_find(tokens, text, lparen + 1, last, |kind, _| {
+        kind == TokenKind::Keyword(Keyword::Is)
+    })?;
+    let is_end = token_end(tokens.get(is)?);
+    let keep_parens = !first
+        .checked_sub(1)
+        .and_then(|index| tokens.get(index))
+        .is_some_and(|prev| paren_removable(prev.kind));
+    let (base, body_end) = if keep_parens {
+        (token_end(tokens.get(first)?), token_end(tokens.get(last)?))
+    } else {
+        (
+            token_end(tokens.get(lparen)?),
+            tokens.get(last)?.byte_offset as usize,
+        )
+    };
+    let body = &text[base..body_end];
+    let at = is_end - base;
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((
+        start16,
+        length16,
+        format!("{}!{}", &body[..at], &body[at..]),
+    ))
+}
+
+/// The `(condition-op, non-null operand token range, then, else)` of a
+/// null-check conditional — the shared read of the two null-aware
+/// rewrites. The separators are the depth-0 `?` and `:` of the span.
+fn null_check_tokens<'s>(
+    tokens: &TokenTable,
+    text: &'s str,
+    first: usize,
+    last: usize,
+) -> Option<(
+    TokenKind,
+    core::ops::Range<usize>,
+    core::ops::Range<usize>,
+    core::ops::Range<usize>,
+)> {
+    let question = depth0_find(tokens, text, first, last + 1, |kind, _| {
+        kind == TokenKind::Question
+    })?;
+    // The conditional's own `:`: each depth-0 `?` after the first opens a
+    // nested conditional (a bare conditional then-arm is legal), whose
+    // `:` closes it before the outer's can appear.
+    let mut depth = 0u32;
+    let mut pending = 0u32;
+    let mut colon = None;
+    for index in question + 1..=last {
+        match kind_of(tokens, index)? {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            TokenKind::Question if depth == 0 => pending += 1,
+            TokenKind::Colon if depth == 0 => {
+                if pending == 0 {
+                    colon = Some(index);
+                    break;
+                }
+                pending -= 1;
+            }
+            _ => {}
+        }
+    }
+    let colon = colon?;
+    let op = depth0_find(tokens, text, first, question, |kind, _| {
+        matches!(kind, TokenKind::EqEq | TokenKind::BangEq)
+    })?;
+    let operand = if is_null_token(tokens, op + 1) {
+        first..op
+    } else if op > first && is_null_token(tokens, op - 1) {
+        op + 1..question
+    } else {
+        return None;
+    };
+    Some((
+        kind_of(tokens, op)?,
+        operand,
+        question + 1..colon,
+        colon + 1..last + 1,
+    ))
+}
+
+/// The trimmed source text of a token range (an empty range is the empty
+/// string).
+fn token_text(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) -> Option<String> {
+    if range.is_empty() {
+        return Some(String::new());
+    }
+    let (start, length) = span_over(text, tokens, range.start, range.end - 1)?;
+    text.get(utf16_offset_to_byte(text, start)..utf16_offset_to_byte(text, start + length))
+        .map(str::trim)
+        .map(str::to_owned)
+}
+
+/// Whether the token ranges hold the same lexeme sequence.
+fn same_tokens(
+    tokens: &TokenTable,
+    text: &str,
+    a: core::ops::Range<usize>,
+    b: core::ops::Range<usize>,
+) -> bool {
+    a.len() == b.len()
+        && !a.is_empty()
+        && a.enumerate()
+            .all(|(i, index)| tokens.lexeme(text, index) == tokens.lexeme(text, b.start + i))
+}
+
+/// `x == null ? a : x` → `x ?? a` (the official `ConvertToIfNull`
+/// replacement text: nullable operand, `??`, default arm — parenthesized
+/// when the arm is itself a bare conditional).
+fn if_null_operators(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    let (op, operand, then_arm, else_arm) = null_check_tokens(tokens, text, first, last)?;
+    let (nullable, default) = match op {
+        TokenKind::EqEq => (else_arm, then_arm),
+        _ => (then_arm, else_arm),
+    };
+    if !same_tokens(tokens, text, operand, nullable.clone()) {
+        return None;
+    }
+    let default_text = token_text(tokens, text, default.clone())?;
+    // A default whose precedence sits below `??` (a bare conditional —
+    // the only such shape) needs its parentheses.
+    let wrap = depth0_find(tokens, text, default.start, default.end, |kind, _| {
+        kind == TokenKind::Question
+    })
+    .is_some();
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((
+        start16,
+        length16,
+        format!(
+            "{} ?? {}{}{}",
+            token_text(tokens, text, nullable)?,
+            if wrap { "(" } else { "" },
+            default_text,
+            if wrap { ")" } else { "" },
+        ),
+    ))
+}
+
+/// `x == null ? null : x.y` → `x?.y`: the arm's access chain peels back
+/// to the null-check operand (the rule's own test, re-verified), the
+/// peeled access goes null-aware — `.` becomes `?.`, a trailing `!`
+/// becomes `?` (or vanishes when bare), an existing `?.` stays.
+fn null_aware_operators(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    let (op, operand, then_arm, else_arm) = null_check_tokens(tokens, text, first, last)?;
+    let result = match op {
+        TokenKind::EqEq if is_null_token(tokens, then_arm.start) => else_arm,
+        TokenKind::BangEq if is_null_token(tokens, else_arm.start) => then_arm,
+        _ => return None,
+    };
+    let n = operand.len();
+    if result.len() <= n
+        || !same_tokens(
+            tokens,
+            text,
+            operand.clone(),
+            result.start..result.start + n,
+        )
+    {
+        return None;
+    }
+    let receiver = token_text(tokens, text, operand)?;
+    // The access right after the peeled receiver decides the rewrite.
+    let after = result.start + n;
+    let access = tokens.get(after)?;
+    let arm_end = token_end(tokens.get(result.end - 1)?);
+    let tail = &text[token_end(access)..arm_end];
+    let rewritten = match access.kind {
+        // The access token itself is excluded from `tail`: `.` and `?.`
+        // both grow to `?.`, a trailing `!` becomes `?` (or vanishes when
+        // nothing follows it).
+        TokenKind::Period | TokenKind::QuestionPeriod => format!("{receiver}?.{tail}"),
+        TokenKind::Bang => {
+            if after + 1 == result.end {
+                receiver
+            } else {
+                format!("{receiver}?{tail}")
+            }
+        }
+        _ => return None,
+    };
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((start16, length16, rewritten))
+}
+
+/// The value of the int literal at `index` (optionally negated by the
+/// preceding `-`): decimal/hex with digit separators, the lint's own
+/// `getIntValue` face.
+fn int_literal_value(tokens: &TokenTable, text: &str, index: usize) -> Option<i64> {
+    let (negative, at) = if kind_of(tokens, index) == Some(TokenKind::Minus) {
+        (true, index + 1)
+    } else {
+        (false, index)
+    };
+    if kind_of(tokens, at) != Some(TokenKind::Int) {
+        return None;
+    }
+    let lexeme = tokens.lexeme(text, at);
+    let hex = lexeme.starts_with("0x") || lexeme.starts_with("0X");
+    let digits: String = lexeme
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .chars()
+        .filter(|&ch| ch != '_')
+        .collect();
+    i64::from_str_radix(&digits, if hex { 16 } else { 10 })
+        .ok()
+        .map(|value| if negative { -value } else { value })
+}
+
+/// The `indexOf` comparison rewrite (`x.indexOf(y) == -1` →
+/// `!x.contains(y)`, the official `ConvertToContains`): the rewrite
+/// matrix alone produces an edit — the always-true/false judgments get
+/// none, exactly as the official producer returns without one.
+fn contains_call(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    // The method-name `indexOf` is the last word followed by `(` (a
+    // receiver's own `indexOf` call sits before it).
+    let call = (first..last)
+        .filter(|&index| word_at(tokens, text, index, "indexOf"))
+        .filter(|&index| kind_of(tokens, index + 1) == Some(TokenKind::OpenParen))
+        .next_back()?;
+    let lparen = call + 1;
+    let rparen = tokens.matching_end(lparen)?;
+    // The start-index argument must be the literal 0 (the lint's own
+    // gate) and is dropped from the rewrite.
+    let comma = depth0_find(tokens, text, lparen + 1, rparen, |kind, _| {
+        kind == TokenKind::Comma
+    });
+    let argument = match comma {
+        Some(comma) => {
+            let second = comma + 1..rparen;
+            if second.len() != 1 || tokens.lexeme(text, second.start) != "0" {
+                return None;
+            }
+            lparen + 1..comma
+        }
+        None => lparen + 1..rparen,
+    };
+    // The int literal sits on one side of the comparison operator; the
+    // left-literal layout reads the operator with its operands swapped to
+    // reach the matrix's `indexOf OP literal` layout.
+    let left_literal = kind_of(tokens, first) == Some(TokenKind::Minus)
+        || kind_of(tokens, first) == Some(TokenKind::Int);
+    let is_comparison = |kind: Option<TokenKind>| {
+        matches!(
+            kind,
+            Some(TokenKind::EqEq)
+                | Some(TokenKind::BangEq)
+                | Some(TokenKind::Lt)
+                | Some(TokenKind::LtEq)
+                | Some(TokenKind::Gt)
+                | Some(TokenKind::GtEq)
+        )
+    };
+    let (value, effective, receiver_start) = if left_literal {
+        // `-1 != x.indexOf(y)`: the operator sits after the literal, the
+        // hit ends at the invocation.
+        let op_index = if kind_of(tokens, first) == Some(TokenKind::Minus) {
+            first + 2
+        } else {
+            first + 1
+        };
+        if !is_comparison(kind_of(tokens, op_index)) || rparen != last {
+            return None;
+        }
+        let after_op = utf16_offset_to_byte(text, tokens.get(op_index + 1)?.utf16_offset);
+        (
+            int_literal_value(tokens, text, first)?,
+            mirror_op(tokens.lexeme(text, op_index)).to_owned(),
+            after_op,
+        )
+    } else {
+        let op_index = rparen + 1;
+        if op_index >= last || !is_comparison(kind_of(tokens, op_index)) {
+            return None;
+        }
+        (
+            int_literal_value(tokens, text, op_index + 1)?,
+            tokens.lexeme(text, op_index).to_owned(),
+            tokens.get(first)?.byte_offset as usize,
+        )
+    };
+    let negated = match (value, effective.as_str()) {
+        (-1, "==" | "<=") => true,
+        (-1, "!=" | ">") => false,
+        (0, ">=") => false,
+        (0, "<") => true,
+        _ => return None,
+    };
+    let argument_text = token_text(tokens, text, argument)?;
+    let receiver = &text[receiver_start..tokens.get(call)?.byte_offset as usize];
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((
+        start16,
+        length16,
+        format!(
+            "{}{receiver}contains({argument_text})",
+            if negated { "!" } else { "" }
+        ),
+    ))
+}
+
+/// The comparison operator read with its operands swapped (`a < b` ≡
+/// `b > a`): the left-literal face canonicalizes to the matrix's layout.
+fn mirror_op(op: &str) -> &str {
+    match op {
+        "<" => ">=",
+        "<=" => ">",
+        ">" => "<=",
+        ">=" => "<",
+        other => other,
+    }
+}
+
+/// One merged interpolation component: a string literal's contents, a
+/// bare identifier, or an arbitrary expression's source.
+struct Component {
+    text: String,
+    identifier: bool,
+}
+
+fn compose_interpolation(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    // The chain's depth-0 `+` splits the operands.
+    let mut operands: Vec<core::ops::Range<usize>> = Vec::new();
+    let mut depth = 0u32;
+    let mut start = first;
+    for index in first..=last {
+        match kind_of(tokens, index)? {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            TokenKind::Plus if depth == 0 => {
+                operands.push(start..index);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    operands.push(start..last + 1);
+    if operands.len() < 2 {
+        return None;
+    }
+    let mut components = Vec::new();
+    let mut style: Option<(u8, bool)> = None;
+    for operand in operands {
+        let (component, literal_style) = flatten_operand(tokens, text, operand.clone())?;
+        match (style, literal_style) {
+            (None, _) => style = literal_style,
+            (Some(existing), Some(new)) if existing != new => return None,
+            _ => {}
+        }
+        components.push(component);
+    }
+    let (quote, triple) = style?;
+    let open = char::from(quote)
+        .to_string()
+        .repeat(if triple { 3 } else { 1 });
+    // A bare identifier absorbs a following identifier-part head, so it
+    // takes the braced form when the next component would continue it.
+    let mut out = open.clone();
+    for (index, component) in components.iter().enumerate() {
+        let next_continues = components
+            .get(index + 1)
+            .and_then(|next| next.text.chars().next())
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$');
+        if component.identifier {
+            if next_continues {
+                out.push_str("${");
+                out.push_str(&component.text);
+                out.push('}');
+            } else {
+                out.push('$');
+                out.push_str(&component.text);
+            }
+        } else {
+            out.push_str(&component.text);
+        }
+    }
+    out.push_str(&open);
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((start16, length16, out))
+}
+
+/// One operand of the `+` chain → its component (with the string style
+/// when the operand is a literal). Adjacent strings flatten piece-wise,
+/// `x.toString()` unwraps to `x`, parentheses unwrap — the official
+/// `_extractComponentsInto` walk. Raw strings drop the whole fix.
+fn flatten_operand(
+    tokens: &TokenTable,
+    text: &str,
+    operand: core::ops::Range<usize>,
+) -> Option<(Component, Option<(u8, bool)>)> {
+    let first = operand.start;
+    let last = operand.end - 1;
+    match kind_of(tokens, first)? {
+        TokenKind::String => {
+            let lexeme = tokens.lexeme(text, first);
+            if lexeme.starts_with('r') {
+                return None;
+            }
+            let quote = *lexeme.as_bytes().first()?;
+            // Adjacent strings: consecutive bare String tokens, each its
+            // own literal piece — all sharing one quote style.
+            let mut split = first;
+            while split <= last && kind_of(tokens, split) == Some(TokenKind::String) {
+                split += 1;
+            }
+            if split > last {
+                let mut contents = String::new();
+                for index in first..=last {
+                    if string_style(tokens, text, index)?
+                        != (quote, quote_is_triple(tokens, text, first)?)
+                    {
+                        return None;
+                    }
+                    contents.push_str(&segment_contents(tokens, text, index)?);
+                }
+                return Some((
+                    Component {
+                        text: contents,
+                        identifier: false,
+                    },
+                    Some((quote, quote_is_triple(tokens, text, first)?)),
+                ));
+            }
+            // An interpolated literal: `${…}` groups and segments to the
+            // end, contents verbatim between the outer quote runs.
+            let mut cursor = split;
+            while cursor <= last {
+                match kind_of(tokens, cursor)? {
+                    TokenKind::String => cursor += 1,
+                    TokenKind::StringInterpolationExpression => {
+                        cursor = tokens.matching_end(cursor)? + 1;
+                    }
+                    _ => return None,
+                }
+            }
+            let head = tokens.get(first)?.byte_offset as usize
+                + quote_run(lexeme.as_bytes(), quote, false);
+            let tail_lexeme = tokens.lexeme(text, last);
+            let tail = tokens.get(last)?.byte_offset as usize + tail_lexeme.len()
+                - quote_run(
+                    tail_lexeme.as_bytes(),
+                    *tail_lexeme.as_bytes().last()?,
+                    true,
+                );
+            Some((
+                Component {
+                    text: text[head..tail].to_owned(),
+                    identifier: false,
+                },
+                Some((quote, quote_run(lexeme.as_bytes(), quote, false) > 1)),
+            ))
+        }
+        TokenKind::Identifier | TokenKind::Keyword(_) if first == last => Some((
+            Component {
+                text: tokens.lexeme(text, first).to_owned(),
+                identifier: true,
+            },
+            None,
+        )),
+        _ => {
+            // `x.toString()` unwraps to `x`; parentheses unwrap.
+            if last >= first + 4
+                && kind_of(tokens, last - 3) == Some(TokenKind::Period)
+                && word_at(tokens, text, last - 2, "toString")
+                && kind_of(tokens, last - 1) == Some(TokenKind::OpenParen)
+                && kind_of(tokens, last) == Some(TokenKind::CloseParen)
+            {
+                return flatten_operand(tokens, text, first..last - 3);
+            }
+            if kind_of(tokens, first) == Some(TokenKind::OpenParen)
+                && tokens.matching_end(first)? == last
+            {
+                return flatten_operand(tokens, text, first + 1..last);
+            }
+            let (start16, length16) = span_over(text, tokens, first, last)?;
+            let slice = text.get(
+                utf16_offset_to_byte(text, start16)..utf16_offset_to_byte(text, start16 + length16),
+            )?;
+            Some((
+                Component {
+                    text: slice.to_owned(),
+                    identifier: false,
+                },
+                None,
+            ))
+        }
+    }
+}
+
+/// The `(quote byte, is-triple)` style of a bare string segment.
+fn string_style(tokens: &TokenTable, text: &str, index: usize) -> Option<(u8, bool)> {
+    let _ = text;
+    let lexeme = tokens.lexeme(text, index);
+    let quote = if lexeme.starts_with('r') {
+        *lexeme.as_bytes().get(1)?
+    } else {
+        *lexeme.as_bytes().first()?
+    };
+    Some((quote, quote_run(lexeme.as_bytes(), quote, false) > 1))
+}
+
+/// The triple-quote flag of the operand's head segment.
+fn quote_is_triple(tokens: &TokenTable, text: &str, index: usize) -> Option<bool> {
+    string_style(tokens, text, index).map(|(_, triple)| triple)
+}
+
+/// The contents of one bare string segment: the lexeme minus its outer
+/// quote runs (escapes stay as written).
+fn segment_contents(tokens: &TokenTable, text: &str, index: usize) -> Option<String> {
+    let lexeme = tokens.lexeme(text, index);
+    let quote = if lexeme.starts_with('r') {
+        *lexeme.as_bytes().get(1)?
+    } else {
+        *lexeme.as_bytes().first()?
+    };
+    let lead = quote_run(lexeme.as_bytes(), quote, false);
+    let trail = quote_run(lexeme.as_bytes(), quote, true);
+    let start = tokens.get(index)?.byte_offset as usize;
+    Some(text[start + lead..start + lexeme.len() - trail].to_owned())
+}
+
+/// `Map()` → `{}` (written type arguments ride along), `Set()` →
+/// `<dynamic>{}` unless the context declares `Set`, `Set.from([…])` /
+/// `Set.of([…])` and `[…].toSet()` → the set literal — the official
+/// `ConvertToMapLiteral` / `ConvertToSetLiteral` replacements.
+fn collection_literal(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    // The `.toSet()` face: an optional type argument group, the list
+    // literal, then `.toSet()`.
+    let mut cursor = first;
+    let mut head_args = String::new();
+    if kind_of(tokens, cursor) == Some(TokenKind::Lt) {
+        let close = tokens.matching_end(cursor)?;
+        head_args = token_text(tokens, text, cursor..close + 1)?;
+        cursor = close + 1;
+    }
+    // The `.toSet()` face: the target list literal — a `[…]` group, or
+    // the scanner's single `[]` token for the empty literal — then
+    // `.toSet()`.
+    if matches!(
+        kind_of(tokens, cursor),
+        Some(TokenKind::OpenSquare) | Some(TokenKind::Index)
+    ) {
+        let (close, contents) = if kind_of(tokens, cursor) == Some(TokenKind::Index) {
+            (cursor, String::new())
+        } else {
+            let close = tokens.matching_end(cursor)?;
+            (close, token_text(tokens, text, cursor + 1..close)?)
+        };
+        if close + 4 == last
+            && kind_of(tokens, close + 1) == Some(TokenKind::Period)
+            && word_at(tokens, text, close + 2, "toSet")
+            && kind_of(tokens, close + 3) == Some(TokenKind::OpenParen)
+            && kind_of(tokens, last) == Some(TokenKind::CloseParen)
+        {
+            let unambiguous = !contents.is_empty() && !contents.starts_with("...");
+            let prefix = if head_args.is_empty() && !unambiguous {
+                "<dynamic>"
+            } else {
+                ""
+            };
+            let (start16, length16) = span_over(text, tokens, first, last)?;
+            return Some((
+                start16,
+                length16,
+                format!("{head_args}{prefix}{{{contents}}}"),
+            ));
+        }
+        return None;
+    }
+    // The creation faces: the callee identifier (after an optional
+    // `new`), its type arguments, then the constructor shape.
+    let mut cursor = cursor.max(first);
+    if kind_of(tokens, cursor) == Some(TokenKind::Keyword(Keyword::New)) {
+        cursor += 1;
+    }
+    let name = tokens.lexeme(text, cursor).to_owned();
+    if !matches!(
+        kind_of(tokens, cursor),
+        Some(TokenKind::Identifier) | Some(TokenKind::Keyword(_))
+    ) || !matches!(
+        name.as_str(),
+        "Map" | "LinkedHashMap" | "Set" | "LinkedHashSet"
+    ) {
+        return None;
+    }
+    cursor += 1;
+    // The written type arguments ride into the replacement, then the
+    // constructor shape: `.from`/`.of` (the named face) or `(`.
+    let mut ctor_args = String::new();
+    if kind_of(tokens, cursor) == Some(TokenKind::Lt) {
+        let close = tokens.matching_end(cursor)?;
+        ctor_args = token_text(tokens, text, cursor..close + 1)?;
+        cursor = close + 1;
+    }
+    let named = kind_of(tokens, cursor) == Some(TokenKind::Period)
+        && (word_at(tokens, text, cursor + 1, "from") || word_at(tokens, text, cursor + 1, "of"));
+    if named {
+        cursor += 2;
+    }
+    if kind_of(tokens, cursor) != Some(TokenKind::OpenParen) {
+        return None;
+    }
+    let close = tokens.matching_end(cursor)?;
+    if !named {
+        // The unnamed face: empty parentheses close the creation.
+        if close != last || close != cursor + 1 {
+            return None;
+        }
+        let prefix = match name.as_str() {
+            "Set" | "LinkedHashSet"
+                if !declares_set_context(tokens, text, first).unwrap_or(false) =>
+            {
+                "<dynamic>"
+            }
+            _ => "",
+        };
+        let (start16, length16) = span_over(text, tokens, first, last)?;
+        return Some((start16, length16, format!("{ctor_args}{prefix}{{}}")));
+    }
+    // The single argument is a list literal — a `[…]` group or the
+    // scanner's single `[]` token — and the argument list closes right
+    // after it.
+    let mut arg = cursor + 1;
+    let mut list_args = String::new();
+    if kind_of(tokens, arg) == Some(TokenKind::Lt) {
+        let close = tokens.matching_end(arg)?;
+        list_args = token_text(tokens, text, arg..close + 1)?;
+        arg = close + 1;
+    }
+    let (close, elements) = match kind_of(tokens, arg) {
+        Some(TokenKind::OpenSquare) => {
+            let close = tokens.matching_end(arg)?;
+            (close, token_text(tokens, text, arg + 1..close)?)
+        }
+        Some(TokenKind::Index) => (arg, String::new()),
+        _ => return None,
+    };
+    if close + 1 != last || tokens.matching_end(cursor)? != last {
+        return None;
+    }
+    let unambiguous = !elements.is_empty() && !elements.starts_with("...");
+    let inferred = !ctor_args.is_empty()
+        || !list_args.is_empty()
+        || unambiguous
+        || declares_set_context(tokens, text, first).unwrap_or(false);
+    let prefix = if inferred { "" } else { "<dynamic>" };
+    let (start16, length16) = span_over(text, tokens, first, last)?;
+    Some((
+        start16,
+        length16,
+        format!("{ctor_args}{prefix}{{{elements}}}"),
+    ))
+}
+
+/// Whether the creation sits in a declaration whose written type is
+/// `Set` (`Set s = Set()`): the official inference face, read backwards
+/// over the declaration shape `= name [type]`.
+fn declares_set_context(tokens: &TokenTable, text: &str, first: usize) -> Option<bool> {
+    let Some(at) = first
+        .checked_sub(1)
+        .filter(|&i| kind_of(tokens, i) == Some(TokenKind::Eq))
+    else {
+        return Some(false);
+    };
+    let Some(name) = at
+        .checked_sub(1)
+        .filter(|&i| kind_of(tokens, i) == Some(TokenKind::Identifier))
+    else {
+        return Some(false);
+    };
+    let mut cursor = name - 1;
+    // Skip a type-argument group, then expect the type identifier.
+    if matches!(
+        kind_of(tokens, cursor),
+        Some(TokenKind::Gt) | Some(TokenKind::GtGt) | Some(TokenKind::GtGtGt)
+    ) {
+        let mut depth = 0u32;
+        loop {
+            match kind_of(tokens, cursor)? {
+                TokenKind::Gt => depth += 1,
+                TokenKind::GtGt => depth += 2,
+                TokenKind::GtGtGt => depth += 3,
+                TokenKind::Lt => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            cursor = cursor.checked_sub(1)?;
+        }
+        cursor = cursor.checked_sub(1)?;
+    }
+    Some(
+        kind_of(tokens, cursor) == Some(TokenKind::Identifier)
+            && tokens.lexeme(text, cursor) == "Set",
+    )
+}
+
+/// `['a']..add(x)` → `['a', x]` (and the `addAll` literal form): the
+/// cascade sections after the target compose into the literal — one
+/// whole-tail replacement per cascade (the official insert-and-delete
+/// pair folded; a section that is not `add`/`addAll` ends the tail and
+/// stays put).
+fn inlined_adds(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (name_index, _) = hit_tokens(tokens, range)?;
+    let name = tokens.lexeme(text, name_index);
+    if !matches!(name, "add" | "addAll")
+        || kind_of(tokens, name_index + 1) != Some(TokenKind::OpenParen)
+    {
+        return None;
+    }
+    let lparen = name_index + 1;
+    let rparen = tokens.matching_end(lparen)?;
+    if depth0_find(tokens, text, lparen + 1, rparen, |kind, _| {
+        kind == TokenKind::Comma
+    })
+    .is_some()
+    {
+        return None; // the official face takes exactly one argument
+    }
+    // Backwards: the cascade marker, then the target literal's `]`.
+    match kind_of(tokens, name_index.checked_sub(1)?) {
+        Some(TokenKind::PeriodPeriod) | Some(TokenKind::QuestionPeriodPeriod) => {}
+        _ => return None,
+    }
+    let close_square = name_index - 2;
+    // The target literal's `]`: a `[…]` group — or the scanner's single
+    // `[]` token for the empty literal, its own opener and closer.
+    let open_square = match kind_of(tokens, close_square) {
+        Some(TokenKind::Index) => close_square,
+        Some(TokenKind::CloseSquare) => {
+            let mut depth = 0u32;
+            let mut cursor = close_square;
+            loop {
+                cursor = cursor.checked_sub(1)?;
+                match kind_of(tokens, cursor)? {
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth += 1
+                    }
+                    TokenKind::OpenParen | TokenKind::OpenCurly => depth = depth.checked_sub(1)?,
+                    TokenKind::StringInterpolationExpression => depth = depth.checked_sub(1)?,
+                    TokenKind::OpenSquare => {
+                        if depth == 0 {
+                            break cursor;
+                        }
+                        depth = depth.checked_sub(1)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => return None,
+    };
+    // The hit's own section opens the composition; the sections after it
+    // follow while they are `add`/`addAll`.
+    let target_nonempty = close_square > open_square + 1;
+    let mut additions = vec![section_addition(tokens, text, name, lparen, rparen)?];
+    let mut cursor = rparen;
+    loop {
+        let next = cursor + 1;
+        if !matches!(
+            kind_of(tokens, next),
+            Some(TokenKind::PeriodPeriod) | Some(TokenKind::QuestionPeriodPeriod)
+        ) {
+            break;
+        }
+        let section = next + 1;
+        let section_name = tokens.lexeme(text, section);
+        if !matches!(section_name, "add" | "addAll")
+            || kind_of(tokens, section + 1) != Some(TokenKind::OpenParen)
+        {
+            break;
+        }
+        let section_rparen = tokens.matching_end(section + 1)?;
+        match section_addition(tokens, text, section_name, section + 1, section_rparen) {
+            Some(addition) => {
+                additions.push(addition);
+                cursor = section_rparen;
+            }
+            None => break,
+        }
+    }
+    let (start16, length16) = span_over(text, tokens, close_square, cursor)?;
+    let joined = additions.join(", ");
+    // The empty literal is one `[]` token: the whole literal is rewritten.
+    let replacement = if close_square == open_square {
+        format!("[{joined}]")
+    } else {
+        format!("{}{}]", if target_nonempty { ", " } else { "" }, joined)
+    };
+    Some((start16, length16, replacement))
+}
+
+/// The composed element source of one `add`/`addAll` section: the single
+/// argument, or the list literal's elements for `addAll` (`None` when the
+/// section is not the official face — multiple arguments, a non-literal
+/// `addAll` argument, an empty one).
+fn section_addition(
+    tokens: &TokenTable,
+    text: &str,
+    name: &str,
+    lparen: usize,
+    rparen: usize,
+) -> Option<String> {
+    if depth0_find(tokens, text, lparen + 1, rparen, |kind, _| {
+        kind == TokenKind::Comma
+    })
+    .is_some()
+    {
+        return None; // the official face takes exactly one argument
+    }
+    if name == "addAll" {
+        if kind_of(tokens, lparen + 1) != Some(TokenKind::OpenSquare) {
+            return None; // the spread rule's face, not ours
+        }
+        let sq = tokens.matching_end(lparen + 1)?;
+        if sq + 1 != rparen {
+            return None;
+        }
+        let elements = token_text(tokens, text, lparen + 2..sq)?;
+        if elements.is_empty() {
+            return None; // the official face returns without a fix here
+        }
+        Some(elements)
+    } else {
+        let argument = token_text(tokens, text, lparen + 1..rparen)?;
+        if argument.is_empty() {
+            return None;
+        }
+        Some(argument)
+    }
+}
+
+/// `var f = () {};` → `void f() {}` (the official
+/// `ConvertToFunctionDeclaration`, its resolution-free face): the
+/// declaration prefix goes, the name keeps, the closure's parameters and
+/// body follow the inferred-`void` return type (`Future<void>` under
+/// `async`). Value-returning closures and expression bodies drop — their
+/// return type is not derivable here.
+fn function_declaration(
+    tokens: &TokenTable,
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
+    let (first, last) = hit_tokens(tokens, range)?;
+    if kind_of(tokens, first) != Some(TokenKind::Identifier)
+        || kind_of(tokens, first + 1) != Some(TokenKind::Eq)
+        || kind_of(tokens, last + 1) != Some(TokenKind::Semicolon)
+    {
+        return None;
+    }
+    let name = tokens.lexeme(text, first);
+    // The declaration prefix, walked backwards: `late`/`final`/`const`/
+    // `var`, then the optional written type (dotted, nullable, with type
+    // arguments) — a boundary that is not a statement edge drops the fix
+    // (a sibling variable, a bare expression context).
+    let mut cursor = first;
+    loop {
+        let Some(prev) = cursor
+            .checked_sub(1)
+            .and_then(|index| kind_of(tokens, index))
+        else {
+            break;
+        };
+        match prev {
+            TokenKind::Keyword(kw)
+                if matches!(
+                    kw,
+                    Keyword::Final | Keyword::Const | Keyword::Var | Keyword::Late
+                ) => {}
+            TokenKind::Question => {}
+            TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                let mut depth = 0u32;
+                loop {
+                    cursor -= 1;
+                    match kind_of(tokens, cursor)? {
+                        TokenKind::Gt => depth += 1,
+                        TokenKind::GtGt => depth += 2,
+                        TokenKind::GtGtGt => depth += 3,
+                        TokenKind::Lt => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            TokenKind::Identifier | TokenKind::Keyword(Keyword::Function) => {}
+            _ => break,
+        }
+        cursor -= 1;
+    }
+    if let Some(boundary) = cursor.checked_sub(1)
+        && !matches!(
+            kind_of(tokens, boundary),
+            Some(TokenKind::Semicolon) | Some(TokenKind::OpenCurly) | Some(TokenKind::CloseCurly)
+        )
+    {
+        return None;
+    }
+    // The closure: the parameter list, an optional async marker after it,
+    // then a block body without a value `return`.
+    let scan = first + 2;
+    if kind_of(tokens, scan) != Some(TokenKind::OpenParen) {
+        return None;
+    }
+    let params_end = tokens.matching_end(scan)?;
+    let mut return_type = "void ";
+    let mut marker = params_end + 1;
+    match kind_of(tokens, marker) {
+        Some(TokenKind::Keyword(Keyword::Async)) => {
+            return_type = "Future<void> ";
+            marker += 1;
+            if kind_of(tokens, marker) == Some(TokenKind::Star) {
+                return None;
+            }
+        }
+        Some(TokenKind::Keyword(Keyword::Sync)) => return None,
+        _ => {}
+    }
+    if kind_of(tokens, marker) != Some(TokenKind::OpenCurly) {
+        return None;
+    }
+    for index in first + 2..=last {
+        if kind_of(tokens, index) == Some(TokenKind::Keyword(Keyword::Return))
+            && kind_of(tokens, index + 1) != Some(TokenKind::Semicolon)
+        {
+            return None;
+        }
+    }
+    let (start16, length16) = span_over(text, tokens, cursor, last + 1)?;
+    let closure = &text
+        [tokens.get(first + 2)?.byte_offset as usize..tokens.get(last + 1)?.byte_offset as usize];
+    Some((start16, length16, format!("{return_type}{name}{closure}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +2434,35 @@ mod tests {
         }
     }
 
+    /// A row of `rule` over `range` (messages ride the lint rows, not the
+    /// fix face — empty here).
+    fn row(rule: &str, range: core::ops::Range<u32>) -> Lint {
+        Lint {
+            rule: rule_by_name(rule).expect("wired registry"),
+            range,
+            message: String::new(),
+            correction: None,
+        }
+    }
+
+    /// The golden shape each wired rewrite must hold: the hit materializes
+    /// exactly one edit whose application rewrites `source` into
+    /// `expected`.
+    fn assert_rewrite(rule: &str, source: &str, range: core::ops::Range<u32>, expected: &str) {
+        let fix = one_fix(source, &[row(rule, range)]);
+        assert_eq!(fix.rule, rule);
+        let (patched, outcomes) = apply(source, std::slice::from_ref(&fix.edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied], "{rule} on {source:?}");
+        assert_eq!(patched, expected, "{rule} on {source:?}");
+    }
+
+    /// No fix materializes for `rule` over `range` on `source`.
+    fn assert_no_fix(rule: &str, source: &str, range: core::ops::Range<u32>) {
+        let lines = LineIndex::new(source);
+        let fixes = from_lints(&[row(rule, range)], source, &lines);
+        assert!(fixes.is_empty(), "{rule} on {source:?} produced a fix");
+    }
+
     /// The `avoid_empty_else` row over the else `;` at `offset..offset+1`.
     fn empty_else_row(offset: u32) -> Lint {
         Lint {
@@ -1028,6 +2506,423 @@ mod tests {
         let (patched, outcomes) = apply(source, std::slice::from_ref(&fix.edit));
         assert_eq!(patched, "if (b) ; else {}");
         assert_eq!(outcomes, &[EditOutcome::Applied]);
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 breadth: one golden per wired mechanical rewrite
+    // -----------------------------------------------------------------------
+
+    /// Keyword drops: the reported keyword plus its trailing horizontal
+    /// whitespace goes.
+    #[test]
+    fn keyword_drops() {
+        assert_rewrite(
+            "unnecessary_const",
+            "var x = [const 1];",
+            9..9,
+            "var x = [1];",
+        );
+        assert_rewrite(
+            "unnecessary_this",
+            "int get y => this.x;",
+            13..13,
+            "int get y => x;",
+        );
+        // `this` in a constructor field initializer.
+        assert_rewrite(
+            "unnecessary_this",
+            "A(int x) : this.x = x;",
+            11..11,
+            "A(int x) : x = x;",
+        );
+        assert_rewrite(
+            "unnecessary_constructor_name",
+            "class A { A.new(); }",
+            12..12,
+            "class A { A(); }",
+        );
+        assert_rewrite(
+            "unnecessary_constructor_name",
+            "var a = A.new();",
+            10..10,
+            "var a = A();",
+        );
+        // The `this`/`new` lexemes verify before the drop: a drifted row
+        // over other text produces no fix.
+        assert_no_fix("unnecessary_const", "var x = [late 1];", 9..9);
+        assert_no_fix("unnecessary_this", "int get y => super.x;", 13..13);
+        assert_no_fix(
+            "unnecessary_constructor_name",
+            "class A { A.foo(); }",
+            13..13,
+        );
+    }
+
+    /// Syntax drops around strings: the escape's backslash and the
+    /// redundant interpolation wrapper go; the kept text stays verbatim.
+    #[test]
+    fn string_drops() {
+        assert_rewrite(
+            "unnecessary_string_escapes",
+            r"var s = 'a\qb';",
+            10..11,
+            "var s = 'aqb';",
+        );
+        assert_rewrite(
+            "unnecessary_string_interpolations",
+            "var s = ''${'ab'}'';",
+            8..19,
+            "var s = 'ab';",
+        );
+        assert_no_fix("unnecessary_string_escapes", "var s = 'a?b';", 10..11);
+        // A non-empty wrapper body is not this rule's hit.
+        assert_no_fix(
+            "unnecessary_string_interpolations",
+            "var s = 'x${'ab'}y';",
+            8..19,
+        );
+    }
+
+    /// Null-shape drops: the `??`'s null operand leaves with its operator,
+    /// the `??= null` assignment leaves (whole line when the statement is
+    /// alone on it), and the written type's `?` goes.
+    #[test]
+    fn null_drops() {
+        assert_rewrite(
+            "unnecessary_null_in_if_null_operators",
+            "var x = a ?? null;",
+            13..17,
+            "var x = a;",
+        );
+        assert_rewrite(
+            "unnecessary_null_in_if_null_operators",
+            "var x = null ?? a;",
+            8..12,
+            "var x = a;",
+        );
+        // The statement line goes whole; the expression context keeps the
+        // assignment target.
+        assert_rewrite(
+            "unnecessary_null_aware_assignments",
+            "void f() {\n  x ??= null;\n}\n",
+            13..23,
+            "void f() {\n}\n",
+        );
+        assert_rewrite(
+            "unnecessary_null_aware_assignments",
+            "var y = x ??= null;",
+            8..18,
+            "var y = x;",
+        );
+        assert_rewrite(
+            "unnecessary_nullable_for_final_variable_declarations",
+            "final int? x = 1;",
+            11..11,
+            "final int x = 1;",
+        );
+        // A `?` that is not the written type's own (a type argument's)
+        // never drops.
+        assert_no_fix(
+            "unnecessary_nullable_for_final_variable_declarations",
+            "final List<int?> x = const [];",
+            17..17,
+        );
+    }
+
+    /// `avoid_init_to_null`: the initializer tail ` = null` goes, keeping
+    /// the name (and the parameter's written type).
+    #[test]
+    fn init_to_null_drop() {
+        assert_rewrite("avoid_init_to_null", "var x = null;", 4..12, "var x;");
+        assert_rewrite(
+            "avoid_init_to_null",
+            "void f({int x = null}) {}",
+            8..20,
+            "void f({int x}) {}",
+        );
+    }
+
+    /// `!(x is T)` → `x is! T`; the parentheses go when the `!`'s context
+    /// binds looser than `is!`, stay when it does not (a prefix `!`
+    /// chain). A drifted row over a non-matching span drops.
+    #[test]
+    fn is_not_operator_rewrite() {
+        assert_rewrite(
+            "prefer_is_not_operator",
+            "var b = !(a is int);",
+            8..19,
+            "var b = a is! int;",
+        );
+        assert_rewrite(
+            "prefer_is_not_operator",
+            "var b = !!(a is int);",
+            9..20,
+            "var b = !(a is! int);",
+        );
+        // The `is` inside a string literal is never the operator; the
+        // rewrite still lands on the real one.
+        assert_rewrite(
+            "prefer_is_not_operator",
+            "var b = !('is' is int);",
+            8..22,
+            "var b = 'is' is! int;",
+        );
+        // A hit span that does not open with the `!` never matches.
+        assert_no_fix("prefer_is_not_operator", "var b = !(a is int);", 9..19);
+    }
+
+    /// `x == null ? a : x` → `x ?? a`, with the default arm parenthesized
+    /// exactly when it is itself a bare conditional.
+    #[test]
+    fn if_null_operators_rewrite() {
+        assert_rewrite(
+            "prefer_if_null_operators",
+            "var x = a == null ? b : a;",
+            8..25,
+            "var x = a ?? b;",
+        );
+        assert_rewrite(
+            "prefer_if_null_operators",
+            "var x = a != null ? a : b;",
+            8..25,
+            "var x = a ?? b;",
+        );
+        assert_rewrite(
+            "prefer_if_null_operators",
+            "var x = null == a ? b : a;",
+            8..25,
+            "var x = a ?? b;",
+        );
+        // A bare conditional default arm takes parentheses.
+        assert_rewrite(
+            "prefer_if_null_operators",
+            "var x = a == null ? c ? d : e : a;",
+            8..33,
+            "var x = a ?? (c ? d : e);",
+        );
+    }
+
+    /// `x == null ? null : x.y` → `x?.y`: the access chain peels to the
+    /// checked operand; `.` goes `?.`, a trailing `!` goes `?`.
+    #[test]
+    fn null_aware_operators_rewrite() {
+        assert_rewrite(
+            "prefer_null_aware_operators",
+            "var x = a == null ? null : a.b;",
+            8..30,
+            "var x = a?.b;",
+        );
+        assert_rewrite(
+            "prefer_null_aware_operators",
+            "var x = a != null ? a.b.c : null;",
+            8..32,
+            "var x = a?.b.c;",
+        );
+        assert_rewrite(
+            "prefer_null_aware_operators",
+            "var x = a == null ? null : a!.b;",
+            8..31,
+            "var x = a?.b;",
+        );
+    }
+
+    /// The `indexOf` comparisons rewrite to `contains` per the official
+    /// matrix; the always-true/false judgments get no fix.
+    #[test]
+    fn contains_rewrite() {
+        assert_rewrite(
+            "prefer_contains",
+            "var b = x.indexOf(y) == -1;",
+            8..26,
+            "var b = !x.contains(y);",
+        );
+        assert_rewrite(
+            "prefer_contains",
+            "var b = x.indexOf(y) != -1;",
+            8..26,
+            "var b = x.contains(y);",
+        );
+        assert_rewrite(
+            "prefer_contains",
+            "var b = x.indexOf(y, 0) >= 0;",
+            8..28,
+            "var b = x.contains(y);",
+        );
+        assert_rewrite(
+            "prefer_contains",
+            "var b = -1 != x.indexOf(y);",
+            8..26,
+            "var b = x.contains(y);",
+        );
+        // `indexOf < -1` is the always-false judgment — no mechanical fix.
+        assert_no_fix("prefer_contains", "var b = x.indexOf(y) < -1;", 8..25);
+    }
+
+    /// `'a' + b` → `'a$b'`: quote style rides the chain's literals, a
+    /// bare identifier takes `$`, an identifier before an
+    /// identifier-continuation head takes `${}`, `x.toString()` unwraps.
+    #[test]
+    fn interpolation_compose_rewrite() {
+        assert_rewrite(
+            "prefer_interpolation_to_compose_strings",
+            "var s = 'a' + b;",
+            8..15,
+            "var s = 'a$b';",
+        );
+        assert_rewrite(
+            "prefer_interpolation_to_compose_strings",
+            "var s = a + 'b';",
+            8..15,
+            "var s = '${a}b';",
+        );
+        assert_rewrite(
+            "prefer_interpolation_to_compose_strings",
+            r"var s = 'a\\' + b.toString() + c;",
+            8..32,
+            r"var s = 'a\\${b}$c';",
+        );
+        // Mixed quote styles drop; raw strings drop.
+        assert_no_fix(
+            "prefer_interpolation_to_compose_strings",
+            "var s = 'a' + b + \"c\";",
+            8..21,
+        );
+        assert_no_fix(
+            "prefer_interpolation_to_compose_strings",
+            r"var s = r'a' + b;",
+            8..16,
+        );
+    }
+
+    /// The collection-literal rewrites: `Map()` → `{}` (type arguments
+    /// ride), `Set()` → `<dynamic>{}` unless the context declares `Set`,
+    /// `Set.from/of([…])` and `[…].toSet()` → the set literal.
+    #[test]
+    fn collection_literal_rewrite() {
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var m = Map();",
+            8..13,
+            "var m = {};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var m = Map<String, int>();",
+            8..26,
+            "var m = <String, int>{};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var s = Set();",
+            8..13,
+            "var s = <dynamic>{};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "Set s = Set();",
+            8..13,
+            "Set s = {};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var s = Set.from([1, 2]);",
+            8..24,
+            "var s = {1, 2};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var s = Set<int>.of([]);",
+            8..23,
+            "var s = <int>{};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var s = [1].toSet();",
+            8..19,
+            "var s = {1};",
+        );
+        assert_rewrite(
+            "prefer_collection_literals",
+            "var s = [].toSet();",
+            8..18,
+            "var s = <dynamic>{};",
+        );
+    }
+
+    /// The cascade `add`/`addAll` sections compose into the target
+    /// literal — one whole-tail replacement per cascade, chained
+    /// sections included, later sections' hits dropping.
+    #[test]
+    fn inlined_adds_rewrite() {
+        assert_rewrite(
+            "prefer_inlined_adds",
+            "var l = [1]..add(2);",
+            13..16,
+            "var l = [1, 2];",
+        );
+        assert_rewrite(
+            "prefer_inlined_adds",
+            "var l = []..add(2);",
+            12..15,
+            "var l = [2];",
+        );
+        assert_rewrite(
+            "prefer_inlined_adds",
+            "var l = [1]..addAll([2, 3]);",
+            13..19,
+            "var l = [1, 2, 3];",
+        );
+        // A chained cascade: the first section's fix composes every
+        // `add` after it in one edit.
+        let source = "var l = [1]..add(2)..add(3);";
+        let fix = one_fix(source, &[row("prefer_inlined_adds", 13..16)]);
+        assert_eq!(fix.edit.replacement, ", 2, 3]");
+        // The second section's own hit cannot anchor at the literal and
+        // produces no competing edit.
+        let lines = LineIndex::new(source);
+        let second = from_lints(&[row("prefer_inlined_adds", 21..24)], source, &lines);
+        assert!(second.is_empty());
+    }
+
+    /// `var f = () {};` → `void f() {};` — wait, the semicolon goes with
+    /// a block body (the official face): `void f() {}`.
+    #[test]
+    fn function_declaration_rewrite() {
+        assert_rewrite(
+            "prefer_function_declarations_over_variables",
+            "var f = () {};",
+            4..13,
+            "void f() {}",
+        );
+        assert_rewrite(
+            "prefer_function_declarations_over_variables",
+            "final f = (a) { print(a); };",
+            6..27,
+            "void f(a) { print(a); }",
+        );
+        assert_rewrite(
+            "prefer_function_declarations_over_variables",
+            "var f = () async {};",
+            4..19,
+            "Future<void> f() async {}",
+        );
+        // A value return has no derivable return type: no fix.
+        assert_no_fix(
+            "prefer_function_declarations_over_variables",
+            "var f = () { return 1; };",
+            4..24,
+        );
+        // An expression body likewise; a sibling variable cannot split.
+        assert_no_fix(
+            "prefer_function_declarations_over_variables",
+            "var f = () => 1;",
+            4..15,
+        );
+        assert_no_fix(
+            "prefer_function_declarations_over_variables",
+            "var a = 1, f = () {};",
+            11..20,
+        );
     }
 
     /// §15.6's drift case: an unrelated overlay above the edit shifts its

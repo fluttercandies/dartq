@@ -70,8 +70,8 @@ use dartq_engine::Engine;
 use dartq_engine::analysis_options::AnalysisOptions;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    EnableSet, Features, Lint, RULES, RuleId, WorkspaceFacts, check_name, check_url, parse_unit,
-    rule_by_name, run,
+    EnableSet, Features, Lint, RULES, RuleId, UnignorableIgnore, WorkspaceFacts, check_name,
+    check_url, parse_unit, rule_by_name, run, unignorable_ignores,
 };
 use dartq_package::PackageIdentity;
 use dartq_pub::pubspec_facts::scan as scan_pubspec;
@@ -104,6 +104,17 @@ static CODES: LazyLock<Vec<CodeInfo>> = LazyLock::new(|| {
         })
         .collect()
 });
+
+/// `The diagnostic '{0}' can't be ignored.` (registry :17369-17381,
+/// `STATIC_WARNING` → WARNING; published docs). The `IgnoreValidator` face's
+/// code: an ignore comment naming a `cannot-ignore` code reports once at the
+/// name token and the name can never suppress.
+const UNIGNORABLE_IGNORE: CodeInfo = CodeInfo::new(
+    "unignorable_ignore",
+    "UNIGNORABLE_IGNORE",
+    DiagnosticType::StaticWarning,
+    true,
+);
 
 /// Maps one lint row to an engine diagnostic — the oracle's lint shape:
 /// INFO severity, the rule name as the code, the row's UTF-16 span, the
@@ -286,6 +297,7 @@ fn memo_key(
     set: &EnableSet,
     workspace: Option<&WorkspaceFacts>,
     path: &Path,
+    unignorable: &FxHashSet<String>,
 ) -> LintMemoKey {
     let mut h = FxHasher::default();
     let mut bits = 0u8;
@@ -322,10 +334,25 @@ fn memo_key(
     // `file_names` reads the basename and the directory class rules gate on
     // it with no facts attached just the same.
     fold_path(&mut h, path);
+    // The `cannot-ignore` set: it gates the suppression face, so its
+    // membership is part of the rows' identity (order-independent fold —
+    // the set is a hash set).
+    h.write_u64(fold_strs(unignorable));
     LintMemoKey {
         content,
         fingerprint: h.finish(),
     }
+}
+
+/// Folds one string set order-independently ([`fold_names`] over strings).
+fn fold_strs(values: &FxHashSet<String>) -> u64 {
+    let mut sum = 0u64;
+    for value in values {
+        let mut h = FxHasher::default();
+        h.write(value.as_bytes());
+        sum = sum.wrapping_add(h.finish());
+    }
+    sum
 }
 
 /// Folds one string with a trailing separator byte.
@@ -416,15 +443,24 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
     // keeps the parallel phase free of shared mutation and byte-identical
     // to a serial pass.
     let mut enabled: FxHashMap<PathBuf, EnableSet> = FxHashMap::default();
+    let mut unignorable: FxHashMap<PathBuf, Arc<FxHashSet<String>>> = FxHashMap::default();
     let mut faces: FxHashMap<PathBuf, Arc<PackageFace>> = FxHashMap::default();
     for file in &files {
         let Some(path) = engine.file_table().path(*file) else {
             continue;
         };
         let dir = path.parent().unwrap_or(Path::new(""));
-        enabled.entry(dir.to_path_buf()).or_insert_with(|| {
-            enable_set(
-                governing_options(engine, dir, roots).map(|options| options.lint_rules.as_slice()),
+        // One governing-options walk per distinct directory feeds both faces
+        // (the enable set and the cannot-ignore set read the same entry).
+        let options = governing_options(engine, dir, roots);
+        enabled
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| enable_set(options.map(|options| options.lint_rules.as_slice())));
+        unignorable.entry(dir.to_path_buf()).or_insert_with(|| {
+            Arc::new(
+                options
+                    .map(|options| options.unignorable().clone())
+                    .unwrap_or_default(),
             )
         });
         if let Some(identity) = engine.packages().containing(path) {
@@ -465,7 +501,16 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             misses.push((slot, *file, None));
             continue;
         };
-        let key = memo_key(facts.content(), features, set, workspace, path);
+        let key = memo_key(
+            facts.content(),
+            features,
+            set,
+            workspace,
+            path,
+            unignorable
+                .get(dir)
+                .expect("cannot-ignore set precomputed for every resident file's directory"),
+        );
         match memo.get(&key) {
             Some(rows) => slotted[slot] = Some(rows),
             None => misses.push((slot, *file, Some(key))),
@@ -505,7 +550,10 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             let parsed = parse_unit(text, features);
             let mut unit = parsed.unit(Some(path));
             unit.workspace = workspace;
-            (slot, run(&unit, set))
+            let cannot_ignore = unignorable
+                .get(dir)
+                .expect("cannot-ignore set precomputed for every resident file's directory");
+            (slot, run(&unit, set, cannot_ignore))
         })
         .collect();
 
@@ -528,8 +576,60 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         let file = files[slot];
         out.extend(rows.iter().map(|lint| row(lint.clone(), file)));
     }
+    out.extend(unignorable_rows(engine, &files, &unignorable));
     out.extend(pubspec_rows(engine, roots));
     out
+}
+
+/// The `IgnoreValidator` rows (#938): one `unignorable_ignore` per
+/// ignore-comment name a governing `cannot-ignore` set claims. The face
+/// runs outside the memo over (content, set) — the same inputs the memo key
+/// folds, so a memoized file's rows stay identical to a fresh run's — and
+/// the scan-only derivation (comments, never an AST) rides the same
+/// fan-out. Any-empty-set short-circuits before any scan: the dominant
+/// workspace pays one map scan per pass.
+fn unignorable_rows(
+    engine: &Engine,
+    files: &[FileId],
+    unignorable: &FxHashMap<PathBuf, Arc<FxHashSet<String>>>,
+) -> Vec<Diagnostic> {
+    if !unignorable.values().any(|set| !set.is_empty()) {
+        return Vec::new();
+    }
+    let hits: Vec<(FileId, Vec<UnignorableIgnore>)> = files
+        .par_iter()
+        .filter_map(|file| {
+            let path = engine.file_table().path(*file)?;
+            let Some(set) = unignorable.get(path.parent().unwrap_or(Path::new(""))) else {
+                return None;
+            };
+            let bytes = engine.content(*file)?;
+            let text = std::str::from_utf8(bytes).ok()?;
+            let hits = unignorable_ignores(text, set);
+            (!hits.is_empty()).then(|| (*file, hits))
+        })
+        .collect();
+    hits.into_iter()
+        .flat_map(|(file, hits)| {
+            hits.into_iter().map(move |hit| {
+                Diagnostic::new(
+                    UNIGNORABLE_IGNORE.dtype.severity(),
+                    UNIGNORABLE_IGNORE,
+                    format!("The diagnostic '{}' can't be ignored.", hit.name),
+                    file,
+                    SourceRange {
+                        offset: hit.offset,
+                        length: hit.length,
+                    },
+                    Some(
+                        "Try removing the name from the list, or removing the whole comment \
+                         if this is the only name in the list."
+                            .to_owned(),
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The pubspec pass (#434): the root package's and every workspace
@@ -1348,12 +1448,12 @@ mod tests {
             let parsed = parse_unit(text, features);
             let mut unit = parsed.unit(Some(path));
             unit.workspace = None;
-            run(&unit, &set)
+            run(&unit, &set, &FxHashSet::default())
         };
 
         let fresh: Vec<Diagnostic> = rows().into_iter().map(|lint| row(lint, file)).collect();
         let mut memo = LintMemo::default();
-        let key = memo_key(content, features, &set, None, path);
+        let key = memo_key(content, features, &set, None, path, &FxHashSet::default());
         memo.insert(key, Arc::new(rows()));
         let stamped: Vec<Diagnostic> = memo
             .get(&key)
@@ -1399,7 +1499,14 @@ mod tests {
             lib_dir: PathBuf::from("/w/lib"),
         };
         let key = |features, set: &EnableSet, workspace: Option<&WorkspaceFacts>, path| {
-            memo_key(content, features, set, workspace, path)
+            memo_key(
+                content,
+                features,
+                set,
+                workspace,
+                path,
+                &FxHashSet::default(),
+            )
         };
 
         assert_eq!(
@@ -1467,6 +1574,7 @@ mod tests {
                 &set,
                 None,
                 path,
+                &FxHashSet::default(),
             )
         };
         for n in 0..=LINT_MEMO_CAP as u16 {
