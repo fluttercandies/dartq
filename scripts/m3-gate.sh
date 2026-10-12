@@ -58,6 +58,27 @@ done
 for path in "$CODES_FILE" "$CORPUS/pubspec.yaml" "$CORPUS/.dart_tool" "$HARNESS"; do
   [ -e "$path" ] || { echo "m3-gate: $path not found (build the harness: cargo build -p harness; pub get the corpus: cd $CORPUS && dart pub get)" >&2; exit 2; }
 done
+# Frozen-family count pin (#937): the freeze file is the gate's denominator,
+# and a hand-truncation during a window would otherwise pass with no runtime
+# trace. The expected size is DERIVED, not hardcoded: m3_codes_pin.rs's
+# USAGE_FAMILY is the compile-checked registry derivation (it already names
+# unused_field_from_primary_constructor, ahead of the re-freeze regen), so
+# counting its members keeps this pin exact across the regen. Freeze rows are
+# counted as the harness's parse_codes_file reads them (skip blank/'#' lines).
+# RED today by design (freeze 10 rows, family 11) until the serial window
+# runs the regen — the pin is the calibration protection, not a bug.
+PIN_SRC="crates/dartq-semantic/tests/m3_codes_pin.rs"
+[ -f "$PIN_SRC" ] || { echo "m3-gate: $PIN_SRC not found (the count pin's registry-derivation source)" >&2; exit 2; }
+m3_expected="$(sed -n '/^const USAGE_FAMILY/,/^];/p' "$PIN_SRC" | grep -c 'SemanticCode::')"
+[ -n "$m3_expected" ] && [ "$m3_expected" -gt 0 ] || {
+  echo "m3-gate: cannot derive the expected freeze size from $PIN_SRC (USAGE_FAMILY moved?) — fix the pin's extraction" >&2
+  exit 2
+}
+m3_count="$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CODES_FILE")"
+[ "$m3_count" -eq "$m3_expected" ] || {
+  echo "m3-gate: $CODES_FILE has $m3_count data rows, registry-derived expectation $m3_expected — stale or drifted freeze; re-freeze with: cargo test -p dartq-semantic --test m3_codes_pin regen_m3_unused_codes -- --ignored (then reconcile the header prose)" >&2
+  exit 2
+}
 command -v jq >/dev/null 2>&1 || { echo "m3-gate: jq is required for the scoring (brew install jq)" >&2; exit 2; }
 sdk_root="${FVM_HOME:-$HOME/fvm}/default/bin/cache/dart-sdk"
 [ -x "$sdk_root/bin/dart" ] || { echo "m3-gate: fvm default dart not found at $sdk_root/bin/dart (install the fvm default pin or set FVM_HOME)" >&2; exit 2; }

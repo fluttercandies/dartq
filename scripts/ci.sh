@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Release-readiness gate: per-crate rustfmt + clippy over the workspace.
+# Release-readiness gate: calibration pin tests + per-crate rustfmt + clippy
+# over the workspace.
 #
 # Walks the workspace members declared in the root Cargo.toml (skipping
 # fixture/test-only members), one crate at a time, serially:
@@ -7,7 +8,15 @@
 #   cargo fmt   -p <crate> -- --check
 #   cargo clippy -p <crate> --offline --all-targets -- -D warnings
 #
-# `--check-only` runs a fast `cargo check -p <crate>` instead. The script
+# then runs the oracle-free calibration pins (#937): `cargo test -p harness`
+# and `cargo test -p dartq-semantic --test m3_codes_pin` — seconds-fast,
+# catch frozen-universe drift before any differential work. The m3 pin is
+# RED by design until the serial window runs the m3 re-freeze regen (the
+# freeze file is at 10 rows, the registry family at 11); ci.sh going red
+# there today is the calibration protection working, not a bug.
+#
+# `--check-only` runs a fast `cargo check -p <crate>` instead (no pins: the
+# mode compiles only). The script
 # exits nonzero at the first failure and names the crate. Compile-job
 # concurrency comes from the workspace config (.cargo/config.toml pins
 # jobs = 2); no -j is passed anywhere.
@@ -59,7 +68,24 @@ for member in $members; do
     fi
 done
 
-# Heavyweight phases (test suites, coverage, differential gates) are NOT run
+# Calibration pins (#937): oracle-free, seconds-fast, required — they fail
+# the gate naming the drifted freeze before any differential work starts.
+# Gate mode only: --check-only is the fast compile-only probe.
+if [ "$mode" = "gate" ]; then
+    echo "== cargo test pins: harness"
+    if ! cargo test -q -p harness; then
+        echo "ci: cargo test pins FAILED: harness" >&2
+        exit 1
+    fi
+    echo "== cargo test pins: dartq-semantic m3_codes_pin"
+    if ! cargo test -q -p dartq-semantic --test m3_codes_pin; then
+        echo "ci: cargo test pins FAILED: dartq-semantic (m3_codes_pin)" >&2
+        exit 1
+    fi
+fi
+
+# Heavyweight phases (coverage, differential gates, test suites beyond the
+# calibration pins above) are NOT run
 # here: they execute real processes over the whole workspace and are reserved
 # for the serial verification phase (AGENTS.md resource discipline):
 #   scripts/coverage-gate.sh — llvm-cov coverage gate (serial phase only)

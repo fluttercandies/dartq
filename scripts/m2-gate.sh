@@ -101,6 +101,16 @@ if [ ! -f "$CODES_FILE" ]; then
   echo "m2-gate: $CODES_FILE not found (the frozen M2 code universe)" >&2
   exit 2
 fi
+# Frozen-universe count pin (#937): this file is the gate's denominator, and
+# a hand-truncation during a window would otherwise pass with no runtime
+# trace. Rows are counted exactly as the harness's parse_codes_file reads
+# them (trim; skip blank and '#'-comment lines): the frozen M2 universe is
+# 43 codes.
+m2_count="$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CODES_FILE")"
+[ "$m2_count" -eq 43 ] || {
+  echo "m2-gate: $CODES_FILE has $m2_count data rows, expected 43 — the frozen M2 universe was truncated or drifted" >&2
+  exit 2
+}
 if [ ! -f "$CORPUS/pubspec.yaml" ]; then
   echo "m2-gate: $CORPUS is not a corpus package — run: cargo run -p harness -- corpus" >&2
   exit 2

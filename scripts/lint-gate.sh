@@ -3,7 +3,7 @@
 # docs/plans/lint-differential-face.md section 3; ticket #721).
 #
 # Runs the harness once over tests/corpus/lints with the frozen r0 lint
-# universe (tests/harness/lint_codes.txt, 88 names), INFO severity filtered
+# universe (tests/harness/lint_codes.txt, 89 names), INFO severity filtered
 # to the LINT type, threshold 1.0 — full parity like every differential gate
 # (2026-10-12 ruling, docs/facts/adr-2026-10-12-full-parity-bars.md;
 # supersedes the PRD-era numeric bars; residuals pass only via individually

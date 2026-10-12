@@ -3,7 +3,10 @@
 #
 # Orchestrates the adjudicated 0.1.0 release gate set (#622: the #881 gate
 # chain + the D1-D5 rulings from docs/audits/release-prep.md):
-#   M0 differential >= 0.99, M1 >= 0.95, lints/m2/m3 green, ci.sh green,
+#   M0/M1 differential at full parity (bar 1.0 per the 2026-10-12 ADR,
+#   docs/facts/adr-2026-10-12-full-parity-bars.md, which superseded the
+#   PRD-era 0.99/0.95 numbers), calibration pins green, lints/m2/m3 green,
+#   ci.sh green,
 #   repro-gate sealed, bench five-axis evidence persisted, CHANGELOG 0.1.0
 #   section present, legacy-name gate clean, clean tree -> annotated tag ->
 #   push. Tag + binary distribution; crates.io publish deferred (D1).
@@ -28,7 +31,8 @@
 #   verify     the gate chain in order, one subprocess at a time, each with
 #              its own RSS watchdog slot (and a timeout backstop when
 #              timeout(1) exists) and full exit-code propagation:
-#                m0-gate -> m1-gate -> lint-gate -> m2-gate -> m3-gate
+#                calibration pins (harness unit pins + m3_codes_pin)
+#                -> m0-gate -> m1-gate -> lint-gate -> m2-gate -> m3-gate
 #                -> ci.sh -> repro-gate
 #              One PASS/FAIL line per gate; on FAIL the harness stops and
 #              names the gate and its evidence directory. Before repro-gate
@@ -290,6 +294,27 @@ phase_verify() {
     m2_label="${M2_LABEL:-m2-r1}"
     m3_label="${M3_LABEL:-m3-r1}"
     gate_dry=""; [ "$DRY_RUN" = 1 ] && gate_dry="--dry-run"
+
+    # Calibration pins first (#937): the oracle-free pin tests are
+    # seconds-fast and catch frozen-universe drift before hours of oracle
+    # gate work. Required step, not best-effort. The m3 pin is RED by design
+    # until the serial window runs the m3 re-freeze regen (the freeze file
+    # is at 10 rows, the registry family at 11): release.sh going red here
+    # today is the calibration protection working, not a bug — the regen
+    # turns it green. Nothing below works around that redness.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "release: [verify] would run: cargo test -p harness   # calibration pins"
+        echo "release: [verify] would run: cargo test -p dartq-semantic --test m3_codes_pin   # m3 freeze pin (red until the re-freeze regen)"
+        echo "verify: SKIP pins (dry-run)"
+    else
+        # rm -f first: run_guarded judges the exit from /tmp/serial_<name>.log,
+        # and a stale log from a previous run would mask a failure (#931 P2).
+        rm -f /tmp/serial_pins-harness.log /tmp/serial_pins-m3.log
+        run_gate pins-harness 600 8388608 "terminal output (harness calibration pins)" \
+            cargo test -p harness || return 1
+        run_gate pins-m3 600 8388608 "terminal output (m3 unused-family freeze pin)" \
+            cargo test -p dartq-semantic --test m3_codes_pin || return 1
+    fi
 
     # Gates are invoked via `bash scripts/...` (the CI convention): several
     # gate scripts (m0/m2/m3/repro-gate) are not committed executable.

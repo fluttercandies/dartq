@@ -1353,10 +1353,11 @@ mod tests {
     ///   `invalid_return_type_for_then`, `unawaited_return_in_try_block`).
     /// - `Map()` / `Set()` bare constructor calls -> the
     ///   `non_const_call_to_literal_constructor` trigger: a WARNING-tier
-    ///   universe member with no dartq implementation and no fixture yet
-    ///   (#749), so a stray call mints oracle-only rows. Legal only inside
-    ///   that code's dedicated targeted fixture (the corpus's "one surgical
-    ///   fixture per included code" contract).
+    ///   universe member whose dartq producer exists (the @literal class
+    ///   face, dartq-semantic annotation.rs) but whose dedicated targeted
+    ///   fixture does not yet (#749), so a stray call mints gate entries
+    ///   outside that fixture. Legal only inside the corpus's "one surgical
+    ///   fixture per included code" contract.
     /// - `=> {` arrow-body collection literals -> the
     ///   `unnecessary_set_literal` face (a built-in WARNING at the oracle
     ///   generation; fires on a void-returning arrow body producing a set
