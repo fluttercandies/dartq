@@ -3,14 +3,20 @@
 #
 # Two harness runs against a single oracle of record, the fvm default install:
 #
-#   Run A (syntax caliber): tests/corpus/m0 + tests/corpus/m0-syntax over the
-#   255-code syntax universe (tests/corpus/syntax-codes.txt), ERROR severity,
-#   bar 1.0.
+#   Run A (syntax caliber, check face): tests/corpus/m0 +
+#   tests/corpus/m0-syntax over the 255-code syntax universe
+#   (tests/corpus/syntax-codes.txt), ERROR severity, bar 1.0 — the syntax
+#   universe over the check face (`dartq check`, the scan+parse tier by
+#   contract; no semantic diagnoser is mounted there).
 #
-#   Run B (union caliber): the same corpora over the union of the syntax
-#   universe with the frozen M1 code universe (tests/harness/m1_codes.txt),
-#   pinned at exactly 290 codes = 255 + 36 - 1 overlap (the shared
-#   wrong_number_of_parameters_for_setter), ERROR severity, bar 1.0.
+#   Run B (union caliber, analyze face): the same corpora over the union of
+#   the syntax universe with the frozen M1 code universe
+#   (tests/harness/m1_codes.txt), pinned at exactly 290 codes = 255 + 36 - 1
+#   overlap (the shared wrong_number_of_parameters_for_setter), ERROR
+#   severity, bar 1.0 — the union universe over the analyze face (`dartq
+#   analyze --sdk <fvm default dart-sdk>`, the engine tier with the semantic
+#   diagnoser mounted). The check face can never match the oracle's
+#   semantic rows, so a union-caliber run requires the analyze face.
 #
 #   Both bars are 1.0 — full parity (2026-10-12 ruling,
 #   docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD
@@ -20,8 +26,9 @@
 # Neither run passes --type-filter: the M0 gates are code-scoped, never
 # type-scoped.
 #
-# SERIAL PHASE ONLY: a run spawns real `dart analyze` and `dartq check`
-# processes over the corpora. Never run it alongside development-phase lanes
+# SERIAL PHASE ONLY: a run spawns real `dart analyze`, `dartq check` (run A)
+# and `dartq analyze` (run B) processes over the corpora. Never run it
+# alongside development-phase lanes
 # (memory-incident discipline). --dry-run writes nothing and executes
 # nothing: composing the union and counting it is pure local computation and
 # runs on the dry-run path too, while the release-binary checks are run-path
@@ -42,9 +49,11 @@
 #                   recorded evidence. M0_LABEL env is accepted too.
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the oracle version banner
-# is echoed on the run path), DARTQ_CMD (the dartq side of the harness;
+# is echoed on the run path), DARTQ_CMD (run A's dartq side, the check face;
 # default `./target/release/dartq check --format=machine` — the recorded M0
-# shape).
+# shape), DARTQ_ANALYZE_CMD (run B's dartq side, the analyze face; default
+# `./target/release/dartq analyze --format=machine --sdk <fvm default
+# dart-sdk>` — the m1-gate shape against the release binary).
 #
 # Exit codes: 0 both calibers met their bars; 1 either caliber below its
 # bar; 2 usage or environment error (missing binaries, corpora not pub-get,
@@ -67,7 +76,6 @@ UNION_THRESHOLD="1.0"
 OUT_ROOT="docs/audits/gate-m0"
 HARNESS="./target/release/harness"
 PERSIST_DIR="tests/corpus/regressions/cases"
-DEFAULT_DARTQ_CMD="./target/release/dartq check --format=machine"
 
 usage() {
   sed -n '2,/^set -u -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -136,7 +144,13 @@ FVM_HOME="${FVM_HOME:-$HOME/fvm}"
 sdk_root="$FVM_HOME/default/bin/cache/dart-sdk"
 dart_bin="$sdk_root/bin/dart"
 
-DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
+# Run A drives the check face (scan+parse tier), run B the analyze face
+# (engine tier with the semantic diagnoser) — the union universe includes
+# the 36 semantic-tier codes, which only the analyze face can emit.
+DEFAULT_CHECK_CMD="./target/release/dartq check --format=machine"
+CHECK_CMD="${DARTQ_CMD:-$DEFAULT_CHECK_CMD}"
+DEFAULT_ANALYZE_CMD="./target/release/dartq analyze --format=machine --sdk $sdk_root"
+ANALYZE_CMD="${DARTQ_ANALYZE_CMD:-$DEFAULT_ANALYZE_CMD}"
 
 # The union code universe: both sources comment-stripped, first field per
 # line, whitespace stripped, empties dropped, case-fold deduplicated
@@ -172,12 +186,13 @@ printf '  %-16s %s (ERROR tier, bar %s)\n' "run A codes" "$SYNTAX_CODES" "$SYNTA
 printf '  %-16s %s codes = 255 + 36 - 1 overlap (ERROR tier, bar %s)\n' "run B codes" "$union_count" "$UNION_THRESHOLD"
 printf '  %-16s %s\n' "union file" "$UNION_CODES"
 printf '  %-16s %s\n' "oracle" "$dart_bin"
-printf '  %-16s %s\n' "dartq" "$DARTQ_CMD"
+printf '  %-16s %s\n' "dartq run A" "$CHECK_CMD"
+printf '  %-16s %s\n' "dartq run B" "$ANALYZE_CMD"
 printf '  %-16s %s , %s\n' "reports" "$outdir_syntax" "$outdir_union"
 printf '  %-16s harness run --corpus-dir %s --corpus-dir %s --oracle-dart %s --dartq-cmd "%s" --severity-filter ERROR --threshold %s --codes-file %s --out %s --persist-regressions %s\n' \
-  "run A" "$CORPUS_M0" "$CORPUS_SYNTAX" "$dart_bin" "$DARTQ_CMD" "$SYNTAX_THRESHOLD" "$SYNTAX_CODES" "$outdir_syntax" "$PERSIST_DIR"
+  "run A" "$CORPUS_M0" "$CORPUS_SYNTAX" "$dart_bin" "$CHECK_CMD" "$SYNTAX_THRESHOLD" "$SYNTAX_CODES" "$outdir_syntax" "$PERSIST_DIR"
 printf '  %-16s harness run --corpus-dir %s --corpus-dir %s --oracle-dart %s --dartq-cmd "%s" --severity-filter ERROR --threshold %s --codes-file %s --out %s --persist-regressions %s\n' \
-  "run B" "$CORPUS_M0" "$CORPUS_SYNTAX" "$dart_bin" "$DARTQ_CMD" "$UNION_THRESHOLD" "$UNION_CODES" "$outdir_union" "$PERSIST_DIR"
+  "run B" "$CORPUS_M0" "$CORPUS_SYNTAX" "$dart_bin" "$ANALYZE_CMD" "$UNION_THRESHOLD" "$UNION_CODES" "$outdir_union" "$PERSIST_DIR"
 if [ "$dry_run" = 1 ]; then
   echo "== dry run: paths resolved, union composed in memory ($union_count codes), nothing written or executed"
   exit 0
@@ -192,8 +207,10 @@ fi
   echo "m0-gate: fvm default dart not found at $dart_bin (install the fvm default pin or set FVM_HOME)" >&2
   exit 2
 }
-if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/release/dartq" ]; then
-  echo "m0-gate: ./target/release/dartq not found — build it first: cargo build -p dartq-cli --release (or set DARTQ_CMD=<cmd>)" >&2
+# Both face defaults invoke the same release binary, so one -x guard covers
+# run A's check shape and run B's analyze shape alike.
+if { [ "$CHECK_CMD" = "$DEFAULT_CHECK_CMD" ] || [ "$ANALYZE_CMD" = "$DEFAULT_ANALYZE_CMD" ]; } && [ ! -x "./target/release/dartq" ]; then
+  echo "m0-gate: ./target/release/dartq not found — build it first: cargo build -p dartq-cli --release (or set DARTQ_CMD / DARTQ_ANALYZE_CMD)" >&2
   exit 2
 fi
 
@@ -210,13 +227,13 @@ mkdir -p "$(dirname "$UNION_CODES")"
 compose_union >"$UNION_CODES"
 
 verdict=PASS
-run_gate() { # <threshold> <codes-file> <outdir> <title>
+run_gate() { # <threshold> <codes-file> <outdir> <dartq-cmd> <title>
   run_args=(
     run
     --corpus-dir "$CORPUS_M0"
     --corpus-dir "$CORPUS_SYNTAX"
     --oracle-dart "$dart_bin"
-    --dartq-cmd "$DARTQ_CMD"
+    --dartq-cmd "$4"
     --severity-filter ERROR
     --threshold "$1"
     --codes-file "$2"
@@ -225,25 +242,25 @@ run_gate() { # <threshold> <codes-file> <outdir> <title>
     --out "$3"
   )
   echo
-  echo "== [$label] m0 gate: $4 (bar $1)"
+  echo "== [$label] m0 gate: $5 (bar $1)"
   # Capture the harness exit status at invocation: `if harness; then ... fi`
   # without an `else` exits 0 when the condition fails (the if statement's own
   # status), so a scored FAIL (exit 1) would be misread as 0 here.
   rc=0
   "$HARNESS" "${run_args[@]}" || rc=$?
   if [ "$rc" -eq 0 ]; then
-    echo "-- [$label] $4 PASSED the bar; report: $3/report.json"
+    echo "-- [$label] $5 PASSED the bar; report: $3/report.json"
   elif [ "$rc" -eq 1 ]; then
     verdict=FAIL
-    echo "-- [$label] $4 FAILED below the bar (harness exit 1); report: $3/report.json"
+    echo "-- [$label] $5 FAILED below the bar (harness exit 1); report: $3/report.json"
   else
-    echo "-- [$label] $4 ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
+    echo "-- [$label] $5 ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
     exit 2
   fi
 }
 
-run_gate "$SYNTAX_THRESHOLD" "$SYNTAX_CODES" "$outdir_syntax" "run A (syntax caliber)"
-run_gate "$UNION_THRESHOLD" "$UNION_CODES" "$outdir_union" "run B (union caliber, $union_count codes)"
+run_gate "$SYNTAX_THRESHOLD" "$SYNTAX_CODES" "$outdir_syntax" "$CHECK_CMD" "run A (syntax caliber, check face)"
+run_gate "$UNION_THRESHOLD" "$UNION_CODES" "$outdir_union" "$ANALYZE_CMD" "run B (union caliber, $union_count codes, analyze face)"
 
 # --- summary -----------------------------------------------------------------
 summarize() { # <report-dir> <bar>
