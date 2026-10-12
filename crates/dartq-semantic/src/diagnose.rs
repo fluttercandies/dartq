@@ -6182,6 +6182,35 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The receiver an unmerged member placeholder resolves against: the
+    /// classification [`Self::merge_member`] applies at the dot event, plus
+    /// the call-result arm — a plain row whose send already completed reads
+    /// its callee's declared return type (`g().m(...)`; the result's static
+    /// type IS the return type, the [`Self::receiver_static_ty`] invoke
+    /// face). The merge itself keeps such receivers untyped (under-report);
+    /// only the argument check widens, because it sees the placeholder
+    /// before the merge runs.
+    fn argument_receiver(&self, row: &Row) -> Receiver {
+        match &row.shape {
+            RowShape::Bare(info) => {
+                let recv = Engine::receiver_of_bare(info.clone());
+                if matches!(recv, Receiver::Unknown)
+                    && matches!(row.intent, Intent::Invoke)
+                    && let ty @ Ty::Named { name, .. } = self.callee_return_ty(row)
+                {
+                    Receiver::Typed {
+                        type_name: name,
+                        ty,
+                    }
+                } else {
+                    recv
+                }
+            }
+            RowShape::Receiver(recv) => *recv,
+            _ => Receiver::Unknown,
+        }
+    }
+
     // —— resolution ——————————————————————————————————————————————————
 
     /// Resolves a bare name in value position: locals, type parameters, the
@@ -9196,10 +9225,29 @@ impl<'a> Engine<'a> {
         // Cloned: the assignability path below reads the table while the
         // named-argument marking mutates it.
         let formals: Option<Formals> = match &row.shape {
-            // A top-level function's declared formals.
-            RowShape::Bare(BareInfo::Plain { .. }) => self
+            // A top-level function's declared formals. Unqualified: a
+            // qualified plain row is the member placeholder below — a
+            // same-named top-level function must not lend its formals to a
+            // member column.
+            RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => self
                 .top_level_decl(row.name)
                 .and_then(|d| d.formals.as_deref().cloned()),
+            // The member invocation's send closes BEFORE the dot-access
+            // event merges `receiver.name` (`parse_send_from_identifier`
+            // parses the argument list inside `parse_primary`): the callee
+            // is the unmerged member placeholder (qualified, unresolved)
+            // with the receiver row directly below — the
+            // `check_invocation_arity` shape. Classify the receiver and
+            // resolve the member's formals now; the merged face cannot
+            // carry the check (this runs once, at the group's close).
+            RowShape::Bare(BareInfo::Plain { .. }) => {
+                let recv = callee
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get(index))
+                    .map_or(Receiver::Unknown, |below| self.argument_receiver(below));
+                self.member_formals_full(&recv, row.name)
+                    .map(std::borrow::Cow::into_owned)
+            }
             RowShape::Member { recv } => self
                 .member_formals_full(recv, row.name)
                 .map(std::borrow::Cow::into_owned),
@@ -19558,6 +19606,85 @@ mod tests {
         );
     }
 
+    /// The member invocation columns check positional arguments through the
+    /// unmerged placeholder (`argument_type_not_assignable`, the official
+    /// `checkForArgumentTypeNotAssignableForArgument` — the argument's
+    /// `correspondingParameter` is resolution-filled for every resolved
+    /// invocation kind, instance, static, creation-folded, cascade and
+    /// call-result alike). The send closes before the dot-access event
+    /// merges `receiver.name`, so the callee is the qualified placeholder
+    /// with the receiver row directly below (`check_invocation_arity`'s
+    /// shape); one receiver classification per form — local read `b.m`,
+    /// static column `A.s`,
+    /// folded creation `C().m`, cascade section `b..m`, call result
+    /// `g().m` (the result's static type is `g`'s declared return type).
+    #[test]
+    fn member_columns_report_unassignable_positional_arguments() {
+        let report = report(
+            "class int {} class B { void m(int x) {} } \
+             class A { static void s(int x) {} } \
+             class C { void m(int x) {} } \
+             B g() => B(); \
+             void f() { \
+               B b = B(); \
+               b.m(null); A.s(null); C().m(null); b..m(null); g().m(null); \
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["argument_type_not_assignable"; 5],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The argument type 'Null' can't be assigned to the parameter type 'int'. "
+        );
+    }
+
+    /// The same five columns stay silent when every positional argument
+    /// assigns (the under-report direction keeps the matching face quiet,
+    /// not the placeholder gate).
+    #[test]
+    fn member_columns_stay_silent_on_assignable_positional_arguments() {
+        let report = report(
+            "class int {} class B { void m(int x) {} } \
+             class A { static void s(int x) {} } \
+             class C { void m(int x) {} } \
+             B g() => B(); \
+             void f() { \
+               B b = B(); \
+               b.m(1); A.s(1); C().m(1); b..m(1); g().m(1); \
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [] as [&str; 0],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The placeholder resolution feeds the full formal table, so a named
+    /// argument mixed into the same column checks against its own formal
+    /// (named by spelling, positional by index — `b.m(null, y: null)`
+    /// reports both slots: `Null` into the non-nullable positional `int`
+    /// and into the non-nullable named `C`).
+    #[test]
+    fn member_columns_check_mixed_positional_and_named_arguments() {
+        let report = report(
+            "class int {} class C {} \
+             class B { void m(int x, {C y}) {} } \
+             void f() { B b = B(); b.m(null, y: null); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["argument_type_not_assignable"; 2],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
     /// `return null` in a non-nullable function reports
     /// `return_of_invalid_type` with the per-host message
     /// (`rtv.dart:209-249` sync matrix).
@@ -26345,10 +26472,10 @@ mod sealed_contract_tests {
     /// A static call column on an imported container resolves through
     /// `member_formals_full`'s direct `Receiver::Container` arm: the
     /// named-argument membership face — the column that reaches a static
-    /// callee from a full parse (the positional argument face stays
-    /// placeholder-gated: the send closes before the receiver merge, so
-    /// `A.m(c)` itself reports nothing) — answers off the projected table
-    /// without touching a foreign slot.
+    /// callee from a full parse — answers off the projected table without
+    /// touching a foreign slot. The positional face rides the same arm via
+    /// the unmerged placeholder (`check_arguments` classifies the receiver
+    /// row below the callee before the dot-access merge).
     #[test]
     fn foreign_static_call_column_resolves_through_the_boundary() {
         let report = foreign_unit_report(
@@ -26360,6 +26487,28 @@ mod sealed_contract_tests {
             ["undefined_named_parameter"],
             "{:?}",
             code_names(&report)
+        );
+    }
+
+    /// The same static call column checks its positional arguments end to
+    /// end: the foreign formal's `List<int>` renders through the boundary
+    /// pool — the exact projection the direct-engine differential below
+    /// pins for the table itself, now live in the verdict message.
+    #[test]
+    fn foreign_static_call_positional_argument_renders_through_the_boundary() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; void f() { A.m(null); }",
+            "class A { static void m(List<int> x) {} }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["argument_type_not_assignable"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The argument type 'Null' can't be assigned to the parameter type 'List<int>'. "
         );
     }
 
