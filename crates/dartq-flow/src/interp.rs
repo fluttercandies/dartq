@@ -443,6 +443,11 @@ pub(crate) struct Interp<'o> {
     /// identifies the pattern face (`p as T` — no operand was pushed).
     pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
+    /// The depth contributed by condition slices of C-style `for` headers
+    /// (raised by `run_header_expr` only): condition wrappers dead-anchor
+    /// like body-level statements (`header_dead_check`), so the counter
+    /// separates them from init/updater slices.
+    pub(crate) header_cond_depth: usize,
     pub(crate) anywhere: Effects,
     /// The open dead-code interval (official
     /// `NullSafetyDeadCodeVerifier._firstDead`): the first unreachable
@@ -501,6 +506,7 @@ impl<'o> Interp<'o> {
             in_as_cast: false,
             as_base: 0,
             for_header_depth: 0,
+            header_cond_depth: 0,
             anywhere: Effects::default(),
             dead: None,
             collect: None,
@@ -1345,8 +1351,10 @@ impl Interp<'_> {
         base: usize,
     ) -> Option<Expr> {
         self.for_header_depth += 1;
+        self.header_cond_depth += 1;
         self.run_range(events, range, match_of);
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
+        self.header_cond_depth = self.header_cond_depth.saturating_sub(1);
         let expr = if self.exprs.len() > base {
             self.exprs.pop()
         } else {

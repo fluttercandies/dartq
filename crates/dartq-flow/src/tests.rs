@@ -2313,13 +2313,37 @@ fn dead_interval_empty_body_loop_folds_the_tail() {
     assert_eq!(dead_snippets(source), ["for (;;) {} 1;"]);
 }
 
+/// The for-header condition anchors its own dead row (official
+/// first-dead-node: `test_forLoop_noUpdaters` opens the row at the
+/// condition's `(` — the header part's ExprStmt): an init whose `throw`
+/// exits leaves the state unreachable when the condition wrapper fires,
+/// so the row anchors at the condition — not at the body `{` (the
+/// pre-#860 suppression) — and folds through the body to the function
+/// exit. Parse-only stand-in for the engine-driven golden below: `foo()`
+/// needs resolution to report Never, `throw` needs nothing.
+#[test]
+fn dead_interval_for_condition_anchors_at_the_condition() {
+    let source = "void f(bool c) { for (throw 0; c;) {} }";
+    assert_eq!(dead_snippets(source), ["c;) {}"]);
+}
+
+/// Gate polarity guard: init/updater wrappers stay suppressed. A wholly
+/// dead loop anchors at `for` itself (`for_begin`, official ForStatement
+/// `firstToken`); a header wrapper anchoring instead would start the row
+/// at the init expression.
+#[test]
+fn dead_interval_dead_for_loop_starts_at_the_keyword_not_the_header() {
+    let source = "void f(bool c) { return; for (1; c;) {} }";
+    assert_eq!(dead_snippets(source), ["for (1; c;) {}"]);
+}
+
 /// official `test_forLoop_noUpdaters` (dead_code_test.dart:212-220,
 /// column 15, length 29) ported verbatim: the interval anchors at the
 /// condition's `(` — the for's `flowEnd(node.body)` does NOT cover it
 /// (`_containsFirstDeadNode` fails: the body block is not an ancestor of
 /// the condition, dead_code_verifier.dart:453-459) — and folds through
 /// the body `{}` and `return i;` to the function exit's last statement.
-#[ignore = "adjudicated: needs the engine half of #642 (Never-returning call-type facts near consume_send); the flow-crate Ev::Exit half has landed"]
+#[ignore = "half-landed: the flow half is done (header_dead_check anchors condition slices, pinned by dead_interval_for_condition_anchors_at_the_condition), but this harness is parse-only — facts_of never drives the engine (dartq-flow cannot depend on dartq-semantic), so `foo()`'s Never exit never fires and the row stays anchored later; a live run needs the semantic-driven harness (#860 semantic half)"]
 #[test]
 fn official_for_loop_no_updaters_folds_through_the_return() {
     let source = "Never foo() => throw \"Never\";\n\ntest() {\n  int i = 0;\n  for (foo(); (i = 42) < 0;) {}\n  return i;\n}\n";

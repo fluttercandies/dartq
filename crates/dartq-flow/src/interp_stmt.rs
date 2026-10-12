@@ -835,10 +835,19 @@ impl Interp<'_> {
         true
     }
 
-    /// Dead-code check outside for headers (header slices skip statement
-    /// semantics).
+    /// Dead-code check for header wrapper statements. Init/updater slices
+    /// skip statement semantics: their wrappers are parsing artifacts (the
+    /// value feeds the header replay), a dead loop anchors at `for`
+    /// itself (`for_begin`), and dead updaters get their own official row
+    /// (`for_updaterBegin`, dead_code_verifier.dart:357-375) — not a fold.
+    /// The condition slice anchors: the condition can be the first dead
+    /// node (`test_forLoop_noUpdaters` anchors the row at the condition's
+    /// `(` — dead_code_test.dart:212-220), and the loop's body `flowEnd`
+    /// does not cover it (the body block is not an ancestor of the
+    /// condition, dead_code_verifier.dart:453-459). Equal depths mean no
+    /// init/updater slice encloses — body level or inside a condition.
     fn header_dead_check(&mut self, span: TokenSpan) {
-        if self.for_header_depth == 0 {
+        if self.for_header_depth == self.header_cond_depth {
             self.dead_code(span);
         }
     }
