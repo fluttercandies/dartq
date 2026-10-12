@@ -131,6 +131,11 @@ workspace_version() {
 run_guarded() {
     name=$1; cap=$2; tmo=$3; shift 3
     if [ -x "$RSS_WRAPPER" ]; then
+        # rm -f first: the exit code below is judged from the log's exit=
+        # line, and a stale log from a previous run (the wrapper dying before
+        # writing) would yield a false PASS (#931 P2). Here, so no caller can
+        # forget it.
+        rm -f "/tmp/serial_${name}.log"
         if [ -n "$tmo" ] && [ -n "$TIMEOUT_BIN" ]; then
             "$RSS_WRAPPER" "$name" "$cap" "$TIMEOUT_BIN" "$tmo" "$@"
         else
@@ -307,9 +312,6 @@ phase_verify() {
         echo "release: [verify] would run: cargo test -p dartq-semantic --test m3_codes_pin   # m3 freeze pin (red until the re-freeze regen)"
         echo "verify: SKIP pins (dry-run)"
     else
-        # rm -f first: run_guarded judges the exit from /tmp/serial_<name>.log,
-        # and a stale log from a previous run would mask a failure (#931 P2).
-        rm -f /tmp/serial_pins-harness.log /tmp/serial_pins-m3.log
         run_gate pins-harness 600 8388608 "terminal output (harness calibration pins)" \
             cargo test -p harness || return 1
         run_gate pins-m3 600 8388608 "terminal output (m3 unused-family freeze pin)" \
