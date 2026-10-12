@@ -58,7 +58,7 @@ binaries (`dartq-cli`, `harness`). Concurrent cargo invocations share
 | `assists` | Query plugin hosts' assists for one file location (report-only) |
 | `index` | Build the symbol index over the analyzed workspace and report what it built |
 | `impact` | Assess what a change to one file would affect |
-| `query` | Query the symbol index — faces: `symbol`, `references`, `callers` |
+| `query` | Query the symbol index — faces: `symbol`, `references`, `callers`, `implementations`, `dependencies`, `batch` |
 | `version` | Print the version |
 
 ```bash
@@ -76,6 +76,15 @@ dartq analyze ~/src/my_app --format=human
 # Symbol index: declarations of one name plus resolved references to them.
 dartq query symbol Foo
 dartq query symbol Foo --format=json
+dartq query callers Foo
+dartq query implementations Foo
+dartq query dependencies Foo
+
+# Batch query: every --symbol x --kind answered in one workspace assembly.
+dartq query batch --symbol Foo --symbol Bar --kinds callers
+
+# Explain: the one-stop JSON report for one symbol.
+dartq explain Foo
 
 # Impact: what depends on one file's API surface (a hypothetical change —
 # a CLI run holds no edit baseline; the daemon passes real diffs).
@@ -92,7 +101,8 @@ dartq compat lib/api.dart --context beta
 dartq fix lib/ --dry-run
 dartq fix lib/
 
-# The daemon: an LSP server over stdin/stdout (see "Daemon" below).
+# The daemon: an LSP server over stdin/stdout (see "Daemon" below); add
+# --watch to re-analyze after on-disk changes settle.
 dartq daemon ~/src/my_app
 
 # Version.
@@ -102,9 +112,17 @@ dartq --version
 
 Severity-sensitive flags mirror the oracle on `check`/`analyze`:
 warnings are fatal by default (`--no-fatal-warnings` clears that), infos
-are not (`--fatal-infos` opts in). `check`/`analyze` also accept
-`--metrics-json PATH` — one JSON object at exit with file/LOC/diagnostic
-counts, phase timings, library cache counters, and peak RSS.
+are not (`--fatal-infos` opts in). Both faces take `-v`/`--verbosity
+concise|default|verbose` — the machine-row volume tier: `concise` drops
+the message field, `default` is the oracle machine row, `verbose` appends
+the correctionMessage — and `--metrics-json PATH`: one JSON object at exit
+with file/LOC/diagnostic counts, phase timings, library cache counters,
+and peak RSS. `analyze` additionally accepts `--overlay PATH=FILE`
+(repeatable: analyze PATH with FILE's content instead of the on-disk
+bytes, `-` reads stdin — the AI-agent edit case), `--memory-limit MiB`
+(tiered degradation with an INFO `dartq/memory_degraded` row on breach),
+`--trace-events PATH` (one JSONL engine event per line), and
+`--cache-size-limit SIZE` (the persistent content store cap).
 
 ## Exit Codes
 
@@ -120,10 +138,10 @@ semantics — the oracle-parity tiers:
 | 4 | internal failure (stdout stays empty — a partial set never poses as a result) |
 | 64 | usage error (bad flags, missing paths/package config/SDK) |
 
-The query-family faces (`query`, `impact`, `compat`, `fix`) use the query
-tiers: 0 on a successful query — zero results and incompatible compat
-axes are the answer's data, not failures; stale fix anchors are safe
-no-ops — plus 64 usage and 4 internal.
+The query-family faces (`query`, `impact`, `compat`, `fix`, `assists`,
+`index`, `explain`) use the query tiers: 0 on a successful query — zero
+results and incompatible compat axes are the answer's data, not failures;
+stale fix anchors are safe no-ops — plus 64 usage and 4 internal.
 
 ## Daemon
 
@@ -136,13 +154,19 @@ overlay edits arrive through `textDocument/didOpen`/`didChange`/`didClose`
 read. Each turn batches all queued work — N edits collapse into one apply
 plus one analysis.
 
-Six `dartq/*` methods mirror the CLI commands one-to-one (announced under
-`capabilities.experimental`): `dartq/analyze` (merged diagnostics, document
-URIs), `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/fix`, and
+Thirteen `dartq/*` methods (announced under `capabilities.experimental`)
+mirror the CLI commands and session management: `dartq/analyze` (merged
+diagnostics, document URIs), `dartq/check`, `dartq/query`,
+`dartq/queryBatch` (many symbols x kinds in one round trip), `dartq/index`,
+`dartq/impact`, `dartq/explain`, `dartq/fix`, `dartq/assists`, and
 `dartq/compat` (canonical path labels; `dartq/compat` requires explicit
-`sdk_roots` — the CLI's `$DART_SDK` fallback has no daemon equivalent).
-Every answer carries `schema_version` and honors an optional `verbosity`
-tier. Example frame:
+`sdk_roots` — the CLI's `$DART_SDK` fallback has no daemon equivalent) —
+plus the `dartq/overlay.set` / `dartq/overlay.commit` / `dartq/overlay.clear`
+staging faces for multi-agent overlay views. Engine-view requests accept an
+optional `agentId` (analyze the agent's overlay view) and `context` (a
+`dartq.yaml` context); row-bearing answers honor a `since` cursor for delta
+economics. Every answer carries `schema_version` and an optional
+`verbosity` tier. Example frame:
 
 ```text
 Content-Length: 71
@@ -236,13 +260,13 @@ today:
 | Environment | [`dartq-sdk`](crates/dartq-sdk) | SDK metadata: `libraries.json` loading, identity, `dart:` library surface, target/platform scoping | landed |
 | Semantics | [`dartq-types`](crates/dartq-types) | Type system M1 surface: ten-shape type skeleton, nullability dimension, canonical interning, subtype / assignability, least upper bound | landed |
 | Semantics | [`dartq-resolution`](crates/dartq-resolution) | URI, import/export/part, and conditional-import resolution with namespace computation | landed |
-| Semantics | [`dartq-semantic`](crates/dartq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
-| Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
+| Semantics | [`dartq-semantic`](crates/dartq-semantic) | Semantic graph (element/reference/symbol arenas) plus the semantic diagnostic fold: `undefined_*`, `wrong_number_*`, the part family, dead code | landed |
+| Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | landed |
 | Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | landed |
-| Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | partial — flush machinery only |
+| Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots (atomic generation save/load) | landed |
 | Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | landed |
-| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (64 official core/recommended rules) | rules implemented; CLI wiring pending |
-| Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin protocol v1 IPC types: frames, codec, handshake, manifest | protocol landed; core spawn pending |
+| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (the `package:lints` core + recommended sets, 90 rules), wired into the analyze face | landed |
+| Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin system: protocol v1 (frames, codec, handshake, manifest) plus the enforced runtime — discovery, spawn, isolation budgets | landed |
 | Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | landed |
 | Interface | [`dartq-commands`](crates/dartq-commands) | Per-command cores shared by the CLI and daemon faces: plain parameters in, typed results out — no parsing, printing, or exit codes | landed |
 | Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | landed |
@@ -337,20 +361,17 @@ these numbers.
 
 Honest state of the current tree:
 
-- `dartq analyze` covers scan, parse, and resolution; the type-system and
-  semantic-diagnostic seam is still landing, so semantic errors beyond
-  syntax/resolution are not yet reported.
-- `query` serves three faces: `symbol`, `references`, and `callers`. More
-  query kinds are unplanned future work.
-- The 64 built-in lint rules are implemented and tested but not yet wired
-  into the CLI/daemon diagnostic output.
-- `dartq fix` plumbing (anchoring, drift-correcting applier, patch
-  document) is complete, but no fix sources are wired yet — current runs
-  apply zero edits.
-- Plugins: the wire protocol (v1) and the host-side Dart package exist;
-  the core does not yet spawn or discover plugins.
-- The daemon's debounced snapshot flush machinery is in place; the
-  generation payload awaits engine faces, so nothing is written yet.
+- Semantic diagnostics cover the families the default diagnoser implements
+  (undefined identifiers and members, wrong-number-of-arguments and
+  -type-arguments, the part/part-of family, dead code); full oracle parity
+  for the semantic tier is still below the gate bar and is tracked by the
+  differential harness (see the M1 gate state above).
+- Without an `analysis_options.yaml`, dartq enables the whole
+  `package:lints` core + recommended slice — a deliberate divergence from
+  the oracle, which enables nothing without an `include:`.
+- pub faces consume pub's resolution artifacts; there is no version
+  solving — run `dart pub get` to produce
+  `.dart_tool/package_config.json` first.
 - `analyze --format=human` is a convenience view, not a differential
   face — its layout may change freely.
 - The benchmark numbers above are debug builds over a 22.7k-LOC corpus.
