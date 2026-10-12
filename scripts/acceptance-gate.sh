@@ -155,7 +155,7 @@ warning_rows="$(grep -Ec '^WARNING\|' "$machine_file" || true)"
 info_rows="$(grep -Ec '^INFO\|' "$machine_file" || true)"
 
 if [ "$rows" -gt 0 ]; then
-  echo "-- [$label] diagnostics over the valid corpus ($rows rows: $error_rows error, $warning_rows warning, $info info):"
+  echo "-- [$label] diagnostics over the valid corpus ($rows rows: $error_rows error, $warning_rows warning, $info_rows info):"
   grep -E '^(ERROR|WARNING|INFO)\|' "$machine_file" | sed 's/^/  | /'
   verdict=FAIL
 else
