@@ -8,6 +8,7 @@ description = "Readers for pub's resolution artifacts (package_config.json, pubs
 repository.workspace = true
 readme = "README.md"
 keywords = ["dart", "pub"]
+categories = ["config", "development-tools"]
 
 [dependencies]
 dartq-language = { workspace = true }

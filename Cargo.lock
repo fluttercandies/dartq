@@ -207,10 +207,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dartq-cache"
-version = "0.1.0"
-
-[[package]]
 name = "dartq-cli"
 version = "0.1.0"
 dependencies = [
@@ -323,10 +319,6 @@ dependencies = [
  "dartq-source",
  "rustc-hash",
 ]
-
-[[package]]
-name = "dartq-incremental"
-version = "0.1.0"
 
 [[package]]
 name = "dartq-index"

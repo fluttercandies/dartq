@@ -20,9 +20,6 @@
 #   only the pure parse/args core is floor-gated.
 #
 # Unlisted crates (no floor row => fall back to `default` 0 = advisory):
-#   - True empty stubs (1-line lib.rs; auto-dropped by the fold as LF:0
-#     rows): dartq-incremental, dartq-cache. Each MUST gain a real floor
-#     row in the same PR as its first real implementation.
 #   - Real code, no measured baseline yet: dartq-flow, dartq-snapshot,
 #     dartq-lints, dartq-ai, dartq-plugin, dartq-schema, dartq-commands,
 #     dartq-daemon. They ride `default` until the first full advisory run

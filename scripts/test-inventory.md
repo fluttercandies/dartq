@@ -16,7 +16,7 @@ depth — the gate measures, this file explains.
 
 - 23 Rust workspace members; **15 carry tests** (853 `#[test]` fns in crates)
   plus the differential harness (56 `#[test]` fns) = **909 pinned test fns**.
-- 8 members are empty scaffolds (1-line `lib.rs`, no implementation): no
+- 6 members are empty scaffolds (1-line `lib.rs`, no implementation): no
   behavior to cover, listed as GAPS with their unblocking condition.
 - `dartq-plugin-host` is a Dart package (no Cargo.toml) — not applicable.
 
@@ -48,8 +48,6 @@ depth — the gate measures, this file explains.
 | crate | status | note |
 | --- | --- | --- |
 | dartq-flow | GAP (stub) | 1-line `lib.rs`; flow analysis unimplemented — pins land with the first real implementation (PRD §19.4 also demands signature-hash gate unit tests there) |
-| dartq-incremental | GAP (stub) | 1-line `lib.rs`; incrementality is currently exercised only transitively at the engine level (`dartq-engine/tests/incremental*.rs`) — a crate-level pin (SignatureHash/invalidation units) is still owed when the crate lands |
-| dartq-cache | GAP (stub) | 1-line `lib.rs`; no implementation |
 | dartq-snapshot | GAP (stub) | 1-line `lib.rs`; no implementation |
 | dartq-lints | GAP (stub) | 1-line `lib.rs`; the 264-rule lint surface has zero pins |
 | dartq-ai | GAP (stub) | 1-line `lib.rs`; no implementation |

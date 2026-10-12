@@ -217,7 +217,7 @@ small edits.
 
 ## Architecture
 
-One-way layering, one crate per concern. 25 `dartq-*` workspace crates,
+One-way layering, one crate per concern. 23 `dartq-*` workspace crates,
 plus the differential-testing harness and the corpus generator
 (`tools/corpus-gen`). Status = what ships through the CLI/daemon faces
 today:
@@ -239,8 +239,6 @@ today:
 | Semantics | [`dartq-semantic`](crates/dartq-semantic) | Element, reference, and symbol arenas forming the semantic graph | in development |
 | Semantics | [`dartq-flow`](crates/dartq-flow) | Event-driven flow analysis, decoupled from the AST | in development |
 | Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | landed |
-| Services | [`dartq-incremental`](crates/dartq-incremental) | Invalidation engine on signature hashes and dependency fingerprints | namespace placeholder — implementation lives in dartq-engine |
-| Services | [`dartq-cache`](crates/dartq-cache) | Layered cache and eviction policies | namespace placeholder — implementation lives in dartq-engine (L1) |
 | Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots | partial — flush machinery only |
 | Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | landed |
 | Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (64 official core/recommended rules) | rules implemented; CLI wiring pending |

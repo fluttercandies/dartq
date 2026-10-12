@@ -116,7 +116,7 @@ if [ ! -f "$CORPUS/pubspec.yaml" ]; then
   exit 2
 fi
 if [ ! -f "$CORPUS/.dart_tool/package_config.json" ]; then
-  echo "lint-gate: $CORPUS/.dart_tool/package_config.json missing — the corpus ships it versioned (pub-get-free, m2-warning precedent); do not run dart pub get" >&2
+  echo "lint-gate: $CORPUS/.dart_tool/package_config.json missing — run dart pub get in the corpus root to regenerate it (safe: path deps only, offline); the tracked hand state is nested/.dart_tool/package_config.json and must never be regenerated" >&2
   exit 2
 fi
 if [ ! -f "$CORPUS/vendor/lints/lib/recommended.yaml" ]; then
