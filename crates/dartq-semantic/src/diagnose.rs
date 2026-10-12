@@ -6179,7 +6179,31 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
             }
-            Receiver::Prefix { .. } | Receiver::Unknown => return None,
+            // A prefixed top-level callee (`p.f(...)` through `import as`):
+            // the same unmerged-placeholder shape as the plain arm above —
+            // the prefix resolves to its target file and the declaration's
+            // formals project through the boundary (foreign slots re-intern
+            // into the diagnosing pool, single-pool with the argument rows).
+            // An unregistered prefix, an ambiguous or absent name, and a
+            // non-executable target all keep the under-report.
+            Receiver::Prefix { name: prefix } => {
+                let dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) =
+                    self.namespaces.lookup_prefixed(self.lib, prefix, name)
+                else {
+                    return None;
+                };
+                let decl = self.index.get(file).and_then(|f| f.decl(name))?;
+                return match self.boundary.top(file, name, decl) {
+                    Projected::Own(decl) => {
+                        decl.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                    }
+                    Projected::Foreign(decl) => decl
+                        .formals
+                        .as_deref()
+                        .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
+                };
+            }
+            Receiver::Unknown => return None,
         };
         let walk = if super_walk {
             self.walk_super(container, name)
@@ -26190,6 +26214,22 @@ mod sealed_contract_tests {
     /// node backs the annotation's resolution face (`is_meta_getter` keys
     /// the `package:meta/` uri — the vendored corpus stand-in's shape).
     fn sealed_report(source: &str, dependency: &str, dependency_uri: &str) -> FileReport {
+        sealed_report_prefixed(source, dependency, dependency_uri, None)
+    }
+
+    /// [`sealed_report`] through a prefixed import (`import ... as p;`) —
+    /// the prefix's merged table is the lookup surface the prefixed-callee
+    /// arm of `member_formals_full` resolves against.
+    fn prefixed_unit_report(main_source: &str, dependency: &str) -> FileReport {
+        sealed_report_prefixed(main_source, dependency, "package:t/other.dart", Some("p"))
+    }
+
+    fn sealed_report_prefixed(
+        source: &str,
+        dependency: &str,
+        dependency_uri: &str,
+        prefix: Option<&str>,
+    ) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -26242,7 +26282,7 @@ mod sealed_contract_tests {
             lib,
             ImportEdge {
                 target: Some(dep_lib),
-                prefix: None,
+                prefix: prefix.map(|p| strings.intern(p)),
                 deferred: false,
                 combinators: Combinators::unfiltered(),
             },
@@ -26841,6 +26881,61 @@ mod sealed_contract_tests {
             report.diagnostics[0].message,
             "A value of type 'Null' can't be assigned to a variable of type 'List<int>'."
         );
+    }
+
+    /// A prefixed top-level callee (`p.f(null)` through `import as p`)
+    /// checks its positional arguments against the target's projected
+    /// formals — the same verdict the unqualified `f(null)` shape gives,
+    /// with the foreign `List<int>` slot rendered through the boundary
+    /// pool (`member_formals_full`'s `Receiver::Prefix` arm).
+    #[test]
+    fn prefixed_top_level_call_checks_positional_arguments() {
+        let report = prefixed_unit_report(
+            "import 'other.dart' as p; void f() { p.g(null); }",
+            "void g(List<int> x) {}",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["argument_type_not_assignable"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The argument type 'Null' can't be assigned to the parameter type 'List<int>'. "
+        );
+    }
+
+    /// The same arm is strictly a projection, not a new report source: an
+    /// assignable argument through a resolved prefixed callee stays
+    /// silent, and a callee the prefix table does not name keeps the
+    /// invocation face's existing under-report (an argument-bearing
+    /// prefixed miss is that face's territory — no argument verdict).
+    #[test]
+    fn prefixed_top_level_call_argument_misses_stay_quiet() {
+        let pass = prefixed_unit_report(
+            "import 'other.dart' as p; void f() { p.g(1); }",
+            "void g(int x) {}",
+        );
+        assert!(pass.diagnostics.is_empty(), "{:?}", code_names(&pass));
+
+        let miss = prefixed_unit_report(
+            "import 'other.dart' as p; void f() { p.gone(null); }",
+            "void g(int x) {}",
+        );
+        assert!(miss.diagnostics.is_empty(), "{:?}", code_names(&miss));
+    }
+
+    /// An unregistered prefix never reaches the formals arm: the lookup
+    /// misses before any projection, so no argument verdict can be minted
+    /// off an unresolved prefix.
+    #[test]
+    fn unregistered_prefix_callee_suppresses_the_argument_check() {
+        let report = prefixed_unit_report(
+            "import 'other.dart' as p; void f() { nosuch.g(null); }",
+            "void g(int x) {}",
+        );
+        assert!(!code_names(&report).contains(&"argument_type_not_assignable"));
     }
 
     /// An imported generic member's row type and a local annotation land in
