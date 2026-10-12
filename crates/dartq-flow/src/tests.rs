@@ -222,6 +222,176 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
+// —— W3 dead-code oracle faces (#868, docs/audits/w3-deadcode-probes.md) ——
+
+/// Wholly-dead branch face (probe table B): the anchor IS the dead branch's
+/// block, so the row spans the block's full extent — closing brace
+/// included (official `flowEnd` with `node == firstDeadNode`: no
+/// last-statement trim).
+#[test]
+fn dead_else_block_row_spans_the_whole_block() {
+    // Probe g5: oracle row = the else block `{ print('d'); }`.
+    let source = "void f() { if (true) {} else { print('d'); } }";
+    assert_eq!(dead_snippets(source), ["{ print('d'); }"]);
+}
+
+#[test]
+fn dead_then_block_row_spans_the_whole_block() {
+    // Probe g6.
+    let source = "void f() { if (false) { print('d'); } else {} }";
+    assert_eq!(dead_snippets(source), ["{ print('d'); }"]);
+}
+
+/// `while (false)` body: anchor = the body block, whole block (probe g8).
+#[test]
+fn while_false_body_row_spans_the_whole_block() {
+    let source = "void f() { while (false) { print('d'); } }";
+    assert_eq!(dead_snippets(source), ["{ print('d'); }"]);
+}
+
+/// Dead right operand of `&&` (probe table C): the row re-anchors at the
+/// operator and ends at the right operand's end, and the (now provably
+/// dead) then block forms its own row.
+#[test]
+fn and_false_right_operand_row_anchors_at_the_operator() {
+    // Probe g10: oracle rows = `&& x > 0` and the whole then block.
+    let source = "void f(int x) { if (false && x > 0) { print('n'); } }";
+    assert_eq!(dead_snippets(source), ["&& x > 0", "{ print('n'); }"]);
+}
+
+/// A non-constant `&&` LHS keeps the right operand live; only the
+/// provably-dead loop body reports (probe g10's second shape).
+#[test]
+fn non_constant_and_rhs_stays_live_body_reports() {
+    let source = "void f(int x) { while (x > 0 && false) { print('a'); } }";
+    assert_eq!(dead_snippets(source), ["{ print('a'); }"]);
+}
+
+/// Dead right operand of `||` (probe g11): the then branch stays live.
+#[test]
+fn or_true_right_operand_row_anchors_at_the_operator() {
+    let source = "void f(int x) { if (true || x > 0) {} }";
+    assert_eq!(dead_snippets(source), ["|| x > 0"]);
+}
+
+/// `??` with a guaranteed-non-null LHS type (probe g25, official
+/// `_isGuaranteedNonNullWithSoundNullSafety`): the RHS path is unreachable
+/// and the row anchors at `??`.
+#[test]
+fn non_null_lhs_if_null_right_operand_row() {
+    let source = "void f(int x) { x ?? 1; }";
+    assert_eq!(dead_snippets(source), ["?? 1"]);
+}
+
+/// A nullable LHS keeps both `??` arms live.
+#[test]
+fn nullable_lhs_if_null_reports_nothing() {
+    let source = "void f(int? x) { x ?? 1; }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// Dead conditional-expression arms (probe table C): each arm's row spans
+/// the arm's own range (`flowEnd(thenExpression)`/`flowEnd(elseExpression)`).
+#[test]
+fn conditional_dead_then_arm_row() {
+    let source = "void f() { false ? 1 : 2; }";
+    assert_eq!(dead_snippets(source), ["1"]);
+}
+
+#[test]
+fn conditional_dead_else_arm_row() {
+    let source = "void f() { true ? 1 : 2; }";
+    assert_eq!(dead_snippets(source), ["2"]);
+}
+
+/// Switch member-order faces (probe table G, r5): every member at/after the
+/// first `default` is dead (keyword row at the head-time member check, body
+/// row at the member close), and a default followed by a case-headed group
+/// reports its own keyword row.
+#[test]
+fn switch_case_after_default_member_rows() {
+    let source = "\
+void f(int x) {
+  switch (x) {
+    case 1:
+      break;
+    default:
+      break;
+    case 2:
+      break;
+  }
+}";
+    assert_eq!(dead_snippets(source), ["default", "case", "break;"]);
+}
+
+/// A default followed by another default-headed group stays live (probe
+/// table G, r6): only the SECOND default and its body report.
+#[test]
+fn switch_multiple_defaults_second_member_rows() {
+    let source = "\
+void f(int x) {
+  switch (x) {
+    case 1:
+      break;
+    default:
+      break;
+    default:
+      break;
+  }
+}";
+    assert_eq!(dead_snippets(source), ["default", "break;"]);
+}
+
+/// A trailing default stays live; no member rows at all (probe s1).
+#[test]
+fn switch_trailing_default_reports_nothing() {
+    let source = "\
+void f(int x) {
+  switch (x) {
+    case 1:
+      break;
+    default:
+      break;
+  }
+}";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// Default first, then cases: the default's keyword row plus every later
+/// member's keyword and body rows (probe s2/s6).
+#[test]
+fn switch_default_first_member_rows() {
+    let source = "\
+void f(int x) {
+  switch (x) {
+    default:
+      break;
+    case 1:
+      break;
+  }
+}";
+    assert_eq!(dead_snippets(source), ["default", "case", "break;"]);
+}
+
+/// A default head sharing a body with a preceding case (probe s5): the
+/// shared group's case head stays live, the default's keyword row fires at
+/// the next case-headed group's opening, and the later member reports
+/// keyword + body rows.
+#[test]
+fn switch_shared_body_default_row() {
+    let source = "\
+void f(int x) {
+  switch (x) {
+    case 1:
+    default:
+      break;
+    case 2:
+      break;
+  }
+}";
+    assert_eq!(dead_snippets(source), ["default", "case", "break;"]);
+}
+
 /// A Never-typed subexpression records `Ev::Exit` (official
 /// `FlowAnalysis.handleExit`, flow_analysis.dart:919-925): the flow state
 /// goes unreachable from the expression's end, so the following statement
@@ -1505,25 +1675,36 @@ fn switch_statement_default_exhaustive_tail_dead() {
         Ev::CaseBegin {
             label_count: 0,
             expression_count: 1,
+            kw: None,
         },
-        Ev::CaseExprBegin,
+        Ev::CaseExprBegin { span: span(3) },
         Ev::OtherExpr { span: span(3) },
-        Ev::CaseExprEnd { has_guard: false },
+        Ev::CaseExprEnd {
+            has_guard: false,
+            kw: span(3),
+        },
         Ev::ReturnBegin { span: span(4) },
         Ev::ReturnEnd {
             has_expression: false,
         },
-        Ev::CaseEnd { statement_count: 1 },
+        Ev::CaseEnd {
+            statement_count: 1,
+            default_kw: None,
+        },
         // `default:` — no case-expression events; the group opens at once.
         Ev::CaseBegin {
             label_count: 0,
             expression_count: 0,
+            kw: Some(span(5)),
         },
         Ev::ReturnBegin { span: span(5) },
         Ev::ReturnEnd {
             has_expression: false,
         },
-        Ev::CaseEnd { statement_count: 1 },
+        Ev::CaseEnd {
+            statement_count: 1,
+            default_kw: Some(span(5)),
+        },
         Ev::SwitchBlockEnd,
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
@@ -1626,9 +1807,15 @@ fn assert_condition_write_unassigned_after() {
         },
         Ev::OtherExpr { span: span(4) },
         Ev::Assign { plain: true },
-        Ev::BinaryBegin { op: BinOp::Other },
+        Ev::BinaryBegin {
+            op: BinOp::Other,
+            span: span(4),
+        },
         Ev::OtherExpr { span: span(5) },
-        Ev::BinaryEnd { op: BinOp::Other },
+        Ev::BinaryEnd {
+            op: BinOp::Other,
+            end: 6,
+        },
         // Message `v`: reads the post-assignment state, so no fact.
         Ev::Ident {
             name: 0,
@@ -2516,11 +2703,13 @@ fn if_null_types_as_the_lhs_non_null_form() {
             read(X),
             Ev::BinaryBegin {
                 op: crate::ev::BinOp::IfNull,
+                span: tspan(1),
             },
             read(X),
             Ev::OtherExpr { span: tspan(2) },
             Ev::BinaryEnd {
                 op: crate::ev::BinOp::IfNull,
+                end: 3,
             },
         ],
     ]
@@ -2553,11 +2742,13 @@ fn if_null_write_repromotes_via_types_of_interest() {
             read(X),
             Ev::BinaryBegin {
                 op: crate::ev::BinOp::IfNull,
+                span: tspan(1),
             },
             read(X),
             Ev::OtherExpr { span: tspan(2) },
             Ev::BinaryEnd {
                 op: crate::ev::BinOp::IfNull,
+                end: 3,
             },
             Ev::Assign { plain: true },
             Ev::ExecEnd {

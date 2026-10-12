@@ -5,6 +5,7 @@
 use dartq_parser::TokenSpan;
 
 use crate::ev::{BlockKind, Ev};
+use crate::facts::FlowFact;
 use crate::interp::{DeclCtx, Effects, Expr, Frame, Interp, PatternKind, Scope, VarMeta};
 use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
@@ -200,8 +201,10 @@ impl Interp<'_> {
                 // Attach the `while (c);` part to the interval the do's
                 // back edge opened, and drop the tail row when a break
                 // makes the code after the do-while reachable (official
-                // `hasBreakStatement`).
-                let tail_reachable = self.reachable();
+                // `hasBreakStatement`). The LOCAL flag: a break path is a
+                // real control path even when the statement is entry-dead
+                // (the official test is syntactic, not `isReachable`).
+                let tail_reachable = self.reach.locally_reachable(self.current.reach);
                 if let Some(window) = &mut self.dead
                     && window.awaiting_split()
                 {
@@ -495,12 +498,15 @@ impl Interp<'_> {
                     group_default: false,
                     group_combined: None,
                     body_depth: None,
+                    dead_default: None,
+                    reported_kw: None,
                     block,
                 });
             }
             Ev::CaseBegin {
                 label_count,
                 expression_count,
+                kw,
             } => {
                 if self.collecting() {
                     return true;
@@ -512,6 +518,28 @@ impl Interp<'_> {
                 // no-op when `CaseExprBegin` already closed it).
                 self.switch_after_case(frame_index);
                 let is_default = *expression_count == 0;
+                // The previous group's default feeds this group's opening:
+                // the chained unmatched state goes unreachable (the
+                // default's guard-true, no-pattern alternative end). No
+                // keyword row here — a default-headed opener stays silent
+                // (probe table G rule 2: s7's first default stays live).
+                self.consume_dead_default(frame_index, false);
+                if let Some(anchor) = kw.filter(|_| is_default) {
+                    // The member check of a default head (official
+                    // `switch_beginAlternative` + `checkUnreachableNode`):
+                    // run the head under the chained unmatched state.
+                    let chain = match &self.stack[frame_index] {
+                        Frame::Switch { unmatched, .. } => unmatched.clone(),
+                        _ => self.current.clone(),
+                    };
+                    self.current = chain;
+                    self.dead_code(anchor);
+                    // `handleDefault`'s `flowEnd(member)`: a member anchored
+                    // at its own keyword reports there and resets (official
+                    // dead_code_verifier.dart:232-235) — the body then opens
+                    // a fresh interval.
+                    self.report_member_head(anchor);
+                }
                 if let Frame::Switch {
                     group_labels,
                     group_default,
@@ -530,7 +558,7 @@ impl Interp<'_> {
                     *case_open |= is_default;
                 }
             }
-            Ev::CaseExprBegin => {
+            Ev::CaseExprBegin { span } => {
                 if self.collecting() {
                     return true;
                 }
@@ -541,22 +569,49 @@ impl Interp<'_> {
                 // event of that clause).
                 if let Some(frame_index) = self.switch_frame() {
                     self.switch_after_case(frame_index);
+                    // The previous group's default: the chain goes
+                    // unreachable and — a case-headed opener — the default's
+                    // own keyword row fires (probe table G rule 2).
+                    self.consume_dead_default(frame_index, true);
                 }
                 self.case_pattern_begin(false);
+                // The member check (official `checkUnreachableNode(member)`
+                // right after `switch_beginAlternative`): a dead member
+                // anchors at its `case` keyword.
+                self.dead_code(*span);
             }
-            Ev::CaseExprEnd { has_guard } => {
+            Ev::CaseExprEnd { has_guard, kw } => {
                 if self.collecting() {
                     return true;
                 }
+                // `handleCaseHead`'s `flowEnd(member)` runs before
+                // `switch_endAlternative`: a member anchored at its own
+                // keyword reports there and resets.
+                self.report_member_head(*kw);
                 self.case_pattern_end(*has_guard);
             }
-            Ev::SwitchEnd
-            | Ev::CaseEnd { .. }
-            | Ev::CaseNoWhen
-            | Ev::NoInitializer
-            | Ev::BlockBodyBegin
-            | Ev::BlockBodyEnd
-            | Ev::EmptyBody => {}
+            Ev::SwitchEnd | Ev::CaseNoWhen | Ev::NoInitializer => {}
+            Ev::CaseEnd {
+                default_kw,
+                statement_count: _,
+            } => {
+                // Latch the group's default (if any) for the next group's
+                // opening (probe table G rules 1-2); a default whose
+                // head-time member row already fired is latched reported so
+                // the group close never re-reports it.
+                if let Some(frame_index) = self.switch_frame() {
+                    let reported = match &self.stack[frame_index] {
+                        Frame::Switch { reported_kw, .. } => reported_kw.is_some_and(|offset| {
+                            default_kw.is_some_and(|kw| kw.range.offset == offset)
+                        }),
+                        _ => false,
+                    };
+                    if let Frame::Switch { dead_default, .. } = &mut self.stack[frame_index] {
+                        *dead_default = default_kw.map(|kw| (kw, reported));
+                    }
+                }
+            }
+            Ev::BlockBodyBegin | Ev::BlockBodyEnd | Ev::EmptyBody => {}
             Ev::SwitchBlockEnd => {
                 if self.collecting() {
                     return true;
@@ -584,6 +639,8 @@ impl Interp<'_> {
                     group_default: false,
                     group_combined: None,
                     body_depth: None,
+                    dead_default: None,
+                    reported_kw: None,
                     block: i..i,
                 });
             }
@@ -803,8 +860,13 @@ impl Interp<'_> {
                     // A statement block's own end trims the interval to the
                     // official last-statement end; a construct's body block
                     // (loop/try/catch/branch/switch — the parent frame
-                    // below) is the covering node itself and never extends.
-                    // The stack can be shallow here — the outermost
+                    // below) is the covering node itself and never extends
+                    // — UNLESS the interval's anchor IS the block (a wholly
+                    // dead branch/loop body): the official close reports
+                    // the anchor node's own extent, `}` included
+                    // (dead_code_verifier.dart:253-279's trim only applies
+                    // when the anchor sits inside, not at, the covering
+                    // node). The stack can be shallow here — the outermost
                     // executable records no Exec frame — so the parent is
                     // looked up guarded; a missing parent is a statement
                     // block.
@@ -823,7 +885,13 @@ impl Interp<'_> {
                                 | Frame::Switch { .. }
                         )
                     );
-                    if !is_body_block && let Some(window) = &mut self.dead {
+                    let block_anchored = self
+                        .dead
+                        .as_ref()
+                        .is_some_and(|window| window.anchored_at_depth(self.stack.len() - 1));
+                    if (!is_body_block || block_anchored)
+                        && let Some(window) = &mut self.dead
+                    {
                         window.extend(*end);
                     }
                     self.stack.pop();
@@ -849,6 +917,52 @@ impl Interp<'_> {
     fn header_dead_check(&mut self, span: TokenSpan) {
         if self.for_header_depth == self.header_cond_depth {
             self.dead_code(span);
+        }
+    }
+
+    /// The switch member's keyword row: the official
+    /// `flowEnd(SwitchMember)` with `node == firstDeadNode` reports at
+    /// `node.keyword` — the bare `case`/`default` token — and resets the
+    /// interval (dead_code_verifier.dart:232-235); a member folded into an
+    /// outer interval (anchor elsewhere) keeps it open.
+    fn report_member_head(&mut self, kw: TokenSpan) {
+        let anchored_here = self
+            .dead
+            .as_ref()
+            .is_some_and(|window| window.anchor_at(kw.range.offset));
+        if anchored_here {
+            self.emit(FlowFact::DeadCode { span: kw });
+            self.dead = None;
+            if let Some(frame_index) = self.switch_frame()
+                && let Frame::Switch { reported_kw, .. } = &mut self.stack[frame_index]
+            {
+                *reported_kw = Some(kw.range.offset);
+            }
+        }
+    }
+
+    /// Consumes the previous group's latched `default` at the next group's
+    /// opening: the chain's unmatched state goes unreachable (the
+    /// default's alternative ends with a true guard and no pattern —
+    /// official `switch_endAlternative` via `_popPattern`), and a
+    /// case-headed opener also reports the default's own keyword row
+    /// unless its head-time check already fired it (probe table G rules
+    /// 1-2: every member at/after the first default is dead, while a
+    /// first default followed by another default-headed group stays
+    /// live).
+    fn consume_dead_default(&mut self, frame_index: usize, case_opener: bool) {
+        let latched = match &mut self.stack[frame_index] {
+            Frame::Switch { dead_default, .. } => dead_default.take(),
+            _ => None,
+        };
+        let Some((kw, reported)) = latched else {
+            return;
+        };
+        if let Frame::Switch { unmatched, .. } = &mut self.stack[frame_index] {
+            *unmatched = unmatched.clone().set_unreachable(&mut self.reach);
+        }
+        if case_opener && !reported {
+            self.emit(FlowFact::DeadCode { span: kw });
         }
     }
 
@@ -960,7 +1074,11 @@ impl Interp<'_> {
         // `handleMergedStatementCase`'s `flowEnd` on the member): one
         // window per member, never across groups.
         self.flow_end(crate::interp::Covered::Body);
-        let reachable = self.reachable();
+        // Official `switch_afterCase` reads the LOCAL flag
+        // (flow_analysis.dart:8033): `switch_endAlternatives`' closing
+        // split resurrects it on purpose, so a dead group's body still
+        // joins its fall-through into the break model.
+        let reachable = self.reach.locally_reachable(self.current.reach);
         if reachable {
             let exit = self.current.clone();
             let prior = match &mut self.stack[frame_index] {

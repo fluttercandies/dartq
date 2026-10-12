@@ -203,14 +203,31 @@ pub enum Ev {
     CaseBegin {
         label_count: usize,
         expression_count: usize,
+        /// A default-headed group's `default` keyword (`None` for case
+        /// heads): the head-time anchor of the official member check
+        /// (`handleSwitchBeforeAlternative`'s `checkUnreachableNode`),
+        /// which reports dead members at `node.keyword`
+        /// (dead_code_verifier.dart:232-235).
+        kw: Option<TokenSpan>,
     },
-    CaseExprBegin,
+    /// A case clause head: `span` is the `case` keyword — the member's
+    /// first dead node anchors its row there (dead_code_verifier.dart:232).
+    CaseExprBegin {
+        span: TokenSpan,
+    },
     CaseNoWhen,
     CaseExprEnd {
         has_guard: bool,
+        /// The head's `case` keyword: the head-time member report
+        /// (`handleCaseHead`'s `flowEnd`) fires a member-anchored row here.
+        kw: TokenSpan,
     },
     CaseEnd {
         statement_count: usize,
+        /// The group's `default` keyword, when its heads include one: the
+        /// next group's opening consumes it (the dead first-default face,
+        /// probe table G rule 2).
+        default_kw: Option<TokenSpan>,
     },
     SwitchEnd,
     SwitchExprBegin {
@@ -249,9 +266,16 @@ pub enum Ev {
     UnaryPostfixAssign,
     BinaryBegin {
         op: BinOp,
+        /// The operator token: a dead right operand's row re-anchors at it
+        /// (official `parent is LogicalAnd/LogicalOr/IfNull`,
+        /// dead_code_verifier.dart:311-322).
+        span: TokenSpan,
     },
     BinaryEnd {
         op: BinOp,
+        /// The expression's end (the right operand's last token end): the
+        /// dead-RHS row ends there.
+        end: u32,
     },
     IsBegin,
     IsEnd,
@@ -266,8 +290,20 @@ pub enum Ev {
     },
     PatternAssign,
     CondBegin,
-    CondColon,
-    CondEnd,
+    /// The then arm ended at `:`: a dead arm's row spans its own range
+    /// (official `flowEnd(thenExpression)`, type_analyzer.dart:2588).
+    /// `then_end` is the arm's last token end.
+    CondColon {
+        then_begin: TokenSpan,
+        then_end: u32,
+    },
+    /// The else arm ended: a dead arm's row spans its own range (official
+    /// `flowEnd(elseExpression)`, type_analyzer.dart:2616). `end` is the
+    /// conditional's last token end.
+    CondEnd {
+        else_begin: TokenSpan,
+        end: u32,
+    },
     DotAccess {
         null_aware: bool,
     },

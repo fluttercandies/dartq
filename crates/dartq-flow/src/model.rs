@@ -53,6 +53,16 @@ impl ReachArena {
         self.nodes[r as usize].locally
     }
 
+    /// Whether any control path reaches `r` (official `overallReachable` —
+    /// the flag `isReachable` reads, flow_analysis.dart:6396): a split
+    /// resurrects the local flag (official `Reachability.split` hardcodes
+    /// `locallyReachable: true`) but never the overall one, so a case body
+    /// opened after a resurrecting split still queries dead for the
+    /// dead-code and completion faces.
+    pub(crate) fn overall_reachable(&self, r: u32) -> bool {
+        self.nodes[r as usize].overall
+    }
+
     pub(crate) fn parent(&self, r: u32) -> u32 {
         self.nodes[r as usize].parent
     }

@@ -116,12 +116,28 @@ pub(crate) enum Frame {
     Cond {
         branch: State,
         then_state: Option<State>,
+        /// The then arm's entry state was unreachable (a literal-folded
+        /// condition): the dead-arm row fires at the arm's close. An arm
+        /// that only ENDS unreachable (a `throw`/Never subexpression) is
+        /// live — the official rows only when a node inside was checked
+        /// unreachable, which a literal-folded entry guarantees.
+        then_dead_entry: bool,
+        /// Same latch for the else arm, taken at the colon.
+        else_dead_entry: bool,
     },
     Branch {
         branch: State,
         /// `??`'s result type — the LHS's non-null form (official `??`
         /// typing); `None` for the boolean-operator branches.
         ifnull_ty: Option<Ty>,
+        /// The operator token (`&&`/`||`/`??`): the dead-RHS row's anchor
+        /// at the construct's close.
+        op_span: TokenSpan,
+        /// The right operand's entry state was unreachable (a literal-folded
+        /// left operand, or a guaranteed-non-null `??` LHS): the dead-RHS
+        /// row fires at the construct's close. An operand that only ENDS
+        /// unreachable (a `throw`/Never subexpression) is live.
+        rhs_dead_entry: bool,
     },
     Cascade {
         exprs_base: usize,
@@ -168,6 +184,16 @@ pub(crate) enum Frame {
         group_combined: Option<State>,
         /// Set once the group closed and its body started.
         body_depth: Option<usize>,
+        /// The just-closed group's `default` keyword with whether its own
+        /// keyword row already fired (probe table G rule 2): the next
+        /// group's opening consumes it — the chain marks unreachable, and a
+        /// case-headed opener reports the default's keyword row.
+        dead_default: Option<(TokenSpan, bool)>,
+        /// The offset of the member keyword whose head-time row last fired
+        /// in this switch (a member-anchored report): the next `CaseEnd`
+        /// latch reads it so an already-reported default is never
+        /// re-reported by its group's close.
+        reported_kw: Option<u32>,
         block: Range<usize>,
     },
     /// A labeled statement: a labeled break's target. `label` is the
@@ -348,6 +374,21 @@ impl DeadWindow {
     /// Whether the interval waits for its do-while's `while` part.
     pub(crate) fn awaiting_split(&self) -> bool {
         self.awaiting
+    }
+
+    /// Whether the interval's anchor is the node whose frame stack depth is
+    /// `depth` — the wholly-dead block face: the anchor IS the covering
+    /// node, so the close spans the block's full extent including `}`
+    /// (official `flowEnd`'s `node != firstDeadNode` trim applies only to
+    /// inner anchors, dead_code_verifier.dart:253-279).
+    pub(crate) fn anchored_at_depth(&self, depth: usize) -> bool {
+        self.depth == depth
+    }
+
+    /// Whether the interval's anchor starts at `offset` (the switch
+    /// member's own keyword — the member anchored the interval itself).
+    pub(crate) fn anchor_at(&self, offset: u32) -> bool {
+        self.anchor.range.offset == offset
     }
 
     /// Grows the interval's end to a later dead statement's end (the
@@ -612,8 +653,16 @@ impl<'o> Interp<'o> {
 
     // —— state helpers ——————————————————————————————————————————————————
 
+    /// Whether any control path reaches the current state (official
+    /// `isReachable` = `overallReachable`, flow_analysis.dart:6396) — the
+    /// diagnostic face: dead-code anchors, unassigned-read rows, promotion
+    /// rows, and body-completion rows all query it. Splits resurrect the
+    /// LOCAL flag (official `Reachability.split`), never this one; the
+    /// local flag's readers (`switch_afterCase`'s break join,
+    /// `attachFinally`, the do-while break approximation) call
+    /// [`ReachArena::locally_reachable`] directly.
     pub(crate) fn reachable(&self) -> bool {
-        self.reach.locally_reachable(self.current.reach)
+        self.reach.overall_reachable(self.current.reach)
     }
 
     /// Splits the current state on a condition expression (official
@@ -710,6 +759,34 @@ impl<'o> Interp<'o> {
     pub(crate) fn dead_do_condition(&mut self) {
         if self.dead.is_none() && !self.reachable() {
             self.dead = Some(DeadWindow::awaiting_do(self.stack.len()));
+        }
+    }
+
+    /// The expression-construct dead face (dead right operand of
+    /// `&&`/`||`/`??`, dead `?:` arm): the official reports at the
+    /// construct's own `flowEnd` — one row from the re-anchored start
+    /// (operator token / arm's first token) to the arm's end — and resets
+    /// (dead_code_verifier.dart:311-322, type_analyzer.dart:2588/:2616).
+    /// An already-open interval folds instead: the outer anchor owns the
+    /// reporting and the arm only grows its end.
+    pub(crate) fn dead_expr_arm(&mut self, anchor: TokenSpan, end: u32) {
+        if self.reachable() {
+            return;
+        }
+        if let Some(window) = &mut self.dead {
+            window.extend(end);
+            return;
+        }
+        if end > anchor.range.offset {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: anchor.id,
+                    range: SourceRange {
+                        offset: anchor.range.offset,
+                        length: end - anchor.range.offset,
+                    },
+                },
+            });
         }
     }
 
@@ -1499,7 +1576,10 @@ impl Interp<'_> {
         // alternatives before any non-case event processes.
         if !matches!(
             ev,
-            Ev::CaseBegin { .. } | Ev::CaseExprBegin | Ev::CaseNoWhen | Ev::CaseExprEnd { .. }
+            Ev::CaseBegin { .. }
+                | Ev::CaseExprBegin { .. }
+                | Ev::CaseNoWhen
+                | Ev::CaseExprEnd { .. }
         ) {
             self.maybe_close_case_group(events, match_of);
         }

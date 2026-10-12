@@ -66,6 +66,10 @@ pub struct Flow<'t> {
     do_body_is_block: bool,
     /// Executable nesting depth inside the active recording.
     exec_depth: usize,
+    /// The then-arm boundary latched by
+    /// [`Flow::end_conditional_expression_then_arm`], consumed by the
+    /// argless colon call that follows it.
+    cond_then: Option<(TokenSpan, u32)>,
     facts: Vec<FlowFact>,
 }
 
@@ -86,8 +90,25 @@ impl<'t> Flow<'t> {
             do_body_end: None,
             do_body_is_block: false,
             exec_depth: 0,
+            cond_then: None,
             facts: Vec::new(),
         }
+    }
+
+    /// The span of the token at table `index` (the recorder's token-table
+    /// navigation for arm boundaries the listener surface carries only by
+    /// adjacency).
+    fn span_at(&self, index: usize) -> Option<TokenSpan> {
+        self.tokens.get(index).map(|token| {
+            let range = token.byte_range();
+            TokenSpan {
+                id: index as u32,
+                range: dartq_source::SourceRange {
+                    offset: range.start as u32,
+                    length: (range.end - range.start) as u32,
+                },
+            }
+        })
     }
 
     /// Interns a name token's lexeme to a dense id. Synthetic tokens
@@ -884,7 +905,7 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::SwitchBlockEnd);
     }
 
-    fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, _token: Token) {
+    fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, token: Token) {
         // Case labels are counted on `CaseBegin`; drop their name
         // captures so they can never attach to a later labeled statement.
         self.pending_labels.clear();
@@ -892,20 +913,25 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::CaseBegin {
             label_count,
             expression_count,
+            // A default-headed group's member begin token is the `default`
+            // keyword (or the first label of a labeled default) — the
+            // head-time anchor face.
+            kw: (expression_count == 0).then_some(token),
         });
     }
 
-    fn begin_case_expression(&mut self, _case_kw: Token) {
-        self.record(Ev::CaseExprBegin);
+    fn begin_case_expression(&mut self, case_kw: Token) {
+        self.record(Ev::CaseExprBegin { span: case_kw });
     }
 
     fn handle_switch_case_no_when_clause(&mut self, _token: Token) {
         self.record(Ev::CaseNoWhen);
     }
 
-    fn end_case_expression(&mut self, _case_kw: Token, when: Option<Token>, _colon: Token) {
+    fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, _colon: Token) {
         self.record(Ev::CaseExprEnd {
             has_guard: when.is_some(),
+            kw: case_kw,
         });
     }
 
@@ -913,13 +939,16 @@ impl ParserListener for Flow<'_> {
         &mut self,
         _label_count: usize,
         _expression_count: usize,
-        _default_kw: Option<Token>,
+        default_kw: Option<Token>,
         _colon_after_default: Option<Token>,
         statement_count: usize,
         _begin: Token,
         _end: Token,
     ) {
-        self.record(Ev::CaseEnd { statement_count });
+        self.record(Ev::CaseEnd {
+            statement_count,
+            default_kw,
+        });
     }
 
     fn end_switch_statement(&mut self, _token: Token, end: Token) {
@@ -1086,12 +1115,14 @@ impl ParserListener for Flow<'_> {
     fn begin_binary_expression(&mut self, operator: Token) {
         self.record(Ev::BinaryBegin {
             op: self.bin_op(operator),
+            span: operator,
         });
     }
 
-    fn end_binary_expression(&mut self, operator: Token, _end: Token) {
+    fn end_binary_expression(&mut self, operator: Token, end: Token) {
         self.record(Ev::BinaryEnd {
             op: self.bin_op(operator),
+            end: end.range.end(),
         });
     }
 
@@ -1147,12 +1178,46 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::CondBegin);
     }
 
-    fn handle_conditional_expression_colon(&mut self) {
-        self.record(Ev::CondColon);
+    fn end_conditional_expression_then_arm(
+        &mut self,
+        _question: Token,
+        then_begin: Token,
+        _colon: Token,
+        then_end: Token,
+    ) {
+        // Latched for the argless colon call that follows immediately.
+        self.cond_then = Some((then_begin, then_end.range.end()));
     }
 
-    fn end_conditional_expression(&mut self, _question: Token, _colon: Token, _end: Token) {
-        self.record(Ev::CondEnd);
+    fn handle_conditional_expression_colon(&mut self) {
+        let (then_begin, then_end) = self.cond_then.take().unwrap_or((
+            TokenSpan {
+                id: 0,
+                range: dartq_source::SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+            },
+            0,
+        ));
+        self.record(Ev::CondColon {
+            then_begin,
+            then_end,
+        });
+    }
+
+    fn end_conditional_expression(&mut self, _question: Token, colon: Token, end: Token) {
+        // The else arm starts at the token after the colon (official
+        // `flowEnd(elseExpression)` rows span the arm's own range).
+        let else_begin = self
+            .tokens
+            .next(colon.id as usize)
+            .and_then(|index| self.span_at(index))
+            .unwrap_or(colon);
+        self.record(Ev::CondEnd {
+            else_begin,
+            end: end.range.end(),
+        });
     }
 
     fn handle_dot_access(&mut self, _token: Token, _end: Token, is_null_aware: bool) {

@@ -1,6 +1,8 @@
 //! Expression events: references, tests, boolean/null-aware branching,
 //! assignments, and collection elements.
 
+use dartq_parser::TokenSpan;
+
 use crate::ev::{BinOp, Ev};
 use crate::facts::FlowFact;
 pub(crate) use crate::interp::Expr;
@@ -159,7 +161,7 @@ impl Interp<'_> {
                 }
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
-            Ev::BinaryBegin { op } => match op {
+            Ev::BinaryBegin { op, span } => match op {
                 BinOp::And | BinOp::Or => {
                     // The left operand is on the stack; split on it and run
                     // the right operand under the taken branch (official
@@ -171,9 +173,12 @@ impl Interp<'_> {
                     } else {
                         (left_if_false, left_if_true)
                     };
+                    let rhs_dead_entry = !self.reach.overall_reachable(taken.reach);
                     self.stack.push(Frame::Branch {
                         branch: other,
                         ifnull_ty: None,
+                        op_span: *span,
+                        rhs_dead_entry,
                     });
                     self.current = taken;
                 }
@@ -184,7 +189,12 @@ impl Interp<'_> {
                     // official `shortcutState`) carries the LHS's non-null
                     // promotion (`tryMarkNonNullable(...).ifTrue`), while
                     // the RHS itself evaluates on the LHS-null path (the
-                    // split state, unchanged).
+                    // split state, unchanged). A guaranteed-non-null LHS
+                    // type (official `_isGuaranteedNonNullWithSoundNullSafety`)
+                    // makes the RHS path unreachable — `int x; x ?? 1`
+                    // anchors its dead row at `??` (probe table C; a
+                    // resolved-type LHS like `x != null` needs the type
+                    // layer — semantic queue).
                     let left = self.pop_value();
                     self.split_cur();
                     let shortcut = match left.reference {
@@ -204,22 +214,47 @@ impl Interp<'_> {
                         }
                         None => self.current.clone(),
                     };
+                    let mut rhs_dead_entry = false;
+                    if is_non_nullable(self.ops, left.ty) {
+                        self.unreachable_cur();
+                        rhs_dead_entry = true;
+                    }
                     // `??` types as the LHS's non-null form.
                     let result_ty = self.ops.promote_to_non_null(left.ty);
                     self.stack.push(Frame::Branch {
                         branch: shortcut,
                         ifnull_ty: Some(result_ty),
+                        op_span: *span,
+                        rhs_dead_entry,
                     });
                 }
                 _ => {}
             },
-            Ev::BinaryEnd { op } => match op {
+            Ev::BinaryEnd { op, end } => match op {
                 BinOp::And | BinOp::Or => {
+                    // The official reports the dead right operand at the
+                    // construct's own `flowEnd`, re-anchored at the operator
+                    // (dead_code_verifier.dart:311-322) — before the branch
+                    // join restores reachability, and only when the operand
+                    // RAN dead (a literal-folded entry), never when it
+                    // merely ends unreachable (`c && throw 1` is live).
+                    if let Some(Frame::Branch {
+                        op_span,
+                        rhs_dead_entry,
+                        ..
+                    }) = self.stack.last()
+                    {
+                        let (op_span, rhs_dead_entry) = (*op_span, *rhs_dead_entry);
+                        if rhs_dead_entry {
+                            self.dead_expr_arm(op_span, *end);
+                        }
+                    }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
                     let Some(Frame::Branch {
                         branch: other,
                         ifnull_ty: _,
+                        ..
                     }) = self.stack.pop()
                     else {
                         // A frame-less close (unbalanced recovery buffer):
@@ -245,11 +280,23 @@ impl Interp<'_> {
                     // path to both branches (its truthiness is the LHS
                     // value's — unknowable at the name level), the same
                     // convention as the And/Or arms above.
+                    if let Some(Frame::Branch {
+                        op_span,
+                        rhs_dead_entry,
+                        ..
+                    }) = self.stack.last()
+                    {
+                        let (op_span, rhs_dead_entry) = (*op_span, *rhs_dead_entry);
+                        if rhs_dead_entry {
+                            self.dead_expr_arm(op_span, *end);
+                        }
+                    }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
                     let Some(Frame::Branch {
                         branch: shortcut,
                         ifnull_ty,
+                        ..
                     }) = self.stack.pop()
                     else {
                         // A frame-less close (unbalanced recovery buffer):
@@ -412,23 +459,63 @@ impl Interp<'_> {
             Ev::CondBegin => {
                 let cond = self.pop_value();
                 let (if_true, if_false) = self.cond_split(&cond);
+                let then_dead_entry = !self.reach.overall_reachable(if_true.reach);
                 self.stack.push(Frame::Cond {
                     branch: if_false,
                     then_state: None,
+                    then_dead_entry,
+                    else_dead_entry: false,
                 });
                 self.current = if_true;
             }
-            Ev::CondColon => {
+            Ev::CondColon {
+                then_begin,
+                then_end,
+            } => {
+                // The official fires `flowEnd(thenExpression)` at the arm's
+                // end (type_analyzer.dart:2588): a dead then arm reports its
+                // own range before the else arm's state swap — and only an
+                // entry-dead arm rows (`cond ? throw 1 : 2` is live).
+                let then_dead_entry = match self.stack.last() {
+                    Some(Frame::Cond {
+                        then_dead_entry, ..
+                    }) => *then_dead_entry,
+                    _ => false,
+                };
+                if then_dead_entry {
+                    self.dead_expr_arm(*then_begin, *then_end);
+                }
                 let then_expr = self.pop_value();
-                if let Some(Frame::Cond { branch, then_state }) = self.stack.last_mut() {
+                if let Some(Frame::Cond {
+                    branch,
+                    then_state,
+                    else_dead_entry,
+                    ..
+                }) = self.stack.last_mut()
+                {
                     *then_state = Some(self.current.clone());
+                    *else_dead_entry = !self.reach.overall_reachable(branch.reach);
                     self.current = branch.clone();
                 }
                 let _ = then_expr;
                 // The then value is replaced by the whole conditional's
                 // value at CondEnd.
             }
-            Ev::CondEnd => {
+            Ev::CondEnd {
+                else_begin,
+                end: arm_end,
+            } => {
+                // `flowEnd(elseExpression)` (type_analyzer.dart:2616): the
+                // dead else arm reports before the branch join.
+                let else_dead_entry = match self.stack.last() {
+                    Some(Frame::Cond {
+                        else_dead_entry, ..
+                    }) => *else_dead_entry,
+                    _ => false,
+                };
+                if else_dead_entry {
+                    self.dead_expr_arm(*else_begin, *arm_end);
+                }
                 let else_expr = self.pop_value();
                 let Some(Frame::Cond { then_state, .. }) = self.stack.pop() else {
                     // A frame-less close (unbalanced recovery buffer): the
@@ -560,6 +647,16 @@ impl Interp<'_> {
                 self.stack.push(Frame::Branch {
                     branch: if_false,
                     ifnull_ty: None,
+                    // Collection if-elements have no operator row face; the
+                    // field only feeds the `&&`/`||`/`??` close.
+                    op_span: TokenSpan {
+                        id: 0,
+                        range: dartq_source::SourceRange {
+                            offset: 0,
+                            length: 0,
+                        },
+                    },
+                    rhs_dead_entry: false,
                 });
                 self.current = if_true;
             }
