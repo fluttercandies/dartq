@@ -1479,6 +1479,25 @@ struct Engine<'a> {
     /// Open `??` binary groups: rows-stack mark at `begin_binary_expression`,
     /// for the strictly-non-nullable left operand check at close.
     if_null_groups: Vec<(usize, SourceRange)>,
+    /// Completed `==`/`!=` comparison extents: an equality's static type is
+    /// `bool`, so an equality that ends exactly at the `??` left operand's
+    /// rows makes that operand strictly non-nullable (the dead-coalesce
+    /// face of `x != null ?? false`). The exact-span match against the
+    /// operand rows keeps stale spans harmless; a parenthesized comparison
+    /// buried in an earlier `??`'s right operand can still alias the next
+    /// `??`'s operand rows (`y ?? (x != null) ?? false`) — a documented
+    /// niche false-positive the row-level signals cannot separate.
+    eq_spans: Vec<SourceRange>,
+    /// Null-aware chains over definitely-unassigned nullable locals (the
+    /// `_verifyUnassignedVariable` face, dead_code_verifier.dart:460-505):
+    /// `(operator offset, chain end, receiver read span)` latched at the
+    /// operator, resolved at teardown when the flow facts are in.
+    dead_null_chains: Vec<(u32, u32, SourceRange)>,
+    /// Open local-function declarations as `(declaration start, wildcard
+    /// verdict)`: an `_`-named local function reports dead over the whole
+    /// declaration (DeadCodeVerifier's visitFunctionDeclaration,
+    /// dead_code_verifier.dart:72-82).
+    local_fn_wildcard: Vec<(u32, bool)>,
     /// Formal-parameter name spans per declaration site (the
     /// `unused_element_parameter` anchors).
     site_params: FxHashMap<usize, Vec<(StringId, SourceRange)>>,
@@ -2109,6 +2128,9 @@ impl<'a> Engine<'a> {
             catch_params: 0,
             try_clauses: Vec::new(),
             if_null_groups: Vec::new(),
+            eq_spans: Vec::new(),
+            dead_null_chains: Vec::new(),
+            local_fn_wildcard: Vec::new(),
             site_params: FxHashMap::default(),
             self_scope_rows: FxHashSet::default(),
             field_read_rows: FxHashSet::default(),
@@ -2155,6 +2177,30 @@ impl<'a> Engine<'a> {
         self.tokens
             .get(token.id as usize)
             .map(|t| &self.source[t.byte_range()])
+    }
+
+    /// The whitespace-trimmed span between two offsets (the switch member
+    /// body rows' shape: the official row trims to the member's statement
+    /// extent, `dead_code_verifier.dart`'s `flowEnd` member trim). Interior
+    /// comments ride along — a documented divergence.
+    fn trimmed_span(&self, start: u32, end_excl: u32) -> Option<SourceRange> {
+        let start = start as usize;
+        let end = (end_excl as usize).min(self.source.len());
+        if start >= end {
+            return None;
+        }
+        let text = &self.source[start..end];
+        let lead = text.len() - text.trim_start().len();
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // `trimmed` keeps the leading run `offset` already skipped, so the
+        // length drops it too — the span is both-ends trimmed.
+        Some(SourceRange {
+            offset: (start + lead) as u32,
+            length: (trimmed.len() - lead) as u32,
+        })
     }
 
     fn name_of(&self, token: Token) -> Option<StringId> {
@@ -4197,6 +4243,30 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `?`-suffixed face (`NullabilitySuffix.question`) — the
+    /// dead-chain receiver gate: a written-nullable named type, not
+    /// `dynamic` and not the `Null` type.
+    fn is_nullable_ty(ty: Ty) -> bool {
+        matches!(ty, Ty::Named { nullable: true, .. })
+    }
+
+    /// Whether every leaf of the case's root pattern is a value-precise
+    /// constant (`Null`/`BoolValue`/`EnumValue`): only constant roots run
+    /// the official flow's equality-check path
+    /// (`_handleEqualityCheckPattern`), where a known-false result makes
+    /// the matched state unreachable and the member's own body dies. A
+    /// disjoint type test (`case A _` over an enum) takes the restriction
+    /// path, which joins — its body stays live (oracle probes: `case
+    /// null:` over a non-nullable enum reports `dead_code` over the body,
+    /// `case A _:` reports `pattern_never_matches_value_type` alone).
+    fn restriction_is_constant(space: &Restriction) -> bool {
+        match space {
+            Restriction::Null | Restriction::BoolValue(_) | Restriction::EnumValue(..) => true,
+            Restriction::Union(parts) => parts.iter().all(Self::restriction_is_constant),
+            _ => false,
+        }
+    }
+
     /// The enclosing executable's lookup spelling once its name has fired
     /// (the official `_enclosingExec`); constructors, factories stay
     /// `None` (their `ret` latch is unset by design). A local function's
@@ -5076,15 +5146,39 @@ impl<'a> Engine<'a> {
     /// `end_binary_expression` for `??`: the right operand's row anchors
     /// the report when the left operand's type is strictly non-nullable —
     /// the right operand is never executed (the official
-    /// `_checkForDeadNullCoalesce`, error_verifier.dart:4733-4739).
+    /// `_checkForDeadNullCoalesce`, error_verifier.dart:4733-4739). An
+    /// equality comparison as the whole left operand counts too: its
+    /// static type is `bool` (`x != null ?? false`).
     fn end_if_null(&mut self) {
         let Some((mark, _op_range)) = self.if_null_groups.pop() else {
             return;
         };
-        let non_null = mark
-            .checked_sub(1)
-            .and_then(|index| self.rows.get(index))
-            .is_some_and(|lhs| lhs.ty.is_strictly_non_nullable());
+        let mut lhs_is_bool_comparison = false;
+        if let Some(eq) = self.eq_spans.last().copied() {
+            // The comparison's own extent: its two operand rows — the eq
+            // latch spans from the left row's head through the right row's
+            // end (the `??` right operand's row sits above them).
+            let left = mark
+                .checked_sub(2)
+                .and_then(|index| self.rows.get(index))
+                .map(|row| row.range);
+            let eq_right = mark
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+                .map(|row| row.range);
+            if let (Some(left), Some(eq_right)) = (left, eq_right)
+                && eq.offset == left.offset
+                && eq.end() == eq_right.end()
+            {
+                lhs_is_bool_comparison = true;
+                self.eq_spans.pop();
+            }
+        }
+        let non_null = lhs_is_bool_comparison
+            || mark
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+                .is_some_and(|lhs| lhs.ty.is_strictly_non_nullable());
         if !non_null {
             return;
         }
@@ -7835,8 +7929,11 @@ impl<'a> Engine<'a> {
     /// classifies the receiver below it, and pushes the merged row. A
     /// null-aware access on a strictly non-nullable receiver emits
     /// `invalid_null_aware_operator` (a `STATIC_WARNING` — the receiver can
-    /// never be null, `type_system.dart:1921-`).
-    fn merge_member(&mut self, is_null_aware: bool) {
+    /// never be null, `type_system.dart:1921-`). A null-aware access on a
+    /// nullable local's read latches the dead-chain candidate (the
+    /// `_verifyUnassignedVariable` face — resolved at teardown against the
+    /// definite-unassignment facts).
+    fn merge_member(&mut self, is_null_aware: bool, op_offset: u32, chain_end: u32) {
         let Some(member) = self.rows.pop() else {
             return;
         };
@@ -7849,6 +7946,15 @@ impl<'a> Engine<'a> {
                 // invocation, cascade section) folds through this pop.
                 let receiver_ty = self.receiver_static_ty(&popped);
                 self.stage_receiver_of_type_never(popped.range, receiver_ty);
+                // The dead-chain candidate: a null-aware operator over a
+                // local's nullable read (`c1?.g()`, `c1?..g()`).
+                if is_null_aware
+                    && self.local_hits.contains_key(&popped.range.offset)
+                    && Self::is_nullable_ty(receiver_ty)
+                {
+                    self.dead_null_chains
+                        .push((op_offset, chain_end, popped.range));
+                }
                 // The receiver's read counts for the local it resolved to
                 // (`v.m` reads `v`): the member row inherits the hit.
                 if let Some(hit) = self.local_hits.remove(&popped.range.offset) {
@@ -9392,6 +9498,7 @@ impl<'a> Engine<'a> {
             scrutinee,
             cases: Vec::new(),
             default_kw: None,
+            default_pos: None,
             pending_root: None,
         });
     }
@@ -9447,6 +9554,76 @@ impl<'a> Engine<'a> {
         // (:1122-1140) at the `switch` keyword.
         for anchor in unreachable {
             self.emit(SemanticCode::UnreachableSwitchCase, anchor, "", "");
+        }
+        // The flow-dead member rows (statement switches only — a switch
+        // expression's covered arms carry `unreachable_switch_case` at the
+        // arrow alone). The official chain is flow-side: a member whose
+        // unguarded alternative always matches (its space covers the whole
+        // scrutinee — `case _`, a variable pattern over the same type)
+        // drives the flow `unmatched` state unreachable, so every later
+        // member head is entered dead (the keyword row, the bare `case`
+        // token) and its member body dies with it (dead_code_verifier.dart's
+        // SwitchMember faces). A member whose own space is disjoint from
+        // the scrutinee never matches — only its body dies. The
+        // default-driven chain is the flow layer's (#868), so this chain
+        // stops at the first `default` member. Exhaustiveness-only coverage
+        // (a duplicate constant over a fully covered scrutinee) is NOT
+        // flow-dead — the oracle pins that to `unreachable_switch_case`
+        // alone.
+        if !ctx.is_expression && !cases.is_empty() {
+            let total = |index: usize| {
+                matches!(
+                    compute(&world, &value, std::slice::from_ref(&cases[index])).exhaustiveness,
+                    Exhaustiveness::Exhaustive
+                )
+            };
+            // The never-match face: the case's witness set equals the bare
+            // scrutinee's — its space removes nothing, so no scrutinee
+            // value can enter the body. Only constant roots qualify (the
+            // equality-check face — see
+            // [`Self::restriction_is_constant`]): `case null` over a
+            // non-nullable type kills its body, a disjoint type test does
+            // not. A guarded case never qualifies: `compute` keeps its row
+            // out of the covering set (the guard may fail), so witness
+            // equality there says nothing about the pattern's space — its
+            // body stays live.
+            let whole = compute(&world, &value, &[]);
+            let never_matches = |index: usize| {
+                let without = compute(&world, &value, std::slice::from_ref(&cases[index]));
+                match (&whole.exhaustiveness, &without.exhaustiveness) {
+                    (
+                        Exhaustiveness::NonExhaustive(whole_witnesses),
+                        Exhaustiveness::NonExhaustive(case_witnesses),
+                    ) => {
+                        whole_witnesses.len() == case_witnesses.len()
+                            && whole_witnesses
+                                .iter()
+                                .zip(case_witnesses.iter())
+                                .all(|(w, c)| w.as_witness(&world) == c.as_witness(&world))
+                    }
+                    _ => false,
+                }
+            };
+            let chain_start = (0..ctx.cases.len())
+                .find(|&index| !ctx.cases[index].guarded && total(index))
+                .map_or(ctx.cases.len(), |index| index + 1);
+            let chain_end = ctx.default_pos.unwrap_or(ctx.cases.len());
+            for (index, case) in ctx.cases.iter().enumerate() {
+                let in_chain = index >= chain_start && index < chain_end;
+                let never = !in_chain
+                    && !case.guarded
+                    && Self::restriction_is_constant(&ctx.cases[index].space)
+                    && never_matches(index);
+                if !in_chain && !never {
+                    continue;
+                }
+                if in_chain {
+                    self.emit(SemanticCode::DeadCode, case.anchor, "", "");
+                }
+                if let Some(body) = case.body {
+                    self.emit(SemanticCode::DeadCode, body, "", "");
+                }
+            }
         }
         // A cross-file scrutinee name is opaque to the file-scoped
         // world ([`NameWorld::name_resolvable`]): its sealedness and
@@ -11250,6 +11427,31 @@ fn bin_op_of(text: &str) -> BinOp {
 struct DiagnoseListener<'a> {
     engine: Rc<RefCell<Engine<'a>>>,
     flow: Rc<RefCell<Flow<'a>>>,
+    /// A resolved bottom face (`Flow::handle_exit`) not yet recorded: the
+    /// send's exit token, held back so the statement wrapper of the send's
+    /// own statement records first (see [`Self::flow`]).
+    pending_exit: Option<Token>,
+}
+
+impl<'a> DiagnoseListener<'a> {
+    /// The flow recorder accessor. A Never-typed send's `handle_exit` must
+    /// not precede its own statement's wrapper in the recorded buffer: the
+    /// parser fires the wrapper after the body (`;` only exists then), so
+    /// the exit latches instead of recording, and the NEXT forward drains
+    /// it first — its position relative to every other event stays the
+    /// official one (the exit fires at the send's end), except across its
+    /// own statement's wrapper, which now sees the reachable state and
+    /// cannot open the dead window at the call's own statement.
+    fn flow<'s>(&'s mut self) -> std::cell::RefMut<'s, Flow<'a>> {
+        self.flush_flow_exit();
+        self.flow.borrow_mut()
+    }
+
+    fn flush_flow_exit(&mut self) {
+        if let Some(end) = self.pending_exit.take() {
+            self.flow.borrow_mut().handle_exit(end);
+        }
+    }
 }
 
 /// Stably merges two source-ordered diagnostic lists by range offset
@@ -11534,6 +11736,7 @@ pub fn diagnose_unit(
         DiagnoseListener {
             engine: Rc::clone(&engine),
             flow: Rc::clone(&flow),
+            pending_exit: None,
         },
     );
     parser.parse_unit();
@@ -11610,6 +11813,33 @@ pub fn diagnose_unit(
             code.correction_message(""),
         ));
     }
+    // The null-aware dead-chain face (`_verifyUnassignedVariable`,
+    // dead_code_verifier.dart:460-505): a chain latched over a nullable
+    // local's read reports when the flow facts confirm the read is
+    // definitely unassigned and no promotion stands non-null at it (a
+    // promoted receiver's static type is no longer `?`-suffixed).
+    let chains = std::mem::take(&mut engine.borrow_mut().dead_null_chains);
+    let mut chain_rows = Vec::with_capacity(chains.len());
+    for (op_offset, chain_end, recv) in chains {
+        let promoted_non_null = promotions
+            .promoted(recv)
+            .is_some_and(Ty::is_strictly_non_nullable);
+        if promoted_non_null || !unassigned.staged(recv) {
+            continue;
+        }
+        let code = SemanticCode::DeadCode;
+        chain_rows.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message("", ""),
+            file,
+            SourceRange {
+                offset: op_offset,
+                length: chain_end.saturating_sub(op_offset),
+            },
+            code.correction_message(""),
+        ));
+    }
     // The parser held the only other strong reference and is gone, so the
     // unwrap cannot fail.
     let mut engine = Rc::into_inner(engine)
@@ -11655,6 +11885,7 @@ pub fn diagnose_unit(
     // and the body-completion rows are each offset-sorted, and the merges
     // keep the invariant.
     report.diagnostics = merge_source_ordered(report.diagnostics, cast_rows);
+    report.diagnostics = merge_source_ordered(report.diagnostics, chain_rows);
     report.diagnostics = merge_source_ordered(report.diagnostics, body_rows);
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
@@ -12388,7 +12619,7 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
-        self.flow.borrow_mut().begin_method(
+        self.flow().begin_method(
             _kind,
             _augment_kw,
             _external_kw,
@@ -12439,7 +12670,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        self.flow.borrow_mut().end_method(
+        self.flow().end_method(
             _kind,
             _get_or_set,
             _begin,
@@ -12465,8 +12696,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _augment: Option<Token>,
         _external: Option<Token>,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .begin_top_level_method(_last_consumed, _augment, _external);
 
         let mut engine = self.engine.borrow_mut();
@@ -12478,9 +12708,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, _end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_top_level_method(_begin, _get_or_set, _end);
+        self.flow().end_top_level_method(_begin, _get_or_set, _end);
 
         let mut engine = self.engine.borrow_mut();
         // A top-level setter's site spelling fixes up here (`set` parses
@@ -12510,7 +12738,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
-        self.flow.borrow_mut().begin_constructor(
+        self.flow().begin_constructor(
             _kind,
             _augment_kw,
             _external_kw,
@@ -12561,7 +12789,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        self.flow.borrow_mut().end_constructor(
+        self.flow().end_constructor(
             _kind,
             _begin,
             _new_kw,
@@ -12583,7 +12811,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _external_kw: Option<Token>,
         const_keyword: Option<Token>,
     ) {
-        self.flow.borrow_mut().begin_factory(
+        self.flow().begin_factory(
             _kind,
             _last_consumed,
             _augment_kw,
@@ -12609,32 +12837,31 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_factory(_kind, _begin, _factory, _end);
+        self.flow().end_factory(_kind, _begin, _factory, _end);
 
         let mut engine = self.engine.borrow_mut();
         engine.ctor_pending = None;
         engine.pop_frame();
     }
 
-    fn begin_local_function_declaration(&mut self, _token: Token) {
-        self.flow
-            .borrow_mut()
-            .begin_local_function_declaration(_token);
+    fn begin_local_function_declaration(&mut self, token: Token) {
+        self.flow().begin_local_function_declaration(token);
 
         // The closure/local-function face leaves the enclosing site: its
         // parameters are never `unused_element_parameter` candidates (the
         // official `_isUsedElement` enclosing-element gate), and its locals
-        // close with their own frame.
+        // close with their own frame. The wildcard-dead check latches the
+        // declaration start; the name event patches the verdict.
         let instance = self.engine.borrow().instance_context();
-        self.engine.borrow_mut().open_exec_site = None;
-        self.engine.borrow_mut().pending_local_fn = None;
-        self.engine.borrow_mut().push_executable_frame(instance);
+        let mut engine = self.engine.borrow_mut();
+        engine.open_exec_site = None;
+        engine.pending_local_fn = None;
+        engine.local_fn_wildcard.push((token.range.offset, false));
+        engine.push_executable_frame(instance);
     }
 
-    fn end_local_function_declaration(&mut self, _end: Token) {
-        self.flow.borrow_mut().end_local_function_declaration(_end);
+    fn end_local_function_declaration(&mut self, end: Token) {
+        self.flow().end_local_function_declaration(end);
 
         let mut engine = self.engine.borrow_mut();
         // Materialize after the pop: the function's own frame mark covers the
@@ -12644,10 +12871,42 @@ impl ParserListener for DiagnoseListener<'_> {
         // verifier judges local functions at their scope's close.
         engine.pop_frame();
         engine.finish_local_fn_site();
+        // An `_`-named local function is dead code over the whole
+        // declaration, used or not (DeadCodeVerifier's
+        // visitFunctionDeclaration, dead_code_verifier.dart:72-82 — the
+        // wildcard-variables posture).
+        if let Some((start, wildcard)) = engine.local_fn_wildcard.pop()
+            && wildcard
+        {
+            let range = SourceRange {
+                offset: start,
+                length: end.range.end().saturating_sub(start),
+            };
+            engine.emit(SemanticCode::DeadCode, range, "", "");
+        }
+    }
+
+    /// The function name's completion: the declaration flavor patches the
+    /// open wildcard-dead latch with its name's verdict. Named function
+    /// expressions share the identifier context but carry
+    /// `is_function_expression` — the official face is
+    /// `visitFunctionDeclaration` only, so they must not patch.
+    fn end_function_name(&mut self, begin: Token, _end: Token, is_function_expression: bool) {
+        if is_function_expression {
+            return;
+        }
+        let mut engine = self.engine.borrow_mut();
+        let Some(name) = engine.name_of(begin) else {
+            return;
+        };
+        let wildcard = engine.is_wildcard(name);
+        if let Some(last) = engine.local_fn_wildcard.last_mut() {
+            last.1 = wildcard;
+        }
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_function_expression(_token);
+        self.flow().begin_function_expression(_token);
 
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
@@ -12657,7 +12916,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_function_expression(&mut self, _begin: Token, end: Token) {
-        self.flow.borrow_mut().end_function_expression(_begin, end);
+        self.flow().end_function_expression(_begin, end);
 
         let mut engine = self.engine.borrow_mut();
         engine.const_capture.end_opaque_group(end.range);
@@ -12666,9 +12925,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_named_function_expression(&mut self, _token: Token) {
-        self.flow
-            .borrow_mut()
-            .begin_named_function_expression(_token);
+        self.flow().begin_named_function_expression(_token);
 
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().open_exec_site = None;
@@ -12677,7 +12934,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_named_function_expression(&mut self, end: Token) {
-        self.flow.borrow_mut().end_named_function_expression(end);
+        self.flow().end_named_function_expression(end);
 
         let mut engine = self.engine.borrow_mut();
         // Same pop-before-materialize discipline as the declaration form.
@@ -12703,7 +12960,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_catch_clause(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_catch_clause(_token);
+        self.flow().begin_catch_clause(_token);
 
         // The catch frame owns the catch parameters; the body block's own
         // events are not overridable from outside dartq-parser (BlockKind
@@ -12720,14 +12977,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_catch_clause(&mut self, _token: Token) {
-        self.flow.borrow_mut().end_catch_clause(_token);
+        self.flow().end_catch_clause(_token);
 
         // The frame pop moved to `handle_catch_block` (the clause's body
         // block parses between the two events).
     }
 
     fn begin_for_statement(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_for_statement(_token);
+        self.flow().begin_for_statement(_token);
 
         let mut engine = self.engine.borrow_mut();
         engine.push_block_frame();
@@ -12737,7 +12994,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_for_statement(&mut self, _end: Token) {
-        self.flow.borrow_mut().end_for_statement(_end);
+        self.flow().end_for_statement(_end);
 
         self.engine.borrow_mut().pop_frame();
     }
@@ -12750,7 +13007,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _pattern_keyword: Option<Token>,
         _in_kw: Token,
     ) {
-        self.flow.borrow_mut().handle_for_in_loop_parts(
+        self.flow().handle_for_in_loop_parts(
             _await_kw,
             _for_kw,
             _left_paren,
@@ -12762,7 +13019,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_for_in(&mut self, _end: Token) {
-        self.flow.borrow_mut().end_for_in(_end);
+        self.flow().end_for_in(_end);
 
         self.engine.borrow_mut().pop_frame();
     }
@@ -12775,8 +13032,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _late_kw: Option<Token>,
         var_final_or_const: Option<Token>,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .begin_variables_declaration(_token, _late_kw, var_final_or_const);
 
         let mut engine = self.engine.borrow_mut();
@@ -12796,9 +13052,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_variables_declaration(&mut self, _count: usize, _end: Option<Token>) {
-        self.flow
-            .borrow_mut()
-            .end_variables_declaration(_count, _end);
+        self.flow().end_variables_declaration(_count, _end);
 
         let mut engine = self.engine.borrow_mut();
         engine.pending_decl_ty = None;
@@ -12807,7 +13061,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_variable_initializer(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_variable_initializer(_token);
+        self.flow().begin_variable_initializer(_token);
 
         let mut engine = self.engine.borrow_mut();
         engine.init_frame_depth = engine.frames.len();
@@ -12817,7 +13071,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_variable_initializer(&mut self, _token: Token) {
-        self.flow.borrow_mut().end_variable_initializer(_token);
+        self.flow().end_variable_initializer(_token);
 
         let mut engine = self.engine.borrow_mut();
         // `VariableDeclaration` is in the official used set.
@@ -12906,7 +13160,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— identifiers ——————————————————————————————————————————————————
 
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
-        self.flow.borrow_mut().handle_identifier(token, context);
+        self.flow().handle_identifier(token, context);
 
         use IdentifierContext as C;
         let mut engine = self.engine.borrow_mut();
@@ -13216,7 +13470,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— declared types ——————————————————————————————————————————————
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
-        self.flow.borrow_mut().handle_type(name, question);
+        self.flow().handle_type(name, question);
 
         let mut engine = self.engine.borrow_mut();
         // The type completed without a group; its head slot is consumed.
@@ -13325,7 +13579,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
-        self.flow.borrow_mut().handle_no_type(_last_consumed);
+        self.flow().handle_no_type(_last_consumed);
 
         let mut engine = self.engine.borrow_mut();
         // An unbounded type variable declares no bound (`class C<T>`); the
@@ -13342,7 +13596,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_void_keyword(&mut self, _token: Token) {
-        self.flow.borrow_mut().handle_void_keyword(_token);
+        self.flow().handle_void_keyword(_token);
 
         let mut engine = self.engine.borrow_mut();
         // A `void` type argument (`List<void>`) is a leaf of the open #610
@@ -13383,9 +13637,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— receivers and selectors ——————————————————————————————————————
 
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
-        self.flow
-            .borrow_mut()
-            .handle_this_expression(token, _context);
+        self.flow().handle_this_expression(token, _context);
 
         self.engine.borrow_mut().push_keyword_receiver(token, false);
         self.engine
@@ -13395,9 +13647,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
-        self.flow
-            .borrow_mut()
-            .handle_super_expression(token, _context);
+        self.flow().handle_super_expression(token, _context);
 
         self.engine.borrow_mut().push_keyword_receiver(token, true);
         self.engine.borrow_mut().note_super_expression();
@@ -13408,29 +13658,27 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {
-        self.flow
-            .borrow_mut()
-            .handle_dot_access(token, end, is_null_aware);
+        self.flow().handle_dot_access(token, end, is_null_aware);
 
         // The receiver's value flows into the extraction: every pending
         // candidate under it seals used (`_isUsed`'s `PropertyExtraction`
         // parent arm).
         self.engine.borrow_mut().ur_seal_used();
-        self.engine.borrow_mut().merge_member(is_null_aware);
+        self.engine
+            .borrow_mut()
+            .merge_member(is_null_aware, token.range.offset, end.range.end());
         self.engine
             .borrow_mut()
             .const_capture
             .dot_access(is_null_aware, end.range);
-        let _ = token;
     }
 
-    fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
-        self.flow
-            .borrow_mut()
-            .handle_cascade_access(_operator, _end, is_null_aware);
+    fn handle_cascade_access(&mut self, operator: Token, end: Token, is_null_aware: bool) {
+        self.flow()
+            .handle_cascade_access(operator, end, is_null_aware);
 
         let mut engine = self.engine.borrow_mut();
-        engine.merge_member(is_null_aware);
+        engine.merge_member(is_null_aware, operator.range.offset, end.range.end());
         // The merged row is the section's selector: its discarded value
         // reports at this token even when the target's type is unknown to
         // the model (the official walk answers on the section node).
@@ -13440,7 +13688,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_send(&mut self, begin: Token, end: Token) {
-        self.flow.borrow_mut().handle_send(begin, end);
+        self.flow().handle_send(begin, end);
 
         // The engine resolves the send during the parse (the index is
         // complete), so a bottom face's `handleExit` lands in the open
@@ -13450,17 +13698,17 @@ impl ParserListener for DiagnoseListener<'_> {
         // then the expression-level bottom check at the expression's end
         // (`type_analyzer.dart:815-819`).
         let exit = self.engine.borrow_mut().consume_send(end);
+        // The exit records at the next forward ([`Self::flow`]) — never
+        // ahead of the send's own statement wrapper.
         match exit {
-            Some(SendExit::Callee) => self.flow.borrow_mut().handle_exit(begin),
-            Some(SendExit::Result) => self.flow.borrow_mut().handle_exit(end),
+            Some(SendExit::Callee) => self.pending_exit = Some(begin),
+            Some(SendExit::Result) => self.pending_exit = Some(end),
             None => {}
         }
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_assignment_expression(operator, _end);
+        self.flow().handle_assignment_expression(operator, _end);
 
         let mut engine = self.engine.borrow_mut();
         // `DirectAssignment`/`IfNullAssignment` are in the official used
@@ -13473,7 +13721,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_binary_expression(&mut self, operator: Token) {
-        self.flow.borrow_mut().begin_binary_expression(operator);
+        self.flow().begin_binary_expression(operator);
 
         let mut engine = self.engine.borrow_mut();
         let Some(text) = engine.text_of(operator) else {
@@ -13509,7 +13757,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_binary_expression(&mut self, _operator: Token, end: Token) {
-        self.flow.borrow_mut().end_binary_expression(_operator, end);
+        self.flow().end_binary_expression(_operator, end);
 
         let mut engine = self.engine.borrow_mut();
         // `BinaryOperatorInvocation`/`IfNull` are in the official used set
@@ -13526,15 +13774,36 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.null_comparison(mark, negated);
                     engine.check_nan_comparison(mark, negated, op_range);
                 }
+                // The comparison's static type is `bool` — latch its extent
+                // for the dead-coalesce left-operand check (the immediate
+                // `??` reads it; stale spans are harmless, exact-span
+                // matched, and drained under a small bound).
+                let right = engine.rows.last().map(|row| row.range);
+                let left = engine
+                    .rows
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|index| engine.rows.get(index))
+                    .map(|row| row.range);
+                if let (Some(left), Some(right)) = (left, right)
+                    && right.end() >= left.offset
+                {
+                    engine.eq_spans.push(SourceRange {
+                        offset: left.offset,
+                        length: right.end() - left.offset,
+                    });
+                    let excess = engine.eq_spans.len().saturating_sub(32);
+                    if excess > 0 {
+                        engine.eq_spans.drain(..excess + 28);
+                    }
+                }
             }
             _ => {}
         }
     }
 
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_unary_prefix_expression(operator);
+        self.flow().handle_unary_prefix_expression(operator);
 
         let mut engine = self.engine.borrow_mut();
         let op = match engine.text_of(operator) {
@@ -13581,22 +13850,19 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_conditional_expression(&mut self, _question: Token) {
-        self.flow
-            .borrow_mut()
-            .begin_conditional_expression(_question);
+        self.flow().begin_conditional_expression(_question);
 
         self.engine.borrow_mut().const_capture.begin_conditional();
     }
 
     fn handle_conditional_expression_colon(&mut self) {
-        self.flow.borrow_mut().handle_conditional_expression_colon();
+        self.flow().handle_conditional_expression_colon();
 
         self.engine.borrow_mut().const_capture.conditional_colon();
     }
 
     fn end_conditional_expression(&mut self, _question: Token, _colon: Token, end: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .end_conditional_expression(_question, _colon, end);
 
         self.engine
@@ -13606,15 +13872,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .begin_parenthesized_expression_or_record_literal(_token);
 
         self.engine.borrow_mut().const_capture.parenthesized_begin();
     }
 
     fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
-        self.flow.borrow_mut().handle_is_operator(is_operator, _not);
+        self.flow().handle_is_operator(is_operator, _not);
 
         // The type just parsed stays armed (`end_is_operator_type` never
         // takes it): the verdict walk decides here, at the official
@@ -13626,7 +13891,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_as_operator(&mut self, operator: Token) {
-        self.flow.borrow_mut().handle_as_operator(operator);
+        self.flow().handle_as_operator(operator);
 
         let mut engine = self.engine.borrow_mut();
         // Pattern casts report through `handle_cast_pattern`; the
@@ -13665,7 +13930,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— suppression brackets —————————————————————————————————————————
 
     fn begin_is_operator_type(&mut self, _operator: Token) {
-        self.flow.borrow_mut().begin_is_operator_type(_operator);
+        self.flow().begin_is_operator_type(_operator);
 
         let mut engine = self.engine.borrow_mut();
         engine.enter_non_type_pos();
@@ -13675,7 +13940,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_is_operator_type(&mut self, _operator: Token) {
-        self.flow.borrow_mut().end_is_operator_type(_operator);
+        self.flow().end_is_operator_type(_operator);
 
         let mut engine = self.engine.borrow_mut();
         engine.leave_non_type_pos();
@@ -13683,13 +13948,13 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_as_operator_type(&mut self, _operator: Token) {
-        self.flow.borrow_mut().begin_as_operator_type(_operator);
+        self.flow().begin_as_operator_type(_operator);
 
         self.engine.borrow_mut().enter_non_type_pos();
     }
 
     fn end_as_operator_type(&mut self, _operator: Token) {
-        self.flow.borrow_mut().end_as_operator_type(_operator);
+        self.flow().end_as_operator_type(_operator);
 
         self.engine.borrow_mut().leave_non_type_pos();
     }
@@ -13731,7 +13996,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_arguments(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_arguments(_token);
+        self.flow().begin_arguments(_token);
 
         let mut engine = self.engine.borrow_mut();
         // The watermark: only pendings registered inside the list seal used
@@ -13744,7 +14009,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_arguments(&mut self, count: usize, _begin: Token, end: Token) {
-        self.flow.borrow_mut().end_arguments(count, _begin, end);
+        self.flow().end_arguments(count, _begin, end);
 
         let closed = self
             .engine
@@ -13804,7 +14069,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_named_argument(&mut self, _colon: Token) {
-        self.flow.borrow_mut().handle_named_argument(_colon);
+        self.flow().handle_named_argument(_colon);
 
         // The capture opens the named argument here (fires before the
         // value); the row engine opened it at the label's identifier event.
@@ -13817,8 +14082,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_return_statement(&mut self, has_expression: bool, _begin: Token, end: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .end_return_statement(has_expression, _begin, end);
 
         let mut engine = self.engine.borrow_mut();
@@ -13838,9 +14102,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
-        self.flow
-            .borrow_mut()
-            .handle_expression_function_body(_arrow, _end);
+        self.flow().handle_expression_function_body(_arrow, _end);
 
         let mut engine = self.engine.borrow_mut();
         // `ExpressionFunctionBody` is in the official used set.
@@ -13854,9 +14116,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
-        self.flow
-            .borrow_mut()
-            .handle_async_modifier(_async_kw, _star);
+        self.flow().handle_async_modifier(_async_kw, _star);
 
         let mut engine = self.engine.borrow_mut();
         engine.body_mark = Some(engine.rows.len());
@@ -13869,7 +14129,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_cascade(&mut self, operator: Token) {
-        self.flow.borrow_mut().begin_cascade(operator);
+        self.flow().begin_cascade(operator);
 
         let mut engine = self.engine.borrow_mut();
         // The cascade target completed before the `..`: it is a use (the
@@ -13882,7 +14142,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_cascade(&mut self) {
-        self.flow.borrow_mut().end_cascade();
+        self.flow().end_cascade();
 
         let mut engine = self.engine.borrow_mut();
         // The sections are not uses (the official `CascadeExpression` arm
@@ -13896,9 +14156,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_indexed_expression(question, open, close);
+        self.flow().handle_indexed_expression(question, open, close);
 
         let mut engine = self.engine.borrow_mut();
         // `IndexExpression`/`IndexAssignmentTarget` are in the official
@@ -13921,11 +14179,23 @@ impl ParserListener for DiagnoseListener<'_> {
         else {
             return;
         };
-        if question.is_some() {
+        if let Some(question) = question {
             let ty = Engine::receiver_row_ty(&engine.rows[pos]);
             if ty.is_strictly_non_nullable() {
                 let range = engine.rows[pos].range;
                 engine.emit3(SemanticCode::InvalidNullAwareOperator, range, "?[", "[", "");
+            } else if Engine::is_nullable_ty(ty)
+                && engine
+                    .local_hits
+                    .contains_key(&engine.rows[pos].range.offset)
+            {
+                // The `c1?[0]` dead-chain candidate: a null-aware index
+                // over a local's nullable read, resolved at teardown
+                // (`_verifyUnassignedVariable`'s index face).
+                let recv = engine.rows[pos].range;
+                engine
+                    .dead_null_chains
+                    .push((question.range.offset, close.range.end(), recv));
             }
         }
         // Fold (`a[i]`, `c.j[i] = v`): the index arguments leave the stack —
@@ -13949,7 +14219,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— patterns & switch exhaustiveness (M2 face) ——————————————————————
 
     fn begin_pattern(&mut self, _token: Token) {
-        self.flow.borrow_mut().begin_pattern(_token);
+        self.flow().begin_pattern(_token);
 
         let mut engine = self.engine.borrow_mut();
         engine.pattern_depth += 1;
@@ -13964,7 +14234,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_pattern(&mut self, _token: Token) {
-        self.flow.borrow_mut().end_pattern(_token);
+        self.flow().end_pattern(_token);
 
         let mut engine = self.engine.borrow_mut();
         engine.pattern_depth = engine.pattern_depth.saturating_sub(1);
@@ -14077,9 +14347,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_constant_pattern(&mut self, _const_keyword: Option<Token>) {
-        self.flow
-            .borrow_mut()
-            .begin_constant_pattern(_const_keyword);
+        self.flow().begin_constant_pattern(_const_keyword);
 
         let mut engine = self.engine.borrow_mut();
         engine.pending_const = None;
@@ -14089,7 +14357,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_constant_pattern(&mut self, _const_keyword: Option<Token>) {
-        self.flow.borrow_mut().end_constant_pattern(_const_keyword);
+        self.flow().end_constant_pattern(_const_keyword);
 
         let mut engine = self.engine.borrow_mut();
         let leaf = engine
@@ -14171,11 +14439,8 @@ impl ParserListener for DiagnoseListener<'_> {
         variable: Token,
         _in_assignment_pattern: bool,
     ) {
-        self.flow.borrow_mut().handle_declared_variable_pattern(
-            _keyword,
-            variable,
-            _in_assignment_pattern,
-        );
+        self.flow()
+            .handle_declared_variable_pattern(_keyword, variable, _in_assignment_pattern);
 
         let mut engine = self.engine.borrow_mut();
         // The bound variable joins the enclosing scope (the flat M1 frame;
@@ -14221,9 +14486,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_wildcard_pattern(&mut self, _keyword: Option<Token>, _wildcard: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_wildcard_pattern(_keyword, _wildcard);
+        self.flow().handle_wildcard_pattern(_keyword, _wildcard);
 
         // A typed wildcard (`M _`) covers the declared type's space (the
         // official wildcard converts through its type); a bare `_` (or
@@ -14246,7 +14509,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— switch statements ————————————————————————————————————————————
 
     fn begin_switch_block(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_switch_block(token);
+        self.flow().begin_switch_block(token);
 
         let kw = self
             .engine
@@ -14260,15 +14523,13 @@ impl ParserListener for DiagnoseListener<'_> {
     /// Latches the `switch` keyword: the non-exhaustive anchor (the block
     /// event that follows only carries the `{`).
     fn begin_switch_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_switch_statement(token);
+        self.flow().begin_switch_statement(token);
 
         self.engine.borrow_mut().switch_kw_latch = Some(token.range);
     }
 
     fn end_switch_block(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_switch_block(_count, _begin, _end);
+        self.flow().end_switch_block(_count, _begin, _end);
 
         self.engine.borrow_mut().report_switch();
     }
@@ -14278,7 +14539,7 @@ impl ParserListener for DiagnoseListener<'_> {
     /// The case header's pattern window opens before its pattern parses;
     /// the root it produces is captured at [`Self::end_case_expression`].
     fn begin_case_expression(&mut self, _case_kw: Token) {
-        self.flow.borrow_mut().begin_case_expression(_case_kw);
+        self.flow().begin_case_expression(_case_kw);
 
         self.engine.borrow_mut().case_sink_open = true;
     }
@@ -14287,10 +14548,8 @@ impl ParserListener for DiagnoseListener<'_> {
     /// here with the guard flag and the `case`-keyword anchor (the oracle's
     /// `caseNode.keyword`, constant_verifier.dart:1076-1085). Shared-body
     /// groups (`case A: case B:`) capture one case per header.
-    fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, _colon: Token) {
-        self.flow
-            .borrow_mut()
-            .end_case_expression(case_kw, when, _colon);
+    fn end_case_expression(&mut self, case_kw: Token, when: Option<Token>, colon: Token) {
+        self.flow().end_case_expression(case_kw, when, colon);
 
         let mut engine = self.engine.borrow_mut();
         let root = engine.close_case_sink();
@@ -14300,6 +14559,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 space,
                 guarded: when.is_some(),
                 anchor: case_kw.range,
+                head_colon: Some(colon.range),
+                body: None,
             });
         }
     }
@@ -14314,7 +14575,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _begin: Token,
         _end: Token,
     ) {
-        self.flow.borrow_mut().end_switch_case(
+        self.flow().end_switch_case(
             _label_count,
             _expression_count,
             default_kw,
@@ -14325,22 +14586,53 @@ impl ParserListener for DiagnoseListener<'_> {
         );
 
         // The case headers already captured their spaces
-        // ([`Self::end_case_expression`]); the body-level event only
-        // latches `default` and closes any window a broken header left
-        // open.
+        // ([`Self::end_case_expression`]); the body-level event latches
+        // `default`, closes any window a broken header left open, and
+        // anchors the member body span onto the member's last head (the
+        // flow-dead member rows ride it). The span runs from the head's
+        // `:` to the member's end: a `default` head reports its colon here
+        // (`colon_after_default` — the parser opens no case window for
+        // it), a case head's colon latched on the case itself.
         let mut engine = self.engine.borrow_mut();
         engine.case_sink_open = false;
-        if let Some(ctx) = engine.switches.last_mut()
-            && let Some(token) = default_kw
-        {
+        let body_start = if _expression_count > 0 {
+            engine
+                .switches
+                .last()
+                .and_then(|ctx| ctx.cases.last())
+                .and_then(|case| case.head_colon)
+        } else {
+            _colon_after_default.map(|colon| colon.range)
+        };
+        let body = match (body_start, _statement_count) {
+            (Some(colon), count) if count > 0 => {
+                engine.trimmed_span(colon.end(), _end.range.offset)
+            }
+            _ => None,
+        };
+        let Some(ctx) = engine.switches.last_mut() else {
+            return;
+        };
+        if let Some(token) = default_kw {
             ctx.default_kw = Some(token.range);
+            if ctx.default_pos.is_none() {
+                ctx.default_pos = Some(ctx.cases.len());
+            }
+        }
+        // Only a case-headed member owns the last captured case; a
+        // `default` member pushes no case, and its body must not ride the
+        // previous member's head.
+        if _expression_count > 0
+            && let Some(last) = ctx.cases.last_mut()
+        {
+            last.body = body;
         }
     }
 
     // —— switch expressions ————————————————————————————————————————————
 
     fn begin_switch_expression_block(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_switch_expression_block(token);
+        self.flow().begin_switch_expression_block(token);
 
         let kw = self
             .engine
@@ -14353,7 +14645,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     /// Latches the `switch` keyword of a switch expression.
     fn begin_switch_expression(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_switch_expression(token);
+        self.flow().begin_switch_expression(token);
 
         self.engine.borrow_mut().switch_kw_latch = Some(token.range);
     }
@@ -14361,7 +14653,7 @@ impl ParserListener for DiagnoseListener<'_> {
     /// The expression-case header's pattern window opens before its
     /// pattern parses.
     fn begin_switch_expression_case(&mut self) {
-        self.flow.borrow_mut().begin_switch_expression_case();
+        self.flow().begin_switch_expression_case();
 
         self.engine.borrow_mut().case_sink_open = true;
     }
@@ -14369,9 +14661,7 @@ impl ParserListener for DiagnoseListener<'_> {
     /// The expression case's pattern completed: its coverage latches now
     /// (the guard and the `=>` anchor only exist at the case's end).
     fn handle_switch_expression_case_pattern(&mut self, _token: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_switch_expression_case_pattern(_token);
+        self.flow().handle_switch_expression_case_pattern(_token);
 
         let mut engine = self.engine.borrow_mut();
         let root = engine.close_case_sink();
@@ -14388,8 +14678,7 @@ impl ParserListener for DiagnoseListener<'_> {
         arrow: Token,
         _end: Token,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .end_switch_expression_case(_begin, when, arrow, _end);
 
         let mut engine = self.engine.borrow_mut();
@@ -14405,13 +14694,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 space,
                 guarded: when.is_some(),
                 anchor: arrow.range,
+                head_colon: None,
+                body: None,
             });
         }
     }
 
     fn end_switch_expression_block(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .end_switch_expression_block(_count, _begin, _end);
 
         self.engine.borrow_mut().report_switch();
@@ -14481,7 +14771,7 @@ impl ParserListener for DiagnoseListener<'_> {
     // already did.
 
     fn handle_literal_int(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_literal_int(token);
+        self.flow().handle_literal_int(token);
 
         let mut engine = self.engine.borrow_mut();
         engine.push_primitive_row(token, 0);
@@ -14495,9 +14785,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_literal_int_with_separators(token);
+        self.flow().handle_literal_int_with_separators(token);
 
         let mut engine = self.engine.borrow_mut();
         engine.push_primitive_row(token, 0);
@@ -14509,7 +14797,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_double(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_literal_double(token);
+        self.flow().handle_literal_double(token);
 
         let mut engine = self.engine.borrow_mut();
         engine.push_primitive_row(token, 1);
@@ -14521,9 +14809,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_literal_double_with_separators(token);
+        self.flow().handle_literal_double_with_separators(token);
 
         let mut engine = self.engine.borrow_mut();
         engine.push_primitive_row(token, 1);
@@ -14535,7 +14821,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_bool(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_literal_bool(token);
+        self.flow().handle_literal_bool(token);
 
         let mut engine = self.engine.borrow_mut();
         if engine.pattern_depth > 0 {
@@ -14549,7 +14835,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_literal_null(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_literal_null(token);
+        self.flow().handle_literal_null(token);
 
         let mut engine = self.engine.borrow_mut();
         if engine.pattern_depth > 0 {
@@ -14575,9 +14861,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_literal_string(&mut self, interpolation_count: usize, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_literal_string(interpolation_count, end);
+        self.flow().end_literal_string(interpolation_count, end);
 
         let mut engine = self.engine.borrow_mut();
         // `InterpolationExpression` is in the official used set.
@@ -14620,8 +14904,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _const_keyword: Option<Token>,
         right: Token,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .handle_literal_list(count, left, _const_keyword, right);
 
         let mut engine = self.engine.borrow_mut();
@@ -14658,13 +14941,8 @@ impl ParserListener for DiagnoseListener<'_> {
         right: Token,
         has_set_entry: bool,
     ) {
-        self.flow.borrow_mut().handle_literal_set_or_map(
-            count,
-            left,
-            _const_keyword,
-            right,
-            has_set_entry,
-        );
+        self.flow()
+            .handle_literal_set_or_map(count, left, _const_keyword, right, has_set_entry);
 
         use crate::const_eval::{InstanceKind, SetOrMap};
         let mut engine = self.engine.borrow_mut();
@@ -14708,9 +14986,7 @@ impl ParserListener for DiagnoseListener<'_> {
         _nk: Option<Token>,
         _nv: Option<Token>,
     ) {
-        self.flow
-            .borrow_mut()
-            .handle_literal_map_entry(colon, _end, _nk, _nv);
+        self.flow().handle_literal_map_entry(colon, _end, _nk, _nv);
 
         self.engine
             .borrow_mut()
@@ -14719,16 +14995,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_parenthesized_expression(&mut self, token: Token) {
-        self.flow.borrow_mut().end_parenthesized_expression(token);
+        self.flow().end_parenthesized_expression(token);
 
         self.engine.borrow_mut().push_value_row(token);
         self.engine.borrow_mut().const_capture.parenthesized_end();
     }
 
     fn end_record_literal(&mut self, token: Token, count: usize, _const_keyword: Option<Token>) {
-        self.flow
-            .borrow_mut()
-            .end_record_literal(token, count, _const_keyword);
+        self.flow().end_record_literal(token, count, _const_keyword);
 
         let mut engine = self.engine.borrow_mut();
         // `RecordLiteral` is in the official used set.
@@ -14874,14 +15148,14 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_await_expression(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_await_expression(token);
+        self.flow().begin_await_expression(token);
 
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let _ = token;
     }
 
     fn end_await_expression(&mut self, begin: Token, _end: Token) {
-        self.flow.borrow_mut().end_await_expression(begin, _end);
+        self.flow().end_await_expression(begin, _end);
 
         self.engine
             .borrow_mut()
@@ -14890,7 +15164,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_throw_expression(&mut self, throw: Token, _end: Token) {
-        self.flow.borrow_mut().handle_throw_expression(throw, _end);
+        self.flow().handle_throw_expression(throw, _end);
 
         // `ThrowExpression` is in the official used set (the event fires
         // after the operand parsed).
@@ -14902,9 +15176,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_non_null_assert_expression(&mut self, bang: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_non_null_assert_expression(bang);
+        self.flow().handle_non_null_assert_expression(bang);
 
         let mut engine = self.engine.borrow_mut();
         // The operand's row is the stack top (the postfix operand parsed
@@ -14920,38 +15192,36 @@ impl ParserListener for DiagnoseListener<'_> {
     // docs' flow section).
 
     fn begin_assert(&mut self, token: Token, kind: AssertKind) {
-        self.flow.borrow_mut().begin_assert(token, kind);
+        self.flow().begin_assert(token, kind);
     }
 
     fn begin_block(&mut self, token: Token, kind: BlockKind) {
-        self.flow.borrow_mut().begin_block(token, kind);
+        self.flow().begin_block(token, kind);
     }
 
     fn begin_block_function_body(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_block_function_body(token);
+        self.flow().begin_block_function_body(token);
         // The block `{` is the executable-completion row's anchor (the
         // official reports at the block's left bracket).
         self.engine.borrow_mut().note_body_brace(token.range);
     }
 
     fn begin_do_while_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_do_while_statement(token);
+        self.flow().begin_do_while_statement(token);
     }
 
     fn begin_do_while_statement_body(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_do_while_statement_body(token);
+        self.flow().begin_do_while_statement_body(token);
     }
 
     fn begin_else_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_else_statement(token);
+        self.flow().begin_else_statement(token);
         // Insurance: the condition sealed at `begin_then_statement`.
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn begin_for_control_flow(&mut self, await_kw: Option<Token>, for_kw: Token) {
-        self.flow
-            .borrow_mut()
-            .begin_for_control_flow(await_kw, for_kw);
+        self.flow().begin_for_control_flow(await_kw, for_kw);
         let mut engine = self.engine.borrow_mut();
         // The collection-element form's window (2): its condition is an
         // expression statement like the statement form's; its window closes
@@ -14961,7 +15231,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_for_in_body(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_for_in_body(token);
+        self.flow().begin_for_in_body(token);
         // The iterable window closes at the body (statement form only —
         // the collection form pops at `end_for_in_control_flow`).
         let mut engine = self.engine.borrow_mut();
@@ -14971,47 +15241,44 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_for_in_expression(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_for_in_expression(token);
+        self.flow().begin_for_in_expression(token);
     }
 
     fn begin_for_statement_body(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_for_statement_body(token);
+        self.flow().begin_for_statement_body(token);
     }
 
     fn begin_if_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_if_control_flow(token);
+        self.flow().begin_if_control_flow(token);
         self.engine.borrow_mut().const_capture.begin_ctl_element();
     }
 
     fn begin_if_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_if_statement(token);
+        self.flow().begin_if_statement(token);
     }
 
     fn begin_initialized_identifier(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_initialized_identifier(token);
+        self.flow().begin_initialized_identifier(token);
     }
 
     fn begin_labeled_statement(&mut self, token: Token, label_count: usize) {
-        self.flow
-            .borrow_mut()
-            .begin_labeled_statement(token, label_count);
+        self.flow().begin_labeled_statement(token, label_count);
     }
 
     fn begin_literal_symbol(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_literal_symbol(token);
+        self.flow().begin_literal_symbol(token);
     }
 
     fn begin_pattern_guard(&mut self, when: Token) {
-        self.flow.borrow_mut().begin_pattern_guard(when);
+        self.flow().begin_pattern_guard(when);
     }
 
     fn begin_rethrow_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_rethrow_statement(token);
+        self.flow().begin_rethrow_statement(token);
     }
 
     fn begin_switch_case(&mut self, label_count: usize, expression_count: usize, token: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .begin_switch_case(label_count, expression_count, token);
 
         // A case's pattern variables form their own group window.
@@ -15019,24 +15286,24 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_then_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_then_statement(token);
+        self.flow().begin_then_statement(token);
         // `IfStatement` is in the official used set (the condition).
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn begin_try_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_try_statement(token);
+        self.flow().begin_try_statement(token);
 
         let mut engine = self.engine.borrow_mut();
         engine.try_clauses.push(Vec::new());
     }
 
     fn begin_while_statement(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_while_statement(token);
+        self.flow().begin_while_statement(token);
     }
 
     fn begin_while_statement_body(&mut self, token: Token) {
-        self.flow.borrow_mut().begin_while_statement_body(token);
+        self.flow().begin_while_statement_body(token);
         // `WhileStatement` is in the official used set (the condition).
         self.engine.borrow_mut().ur_seal_used();
     }
@@ -15049,16 +15316,14 @@ impl ParserListener for DiagnoseListener<'_> {
         comma: Option<Token>,
         end: Token,
     ) {
-        self.flow
-            .borrow_mut()
-            .end_assert(begin, kind, left_paren, comma, end);
+        self.flow().end_assert(begin, kind, left_paren, comma, end);
         // `AssertStatement`/`AssertInitializer` are in the official used
         // set (condition and message).
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
-        self.flow.borrow_mut().end_block(count, begin, end, kind);
+        self.flow().end_block(count, begin, end, kind);
 
         // The catch clause fact's body anchor: `handle_catch_block` fires
         // right after the clause body's block ends, so the last block end
@@ -15067,25 +15332,21 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_block_function_body(count, begin, end);
+        self.flow().end_block_function_body(count, begin, end);
     }
 
     fn end_do_while_statement(&mut self, token: Token, while_kw: Token, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_do_while_statement(token, while_kw, end);
+        self.flow().end_do_while_statement(token, while_kw, end);
         // `DoStatement` is in the official used set (the while condition).
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_do_while_statement_body(&mut self, end: Token) {
-        self.flow.borrow_mut().end_do_while_statement_body(end);
+        self.flow().end_do_while_statement_body(end);
     }
 
     fn end_for_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().end_for_control_flow(token);
+        self.flow().end_for_control_flow(token);
         let mut engine = self.engine.borrow_mut();
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
@@ -15093,11 +15354,11 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_for_in_body(&mut self, end: Token) {
-        self.flow.borrow_mut().end_for_in_body(end);
+        self.flow().end_for_in_body(end);
     }
 
     fn end_for_in_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().end_for_in_control_flow(token);
+        self.flow().end_for_in_control_flow(token);
         let mut engine = self.engine.borrow_mut();
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
@@ -15105,13 +15366,13 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_for_in_expression(&mut self, end: Token) {
-        self.flow.borrow_mut().end_for_in_expression(end);
+        self.flow().end_for_in_expression(end);
         // `ForEachParts` is in the official used set (the iterable).
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_for_statement_body(&mut self, end: Token) {
-        self.flow.borrow_mut().end_for_statement_body(end);
+        self.flow().end_for_statement_body(end);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15127,7 +15388,7 @@ impl ParserListener for DiagnoseListener<'_> {
         kind: FormalParameterKind,
         member_kind: dartq_parser::MemberKind,
     ) {
-        self.flow.borrow_mut().end_formal_parameter(
+        self.flow().end_formal_parameter(
             var_or_final,
             this_keyword,
             super_keyword,
@@ -15141,49 +15402,44 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_function_type(&mut self, function: Token, question: Option<Token>) {
-        self.flow.borrow_mut().end_function_type(function, question);
+        self.flow().end_function_type(function, question);
         self.engine
             .borrow_mut()
             .var_end_function_type(question.is_some());
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .end_function_typed_formal_parameter(token, question);
     }
 
     fn end_if_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().end_if_control_flow(token);
+        self.flow().end_if_control_flow(token);
     }
 
     fn end_if_else_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().end_if_else_control_flow(token);
+        self.flow().end_if_else_control_flow(token);
     }
 
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {
-        self.flow.borrow_mut().end_if_statement(token, else_kw, end);
+        self.flow().end_if_statement(token, else_kw, end);
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_initialized_identifier(&mut self, name: Token) {
-        self.flow.borrow_mut().end_initialized_identifier(name);
+        self.flow().end_initialized_identifier(name);
     }
 
     fn end_invalid_await_expression(&mut self, begin: Token, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_invalid_await_expression(begin, end);
+        self.flow().end_invalid_await_expression(begin, end);
     }
 
     fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_invalid_yield_statement(begin, star, end);
+        self.flow().end_invalid_yield_statement(begin, star, end);
     }
 
     fn end_labeled_statement(&mut self, label_count: usize) {
-        self.flow.borrow_mut().end_labeled_statement(label_count);
+        self.flow().end_labeled_statement(label_count);
 
         self.engine
             .borrow_mut()
@@ -15191,17 +15447,15 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_pattern_guard(&mut self, token: Token) {
-        self.flow.borrow_mut().end_pattern_guard(token);
+        self.flow().end_pattern_guard(token);
     }
 
     fn end_rethrow_statement(&mut self, rethrow_kw: Token, end: Token) {
-        self.flow
-            .borrow_mut()
-            .end_rethrow_statement(rethrow_kw, end);
+        self.flow().end_rethrow_statement(rethrow_kw, end);
     }
 
     fn end_switch_statement(&mut self, token: Token, end: Token) {
-        self.flow.borrow_mut().end_switch_statement(token, end);
+        self.flow().end_switch_statement(token, end);
     }
 
     fn end_try_statement(
@@ -15211,36 +15465,31 @@ impl ParserListener for DiagnoseListener<'_> {
         finally_kw: Option<Token>,
         end: Token,
     ) {
-        self.flow
-            .borrow_mut()
-            .end_try_statement(count, begin, finally_kw, end);
+        self.flow().end_try_statement(count, begin, finally_kw, end);
 
         self.engine.borrow_mut().finish_try_statement();
     }
 
     fn end_while_statement(&mut self, token: Token, end: Token) {
-        self.flow.borrow_mut().end_while_statement(token, end);
+        self.flow().end_while_statement(token, end);
     }
 
     fn end_while_statement_body(&mut self, end: Token) {
-        self.flow.borrow_mut().end_while_statement_body(end);
+        self.flow().end_while_statement_body(end);
     }
 
     fn end_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
-        self.flow.borrow_mut().end_yield_statement(begin, star, end);
+        self.flow().end_yield_statement(begin, star, end);
         // `YieldStatement` is in the official used set.
         self.engine.borrow_mut().ur_seal_used();
     }
 
     fn handle_assigned_variable_pattern(&mut self, variable: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_assigned_variable_pattern(variable);
+        self.flow().handle_assigned_variable_pattern(variable);
     }
 
     fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .handle_break_statement(has_target, break_kw, end);
     }
 
@@ -15250,37 +15499,41 @@ impl ParserListener for DiagnoseListener<'_> {
         catch_kw: Option<Token>,
         comma: Option<Token>,
     ) {
-        self.flow
-            .borrow_mut()
-            .handle_catch_block(on_kw, catch_kw, comma);
+        self.flow().handle_catch_block(on_kw, catch_kw, comma);
 
         self.engine.borrow_mut().finish_catch_clause();
     }
 
     fn handle_continue_statement(&mut self, has_target: bool, continue_kw: Token, end: Token) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .handle_continue_statement(has_target, continue_kw, end);
     }
 
     fn handle_else_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_else_control_flow(token);
+        self.flow().handle_else_control_flow(token);
     }
 
     fn handle_empty_function_body(&mut self, semicolon: Token) {
-        self.flow.borrow_mut().handle_empty_function_body(semicolon);
+        self.flow().handle_empty_function_body(semicolon);
     }
 
     fn handle_experiment_not_enabled(&mut self, flag: ExperimentalFlag, begin: Token, end: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_experiment_not_enabled(flag, begin, end);
+        self.flow().handle_experiment_not_enabled(flag, begin, end);
     }
 
+    /// The parser fires this after the body expression (the `;` only
+    /// exists then), while the flow grammar records the statement wrapper
+    /// before the body's events (record.rs `handle_expression_statement`,
+    /// the shape its dead-window tests hand-drive). The wrapper therefore
+    /// forwards raw — no flush — and the pending exit lands right after
+    /// it: a statement whose whole expression is the Never send reports at
+    /// the NEXT statement (official `checkUnreachableNode` at the next
+    /// statement's entry), never at its own wrapper.
     fn handle_expression_statement(&mut self, begin: Token, end: Token) {
         self.flow
             .borrow_mut()
             .handle_expression_statement(begin, end);
+        self.flush_flow_exit();
 
         // The discarded-value verdict: `ExpressionStatement` is absent from
         // both official `_isUsed` sets (the value is dropped), except the
@@ -15291,7 +15544,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_finally_block(&mut self, finally_kw: Token) {
-        self.flow.borrow_mut().handle_finally_block(finally_kw);
+        self.flow().handle_finally_block(finally_kw);
     }
 
     fn handle_for_initializer_pattern_variable_assignment(
@@ -15299,8 +15552,7 @@ impl ParserListener for DiagnoseListener<'_> {
         pattern_keyword: Token,
         equals: Token,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals);
     }
 
@@ -15312,7 +15564,7 @@ impl ParserListener for DiagnoseListener<'_> {
         right_separator: Token,
         expression_count: usize,
     ) {
-        self.flow.borrow_mut().handle_for_loop_parts(
+        self.flow().handle_for_loop_parts(
             for_kw,
             left_paren,
             left_separator,
@@ -15332,29 +15584,29 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_invalid_function_body(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_invalid_function_body(token);
+        self.flow().handle_invalid_function_body(token);
     }
 
     fn handle_invalid_statement(&mut self, begin: Token) {
-        self.flow.borrow_mut().handle_invalid_statement(begin);
+        self.flow().handle_invalid_statement(begin);
     }
 
     fn handle_label(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_label(token);
+        self.flow().handle_label(token);
 
         self.engine.borrow_mut().note_label_decl();
     }
 
     fn handle_no_variable_initializer(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_no_variable_initializer(token);
+        self.flow().handle_no_variable_initializer(token);
     }
 
     fn handle_null_aware_element(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_null_aware_element(token);
+        self.flow().handle_null_aware_element(token);
     }
 
     fn handle_pattern_assignment(&mut self, equals: Token) {
-        self.flow.borrow_mut().handle_pattern_assignment(equals);
+        self.flow().handle_pattern_assignment(equals);
         // `PatternAssignment` is in the official used set (the event fires
         // after the RHS parsed).
         self.engine.borrow_mut().ur_seal_used();
@@ -15366,8 +15618,7 @@ impl ParserListener for DiagnoseListener<'_> {
         equals: Token,
         semicolon: Token,
     ) {
-        self.flow
-            .borrow_mut()
+        self.flow()
             .handle_pattern_variable_declaration_statement(keyword, equals, semicolon);
 
         // `PatternVariableDeclaration` is in the official used set (the
@@ -15379,15 +15630,11 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_recoverable_error(&mut self, _p0: Message, _p1: Token, _p2: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_recoverable_error(_p0, _p1, _p2);
+        self.flow().handle_recoverable_error(_p0, _p1, _p2);
     }
 
     fn handle_send_without_arguments(&mut self, begin: Token, end: Token, next: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_send_without_arguments(begin, end, next);
+        self.flow().handle_send_without_arguments(begin, end, next);
 
         // A non-invoked identifier expression is a bare-read candidate
         // (the official `checkNameExpression` face): the read of a
@@ -15397,14 +15644,12 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_spread_expression(&mut self, operator: Token) {
-        self.flow.borrow_mut().handle_spread_expression(operator);
+        self.flow().handle_spread_expression(operator);
         self.engine.borrow_mut().const_capture.begin_ctl_element();
     }
 
     fn handle_switch_case_no_when_clause(&mut self, token: Token) {
-        self.flow
-            .borrow_mut()
-            .handle_switch_case_no_when_clause(token);
+        self.flow().handle_switch_case_no_when_clause(token);
         // `SwitchStatement` is in the official used set (the case head's
         // constants); the body statements answer through their own events.
         self.engine.borrow_mut().ur_seal_used();
@@ -15422,7 +15667,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_then_control_flow(&mut self, token: Token) {
-        self.flow.borrow_mut().handle_then_control_flow(token);
+        self.flow().handle_then_control_flow(token);
     }
 }
 
@@ -15471,13 +15716,20 @@ enum NameTy {
     Unknown(u64),
 }
 
-/// One completed case: its coverage restriction, the guard flag, and the
+/// One completed case: its coverage restriction, the guard flag, the
 /// token the diagnostics anchor to (`case` for statement cases, `=>` for
-/// expression cases).
+/// expression cases), and — statement cases, last head of a member — the
+/// member body's whitespace-trimmed span (the flow-dead member rows ride
+/// it, dead_code_verifier.dart's `flowEnd` member trim). `head_colon` is
+/// the head's own `:` — the parser only reports the member colon at
+/// `end_switch_case` for a `default` head (`colon_after_default`), so the
+/// case-headed member's body boundary latches here.
 struct NameCase {
     space: Restriction,
     guarded: bool,
     anchor: SourceRange,
+    head_colon: Option<SourceRange>,
+    body: Option<SourceRange>,
 }
 
 /// The open switch (statement or expression): the scrutinee's push-time
@@ -15491,6 +15743,11 @@ struct SwitchCtx {
     /// token, `constant_verifier.dart:1141-1148`); `None` when the switch
     /// has no default.
     default_kw: Option<SourceRange>,
+    /// The case-head count that precedes the first `default` member (the
+    /// chain split: the flow layer owns the default-driven dead members,
+    /// so the exhaustiveness-driven chain stops there); `None` when the
+    /// switch has no default.
+    default_pos: Option<usize>,
     /// The captured coverage of an in-flight switch-expression case (the
     /// space latches at the pattern's completion, the guard and anchor at
     /// the case's end). Statement cases capture in one step and leave this
@@ -19134,6 +19391,11 @@ mod tests {
             [
                 "constant_pattern_never_matches_value_type",
                 "constant_pattern_never_matches_value_type",
+                // The trailing `case null`'s body dies with it (the flow
+                // equality-check face — a non-nullable `bool` can never be
+                // null), oracle-pinned on the `case null`-over-non-nullable
+                // probe.
+                "dead_code",
                 "non_exhaustive_switch_statement",
                 "unreachable_switch_case",
             ],
@@ -22625,7 +22887,9 @@ mod tests {
     /// `constant_pattern_never_matches_value_type`
     /// (constant_verifier.dart:140-165): a `String` constant can never
     /// equal an `int` matched value; the int-constant-vs-double-value
-    /// cross answers "possible" (the official's JavaScript note).
+    /// cross answers "possible" (the official's JavaScript note). The
+    /// `case null` shape's body also dies (the flow equality-check face,
+    /// oracle probe: `DEAD_CODE` over the `break;`).
     #[test]
     fn constant_pattern_never_matches_pins() {
         let r = report(
@@ -22638,7 +22902,8 @@ mod tests {
             code_names(&r),
             [
                 "constant_pattern_never_matches_value_type",
-                "constant_pattern_never_matches_value_type"
+                "constant_pattern_never_matches_value_type",
+                "dead_code",
             ],
             "{:?}",
             code_names(&r)
@@ -22650,6 +22915,11 @@ mod tests {
         assert_eq!(
             r.diagnostics[1].message,
             "The matched value type 'int' can never be equal to this constant of type 'Null'."
+        );
+        assert_eq!(
+            r.diagnostics[2].message, "Dead code.",
+            "{:?}",
+            r.diagnostics[2].message
         );
     }
 
@@ -23309,8 +23579,301 @@ mod tests {
         let flagged = report("class int {} void main() { try {} on int catch (__) {} }");
         assert_eq!(code_names(&flagged), ["unused_catch_clause"]);
     }
-}
+    // —— #890: the W3 semantic dead-code queue ———————————————————————————
 
+    /// A total-match member (`case _`) drives the official flow `unmatched`
+    /// state unreachable, so the following member is entered dead: the
+    /// keyword row anchors at the bare `case` token and the body row spans
+    /// the member's statements (`analyzeSwitchStatement`'s
+    /// `switch_beginAlternative` reads the dead `_unmatched`; the
+    /// dead_code_verifier's SwitchMember faces). Exhaustiveness-only
+    /// coverage (the oracle's `unreachable_switch_case`) co-fires and stays
+    /// the sole verdict for the duplicate constant — probe.dart s2/v2,
+    /// oracle rows `30|5|4` + `30|5|4` + `31|7|28`.
+    #[test]
+    fn switch_wildcard_chain_dead_rows() {
+        let source = "enum E { a, b, c } void f(E e) { switch (e) { case E.a: break; case _: break; case E.c: print2('dead2'); break; } } void print2(String s) {}";
+        let report = report(source);
+        let dead: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "dead_code")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            dead,
+            [
+                (offset_of(source, "case E.c:"), "case".len() as u32),
+                (
+                    offset_of(source, "print2"),
+                    ("print2('dead2'); break;".len()) as u32
+                ),
+            ],
+            "{:?}",
+            dead
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "unreachable_switch_case")
+        );
+    }
+
+    /// A member whose space is disjoint from the scrutinee never matches:
+    /// only its body dies (the official's `_EqualityCheckHasKnownResult`
+    /// makes the matched state unreachable at the pattern) — enum.dart
+    /// `unreachableCase3`, oracle `322|7|27`, keyword row absent. The
+    /// gate is constant roots only: a disjoint TYPE TEST (`case A _` over
+    /// an enum) takes the restriction path, which joins — its body stays
+    /// live and `pattern_never_matches_value_type` reports alone (oracle
+    /// probes: the `case null` shape reports the body row, the `case A _`
+    /// shape reports no `dead_code` at all).
+    #[test]
+    fn switch_never_match_member_body_row() {
+        let source = "enum E { a, b, c } void f(E e) { switch (e) { case E.a: break; case null: print2('n'); break; } } void print2(String s) {}";
+        let null_case = report(source);
+        let dead: Vec<_> = null_case
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "dead_code")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            dead,
+            [(
+                offset_of(source, "print2"),
+                "print2('n'); break;".len() as u32
+            )],
+            "{:?}",
+            dead
+        );
+        let type_test = report(
+            "enum E { a, b } class A {} void f(E e) { switch (e) { case A _: 1; 2; case E.a: break; case E.b: break; } }",
+        );
+        assert!(
+            dead_code_offsets(&type_test).is_empty(),
+            "{:?}",
+            code_names(&type_test)
+        );
+    }
+
+    /// A duplicate constant over a fully covered scrutinee is NOT
+    /// flow-dead: the flow `unmatched` state stays reachable (constant
+    /// patterns join without exhausting it), so exhaustiveness coverage
+    /// reports `unreachable_switch_case` alone — probe.dart s1/v1, oracle
+    /// `15|5|4` USC with no dead_code row.
+    #[test]
+    fn switch_covered_constant_not_flow_dead() {
+        let source = "enum E { a, b, c } void f(E e) { switch (e) { case E.a: break; case E.b: break; case E.c: break; case E.a: break; } }";
+        let report = report(source);
+        assert!(
+            dead_code_offsets(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "unreachable_switch_case")
+        );
+    }
+
+    /// A variable pattern over the scrutinee's own type is a total match
+    /// (`case A a:` over sealed `A`): the following member is chain-dead —
+    /// sealed_class.dart `unreachableCase2`, oracle `238|5|4` + `239|7|27`.
+    #[test]
+    fn switch_same_type_variable_pattern_chain_dead() {
+        let source = "sealed class A {} class B extends A {} void f(A a) { switch (a) { case A a2: break; case null: print2('n'); break; } } void print2(String s) {}";
+        let report = report(source);
+        let dead: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "dead_code")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            dead,
+            [
+                (offset_of(source, "case null:"), "case".len() as u32),
+                (
+                    offset_of(source, "print2"),
+                    "print2('n'); break;".len() as u32
+                ),
+            ],
+            "{:?}",
+            dead
+        );
+    }
+
+    /// A guarded total pattern never starts the chain (the guard may
+    /// fail) — probe.dart x3: no dead rows, the non-exhaustive covering
+    /// error aside.
+    #[test]
+    fn switch_guarded_wildcard_keeps_members_live() {
+        let source = "enum E { a, b, c } void f(E e, bool c) { switch (e) { case E.a: break; case _ when c: break; case E.c: break; } }";
+        let report = report(source);
+        assert!(
+            dead_code_offsets(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// `x != null` as a whole `??` left operand is `bool` — strictly
+    /// non-nullable — so the right operand reports
+    /// `dead_null_aware_expression` at its own range (oracle q1:
+    /// `DEAD_NULL_AWARE_EXPRESSION 4|20|5` over `false`).
+    #[test]
+    fn ifnull_equality_lhs_reports_dead_rhs() {
+        let source = "class int {} void g() {} void f(int x) { if (x != null ?? false) { g(); } }";
+        let report = report(source);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_null_aware_expression")
+            .expect("dead_null_aware_expression present");
+        assert_eq!(dead.range.offset, offset_of(source, "false"));
+        assert_eq!(
+            dead.message,
+            "The left operand can't be null, so the right operand is never executed."
+        );
+    }
+
+    /// A nullable left operand stays silent (`x ?? y` over `int? x`) — the
+    /// existing `dead_null_aware_right_operands_report` covers the
+    /// non-nullable read face; this pins the nullable control.
+    #[test]
+    fn ifnull_nullable_lhs_stays_silent() {
+        let source = "class int {} void f(int? x, int y) { x ?? y; }";
+        let report = report(source);
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "dead_null_aware_expression"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// `c1?[0]` over a definitely-unassigned nullable local reports
+    /// `dead_code` spanning the operator through the index close
+    /// (`_verifyUnassignedVariable`'s index face, oracle p5 z1: `5|5|4`
+    /// over `?[0]`); an assigned receiver stays live (z3).
+    #[test]
+    fn null_aware_index_unassigned_receiver_reports() {
+        let source = "class C1 {} void f() { C1? c1; c1?[0]; }";
+        let report = report(source);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "?[0]"))
+            .expect("dead_code at the null-aware index");
+        assert_eq!(dead.range.length, "?[0]".len() as u32);
+        assert_eq!(dead.message, "Dead code.");
+    }
+
+    #[test]
+    fn null_aware_index_assigned_receiver_stays_live() {
+        let source = "class C1 {} void f() { C1? c1; c1 = C1(); c1?[0]; }";
+        let report = report(source);
+        assert!(
+            dead_code_offsets(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The dot form reports over the same face (`c1?.g()`, oracle p5 z2:
+    /// `10|5|7` over `?.g()`); the row anchors at the operator. A field
+    /// receiver is not definitely unassigned and stays silent (z6).
+    #[test]
+    fn null_aware_dot_unassigned_receiver_reports() {
+        let source = "class C1 { void g() {} } void f() { C1? c1; c1?.g(); }";
+        let report = report(source);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "?.g()"))
+            .expect("dead_code at the null-aware access");
+        assert!(dead.range.length >= 2, "{:?}", dead.range);
+    }
+
+    /// A field receiver is not a definitely-unassigned local: the chain
+    /// stays silent (oracle p5 z6).
+    #[test]
+    fn null_aware_field_receiver_stays_live() {
+        let source =
+            "class C1 { void g() {} }\nclass H {\n  C1? c1;\n  void f() {\n    c1?.g();\n  }\n}";
+        let report = report(source);
+        assert!(
+            dead_code_offsets(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A boolean literal as the whole `??` left operand is `bool` —
+    /// strictly non-nullable — so the right operand reports (`true ?? x`,
+    /// oracle q2's `DEAD_NULL_AWARE_EXPRESSION`; the row anchors at the
+    /// right operand).
+    #[test]
+    fn ifnull_bool_literal_lhs_reports_dead_rhs() {
+        let source = "class int {} void f(int x) { true ?? x; }";
+        let report = report(source);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_null_aware_expression")
+            .expect("dead_null_aware_expression present");
+        assert_eq!(dead.range.offset, offset_of(source, "?? x") + 3);
+    }
+
+    /// A Never-typed callee kills the flow state at the send's end, so the
+    /// dead interval anchors at the FIRST statement after the call (the
+    /// official `checkUnreachableNode` at the next statement's entry —
+    /// section I's correction: the row starts at `print`, never at the
+    /// call) and folds to the covering block's end.
+    #[test]
+    fn never_call_dead_row_starts_at_the_next_statement() {
+        let source = "Never boom() => throw 0; void f() { boom(); g(); } void g() {}";
+        let report = report(source);
+        assert_eq!(dead_code_offsets(&report), [offset_of(source, "g();")]);
+    }
+
+    /// An `_`-named local function is dead over the whole declaration,
+    /// call or not (DeadCodeVerifier's visitFunctionDeclaration,
+    /// dead_code_verifier.dart:72-82; oracle p4 y1: `50|3|31`).
+    #[test]
+    fn local_wildcard_function_reports_dead() {
+        let source = "void g() {} void f() { void _() { g(); } _(); }";
+        let report = report(source);
+        let dead = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "dead_code")
+            .expect("dead_code present");
+        assert_eq!(dead.range.offset, offset_of(source, "void _()"));
+        assert_eq!(dead.range.length, "void _() { g(); }".len() as u32);
+        assert_eq!(dead.message, "Dead code.");
+    }
+
+    /// A named local function stays live; named function expressions share
+    /// the identifier context but never report (the official face is
+    /// `visitFunctionDeclaration`).
+    #[test]
+    fn local_named_function_and_expression_stay_live() {
+        let source = "void g() {} void f() { void h() { g(); } h(); }";
+        let report = report(source);
+        assert!(
+            dead_code_offsets(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+}
 /// The W6 `@sealed` supertype-contract producer tests (#702). Kept as a
 /// standalone module so the shared `tests` rig stays untouched: the faces
 /// here need a second analyzed library and the meta stand-in node, which
