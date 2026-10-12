@@ -1,5 +1,5 @@
 //! File-watch for `dartq daemon --watch` (PRD §16.7, mode 3 — the optional
-//! convenience layer; explicit push and ContentId verification stay the
+//! convenience layer; explicit push and `ContentId` verification stay the
 //! truth).
 //!
 //! # Shape (the runtime model's hand-wired notifier)
@@ -77,7 +77,7 @@ pub(crate) fn is_config_input(path: &Path, root: &Path) -> bool {
 /// A change burst may hold the batch at most this long before it flushes
 /// mid-burst — a writer that never quiets (a build tool, a formatter loop)
 /// must not starve re-analysis (the §16.5 starvation-protection posture).
-const MAX_HOLD: Duration = Duration::from_millis(2_000);
+const MAX_HOLD: Duration = Duration::from_secs(2);
 
 /// Where the watcher polls and how fast. `poll_interval` is injectable for
 /// tests; production uses [`POLL_INTERVAL`] via [`Self::new`].
@@ -132,7 +132,7 @@ impl Debounce {
 }
 
 /// A per-file poll fingerprint: cheap hints, not content identities (the
-/// engine's ContentId discipline stays the truth, §16.7).
+/// engine's `ContentId` discipline stays the truth, §16.7).
 type Fingerprint = (SystemTime, u64);
 
 /// One workspace walk: every `.dart` file by the discovery walk rules, with
@@ -206,7 +206,7 @@ impl Watcher {
             .name("dartq-daemon-watch".into())
             .spawn({
                 let stop = Arc::clone(&stop);
-                move || watch_loop(&options, sender, &stop)
+                move || watch_loop(&options, &sender, &stop)
             })
             .inspect_err(|error| eprintln!("dartq-daemon: watch thread unavailable: {error}"))
             .ok();
@@ -227,7 +227,7 @@ impl Drop for Watcher {
 /// interval. Batches ride the reader channel as main-loop intake; a dead
 /// receiver ends the thread, and a full bounded queue blocks the send until
 /// the main loop drains (the same backpressure the reader takes — #947 F2).
-fn watch_loop(options: &WatchOptions, sender: Sender<Vec<Incoming>>, stop: &AtomicBool) {
+fn watch_loop(options: &WatchOptions, sender: &Sender<Vec<Incoming>>, stop: &AtomicBool) {
     let Some(mut previous) = scan(&options.root) else {
         return;
     };

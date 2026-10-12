@@ -99,6 +99,12 @@ pub(crate) enum Incoming {
 /// # Errors
 ///
 /// Writing to the client failed (peer vanished mid-answer).
+///
+/// # Panics
+///
+/// Only if the session's fix mailbox is disconnected while the session
+/// lives — the session owns the mailbox's sender end, so a disconnect is an
+/// internal invariant breach, not a reachable peer-induced state.
 pub fn run<R, W>(
     input: R,
     output: W,
@@ -169,9 +175,8 @@ where
             write_turn(&mut output, session.complete_fix(Some(mail)))?;
             continue;
         }
-        let first = match selected.recv(&receiver) {
-            Ok(first) => first,
-            Err(_) => break,
+        let Ok(first) = selected.recv(&receiver) else {
+            break;
         };
 
         // The batch window: the reader forwards each buffered chunk as one
@@ -363,50 +368,18 @@ fn handle_request(
             *lifecycle = Lifecycle::ShutDown;
             Some(Response::ok(id, Value::Null))
         }
-        // The overlay faces answer at intake: they mutate session
-        // bookkeeping or the worktree (staging, evicting, or merging an
-        // agent view), never analyze — no scheduler task, no cancel
-        // surface. `overlay.commit`'s merge analysis drains with the write
-        // task it stages; the RPC answer is the disk write-back.
-        (Lifecycle::Ready, "dartq/overlay.set") => {
+        // The overlay faces answer at intake (see `overlay_response`).
+        (
+            Lifecycle::Ready,
+            "dartq/overlay.set" | "dartq/overlay.commit" | "dartq/overlay.clear",
+        ) => {
             let params = request.params.unwrap_or(Value::Null);
-            match commands::parse_overlay_set(&params, session.workspace_root()) {
-                Ok((agent, files)) => match session.set_overlay(&agent, files) {
-                    Ok(()) => Some(Response::ok(id, overlay_ack())),
-                    Err(error) => Some(Response::error(
-                        Some(id),
-                        codes::INVALID_PARAMS,
-                        error.to_string(),
-                    )),
-                },
-                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
-            }
-        }
-        (Lifecycle::Ready, "dartq/overlay.commit") => {
-            let params = request.params.unwrap_or(Value::Null);
-            match commands::parse_overlay_commit(&params) {
-                Ok(agent) => match session.commit_overlay(&agent) {
-                    Ok(committed) => Some(Response::ok(
-                        id,
-                        json!({
-                            "schema_version": commands::SCHEMA_VERSION,
-                            "committed": committed,
-                        }),
-                    )),
-                    Err(error) => Some(answer_error(id, &error)),
-                },
-                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
-            }
-        }
-        (Lifecycle::Ready, "dartq/overlay.clear") => {
-            let params = request.params.unwrap_or(Value::Null);
-            match commands::parse_overlay_clear(&params) {
-                Ok(agent) => {
-                    session.clear_overlay(&agent);
-                    Some(Response::ok(id, overlay_ack()))
-                }
-                Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
-            }
+            Some(overlay_response(
+                session,
+                id,
+                request.method.as_str(),
+                &params,
+            ))
         }
         // The plugin-dispatch faces stage onto the scheduler like reads —
         // the epoch machinery is their cancel surface — and run off the
@@ -435,23 +408,23 @@ fn handle_request(
                     // The agent view and the context tag are validated at
                     // intake (fail loud on a typo instead of silently
                     // answering the default view).
-                    if let Some(agent) = staged.agent() {
-                        if !session.has_agent(agent) {
-                            return Some(Response::error(
-                                Some(id),
-                                codes::INVALID_PARAMS,
-                                format!("unknown agentId: {agent}"),
-                            ));
-                        }
+                    if let Some(agent) = staged.agent()
+                        && !session.has_agent(agent)
+                    {
+                        return Some(Response::error(
+                            Some(id),
+                            codes::INVALID_PARAMS,
+                            format!("unknown agentId: {agent}"),
+                        ));
                     }
-                    if let Some(tag) = staged.context() {
-                        if !session.has_context(tag) {
-                            return Some(Response::error(
-                                Some(id),
-                                codes::INVALID_PARAMS,
-                                format!("unknown context: {tag}"),
-                            ));
-                        }
+                    if let Some(tag) = staged.context()
+                        && !session.has_context(tag)
+                    {
+                        return Some(Response::error(
+                            Some(id),
+                            codes::INVALID_PARAMS,
+                            format!("unknown context: {tag}"),
+                        ));
                     }
                     session.queue_command(id, staged);
                     None
@@ -484,6 +457,52 @@ fn handle_request(
 /// it).
 fn overlay_ack() -> Value {
     json!({ "schema_version": commands::SCHEMA_VERSION })
+}
+
+/// Answers the overlay faces at intake: they mutate session bookkeeping or
+/// the worktree (staging, evicting, or merging an agent view), never
+/// analyze — no scheduler task, no cancel surface. `overlay.commit`'s merge
+/// analysis drains with the write task it stages; the RPC answer is the
+/// disk write-back.
+fn overlay_response(
+    session: &mut Session,
+    id: jsonrpc::RequestId,
+    method: &str,
+    params: &Value,
+) -> Response {
+    match method {
+        "dartq/overlay.set" => {
+            match commands::parse_overlay_set(params, session.workspace_root()) {
+                Ok((agent, files)) => match session.set_overlay(&agent, files) {
+                    Ok(()) => Response::ok(id, overlay_ack()),
+                    Err(error) => {
+                        Response::error(Some(id), codes::INVALID_PARAMS, error.to_string())
+                    }
+                },
+                Err(message) => Response::error(Some(id), codes::INVALID_PARAMS, message),
+            }
+        }
+        "dartq/overlay.commit" => match commands::parse_overlay_commit(params) {
+            Ok(agent) => match session.commit_overlay(&agent) {
+                Ok(committed) => Response::ok(
+                    id,
+                    json!({
+                        "schema_version": commands::SCHEMA_VERSION,
+                        "committed": committed,
+                    }),
+                ),
+                Err(error) => answer_error(id, &error),
+            },
+            Err(message) => Response::error(Some(id), codes::INVALID_PARAMS, message),
+        },
+        _ => match commands::parse_overlay_clear(params) {
+            Ok(agent) => {
+                session.clear_overlay(&agent);
+                Response::ok(id, overlay_ack())
+            }
+            Err(message) => Response::error(Some(id), codes::INVALID_PARAMS, message),
+        },
+    }
 }
 
 /// One watch batch's intake: the paths split by input kind. `.dart` paths

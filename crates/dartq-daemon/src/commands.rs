@@ -284,6 +284,78 @@ pub(crate) fn is_command(method: &str) -> bool {
     METHODS.contains(&method)
 }
 
+// The faces' parameter payloads, decoded with serde (`#[serde(default)]`
+// keeps every field optional beyond the contract-critical ones).
+
+#[derive(Deserialize)]
+struct VerbosityParams {
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct CheckParams {
+    paths: Vec<PathBuf>,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct QueryParams {
+    name: String,
+    /// An unknown spelling fails here with serde's one-of message —
+    /// the accepted set, surfaced as `INVALID_PARAMS`.
+    #[serde(default)]
+    kind: QueryKind,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct BatchQueryParams {
+    queries: Vec<BatchItemParams>,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct BatchItemParams {
+    name: String,
+    /// Absent means the symbol face (the single request's default); an
+    /// explicit empty set answers nothing for the item.
+    #[serde(default = "default_query_kinds")]
+    kinds: Vec<QueryKind>,
+}
+
+#[derive(Deserialize)]
+struct TargetParams {
+    path: PathBuf,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct ExplainParams {
+    symbol: String,
+    #[serde(default)]
+    verbosity: Verbosity,
+    /// The per-query SDK root; absent defaults to the session's
+    /// resolved SDK root (an explicit value wins).
+    sdk: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct CompatParams {
+    path: PathBuf,
+    sdk_roots: Vec<PathBuf>,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+/// One agent's staged overlay: its name plus a whole-file replacement
+/// buffer per path (PRD §16.3).
+pub(crate) type StagedOverlay = (String, Vec<(PathBuf, Vec<u8>)>);
+
 /// Decodes one `dartq/*` request's parameters. Relative paths resolve
 /// against `root`; `Err` is the `INVALID_PARAMS` message.
 ///
@@ -292,64 +364,6 @@ pub(crate) fn is_command(method: &str) -> bool {
 /// A structural mismatch (wrong type, missing field, unknown `verbosity`)
 /// or an empty `paths`/`sdk_roots` array.
 pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request, String> {
-    #[derive(Deserialize)]
-    struct VerbosityParams {
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-    #[derive(Deserialize)]
-    struct CheckParams {
-        paths: Vec<PathBuf>,
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-    #[derive(Deserialize)]
-    struct QueryParams {
-        name: String,
-        /// An unknown spelling fails here with serde's one-of message —
-        /// the accepted set, surfaced as `INVALID_PARAMS`.
-        #[serde(default)]
-        kind: QueryKind,
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-    #[derive(Deserialize)]
-    struct BatchQueryParams {
-        queries: Vec<BatchItemParams>,
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-    #[derive(Deserialize)]
-    struct BatchItemParams {
-        name: String,
-        /// Absent means the symbol face (the single request's default); an
-        /// explicit empty set answers nothing for the item.
-        #[serde(default = "default_query_kinds")]
-        kinds: Vec<QueryKind>,
-    }
-    #[derive(Deserialize)]
-    struct TargetParams {
-        path: PathBuf,
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-    #[derive(Deserialize)]
-    struct ExplainParams {
-        symbol: String,
-        #[serde(default)]
-        verbosity: Verbosity,
-        /// The per-query SDK root; absent defaults to the session's
-        /// resolved SDK root (an explicit value wins).
-        sdk: Option<PathBuf>,
-    }
-    #[derive(Deserialize)]
-    struct CompatParams {
-        path: PathBuf,
-        sdk_roots: Vec<PathBuf>,
-        #[serde(default)]
-        verbosity: Verbosity,
-    }
-
     let invalid = |error: serde_json::Error| error.to_string();
     match method {
         "dartq/index" => {
@@ -384,34 +398,7 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 context,
             })
         }
-        "dartq/check" | "dartq/fix" => {
-            let decoded = serde_json::from_value::<CheckParams>(params.clone()).map_err(invalid)?;
-            if decoded.paths.is_empty() {
-                return Err("paths must be a non-empty array".into());
-            }
-            let paths = decoded
-                .paths
-                .into_iter()
-                .map(|path| resolve(root, path))
-                .collect();
-            if method == "dartq/check" {
-                let (agent, since) = session_fields(params)?;
-                let context = context_field(params)?;
-                Ok(Request::Check {
-                    paths,
-                    verbosity: decoded.verbosity,
-                    agent,
-                    context,
-                    since,
-                })
-            } else {
-                reject_disk_view_only(params, "dartq/fix")?;
-                Ok(Request::Fix {
-                    paths,
-                    verbosity: decoded.verbosity,
-                })
-            }
-        }
+        "dartq/check" | "dartq/fix" => parse_check_or_fix(method, params, root),
         "dartq/query" => {
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
@@ -425,27 +412,7 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 since,
             })
         }
-        "dartq/queryBatch" => {
-            let (agent, since) = session_fields(params)?;
-            let context = context_field(params)?;
-            let decoded =
-                serde_json::from_value::<BatchQueryParams>(params.clone()).map_err(invalid)?;
-            let queries = decoded
-                .queries
-                .into_iter()
-                .map(|item| BatchQuery {
-                    name: item.name,
-                    kinds: item.kinds,
-                })
-                .collect();
-            Ok(Request::QueryBatch {
-                queries,
-                verbosity: decoded.verbosity,
-                agent,
-                context,
-                since,
-            })
-        }
+        "dartq/queryBatch" => parse_query_batch(params),
         "dartq/impact" => {
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
@@ -459,32 +426,7 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 since,
             })
         }
-        "dartq/explain" => {
-            // Delta economics without a view selector: `since` filters the
-            // report's rows (see `explain_answer`), but an `agentId` or
-            // `context` would silently answer a different view than the
-            // face's disk contract — the fix/compat rule, minus `since`.
-            let (agent, since) = session_fields(params)?;
-            let context = context_field(params)?;
-            if agent.is_some() || context.is_some() {
-                return Err(
-                    "dartq/explain answers the disk view; agentId/context apply to the \
-                     engine-view faces (analyze/check/query/impact)"
-                        .into(),
-                );
-            }
-            let decoded =
-                serde_json::from_value::<ExplainParams>(params.clone()).map_err(invalid)?;
-            if decoded.symbol.is_empty() {
-                return Err("symbol must be a non-empty string".into());
-            }
-            Ok(Request::Explain {
-                symbol: decoded.symbol,
-                verbosity: decoded.verbosity,
-                since,
-                sdk: decoded.sdk,
-            })
-        }
+        "dartq/explain" => parse_explain(params),
         "dartq/compat" => {
             let decoded =
                 serde_json::from_value::<CompatParams>(params.clone()).map_err(invalid)?;
@@ -504,6 +446,102 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         }
         _ => Err(format!("not a dartq command: {method}")),
     }
+}
+
+/// Decodes `dartq/check` and `dartq/fix` (one shared payload shape; check
+/// answers the session's view, fix the disk view).
+///
+/// # Errors
+///
+/// An empty `paths` array, or (`dartq/fix`) any session view field.
+fn parse_check_or_fix(method: &str, params: &Value, root: &Path) -> Result<Request, String> {
+    let invalid = |error: serde_json::Error| error.to_string();
+    let decoded = serde_json::from_value::<CheckParams>(params.clone()).map_err(invalid)?;
+    if decoded.paths.is_empty() {
+        return Err("paths must be a non-empty array".into());
+    }
+    let paths = decoded
+        .paths
+        .into_iter()
+        .map(|path| resolve(root, path))
+        .collect();
+    if method == "dartq/check" {
+        let (agent, since) = session_fields(params)?;
+        let context = context_field(params)?;
+        Ok(Request::Check {
+            paths,
+            verbosity: decoded.verbosity,
+            agent,
+            context,
+            since,
+        })
+    } else {
+        reject_disk_view_only(params, "dartq/fix")?;
+        Ok(Request::Fix {
+            paths,
+            verbosity: decoded.verbosity,
+        })
+    }
+}
+
+/// Decodes `dartq/queryBatch`.
+///
+/// # Errors
+///
+/// A structural mismatch in `queries` or a malformed session field.
+fn parse_query_batch(params: &Value) -> Result<Request, String> {
+    let invalid = |error: serde_json::Error| error.to_string();
+    let (agent, since) = session_fields(params)?;
+    let context = context_field(params)?;
+    let decoded = serde_json::from_value::<BatchQueryParams>(params.clone()).map_err(invalid)?;
+    let queries = decoded
+        .queries
+        .into_iter()
+        .map(|item| BatchQuery {
+            name: item.name,
+            kinds: item.kinds,
+        })
+        .collect();
+    Ok(Request::QueryBatch {
+        queries,
+        verbosity: decoded.verbosity,
+        agent,
+        context,
+        since,
+    })
+}
+
+/// Decodes `dartq/explain`.
+///
+/// # Errors
+///
+/// An empty `symbol`, or any session view selector (the face answers the
+/// disk view only).
+fn parse_explain(params: &Value) -> Result<Request, String> {
+    let invalid = |error: serde_json::Error| error.to_string();
+    // Delta economics without a view selector: `since` filters the
+    // report's rows (see `explain_answer`), but an `agentId` or `context`
+    // would silently answer a different view than the face's disk contract
+    // — the fix/compat rule, minus `since`.
+    let (agent, since) = session_fields(params)?;
+    let context = context_field(params)?;
+    if agent.is_some() || context.is_some() {
+        return Err(
+            "dartq/explain answers the disk view; agentId/context apply to the \
+             engine-view faces (analyze/check/query/impact)"
+                .into(),
+        );
+    }
+    let decoded = serde_json::from_value::<ExplainParams>(params.clone()).map_err(invalid)?;
+    if decoded.symbol.is_empty() {
+        return Err("symbol must be a non-empty string".into());
+    }
+    Ok(Request::Explain {
+        symbol: decoded.symbol,
+        verbosity: decoded.verbosity,
+        since,
+        sdk: decoded.sdk,
+    })
 }
 
 /// The batch item's kinds when the request omits them: the single request's
@@ -568,10 +606,7 @@ pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), 
 ///
 /// A missing or non-string `agentId`, a missing or non-object `files`, or a
 /// non-string path or content.
-pub(crate) fn parse_overlay_set(
-    params: &Value,
-    root: &Path,
-) -> Result<(String, Vec<(PathBuf, Vec<u8>)>), String> {
+pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOverlay, String> {
     let agent = overlay_agent(params, "set")?;
     let files = match params.get("files") {
         Some(Value::Object(files)) => files,
@@ -754,12 +789,11 @@ impl SymbolTable {
                 let Some(path) = row[*path_field].as_str() else {
                     continue;
                 };
-                match counts.get_mut(path) {
-                    Some(count) => *count += 1,
-                    None => {
-                        counts.insert(path.to_owned(), 1);
-                        order.push(path.to_owned());
-                    }
+                if let Some(count) = counts.get_mut(path) {
+                    *count += 1;
+                } else {
+                    counts.insert(path.to_owned(), 1);
+                    order.push(path.to_owned());
                 }
             }
         }
@@ -824,10 +858,10 @@ impl SymbolTable {
                 continue;
             };
             for row in rows {
-                if let Some(path) = row[*path_field].as_str() {
-                    if let Some(id) = lookup.get(path) {
-                        row[*path_field] = Value::String((*id).to_owned());
-                    }
+                if let Some(path) = row[*path_field].as_str()
+                    && let Some(id) = lookup.get(path)
+                {
+                    row[*path_field] = Value::String((*id).to_owned());
                 }
             }
         }
@@ -956,7 +990,7 @@ fn delta_row(
 ) -> bool {
     match since {
         None => true,
-        Some(since) => changes.changed_since(&files.file_path(file), since),
+        Some(since) => changes.changed_since(files.file_path(file), since),
     }
 }
 
@@ -1046,7 +1080,7 @@ pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
 
 /// One check row. Compact mirrors the machine face's field set (severity /
 /// type / code / file / position / length / message, code in dartq's
-/// stable snake_case name spelling); minimal keeps the red line (`code` +
+/// stable `snake_case` name spelling); minimal keeps the red line (`code` +
 /// location); full equals compact today.
 fn check_row(
     diagnostic: &Diagnostic,

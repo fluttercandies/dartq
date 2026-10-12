@@ -259,13 +259,13 @@ const MAX_OVERLAY_BYTES: usize = 64 << 20;
 /// never deletes files would otherwise grow it for its whole life. Past the
 /// cap the lowest cursors evict — those are the rows only a client paging
 /// from a very old `since` could still ask about, and the delta contract
-/// for them is "re-sync without `since`". 65_536 paths ≈ 10 MiB of
+/// for them is "re-sync without `since`". `65_536` paths ≈ 10 MiB of
 /// bookkeeping at ~150 B/entry, orders above any real editing session.
 const MAX_DELTA_PATHS: usize = 65_536;
 
 /// The open-document table's cap (#947 F8): `opened` grows one entry per
 /// distinct `didOpen`, and only `didClose` removed it before. Real clients
-/// hold tens of open editors; 4_096 is orders above that (≈ 0.5 MiB of
+/// hold tens of open editors; `4_096` is orders above that (≈ 0.5 MiB of
 /// bookkeeping), so the least-recently-touched eighth evicts only under a
 /// broken-client open storm. An evicted document degrades to on-disk
 /// truth: its publishes lose the version, and a watch sync may resync its
@@ -289,7 +289,7 @@ const PLUGIN_PANIC_LIMIT: u32 = 3;
 /// completion mail, so nothing leaks). Generous enough that only a
 /// genuinely wedged plugin set ever hits it; finite so the session never
 /// hangs on one.
-const FIX_TIME_BUDGET: Duration = Duration::from_secs(120);
+const FIX_TIME_BUDGET: Duration = Duration::from_mins(2);
 
 /// One agent's staged view (PRD §16.3): the files whose content the agent's
 /// requests see instead of the base view. Base bytes are never stored here —
@@ -373,6 +373,10 @@ pub struct Turn {
     /// target, and produced nothing.
     pub answers: Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
 }
+
+/// One read task's per-view request group: the agent name (`None` is the
+/// base view) with the view's queued requests.
+type ViewGroup = (Option<String>, Vec<(RequestId, Request)>);
 
 /// A queued read task and the requests waiting on its answer. Reads coalesce
 /// per context: one analysis of that context's engine serves every attached
@@ -620,8 +624,8 @@ pub struct Session {
     publishes_due: bool,
     /// The session symbol table (short-id economics, PRD §15.8).
     symbols: commands::SymbolTable,
-    /// The per-file lint-row memo (#772): rows keyed by content + features
-    /// + enable set + package facts + path, so a quiet turn's lint stage
+    /// The per-file lint-row memo (#772): rows keyed by content, features,
+    /// enable set, package facts, and path, so a quiet turn's lint stage
     /// answers unchanged files from memory and only parses the turn's
     /// dirty set. One per session is sound: `ContentId` is the global
     /// blake3-128 content hash, not per-context sequential, and every
@@ -1152,16 +1156,13 @@ impl Session {
             )
         });
         for (path, bytes) in &staged {
-            match existing.and_then(|overlay| overlay.files.get(path)) {
-                Some(prev) => {
-                    total = total
-                        .saturating_sub(prev.bytes.len())
-                        .saturating_add(bytes.len());
-                }
-                None => {
-                    count += 1;
-                    total = total.saturating_add(bytes.len());
-                }
+            if let Some(prev) = existing.and_then(|overlay| overlay.files.get(path)) {
+                total = total
+                    .saturating_sub(prev.bytes.len())
+                    .saturating_add(bytes.len());
+            } else {
+                count += 1;
+                total = total.saturating_add(bytes.len());
             }
         }
         if count > MAX_OVERLAY_FILES {
@@ -1334,14 +1335,14 @@ impl Session {
         // alone, and so is a duplicate cancel of the still-queued answer —
         // one entry in `cancelled` per id, or `service()` would answer it
         // twice.
-        if let Some(run) = &mut self.fix_running {
-            if run.id == *id {
-                if !run.expired && !run.cancelled {
-                    run.cancelled = true;
-                    self.cancelled.push(id.clone());
-                }
-                return;
+        if let Some(run) = &mut self.fix_running
+            && run.id == *id
+        {
+            if !run.expired && !run.cancelled {
+                run.cancelled = true;
+                self.cancelled.push(id.clone());
             }
+            return;
         }
         let Some(read) = self
             .reads
@@ -1489,7 +1490,7 @@ impl Session {
                     }
                 }));
                 match applied {
-                    Ok(_) => {
+                    Ok(()) => {
                         self.snapshot.note_apply();
                         self.cursor += 1;
                         for change in &changes {
@@ -1635,7 +1636,7 @@ impl Session {
                     job,
                     hosts.unwrap_or_else(|| PluginHosts::launch(&root)),
                     &done,
-                )
+                );
             });
         match spawned {
             Ok(_) => {
@@ -1675,18 +1676,19 @@ impl Session {
         // The budget ceiling answers even though the worker still owns the
         // hosts; the slot frees when the late mail lands (it is discarded —
         // no second answer for one id).
-        if let Some(run) = &mut self.fix_running {
-            if !run.expired && Instant::now() >= run.deadline {
-                run.expired = true;
-                moved = true;
-                turn.answers.push((
-                    run.id.clone(),
-                    Err(SessionError::Internal(format!(
-                        "the fix dispatch exceeded its budget ({:?})",
-                        self.fix_budget
-                    ))),
-                ));
-            }
+        if let Some(run) = &mut self.fix_running
+            && !run.expired
+            && Instant::now() >= run.deadline
+        {
+            run.expired = true;
+            moved = true;
+            turn.answers.push((
+                run.id.clone(),
+                Err(SessionError::Internal(format!(
+                    "the fix dispatch exceeded its budget ({:?})",
+                    self.fix_budget
+                ))),
+            ));
         }
         if let Some(mail) = mail {
             self.absorb_fix(mail, &mut turn, &mut moved);
@@ -1712,10 +1714,11 @@ impl Session {
     fn absorb_fix(&mut self, mail: FixMail, turn: &mut Turn, moved: &mut bool) {
         *moved = true;
         self.fix_hosts = Some(mail.hosts);
-        if let Some(run) = self.fix_running.take() {
-            if !run.expired && !run.cancelled {
-                turn.answers.push((run.id, mail.outcome));
-            }
+        if let Some(run) = self.fix_running.take()
+            && !run.expired
+            && !run.cancelled
+        {
+            turn.answers.push((run.id, mail.outcome));
         }
     }
 
@@ -1829,7 +1832,7 @@ impl Session {
     /// base request rides a default-context read, a zero-request base
     /// analysis still runs so the publish diff drains.
     fn read_turn(&mut self, pending: PendingRead, turn: &mut Turn) {
-        let mut groups: Vec<(Option<String>, Vec<(RequestId, Request)>)> = Vec::new();
+        let mut groups: Vec<ViewGroup> = Vec::new();
         for (id, request) in pending.requests {
             let agent = request.agent().map(str::to_owned);
             match groups.iter_mut().find(|(group, _)| *group == agent) {
@@ -1850,7 +1853,7 @@ impl Session {
         let publishes_here = pending.context == self.default_context;
         if publishes_here && (groups.is_empty() || (self.publishes_due && !has_base)) {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.run_group(self.default_context, None, Vec::new(), turn)
+                self.run_group(self.default_context, None, Vec::new(), turn);
             }));
             match outcome {
                 // The drain happened (run_group clears `publishes_due` at
@@ -1878,14 +1881,14 @@ impl Session {
         for (agent, requests) in groups {
             let ids: Vec<RequestId> = requests.iter().map(|(id, _)| id.clone()).collect();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.run_group(pending.context, agent.as_deref(), requests, turn)
+                self.run_group(pending.context, agent.as_deref(), requests, turn);
             }));
             if let Err(payload) = outcome {
                 eprintln!(
                     "dartq-daemon: analysis panicked ({}); answering the group internal error",
                     panic_message(&payload)
                 );
-                self.answer_panicked(turn, ids);
+                Self::answer_panicked(turn, ids);
                 self.note_plugin_path_panic(pending.context, agent.as_deref());
                 self.restore_base_view_contained();
             }
@@ -1894,7 +1897,7 @@ impl Session {
 
     /// Answers a panicking group's ids `INTERNAL_ERROR` (the catch
     /// boundary's degraded answer).
-    fn answer_panicked(&mut self, turn: &mut Turn, ids: Vec<RequestId>) {
+    fn answer_panicked(turn: &mut Turn, ids: Vec<RequestId>) {
         for id in ids {
             turn.answers.push((
                 id,
@@ -1944,82 +1947,15 @@ impl Session {
             self.restore_base_view();
         }
 
-        let mut diagnostics = match self.analyze(context) {
-            Ok(diagnostics) => diagnostics,
-            Err(Cancelled) => {
-                for (id, _) in requests {
-                    turn.answers.push((id, Err(SessionError::Cancelled)));
-                }
-                return;
+        let Ok(mut diagnostics) = self.analyze_with_lints(context) else {
+            for (id, _) in requests {
+                turn.answers.push((id, Err(SessionError::Cancelled)));
             }
+            return;
         };
-        // The lint stage (#355): the resident files' rows — memoized
-        // (#772), so a quiet turn parses only this turn's changed files —
-        // joined before the severity-first sort so the answers keep the
-        // CLI analyze face's order. The context engine reads through
-        // `runtime` directly so the memo field borrows disjointly.
-        let lint_roots = [self.workspace_root().to_path_buf()];
-        let engine = self
-            .runtime
-            .context_state(context)
-            .expect("session contexts live for the session");
-        diagnostics.extend(dartq_commands::lints::analyze_lints(
-            engine,
-            &lint_roots,
-            &mut self.lint_memo,
-        ));
-        // The plugin weave (#471 phase B), on the publish-bearing group
-        // only: the plugins feed once per base analysis — the editor's
-        // view — never per agent view or forked context. The cycle runs
-        // before the convert-once pass so a crash row converts with the
-        // engine rows; findings resolve against the same analyzed view and
-        // merge into the publish plan below (engine rows first, plugin
-        // groups by discovery order, dedup on the four-key). A crash whose
-        // anchor does not exist yet — the session has published nothing —
-        // is withheld by the cycle, not dropped: it publishes on the first
-        // cycle that has one.
         let mut plugin_findings = Vec::new();
         if self.carries_plugins(context, agent) {
-            let anchor: Option<FileId> = self.published.keys().copied().min();
-            // Direct field access (not `self.engine`): the plugins' mutable
-            // borrow and the engine's read must stay disjoint field borrows.
-            let engine = self
-                .runtime
-                .context_state(context)
-                .expect("the read task's context lives for the session");
-            // The weave is contained a level finer than the group (#690):
-            // it is the group's only plugin-row exposure, so a panic here
-            // is attributable and penalizes immediately — while the group's
-            // engine rows still convert, publish, and answer. The skipped
-            // cycle's rows re-feed on the next cycle; a crash recorded by
-            // the penalty surfaces there through the normal one-shot path.
-            let woven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                #[cfg(test)]
-                if crate::probe::take_weave_panic() {
-                    panic!("test-armed plugin weave panic");
-                }
-                let cycle = self
-                    .plugins
-                    .cycle(&diagnostics, engine.file_table(), anchor);
-                diagnostics.extend(cycle.crashes);
-                plugin_findings =
-                    plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
-                        let index = engine.line_index(file)?;
-                        let text = engine.content(file)?;
-                        Some((
-                            index,
-                            std::str::from_utf8(text).expect("engine content is valid UTF-8"),
-                        ))
-                    });
-            }));
-            if let Err(payload) = woven {
-                eprintln!(
-                    "dartq-daemon: the plugin cycle panicked ({}); this cycle's findings are \
-                     skipped",
-                    panic_message(&payload)
-                );
-                self.penalize_plugins("a panic in the plugin cycle");
-            }
+            plugin_findings = self.weave_plugins(context, &mut diagnostics);
         }
         // The one conversion pass per group (the engine→LSP shape change is
         // the expensive half — #347's convert-once discipline, per view):
@@ -2029,30 +1965,7 @@ impl Session {
             .map(|diagnostic| self.convert(context, diagnostic))
             .collect();
         if context == self.default_context && agent.is_none() {
-            let engine_rows =
-                diagnostics
-                    .iter()
-                    .zip(converted.iter())
-                    .filter_map(|(diagnostic, converted)| {
-                        converted.clone().map(|row| (diagnostic.file, row))
-                    });
-            let merged = plugins::merge(engine_rows, plugin_findings);
-            // The crash row is one-shot: it rides this push but never the
-            // published-state baseline, or every later clean cycle would
-            // republish the file to reconcile it away. The marker is
-            // code+source — plugin codes are free-form, so a plugin emitting
-            // the crash code under its own source keeps its rows and its
-            // baseline.
-            let retained: Vec<_> = merged
-                .iter()
-                .filter(|(_, row)| !Self::is_engine_crash_row(row))
-                .cloned()
-                .collect();
-            turn.publishes.extend(self.plan_publishes(merged, retained));
-            // The diff drained: future writes re-arm it. Kept after the
-            // plan so a panic mid-plan leaves the diff due — the next
-            // intake retries it (the containment posture, #690).
-            self.publishes_due = false;
+            self.publish_plan(&diagnostics, &converted, plugin_findings, turn);
         }
         // dartq/analyze answers keep the CLI analyze face's printed order
         // (severity-first before writing; the shared key lives in
@@ -2112,6 +2025,116 @@ impl Session {
             symbols: &self.symbols,
         };
         Self::answer_requests(&drain, requests, &mut turn.answers);
+    }
+
+    /// The group's analysis: the engine turn plus the resident files' lint
+    /// rows (#355) — memoized (#772), so a quiet turn parses only the
+    /// turn's changed files — joined before the caller's severity-first
+    /// sort so the answers keep the CLI analyze face's order. The context
+    /// engine is read through `runtime` directly so the memo field borrows
+    /// disjointly.
+    fn analyze_with_lints(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
+        let mut diagnostics = self.analyze(context)?;
+        let lint_roots = [self.workspace_root().to_path_buf()];
+        let engine = self
+            .runtime
+            .context_state(context)
+            .expect("session contexts live for the session");
+        diagnostics.extend(dartq_commands::lints::analyze_lints(
+            engine,
+            &lint_roots,
+            &mut self.lint_memo,
+        ));
+        Ok(diagnostics)
+    }
+
+    /// The plugin weave (#471 phase B) for the publish-bearing group: the
+    /// plugins feed once per base analysis — the editor's view — never per
+    /// agent view or forked context. The cycle runs before the
+    /// convert-once pass so a crash row converts with the engine rows, and
+    /// findings resolve against the same analyzed view; the caller merges
+    /// them into the publish plan (engine rows first, plugin groups by
+    /// discovery order, dedup on the four-key). A crash whose anchor does
+    /// not exist yet — the session has published nothing — is withheld by
+    /// the cycle, not dropped: it publishes on the first cycle that has
+    /// one. Contained a level finer than the group (#690): this is the
+    /// group's only plugin-row exposure, so a panic here is attributable
+    /// and penalizes immediately — while the group's engine rows still
+    /// convert, publish, and answer. The skipped cycle's rows re-feed on
+    /// the next cycle; a crash recorded by the penalty surfaces there
+    /// through the normal one-shot path.
+    fn weave_plugins(
+        &mut self,
+        context: ContextId,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<plugins::PluginFinding> {
+        let anchor: Option<FileId> = self.published.keys().copied().min();
+        // Direct field access (not `self.engine`): the plugins' mutable
+        // borrow and the engine's read must stay disjoint field borrows.
+        let engine = self
+            .runtime
+            .context_state(context)
+            .expect("the read task's context lives for the session");
+        let mut plugin_findings = Vec::new();
+        let woven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if crate::probe::take_weave_panic() {
+                panic!("test-armed plugin weave panic");
+            }
+            let cycle = self.plugins.cycle(diagnostics, engine.file_table(), anchor);
+            diagnostics.extend(cycle.crashes);
+            plugin_findings =
+                plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
+                    let index = engine.line_index(file)?;
+                    let text = engine.content(file)?;
+                    Some((
+                        index,
+                        std::str::from_utf8(text).expect("engine content is valid UTF-8"),
+                    ))
+                });
+        }));
+        if let Err(payload) = woven {
+            eprintln!(
+                "dartq-daemon: the plugin cycle panicked ({}); this cycle's findings are \
+                 skipped",
+                panic_message(&payload)
+            );
+            self.penalize_plugins("a panic in the plugin cycle");
+        }
+        plugin_findings
+    }
+
+    /// The base group's publish plan: engine rows merged with the plugin
+    /// findings into the turn's publishes. The crash row is one-shot: it
+    /// rides this push but never the published-state baseline, or every
+    /// later clean cycle would republish the file to reconcile it away. The
+    /// marker is code+source — plugin codes are free-form, so a plugin
+    /// emitting the crash code under its own source keeps its rows and its
+    /// baseline. The diff drains here: future writes re-arm it. Kept after
+    /// the plan so a panic mid-plan leaves the diff due — the next intake
+    /// retries it (the containment posture, #690).
+    fn publish_plan(
+        &mut self,
+        diagnostics: &[Diagnostic],
+        converted: &[Option<lsp::Diagnostic>],
+        plugin_findings: Vec<plugins::PluginFinding>,
+        turn: &mut Turn,
+    ) {
+        let engine_rows =
+            diagnostics
+                .iter()
+                .zip(converted.iter())
+                .filter_map(|(diagnostic, converted)| {
+                    converted.clone().map(|row| (diagnostic.file, row))
+                });
+        let merged = plugins::merge(engine_rows, plugin_findings);
+        let retained: Vec<_> = merged
+            .iter()
+            .filter(|(_, row)| !Self::is_engine_crash_row(row))
+            .cloned()
+            .collect();
+        turn.publishes.extend(self.plan_publishes(merged, retained));
+        self.publishes_due = false;
     }
 
     /// One view group's request answering: the fan-out that makes reads
@@ -2193,7 +2216,7 @@ impl Session {
         drain: &commands::Drain<'_>,
     ) -> Vec<(usize, RequestId, Result<serde_json::Value, SessionError>)> {
         let mut results = Vec::new();
-        for (index, id, request) in receiver.iter() {
+        for (index, id, request) in receiver {
             let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 commands::answer(drain, &request)
             }))
@@ -2364,7 +2387,7 @@ impl Session {
             .map(|(path, &cursor)| (cursor, path.clone()))
             .collect();
         by_cursor.sort_unstable();
-        for (_, path) in by_cursor[..by_cursor.len() - keep].iter() {
+        for (_, path) in &by_cursor[..by_cursor.len() - keep] {
             self.changed.remove(path);
         }
     }
@@ -2385,7 +2408,7 @@ impl Session {
             .map(|(path, document)| (document.touched, path.clone()))
             .collect();
         by_touch.sort_unstable();
-        for (_, path) in by_touch[..by_touch.len() - keep].iter() {
+        for (_, path) in &by_touch[..by_touch.len() - keep] {
             self.opened.remove(path);
         }
     }
