@@ -260,8 +260,24 @@ impl Engine {
     /// `remove_file` before apply nets to a no-op for that path.
     ///
     /// The bytes decode as UTF-8 eagerly (the whole pipeline downstream is
-    /// `&str`); invalid sequences become U+FFFD. The oracle never feeds
-    /// invalid UTF-8, so this is documented behavior, not a parity surface.
+    /// `&str`); invalid sequences become U+FFFD. Oracle parity: the analyzer
+    /// read layer (`FileContentCache._read`,
+    /// pkg/analyzer/lib/src/dart/analysis/file_content_cache.dart) decodes
+    /// strictly and on any decode failure marks the file nonexistent
+    /// (`exists = false`, empty content) — an undecodable file contributes
+    /// zero diagnostics. The `encoding` diagnostic ("Unable to decode bytes
+    /// as UTF-8.", pkg/_fe_analyzer_shared/lib/src/messages/diagnostic.g.dart,
+    /// scanner-path translation at pkg/analyzer/lib/src/dart/scanner/
+    /// translate_error_token.dart) belongs to the compiler's byte-scanner
+    /// path and is never reached by `dart analyze`; probed on 3.13.1: FF FE
+    /// in a comment, inside a string literal, and in a code position all
+    /// yield zero rows. dartq keeps analyzing the lossy text: the scanner
+    /// culls U+FFFD silently (`replacement_char_is_skipped_silently` in
+    /// dartq-scanner), which matches that output for bytes inside comments
+    /// or string literals. Bytes landing in code positions are a known
+    /// divergence: the cull can leave a broken token stream (e.g.
+    /// `var <FFFD> = 1;` scans as `var = 1;`) that may surface parser
+    /// diagnostics where the oracle emits none.
     ///
     /// Exactly one leading UTF-8 BOM is dropped before decode (oracle
     /// read-layer parity: the analyzer read path strips it before scanning,
