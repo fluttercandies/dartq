@@ -20,10 +20,10 @@ pub enum Group {
     /// `.third/lints/lib/recommended.yaml` — core plus idiom/style rules.
     Recommended,
     /// A lint-tier mirror of an analyzer diagnostic that is not a
-    /// `package:lints` member. Excluded from the default posture (the
-    /// default enable set is the `package:lints` slice); the rule joins a
-    /// run only by explicit name (`analysis_options` `linter.rules` or a
-    /// caller-built [`EnableSet`]).
+    /// `package:lints` member. No include set carries it — the enable set
+    /// is entirely options-driven (no options file, no lints) — so the
+    /// rule joins a run only by explicit name (`analysis_options`
+    /// `linter.rules` or a caller-built [`EnableSet`]).
     Diagnostic,
 }
 
@@ -173,7 +173,7 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::names::use_super_parameters::SPEC,
     &crate::rules::flow::use_rethrow_when_possible::SPEC,
     // —— diagnostic mirrors (analyzer diagnostics outside `package:lints`;
-    // never in the default posture, opt-in by name) ——
+    // no include set carries them, opt-in by name) ——
     &crate::rules::expressions::unnecessary_type_check::SPEC,
 ];
 

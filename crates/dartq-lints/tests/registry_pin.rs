@@ -343,9 +343,7 @@ fn lint_codes_freeze_matches_the_registry() {
         };
         let spec = RULES[id.0 as usize];
         if spec.group == Group::Diagnostic {
-            orphans.push(format!(
-                "{row}: a diagnostic mirror, never in the default posture"
-            ));
+            orphans.push(format!("{row}: a diagnostic mirror, opt-in by name only"));
         } else if !emittable.contains(spec.name) {
             orphans.push(format!("{row}: structurally silent (kinds: &[])"));
         }

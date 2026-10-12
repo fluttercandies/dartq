@@ -136,7 +136,8 @@
 //!   written-type operand face (scalar literals, `this`, the same-class
 //!   field; the promotion face stays with the semantic tier's always-on
 //!   producer). Registered under a new [`Group::Diagnostic`] — not a
-//!   `package:lints` member, excluded from the default posture, opt-in by
+//!   `package:lints` member, no include set carries it (the enable set is
+//!   entirely options-driven: no options file, no lints), opt-in by
 //!   name (90 specs).
 //! - approximation-conversion tranche (2026-10-12, exemption-reaudit
 //!   F2–F8): eight documented approximation faces replaced with the

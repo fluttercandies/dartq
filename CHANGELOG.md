@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-10-12
+## [1.0.0] - 2026-10-12
 
 Initial release: a Rust-native re-implementation of the Dart analyzer's
 diagnostic pipeline — scanner, parser, flow analysis, resolution, the
@@ -124,7 +124,7 @@ testing against `dart analyze` (Dart 3.13.1) as the oracle.
 ### Performance
 
 Measured numbers only — measured on the differential corpus, check face;
-analyze-face numbers pending the 0.1.0 gate run:
+analyze-face numbers pending the 1.0.0 gate run:
 
 - Small corpus, the m0 differential corpus (396 files): 17.4x wall-clock
   and 33x lower peak memory than `dart analyze` over the same face.
@@ -137,8 +137,8 @@ analyze-face numbers pending the 0.1.0 gate run:
 - Semantics are pinned to the Dart 3.13.1 oracle: syntax features that
   newer SDKs ship behind experiment flags are diagnosed, never silently
   accepted.
-- Incremental L3 fine-grained invalidation lands post-0.1.0.
-- The supported daemon/LSP shell lands post-0.1.0; the 0.1.0 differential
+- Incremental L3 fine-grained invalidation lands post-1.0.0.
+- The supported daemon/LSP shell lands post-1.0.0; the 1.0.0 differential
   gates cover the `check` and `analyze` faces.
 
-[0.1.0]: https://github.com/fluttercandies/dartq/releases/tag/v0.1.0
+[1.0.0]: https://github.com/fluttercandies/dartq/releases/tag/v1.0.0

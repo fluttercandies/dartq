@@ -231,7 +231,7 @@ cache:
 ## Performance
 
 Measured numbers only — measured on the differential corpus, check face;
-analyze-face numbers pending the 0.1.0 gate run:
+analyze-face numbers pending the 1.0.0 gate run:
 
 | Measurement | Result |
 | --- | --- |
@@ -311,7 +311,7 @@ script per gate under `scripts/`, in release order:
 
 Honest state of the recorded evidence: the last recorded gate runs predate
 the corpus reorganization and fell below the full-parity bars, so no
-current-tree gate numbers exist yet — the 0.1.0 release gate chain
+current-tree gate numbers exist yet — the 1.0.0 release gate chain
 re-establishes the evidence, and the final per-gate numbers land in this
 section from that run. The harness itself is runnable directly:
 
@@ -349,7 +349,7 @@ these numbers.
 
 ## Versioning
 
-- The CLI binary follows semver; the workspace version is `0.1.0`.
+- The CLI binary follows semver; the workspace version is `1.0.0`.
 - Machine-readable outputs carry `schema_version`. The frozen v1 contract
   and its evolution rules (breaking change ⇒ major bump; additive fields
   stay in-major and force the schema document to move first) are specified
@@ -363,13 +363,13 @@ these numbers.
 
 ## Limitations
 
-Honest state of the 0.1.0 tree:
+Honest state of the 1.0.0 tree:
 
 - Semantics are pinned to the Dart 3.13.1 oracle: syntax features that
   newer SDKs ship behind experiment flags are diagnosed, never silently
   accepted.
-- Incremental L3 fine-grained invalidation lands post-0.1.0.
-- The supported daemon/LSP shell lands post-0.1.0; the 0.1.0 differential
+- Incremental L3 fine-grained invalidation lands post-1.0.0.
+- The supported daemon/LSP shell lands post-1.0.0; the 1.0.0 differential
   gates cover the `check` and `analyze` faces (see
   [Differential Testing](#differential-testing)).
 - The semantic diagnostic tier is scoped to the families the diagnoser
@@ -406,7 +406,7 @@ one crate at a time, and stops at the first failure naming the crate.
 Concurrency stays under the workspace job cap — `.cargo/config.toml`
 pins `jobs = 2`; the script passes no `-j`.
 
-The 0.1.0 release harness (`scripts/release.sh`) runs the full gate chain
+The 1.0.0 release harness (`scripts/release.sh`) runs the full gate chain
 in order — `m0-gate` → `m1-gate` → `lint-gate` → `m2-gate` → `m3-gate` →
 `ci.sh` → `repro-gate` — one subprocess at a time, each with its own
 evidence directory under `docs/audits/`. Coverage floors and runners live

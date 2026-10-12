@@ -38,9 +38,11 @@
 //! The rows reach [`from_lints`] through the lints layer's diagnostic
 //! face: [`collect_set`] parses each discovered file once through the
 //! layer's production entry ([`dartq_lints::parse_unit`] — the #355
-//! bridge) and runs the default `package:lints` posture (the fix face
-//! targets the paths you point it at, without the analyze pipeline's
-//! options context). Rules without a mechanical rewrite are never
+//! bridge) and runs the file's governing-options lint set — the same
+//! per-subtree resolution the analyze face applies, engine-free (the fix
+//! face targets the paths you point it at; options load through
+//! [`AnalysisOptions::find_for_dir`] + [`AnalysisOptions::load`], not an
+//! engine's table). Rules without a mechanical rewrite are never
 //! claimed, and a wired hit whose slice no longer verifies is dropped
 //! rather than patched on faith. The built-in semantic fix set is its own
 //! face (dartq-ai).
@@ -71,8 +73,11 @@
 //! answers [`AssistAnswer`]s whose rows keep the change grouping the fix
 //! document flattens away.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use dartq_engine::analysis_options::AnalysisOptions;
 use dartq_language::DEFAULT_LANGUAGE_VERSION;
 use dartq_lints::{EnableSet, Features, Lint, RULES, parse_unit, run};
 use dartq_package::PackageTable;
@@ -80,7 +85,9 @@ use dartq_plugin::{
     Capability, FixesReply, PluginRuntime, PrioritizedChange, SpawnSpec,
     discover as discover_plugins,
 };
+use dartq_pub::PackageConfig;
 use dartq_source::{LineIndex, normalize_path, utf16_len_of, utf16_offset_to_byte};
+use rustc_hash::FxHashMap;
 
 use crate::Verbosity;
 use crate::discover::{self, DiscoverError};
@@ -326,13 +333,22 @@ impl PluginHosts {
 
 /// The fix source stage: validates the targets through discovery, then
 /// parses each file once through the lints layer's production entry and
-/// runs the default `package:lints` posture; every hit the mechanical
+/// runs its governing-options lint set; every hit the mechanical
 /// rewrites can materialize (and whose source slice verifies) becomes an
 /// anchored edit, and every lint hit is a `request/fixes` location for
 /// the plugin hosts (one request per hit per live host — the protocol's
 /// only query granularity). One fix set per patched file — files without
 /// rows never enter the set. Each file runs under its containing package's
 /// language version ([`unit_features`]).
+///
+/// The lint set is per-subtree, the analyze face's resolution
+/// ([`crate::lints::analyze_lints`]): each file runs under the options
+/// entry its own ancestry governs ([`AnalysisOptions::find_for_dir`]),
+/// loaded once per distinct options file and keyed once per distinct
+/// directory. No options file in the ancestry is the official
+/// options-less posture — the empty set, and the file skips the parse
+/// (the opt-in cost ruling): nothing runs and no lint hit exists to
+/// dispatch on.
 ///
 /// # Errors
 ///
@@ -342,29 +358,67 @@ pub fn collect_set(
     hosts: &mut PluginHosts,
 ) -> Result<Vec<FileFixSet>, DiscoverError> {
     let files = discover::discover(paths)?;
-    let enabled = crate::lints::enable_set(None);
-    if enabled == EnableSet::none() {
-        return Ok(Vec::new());
-    }
     // One workspace assembly per run, seeded from the first discovered
     // file, best-effort: a target set with no pub context around it — the
     // face's historical shape — stays at the default-version posture
     // instead of failing.
-    let table = files
+    let assembly = files
         .iter()
         .next()
         .and_then(|first| first.parent())
-        .and_then(|dir| crate::workspace::package_assembly(dir).ok())
-        .map(|(table, ..)| table);
+        .and_then(|dir| crate::workspace::package_assembly(dir).ok());
+    // The options-include faces: the assembly's package resolution when it
+    // succeeded; a failed assembly degrades to the empty resolution — a
+    // `package:` include then contributes nothing (the official
+    // unresolvable-include posture) while the options file's own rules
+    // still load.
+    let (table, packages, config_dir) = match assembly {
+        Some((table, packages, config_dir, ..)) => (Some(table), packages, config_dir),
+        None => (
+            None,
+            Arc::new(PackageConfig {
+                packages: Vec::new(),
+                generator: None,
+                generator_version: None,
+                additional_properties: BTreeMap::new(),
+            }),
+            PathBuf::new(),
+        ),
+    };
+    // The per-directory enable sets (governance is by ancestry, so one
+    // directory always maps to one entry) and the per-file loaded options
+    // (shared through the map, workspace members under one repo-root
+    // options file parse it once) — the analyze face's serial precompute,
+    // hoisted into the walk's cold path.
+    let mut enabled: FxHashMap<PathBuf, EnableSet> = FxHashMap::default();
+    let mut loaded: FxHashMap<PathBuf, Arc<AnalysisOptions>> = FxHashMap::default();
     let mut out = Vec::new();
     for path in &files {
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        let set = enabled.entry(dir.to_path_buf()).or_insert_with(|| {
+            let rules = AnalysisOptions::find_for_dir(dir).map(|file| {
+                loaded
+                    .entry(file.clone())
+                    .or_insert_with(|| {
+                        Arc::new(AnalysisOptions::load(&file, &packages, &config_dir))
+                    })
+                    .lint_rules
+                    .clone()
+            });
+            crate::lints::enable_set(rules.as_deref())
+        });
+        if *set == EnableSet::none() {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(path) else {
             // Unreadable or non-UTF-8 target: nothing to patch — the apply
             // face re-reads and reports on its own terms.
             continue;
         };
         let parsed = parse_unit(&text, unit_features(table.as_ref(), path));
-        let hits: Vec<Lint> = run(&parsed.unit(Some(path)), &enabled);
+        let hits: Vec<Lint> = run(&parsed.unit(Some(path)), set);
         let fixes = from_lints(&hits, &text, &parsed.lines);
         let plugin = dispatch_fixes(hosts, path, &text, &parsed.lines, &hits);
         if !fixes.is_empty() || !plugin.is_empty() {
@@ -1368,15 +1422,20 @@ mod tests {
     }
 
     /// End to end through the #355 bridge: [`collect_set`] parses a real
-    /// file on disk, the default `package:lints` posture fires
-    /// `unnecessary_new`, the mechanical rewrite materializes an anchored
-    /// row with the builtin provenance, and applying it rewrites the
-    /// source. Plugin-less hosts contribute no rows and no dispatch.
+    /// file on disk, the governing options file's `linter.rules` include
+    /// fires `unnecessary_new`, the mechanical rewrite materializes an
+    /// anchored row with the builtin provenance, and applying it rewrites
+    /// the source. Plugin-less hosts contribute no rows and no dispatch.
     #[test]
     fn collect_set_emits_real_patches_through_the_bridge() {
         let root = std::env::temp_dir().join(format!("dq_fix_bridge_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "linter:\n  rules:\n    - unnecessary_new\n",
+        )
+        .expect("options file");
         let path = root.join("a.dart");
         let source = "void f() { var a = new B(); }\n";
         std::fs::write(&path, source).expect("write");
@@ -1402,6 +1461,25 @@ mod tests {
         // The document carries the builtin provenance on the row.
         let doc = patch_json(&sets[0].clone(), Verbosity::Compact);
         assert_eq!(doc["edits"][0]["source"], BUILTIN_SOURCE);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The official options-less posture at the fix face: no
+    /// `analysis_options.yaml` in the target's ancestry is the empty lint
+    /// set — a fixable shape in the file produces no lint-driven rows (the
+    /// #936 ruling; the fix face enables nothing on its own).
+    #[test]
+    fn collect_set_options_less_runs_no_lints() {
+        let root = std::env::temp_dir().join(format!("dq_fix_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.dart"), "void f() { var a = new B(); }\n").expect("write");
+
+        let mut hosts = PluginHosts::empty();
+        let sets = collect_set(&[root.clone()], &mut hosts).expect("collect");
+        assert!(sets.is_empty(), "no governing options, no lint rows");
+        assert_eq!(hosts.take_errors(), Vec::new());
 
         std::fs::remove_dir_all(&root).ok();
     }
