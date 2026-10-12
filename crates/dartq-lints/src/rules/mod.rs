@@ -68,6 +68,10 @@ pub(crate) fn last_child(c: &Check<'_>, id: u32) -> Option<u32> {
 /// production `DeclarationBody` begins at the first non-field member, so a
 /// leading field's rows predate its window and the parent pointer is the
 /// only link back).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "arena row space is u32 by the AST table's payload width"
+)]
 pub(crate) fn rows_with_parent(c: &Check<'_>, owner: u32) -> Vec<u32> {
     (0..c.unit.ast.len() as u32)
         .filter(|&row| c.unit.ast.parent(row) == Some(owner))
@@ -161,7 +165,7 @@ pub(crate) fn class_declaration_name<'a>(c: &'a Check<'_>, class_row: u32) -> Op
     Some(c.lexeme(c.head_token(name)))
 }
 
-/// The name-bearing direct child (Identifier or OperatorName) of a member
+/// The name-bearing direct child (Identifier or `OperatorName`) of a member
 /// declaration node — operators name through [`NodeKind::OperatorName`],
 /// everything else through an `Identifier` (collapse map §3.3/§3.5).
 pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
@@ -225,7 +229,7 @@ pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u
 /// when the grammar allows its absence — collapse map §3.3/§3.8). `name`'s
 /// subtree ends at the previous direct sibling, so the sibling is O(1) to
 /// read. `None` when the name is the first child (nothing recovered).
-pub(crate) fn type_before<'a>(c: &'a Check<'_>, parent: u32, name: u32) -> Option<(u32, NodeKind)> {
+pub(crate) fn type_before(c: &Check<'_>, parent: u32, name: u32) -> Option<(u32, NodeKind)> {
     let window = c.children(parent);
     let subtree_start = c.children(name).start;
     (subtree_start > window.start).then(|| {
@@ -485,6 +489,10 @@ pub(crate) fn byte_span_of_token(c: &Check<'_>, token: u32) -> core::ops::Range<
 }
 
 /// The UTF-16 span of one token — the `reportAtToken` face.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "utf16 lengths fit u32 by the SourceRange convention"
+)]
 pub(crate) fn utf16_token_span(c: &Check<'_>, token: u32) -> core::ops::Range<u32> {
     let start = c
         .unit
@@ -861,8 +869,13 @@ pub(crate) fn member_matches(
     hits
 }
 
-/// The written-type verdicts the field-reading faces need (void_checks,
-/// implicit_call_tearoffs, null_check_on_nullable_type_parameter).
+/// The written-type verdicts the field-reading faces need (`void_checks`,
+/// `implicit_call_tearoffs`, `null_check_on_nullable_type_parameter`).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent written-type predicates read by several rule faces; \
+              an enum encoding would force match plumbing at every read site"
+)]
 pub(crate) struct TypeFace<'a> {
     /// The written type's head name (`List` of `List<int>`, `T` of `T?`);
     /// `None` for `void` and function types.
@@ -881,7 +894,7 @@ pub(crate) struct TypeFace<'a> {
 }
 
 /// The written type face of the same-class instance field `name` (the
-/// `Fields` row's written type sibling — the prefer_initializing_formals
+/// `Fields` row's written type sibling — the `prefer_initializing_formals`
 /// tiling). `None` when the name is no instance field of the enclosing
 /// class-like declaration.
 ///

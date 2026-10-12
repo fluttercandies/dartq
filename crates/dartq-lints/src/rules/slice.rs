@@ -87,9 +87,7 @@ pub(crate) fn binary_operands(c: &Check<'_>) -> Option<(Vec<u32>, Vec<u32>)> {
         _ => {
             let grand = c.ancestor(2)?;
             let owner_kids = c.collect_direct(grand);
-            let Some(container_pos) = owner_kids.iter().position(|&kid| kid == parent) else {
-                return None;
-            };
+            let container_pos = owner_kids.iter().position(|&kid| kid == parent)?;
             statement_run(c, &owner_kids[..container_pos])
         }
     };
@@ -475,13 +473,13 @@ pub(crate) fn arguments(c: &Check<'_>, pieces: &[u32]) -> Vec<core::ops::Range<u
             }) {
                 end += 1;
             }
-            if end == i + 1 {
-                if let Some(offset) = pieces[i + 1..].iter().position(|&piece| {
+            if end == i + 1
+                && let Some(offset) = pieces[i + 1..].iter().position(|&piece| {
                     let span = c.byte_span(piece);
                     span.start <= head_span.start && head_span.end <= span.end
-                }) {
-                    end = i + offset + 2;
-                }
+                })
+            {
+                end = i + offset + 2;
             }
             args.push(i..end);
             i = end;

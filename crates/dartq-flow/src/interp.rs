@@ -266,8 +266,8 @@ impl ForBounds {
                 }
             }
         }
-        for j in begin + 1..parts {
-            if matches!(events[j], Ev::ForInit) {
+        for (j, event) in events.iter().enumerate().take(parts).skip(begin + 1) {
+            if matches!(event, Ev::ForInit) {
                 cond_start = j + 1;
                 break;
             }
@@ -684,7 +684,7 @@ impl<'o> Interp<'o> {
     // —— state helpers ——————————————————————————————————————————————————
 
     /// Whether any control path reaches the current state (official
-    /// `isReachable` = `overallReachable`, flow_analysis.dart:6396) — the
+    /// `isReachable` = `overallReachable`, `flow_analysis.dart:6396`) — the
     /// diagnostic face: dead-code anchors, unassigned-read rows, promotion
     /// rows, and body-completion rows all query it. Splits resurrect the
     /// LOCAL flag (official `Reachability.split`), never this one; the
@@ -796,7 +796,7 @@ impl<'o> Interp<'o> {
     /// `&&`/`||`/`??`, dead `?:` arm): the official reports at the
     /// construct's own `flowEnd` — one row from the re-anchored start
     /// (operator token / arm's first token) to the arm's end — and resets
-    /// (dead_code_verifier.dart:311-322, type_analyzer.dart:2588/:2616).
+    /// (dead_code_verifier.dart:311-322, `type_analyzer.dart:2588/:2616`).
     /// An already-open interval folds instead: the outer anchor owns the
     /// reporting and the arm only grows its end.
     pub(crate) fn dead_expr_arm(&mut self, anchor: TokenSpan, end: u32) {

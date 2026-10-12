@@ -83,24 +83,23 @@ fn check_if(c: &mut Check<'_>, node: u32) {
         // With an `else`, both arms are checked; an else-if chain arm is
         // skipped (`elseStatement is! IfStatement`, :71-77).
         check_body(c, then, "an if");
-        if let Some(else_stmt) = arms.1 {
-            if c.kind(else_stmt) != NodeKind::IfStatement {
-                check_body(c, else_stmt, "an if");
-            }
+        if let Some(else_stmt) = arms.1
+            && c.kind(else_stmt) != NodeKind::IfStatement
+        {
+            check_body(c, else_stmt, "an if");
         }
         return;
     }
     // An `if` without `else` that IS the else branch of an outer if: the
     // outer chain already requires blocks, so the then-arm is checked
     // unconditionally (:55-61).
-    if let Some(parent) = c.ancestor(1) {
-        if c.kind(parent) == NodeKind::IfStatement
-            && c.payload(parent).first().copied() != Some(NONE_TOKEN)
-            && arms.2 == Some(node)
-        {
-            check_body(c, then, "an if");
-            return;
-        }
+    if let Some(parent) = c.ancestor(1)
+        && c.kind(parent) == NodeKind::IfStatement
+        && c.payload(parent).first().copied() != Some(NONE_TOKEN)
+        && arms.2 == Some(node)
+    {
+        check_body(c, then, "an if");
+        return;
     }
     // Single-line form allowed (:62-69): report only when the statement
     // spans lines (`lineOf(if) != lineOf(then.end)`).
@@ -343,8 +342,8 @@ pub(crate) mod no_duplicate_case_values {
     /// — a `case` whose constant value equals an earlier `case` of the same
     /// switch reports at the duplicate expression with both sources spelled
     /// into `{0}`/`{1}`. The official visitor processes only legacy members
-    /// (`if (member is SwitchCase)`, :41); the AstBuilder materializes that
-    /// member shape only when `Feature.patterns` is off (ast_builder.dart:1295
+    /// (`if (member is SwitchCase)`, :41); the `AstBuilder` materializes that
+    /// member shape only when `Feature.patterns` is off (`ast_builder.dart:1295`
     /// — patterns shipped in 3.0), so at the default language version every
     /// case is a `SwitchPatternCase` and the lint is silent — the official
     /// test pins exactly that (all default-version duplicates expect no lint;
@@ -523,7 +522,7 @@ pub(crate) mod no_duplicate_case_values {
         };
         u64::from_str_radix(digits, radix)
             .ok()
-            .map(|value| value as i64)
+            .map(u64::cast_signed)
     }
 
     /// The value of one string literal: a single-token span (adjacent
@@ -1196,8 +1195,8 @@ pub(crate) mod exhaustive_cases {
     //!
     //! Mounted face: the element facts ride the same-file declarative
     //! channel — the scrutinee's written type resolves through
-    //! [`same_file::written_type`](crate::rules::expressions::same_file::
-    //! written_type) (the `type_literal_in_constant_pattern` idiom), the
+    //! [`same_file::written_type`](crate::rules::expressions::same_file::written_type)
+    //! (the `type_literal_in_constant_pattern` idiom), the
     //! candidate's constructor/field facts walk the same-file declaration
     //! rows, and constant-value identity interns canonical initializer
     //! texts — `computeConstantValue` same-file edition: two constants
@@ -1991,15 +1990,18 @@ pub(crate) mod exhaustive_cases {
     }
 
     impl ConstValues {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "interned ids are bounded by one unit's constant count; \
+                      u32 is the payload width"
+        )]
         fn intern(&mut self, c: &Check<'_>, range: core::ops::Range<u32>) -> u32 {
             let text = token_text(c, range);
-            match self.texts.iter().position(|known| *known == text) {
-                Some(id) => id as u32,
-                None => {
-                    self.texts.push(text);
-                    (self.texts.len() - 1) as u32
-                }
+            if let Some(id) = self.texts.iter().position(|known| *known == text) {
+                return id as u32;
             }
+            self.texts.push(text);
+            (self.texts.len() - 1) as u32
         }
 
         fn text(&self, id: u32) -> &str {

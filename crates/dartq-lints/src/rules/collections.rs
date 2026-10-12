@@ -1105,10 +1105,10 @@ pub(crate) mod collection_methods_unrelated_type {
         // or the `[`; the `]` is the span's last token. The byte offsets
         // bound the key scan.
         let range = c.unit.ast.token_range(node);
-        let open = if c.payload(node).first().copied() != Some(crate::rules::NONE_TOKEN) {
-            range.start + 1
-        } else {
+        let open = if c.payload(node).first().copied() == Some(crate::rules::NONE_TOKEN) {
             range.start
+        } else {
+            range.start + 1
         };
         let close = range.end - 1;
         let open_byte = crate::rules::byte_span_of_token(c, open).start;
@@ -1204,13 +1204,11 @@ pub(crate) mod collection_methods_unrelated_type {
     /// `Queue.remove` declares on dart:collection's `Queue` (:158-164).
     fn expected_slot(method: &str, written: &str) -> Option<(usize, ())> {
         match (method, written) {
-            ("contains", "List" | "Set" | "Iterable" | "String" | "Queue") => Some((0, ())),
-            ("remove", "List" | "Set" | "Queue") => Some((0, ())),
-            ("remove", "Map") => Some((0, ())),
-            ("lookup", "Set") => Some((0, ())),
-            ("containsKey", "Map") => Some((0, ())),
             ("containsValue", "Map") => Some((1, ())),
-            ("[]", "Map") => Some((0, ())),
+            ("contains", "List" | "Set" | "Iterable" | "String" | "Queue")
+            | ("remove", "List" | "Set" | "Queue" | "Map")
+            | ("lookup", "Set")
+            | ("containsKey" | "[]", "Map") => Some((0, ())),
             _ => None,
         }
     }

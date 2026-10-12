@@ -220,7 +220,7 @@ pub enum Ev {
         kw: Option<TokenSpan>,
     },
     /// A case clause head: `span` is the `case` keyword — the member's
-    /// first dead node anchors its row there (dead_code_verifier.dart:232).
+    /// first dead node anchors its row there (`dead_code_verifier.dart:232`).
     CaseExprBegin {
         span: TokenSpan,
     },
@@ -306,14 +306,14 @@ pub enum Ev {
     PatternAssign,
     CondBegin,
     /// The then arm ended at `:`: a dead arm's row spans its own range
-    /// (official `flowEnd(thenExpression)`, type_analyzer.dart:2588).
+    /// (official `flowEnd(thenExpression)`, `type_analyzer.dart:2588`).
     /// `then_end` is the arm's last token end.
     CondColon {
         then_begin: TokenSpan,
         then_end: u32,
     },
     /// The else arm ended: a dead arm's row spans its own range (official
-    /// `flowEnd(elseExpression)`, type_analyzer.dart:2616). `end` is the
+    /// `flowEnd(elseExpression)`, `type_analyzer.dart:2616`). `end` is the
     /// conditional's last token end.
     CondEnd {
         else_begin: TokenSpan,

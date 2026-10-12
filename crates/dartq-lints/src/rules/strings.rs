@@ -305,6 +305,12 @@ pub(crate) mod unnecessary_string_interpolations {
         check,
     };
 
+    #[expect(
+        clippy::match_same_arms,
+        reason = "the interpolation-identifier arm is a documented no-op face \
+                  (:50-53 keeps `'$x'` unflagged); folding it into the wildcard \
+                  would erase that pinned under-report note"
+    )]
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let tokens = c.unit.tokens;

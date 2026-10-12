@@ -16,6 +16,10 @@
 //! Zero persistent memory: nothing here is retained after
 //! [`ParsedUnit`] drops — the engine re-parses resident source text at
 //! consumption time (#355 ruling 1).
+//!
+//! The `usize` to `u32` casts below mirror the builder's payload widths.
+
+#![allow(clippy::cast_possible_truncation)]
 
 use std::path::Path;
 
@@ -157,7 +161,7 @@ pub(crate) struct AstListener {
     /// `handle_enum_elements` fires while the `EnumBody` wrapper is still
     /// open; the `EnumDeclaration` payload word 2 (`elements_end`) is
     /// stashed here and applied at `end_enum_declaration` (`None` writes
-    /// the TOKEN_NONE sentinel for element-less enums).
+    /// the `TOKEN_NONE` sentinel for element-less enums).
     enum_elements_end: Option<u32>,
     /// Arena-tail snapshot at the previous `SwitchCase` boundary: the case's
     /// labels/expressions/guards complete BEFORE `begin_switch_case` fires,
@@ -369,19 +373,16 @@ impl ParserListener for AstListener {
         // Recovery-pass sentinel (collapse map §3.1): anchored at the `;`
         // when the pass found one, zero-width at the current position
         // otherwise.
-        match semicolon {
-            Some(semicolon) => {
-                self.b.begin(NodeKind::RecoverImport, self.t(semicolon.id));
-                self.b.patch(0, self.t(semicolon.id));
-                self.b
-                    .end(NodeKind::RecoverImport, self.t(semicolon.id) + 1);
-            }
-            None => {
-                let anchor = self.b.last_end_token().expect("recover import anchor");
-                self.b.begin(NodeKind::RecoverImport, anchor);
-                self.b.patch(0, TOKEN_NONE);
-                self.b.end(NodeKind::RecoverImport, anchor);
-            }
+        if let Some(semicolon) = semicolon {
+            self.b.begin(NodeKind::RecoverImport, self.t(semicolon.id));
+            self.b.patch(0, self.t(semicolon.id));
+            self.b
+                .end(NodeKind::RecoverImport, self.t(semicolon.id) + 1);
+        } else {
+            let anchor = self.b.last_end_token().expect("recover import anchor");
+            self.b.begin(NodeKind::RecoverImport, anchor);
+            self.b.patch(0, TOKEN_NONE);
+            self.b.end(NodeKind::RecoverImport, anchor);
         }
     }
 
@@ -2706,19 +2707,16 @@ impl ParserListener for AstListener {
     fn end_constant_pattern(&mut self, const_keyword: Option<TokenSpan>) {
         let pending = self.pending_constant_pattern.take();
         let head = pending.or(const_keyword.map(|t| self.t(t.id)));
-        match head {
-            Some(head) => {
-                let start = self
-                    .b
-                    .last_subtree_start()
-                    .expect("constant pattern operand");
-                self.b
-                    .begin_with_first_child(NodeKind::ConstantPattern, head, start);
-            }
-            None => {
-                let first = self.b.last_first_token().expect("constant pattern operand");
-                self.b.begin_adopting(NodeKind::ConstantPattern, first, 1);
-            }
+        if let Some(head) = head {
+            let start = self
+                .b
+                .last_subtree_start()
+                .expect("constant pattern operand");
+            self.b
+                .begin_with_first_child(NodeKind::ConstantPattern, head, start);
+        } else {
+            let first = self.b.last_first_token().expect("constant pattern operand");
+            self.b.begin_adopting(NodeKind::ConstantPattern, first, 1);
         }
         self.end_last(NodeKind::ConstantPattern);
     }

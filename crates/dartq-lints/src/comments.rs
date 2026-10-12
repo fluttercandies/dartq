@@ -11,6 +11,11 @@
 //! is exactly a comment — a `//` inside a string literal always lies inside
 //! one token's byte range and is never scanned. Block comments nest (depth
 //! counted, matching the scanner; `dartq-scanner` crate docs).
+//!
+//! The `usize` to `u32` casts below mirror the token-table's own
+//! offset/id widths.
+
+#![allow(clippy::cast_possible_truncation)]
 
 use dartq_scanner::TokenTable;
 

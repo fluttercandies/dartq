@@ -183,6 +183,11 @@ pub static RULES: &[&RuleSpec] = &[
 /// casing of a registered rule resolves — the SDK machine names are lowercase
 /// while `package:lints` yaml uses mixed-case spellings; the spec's canonical
 /// name (what reports render) is unchanged.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "rule positions come from the static registry, bounded far below \
+              u16::MAX; u16 is the RuleId payload width"
+)]
 #[must_use]
 pub fn rule_by_name(name: &str) -> Option<RuleId> {
     RULES
@@ -209,6 +214,11 @@ impl EnableSet {
     #[must_use]
     pub fn all() -> Self {
         let mut set = Self { words: [0; WORDS] };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "rule positions come from the static registry, bounded \
+                      far below u16::MAX; u16 is the RuleId payload width"
+        )]
         for i in 0..RULES.len() {
             set.set(RuleId(i as u16));
         }

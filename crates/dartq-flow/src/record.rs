@@ -53,7 +53,7 @@ pub struct Flow<'t> {
     /// `beginLabeledStatement` carries the statement past the labels
     /// (official fasta shape), but the official dead row anchors at the
     /// labeled statement's `firstToken` — the first label
-    /// (dead_code_verifier.dart:253) — so the begin latches this.
+    /// (`dead_code_verifier.dart:253`) — so the begin latches this.
     pending_label_token: Option<Token>,
     /// Recording buffer of the outermost active executable, if any.
     buffer: Option<Vec<Ev>>,
@@ -98,6 +98,11 @@ impl<'t> Flow<'t> {
     /// The span of the token at table `index` (the recorder's token-table
     /// navigation for arm boundaries the listener surface carries only by
     /// adjacency).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "SourceRange is u32 by the scanner's own offset/length \
+                  convention; source files fit that width"
+    )]
     fn span_at(&self, index: usize) -> Option<TokenSpan> {
         self.tokens.get(index).map(|token| {
             let range = token.byte_range();

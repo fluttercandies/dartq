@@ -231,6 +231,12 @@ fn parse_element_list(rest: &str) -> Vec<Entry> {
 }
 
 /// 1-based line number of a byte offset.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::naive_bytecount,
+    reason = "line numbers fit u32 by the SourceRange convention; the plain \
+              byte count avoids a new dependency on this cold path"
+)]
 fn line_of(source: &str, byte_offset: u32) -> u32 {
     1 + source.as_bytes()[..byte_offset as usize]
         .iter()

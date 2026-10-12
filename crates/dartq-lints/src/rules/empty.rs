@@ -75,7 +75,7 @@ pub(crate) mod empty_constructor_bodies {
     /// empty AND whose `}` carries no preceding comments reports at the
     /// block. The official factory exclusion is structural here: factory
     /// methods land as [`NodeKind::Factory`] nodes, not
-    /// [`NodeKind::Constructor`] (collapse map §3.3 FactoryEnd row), so no
+    /// [`NodeKind::Constructor`] (collapse map §3.3 `FactoryEnd` row), so no
     /// `factoryKeyword` test is needed. Message: `diagnostic.g.dart`
     /// `emptyConstructorBodies`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
@@ -132,14 +132,12 @@ pub(crate) mod empty_catches {
         let node = c.node();
         // The exception formal is the first child; its name token is payload
         // word 1 (collapse map §3.3 FormalParameter row).
-        if let Some(exception) = super::first_child(c, node) {
-            if c.kind(exception) == NodeKind::FormalParameter {
-                if let Some(&name) = c.payload(exception).get(1) {
-                    if super::is_just_underscores(c.lexeme(name)) {
-                        return;
-                    }
-                }
-            }
+        if let Some(exception) = super::first_child(c, node)
+            && c.kind(exception) == NodeKind::FormalParameter
+            && let Some(&name) = c.payload(exception).get(1)
+            && super::is_just_underscores(c.lexeme(name))
+        {
+            return;
         }
         let Some(body) = super::last_child(c, node) else {
             return;

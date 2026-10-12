@@ -18,7 +18,7 @@ pub(crate) mod unnecessary_new {
     /// every `new` keyword of an instance creation reports at the keyword
     /// (`reportAtToken(keyword)`). `new` is the span head (`NewExpression`
     /// is a width-0 kind: the derivable word lives in `header.first_token`,
-    /// collapse map §3.5 NewExpressionEnd row + the §1 elimination note).
+    /// collapse map §3.5 `NewExpressionEnd` row + the §1 elimination note).
     /// Message: `diagnostic.g.dart` `unnecessaryNew`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_new",
@@ -47,7 +47,7 @@ pub(crate) mod unnecessary_null_in_if_null_operators {
     /// Official: `pkg/linter/lib/src/rules/unnecessary_null_in_if_null_operators.dart:34-49`
     /// — `a ?? null` (or `null ?? a`) reports at the `null` literal, right
     /// operand first. The operator is payload word 0, operands the two
-    /// children (collapse map §3.5 BinaryExpression row). Message:
+    /// children (collapse map §3.5 `BinaryExpression` row). Message:
     /// `diagnostic.g.dart` `unnecessaryNullInIfNullOperators`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_null_in_if_null_operators",
@@ -168,7 +168,7 @@ pub(crate) mod unnecessary_type_check {
     /// Approximations (documented): the operand face is the syntax-knowable
     /// slice — scalar literals, the `null` literal (`Null`), `this` (the
     /// enclosing class-like name), and the same-class instance field (bare
-    /// or `this.`-qualified, the void_checks field face; a bare name
+    /// or `this.`-qualified, the `void_checks` field face; a bare name
     /// shadowed by a local over-reports — the user-shadowed family). The
     /// check face is the written type row; the name-level subtype relation
     /// is same-name (type arguments equal name+nullable — the
@@ -180,7 +180,7 @@ pub(crate) mod unnecessary_type_check {
     /// (`n is! int` after a promotion) needs flow analysis and stays with
     /// the semantic tier, as do initializer positions whose run carries
     /// declaration rows. An unresolved operand under the `dynamic` gate
-    /// reports where the official's InvalidType gate (:1008-1010) stays
+    /// reports where the official's `InvalidType` gate (:1008-1010) stays
     /// silent (over-report, the erroneous family).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_type_check",
@@ -1246,8 +1246,8 @@ pub(crate) mod prefer_is_not_empty {
         }
         // The interface declares `isNotEmpty` (:57-62): every core family
         // with `isEmpty` does, so the face query decides.
-        if !slice::receiver_faces(c, chain, name)
-            .is_none_or(|faces| faces & (slice::ITERABLE | slice::MAP | slice::STRING) != 0)
+        if slice::receiver_faces(c, chain, name)
+            .is_some_and(|faces| faces & (slice::ITERABLE | slice::MAP | slice::STRING) == 0)
         {
             return;
         }
@@ -1786,6 +1786,12 @@ pub(crate) mod same_file {
     /// The production shape: the name identifier carries the local-variable
     /// context word inside its `VariablesDeclaration` slice, typed by the
     /// nearest preceding `Type` piece.
+    #[expect(
+        clippy::option_option,
+        reason = "three states by design: name absent (outer None) vs \
+                  present-untyped vs present-typed; callers branch on the \
+                  outer layer first"
+    )]
     fn block_binding(
         c: &Check<'_>,
         block: u32,
@@ -1825,6 +1831,12 @@ pub(crate) mod same_file {
     }
 
     /// The explicit type of a formal parameter.
+    #[expect(
+        clippy::option_option,
+        reason = "three states by design: name absent (outer None) vs \
+                  present-untyped vs present-typed; callers branch on the \
+                  outer layer first"
+    )]
     fn parameter_binding(c: &Check<'_>, params: u32, name: &str) -> Option<Option<u32>> {
         for kid in c.collect_direct(params) {
             if c.kind(kid) != NodeKind::FormalParameter {
@@ -1849,6 +1861,12 @@ pub(crate) mod same_file {
     }
 
     /// The explicit type of an instance field declared in the owner body.
+    #[expect(
+        clippy::option_option,
+        reason = "three states by design: name absent (outer None) vs \
+                  present-untyped vs present-typed; callers branch on the \
+                  outer layer first"
+    )]
     fn field_binding(c: &Check<'_>, owner: u32, name: &str) -> Option<Option<u32>> {
         for member in c.collect_direct(owner) {
             if c.kind(member) != NodeKind::Fields
@@ -1864,6 +1882,12 @@ pub(crate) mod same_file {
     }
 
     /// The explicit type of a top-level variable.
+    #[expect(
+        clippy::option_option,
+        reason = "three states by design: name absent (outer None) vs \
+                  present-untyped vs present-typed; callers branch on the \
+                  outer layer first"
+    )]
     fn top_level_field_binding(c: &Check<'_>, unit: u32, name: &str) -> Option<Option<u32>> {
         for top in c.collect_direct(unit) {
             for inner in c.collect_direct(top) {
@@ -1880,6 +1904,12 @@ pub(crate) mod same_file {
     /// Shared `Fields` scan: the name identifiers carry the field context
     /// (a written type is a `TypeReference` identifier), and the type head
     /// precedes each name among the children.
+    #[expect(
+        clippy::option_option,
+        reason = "three states by design: name absent (outer None) vs \
+                  present-untyped vs present-typed; callers branch on the \
+                  outer layer first"
+    )]
     fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>> {
         let ctx = if c.kind(fields) == NodeKind::TopLevelFields {
             dartq_parser::IdentifierContext::TopLevelVariableDeclaration as u32
@@ -2856,7 +2886,7 @@ pub(crate) mod prefer_final_fields {
             let set = |ctor: u32| sets_field(c, ctor, candidate.name);
             let set_any = constructors.iter().copied().any(set);
             let set_all = constructors.iter().copied().all(set);
-            if !(set_any && set_all) && !candidate.has_initializer {
+            if !(candidate.has_initializer || set_any && set_all) {
                 continue;
             }
             let range = c.utf16_span(candidate.declaration);
@@ -3146,7 +3176,6 @@ pub(crate) mod unrelated_type_equality_checks {
             NodeKind::LiteralDouble => Some("double"),
             NodeKind::StringLiteral => Some("String"),
             NodeKind::LiteralBool => Some("bool"),
-            NodeKind::LiteralNull => None, // the official skips null operands
             NodeKind::ThisExpression => {
                 let class_row = c.path.iter().rev().find(|&&a| {
                     matches!(
@@ -3167,6 +3196,8 @@ pub(crate) mod unrelated_type_equality_checks {
                     })?;
                 Some(c.lexeme(c.head_token(name)))
             }
+            // `null` skips too (the official skips null operands); every
+            // other kind has no scalar face.
             _ => None,
         }
     }
@@ -3289,7 +3320,7 @@ pub(crate) mod null_check_on_nullable_type_parameter {
     /// Approximation (documented): the operand face is `this.<field>` or
     /// bare `<field>` where the same-class field is written `T?` with `T`
     /// a class type parameter. The context face (`getExpectedType`,
-    /// unnecessary_null_checks.dart) ports for the two syntax-knowable
+    /// `unnecessary_null_checks.dart`) ports for the two syntax-knowable
     /// sites: a `return` inside a method whose written return type is
     /// `T?`, and a variable initializer whose declaration is written
     /// `T?`. Other contexts (arguments, assignments) stay silent
@@ -3365,10 +3396,7 @@ pub(crate) mod null_check_on_nullable_type_parameter {
         let Some(face) = crate::rules::type_face_of_field(c, name) else {
             return false;
         };
-        face.nullable
-            && face
-                .name
-                .is_some_and(|t| type_parameters.iter().any(|p| *p == t))
+        face.nullable && face.name.is_some_and(|t| type_parameters.contains(&t))
     }
 
     /// The enclosing class's type parameter names. Production tiling: the
@@ -3445,7 +3473,7 @@ pub(crate) mod null_check_on_nullable_type_parameter {
                     let function = enclosing_function(c, ancestor)?;
                     return written_return_type(c, function)
                         .filter(|face| face.1)
-                        .and_then(|face| Some(face.0));
+                        .map(|face| face.0);
                 }
                 NodeKind::Block | NodeKind::BlockBody | NodeKind::ExpressionBody => {
                     return None; // a body boundary — no written context face
@@ -3470,9 +3498,7 @@ pub(crate) mod null_check_on_nullable_type_parameter {
     /// The written type sibling of a declaration row: `(name, nullable)`.
     type WrittenType<'a> = (&'a str, bool);
     fn written_declaration_type<'a>(c: &'a Check<'_>, decl: u32) -> Option<WrittenType<'a>> {
-        let Some(owner) = c.unit.ast.parent(decl) else {
-            return None;
-        };
+        let owner = c.unit.ast.parent(decl)?;
         let members = c.collect_direct(owner);
         let index = members.iter().position(|&m| m == decl)?;
         let type_row = index
@@ -3585,14 +3611,13 @@ pub(crate) mod implicit_call_tearoffs {
         }
         // The right side: `this.<field>` or bare `<field>`, whose field
         // type names a same-file class with an instance `call` method.
-        let rows = match c.kind(node) {
-            NodeKind::VariableInitializer => c.collect_direct(node),
-            _ => {
-                let Some((_, right)) = slice::binary_operands(c) else {
-                    return;
-                };
-                right
-            }
+        let rows = if c.kind(node) == NodeKind::VariableInitializer {
+            c.collect_direct(node)
+        } else {
+            let Some((_, right)) = slice::binary_operands(c) else {
+                return;
+            };
+            right
         };
         let run = slice::access_run(c, &rows);
         let Some(field) = assigned_name(c, &run) else {

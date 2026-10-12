@@ -34,13 +34,13 @@ pub(crate) mod camel_case_types {
     use super::{Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_types.dart:33-88` —
-    /// every type-introducing declaration's name must be UpperCamelCase
+    /// every type-introducing declaration's name must be `UpperCamelCase`
     /// (`isCamelCase`, `pkg/linter/lib/src/utils.dart:22`). Message:
     /// `diagnostic.g.dart` `camelCaseTypes`.
     ///
     /// Names of top-level declarations live in the enclosing
     /// [`NodeKind::TopLevelDeclaration`] wrapper (collapse map §3.1:
-    /// TopLevelDeclarationEnd, the name-Identifier container). The official
+    /// `TopLevelDeclarationEnd`, the name-Identifier container). The official
     /// augmentation skips are wave-1 inert: `augment` is gated off at the
     /// scanner, so no augmentation declaration reaches the AST.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
@@ -89,7 +89,7 @@ pub(crate) mod camel_case_extensions {
     use super::{Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_extensions.dart:31-42`
-    /// — a named extension's name must be UpperCamelCase. The name is
+    /// — a named extension's name must be `UpperCamelCase`. The name is
     /// payload word 1 of [`NodeKind::ExtensionDeclaration`]
     /// (`extension: T, name: O, on: O`, collapse map §3.2). Message:
     /// `diagnostic.g.dart` `camelCaseExtensions`.
@@ -190,10 +190,10 @@ pub(crate) mod constant_identifier_names {
                 if super::is_field_name_shortcut(c, node) {
                     return;
                 }
-                if let Some(&name) = c.payload(node).first() {
-                    if name != crate::rules::NONE_TOKEN {
-                        super::check_lower_camel(c, name, c.lexeme(name));
-                    }
+                if let Some(&name) = c.payload(node).first()
+                    && name != crate::rules::NONE_TOKEN
+                {
+                    super::check_lower_camel(c, name, c.lexeme(name));
                 }
             }
             _ => {}
@@ -235,10 +235,10 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
                 // Locals only: fields and top-level variables are not local
                 // identifiers (the official visits variable *statements* and
                 // for-parts initializers, never field declarations).
-                if let Some(parent) = c.ancestor(1) {
-                    if matches!(c.kind(parent), NodeKind::Fields | NodeKind::TopLevelFields) {
-                        return;
-                    }
+                if let Some(parent) = c.ancestor(1)
+                    && matches!(c.kind(parent), NodeKind::Fields | NodeKind::TopLevelFields)
+                {
+                    return;
                 }
                 // Gather under the scratch borrow, then report.
                 let mut hits: Vec<u32> = Vec::new();
@@ -260,10 +260,10 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
                 for child in c.direct_children(node).iter().copied() {
                     if c.kind(child) == NodeKind::FormalParameter {
                         // name: T is payload word 1 (§3.3 FormalParameter row).
-                        if let Some(&name) = c.payload(child).get(1) {
-                            if name != crate::rules::NONE_TOKEN {
-                                hits.push(name);
-                            }
+                        if let Some(&name) = c.payload(child).get(1)
+                            && name != crate::rules::NONE_TOKEN
+                        {
+                            hits.push(name);
                         }
                     }
                 }
@@ -295,10 +295,10 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
                 if super::is_field_name_shortcut(c, node) {
                     return;
                 }
-                if let Some(&name) = c.payload(node).first() {
-                    if name != crate::rules::NONE_TOKEN {
-                        report_underscored(c, name);
-                    }
+                if let Some(&name) = c.payload(node).first()
+                    && name != crate::rules::NONE_TOKEN
+                {
+                    report_underscored(c, name);
                 }
             }
             _ => {}
@@ -316,15 +316,15 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
             if c.kind(child) != NodeKind::FormalParameter {
                 continue;
             }
-            if let Some(&receiver) = c.payload(child).first() {
-                if receiver != crate::rules::NONE_TOKEN {
-                    continue;
-                }
+            if let Some(&receiver) = c.payload(child).first()
+                && receiver != crate::rules::NONE_TOKEN
+            {
+                continue;
             }
-            if let Some(&name) = c.payload(child).get(1) {
-                if name != crate::rules::NONE_TOKEN {
-                    hits.push(name);
-                }
+            if let Some(&name) = c.payload(child).get(1)
+                && name != crate::rules::NONE_TOKEN
+            {
+                hits.push(name);
             }
         }
         for name in hits {
@@ -762,7 +762,7 @@ pub(crate) mod avoid_types_as_parameter_names {
     /// lexical face of the official's element test — `ClassElement`
     /// membership). The official additionally matches user-declared types,
     /// typedefs, extension types, and in-scope type parameters through
-    /// resolution (`resolveNameInScope`, avoid_types_as_parameter_names.dart:
+    /// resolution (`resolveNameInScope`, `avoid_types_as_parameter_names.dart`:
     /// 118-131); those are out of the syntax face and under-report.
     /// `dynamic` is excluded faithfully: the dynamic element is none of the
     /// official's accepted element kinds.
@@ -894,6 +894,10 @@ pub(crate) mod avoid_types_as_parameter_names {
     }
 
     /// `reportAtToken(name)` with the variant's message texts.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "utf16 lengths fit u32 by the SourceRange convention"
+    )]
     fn report_at_token(c: &mut Check<'_>, token: u32, problem: &str, correction: &str) {
         let name = c.lexeme(token);
         let start = utf16_start_of(c, token);
@@ -953,6 +957,12 @@ pub(crate) mod use_super_parameters {
         check,
     };
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the check mirrors the official visitor's gate order; splitting \
+                  it into helpers would scatter the pinned :ref mapping for no \
+                  behavioral gain"
+    )]
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let kids = c.collect_direct(node);
@@ -970,8 +980,7 @@ pub(crate) mod use_super_parameters {
         let body = kids
             .iter()
             .copied()
-            .filter(|&kid| BODY_KINDS.contains(&c.kind(kid)))
-            .next_back();
+            .rfind(|&kid| BODY_KINDS.contains(&c.kind(kid)));
         // The last super invocation decides (:79-84 — `initializers.reversed`
         // first `SuperConstructorInvocation`).
         let Some(super_invocation) = initializers.and_then(|list| {
@@ -1029,7 +1038,7 @@ pub(crate) mod use_super_parameters {
         let mut converted: Vec<&str> = Vec::new();
         let mut matched_index = 0usize;
         let mut seen: Vec<&str> = Vec::new();
-        for &arg in c.collect_direct(arguments).iter() {
+        for &arg in &c.collect_direct(arguments) {
             if c.kind(arg) == NodeKind::NamedArgument {
                 continue;
             }
@@ -1182,6 +1191,10 @@ pub(crate) mod use_super_parameters {
     }
 
     /// Exclusive UTF-16 end of `token`'s lexeme.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "utf16 lengths fit u32 by the SourceRange convention"
+    )]
     fn utf16_end(c: &Check<'_>, token: u32) -> u32 {
         let start = utf16_start(c, token);
         start + c.lexeme(token).encode_utf16().count() as u32

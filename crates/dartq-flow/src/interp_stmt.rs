@@ -605,7 +605,12 @@ impl Interp<'_> {
                 self.report_member_head(*kw);
                 self.case_pattern_end(*has_guard);
             }
-            Ev::SwitchEnd | Ev::CaseNoWhen | Ev::NoInitializer => {}
+            Ev::SwitchEnd
+            | Ev::CaseNoWhen
+            | Ev::NoInitializer
+            | Ev::BlockBodyBegin
+            | Ev::BlockBodyEnd
+            | Ev::EmptyBody => {}
             Ev::CaseEnd {
                 default_kw,
                 statement_count: _,
@@ -626,7 +631,6 @@ impl Interp<'_> {
                     }
                 }
             }
-            Ev::BlockBodyBegin | Ev::BlockBodyEnd | Ev::EmptyBody => {}
             Ev::SwitchBlockEnd => {
                 if self.collecting() {
                     return true;
@@ -991,6 +995,11 @@ impl Interp<'_> {
 
     /// One-event lookahead: closes the current case alternative group
     /// before its first body event (official `switch_endAlternatives`).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "var ids are arena indices bounded by one executable's \
+                  declarations; u32 matches the event payload width"
+    )]
     pub(crate) fn maybe_close_case_group(&mut self, events: &[Ev], match_of: &[u32]) {
         // The close runs its own collect over the switch block, and the
         // frame keeps `case_open` until it returns — a collect run's

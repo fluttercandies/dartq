@@ -130,7 +130,7 @@
 //!   registry now covers the full `package:lints` core+recommended union
 //!   (89 specs).
 //! - diagnostic-mirror tranche (1, #570): `unnecessary_type_check` — the
-//!   analyzer STATIC_WARNING family (`_checkAllTypeChecks`,
+//!   analyzer `STATIC_WARNING` family (`_checkAllTypeChecks`,
 //!   best_practices_verifier.dart:987-1041; the rule file left the linter
 //!   in the Dart 3.15 main re-pin) ported as the lint-tier face over the
 //!   written-type operand face (scalar literals, `this`, the same-class

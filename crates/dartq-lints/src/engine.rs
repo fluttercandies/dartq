@@ -24,6 +24,12 @@ use crate::rules::expressions::same_file::Decls;
 /// The language-feature bits a rule may query. Features the caller does not
 /// know are treated per their shipped defaults; the caller pins the bits it
 /// wants to control (e.g. from `// @dart=` / experiment config).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent bit per shipped language feature, mirroring the \
+              official feature table; a state-machine refactor would obscure \
+              the 1:1 mapping"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Features {
     /// `wildcard_variables` (shipped in Dart 3.7): a lone `_` parameter name
@@ -42,11 +48,11 @@ pub struct Features {
     /// (unnecessary_library_name.dart:32-34).
     pub unnamed_libraries: bool,
     /// `patterns` (shipped in 3.0, `experimental_features.yaml:387-389`): the
-    /// bit the official AstBuilder keys switch-statement member
-    /// materialization on (ast_builder.dart:1295) — with it on, every `case`
+    /// bit the official `AstBuilder` keys switch-statement member
+    /// materialization on (`ast_builder.dart:1295`) — with it on, every `case`
     /// of a switch statement is a `SwitchPatternCase`, so
     /// `no_duplicate_case_values` (whose visitor processes only legacy
-    /// `SwitchCase` members, no_duplicate_case_values.dart:41) is silent.
+    /// `SwitchCase` members, `no_duplicate_case_values.dart:41`) is silent.
     pub patterns: bool,
 }
 
@@ -103,7 +109,7 @@ pub struct WorkspaceFacts {
     pub root: PathBuf,
     /// The package's package-URI directory (`packageUri`, normally `lib/`):
     /// a file under it resolves to a `package:` URI —
-    /// implementation_imports' registration gate
+    /// `implementation_imports`' registration gate
     /// (implementation_imports.dart:30-33).
     pub lib_dir: PathBuf,
 }
@@ -139,6 +145,11 @@ pub struct WildcardScope {
 
 /// Kind -> rule dispatch. Built once from the static table; a node whose
 /// kind has no registered rules costs one empty-Vec test.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "rule positions come from the static registry, bounded far below \
+              u16::MAX; u16 is the RuleId payload width"
+)]
 static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock::new(|| {
     let mut table: [Vec<u16>; NodeKind::KIND_COUNT as usize] = std::array::from_fn(|_| Vec::new());
     for (i, spec) in RULES.iter().enumerate() {
@@ -166,14 +177,16 @@ static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock:
 /// takes the slot exclusively. The accessors keep guards function-local to
 /// their read, so no call site can trip this; nested-borrow panics name the
 /// violation.
+/// Class row -> its instance fields: `(name token, written type row)` per
+/// field, in body order (`None` type row = the field is untyped).
+type FieldTypes = FxHashMap<u32, Vec<(u32, Option<u32>)>>;
+
 pub(crate) struct RunCaches {
     /// The unit's same-file declaration index
     /// ([`Decls`]), read by the annotation/shadow/creation faces.
     pub(crate) decls: core::cell::RefCell<Option<Decls>>,
-    /// Class row -> its instance fields as `(name token, written type row)`
-    /// in body order (`None` type row = the field is untyped). Read by
-    /// [`crate::rules::type_face_of_field`].
-    pub(crate) field_types: core::cell::RefCell<FxHashMap<u32, Vec<(u32, Option<u32>)>>>,
+    /// Read by [`crate::rules::type_face_of_field`].
+    pub(crate) field_types: core::cell::RefCell<FieldTypes>,
     /// Class-like row -> its written supertypes as `(name head token,
     /// clause)` pairs in source order. Read by [`crate::rules::supertypes`]
     /// (#758: the header scan ran per ancestor per ancestor-chain build —
@@ -483,6 +496,11 @@ fn fill_direct(ast: &SyntaxTable, id: u32, buf: &mut Vec<u32>) {
 
 impl<'a> Check<'a> {
     /// The current node.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the path is empty — cannot happen for a live `Check`
+    /// (every run starts at the root); the `expect` names that invariant.
     #[must_use]
     pub fn node(&self) -> u32 {
         *self.path.last().expect("check always has a current node")
@@ -522,6 +540,11 @@ impl<'a> Check<'a> {
     /// rule-side comments call "collect first". Debug builds assert the
     /// contract here and name the violation; release keeps the `RefCell`
     /// guard as the backstop (the refill panics on the live borrow).
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "adding `#[must_use]` would mint new warnings at every \
+                  out-of-crate call site; outside this warning sweep"
+    )]
     pub fn direct_children(&self, id: u32) -> core::cell::Ref<'_, Vec<u32>> {
         debug_assert!(
             self.direct.try_borrow().is_ok(),
@@ -538,6 +561,11 @@ impl<'a> Check<'a> {
     /// `direct_children` borrow). Use it whenever children are held across a
     /// call that may itself read children; prefer [`Check::direct_children`]
     /// otherwise (no allocation).
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "adding `#[must_use]` would mint new warnings at every \
+                  out-of-crate call site; outside this warning sweep"
+    )]
     pub fn collect_direct(&self, id: u32) -> Vec<u32> {
         let mut buf = Vec::new();
         fill_direct(self.unit.ast, id, &mut buf);

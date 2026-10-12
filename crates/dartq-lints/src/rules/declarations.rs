@@ -56,7 +56,7 @@ pub(crate) mod unnecessary_late {
     /// of the declaration has an initializer reports at `late`. Instance
     /// fields are excluded (lazy initialization is meaningful there). The
     /// `late` keyword is the declaration's span head when present
-    /// (collapse map §3.3 VariablesDeclaration row, `head_is`). Message:
+    /// (collapse map §3.3 `VariablesDeclaration` row, `head_is`). Message:
     /// `diagnostic.g.dart` `unnecessaryLate`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_late",
@@ -133,8 +133,7 @@ pub(crate) mod use_function_type_syntax_for_parameters {
         // `node.name?.lexeme ?? ''` (:44).
         let name = super::member_name(c, node)
             .filter(|&n| c.kind(n) == NodeKind::Identifier)
-            .map(|n| c.lexeme(c.head_token(n)))
-            .unwrap_or("");
+            .map_or("", |n| c.lexeme(c.head_token(n)));
         let range = c.utf16_span(node);
         c.report(range, &[name]);
     }
@@ -164,8 +163,7 @@ pub(crate) mod prefer_typing_uninitialized_variables {
         // `node.type != null` skips the whole declaration (:34).
         match super::first_child(c, node) {
             Some(first) if c.kind(first) == NodeKind::NoType => {}
-            Some(_) => return,
-            None => return,
+            Some(_) | None => return,
         }
         let is_field = c.ancestor(1).is_some_and(|parent| {
             matches!(c.kind(parent), NodeKind::Fields | NodeKind::TopLevelFields)
@@ -2051,7 +2049,7 @@ pub(crate) mod annotate_overrides {
     }
 
     /// The instance-member gates shared with the other override rules:
-    /// fields by their kind payload, methods by the header ModSet bit
+    /// fields by their kind payload, methods by the header `ModSet` bit
     /// (collapse map §1 — static is bit 3), extension-type members out of
     /// face (:58, :69).
     fn is_instance_member(c: &Check<'_>, node: u32) -> bool {
@@ -2093,9 +2091,8 @@ pub(crate) mod annotate_overrides {
     /// declared variable (:60-62 — the `InitializedIdentifier` rows, whose
     /// span head is the name token).
     fn member_names(c: &Check<'_>, node: u32) -> Vec<u32> {
-        match c.kind(node) {
-            NodeKind::Method => c
-                .collect_direct(node)
+        if c.kind(node) == NodeKind::Method {
+            c.collect_direct(node)
                 .into_iter()
                 .filter(|&kid| {
                     matches!(c.kind(kid), NodeKind::OperatorName)
@@ -2105,23 +2102,22 @@ pub(crate) mod annotate_overrides {
                                     &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
                                 ))
                 })
-                .collect(),
-            _ => {
-                let mut names = Vec::new();
-                for decl in c.collect_direct(node) {
-                    if c.kind(decl) != NodeKind::VariablesDeclaration {
-                        continue;
-                    }
-                    for var in c.collect_direct(decl) {
-                        if c.kind(var) == NodeKind::InitializedIdentifier
-                            && crate::rules::initialized_identifier_name(c, var).is_some()
-                        {
-                            names.push(var);
-                        }
+                .collect()
+        } else {
+            let mut names = Vec::new();
+            for decl in c.collect_direct(node) {
+                if c.kind(decl) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                for var in c.collect_direct(decl) {
+                    if c.kind(var) == NodeKind::InitializedIdentifier
+                        && crate::rules::initialized_identifier_name(c, var).is_some()
+                    {
+                        names.push(var);
                     }
                 }
-                names
             }
+            names
         }
     }
 }
@@ -2161,6 +2157,8 @@ pub(crate) mod avoid_renaming_method_parameters {
     };
 
     fn check(c: &mut Check<'_>) {
+        // Static skip (:56) — header ModSet bit (static is bit 3).
+        const STATIC_BIT: u16 = 1 << 3;
         // `if (!context.isInLibDir) return` (:37).
         let in_lib = c
             .unit
@@ -2170,8 +2168,6 @@ pub(crate) mod avoid_renaming_method_parameters {
             return;
         }
         let node = c.node();
-        // Static skip (:56) — header ModSet bit (static is bit 3).
-        const STATIC_BIT: u16 = 1 << 3;
         if dartq_ast::mod_flags(c.unit.ast, node) & STATIC_BIT != 0 {
             return;
         }
@@ -2356,10 +2352,7 @@ pub(crate) mod overridden_fields {
             return;
         };
         let chain = same_file_ancestors(c, class_row, true);
-        let fields: Vec<(&str, u32)> = field_names(c, node)
-            .into_iter()
-            .map(|(n, r)| (n, r))
-            .collect();
+        let fields: Vec<(&str, u32)> = field_names(c, node);
         // The nearest concrete variable-backed declaration in the chain
         // supplies the defining interface (:69-78); names collect owned —
         // the lookup borrows `c` immutably across the report.
@@ -2445,9 +2438,9 @@ pub(crate) mod unnecessary_overrides {
     };
 
     fn check(c: &mut Check<'_>) {
-        let node = c.node();
-        // `node.isStatic` (:332) — header ModSet bit.
+        // Static skip (:56) — header ModSet bit (static is bit 3).
         const STATIC_BIT: u16 = 1 << 3;
+        let node = c.node();
         if dartq_ast::mod_flags(c.unit.ast, node) & STATIC_BIT != 0 {
             return;
         }
@@ -2681,56 +2674,53 @@ pub(crate) mod unnecessary_overrides {
         else {
             return false;
         };
-        let rows: Vec<u32> = match c.kind(body) {
-            NodeKind::ExpressionBody => {
-                // The expression completes before the childless handle
-                // opens (bridge `handle_expression_function_body`): the
-                // member-window pieces before the handle, from the arrow
-                // on — the signature rows tile before the arrow and drop
-                // out.
-                let arrow_end = crate::rules::byte_span_of_token(c, c.head_token(body)).end;
-                let pos = kids.iter().position(|&kid| kid == body).unwrap_or(0);
-                kids[..pos]
-                    .iter()
-                    .copied()
-                    .filter(|&row| c.byte_span(row).start >= arrow_end)
-                    .collect()
+        let rows: Vec<u32> = if c.kind(body) == NodeKind::ExpressionBody {
+            // The expression completes before the childless handle
+            // opens (bridge `handle_expression_function_body`): the
+            // member-window pieces before the handle, from the arrow
+            // on — the signature rows tile before the arrow and drop
+            // out.
+            let arrow_end = crate::rules::byte_span_of_token(c, c.head_token(body)).end;
+            let pos = kids.iter().position(|&kid| kid == body).unwrap_or(0);
+            kids[..pos]
+                .iter()
+                .copied()
+                .filter(|&row| c.byte_span(row).start >= arrow_end)
+                .collect()
+        } else {
+            // Statement tiling: the statement rows (and their expression
+            // pieces) are the body row's own children on production
+            // parses — a `Block` wrapper row exists only in hand-built
+            // trees.
+            let block_rows = match c
+                .collect_direct(body)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Block)
+            {
+                Some(block) => c.collect_direct(block),
+                None => c.collect_direct(body),
+            };
+            // Exactly one statement (:52-56): the statement's own row
+            // is the block window's last row, and no other statement
+            // row precedes it.
+            let Some((&last, head)) = block_rows.split_last() else {
+                return false;
+            };
+            if head
+                .iter()
+                .any(|&row| crate::rules::is_statement_row(c, row))
+            {
+                return false;
             }
-            _ => {
-                // Statement tiling: the statement rows (and their expression
-                // pieces) are the body row's own children on production
-                // parses — a `Block` wrapper row exists only in hand-built
-                // trees.
-                let block_rows = match c
-                    .collect_direct(body)
-                    .into_iter()
-                    .find(|&kid| c.kind(kid) == NodeKind::Block)
-                {
-                    Some(block) => c.collect_direct(block),
-                    None => c.collect_direct(body),
-                };
-                // Exactly one statement (:52-56): the statement's own row
-                // is the block window's last row, and no other statement
-                // row precedes it.
-                let Some((&last, head)) = block_rows.split_last() else {
-                    return false;
-                };
-                if head
-                    .iter()
-                    .any(|&row| crate::rules::is_statement_row(c, row))
-                {
-                    return false;
-                }
-                match c.kind(last) {
-                    NodeKind::ExpressionStatement => head.to_vec(),
-                    NodeKind::ReturnStatement => {
-                        if c.comments.has_attached(c.head_token(last) as usize) {
-                            return false;
-                        }
-                        c.collect_direct(last)
+            match c.kind(last) {
+                NodeKind::ExpressionStatement => head.to_vec(),
+                NodeKind::ReturnStatement => {
+                    if c.comments.has_attached(c.head_token(last) as usize) {
+                        return false;
                     }
-                    _ => return false,
+                    c.collect_direct(last)
                 }
+                _ => return false,
             }
         };
         match query {

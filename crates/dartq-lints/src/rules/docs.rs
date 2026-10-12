@@ -108,9 +108,10 @@ pub(crate) mod unintended_html_in_doc_comment {
     /// and finally the invalid `</?tag…>` shape — the report. Lines inside a
     /// markdown code region are skipped, mirroring the analyzer's
     /// `codeBlocks` construction (`doc_comment_builder.dart`):
-    /// fenced regions toggle on ``` lines (a documented approximation —
-    /// no tick-count matching), and an indented code block opens after an
-    /// empty line when the content is indented by four or more characters,
+    /// fenced regions toggle on three-backtick fence lines (a documented
+    /// approximation — no tick-count matching), and an indented code block
+    /// opens after an empty line when the content is indented by four or
+    /// more characters,
     /// lasting while it stays so. Remaining approximations: the official
     /// models no other container blocks (lists, quotes) either —
     /// `isPreviousLineEmpty` alone decides — and the scan faces
@@ -161,10 +162,10 @@ pub(crate) mod unintended_html_in_doc_comment {
     /// Scans one doc-comment run, skipping lines inside a markdown code
     /// region — the analyzer's `codeBlocks` construction
     /// (`doc_comment_builder.dart:_parseDocComment`, :270-308): fenced
-    /// regions toggle on ``` lines (the documented approximation — no
-    /// tick-count matching), and an indented code block opens after an
-    /// empty line when the line content is indented by four or more
-    /// characters, lasting while it stays so; its terminating line is
+    /// regions toggle on three-backtick fence lines (the documented
+    /// approximation — no tick-count matching), and an indented code block
+    /// opens after an empty line when the line content is indented by four
+    /// or more characters, lasting while it stays so; its terminating line is
     /// re-dispatched as a normal line. The official models no other
     /// container blocks (lists, quotes) either — `isPreviousLineEmpty`
     /// alone decides — so a tightly indented list-item continuation is

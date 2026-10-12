@@ -155,8 +155,7 @@ fn creation_parts(c: &Check<'_>, node: u32) -> (Option<u32>, Option<u32>) {
                         let window = c.children(kids[0]);
                         let mut ids = (window.start..window.end)
                             .filter(|&id| c.kind(id) == NodeKind::Identifier);
-                        let only = ids.next().filter(|_| ids.next().is_none());
-                        only
+                        ids.next().filter(|_| ids.next().is_none())
                     }
                     _ => None,
                 },
@@ -345,7 +344,7 @@ impl Scan {
     fn alternative(&mut self) -> bool {
         loop {
             match self.peek() {
-                None | Some('|') | Some(')') => return true,
+                None | Some('|' | ')') => return true,
                 Some(_) => {
                     if !self.term() {
                         return false;
@@ -361,10 +360,6 @@ impl Scan {
             Some('^' | '$') => {
                 self.pos += 1;
                 Atom::Anchor
-            }
-            Some('.') => {
-                self.pos += 1;
-                Atom::Term
             }
             Some('(') => match self.group() {
                 Some(atom) => atom,
@@ -384,15 +379,15 @@ impl Scan {
                     None => return false,
                 }
             }
-            // Quantifiers with nothing to repeat; lone `{`/`}`/`]` are
-            // literal only in annex B.
-            Some('*' | '+' | '?') => return false,
+            // Quantifiers with nothing to repeat, or end of input; lone
+            // `{`/`}`/`]` are literal only in annex B. `.` and every other
+            // character are plain literal terms.
+            Some('*' | '+' | '?') | None => return false,
             Some('{' | '}' | ']') if self.unicode => return false,
             Some(_) => {
                 self.pos += 1;
                 Atom::Term
             }
-            None => return false,
         };
         if self.at_quantifier() {
             let quantifiable = match atom {
@@ -644,6 +639,11 @@ impl Scan {
     /// `FormatException` face. `in_class` adjusts the `\b`/`\B`/digit faces.
     /// `Char` carries the escape's real codepoint — class-range ordering
     /// compares actual values.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per escape mirrors the official FormatException \
+                  decision order; splitting it would scatter that pinned table"
+    )]
     fn escape(&mut self, in_class: bool) -> Option<Escape> {
         match self.bump()? {
             'f' => Some(Escape::Char(0xc)),
@@ -652,9 +652,8 @@ impl Scan {
             't' => Some(Escape::Char(0x9)),
             'v' => Some(Escape::Char(0xb)),
             'b' if in_class => Some(Escape::Char(0x8)),
-            'b' => Some(Escape::Anchor),
             'B' if in_class && self.unicode => None,
-            'B' => Some(Escape::Anchor),
+            'b' | 'B' => Some(Escape::Anchor),
             'c' => {
                 match self.peek() {
                     Some(ch) if ch.is_ascii_alphabetic() => {
@@ -711,7 +710,7 @@ impl Scan {
                     return match first {
                         '8' | '9' if !self.unicode => Some(Escape::Char(u32::from(first))),
                         _ if !self.unicode => {
-                            Some(Escape::Char(self.octal_run(u32::from(first.to_digit(8)?))))
+                            Some(Escape::Char(self.octal_run(first.to_digit(8)?)))
                         }
                         _ => None,
                     };
@@ -818,9 +817,7 @@ impl Scan {
     fn hex_value_run(&mut self, width: usize) -> Option<u32> {
         let mut value = 0u32;
         for k in 0..width {
-            let Some(digit) = self.s.get(self.pos + k).and_then(|ch| ch.to_digit(16)) else {
-                return None;
-            };
+            let digit = self.s.get(self.pos + k).and_then(|ch| ch.to_digit(16))?;
             value = value * 16 + digit;
         }
         self.pos += width;

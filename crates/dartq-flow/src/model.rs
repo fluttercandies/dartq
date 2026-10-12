@@ -54,7 +54,7 @@ impl ReachArena {
     }
 
     /// Whether any control path reaches `r` (official `overallReachable` —
-    /// the flag `isReachable` reads, flow_analysis.dart:6396): a split
+    /// the flag `isReachable` reads, `flow_analysis.dart:6396`): a split
     /// resurrects the local flag (official `Reachability.split` hardcodes
     /// `locallyReachable: true`) but never the overall one, so a case body
     /// opened after a resurrecting split still queries dead for the
