@@ -731,6 +731,16 @@ pub enum SemanticCode {
     /// map literal (same verifier site, reported at the later key); map
     /// values never participate. `messages.yaml` :26951.
     EqualKeysInMap,
+    // —— #911: the M3 primary-constructor field face (`STATIC_WARNING`) ——————
+    /// `The value of the field '{0}' isn't used.` — a primary-constructor
+    /// formal that declares a field (`var`/`final` keyword, no `this`/
+    /// `super` selector) of a class or enum whose field no read spares
+    /// (`visitPrimaryConstructorDeclaration`,
+    /// unused_local_elements_verifier.dart:887-920, reported at the
+    /// parameter's name token; extension-type representation formals are
+    /// exempt, as is every public name — `_isReadMember`'s public-instance
+    /// arm answers used). `diagnostic.g.dart` :18040-18055.
+    UnusedFieldFromPrimaryConstructor,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -1119,6 +1129,12 @@ impl SemanticCode {
             // `hasPublishedDocs: true`).
             Self::EqualElementsInSet => ("equal_elements_in_set", "EQUAL_ELEMENTS_IN_SET"),
             Self::EqualKeysInMap => ("equal_keys_in_map", "EQUAL_KEYS_IN_MAP"),
+            // The #911 M3 face (diagnostic.g.dart:18040-18055 —
+            // `hasPublishedDocs: true`).
+            Self::UnusedFieldFromPrimaryConstructor => (
+                "unused_field_from_primary_constructor",
+                "UNUSED_FIELD_FROM_PRIMARY_CONSTRUCTOR",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -1239,7 +1255,10 @@ impl SemanticCode {
             // block: equalElementsInSet :26904, equalKeysInMap :26951 —
             // both `type: staticWarning`).
             | Self::EqualElementsInSet
-            | Self::EqualKeysInMap => DiagnosticType::StaticWarning,
+            | Self::EqualKeysInMap
+            // The #911 M3 face (`type: DiagnosticType.STATIC_WARNING`,
+            // diagnostic.g.dart:18051).
+            | Self::UnusedFieldFromPrimaryConstructor => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -1281,6 +1300,9 @@ impl SemanticCode {
                 format!("The stack trace variable '{a0}' isn't used and can be removed.")
             }
             Self::UnusedLabel => format!("The label '{a0}' isn't used."),
+            Self::UnusedFieldFromPrimaryConstructor => {
+                format!("The value of the field '{a0}' isn't used.")
+            }
             Self::UnusedImport => format!("Unused import: '{a0}'."),
             Self::UnusedShownName => format!("The name {a0} is shown, but isn't used."),
             Self::UnusedResult => format!("The value of '{a0}' should be used."),
@@ -1781,6 +1803,9 @@ impl SemanticCode {
             }
             Self::UnusedElement => format!("The declaration '{a0}' isn't referenced."),
             Self::UnusedField => format!("The value of the field '{a0}' isn't used."),
+            Self::UnusedFieldFromPrimaryConstructor => {
+                format!("The value of the field '{a0}' isn't used.")
+            }
             Self::UnusedElementParameter => {
                 format!("A value for optional parameter '{a0}' isn't ever given.")
             }
@@ -1878,6 +1903,12 @@ impl SemanticCode {
             Self::UnusedLocalVariable => Some("Try removing the variable or using it.".to_string()),
             Self::UnusedElement => Some(format!("Try removing the declaration of '{a2}'.")),
             Self::UnusedField => Some("Try removing the field, or using it.".to_string()),
+            // The primary-constructor twin's keyword-specific text
+            // (diagnostic.g.dart:18047-18049); `{1}` carries the declaring
+            // keyword (`var`/`final`), passed as `a2`.
+            Self::UnusedFieldFromPrimaryConstructor => Some(format!(
+                "Try removing the '{a2}' keyword to avoid declaring a field, or try using the field, or removing it."
+            )),
             Self::UnusedElementParameter => {
                 Some("Try removing the unused parameter.".to_string())
             }

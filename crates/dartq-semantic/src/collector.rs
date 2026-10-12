@@ -1989,15 +1989,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     fn end_formal_parameter(
         &mut self,
-        _var_or_final: Option<Token>,
-        _this_keyword: Option<Token>,
-        _super_keyword: Option<Token>,
+        var_or_final: Option<Token>,
+        this_keyword: Option<Token>,
+        super_keyword: Option<Token>,
         _period_after_this_or_super: Option<Token>,
         name: Token,
         _initializer_start: Option<Token>,
         _initializer_end: Option<Token>,
         kind: FormalParameterKind,
-        _member_kind: ParserMemberKind,
+        member_kind: ParserMemberKind,
     ) {
         if self.builder.borrow().formal_depth != 1 {
             return;
@@ -2011,6 +2011,37 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             kind,
             FormalParameterKind::RequiredPositional | FormalParameterKind::RequiredNamed
         );
+        // A class/enum primary-constructor formal with a `var`/`final`
+        // keyword declares an instance field (`FieldFormalParameterElement
+        // .isDeclaring`): bodies read it bare and instances through the
+        // member walk. No field-declaration event fires for it, so the
+        // capture introduces the member here; it stays out of the
+        // declaration-site log — the official verifier never visits it in
+        // the plain field walk, the primary-constructor face owns its
+        // unused-ness (unused_local_elements_verifier.dart:887-920).
+        if member_kind == ParserMemberKind::PrimaryConstructor
+            && var_or_final.is_some()
+            && this_keyword.is_none()
+            && super_keyword.is_none()
+            && builder
+                .containers
+                .last()
+                .is_some_and(|open| matches!(open.kind, ContainerKind::Class | ContainerKind::Enum))
+        {
+            let open = builder.containers.last_mut().expect("checked above");
+            open.members.entry(name).or_insert(MemberEntry {
+                kind: MemberKind::Field,
+                is_static: false,
+                is_abstract: false,
+                is_external: false,
+                is_final: false,
+                type_params: 0,
+                type_param_names: Box::default(),
+                var_ty: ty,
+                return_ty: Ty::UNKNOWN,
+                formals: None,
+            });
+        }
         let formal = Formal { name, ty, required };
         if matches!(
             kind,

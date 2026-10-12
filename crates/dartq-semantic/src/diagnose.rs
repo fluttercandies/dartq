@@ -973,6 +973,15 @@ struct PendingAnnotation {
     unless: Option<(StringId, SourceRange)>,
 }
 
+/// One primary-constructor formal that declares a field: the name token's
+/// span anchors the report and the `var`/`final` keyword text feeds the
+/// correction (`finalOrVarKeyword.lexeme`).
+struct PrimaryFieldSite {
+    name: StringId,
+    range: SourceRange,
+    keyword: StringId,
+}
+
 /// One library-level declaration site of this file (the usage cluster's
 /// library-level side), captured at the declaration events with the name
 /// token's span.
@@ -1425,6 +1434,12 @@ struct Engine<'a> {
     /// Names a READ-shaped member access resolved to (the `unused_field`
     /// read-only rule: writes never spare a field).
     read_names: FxHashSet<StringId>,
+    /// Primary-constructor formals that declare a field (`var`/`final`
+    /// keyword, no `this`/`super` selector — the official
+    /// `FieldFormalParameterElement.isDeclaring`), in source order: the
+    /// `unused_field_from_primary_constructor` face's candidates
+    /// (unused_local_elements_verifier.dart:887-920).
+    primary_fields: Vec<PrimaryFieldSite>,
     /// Resolved annotation names this unit referenced (the use-face's
     /// annotation uses; `check_annotation` inserts on the resolved side
     /// only — an unresolved annotation is its own error and never counts).
@@ -2112,6 +2127,7 @@ impl<'a> Engine<'a> {
             cascade_sections: FxHashSet::default(),
             used_names: FxHashSet::default(),
             read_names: FxHashSet::default(),
+            primary_fields: Vec::new(),
             annotation_uses: FxHashSet::default(),
             named_given: FxHashSet::default(),
             positional_given: FxHashMap::default(),
@@ -3987,6 +4003,31 @@ impl<'a> Engine<'a> {
                 }
             }
             self.report_optional_parameters(site_index, site);
+        }
+        // The `unused_field_from_primary_constructor` face
+        // (unused_local_elements_verifier.dart:887-920): each field-declaring
+        // primary-constructor formal of a class or enum whose field no read
+        // spares. A public name is always readable (`_isReadMember`'s
+        // public-instance arm returns used), extension-type representation
+        // formals are exempt (the official switch's third arm), and the
+        // anchor is the parameter's name token.
+        for field in std::mem::take(&mut self.primary_fields) {
+            let bare = self.bare_name(field.name);
+            if !self.is_private_name(field.name) || self.read_names.contains(&bare) {
+                continue;
+            }
+            let code = SemanticCode::UnusedFieldFromPrimaryConstructor;
+            let name_text = self.strings.resolve(field.name).to_string();
+            let keyword_text = self.strings.resolve(field.keyword).to_string();
+            let correction = code.correction_message(&keyword_text);
+            self.report.usage.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message(&name_text, ""),
+                self.file,
+                field.range,
+                correction,
+            ));
         }
         self.report_unused_imports();
     }
@@ -15399,6 +15440,41 @@ impl ParserListener for DiagnoseListener<'_> {
             kind,
             member_kind,
         );
+
+        // A primary-constructor formal with a `var`/`final` keyword declares
+        // a field (`FieldFormalParameterElement.isDeclaring`); `this`/`super`
+        // selectors name existing fields instead. The
+        // `unused_field_from_primary_constructor` candidates
+        // (unused_local_elements_verifier.dart:887-920).
+        if member_kind != dartq_parser::MemberKind::PrimaryConstructor {
+            return;
+        }
+        let Some(keyword) = var_or_final else {
+            return;
+        };
+        if this_keyword.is_some() || super_keyword.is_some() {
+            return;
+        }
+        let mut engine = self.engine.borrow_mut();
+        // Only class and enum primary constructors report (the official
+        // switch's arms); an extension type's representation formal cannot
+        // be removed and never reports.
+        if !engine
+            .container_context()
+            .is_some_and(|(_, kind)| matches!(kind, ContainerKind::Class | ContainerKind::Enum))
+        {
+            return;
+        }
+        let Some(name_id) = engine.name_of(name) else {
+            return;
+        };
+        let keyword_text = engine.text_of(keyword).unwrap_or_default().to_owned();
+        let keyword = engine.intern(&keyword_text);
+        engine.primary_fields.push(PrimaryFieldSite {
+            name: name_id,
+            range: name.range,
+            keyword,
+        });
     }
 
     fn end_function_type(&mut self, function: Token, question: Option<Token>) {
@@ -15486,6 +15562,28 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_assigned_variable_pattern(&mut self, variable: Token) {
         self.flow().handle_assigned_variable_pattern(variable);
+
+        // An assigned-variable pattern is a reference: the pattern
+        // assignment resolves the name through the enclosing scope, and a
+        // miss is the oracle's `undefined_identifier` at the name
+        // (`[a, var d] = y;` reports `a` — the event is the whole use, so
+        // the verdict emits here instead of a deferred row).
+        let mut engine = self.engine.borrow_mut();
+        let Some(name) = engine.name_of(variable) else {
+            return;
+        };
+        if let Some(hit) = engine.resolve_local(name) {
+            engine.locals[hit as usize].uses += 1;
+            return;
+        }
+        let BareInfo::Missing { on_opaque, .. } = engine.resolve_bare(name) else {
+            return;
+        };
+        if !on_opaque && !engine.guard.ignore(None, name) {
+            let text = engine.strings.resolve(name).to_string();
+            engine.emit(SemanticCode::UndefinedIdentifier, variable.range, &text, "");
+        }
+        engine.record_miss(name, variable.range, false, NameUse::Write);
     }
 
     fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
@@ -19075,6 +19173,48 @@ mod tests {
         assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
     }
 
+    /// A pattern assignment's assigned variables are references: each
+    /// undeclared name reports `undefined_identifier` (the official
+    /// assigned-variable-pattern resolution), the RHS is a plain read, and
+    /// a declared local spares. The `var`/typed-declaration faces are the
+    /// parser's `pattern_assignment_declares_variable`, never this pass.
+    ///
+    /// Corpus shapes (m0-syntax `declaredVariable_inPatternAssignment_
+    /// usingVar.dart`, `wildcard_inPatternAssignment_usingType.dart`):
+    /// `void f() { [a, var d] = y; }` carries `undefined_identifier` 'a'
+    /// at 2:4 and 'y' at 2:16.
+    #[test]
+    fn pattern_assignment_variables_resolve() {
+        let r = report("void f() {\n  [a, var d] = y;\n}\n");
+        let misses: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_identifier")
+            .collect();
+        assert_eq!(misses.len(), 2, "{:?}", code_names(&r));
+        assert_eq!(misses[0].message, "Undefined name 'a'.");
+        assert_eq!(misses[1].message, "Undefined name 'y'.");
+
+        let r2 = report("void f() {\n  [a, int _] = y;\n}\n");
+        let misses2: Vec<_> = r2
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_identifier")
+            .collect();
+        assert_eq!(misses2.len(), 2, "{:?}", code_names(&r2));
+        assert_eq!(misses2[0].message, "Undefined name 'a'.");
+        assert_eq!(misses2[1].message, "Undefined name 'y'.");
+
+        let r3 = report("void f() {\n  var a = 0;\n  [a] = y;\n}\n");
+        let misses3: Vec<_> = r3
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_identifier")
+            .collect();
+        assert_eq!(misses3.len(), 1, "{:?}", code_names(&r3));
+        assert_eq!(misses3[0].message, "Undefined name 'y'.");
+    }
+
     /// A type-free `var` pattern binds without a type and covers its
     /// context (substituted with the scrutinee's type at case close).
     #[test]
@@ -21825,6 +21965,66 @@ mod tests {
         assert_eq!(
             r.diagnostics[1].message,
             "The value of the field '_dead' isn't used."
+        );
+    }
+
+    // —— #911: the primary-constructor field face ———————————————————————————
+
+    /// An unread `var`/`final` primary-constructor field reports
+    /// `unused_field_from_primary_constructor` at the parameter's name; a
+    /// read twin stays silent; the row is a STATIC_WARNING with the
+    /// keyword-specific correction.
+    ///
+    /// Verbatim oracle probe (dart analyze 3.13.1; primary constructors
+    /// shipped 3.13.0): `class Q(var _u, final int _v) {}` —
+    /// `WARNING|STATIC_WARNING|UNUSED_FIELD_FROM_PRIMARY_CONSTRUCTOR|
+    /// …|1|13|2|The value of the field '_u' isn't used.` and the same for
+    /// `_v`; a getter read of `_v` leaves only the `_u` row.
+    #[test]
+    fn unused_primary_constructor_field_reports() {
+        let r = report("class int {} class P(var _a, final int _b) { int get r => _b; }");
+        assert_eq!(
+            code_names(&r),
+            ["unused_field_from_primary_constructor"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The value of the field '_a' isn't used."
+        );
+        let at = u32::try_from("class int {} class P(var ".len()).unwrap();
+        assert_eq!(r.diagnostics[0].range.offset, at);
+        assert_eq!(r.diagnostics[0].range.length, 2);
+        assert_eq!(
+            r.diagnostics[0].correction.as_deref(),
+            Some(
+                "Try removing the 'var' keyword to avoid declaring a field, or try using the field, or removing it."
+            )
+        );
+        // The read twin never reports.
+        let r2 = report("class int {} class P(var _a, final int _b) { int f() => _a + _b; }");
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+    }
+
+    /// The exemption faces: a public name is always readable
+    /// (`_isReadMember`'s public-instance arm answers used), a
+    /// non-declaring formal (`int _a` — no `var`/`final` keyword) declares
+    /// nothing, and an extension type's representation formal never reports
+    /// (the official switch's third arm).
+    #[test]
+    fn primary_constructor_field_exemptions_stay_silent() {
+        let r = report("class P(var a) {}");
+        assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+        let r2 = report("class int {} class P(int _a) {}");
+        assert!(code_names(&r2).is_empty(), "{:?}", code_names(&r2));
+        let r3 = report("extension type ET(final int _x) {}");
+        assert!(
+            !code_names(&r3)
+                .iter()
+                .any(|name| *name == "unused_field_from_primary_constructor"),
+            "{:?}",
+            code_names(&r3)
         );
     }
 
