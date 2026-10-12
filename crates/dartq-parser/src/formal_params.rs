@@ -632,7 +632,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             let is_final = self.cursor.lexeme(t.id) == "final";
             if is_var || is_final {
                 var_or_final = Some(t);
-                if is_var && !matches!(type_info, TypeInfo::NoType) {
+                // `varAndType` for `var` + a type in ordinary formal
+                // positions (parser_impl.dart:2283-2298). Primary-constructor
+                // declaring parameters legitimately carry `var` + a type and
+                // stay silent: the official gate keys on
+                // `memberKind != MemberKind.PrimaryConstructor`, and the
+                // front_end's feature-off `reportExperimentNotEnabled` arm
+                // (:2290-2296) never fires on the analyzer — probed 3.13.1
+                // at language version 3.12, `class C(var int a) {}` yields
+                // zero rows. The `final` arm (:2299-2307) has no type gate.
+                if is_var
+                    && !matches!(type_info, TypeInfo::NoType)
+                    && member_kind != MemberKind::PrimaryConstructor
+                {
                     self.report(msg::var_and_type(), t);
                 }
             }

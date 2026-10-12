@@ -135,9 +135,11 @@ fn covariant_primary_constructor_formal_reports() {
 /// skipped junk (`unexpected_token`), `{var int a}` re-forms the class
 /// body (the member re-reports `var_and_type` and walks the `;` back to
 /// `a`), and the leftover `)` lands as top-level junk
-/// (`expected_executable`). The probed oracle face is exactly these four
-/// codes — `var_and_type` twice (once in the params parse, once in the
-/// junk member).
+/// (`expected_executable`). The probed oracle face (3.13.1, feature on,
+/// re-probed 2026-10-12) is exactly these four codes — `var_and_type`
+/// ONCE, from the junk member: the declaring-parameter parse itself stays
+/// silent under the PrimaryConstructor exemption (parser_impl.dart:2283-
+/// 2298; the earlier twice-face probe predates the feature-on oracle).
 #[test]
 fn missing_class_body_reexpands_primary_params_as_junk() {
     assert_codes(
@@ -146,7 +148,6 @@ fn missing_class_body_reexpands_primary_params_as_junk() {
             "expected_executable",
             "expected_token",
             "unexpected_token",
-            "var_and_type",
             "var_and_type",
         ],
         "primary params at EOF re-expand as junk",

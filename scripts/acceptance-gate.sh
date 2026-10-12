@@ -138,7 +138,10 @@ fi
 # The verdict comes from the ROWS, not the exit code — info-only runs exit 0
 # and still carry INFO rows this gate must fail on. Tiers 4/64 are tool
 # failures, not verdicts.
-mkdir -p "$outdir"
+mkdir -p "$outdir" || {
+  echo "acceptance-gate: cannot create evidence directory $outdir" >&2
+  exit 2
+}
 machine_file="$outdir/machine-output.txt"
 
 rc=0
@@ -148,11 +151,25 @@ if [ "$rc" -ge 4 ]; then
   sed 's/^/  | /' "$machine_file" >&2
   exit 2
 fi
+# The counters below are integer-scored; a vanished machine file would turn
+# every comparison into a non-integer test (a silent false PASS). Refuse
+# instead — an unreadable artifact is an environment error, not a verdict.
+[ -f "$machine_file" ] || {
+  echo "acceptance-gate: $machine_file missing after the dartq check run" >&2
+  exit 2
+}
 
+# grep -c prints 0 (exit 1) on no match; the `|| true` keeps that exit from
+# tripping pipefail, and the defaults keep an empty substitution (a grep
+# that errored outright) from feeding a non-integer into the verdict test.
 rows="$(grep -Ec '^(ERROR|WARNING|INFO)\|' "$machine_file" || true)"
 error_rows="$(grep -Ec '^ERROR\|' "$machine_file" || true)"
 warning_rows="$(grep -Ec '^WARNING\|' "$machine_file" || true)"
 info_rows="$(grep -Ec '^INFO\|' "$machine_file" || true)"
+rows=${rows:-0}
+error_rows=${error_rows:-0}
+warning_rows=${warning_rows:-0}
+info_rows=${info_rows:-0}
 
 if [ "$rows" -gt 0 ]; then
   echo "-- [$label] diagnostics over the valid corpus ($rows rows: $error_rows error, $warning_rows warning, $info_rows info):"

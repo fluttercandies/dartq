@@ -284,53 +284,88 @@ fn closer_units(kind: TokenKind) -> usize {
 // read-only group/record scanning
 // ---------------------------------------------------------------------------
 
-/// `(...)` record-type content probe (a reduced
-/// `_checkIfRecordTypeParenthesisAreRecovered`).
+/// `(...)` record-type content probe (the reduced
+/// `_checkIfRecordTypeParenthesisAreRecovered`,
+/// `type_info_impl.dart:882-943`).
 pub(crate) struct RecordProbe {
     pub(crate) open: usize,
 }
 
 impl RecordProbe {
     /// Whether `(` at `self.open` (closing at `end_offset`) holds
-    /// record-type field shapes.
+    /// record-type field shapes. Faithful walk of the official check: each
+    /// field is an optional named-section `{`, optional metadata, a type,
+    /// and one optional name (a name only directly after the type — the
+    /// next field's type must never read as a name), followed by `,`,
+    /// `)`, or the named section's closing `}` + `)`. The tail verdict
+    /// rejects a single positional field with no comma (`(int)` is not a
+    /// record) while `(int,)` and `()` pass.
     pub(crate) fn looks_like_record_type(
         &self,
         parser: &Parser<'_, '_, impl ParserListener>,
         end_offset: usize,
     ) -> bool {
-        let mut offset = self.open;
-        let mut fields = 0usize;
-        let mut in_named = false;
+        // Walk head: the last consumed separator (`(`, `,`, `{`).
+        let mut token = self.open;
+        let mut has_named_fields = false;
+        let mut parameter_count = 0usize;
+        let mut has_comma = false;
         loop {
-            offset += 1;
-            if offset >= end_offset {
-                break;
+            let next = token + 1;
+            // The `)` arm consumes next == end_offset; only a walk that
+            // overshoots the paired group (impossible over balanced table
+            // spans) hits this bound.
+            if next > end_offset {
+                return false;
             }
-            match parser.kind_at(offset) {
+            match parser.kind_at(next) {
                 TokenKind::CloseParen => break,
-                TokenKind::OpenCurly if !in_named => {
-                    in_named = true;
-                    continue;
-                }
-                TokenKind::Comma => {
-                    fields += 1;
-                    continue;
+                TokenKind::CloseCurly
+                    if has_named_fields && parser.kind_at(next + 1) == TokenKind::CloseParen =>
+                {
+                    break;
                 }
                 _ => {}
             }
-            let len = parser.skip_type_len(offset);
-            if len == 0 {
-                return false;
+            parameter_count += 1;
+            if !has_named_fields && parser.kind_at(next) == TokenKind::OpenCurly {
+                has_named_fields = true;
+                token = next;
             }
-            offset += len;
-            fields += 1;
-            if is_identifier(parser.kind_at(offset + 1)) {
-                offset += 1;
+            let mut type_at = token + 1;
+            if parser.kind_at(type_at) == TokenKind::At {
+                let meta_len = parser.metadata_skip_len(type_at);
+                if meta_len == 0 {
+                    return false;
+                }
+                type_at += meta_len;
+            }
+            let len = parser.skip_type_len(type_at);
+            if len == 0 {
+                return false; // official: computeType(required).recovered
+            }
+            token = type_at + len - 1;
+            if is_identifier(parser.kind_at(token + 1)) {
+                token += 1; // optional field name
+            } else if has_named_fields {
+                return false; // named fields require names
+            }
+            match parser.kind_at(token + 1) {
+                TokenKind::Comma => {
+                    has_comma = true;
+                    token += 1;
+                }
+                TokenKind::CloseParen => break,
+                TokenKind::CloseCurly if parser.kind_at(token + 2) == TokenKind::CloseParen => {
+                    break;
+                }
+                _ => return false, // recovery
             }
         }
-        // A record needs a comma or named fields; one positional field
-        // without a comma is a parenthesized type, not a record.
-        fields >= 2 || in_named
+        // Official tail verdict (type_info_impl.dart:937-941): exactly one
+        // positional field with no comma is a parenthesized type, not a
+        // record; the empty record and trailing-comma singles pass.
+        !(parameter_count == 1 && !has_named_fields && !has_comma)
     }
 }
 
