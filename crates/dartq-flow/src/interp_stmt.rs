@@ -143,8 +143,20 @@ impl Interp<'_> {
             }
             Ev::WhileEnd => {
                 // The loop statement's end covers body intervals (official
-                // `visitWhileStatement`'s `flowEnd` on the body).
-                self.flow_end(crate::interp::Covered::Strict);
+                // `visitWhileStatement`'s `flowEnd(node.body)`,
+                // type_analyzer.dart:4901). The containment gate accepts the
+                // close node itself (`_containsFirstDeadNode`,
+                // dead_code_verifier.dart:453-459 — the walk starts at the
+                // first dead node and matches on equality), so the at-depth
+                // body band is covered: the body block's `{` and a non-block
+                // body statement carry the loop's frame depth (the body keeps
+                // no frame of its own), while the `while` keyword's anchor
+                // sits one depth below and stays open for the outer covering
+                // close. No offset gate is needed: reachability is unchanged
+                // between `WhileBegin` and `WhileBodyBegin`, so the condition
+                // can never be the first dead node — an entry-dead loop
+                // anchors at the keyword first.
+                self.flow_end(crate::interp::Covered::Body);
                 self.loop_exit(false);
             }
             Ev::DoBegin { span } => {

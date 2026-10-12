@@ -2552,6 +2552,53 @@ fn dead_interval_dead_branch_block_reports_full_extent() {
     assert_eq!(dead_snippets(source), ["{ return; 1; }"]);
 }
 
+// —— dead while-loop body containment (phase-1 while probes) ————
+
+/// Probe s2 (oracle row `2:17 27`): a wholly dead block body anchors at
+/// the body block's `{` — the official `flowEnd(node.body)` containment
+/// accepts the close node itself (`node == firstDeadNode`), so the row
+/// spans the block's full extent, `}` included — and the close fires at
+/// `WhileEnd`, so the live tail after the loop is not swallowed.
+#[test]
+fn dead_while_block_body_row_spans_block_not_tail() {
+    let source =
+        "void f() {\n  while (false) {\n    int x;\n    int y;\n  }\n  print('tail');\n}\n";
+    assert_eq!(dead_snippets(source), ["{\n    int x;\n    int y;\n  }"]);
+}
+
+/// Probe s3 (oracle row `2:17 11`): a non-block body statement carries
+/// the loop's frame depth, so the row is exactly that statement — anchor
+/// at its first token, end at its `;` — and the tail stays live.
+#[test]
+fn dead_while_statement_body_row_is_exactly_the_statement() {
+    let source = "void f() {\n  while (false) print('x');\n  print('tail');\n}\n";
+    assert_eq!(dead_snippets(source), ["print('x');"]);
+}
+
+/// Probe s13 (oracle rows `2:17 16` + `5:17 11`): two consecutive dead
+/// loops report TWO rows — the first loop's close fires at its own
+/// `WhileEnd`, so the second loop's body anchors a fresh interval instead
+/// of folding into the first.
+#[test]
+fn dead_while_loops_report_one_row_per_loop() {
+    let source = "void f() {\n  while (false) {\n    print('1');\n  }\n  while (false) print('2');\n  print('tail');\n}\n";
+    assert_eq!(
+        dead_snippets(source),
+        ["{\n    print('1');\n  }", "print('2');"]
+    );
+}
+
+/// Regression guard: an entry-dead loop anchors at the `while` keyword —
+/// one depth BELOW the at-depth body band — so the `WhileEnd` close must
+/// leave the interval open; it rides to the declaration exit as one
+/// whole-statement row (official: the first dead node is the `while`
+/// itself).
+#[test]
+fn entry_dead_while_keeps_anchoring_at_the_keyword() {
+    let source = "void f(bool c) {\n  return;\n  while (c) print('x');\n}\n";
+    assert_eq!(dead_snippets(source), ["while (c) print('x');"]);
+}
+
 // —— dead for-loop updaters (official `for_updaterBegin`, probe table J) ——
 
 /// Probe u1 (oracle rows `2|26|3` = `i++`, `2|31|2` = `{}`): a
