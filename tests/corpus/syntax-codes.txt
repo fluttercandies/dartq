@@ -2,8 +2,8 @@
 # Derived from the authoritative table
 # crates/dartq-diagnostics/data/syntax-codes.tsv (258 rows) by excluding the
 # 3 language-version-family codes (illegal/inconsistent/
-# invalid_language_version_override): docs/facts/version-skew.md §5.3 keeps
-# version-skew codes out of the gate denominator. The derivation is pinned by
+# invalid_language_version_override): the gate denominator excludes those
+# version-skew codes. The derivation is pinned by
 # the harness test `gate_codes_file_matches_authoritative_tsv`.
 abstract_class_member
 abstract_external_field

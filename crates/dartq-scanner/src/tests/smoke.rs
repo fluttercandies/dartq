@@ -1,23 +1,28 @@
 //! Legality golden smoke: scans the official scanner's own source (~2900 lines
 //! of real Dart) and a ~1MB synthetic source (release <5ms, PRD §19.3
-//! performance axis). Automatically skipped in CI without `.third`.
+//! performance axis). Automatically skipped unless `DARTQ_SDK_CHECKOUT` is
+//! set to a dart-lang/sdk checkout.
 
 use std::path::PathBuf;
 
 use super::{config, file_id};
 use crate::scan;
 
-/// Repo root = `CARGO_MANIFEST_DIR`/../.. (two levels above crates/dartq-scanner).
+/// The official scanner source inside a dart-lang/sdk checkout
+/// (`DARTQ_SDK_CHECKOUT`), the same file the upstream scanner tests scan.
 fn official_scanner_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart")
+    PathBuf::from(std::env::var("DARTQ_SDK_CHECKOUT").unwrap_or_default())
+        .join("pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart")
 }
 
 #[test]
 fn smoke_official_scanner_source() {
     let path = official_scanner_path();
     let Ok(src) = std::fs::read_to_string(&path) else {
-        eprintln!("skip: {} not present (CI without .third)", path.display());
+        eprintln!(
+            "skip: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout to scan {}",
+            path.display()
+        );
         return;
     };
     let r = scan(&src, config(), file_id());

@@ -4,7 +4,7 @@
 # Runs the harness once over tests/corpus/m2-warning with the frozen M2 code
 # universe (tests/harness/m2_warning_codes.txt), WARNING severity, threshold
 # 1.0 — the M2 bar, full parity like every differential gate (2026-10-12
-# ruling, docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD
+# ruling, the full-parity bars ADR; supersedes the PRD
 # section 20.3 numeric bars; residuals pass only via individually adjudicated
 # pinned exemptions, never a numeric budget) — against the same single oracle
 # of record as M1: the fvm default install (Dart 3.13.1, the gate-caliber-r5
@@ -30,7 +30,7 @@
 #
 #   --dry-run       resolve every path, print the plan and the exact harness
 #                   command, execute nothing (no dart, no harness).
-#   --label L       report directory name under docs/audits/gate-m2/.
+#   --label L       report directory name under target/evidence/gate-m2/.
 #                   Default: M2_LABEL env, else m2-r1. An existing report
 #                   directory is refused — a rerun never overwrites recorded
 #                   evidence.
@@ -61,7 +61,7 @@ CORPUS="tests/corpus/m2-warning"
 CODES_FILE="tests/harness/m2_warning_codes.txt"
 THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
-OUT_ROOT="docs/audits/gate-m2"
+OUT_ROOT="target/evidence/gate-m2"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="m2-r1"
 

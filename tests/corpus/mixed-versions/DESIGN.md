@@ -25,14 +25,14 @@ This corpus is NOT wired into the m0/m1 gates. See "Wiring" at the bottom.
 ## Resolution and override anchors (ground truth)
 
 - `languageVersion` field in `package_config.json` entries is read as a
-  string per package: `.third/pub/lib/src/package_config.dart:236-238`
+  string per package: `upstream pub source, lib/src/package_config.dart:236-238`
   (non-string rejected). The pubspec-derived default comes from the
-  `environment: sdk:` lower bound: `.third/pub/lib/src/pubspec.dart:141`.
+  `environment: sdk:` lower bound: `upstream pub source, lib/src/pubspec.dart:141`.
 - `// @dart` version-comment recognition lives in the scanner:
-  `.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart:1837`
+  `upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart:1837`
   (`"@dart"` prefix check) and `token.dart:809` (accepted form
   `'// @dart = 2.1'`, spacing around `=` optional).
-- Override semantics: `.third/dart-sdk/pkg/front_end/lib/src/source/
+- Override semantics: `upstream Dart SDK source, pkg/front_end/lib/src/source/
   source_compilation_unit.dart:469-478` — the package_config version is the
   default, a source-level version annotation overrides it, and only the
   FIRST registered version applies (later ones are ignored).

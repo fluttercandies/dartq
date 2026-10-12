@@ -1,5 +1,5 @@
 // Targets the accessor family (analyzer ParserErrorCode, pinned snapshot
-// syntax-codes.tsv; the analyzer sources are not vendored in .third).
+// syntax-codes.tsv; the analyzer sources are not vendored in this repo).
 // Targets missing_get (TSV:207): a '=>' member without 'get'.
 class MissingGet {
   int x => 1;

@@ -23,8 +23,8 @@
 //!   [`dartq_pub::ResolvedPackageGraph`]; the build rejects artifact pairs
 //!   that disagree instead of silently dropping packages.
 //!
-//! Format facts and pub behavior anchors live in `docs/facts/pub-formats.md`
-//! and `.third/pub/lib/src/package.dart`; do not lint-prose them here.
+//! Format facts and pub behavior anchors live in the pub formats contract
+//! and `upstream pub source, lib/src/package.dart`; do not lint-prose them here.
 #![allow(clippy::doc_markdown)]
 
 mod identity;

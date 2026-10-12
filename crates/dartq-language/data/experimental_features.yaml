@@ -1,11 +1,11 @@
 # Vendored copy of dart-lang/sdk `tools/experimental_features.yaml`.
 #
 # ERA PIN (2026-10-09): this snapshot is pinned to the measurement oracle,
-# dart 3.13.1 stable (docs/facts/corpus-expansion-plan.md oracle lock), NOT to
+# dart 3.13.1 stable (the corpus expansion plan oracle lock), NOT to
 # a live SDK main. Source: dart-lang/sdk tag `3.13.1`,
 # `tools/experimental_features.yaml` (`current-version: '3.13.0'`), fetched
 # 2026-10-09 and cross-checked against the locked pub artifacts
-# analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 (docs/facts/version-skew.md §2;
+# analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 (the version-skew ledger §2;
 # both are older 3.11-dev generated snapshots that lag the 3.13.1 tag — they
 # still carry `declaring-constructors` (shipped by the 3.13.1 tag as
 # `primary-constructors`) and lack `this-promotion` / `anonymous-methods`,
@@ -31,7 +31,7 @@
 # for details. All rights reserved. Use of this source code is governed by a
 # BSD-style license that can be found in the LICENSE file.
 
-# Experimental features are described in docs/process/experimental-flags.md
+# Experimental features are described in the upstream Dart SDK's experimental-flags process notes
 #
 # Despite the name, they are not limited to experiments, and are often
 # used to enable new features or enhancements that are being

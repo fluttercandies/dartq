@@ -1,6 +1,6 @@
 // Targets the type-literal family (analyzer ParserErrorCode, pinned
 // snapshot syntax-codes.tsv; the analyzer sources are not vendored in
-// .third).
+// this repo).
 // Targets expected_list_or_map_literal (TSV:100): type arguments not
 // followed by a list or map literal.
 var expectedListOrMap = <int> 3;

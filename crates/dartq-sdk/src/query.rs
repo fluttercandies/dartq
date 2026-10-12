@@ -19,7 +19,7 @@ impl SdkSnapshot {
     ///
     /// Segment sets drift across SDK versions, so segments are addressed by
     /// their `libraries.json` name — never a hardcoded enumeration
-    /// (`docs/facts/sdk-metadata.md` §7).
+    /// (the SDK metadata capture §7).
     #[must_use]
     pub fn target(&self, segment: &str) -> Option<&TargetLibraries> {
         self.sdk_libraries.get(segment)
@@ -39,7 +39,7 @@ impl SdkSnapshot {
     ///
     /// Patch files are deliberately unreachable from here: they are backend
     /// implementation details, kept as [`SdkLibrary::patches`](crate::SdkLibrary::patches)
-    /// path lists only (`docs/facts/sdk-metadata.md` §6).
+    /// path lists only (the SDK metadata capture §6).
     ///
     /// The structural twin [`SdkSnapshot::library_to_path`] consumes the
     /// already-split `(library, part)` pair with byte-identical semantics;
@@ -135,7 +135,7 @@ impl SdkSnapshot {
     /// looks up `dart.library.<libraryName>` against the target's effective
     /// library set (`pkg/kernel/lib/target/targets.dart`,
     /// `dartLibraryPrefix`; correction of PRD §7 in
-    /// `docs/facts/sdk-metadata.md` §1).
+    /// the SDK metadata capture §1).
     #[must_use]
     pub fn library_support_value(&self, segment: &str, library: &str) -> bool {
         self.target(segment)

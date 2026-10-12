@@ -37,9 +37,9 @@
   "source": "import 'dart:io';\n\nvoid main(List<String> args) async {\n  final proc = await Process.start('', []);\n  proc.stdout. // we're typing here!\n\n  int getNumber() { return 42; }\n}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

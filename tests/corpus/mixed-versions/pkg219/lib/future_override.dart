@@ -1,7 +1,7 @@
 // @dart=3.0
 // HIGHER-than-package override face: the package default is 2.19 but this
 // file pins 3.0 (override semantics anchor:
-// .third/dart-sdk/pkg/front_end/lib/src/source/source_compilation_unit.dart
+// upstream Dart SDK source, pkg/front_end/lib/src/source/source_compilation_unit.dart
 // :469-478).
 //
 // Records and patterns ship at 3.0, so these shapes are legal INSIDE this

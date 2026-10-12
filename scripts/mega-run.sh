@@ -21,7 +21,7 @@
 # axis stays with the m0/m1 gates).
 #
 # --oracle-leg runs the mega T2 oracle differential leg at the 1k tier only
-# (docs/plans/mega-corpus.md §3.2 fast tier + §4 A9; #736). It materializes
+# (the mega acceptance-bar ledger §3.2 fast tier + §4 A9; #736). It materializes
 # the seeded-error variant of the 1k tree (scripts/mega-seed-errors.sh from
 # the checked-in manifest scripts/mega-seeded-errors.json) and drives the
 # existing harness differential face twice, once per tree:
@@ -49,10 +49,10 @@
 # oracle-related runs and the strict table keeps the A7/A8/A9 SKIP row
 # verbatim.
 #
-# --strict turns the run into the acceptance gate face (docs/plans/
-# mega-corpus.md §4): per-scale budget rows are asserted and the run gets a
+# --strict turns the run into the acceptance gate face (the mega acceptance-bar
+# ledger §4): per-scale budget rows are asserted and the run gets a
 # labeled VERDICT. Asserted faces: A1 rss_per_100k_loc_kib <= 200000 KiB at
-# the 100k tier (PRD section 1.5, PRD.md:140; 1k/10k stay report-only per
+# the 100k tier (PRD section 1.5, the RSS charter row; 1k/10k stay report-only per
 # A2 — fixed process overhead dominates there), A3 the 8 GiB watchdog cap,
 # A4/A5/A6 the batch-proxy incremental p95 bars (2000/4000/60000 ms by
 # tier, adopted at recon closure #733), A10 zero-panic, A11 completion
@@ -77,7 +77,7 @@
 #
 #   --scale S       single scale to run (default 1k).
 #   --all           run the whole ladder (1k, 10k, 100k) in order.
-#   --strict        acceptance gate face (docs/plans/mega-corpus.md §4):
+#   --strict        acceptance gate face (the mega acceptance-bar ledger §4):
 #                   assert the budget rows, print a VERDICT line, exit 1 on
 #                   any breach. Under a strict 100k tier a disk-headroom
 #                   precheck (~800 MB for the incremental copy) runs first.
@@ -90,16 +90,16 @@
 #                   (#798): oracle_baseline.sh twice over the clean 1k tree
 #                   (oracle-of-record dart vs DARTQ_CMD, 5 rounds each,
 #                   round 1 = cold; single-instance, sequential). Reports
-#                   land at docs/audits/mega/<label>/1k/{oracle-clean,
+#                   land at target/evidence/mega/<label>/1k/{oracle-clean,
 #                   oracle-seeded,cold}/. Mutually exclusive with --all and
 #                   scales other than 1k.
 #   --dry-run       print the plan + exact commands, execute nothing
 #                   (--dry-run --strict prints the asserted table).
-#   --label L       report directory name under docs/audits/mega/.
+#   --label L       report directory name under target/evidence/mega/.
 #                   Default: MEGA_LABEL env, else mega-r1. A label whose
 #                   directory already exists refuses the run (exit 2) —
 #                   recorded evidence is never overwritten. Reports land at
-#                   docs/audits/mega/<label>/<scale>/{rss-100k,
+#                   target/evidence/mega/<label>/<scale>/{rss-100k,
 #                   incremental-p95}/report.json plus edit-manifest.json.
 #
 # Environment overrides: DARTQ_CMD (the dartq side; default
@@ -128,14 +128,14 @@
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
 
-OUT_ROOT="docs/audits/mega"
+OUT_ROOT="target/evidence/mega"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="mega-r1"
 DEFAULT_TIMEOUT_MS=600000
 
 # --- strict acceptance bars (asserted only under --strict; sources are
-# docs/plans/mega-corpus.md §4) -------------------------------------------------
-# A1: PRD §1.5 (PRD.md:140) "RSS/100k LOC <= 200 MB" — decimal reading,
+# the mega acceptance-bar ledger §4) -------------------------------------------------
+# A1: PRD §1.5 (the RSS charter row) "RSS/100k LOC <= 200 MB" — decimal reading,
 # 200000 KiB (stricter than the MiB reading, 204800). Asserted at the 100k
 # tier only. Env override: MEGA_RSS_100K_LIMIT_KIB.
 RSS_100K_LIMIT_KIB=200000
@@ -145,8 +145,8 @@ RSS_100K_LIMIT_KIB=200000
 WATCHDOG_CAP_KIB=8388608
 # A4/A5/A6: batch-proxy incremental p95 bars by tier. The metric spawns one
 # full dartq process per edit step (tests/harness/src/bench.rs), so
-# PRD.md:143's resident 2 s binds only as the adopted analog. A4 1k:
-# PRD.md:143 analog at the 52k-LOC tier; A5 10k: 2x linear from the pinned
+# the charter's resident-2s row binds only as the adopted analog. A4 1k:
+# the resident-2s charter row analog at the 52k-LOC tier; A5 10k: 2x linear from the pinned
 # 250k point; A6 100k: adopted two-stage (r1 records the baseline, the bar
 # asserts from r2 on; relax via env for a deliberate r1 run). Env overrides:
 # MEGA_INC_P95_1K_MS / MEGA_INC_P95_10K_MS / MEGA_INC_P95_100K_MS.
@@ -157,9 +157,9 @@ INC_P95_100K_MS=60000
 # before timing it (~398 MB corpus + the copy; tools/corpus-gen/README.md
 # consumption note and the #546 ledger's deferred note).
 DISK_HEADROOM_100K_MIB=800
-# A9 (oracle leg, 1k only): ERROR (code,file) Jaccard bar, docs/plans/
-# mega-corpus.md §4 A9. Bar 1.0 — full parity like every differential gate
-# (2026-10-12 ruling, docs/facts/adr-2026-10-12-full-parity-bars.md;
+# A9 (oracle leg, 1k only): ERROR (code,file) Jaccard bar, the mega acceptance-bar
+# ledger §4 A9. Bar 1.0 — full parity like every differential gate
+# (2026-10-12 ruling, the full-parity bars ADR;
 # supersedes the PRD-era numeric bars; residuals pass only via individually
 # adjudicated pinned exemptions, never a numeric budget). The harness
 # enforces it as its own --threshold; this script classifies the
@@ -243,7 +243,7 @@ done
 # the harness's own threshold gate either way) --------------------------------
 if [ "$oracle_leg" -eq 1 ]; then
   if [ "$all_scales" -eq 1 ] || [ "$scales" != "1k" ]; then
-    die "--oracle-leg runs the 1k tier only (docs/plans/mega-corpus.md §3.2); use --scale 1k"
+    die "--oracle-leg runs the 1k tier only (the mega acceptance-bar ledger §3.2); use --scale 1k"
   fi
   oracle_jac_min="${MEGA_ORACLE_JACCARD_MIN:-$ORACLE_JACCARD_MIN}"
   case "$oracle_jac_min" in
@@ -439,7 +439,7 @@ run_bench() {
   return 1
 }
 
-# Strict acceptance rows for one scale (docs/plans/mega-corpus.md §4),
+# Strict acceptance rows for one scale (the mega acceptance-bar ledger §4),
 # printed inside the summary. Reads the summary globals; appends breaches
 # and sets strict_fail. A12 (corpus identity) runs on every scale and is an
 # environment-tier failure when violated — the tree must come from the
@@ -460,9 +460,9 @@ strict_rows() {
         die "rss report for $s carries no rss_per_100k_loc_kib"
       fi
       if [ "$a1" -le "$rss_limit_kib" ]; then
-        printf '  %-16s %s KiB <= %s KiB (PRD.md:140, decimal) — PASS\n' "A1 rss/100k" "$a1" "$rss_limit_kib"
+        printf '  %-16s %s KiB <= %s KiB (the RSS charter row, decimal) — PASS\n' "A1 rss/100k" "$a1" "$rss_limit_kib"
       else
-        printf '  %-16s %s KiB > %s KiB (PRD.md:140, decimal) — FAIL\n' "A1 rss/100k" "$a1" "$rss_limit_kib"
+        printf '  %-16s %s KiB > %s KiB (the RSS charter row, decimal) — FAIL\n' "A1 rss/100k" "$a1" "$rss_limit_kib"
         strict_fail=1
         breaches="${breaches}[$label/$s] A1: rss_per_100k_loc_kib $a1 > $rss_limit_kib KiB
 "
@@ -479,7 +479,7 @@ strict_rows() {
     1k)
       bar="$inc_p95_1k_ms"
       face="A4"
-      cite="adopted #733: PRD.md:143 analog at the 52k-LOC tier"
+      cite="adopted #733: the resident-2s charter row analog at the 52k-LOC tier"
       ;;
     10k)
       bar="$inc_p95_10k_ms"
@@ -514,7 +514,7 @@ strict_rows() {
   fi
 }
 
-# --- oracle leg helpers (mega T2, docs/plans/mega-corpus.md §3.2 fast
+# --- oracle leg helpers (mega T2, the mega acceptance-bar ledger §3.2 fast
 # tier + §4 A9; run path only) -------------------------------------------------
 
 # Run one differential face of the leg and classify the harness exit into
@@ -607,7 +607,7 @@ oracle_leg_run() {
   seeded_class="$oracle_face_class"
 }
 
-# The A7 cold leg for the 1k scale (docs/plans/mega-corpus.md §4 A7; #798):
+# The A7 cold leg for the 1k scale (the mega acceptance-bar ledger §4 A7; #798):
 # the generalized oracle_baseline.sh driven twice over the same clean tree —
 # the oracle side (oracle-of-record dart, `dart analyze --format=machine`,
 # the instrument's default shape passed via --cmd so both legs share one
@@ -716,23 +716,23 @@ if [ "$oracle_leg" -eq 1 ]; then
 else
   printf '  %-16s NO oracle differential (S4 is a dartq-side budget: PRD 19.2 S4, 19.3)\n' "oracle"
 fi
-printf '  %-16s docs/audits/mega/%s/<scale>/\n' "reports" "$label"
+printf '  %-16s target/evidence/mega/%s/<scale>/\n' "reports" "$label"
 if [ "$strict" -eq 1 ]; then
-  echo "== strict acceptance gate (docs/plans/mega-corpus.md §4)"
-  printf '  %-6s %s\n' "A1" "rss_per_100k_loc_kib <= $rss_limit_kib KiB at 100k (PRD.md:140 decimal; 1k/10k report-only per A2)"
+  echo "== strict acceptance gate (the mega acceptance-bar ledger §4)"
+  printf '  %-6s %s\n' "A1" "rss_per_100k_loc_kib <= $rss_limit_kib KiB at 100k (RSS charter row, decimal; 1k/10k report-only per A2)"
   printf '  %-6s %s\n' "A3" "watchdog tree cap $WATCHDOG_CAP_KIB KiB — harness breach = FAIL (runbook:8)"
-  printf '  %-6s %s\n' "A4" "incremental p95 batch proxy <= $inc_p95_1k_ms ms at 1k (adopted #733: PRD.md:143 analog)"
+  printf '  %-6s %s\n' "A4" "incremental p95 batch proxy <= $inc_p95_1k_ms ms at 1k (adopted #733: the resident-2s charter row analog)"
   printf '  %-6s %s\n' "A5" "incremental p95 batch proxy <= $inc_p95_10k_ms ms at 10k (adopted #733: 2x linear from the 250k point)"
   printf '  %-6s %s\n' "A6" "incremental p95 batch proxy <= $inc_p95_100k_ms ms at 100k (adopted #733: two-stage r1 record / r2 assert)"
-  printf '  %-6s %s\n' "A10" "zero panic — dartq exit outside the valid 0-3 tiers = FAIL (PRD.md:146)"
+  printf '  %-6s %s\n' "A10" "zero panic — dartq exit outside the valid 0-3 tiers = FAIL (the zero-panic charter row)"
   printf '  %-6s %s\n' "A11" "completion — driver timeout at ${DARTQ_HARNESS_ORACLE_TIMEOUT_MS} ms = FAIL"
   printf '  %-6s %s\n' "A12" "manifest fingerprint echoed + seed-0 corpus identity checked"
   if [ "$oracle_leg" -eq 1 ]; then
     printf '  %-6s %s\n' "A9" "ERROR (code,file) Jaccard >= $oracle_jac_min at 1k — clean face (record + false-positive detector) + seeded face (judgment)"
     printf '  %-6s %s\n' "A7" "cold pair measured, record-only (oracle-of-record dart vs DARTQ_CMD, $COLD_ROUNDS rounds each, round 1 = cold; assert bar dartq <= 1/2 oracle not asserted this round)"
-    printf '  %-6s %s\n' "SKIP" "A8 10k/100k oracle DNF record — stress tiers, arbitration = A1 (PRD.md:141)"
+    printf '  %-6s %s\n' "SKIP" "A8 10k/100k oracle DNF record — stress tiers, arbitration = A1 (the stress-tier arbitration row)"
   else
-    printf '  %-6s %s\n' "SKIP" "A7/A8/A9 oracle differential faces — mega T2 (docs/plans/mega-corpus.md §5)"
+    printf '  %-6s %s\n' "SKIP" "A7/A8/A9 oracle differential faces — mega T2 (the mega acceptance-bar ledger §5)"
   fi
   printf '  %-6s %s\n' "SKIP" "A13 S4 LOC accounting — parked T4 (bench non-blank vs manifest 5402483 lines)"
   printf '  %-6s %s\n' "env" "bar overrides: MEGA_RSS_100K_LIMIT_KIB MEGA_INC_P95_1K_MS MEGA_INC_P95_10K_MS MEGA_INC_P95_100K_MS$([ "$oracle_leg" -eq 1 ] && printf ' MEGA_ORACLE_JACCARD_MIN')"
@@ -854,7 +854,7 @@ echo
 if [ "$oracle_leg" -eq 1 ]; then
   deferred="deferred faces: A8 stress-tier DNF record (arbitration = A1; A7 cold pair is measured above, record-only); A13 LOC accounting -> parked T4"
 else
-  deferred="deferred faces: A7/A8/A9 oracle leg -> mega T2; A13 LOC accounting -> parked T4 (docs/plans/mega-corpus.md §5)"
+  deferred="deferred faces: A7/A8/A9 oracle leg -> mega T2; A13 LOC accounting -> parked T4 (the mega acceptance-bar ledger §5)"
 fi
 if [ "$strict" -eq 1 ]; then
   if [ "$strict_fail" -eq 1 ]; then

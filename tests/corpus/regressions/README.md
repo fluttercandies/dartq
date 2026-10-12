@@ -19,7 +19,7 @@ Cases are produced by the runner flag, not by hand:
 # persist cases next to the run's reports (recommended target: the audit dir)
 target/debug/harness run --corpus-dir tests/corpus/m1-semantic \
   --dartq-cmd "./target/debug/dartq analyze --format=machine --sdk <sdk>" \
-  --persist-regressions docs/audits/gate-m1/<label>/cases
+  --persist-regressions <evidence-dir>/gate-m1/<label>/cases
 
 # triage: which known divergences still fail?
 target/debug/harness run --list-known

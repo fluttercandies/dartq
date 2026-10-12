@@ -1,5 +1,5 @@
 //! Golden tests pinning `write_machine`/`write_json` to measured oracle
-//! output (`docs/facts/oracle-machine-format.md` §1/§2). File contents are
+//! output (the oracle machine-format contract §1/§2). File contents are
 //! reconstructed so the fixtures reproduce the oracle's measured positions.
 
 use std::path::Path;

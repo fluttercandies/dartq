@@ -1,7 +1,7 @@
 // Positive control at language version 3.0: records, patterns, and class
 // modifiers (sealed/base/final/interface) all ship at 3.0 and are legal at
 // the package default. Feature set derives from the library version
-// (anchor: .third/dart-sdk/pkg/front_end/lib/src/source/
+// (anchor: upstream Dart SDK source, pkg/front_end/lib/src/source/
 // source_compilation_unit.dart:348-353).
 //
 // Expectation: analyzes clean at 3.0.

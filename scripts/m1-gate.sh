@@ -4,12 +4,12 @@
 # Runs the harness once over tests/corpus/m1-semantic with the frozen M1 code
 # universe (tests/harness/m1_codes.txt), ERROR severity, threshold 1.0 — the
 # M1 bar, full parity like every differential gate (2026-10-12 ruling,
-# docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD section
+# the full-parity bars ADR; supersedes the PRD section
 # 20.3 numeric bars; residuals pass only via individually adjudicated pinned
 # exemptions, never a numeric budget) — against a single oracle of record:
 # the fvm default install (Dart 3.13.1, the gate-caliber-r5 baseline). No
 # matrix: M1 acceptance is defined on one caliber. The report lands under
-# docs/audits/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r4;
+# target/evidence/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r4;
 # the recorded history is baseline-r1, r2 and r3, and r2 measured ERROR-tier
 # Jaccard 0.8235 below this bar over the pre-growth corpus — five dartq
 # misses in the wrong_number_of_type_arguments family plus one dartq-only
@@ -25,7 +25,7 @@
 #
 #   --dry-run       resolve every path, print the plan and the exact harness
 #                   command, execute nothing (no dart, no harness).
-#   --label L       report directory name under docs/audits/gate-m1/.
+#   --label L       report directory name under target/evidence/gate-m1/.
 #                   Default: M1_LABEL env, else m1-r4. An existing report
 #                   directory is refused — a rerun never overwrites recorded
 #                   evidence.
@@ -60,7 +60,7 @@ CORPUS="tests/corpus/m1-semantic"
 CODES_FILE="tests/harness/m1_codes.txt"
 THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
-OUT_ROOT="docs/audits/gate-m1"
+OUT_ROOT="target/evidence/gate-m1"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="m1-r4"
 

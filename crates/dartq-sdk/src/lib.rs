@@ -6,7 +6,7 @@
 //! `libraries.dart` with an embedded Dart parser — dartq consumes the
 //! machine-readable `libraries.json`: same public library names, plus the
 //! target segments, patch paths, and conditional-import gates the
-//! Dart-shaped table lacks (rationale in `docs/facts/sdk-metadata.md` §2).
+//! Dart-shaped table lacks (rationale in the SDK metadata capture §2).
 //!
 //! Loading is eager over the small metadata files and lazy over `dart:`
 //! source bodies:
@@ -37,7 +37,7 @@
 //! library map yields empty analysis and a malformed
 //! `allowed_experiments.json` disables every experiment — dartq hard-errors
 //! with [`SdkError`], so a crippled SDK can never masquerade as a valid
-//! analysis baseline (`docs/facts/sdk-loader-spec.md` §6).
+//! analysis baseline (the SDK loader contract §6).
 
 mod identity;
 mod loader;

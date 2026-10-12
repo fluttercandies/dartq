@@ -1,7 +1,7 @@
 // @dart=2.12
 // Below-version override face: the package default is 2.17 but this file
 // pins 2.12 (override semantics anchor:
-// .third/dart-sdk/pkg/front_end/lib/src/source/source_compilation_unit.dart
+// upstream Dart SDK source, pkg/front_end/lib/src/source/source_compilation_unit.dart
 // :469-478 — first registered version wins).
 //
 // The enhanced-enum shape from pkg217/lib/main.dart is repeated here.

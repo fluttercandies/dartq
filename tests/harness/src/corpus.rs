@@ -12,13 +12,13 @@ use crate::oracle::{driver_timeout_from_env, run_captured};
 
 /// Corpus package manifest. The sdk lower bound pins the languageVersion pub
 /// records in `.dart_tool/package_config.json`; it must stay >= 3.13 (Plan A,
-/// docs/facts/version-skew.md §4): a lower pin re-disables shipped language
+/// the version-skew ledger §4): a lower pin re-disables shipped language
 /// features (e.g. inline-class @ 3.3) and floods the gate with
 /// `experiment_not_enabled` assembly noise (51/51 of the old syntactic bucket).
 /// Shared with the bench fixture materialization (`bench::BenchFixture`).
 pub(crate) const PUBSPEC: &str = "name: corpus_m0\nenvironment:\n  sdk: ^3.13.0\n";
 
-/// Minimum corpus language version (Plan A, docs/facts/version-skew.md §4).
+/// Minimum corpus language version (Plan A, the version-skew ledger §4).
 const MIN_LANGUAGE_VERSION: (u32, u32) = (3, 13);
 
 /// Preflight before oracle runs: the corpus package's own `languageVersion` in
@@ -67,7 +67,7 @@ pub(crate) fn check_language_version(corpus_dir: &Path) -> Result<(), String> {
         return Err(format!(
             "preflight: corpus `{}` languageVersion is {version}, need >= 3.13; \
              bump the pubspec sdk lower bound and re-run `dart pub get` \
-             (docs/facts/version-skew.md §4)",
+             (the version-skew ledger §4)",
             corpus_dir.display()
         ));
     }

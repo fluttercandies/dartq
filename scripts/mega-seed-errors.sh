@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mega-seed-errors.sh — deterministic seeded-error variant of a generated
-# mega scale tree (the mega T2 oracle differential leg, docs/plans/
-# mega-corpus.md §3.2 + the #733 vacuity ruling).
+# mega scale tree (the mega T2 oracle differential leg, the mega acceptance-bar
+# ledger §3.2 + the #733 vacuity ruling).
 #
 # Copies <src> (a corpus-gen tree, seed-0, package config materialized by
 # mega-run.sh) to <dst> and injects the checked-in manifest's error files

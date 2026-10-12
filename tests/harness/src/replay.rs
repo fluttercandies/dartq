@@ -419,7 +419,7 @@ impl Default for ReplayOptions {
             dartq_cmd: String::new(),
             daemon_cmd: String::new(),
             label: "replay-r1".into(),
-            out_dir: "docs/audits/replay".into(),
+            out_dir: "target/evidence/replay".into(),
         }
     }
 }
@@ -934,7 +934,7 @@ mod tests {
         ])
         .expect("parses");
         assert_eq!(parsed.label, "replay-r1", "default label");
-        assert_eq!(parsed.out_dir, PathBuf::from("docs/audits/replay"));
+        assert_eq!(parsed.out_dir, PathBuf::from("target/evidence/replay"));
         assert!(
             parse_options(&["--corpus-dir".into(), "c".into()]).is_err(),
             "missing required flags must fail"

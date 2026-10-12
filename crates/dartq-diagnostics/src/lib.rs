@@ -3,7 +3,7 @@
 //! This crate is the single source of truth for the shape and serialization of
 //! dartq diagnostics (PRD §13). Its output must match `dart analyze`'s
 //! machine formats field-for-field, so every layout decision here is pinned to
-//! the measured oracle facts (`docs/facts/oracle-machine-format.md`).
+//! the measured oracle facts (the oracle machine-format contract).
 //!
 //! - [`Severity`] and [`DiagnosticType`]: the severity and type layering
 //!   measured from `dart analyze --format=machine` (`TYPE` value set:

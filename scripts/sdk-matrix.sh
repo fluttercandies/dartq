@@ -4,11 +4,11 @@
 # Runs the existing gate caliber — the gate-caliber-r5 shape: `harness run`
 # over tests/corpus/m0 + tests/corpus/m0-syntax, ERROR severity, threshold
 # 1.0 (full parity like every differential gate; 2026-10-12 ruling,
-# docs/facts/adr-2026-10-12-full-parity-bars.md), the full syntax-codes
+# the full-parity bars ADR), the full syntax-codes
 # TSV — once per supported Dart SDK oracle, then
 # prints a per-version summary (version / Jaccard / verdict) and
 # pre-classifies one-sided (code,file) entries through the version-skew
-# attribution rules (docs/facts/version-skew.md §5: the 7 `removedIn` codes
+# attribution rules (the version-skew ledger §5: the 7 `removedIn` codes
 # and the language-version diagnostic family are version skew, everything
 # else is a real-defect candidate). Classification reads raw-outputs.json —
 # the unfiltered plane — so codes the gate's codes-file set drops (the
@@ -22,7 +22,7 @@
 #
 # Matrix set (single source of truth: MATRIX + the vendored anchor below).
 # The PRD §19.1 anchors are fvm 3.29 / 3.35 / 3.38 (Flutter versions; each
-# bundles a Dart SDK) + the vendored dev SDK .third/dart-sdk (main
+# bundles a Dart SDK) + the vendored dev SDK source checkout (main
 # 3.15.0-dev). The current gate oracle of record (fvm default → Dart 3.13.1,
 # the gate-caliber-r5 baseline) is included so matrix numbers stay comparable
 # to it. The dart versions below were read from each install's
@@ -35,7 +35,7 @@
 #   --dry-run           resolve every matrix entry, print the resolved dart
 #                       version, run no gate.
 #   --dart-override P   run a single-SDK pass with the dart executable P as
-#                       the oracle, report under docs/audits/sdk-matrix/
+#                       the oracle, report under target/evidence/sdk-matrix/
 #                       override. This is the fallback when fvm is absent,
 #                       and the way to cover the vendored main-3.15 anchor:
 #                       a source snapshot ships no dart binary, so in a full
@@ -72,17 +72,17 @@ MATRIX=(
   "dart-3.10|3.38.1|3.10.0"
   "dart-3.13|default|3.13.1"
 )
-VENDORED_LABEL="dart-main-3.15" # .third/dart-sdk (main 3.15.0-dev anchor)
+VENDORED_LABEL="dart-main-3.15" # local SDK source checkout (main 3.15.0-dev anchor)
 
 CORPORA=(tests/corpus/m0 tests/corpus/m0-syntax)
 CODES_FILE="crates/dartq-diagnostics/data/syntax-codes.tsv"
 THRESHOLD="1.0"
-OUT_ROOT="docs/audits/sdk-matrix"
+OUT_ROOT="target/evidence/sdk-matrix"
 HARNESS="./target/debug/harness"
 DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=machine"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 
-# Version-skew diagnostic families (docs/facts/version-skew.md §2.2 removedIn
+# Version-skew diagnostic families (the version-skew ledger §2.2 removedIn
 # codes + §2 language-version family), matched case-insensitively against the
 # one-sided (code,file) entry codes computed from raw-outputs.json — the
 # unfiltered plane. report.json's diff lists are post-codes-filter and can
@@ -201,7 +201,7 @@ else
       plan+=("$VENDORED_LABEL||skipped: VENDORED_DART='$VENDORED_DART' is not executable|")
     fi
   else
-    plan+=("$VENDORED_LABEL||skipped: .third/dart-sdk is a source snapshot (no dart binary); build dart from it and rerun with VENDORED_DART=<path> or --dart-override <path>|")
+    plan+=("$VENDORED_LABEL||skipped: the local SDK source checkout is a source snapshot (no dart binary); build dart from it and rerun with VENDORED_DART=<path> or --dart-override <path>|")
   fi
 fi
 
@@ -338,7 +338,7 @@ echo "resolved=$resolved/${#plan[@]} (SKIP entries count as unresolved)"
 echo "skew columns: '<skew-classified>/<total>' per side — one-sided (code,file)"
 echo "entries computed from raw-outputs.json (all severities, unfiltered), so"
 echo "codes outside the gate's codes-file set — e.g. the removedIn codes pruned"
-echo "from the TSV — are still classified (docs/facts/version-skew.md §5 rule 3:"
+echo "from the TSV — are still classified (the version-skew ledger §5 rule 3:"
 echo "removedIn codes + language-version family = version skew, not dartq"
 echo "defects; the remaining one-sided entries are real-defect candidates —"
 echo "attribute each through the per-version report.json + raw-outputs.json;"

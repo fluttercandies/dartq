@@ -1,6 +1,6 @@
 // Positive control at language version 3.3: extension types ship at 3.3
 // and are legal at the package default. Feature set derives from the
-// library version (anchor: .third/dart-sdk/pkg/front_end/lib/src/source/
+// library version (anchor: upstream Dart SDK source, pkg/front_end/lib/src/source/
 // source_compilation_unit.dart:348-353; representation declaration
 // parsing in the shared parser,
 // pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart, with the

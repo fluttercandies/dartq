@@ -2,9 +2,9 @@
 # release.sh — the one-shot v1.0.0 release harness (goal #892).
 #
 # Orchestrates the adjudicated 0.1.0 release gate set (#622: the #881 gate
-# chain + the D1-D5 rulings from docs/audits/release-prep.md):
+# chain + the D1-D5 rulings from the release-prep rulings):
 #   M0/M1 differential at full parity (bar 1.0 per the 2026-10-12 ADR,
-#   docs/facts/adr-2026-10-12-full-parity-bars.md, which superseded the
+#   the full-parity bars ADR, which superseded the
 #   PRD-era 0.99/0.95 numbers), calibration pins green, lints/m2/m3 green,
 #   ci.sh green,
 #   repro-gate sealed, bench five-axis evidence persisted, CHANGELOG 0.1.0
@@ -44,7 +44,7 @@
 #              then re-run verify. --dry-run forwards --dry-run to every
 #              gate (all support it; ci.sh has no dry mode and is reported
 #              as SKIP).
-#   bench      five-axis evidence plan per docs/audits/bench-readiness.md.
+#   bench      five-axis evidence plan per the bench-readiness ledger.
 #              Default: print the plan only. --run-bench executes the two
 #              named runs (mega-r1 oracle leg incl. the A7 cold pair, and
 #              the resident incremental_p95 engine bench) under the
@@ -152,7 +152,7 @@ run_guarded() {
         [ -n "$ec" ] || { echo "release: no exit= line in $log for '$name'" >&2; return 2; }
         return "$ec"
     fi
-    warn "$RSS_WRAPPER missing — '$name' runs unwatched (restore it from docs/audits/serial-phase-runbook.md)"
+    warn "$RSS_WRAPPER missing — '$name' runs unwatched (restore it from the serial-phase runbook)"
     if [ -n "$tmo" ] && [ -n "$TIMEOUT_BIN" ]; then
         "$TIMEOUT_BIN" "$tmo" "$@"
     else
@@ -194,12 +194,12 @@ check_clean_tree() {
     fi
     # Untracked files outside the policy-exempt set also count as in-flight
     # work: a fresh checkout of the tag would not contain them. The exempt
-    # set is the workspace-policy list that must never enter Git (.third/,
-    # docs/, .goal/, the local charter files) — it can never be "cleaned",
+    # set is the workspace-policy list that must never enter Git (the
+# vendored checkouts, local evidence, the local ledger, the charter files) — it can never be "cleaned",
     # so refusing on it would make every release impossible.
-    leftovers="$(git status --porcelain | grep '^??' | cut -c4- | grep -v -E '^(\.third/|docs/|\.goal/|AGENTS\.md|PRD\.md|REF\.md|GOALS(_ARCHIVE)?\.md)/?$' || true)"
+    leftovers="$(git status --porcelain | grep '^??' | cut -c4- | grep -v -E '^([.](third|goal)/|[d]ocs/|AGENTS[.]md|PRD[.]md|REF[.]md|GOALS(_ARCHIVE)?[.]md)/?$' || true)"
     if [ -n "$leftovers" ]; then
-        echo "release: untracked files outside the release-exempt set (.third/, docs/, .goal/, AGENTS.md, PRD.md, REF.md, GOALS*.md) — commit them or add them to .gitignore before releasing:" >&2
+        echo "release: untracked files outside the release-exempt set (vendored checkouts, local evidence, the local ledger, the local charter files) — commit them or add them to .gitignore before releasing:" >&2
         printf '%s\n' "$leftovers" | sed 's/^/  /' >&2
         exit 2
     fi
@@ -237,7 +237,7 @@ check_tools() {
     command -v gh >/dev/null 2>&1 || die "gh is required for the tag-push probe (brew install gh, then gh auth login)"
     command -v sccache >/dev/null 2>&1 || die "sccache is required: .cargo/config.toml sets rustc-wrapper = sccache, every cargo command would fail without it (brew install sccache)"
     [ -n "$TIMEOUT_BIN" ] || warn "timeout(1) not found — gate timeout backstops are disabled (the RSS watchdog still applies when present)"
-    [ -x "$RSS_WRAPPER" ] || warn "$RSS_WRAPPER missing — heavy phases will run unwatched (restore it from docs/audits/serial-phase-runbook.md before the serial phase)"
+    [ -x "$RSS_WRAPPER" ] || warn "$RSS_WRAPPER missing — heavy phases will run unwatched (restore it from the serial-phase runbook before the serial phase)"
 }
 
 phase_preflight() {
@@ -322,15 +322,15 @@ phase_verify() {
 
     # Gates are invoked via `bash scripts/...` (the CI convention): several
     # gate scripts (m0/m2/m3/repro-gate) are not committed executable.
-    run_gate m0 2400 8388608 "docs/audits/gate-m0/${m0_label}-syntax, docs/audits/gate-m0/${m0_label}-union" \
+    run_gate m0 2400 8388608 "target/evidence/gate-m0/${m0_label}-syntax, target/evidence/gate-m0/${m0_label}-union" \
         bash scripts/m0-gate.sh --label "$m0_label" $gate_dry || return 1
-    run_gate m1 900 8388608 "docs/audits/gate-m1/$m1_label" \
+    run_gate m1 900 8388608 "target/evidence/gate-m1/$m1_label" \
         bash scripts/m1-gate.sh $gate_dry || return 1
-    run_gate lints 900 8388608 "docs/audits/gate-lints/$lints_label" \
+    run_gate lints 900 8388608 "target/evidence/gate-lints/$lints_label" \
         bash scripts/lint-gate.sh $gate_dry || return 1
-    run_gate m2 900 8388608 "docs/audits/gate-m2/$m2_label" \
+    run_gate m2 900 8388608 "target/evidence/gate-m2/$m2_label" \
         bash scripts/m2-gate.sh $gate_dry || return 1
-    run_gate m3 600 8388608 "docs/audits/gate-m3/$m3_label" \
+    run_gate m3 600 8388608 "target/evidence/gate-m3/$m3_label" \
         env M3_LABEL="$m3_label" bash scripts/m3-gate.sh $gate_dry || return 1
 
     # M4 surfaces (#945): the daemon/plugin/commands/schema suites, then the
@@ -395,7 +395,7 @@ phase_verify() {
             echo "release: commit the gate outputs first (a rerun of a failed gate needs a fresh label: M0_LABEL=<...>-r2 etc.), then re-run --phase verify." >&2
             return 1
         fi
-        run_gate repro 1800 8388608 "docs/audits/repro/default" \
+        run_gate repro 1800 8388608 "target/evidence/repro/default" \
             bash scripts/repro-gate.sh || return 1
     else
         echo "release: [verify] would run: scripts/repro-gate.sh   # refuses a dirty tracked tree at run time"
@@ -409,15 +409,15 @@ phase_verify() {
 phase_bench() {
     mega_label="${MEGA_LABEL:-mega-r1}"
     cat <<EOF
-release: [bench] five-axis evidence plan (docs/audits/bench-readiness.md) — serial phase, RSS-watchdog caps below
+release: [bench] five-axis evidence plan (the bench-readiness ledger) — serial phase, RSS-watchdog caps below
   axis 1 rss-100k + axis 2 incremental-p95 + axis 3 token-cost + axis 4 cold (m0 smoke scale):
     rss_cmd.sh bench 4294967296 ./target/release/harness bench \\
       --corpus-dir tests/corpus/m0 \\
-      --manifest docs/audits/bench/incremental-manifest.json \\
+      --manifest target/evidence/bench/incremental-manifest.json \\
       --metric rss-100k --metric incremental-p95 --metric token-cost --metric cold \\
       --dartq-cmd "./target/release/dartq check --format=machine" \\
       --oracle-dart "\$HOME/fvm/default/bin/dart" \\
-      --with-oracle --out docs/audits/bench-<fresh-label>
+      --with-oracle --out target/evidence/bench-<fresh-label>
   axis 4 cold (milestone provenance, mega-r1 oracle leg incl. the A7 cold pair):
     rss_cmd.sh mega1 12582912 scripts/mega-run.sh --scale 1k --oracle-leg --label $mega_label
   axis 2 resident arm:
@@ -434,7 +434,7 @@ EOF
     echo "release: [bench] RSS-watchdog reminder: serial phase — one dart/cargo process at a time from here on"
     run_guarded bench-mega 12582912 3600 \
         scripts/mega-run.sh --scale 1k --oracle-leg --label "$mega_label" || {
-        echo "release: FAIL bench (mega-run $mega_label) — see docs/audits/mega/$mega_label and /tmp/serial_bench-mega.log" >&2
+        echo "release: FAIL bench (mega-run $mega_label) — see target/evidence/mega/$mega_label and /tmp/serial_bench-mega.log" >&2
         return 1
     }
     run_guarded bench-engine-p95 4294967296 1800 \
@@ -457,7 +457,7 @@ phase_bundle() {
     bundle="dist/dartq-v$version-$triple"
     grep -q "^## \[$version\]" CHANGELOG.md || die "CHANGELOG.md has no '## [$version]' section — the Keep-a-Changelog contract requires it before a $version tag. The harness checks, it never creates."
     for f in README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT "target/release/dartq" "target/release/$hp"; do
-        [ -e "$f" ] || die "bundle input missing: $f (run --phase build for the binaries; the docs/licenses are tracked files)"
+        [ -e "$f" ] || die "bundle input missing: $f (run --phase build for the binaries; README, CHANGELOG and licenses are tracked files)"
     done
     files=(dartq "$hp" README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT)
     if [ "$DRY_RUN" = 1 ]; then

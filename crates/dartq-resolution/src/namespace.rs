@@ -1,5 +1,5 @@
 //! Namespace construction and lookup over the library graph
-//! (`docs/facts/resolution-design-spec.md` §1/§5, module `namespace.rs`) —
+//! (the resolution design contract §1/§5, module `namespace.rs`) —
 //! the dartq face of the analyzer's `NamespaceBuilder`
 //! (`analyzer-8.4.1 lib/src/dart/resolver/scope.dart:140-283`) applied over
 //! [`crate::library_graph`]'s export scopes.

@@ -4,7 +4,7 @@
 // extension-declared `>>>`.
 //
 // Provenance: shapes modeled on the official language test
-// .third/dart-sdk/tests/language/operator/operator_triple_shift_test.dart
+// upstream Dart SDK source, tests/language/operator/operator_triple_shift_test.dart
 // (SDK main @ e6f4207a). Covered by scripts/acceptance-gate.sh
 // (zero-diagnostics bar, `dartq check` machine face).
 

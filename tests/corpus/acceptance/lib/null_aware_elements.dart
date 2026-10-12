@@ -3,7 +3,7 @@
 // keys (`?k: v`), and map values (`k: ?v`), in mutable and const literals.
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/null_aware_elements/const_literals_test.dart
+// upstream Dart SDK source, tests/language/null_aware_elements/const_literals_test.dart
 // (SDK main @ e6f4207a). Covered by scripts/acceptance-gate.sh
 // (zero-diagnostics bar, `dartq check` machine face).
 

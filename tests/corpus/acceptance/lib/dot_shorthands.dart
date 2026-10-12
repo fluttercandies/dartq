@@ -6,7 +6,7 @@
 // and the relational-pattern face (`case == .blue`).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/dot_shorthands/ — feature_enabled_test.dart,
+// upstream Dart SDK source, tests/language/dot_shorthands/ — feature_enabled_test.dart,
 // dot_shorthand_helper.dart, member/static_method_test.dart,
 // equality/equality_test.dart, multiple/selector_chain_test.dart, and
 // multiple/null_assert_test.dart (SDK main @ e6f4207a). Covered by

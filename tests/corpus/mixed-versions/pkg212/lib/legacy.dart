@@ -1,9 +1,9 @@
 // @dart=2.9
 // Language-version override BELOW the package default (2.12): per
-// .third/dart-sdk/pkg/front_end/lib/src/source/source_compilation_unit.dart
+// upstream Dart SDK source, pkg/front_end/lib/src/source/source_compilation_unit.dart
 // :469-478, a source-level annotation replaces the package_config default,
 // and only the first registered version applies. Scanner recognition:
-// .third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart
+// upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart
 // :1837 and token.dart:809.
 //
 // Legacy (pre-null-safety) mode face: with the non-nullable feature off,

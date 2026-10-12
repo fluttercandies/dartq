@@ -3,7 +3,7 @@
 //! stream.
 //!
 //! Behavior mirrors the official flow analysis engine
-//! (`.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`,
+//! (`upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`,
 //! Dart 3.15 main): the same syntax-directed single-pass walk with
 //! branch/merge promotion semantics, the same decision order for
 //! short-circuit joins, loop heads, `try`/`finally` composition, and

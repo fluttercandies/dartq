@@ -31,8 +31,8 @@
 # == Resource discipline (SERIAL PHASE ONLY) ==
 # Each mode executes the ENTIRE workspace test suite under instrumentation.
 # Run it single-process with an RSS watchdog (see
-# docs/audits/serial-phase-runbook.md), never alongside development-phase
-# lanes (AGENTS.md memory-incident discipline: the 80GB/90GB incidents were
+# the serial-phase runbook), never alongside development-phase
+# lanes (the memory-incident discipline: the 80GB/90GB incidents were
 # exactly this shape). Test binaries run one at a time (cargo serializes
 # them); the gate pins `-- --test-threads=1`, inside this runner's ≤2 budget
 # for the heavyweight instrumented suite. Never run --measure and --enforce
@@ -68,8 +68,8 @@
 #   --output FILE          --measure only: lcov destination (default
 #                          target/coverage/coverage.lcov); summary.txt and
 #                          measured.tsv land beside it. For an archived
-#                          baseline use a path under docs/audits/coverage/
-#                          (docs/plans/coverage-gate.md section 4).
+#                          baseline use a path under
+#                          target/evidence/coverage/ (gitignored).
 #   --tsv FILE             --floors-from-measured only: measured TSV to read
 #                          (default: measured.tsv beside the --output report,
 #                          i.e. target/coverage/measured.tsv by default).

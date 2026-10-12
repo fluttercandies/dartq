@@ -32,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Untracked-reference gate
+        run: bash scripts/untracked-ref-gate.sh
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
         run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -108,7 +110,7 @@ jobs:
       # e2e-verified face; the heavy mega/1k face stays a local serial-phase
       # run via REPRO_CORPUS). Memory stays bounded by the corpus slice; the
       # gate's clean-tracked-tree guard holds here because gate reports
-      # (docs/) and persisted regression cases are untracked.
+      # (target/evidence is gitignored) and persisted regression cases are untracked.
       - id: repro
         name: Reproducibility gate (§19.5)
         run: bash scripts/repro-gate.sh --label ci
@@ -117,5 +119,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: repro-report
-          path: docs/audits/repro/ci/
+          path: target/evidence/repro/ci/
           if-no-files-found: ignore

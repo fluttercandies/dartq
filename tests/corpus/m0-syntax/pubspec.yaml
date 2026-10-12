@@ -1,4 +1,4 @@
 name: corpus_m0_syntax
-description: M0 syntax-broken corpus. Read-only assembled snapshot; see docs/facts/corpus-baseline.md.
+description: M0 syntax-broken corpus. Read-only assembled snapshot; pinned by the M0 differential baseline (oracle 3.13.1 code distribution).
 environment:
   sdk: ^3.13.0

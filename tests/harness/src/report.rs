@@ -1777,7 +1777,7 @@ mod tests {
             let opts = persist_opts(
                 &out,
                 &[],
-                Path::new("docs/audits/x/report.json"),
+                Path::new("target/evidence/x/report.json"),
                 1_700_000_000,
             );
             let stats = persist_regressions(&cmp, &raw, &opts).expect("persist");
@@ -1839,7 +1839,7 @@ mod tests {
             oracle: &oracle_lists,
             dartq: &dartq_lists,
         };
-        let opts = persist_opts(&out, &[], Path::new("docs/audits/x/report.json"), 42);
+        let opts = persist_opts(&out, &[], Path::new("target/evidence/x/report.json"), 42);
         persist_regressions(&cmp, &raw, &opts).expect("persist");
 
         let case_path = fs::read_dir(&out)
@@ -1857,7 +1857,7 @@ mod tests {
             parsed["source_run"]["dartq_cmd"],
             "./target/debug/dartq analyze --format=machine --sdk /sdk"
         );
-        assert_eq!(parsed["source_run"]["report"], "docs/audits/x/report.json");
+        assert_eq!(parsed["source_run"]["report"], "target/evidence/x/report.json");
         // Oracle rows verbatim and sorted; dartq side empty (its only entry matched)
         let oracle_rows = parsed["oracle"].as_array().expect("oracle rows");
         assert_eq!(oracle_rows.len(), 2);

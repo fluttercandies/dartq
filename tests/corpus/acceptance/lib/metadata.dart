@@ -1,7 +1,7 @@
 // Valid Dart 3.15 acceptance corpus — metadata/annotations (const-class and const-instance annotations on library, classes, type parameters, members, constructors, parameters, enum values, typedefs, functions, locals, and loop variables).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/metadata/ (SDK main @ e6f4207a). Oracle-verified
+// upstream Dart SDK source, tests/language/metadata/ (SDK main @ e6f4207a). Oracle-verified
 // 2026-10-12: zero rows under fvm dart 3.13.1 `dart analyze --format=machine`
 // in a probe package (`environment: sdk: ^3.13.0`). Covered by
 // scripts/acceptance-gate.sh (zero-diagnostics bar, `dartq check` machine face).

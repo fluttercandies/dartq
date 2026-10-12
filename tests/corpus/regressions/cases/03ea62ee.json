@@ -29,9 +29,9 @@
   "source": "// Targets const_eval_type_string: a property access in a constant\n// expression requires a String operand. The oracle shape routes the\n// non-String receiver through an undefined const argument (a defined\n// non-String receiver is intercepted by const_eval_property_access\n// instead), so two already-covered codes co-fire at the argument.\n//\n// Oracle rows (dart 3.13.1, `dart analyze --format=machine`; <file> is this\n// file's path):\n// ERROR|COMPILE_TIME_ERROR|CONST_EVAL_TYPE_STRING|<file>|17|11|4|In constant expressions, operands of this operator must be of type 'String'.\n// ERROR|COMPILE_TIME_ERROR|CONST_WITH_NON_CONSTANT_ARGUMENT|<file>|17|13|1|Arguments of a constant creation must be constant expressions.\n// ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|<file>|17|13|1|Undefined name 'x'.\nclass B {\n  final l;\n  const B(String o) : l = o.length;\n}\n\nconst y = B(x);\n",
   "captured_at": 1791791934,
   "source_run": {
-    "report": "docs/audits/gate-m1/m1-r4-base/report.json",
-    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk /Users/iota9star/fvm/default/bin/cache/dart-sdk",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "gate-m1/m1-r4-base/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk $HOME/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -41,8 +41,8 @@
     "--edits",
     "tests/corpus/regressions/cases/03ea62ee.edits.jsonl",
     "--dartq-cmd",
-    "./target/debug/dartq analyze --format=machine --sdk /Users/iota9star/fvm/default/bin/cache/dart-sdk",
+    "./target/debug/dartq analyze --format=machine --sdk $HOME/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/debug/dartq daemon --dir {dir} --sdk /Users/iota9star/fvm/default/bin/cache/dart-sdk"
+    "./target/debug/dartq daemon --dir {dir} --sdk $HOME/fvm/default/bin/cache/dart-sdk"
   ]
 }

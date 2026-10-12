@@ -325,7 +325,7 @@ script per gate under `scripts/`, in release order:
 | `m2-gate.sh` | analyze | WARNING, the frozen M2 code set (`tests/harness/m2_warning_codes.txt`) |
 | `m3-gate.sh` | analyze | WARNING, the frozen unused-family set (`tests/harness/m3_unused_codes.txt`) |
 | `acceptance-gate.sh` | check | zero diagnostics of any tier over the valid-syntax feature-family corpus (`tests/corpus/acceptance/`) |
-| `repro-gate.sh` | — | fresh-process runs are byte-identical; the sealed `{tuple, output_digest}` pair lands under `docs/audits/repro/` |
+| `repro-gate.sh` | — | fresh-process runs are byte-identical; the sealed `{tuple, output_digest}` pair lands under `target/evidence/repro/` |
 
 Honest state of the recorded evidence: the last recorded gate runs predate
 the corpus reorganization and fell below the full-parity bars, so no
@@ -427,13 +427,13 @@ pins `jobs = 2`; the script passes no `-j`.
 The 1.0.0 release harness (`scripts/release.sh`) runs the full gate chain
 in order — `m0-gate` → `m1-gate` → `lint-gate` → `m2-gate` → `m3-gate` →
 `ci.sh` → `repro-gate` — one subprocess at a time, each with its own
-evidence directory under `docs/audits/`. Coverage floors and runners live
+evidence directory under `target/evidence/`. Coverage floors and runners live
 alongside (`scripts/coverage-floors.tsv`, `coverage-run.sh`,
 `coverage-gate.sh`).
 
 ## Third-Party Notices
 
-Reference sources vendored under `.third/` (the Dart SDK, pub, and
+Reference checkouts of upstream sources (the Dart SDK, pub, and
 rust-analyzer repositories) are local development references used for
 semantic grounding and calibration only. They are not part of the source
 distribution, are never modified, and are not required to build or use

@@ -2,7 +2,7 @@
 //! diagnostics.
 //!
 //! Behavior is aligned with the official scanner
-//! (`.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/`, Dart 3.15
+//! (`upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/`, Dart 3.15
 //! main). Key behavioral contracts (all verified against the reference source):
 //!
 //! # Interpolated string token sequence shape (parser contract)

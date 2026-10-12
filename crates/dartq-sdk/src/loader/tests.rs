@@ -1,8 +1,9 @@
 //! Unit tests for the [`crate::loader`] parse functions.
 //!
-//! Parsing-level tests run against synthetic JSON plus the real
-//! `.third/dart-sdk` `libraries.json` when present; full-load and error-path
-//! tests against complete SDK layouts live in the crate's `tests/` suite.
+//! Parsing-level tests run against synthetic JSON plus a real SDK
+//! `libraries.json` when `DARTQ_SDK_CHECKOUT` points at a dart-lang/sdk
+//! checkout; full-load and error-path tests against complete SDK layouts
+//! live in the crate's `tests/` suite.
 
 use std::collections::BTreeSet;
 
@@ -12,20 +13,19 @@ use super::{parse_allowed_experiments, parse_libraries_json};
 use crate::metadata::Importability;
 use crate::metadata::UnknownExperiments;
 
-/// The real `libraries.json` from the vendored Dart SDK tree, when present.
-fn third_party_libraries_json() -> Option<String> {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let path = std::path::Path::new(manifest)
-        .ancestors()
-        .nth(2)?
-        .join(".third/dart-sdk/sdk/lib/libraries.json");
-    std::fs::read_to_string(path).ok()
+/// The real `libraries.json` from a dart-lang/sdk checkout
+/// (`DARTQ_SDK_CHECKOUT`), when available.
+fn sdk_libraries_json() -> Option<String> {
+    let root = std::env::var("DARTQ_SDK_CHECKOUT").ok()?;
+    std::fs::read_to_string(std::path::Path::new(&root).join("sdk/lib/libraries.json")).ok()
 }
 
 #[test]
 fn real_libraries_json_resolves_targets() {
-    let Some(text) = third_party_libraries_json() else {
-        eprintln!("skipped: .third/dart-sdk/sdk/lib/libraries.json not present");
+    let Some(text) = sdk_libraries_json() else {
+        eprintln!(
+            "skipped: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout for the real libraries.json"
+        );
         return;
     };
     let libraries = parse_libraries_json(&text).expect("the real file parses");

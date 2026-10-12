@@ -4,7 +4,7 @@
 // inconsistent_language_version_override.*).
 //
 // Anchors: scanner recognition of the `@dart` prefix
-// (.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart
+// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart
 // :1837) and the first-registered-version rule
 // (pkg/front_end/lib/src/source/source_compilation_unit.dart:469-478).
 //

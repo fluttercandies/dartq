@@ -1,5 +1,5 @@
 # dartq official syntax diagnostic codes — authoritative data table.
-# Source: docs/facts/syntax-codes.md section 9 (goal #25 forensic capture).
+# Source: the pinned dart 3.13.1 oracle registry (goal #25 forensic capture).
 # Oracle lock: dart 3.13.1 stable. This table is a PINNED SNAPSHOT of
 #   analyzer-8.4.1 (lib/src/dart/error/syntactic_errors.g.dart +
 #   lib/src/error/codes.g.dart) and _fe_analyzer_shared-91.0.0
@@ -39,7 +39,7 @@
 #   the pinned checkout (pkg/analyzer + pkg/_fe_analyzer_shared sources), so
 #   the pinned oracle can never emit them; the generated registry is dartq's
 #   acceptance set and phantom rows would widen it with unemittable codes.
-#   The forensic record stays in docs/facts/syntax-codes.md section 9; the
+#   The forensic record is this header's removal notes; the
 #   parser's never-emit pins (group_a_dead_codes_never_emitted) match code
 #   name strings and are unaffected by the removal.
 abstract_class_member	ABSTRACT_CLASS_MEMBER	ERROR	P	Members of classes can't be declared to be 'abstract'.	false

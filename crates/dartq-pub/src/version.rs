@@ -1,7 +1,7 @@
 //! Semantic versions, `pub_semver` constraint syntax, and language versions.
 //!
 //! This is the exact subset of `pub_semver` 2.x grammar that pub itself
-//! accepts (`.third/pub` + `pub_semver-2.2.0`): `any`, bare versions,
+//! accepts (upstream pub + `pub_semver-2.2.0`): `any`, bare versions,
 //! caret `^` (which must occupy the whole string), and space-separated
 //! `<`/`>`/`<=`/`>=` comparisons that intersect. There is **no** `~`/`~>`
 //! syntax and no comma lists — pub's `startComparison` is `^[<>]=?` only.

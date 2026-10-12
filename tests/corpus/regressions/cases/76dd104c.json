@@ -177,9 +177,9 @@
   "source": "class A {\n  method1() {}\n  method2() {}\n}\n\nclass B {\n  method1(String foo) {\n    // was:\n    // print(\"hello world\");\n    // but then we started typing inside the quotes:\n    print(\"${foo.\n    length hello world\");\n  }\n\n  method2() {}\n}\n\nclass C {\n  method1() {}\n  method2() {}\n}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

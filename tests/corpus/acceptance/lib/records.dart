@@ -3,8 +3,8 @@
 // records, the empty record, equality-bearing usage).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/records/simple/literals_and_field_access_test.dart
-// and .third/dart-sdk/tests/language/record_type_test.dart (SDK main @
+// upstream Dart SDK source, tests/language/records/simple/literals_and_field_access_test.dart
+// and upstream Dart SDK source, tests/language/record_type_test.dart (SDK main @
 // e6f4207a). Covered by scripts/acceptance-gate.sh (zero-diagnostics bar,
 // `dartq check` machine face).
 

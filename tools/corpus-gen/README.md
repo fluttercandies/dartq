@@ -138,7 +138,7 @@ Facts the runner relies on:
 - **Timeout:** the runner exports
   `DARTQ_HARNESS_ORACLE_TIMEOUT_MS=600000` unless already set — a
   100k-file batch analysis exceeds the harness's 120 s default.
-- **Reports:** `docs/audits/mega/<label>/<scale>/{rss-100k,
+- **Reports:** `target/evidence/mega/<label>/<scale>/{rss-100k,
   incremental-p95}/report.json`; the runner's summary prints per-scale
   wall time, files/LOC, peak RSS (+ per-100k normalization), and the
   incremental p50/p95/p99. Budget thresholds are intentionally not asserted

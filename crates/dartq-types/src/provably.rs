@@ -5,7 +5,7 @@
 //! One face serves the seven WARNING codes (semantic emitters wire one code
 //! to one row of the table below). All names are the *current* official code
 //! names, verified in
-//! `.third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart` —
+//! `upstream Dart SDK source, pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart` —
 //! `unnecessary_non_null_assertion` (:17504) and `unnecessary_type_check`
 //! (:17642/:17655) are the renamed family members; the `is Null`/`is! Null`
 //! warning's code name is `type_check_with_null` (:16358, unique names

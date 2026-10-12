@@ -2,12 +2,12 @@
 # the M1 milestone gates on -- uri_does_not_exist, the undefined_* family,
 # duplicate_definition, the wrong_number_of_* family, and the static-
 # nullability four (invalid_assignment / argument_type_not_assignable /
-# return_of_invalid_type / invalid_null_aware_operator, docs/facts/
-# types-nullability-spec.md sections 3.1-3.4). The wildcard families are
+# return_of_invalid_type / invalid_null_aware_operator, the pinned
+# nullability contract, sections 3.1-3.4). The wildcard families are
 # expanded mechanically over the official analyzer diagnostic registries:
 # analyzer-8.4.1 (pub-cache, lib/src/error/codes.g.dart + lib/src/dart/error/
 # syntactic_errors.g.dart, DiagnosticCode.name form) unioned with the Dart SDK
-# main unified registry (.third/dart-sdk pkg/analyzer lib/src/diagnostic/
+# main unified registry (upstream Dart SDK, pkg/analyzer lib/src/diagnostic/
 # diagnostic.g.dart, name: form). The mechanical union yields 37 codes:
 # wrong_number_of_type_arguments_method (analyzer-8.4.1 codes.g.dart:7934)
 # is not frozen -- the SDK-main oracle can never emit it.
@@ -17,7 +17,7 @@
 # undefined_lint is excluded: it is an
 # analysis-options code (analyzer-8.4.1 lib/src/analysis_options/error/
 # option_codes.g.dart), not a Dart-language diagnostic. Trigger conditions:
-# docs/facts/resolution-design-spec.md section 4.2. Same format as
+# the pinned resolution trigger table (lookup failures against the resolved import scope). Same format as
 # tests/corpus/syntax-codes.txt: one code per line, # comments, case- and
 # TSV-tolerant on the harness side. wrong_number_of_parameters_for_setter
 # overlaps the M0 syntax gate (tests/corpus/syntax-codes.txt) by PRD wording:

@@ -3,8 +3,8 @@
 // implementation; sealed-hierarchy exhaustive switch expression).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/class_modifiers/ and
-// .third/dart-sdk/tests/language/sealed_class/ (SDK main @ e6f4207a).
+// upstream Dart SDK source, tests/language/class_modifiers/ and
+// upstream Dart SDK source, tests/language/sealed_class/ (SDK main @ e6f4207a).
 // Covered by scripts/acceptance-gate.sh (zero-diagnostics bar, `dartq check`
 // machine face).
 

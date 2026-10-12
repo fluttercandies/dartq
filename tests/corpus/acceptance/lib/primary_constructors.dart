@@ -5,7 +5,7 @@
 // mixin and extension-type primary forms, unnamed `extension on T;`.
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/primary_constructors/
+// upstream Dart SDK source, tests/language/primary_constructors/
 // feature_enabled_test.dart, syntax/class_header_test.dart,
 // syntax/empty_body_test.dart, and short_syntax/new_test.dart (SDK main @
 // e6f4207a). Covered by scripts/acceptance-gate.sh (zero-diagnostics bar,

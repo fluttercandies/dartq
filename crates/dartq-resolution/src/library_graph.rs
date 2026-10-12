@@ -1,5 +1,5 @@
 //! The library graph: interned library nodes, import/export edges, and the
-//! eager export-scope fixpoint (`docs/facts/resolution-design-spec.md` §3/§5,
+//! eager export-scope fixpoint (the resolution design contract §3/§5,
 //! module `library_graph.rs`).
 //!
 //! Nodes are libraries keyed by their canonical identity string

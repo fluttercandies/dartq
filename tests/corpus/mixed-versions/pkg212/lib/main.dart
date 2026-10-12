@@ -1,10 +1,10 @@
 // Positive control at language version 2.12 (package default from
 // pubspec `sdk: ^2.12.0`, mirrored in .dart_tool/package_config.json —
-// anchor: .third/pub/lib/src/package_config.dart:236-238).
+// anchor: upstream pub source, lib/src/package_config.dart:236-238).
 //
 // 2.12 is the first null-safe language version: `?` types, `late`, and
 // `required` are all legal here. Feature set is derived from the library
-// version (anchor: .third/dart-sdk/pkg/front_end/lib/src/source/
+// version (anchor: upstream Dart SDK source, pkg/front_end/lib/src/source/
 // source_compilation_unit.dart:348-353 — LibraryFeatures from
 // languageVersion.version).
 //

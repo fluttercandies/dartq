@@ -8,7 +8,7 @@
 #
 # Inclusion rule (mechanical, re-derivable): take every code carrying
 # `type: DiagnosticType.STATIC_WARNING` in the SDK main unified registry
-# (.third/dart-sdk pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart,
+# (upstream Dart SDK, pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart,
 # each `name:` literal paired with the following `type:` line) -- the
 # severity family `dart analyze --format=machine` reports as WARNING;
 # 190 unique names at freeze time -- and intersect it with the per-bucket

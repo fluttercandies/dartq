@@ -1,6 +1,6 @@
 // Positive control at language version 3.6: digit separators ship at 3.6.
 // Ground truth for the gate: the scanner accepts `_` in numeric literals
-// unconditionally (.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/scanner/
+// unconditionally (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/
 // abstract_scanner.dart:1533-1541) and the CFE version gate sits at
 // pkg/front_end/lib/src/kernel/body_builder.dart:7372
 // (`libraryFeatures.digitSeparators.isEnabled`; flag entry

@@ -1,6 +1,6 @@
 # coverage-floors.tsv — per-crate line-coverage floors consumed by
-# scripts/coverage-gate.sh (--floors; rationale in
-# docs/plans/coverage-gate.md section 6).
+# scripts/coverage-gate.sh (--floors; the floors ratchet upward
+# only with a recorded measured baseline).
 #
 # Format: <crate-name><TAB><floor-percent>. Lines starting with '#' are
 # comments. Crate names must match the gate's lcov fold rows (workspace

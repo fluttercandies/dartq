@@ -13,7 +13,7 @@
 //! snapshot, and it also keeps interpolation nesting off the call stack.
 //!
 //! Escape sequences are validated against the official unescape rules
-//! (`.third/dart-sdk` `pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
+//! (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
 //! `unescapeCodeUnits`): `\x` wants exactly two hex digits, `\u` a
 //! `{1-6 hex}` bracket or four bare hex digits, values above 0x10FFFF are
 //! invalid, and a part cannot end with a lone backslash. Unescaping happens

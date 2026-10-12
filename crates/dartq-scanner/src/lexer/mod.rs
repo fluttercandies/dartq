@@ -761,8 +761,7 @@ impl<'s> Lexer<'s> {
             // ZERO diagnostics for both reachable U+FFFD classes: a raw
             // undecodable byte (the read layer tolerates it) and a literal
             // U+FFFD in valid UTF-8 — measured against
-            // `dart analyze --format=machine` (docs/facts
-            // corpus-expansion-plan.md §7). Measured-cull doctrine governs:
+            // `dart analyze --format=machine` (the corpus expansion plan §7). Measured-cull doctrine governs:
             // dartq emits nothing here. The character is still consumed
             // (never merged into an identifier), preserving termination.
             self.bump();

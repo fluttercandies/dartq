@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# lint-gate.sh — the LINT INFO-tier differential gate (design doc
-# docs/plans/lint-differential-face.md section 3; ticket #721).
+# lint-gate.sh — the LINT INFO-tier differential gate (one harness
+# invocation over one frozen universe; ticket #721).
 #
 # Runs the harness once over tests/corpus/lints with the frozen r0 lint
 # universe (tests/harness/lint_codes.txt, 89 names), INFO severity filtered
 # to the LINT type, threshold 1.0 — full parity like every differential gate
-# (2026-10-12 ruling, docs/facts/adr-2026-10-12-full-parity-bars.md;
+# (2026-10-12 ruling, the full-parity bars ADR;
 # supersedes the PRD-era numeric bars; residuals pass only via individually
 # adjudicated pinned exemptions, never a numeric budget) — against the same
 # single oracle of record: the fvm default install (Dart 3.13.1, the
@@ -37,7 +37,7 @@
 #
 #   --dry-run       resolve every path, print the plan and the exact harness
 #                   command, execute nothing (no dart, no harness).
-#   --label L       report directory name under docs/audits/gate-lints/.
+#   --label L       report directory name under target/evidence/gate-lints/.
 #                   Default: LINTS_LABEL env, else lints-r1.
 #   --allow-vacuous forwarded to the harness and honored here: accept a run
 #                   whose oracle side has no INFO-tier LINT entries
@@ -66,7 +66,7 @@ CODES_FILE="tests/harness/lint_codes.txt"
 LEDGER="tests/harness/lint_divergences.tsv"
 THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
-OUT_ROOT="docs/audits/gate-lints"
+OUT_ROOT="target/evidence/gate-lints"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="lints-r1"
 

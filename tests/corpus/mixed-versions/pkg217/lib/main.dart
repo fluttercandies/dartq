@@ -1,7 +1,7 @@
 // Positive control at language version 2.17: enhanced enums (members,
 // constructors, generics) shipped in 2.17 and are legal at the package
 // default. Feature set derives from the library version (anchor:
-// .third/dart-sdk/pkg/front_end/lib/src/source/source_compilation_unit.dart
+// upstream Dart SDK source, pkg/front_end/lib/src/source/source_compilation_unit.dart
 // :348-353).
 //
 // Expectation: analyzes clean at 2.17.

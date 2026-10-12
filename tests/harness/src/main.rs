@@ -27,7 +27,6 @@ use dartq::DartqDriver;
 use machine::{DIAG_TYPES, MachineDiag, OutputFormat, Severity};
 use oracle::OracleDriver;
 
-const DEFAULT_SOURCE: &str = ".third/dart-sdk/pkg/_fe_analyzer_shared/test";
 const DEFAULT_TARGET: &str = "tests/corpus/m0";
 const DEFAULT_OUT: &str = "target/harness-report";
 const DEFAULT_THRESHOLD: f64 = 1.0;
@@ -84,7 +83,8 @@ fn print_usage() {
   harness corpus [--source DIR] [--target DIR] [--rebuild] [--dart PATH]
       Assemble the M0 synthetic corpus (self-contained .dart files from the
       analyzer test suite, relative layout preserved) into a zero-dependency
-      package. Default source: {DEFAULT_SOURCE}; default target: {DEFAULT_TARGET}.
+      package. Default source: $DARTQ_SDK_CHECKOUT/pkg/_fe_analyzer_shared/test;
+      default target: {DEFAULT_TARGET}.
 
   harness run [--corpus-dir DIR]... [--oracle-dart PATH] [--oracle-format machine|json]
               [--dartq-cmd TEMPLATE] [--e2e-oracle] [--severity-filter LIST]
@@ -122,8 +122,7 @@ fn print_usage() {
       a harness error unless --allow-vacuous is given. --allow-vacuous:
       accept such a run (e.g. a genuinely clean corpus).
       Preflight: every corpus dir must carry a .dart_tool/package_config.json
-      whose own languageVersion is >= 3.13 (Plan A, docs/facts/
-      version-skew.md §4) — a stale pin floods the gate with
+      whose own languageVersion is >= 3.13 (Plan A, the version-skew ledger §4) — a stale pin floods the gate with
       experiment_not_enabled assembly noise and fails the run up front.
       Panic isolation: if the dartq side crashes (exit 4 with empty stdout),
       the corpus is auto-bisected to attribute the panicking files; the run
@@ -184,7 +183,7 @@ fn print_usage() {
       report records its inputs for reproducibility). --metric is
       repeatable (rss-100k | incremental-p95 | incremental-p95-resident |
       token-cost | plugin-overhead | cold); default = all nine, in that
-      order. Default corpus: {DEFAULT_TARGET}; default out: docs/audits/bench.
+      order. Default corpus: {DEFAULT_TARGET}; default out: target/evidence/bench.
       rss-100k: peak tree-RSS of one full dartq analysis over the corpus
       (/bin/ps polling at --rss-interval-ms, default 50ms, process-group
       tree walk; an 8 GiB tree-RSS watchdog kills the sampled group),
@@ -233,14 +232,14 @@ fn print_usage() {
 }
 
 fn run_corpus(args: &[String]) -> Result<String, Outcome> {
-    let mut source = PathBuf::from(DEFAULT_SOURCE);
+    let mut source: Option<PathBuf> = None;
     let mut target = PathBuf::from(DEFAULT_TARGET);
     let mut rebuild = false;
     let mut dart = "dart".to_string();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--source" => source = value(args, &mut i)?.into(),
+            "--source" => source = Some(value(args, &mut i)?.into()),
             "--target" => target = value(args, &mut i)?.into(),
             "--dart" => dart = value(args, &mut i)?.to_string(),
             "--rebuild" => rebuild = true,
@@ -249,16 +248,27 @@ fn run_corpus(args: &[String]) -> Result<String, Outcome> {
         i += 1;
     }
 
+    let source = source.map(Ok).unwrap_or_else(|| {
+        std::env::var("DARTQ_SDK_CHECKOUT")
+            .map(|root| PathBuf::from(root).join("pkg/_fe_analyzer_shared/test"))
+            .map_err(|_| {
+                Outcome::Error(
+                    "corpus source not set: pass --source DIR or export \
+                     DARTQ_SDK_CHECKOUT=<dart-lang/sdk checkout>"
+                        .into(),
+                )
+            })
+    })?;
     if !source.is_dir() {
         return Err(Outcome::Error(format!(
-            "source dir `{}` does not exist (clone .third/dart-sdk first)",
+            "source dir `{}` does not exist (point --source or DARTQ_SDK_CHECKOUT at a dart-lang/sdk checkout)",
             source.display()
         )));
     }
     let report = corpus::build_corpus(&source, &target, rebuild).map_err(Outcome::Error)?;
     corpus::pub_get(&dart, &target).map_err(Outcome::Error)?;
     // Same preflight as `run`: assembly is only valid when pub recorded a
-    // languageVersion >= 3.13 (Plan A, docs/facts/version-skew.md §4).
+    // languageVersion >= 3.13 (Plan A, the version-skew ledger §4).
     corpus::check_language_version(&target).map_err(Outcome::Error)?;
     let target_display = target.canonicalize().map_or_else(
         |_| target.display().to_string(),
@@ -584,7 +594,7 @@ pub(crate) fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
 }
 
 /// Canonicalize every corpus dir in declaration order, failing fast on the Plan A
-/// languageVersion preflight (docs/facts/version-skew.md §4: a stale corpus
+/// languageVersion preflight (the version-skew ledger §4: a stale corpus
 /// languageVersion re-enables `experiment_not_enabled` skew; fail before any oracle
 /// run so the noise can never reach a report).
 ///
@@ -725,7 +735,7 @@ fn parse_type_filter(spec: &str) -> Result<Option<Vec<String>>, Outcome> {
 /// oracle-only out-of-set entries are dropped and never enter the denominator. This is exactly the
 /// M0 syntax-tier criterion: **codes-file (the 255 scanner/parser codes, see
 /// tests/corpus/syntax-codes.txt) ∩ severity ERROR**; the analyzer reports `ParserErrorCode` as
-/// `COMPILE_TIME_ERROR` (docs/facts/corpus-baseline.md §1), so the syntax tier cannot be obtained by
+/// `COMPILE_TIME_ERROR` (the M0 differential baseline §1), so the syntax tier cannot be obtained by
 /// `--type-filter syntactic_error` alone and must be filtered by code set.
 ///
 /// Empty-set semantics: a filter may remove all diagnostics from both sides -- then both entry sets
@@ -813,7 +823,7 @@ fn build_filtered_side(
 /// `crates/dartq-diagnostics/data/syntax-codes.tsv` (258 rows = 255
 /// scanner/parser codes + 3 language-version-family codes) can be passed
 /// directly. The M0 gate input is `tests/corpus/syntax-codes.txt`, the TSV
-/// minus the 3 language-version-family codes (docs/facts/version-skew.md §5.3:
+/// minus the 3 language-version-family codes (the version-skew ledger §5.3:
 /// skew codes must not enter the gate denominator); the derivation is pinned
 /// by `gate_codes_file_matches_authoritative_tsv` below.
 ///
@@ -1034,7 +1044,7 @@ mod tests {
     /// Derivation pin: the M0 gate codes file (tests/corpus/syntax-codes.txt)
     /// must stay exactly the authoritative TSV
     /// (crates/dartq-diagnostics/data/syntax-codes.tsv) minus the 3
-    /// language-version-family codes (docs/facts/version-skew.md §5.3: skew
+    /// language-version-family codes (the version-skew ledger §5.3: skew
     /// codes must not enter the gate denominator). Catches silent drift
     /// between the two files and parser regression in one shot.
     #[test]
@@ -1086,7 +1096,7 @@ mod tests {
     /// Derivation pin: the M1 gate codes file (`tests/harness/m1_codes.txt`)
     /// must equal its documented derivation (file header, PRD section 20.3 M1
     /// row): the `undefined_*` and `wrong_number_of_*` wildcard families expanded
-    /// over the SDK main unified registry (.third/dart-sdk pkg/analyzer
+    /// over the SDK main unified registry (upstream Dart SDK, pkg/analyzer
     /// lib/src/diagnostic/diagnostic.g.dart, `name:` literals), unioned with
     /// the explicit picks (`uri_does_not_exist`, `duplicate_definition`, the
     /// static-nullability four), plus `undefined_annotation`, minus
@@ -1099,7 +1109,7 @@ mod tests {
     /// immutable — re-reading it at test time detects nothing — and no
     /// workspace lockfile pins 8.4.1 into pub-cache, so a live read would be
     /// a spurious environmental failure. The SDK main registry is the live
-    /// drift surface: a .third re-clone that adds or removes a wildcard
+    /// drift surface: an SDK checkout update that adds or removes a wildcard
     /// family member fails this pin and forces a conscious re-freeze.
     /// `wrong_number_of_type_arguments_method` exists only in analyzer-8.4.1,
     /// never in the SDK main registry, and is intentionally not gated; the
@@ -1110,10 +1120,16 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .expect("harness lives at <repo>/tests/harness");
+        let Some(sdk) = std::env::var("DARTQ_SDK_CHECKOUT").ok() else {
+            eprintln!(
+                "skipped: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout to run the live-registry derivation pin"
+            );
+            return;
+        };
         let registry = std::fs::read_to_string(
-            root.join(".third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
+            Path::new(&sdk).join("pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
         )
-        .expect("SDK main diagnostic registry present (.third/dart-sdk checkout)");
+        .expect("SDK main diagnostic registry present in $DARTQ_SDK_CHECKOUT");
         let txt = std::fs::read_to_string(root.join("tests/harness/m1_codes.txt"))
             .expect("gate codes file present");
         let gate_codes = parse_codes_file(&txt).expect("gate file parses");
@@ -1191,10 +1207,16 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .expect("harness lives at <repo>/tests/harness");
+        let Some(sdk) = std::env::var("DARTQ_SDK_CHECKOUT").ok() else {
+            eprintln!(
+                "skipped: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout to run the live-registry derivation pin"
+            );
+            return;
+        };
         let registry = std::fs::read_to_string(
-            root.join(".third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
+            Path::new(&sdk).join("pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
         )
-        .expect("SDK main diagnostic registry present (.third/dart-sdk checkout)");
+        .expect("SDK main diagnostic registry present in $DARTQ_SDK_CHECKOUT");
         let txt = std::fs::read_to_string(root.join("tests/harness/m2_warning_codes.txt"))
             .expect("gate codes file present");
         let gate_codes = parse_codes_file(&txt).expect("gate file parses");

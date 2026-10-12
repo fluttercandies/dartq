@@ -1,6 +1,6 @@
 // Targets the member-modifier family (analyzer ParserErrorCode, pinned
 // snapshot syntax-codes.tsv; the analyzer sources are not vendored in
-// .third).
+// this repo).
 // Targets abstract_static_method (TSV:52).
 class AbstractStaticMethod {
   abstract static void m();

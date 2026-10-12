@@ -4,7 +4,7 @@
 // implicit-application paths report the plain undefined_* codes instead,
 // see undefined_extension_getter.dart). Extension dispatch cannot reach
 // Object members, so the method name needs no noSuchMethod avoidance.
-// Trigger conditions: docs/facts/resolution-design-spec.md 4.2.
+// Trigger conditions: the pinned resolution trigger table (lookup failures against the resolved import scope).
 // Hand-crafted from the code semantics; no official test file.
 extension X on String {
   int get g => 1;

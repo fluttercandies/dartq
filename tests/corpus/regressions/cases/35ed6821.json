@@ -72,9 +72,9 @@
   "source": "// Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nclass Class1 {\n  int operator [](int index) => index;\n  void operator []=(int index, int value) {}\n}\n\nmain() {\n  Class1? c1;\n  c1?.[0];\n  c1?.[0] = 1;\n\n  c1?[0];\n  c1?[0] = 1;\n\n  c1 ? [0];\n  c1 ? [0] = 1;\n}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

@@ -1,7 +1,7 @@
 // Valid Dart 3.15 acceptance corpus — collection literals (typed/const list/set/map literals, spread and null-aware spread, collection-if with else, collection-for (C-style and for-in), elements with patterns, nesting).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/control_flow_collections/, tests/language/spread_collections/, tests/language/set_literals/ (SDK main @ e6f4207a). Oracle-verified
+// upstream Dart SDK source, tests/language/control_flow_collections/, tests/language/spread_collections/, tests/language/set_literals/ (SDK main @ e6f4207a). Oracle-verified
 // 2026-10-12: zero rows under fvm dart 3.13.1 `dart analyze --format=machine`
 // in a probe package (`environment: sdk: ^3.13.0`). Covered by
 // scripts/acceptance-gate.sh (zero-diagnostics bar, `dartq check` machine face).

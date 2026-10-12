@@ -463,7 +463,7 @@ mod tests {
       ],
       "generator": "pub",
       "generatorVersion": "3.13.1",
-      "flutterRoot": "file:///Users/x/fvm/versions/3.47.1",
+      "flutterRoot": "file:///home/x/fvm/versions/3.47.1",
       "flutterVersion": "3.47.1",
       "pubCache": "file:///tmp/pubfacts/pcache",
       "generated": "2026-10-08T00:00:00.000Z"

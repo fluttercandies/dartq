@@ -4,7 +4,7 @@
 //!
 //! dartq does **no version solving**: `pub get` is an external dependency,
 //! and this crate only reads what it materialized. Behavior is anchored to
-//! `docs/facts/pub-formats.md`, which cites `.third/pub` line-by-line.
+//! the pub formats contract, which cites upstream pub line-by-line.
 //!
 //! Module map:
 //! - [`version`] module — pub_semver subset and language versions (§5)
@@ -19,8 +19,8 @@
 //!   + listing), shared by workspace expansion and analysis-options excludes
 //! - [`graph`]: `ResolvedPackageGraph` / `PackageGraphId`
 //!
-//! Docs throughout cite `.third/pub` source paths and measured facts from
-//! `docs/facts/pub-formats.md` verbatim; do not lint-prose them.
+//! Docs throughout cite upstream pub source paths and measured facts from
+//! the pub formats contract verbatim; do not lint-prose them.
 #![allow(clippy::doc_markdown)]
 
 pub mod config;

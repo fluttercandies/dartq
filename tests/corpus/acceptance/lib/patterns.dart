@@ -1,8 +1,8 @@
 // Valid Dart 3.15 acceptance corpus — patterns (all pattern forms).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/patterns/ and the CFE parser suites
-// .third/dart-sdk/pkg/front_end/parser_testcases/patterns/ (SDK main @
+// upstream Dart SDK source, tests/language/patterns/ and the CFE parser suites
+// upstream Dart SDK source, pkg/front_end/parser_testcases/patterns/ (SDK main @
 // e6f4207a). Covered by scripts/acceptance-gate.sh (zero-diagnostics bar,
 // `dartq check` machine face).
 //

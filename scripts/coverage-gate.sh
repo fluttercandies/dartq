@@ -42,7 +42,7 @@
 #
 # SERIAL PHASE ONLY: this script executes the ENTIRE workspace test suite
 # rebuilt with coverage instrumentation. Never run it alongside
-# development-phase lanes (AGENTS.md memory-incident discipline); run it
+# development-phase lanes (the 80GB/90GB memory-incident discipline); run it
 # single-process with an RSS watchdog. `-- --test-threads=1` is forwarded to
 # every test binary — no internal suite parallelism, and traces stay free of
 # thread-scheduling nondeterminism. --dry-run prints the plan and runs
@@ -58,7 +58,7 @@
 # from the per-crate policy table scripts/coverage-floors.tsv (tier
 # gradient: pure-logic crates 80, semantic/engine 65, I/O/CLI boundary 50;
 # `default` fallback 0; rationale and ratchet discipline live inside the
-# table and docs/plans/coverage-gate.md section 6). --floor N overrides the table
+# table). --floor N overrides the table
 # with one global floor. TOTAL is printed but always advisory — a global
 # percentage is gameable by stub growth and mixes I/O crates with pure
 # logic. Default posture is advisory: below-floor rows are reported, exit
@@ -121,7 +121,7 @@
 #   --enforce      fail (exit 1) when a crate row is below its floor.
 #                  Default: advisory — below-floor rows are reported on
 #                  stderr, exit stays 0; flip once the measured baseline is
-#                  committed (docs/plans/coverage-gate.md section 6).
+#                  committed (the floors table header pins the contract).
 #   --stability     the §19.5 two-run protocol: two consecutive llvm-cov
 #                   passes; pass/fail on the run-to-run stability of the
 #                   TOTAL coverage percentage (identical aggregate
@@ -391,7 +391,7 @@ if [ "$MODE" != "report" ]; then
 
   banner="$(rustc --version) / $(cargo llvm-cov --version)"
 
-  # §19.5 seal (docs/plans/coverage-gate.md section 5): stamp the run's
+  # §19.5 seal (the repro-tuple identity contract): stamp the run's
   # environment identity from repro-tuple.sh — the single source of the
   # identity computation, so the summary stamp and tuple.json agree field
   # for field. A clean tree hashes the empty diff (sha256 of zero bytes),
@@ -560,7 +560,7 @@ printf '%s\n' "$TABLE"
 # environment is unknown, so neither is stamped) + the table. LC_ALL=C row
 # ordering and the pinned decimal point keep this byte-stable run over run:
 # same committed HEAD + same worktree patch + same toolchain ⇒ byte-identical
-# summary.txt (docs/plans/coverage-gate.md section 5).
+# summary.txt (the §19.5 seal contract).
 {
   [ -z "$banner" ] || printf '%s\n' "$banner"
   if [ -n "$GIT_HEAD" ]; then

@@ -1,10 +1,10 @@
 //! Parsing of `dart analyze` machine/json output and normalization of diagnostic entry keys.
 //!
-//! Wire-format source of truth: `.third/dart-sdk/pkg/dartdev/lib/src/commands/analyze.dart`
+//! Wire-format source of truth: `upstream Dart SDK source, pkg/dartdev/lib/src/commands/analyze.dart`
 //! `emitMachineFormat` (stdout, uppercase codes). `analyzer_cli`'s `MachineErrorFormatter`
 //! (`pkg/analyzer_cli/lib/src/error_formatter.dart`, stderr, lowercase codes) is the legacy CLI
 //! path, not what this oracle prints. Format facts source:
-//! docs/facts/oracle-machine-format.md §1 (machine EBNF/escapes), §2 (json fields).
+//! the oracle machine-format contract §1 (machine EBNF/escapes), §2 (json fields).
 
 use std::path::{Path, PathBuf};
 

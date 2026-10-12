@@ -5,7 +5,7 @@
 # harness, runs `harness repro` (fresh-process N-run byte-identical
 # normalized-digest check) over a corpus, then seals the judged run with
 # scripts/repro-tuple.sh. The {tuple, output_digest} pair lands under
-# docs/audits/repro/<label>/seal.json — timestamp-free, so two runs of the
+# target/evidence/repro/<label>/seal.json — timestamp-free, so two runs of the
 # same repository and toolchain state produce byte-identical seals a CI
 # assertion can compare directly.
 #
@@ -13,7 +13,7 @@
 # (git head + `git diff HEAD` patch hash — see repro-tuple.sh), so the gate
 # refuses to run from a dirty tracked tree: a seal taken over uncommitted
 # changes names an identity no clean checkout can reproduce. Untracked
-# workspace material (docs/, .third/, .goal/) is not part of the identity
+# workspace material (local evidence, vendored checkouts, the local ledger) is not part of the identity
 # and does not block the gate. The guard enforces on the run path only.
 #
 # SERIAL PHASE ONLY: a run builds workspace crates and spawns real `dartq
@@ -27,7 +27,7 @@
 #
 #   --dry-run       resolve every path, print the plan and the exact
 #                   commands, execute nothing.
-#   --label L       report directory name under docs/audits/repro/.
+#   --label L       report directory name under target/evidence/repro/.
 #                   Default: default.
 #
 # Environment overrides: REPRO_CORPUS (corpus dir; default tests/corpus/m0,
@@ -46,7 +46,7 @@ cd "$(dirname "$0")/.." || exit 2
 
 CORPUS="${REPRO_CORPUS:-tests/corpus/m0}"
 RUNS=2
-OUT_ROOT="docs/audits/repro"
+OUT_ROOT="target/evidence/repro"
 HARNESS="./target/release/harness"
 DEFAULT_LABEL="default"
 

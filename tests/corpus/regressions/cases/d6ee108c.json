@@ -65,9 +65,9 @@
   "source": "f('${)\n",
   "captured_at": 1791810281,
   "source_run": {
-    "report": "docs/audits/release-night/sii-probes/oracle.machine",
+    "report": "release-night/sii-probes/oracle.machine",
     "dartq_cmd": "static scanner-axis prediction (dartq not executed in lane #921; replay_command measures it live)",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

@@ -149,9 +149,9 @@
   "source": "class F {\n  /* notice the bracket at the end instead of parenthesis! */\n  final List<Undefined> foo1 = List<List<int>>[];\n\n  // variation #1: OK.\n  final List<Undefined> foo2 = <List<int>>[];\n\n  // variation #2: Bad.\n  final List<Undefined> foo3 = List[];\n\n  // variation #3: OK.\n  final List<Undefined> foo4 = List<List<int>>();\n\n  // variation #4: OK.\n  final List<Undefined> foo5 = List();\n\n  // variation #5: Bad.\n  final List<Undefined> foo6 = List<List<int>>[null];\n\n  // variation #6: This is actually just an indexed expression.\n  final List<Undefined> foo7 = List[null];\n\n  // variation #7: OK.\n  final List<Undefined> foo8 = <List<int>>[null];\n\n  // variation #8: OK.\n  final List<Undefined> foo9 = [null];\n}",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

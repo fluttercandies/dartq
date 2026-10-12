@@ -87,9 +87,13 @@ fi
 # Heavyweight phases (coverage, differential gates, test suites beyond the
 # calibration pins above) are NOT run
 # here: they execute real processes over the whole workspace and are reserved
-# for the serial verification phase (AGENTS.md resource discipline):
+# for the serial verification phase (the resource discipline after the 80GB/90GB memory incidents):
 #   scripts/coverage-gate.sh — llvm-cov coverage gate (serial phase only)
 #   scripts/m1-gate.sh       — M1 differential gate (serial phase only)
 #   scripts/acceptance-gate.sh — valid-syntax acceptance gate (serial phase only)
 #   scripts/repro-gate.sh    — §19.5 reproducibility gate (serial phase only)
+
+# Untracked-reference gate: no tracked file may reference never-tracked local
+# workspace material (vendored checkouts, evidence/ledger paths, home paths).
+bash "$(dirname "$0")/untracked-ref-gate.sh"
 echo "ci: gate passed"

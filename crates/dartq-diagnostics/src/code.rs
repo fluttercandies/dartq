@@ -3,7 +3,7 @@
 //!
 //! The official set — 255 registry-gated codes plus 4 supplemental rows —
 //! is generated at build time from `data/syntax-codes.tsv`, the
-//! authoritative table captured in `docs/facts/syntax-codes.md` §9
+//! authoritative table captured in the pinned syntax-codes capture §9
 //! (dart 3.13.1 oracle lock). To update it,
 //! edit the TSV and rebuild; the per-code constants, the [`OFFICIAL_CODES`]
 //! slice, and [`OFFICIAL_CODE_DATA`] are regenerated. Only codes outside that

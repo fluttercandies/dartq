@@ -1,7 +1,7 @@
 // Valid Dart 3.15 acceptance corpus — null-safety edges (local and private-final field promotion, ?? / ??= / ?. / ! operators, null-aware chains with fallbacks, is/is! narrowing, definite assignment of late locals).
 //
 // Provenance: shapes modeled on the official language tests
-// .third/dart-sdk/tests/language/null/, tests/language/null_aware/, tests/language/type_promotion/ (SDK main @ e6f4207a). Oracle-verified
+// upstream Dart SDK source, tests/language/null/, tests/language/null_aware/, tests/language/type_promotion/ (SDK main @ e6f4207a). Oracle-verified
 // 2026-10-12: zero rows under fvm dart 3.13.1 `dart analyze --format=machine`
 // in a probe package (`environment: sdk: ^3.13.0`). Covered by
 // scripts/acceptance-gate.sh (zero-diagnostics bar, `dartq check` machine face).

@@ -31,7 +31,7 @@
 # can compare the lines (or their hashes) directly.
 #
 # Identity scope: tracked-file content only. Untracked workspace material
-# (docs/, .third/, .goal/) is intentionally not part of the identity — it
+# (local evidence, vendored checkouts, the local ledger) is intentionally not part of the identity — it
 # is not commit-tracked repo content. For CI-grade tuples, run from a clean
 # committed tree (dirty: false).
 

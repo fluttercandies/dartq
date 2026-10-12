@@ -12,7 +12,7 @@
 //!
 //! Diagnostic range pinning mirrors the analyzer's translation of
 //! `ErrorToken`s
-//! (`.third/dart-sdk/pkg/analyzer/lib/src/dart/scanner/translate_error_token.dart`):
+//! (`upstream Dart SDK source, pkg/analyzer/lib/src/dart/scanner/translate_error_token.dart`):
 //! unterminated strings/comments and missing digits pin to the **last UTF-16
 //! unit** (`endOffset - 1`, `length: 1` — when the final character is astral
 //! that is its low surrogate, which a byte range cannot address, so the

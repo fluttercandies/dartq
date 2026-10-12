@@ -1,7 +1,7 @@
 {
  "format": "dartq-scanner-golden/1",
- "license": "BSD-3-Clause. Transcribed from dart-lang/sdk sources; each case file carries a 2-line provenance header. Copyright (c) the Dart project authors. See .third/dart-sdk/LICENSE.",
- "provenance": ".third/dart-sdk @ e6f4207a (Dart 3.15 main, shallow clone 2026-10-08); upstream test layouts documented in docs/facts/scanner-test-corpus.md",
+ "license": "BSD-3-Clause. Transcribed from dart-lang/sdk sources; each case file carries a 2-line provenance header. Copyright (c) the Dart project authors. See the upstream dart-lang/sdk LICENSE.",
+ "provenance": "upstream dart-lang/sdk @ e6f4207a (Dart 3.15 main); transcribed from the upstream scanner and analyzer test suites",
  "loading_contract": "strip the first 2 header lines of each case .dart, scan the remainder; offsets are UTF-16 code units relative to that remainder; token rows are [Kind, offset, length, lexeme] with optional 5th field =1 marking synthetic tokens; EOF token is implicit and not listed; diagnostics rows are [code, offset, args?]",
  "case_count": 74,
  "counts_by_category": {
@@ -695,7 +695,7 @@
    "language_version": null,
    "diagnostics": [],
    "line_starts": null,
-   "notes": "official inserts synthetic ')' closers for the unmatched parens into the stream (not asserted by the official test); dartq reports expected_token diagnostics for EOF-unmatched groups per lib.rs:49 - representation delta documented in docs/facts/scanner-test-corpus.md"
+   "notes": "official inserts synthetic ')' closers for the unmatched parens into the stream (not asserted by the official test); dartq reports expected_token diagnostics for EOF-unmatched groups per lib.rs:49"
   },
   {
    "id": "070_mismatched_closer",

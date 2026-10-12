@@ -15,7 +15,7 @@
 # 262 names. Consumed by build.rs: every name here must exist in
 # data/syntax-codes.tsv unless it is in build.rs's EXEMPTED_REGISTRY_CODES
 # (the 7 measured-dead removedIn codes pruned from the TSV, see the TSV
-# header and docs/facts/syntax-codes.md section 9).
+# header and its measured-dead removal record).
 abstract_class_member
 abstract_external_field
 abstract_final_base_class

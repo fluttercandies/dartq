@@ -21,7 +21,7 @@ no known-deliberate advisory rows in this corpus.
 
 ## Families
 
-| File | Family | Official provenance (`​.third/dart-sdk/`) |
+| File | Family | Official provenance (upstream dart-lang/sdk) |
 | --- | --- | --- |
 | `lib/patterns.dart` | all pattern forms (constant, variable, wildcard, parenthesized, logical-or/and, relational, cast, null-check, null-assert, list+rest, map, record, object, guards, switch statement/expression, if-case, declarations, assignments, for-in) | `tests/language/patterns/`, `pkg/front_end/parser_testcases/patterns/` |
 | `lib/records.dart` | record literals, positional/named/mixed types, field access, nested and empty records | `tests/language/records/simple/literals_and_field_access_test.dart`, `tests/language/record_type_test.dart` |
@@ -45,7 +45,7 @@ oracle because every shipped feature of the 3.13–3.15 window landed at or
 before 3.13 (primary constructors `enabledIn 3.13.0`, private named
 parameters 3.12.0, dot shorthands 3.10.0); see the `modern/` note below.
 
-| File | Family | Official provenance (`.third/dart-sdk/`) | Verified |
+| File | Family | Official provenance (upstream dart-lang/sdk) | Verified |
 | --- | --- | --- | --- |
 | `lib/enhanced_enums.dart` | generative/const/factory enum constructors, fields, mixins/implements, generic enums with bounds, static members | `tests/language/enum/` (enhanced_enums_basic_test, syntax_test) | 2026-10-12 |
 | `lib/mixins.dart` | mixin declarations (on/super, base mixin), mixin application classes, multi-mixin chains | `tests/language/mixin_declaration/`, `tests/language/mixin/` | 2026-10-12 |
@@ -102,10 +102,10 @@ stay off). Do not add files for these families until the check face grows
 experiment plumbing or the features ship:
 
 - **augmentations** — `augment` declarations (lexical + syntactic gate;
-  oracle-facing faces need the analysis_options double-enable, measured in
-  `docs/facts/version-skew.md` §1.3 T5)
+  oracle-facing faces need the analysis_options double-enable, measured:
+  double-enabling a real experiment clears its syntax code on both faces)
 - **variance** — `in` / `out` / `inout` type-parameter modifiers
-  (`docs/facts/version-skew.md` §1.3 T3/T4)
+  (probed: enabling variance swaps the syntax code for the semantic CTE)
 - **enhanced-parts**, **macros**, **data-assets**, **unquoted-imports**,
   **const-functions**, **static-extensions**, **anonymous-methods**,
   **this-promotion**, **inference-update-4** — experimental windows with no

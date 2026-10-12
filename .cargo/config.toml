@@ -10,8 +10,8 @@ jobs = 2
 # is unaffected. Requires `sccache` on PATH (brew install sccache).
 rustc-wrapper = "sccache"
 # Incremental rustc invocations are not cacheable — the official Rust
-# caching notes REQUIRE disabling incremental (docs/Rust.md:10 in the
-# .third/sccache reference checkout), and the stats breakdown confirms
+# caching notes REQUIRE disabling incremental (Rust.md:10 in the
+# upstream sccache repo), and the stats breakdown confirms
 # incremental calls pass straight through. Disabling it makes every
 # compilation content-addressed: the dominant workload here (seven
 # parallel lanes re-running cargo check over mostly-unchanged crates)

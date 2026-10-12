@@ -51,9 +51,9 @@
   "source": "// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nbool x;\nbool x;\n\nerrors() {\n  print(x);\n  print(x!);\n  print(!x);\n}\n\nclass C {\n  C.c0() : super();\n  C.c1() : super()!;\n}\n\nmain() {}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

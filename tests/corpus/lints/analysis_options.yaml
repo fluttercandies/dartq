@@ -23,3 +23,15 @@ linter:
     avoid_final_parameters: true
     avoid_js_rounded_ints: true
     avoid_multiple_declarations_per_line: true
+    # W3 standalone expansion (#992).
+    avoid_private_typedef_functions: true
+    avoid_returning_this: true
+    avoid_types_on_closure_parameters: true
+    avoid_unused_constructor_parameters: true
+    combinators_ordering: true
+    initialize_in_field_declaration: true
+    leading_newlines_in_multiline_strings: true
+    migrate_design_widgets: true
+    missing_whitespace_between_adjacent_strings: true
+    no_adjacent_strings_in_list: true
+    no_literal_bool_comparisons: true

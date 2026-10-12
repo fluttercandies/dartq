@@ -156,9 +156,9 @@
   "source": "void foo(dynamic bar) {\n  return \"\"\"æbler$bar\"\"\"\n}\n\nvoid bar() {\n  return \"\"\"æbler\"\"\"\n}\n\nvoid baz() {\n  return r\"\"\"hello\"\"\"\n}\n\nvoid qux() {\n  return \"\"\"\næbler\n\"\"\"\n}\n\nvoid quux() {\n  // ends in eof.\n  return \"\"\"æbler\\",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

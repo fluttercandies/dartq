@@ -19,7 +19,7 @@
 #   semantic rows, so a union-caliber run requires the analyze face.
 #
 #   Both bars are 1.0 — full parity (2026-10-12 ruling,
-#   docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD
+#   the full-parity bars ADR; supersedes the PRD
 #   section 20.3 numeric bars). Residuals pass only via individually
 #   adjudicated pinned exemptions, never a numeric budget.
 #
@@ -43,8 +43,8 @@
 #                   the plan (including the union count) and the exact
 #                   harness commands, write nothing, execute nothing.
 #   --label L       REQUIRED on the run path, no default: the report
-#                   directories are docs/audits/gate-m0/<label>-syntax and
-#                   docs/audits/gate-m0/<label>-union, and an existing
+#                   directories are target/evidence/gate-m0/<label>-syntax and
+#                   target/evidence/gate-m0/<label>-union, and an existing
 #                   directory is refused — the gate never overwrites
 #                   recorded evidence. M0_LABEL env is accepted too.
 #
@@ -73,7 +73,7 @@ UNION_CODES="target/gate/union-codes.txt"
 EXPECTED_UNION_COUNT="290" # 255 (syntax) + 36 (M1) - 1 overlap
 SYNTAX_THRESHOLD="1.0"
 UNION_THRESHOLD="1.0"
-OUT_ROOT="docs/audits/gate-m0"
+OUT_ROOT="target/evidence/gate-m0"
 HARNESS="./target/release/harness"
 PERSIST_DIR="tests/corpus/regressions/cases"
 

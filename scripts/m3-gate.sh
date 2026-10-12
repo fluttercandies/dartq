@@ -4,7 +4,7 @@
 # One harness run over tests/corpus/m3-unused with the frozen M3 code set
 # (tests/harness/m3_unused_codes.txt), WARNING severity, bar 1.0 — full
 # parity like every differential gate (2026-10-12 ruling,
-# docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD-era
+# the full-parity bars ADR; supersedes the PRD-era
 # numeric bars; residuals pass only via individually adjudicated pinned
 # exemptions, never a numeric budget) — against
 # the same single oracle of record as M1/M2: the fvm default install. All
@@ -27,7 +27,7 @@
 # Environment overrides: FVM_HOME (default ~/fvm; the default install's Dart
 # version banner is checked on the run path, a mismatch is a WARN, not
 # fatal), DARTQ_CMD (the dartq side of the harness), M3_LABEL (report
-# directory name under docs/audits/gate-m3/, default m3-r1; an existing
+# directory name under target/evidence/gate-m3/, default m3-r1; an existing
 # report directory is refused — a rerun never overwrites recorded evidence).
 #
 # Exit codes: 0 gate met (WARNING-tier Jaccard >= 1.0); 1 below the bar;
@@ -41,7 +41,7 @@ CORPUS="tests/corpus/m3-unused"
 CODES_FILE="tests/harness/m3_unused_codes.txt"
 THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
-OUT_ROOT="docs/audits/gate-m3"
+OUT_ROOT="target/evidence/gate-m3"
 HARNESS="./target/debug/harness"
 label="${M3_LABEL:-m3-r1}"
 

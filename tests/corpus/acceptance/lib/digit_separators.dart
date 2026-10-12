@@ -4,7 +4,7 @@
 // coercion contexts and const contexts.
 //
 // Provenance: shapes modeled on the official language test
-// .third/dart-sdk/tests/language/number/separators_test.dart (SDK main @
+// upstream Dart SDK source, tests/language/number/separators_test.dart (SDK main @
 // e6f4207a). Covered by scripts/acceptance-gate.sh (zero-diagnostics bar,
 // `dartq check` machine face).
 

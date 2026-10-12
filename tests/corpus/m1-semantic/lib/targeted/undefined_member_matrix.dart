@@ -3,8 +3,8 @@
 // undefined_named_parameter (instance member lookup on a user class; the
 // method name avoids the Object.noSuchMethod collision noted in
 // undefined_method.dart), plus undefined_operator (binary operator on a
-// class that declares none). Trigger conditions: docs/facts/
-// resolution-design-spec.md 4.2. Hand-crafted from the code semantics; no
+// class that declares none). Trigger conditions: the pinned
+// resolution trigger table (lookup failures against the resolved import scope). Hand-crafted from the code semantics; no
 // official test file.
 class C {
   int m(int a) => a;

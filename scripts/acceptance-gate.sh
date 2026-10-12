@@ -35,7 +35,7 @@
 #   --dry-run       resolve every path, print the plan and the exact
 #                   command, write nothing, execute nothing.
 #   --label L       REQUIRED on the run path, no default: the evidence
-#                   directory is docs/audits/gate-acceptance/<label>/ and an
+#                   directory is target/evidence/gate-acceptance/<label>/ and an
 #                   existing directory is refused — the gate never overwrites
 #                   recorded evidence. ACCEPTANCE_LABEL env is accepted too.
 #
@@ -51,7 +51,7 @@ set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
 
 CORPUS="tests/corpus/acceptance"
-OUT_ROOT="docs/audits/gate-acceptance"
+OUT_ROOT="target/evidence/gate-acceptance"
 DARTQ_BIN="${DARTQ_BIN:-./target/release/dartq}"
 
 usage() {

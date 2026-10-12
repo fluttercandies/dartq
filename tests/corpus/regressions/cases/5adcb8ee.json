@@ -22,9 +22,9 @@
   "source": "// Copyright (c) 2026, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nclass C<X> {\n  C(void Function(X) x);\n}\n\nT check<T>(C<List<T>> f) {\n  print('check<$T>(...)');\n  return 42 as T;\n}\n\nvoid main() {\n  var x =\n      check\n      /*cfe.T :> int,T :> int*/\n      /*analyzer.T :> int*/ (\n        C\n        /*cfe.X <: List<_>,X <: List<int>,X <: List<int>*/\n        /*analyzer.X <: List<_>,X <: List<int>*/ ((List<int> x) {}),\n      );\n  print(x); // VM prints 42\n}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

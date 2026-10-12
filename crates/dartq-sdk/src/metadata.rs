@@ -109,7 +109,7 @@ pub struct TargetLibraries {
 /// `patches` is kept as path list only — patch files are backend
 /// implementation details that do not change the public API surface, so they
 /// are stored for later platform-file localization but never read
-/// (`docs/facts/sdk-metadata.md` §6).
+/// (the SDK metadata capture §6).
 #[derive(Debug, Clone, Serialize)]
 pub struct SdkLibrary {
     /// Implementation file relative to `<dart-sdk>/lib`, e.g.

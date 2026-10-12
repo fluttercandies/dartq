@@ -83,7 +83,7 @@
 //! Every report carries `schema_version: 1` and its full input set (corpus
 //! dir, LOC definition, tokenizer id, sample counts, commands) for PRD §19.5
 //! reproducibility, written as `<out>/<metric>/report.json` (default out:
-//! `docs/audits/bench`).
+//! `target/evidence/bench`).
 //!
 //! Discipline: the process-driving functions are exercised only by the
 //! serial verification phase — the unit tests cover the pure core
@@ -106,7 +106,7 @@ use crate::machine::OutputFormat;
 use crate::oracle::{driver_timeout_from_env, run_captured};
 
 const DEFAULT_CORPUS: &str = "tests/corpus/m0";
-const DEFAULT_OUT: &str = "docs/audits/bench";
+const DEFAULT_OUT: &str = "target/evidence/bench";
 const DEFAULT_DARTQ_CMD: &str = "cargo run -q -p dartq-cli -- check --format=machine";
 /// Tree-RSS watchdog threshold: 8 GiB in KiB (memory-incident discipline —
 /// the collector carries the same guard the serial phase runs under).

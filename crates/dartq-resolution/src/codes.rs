@@ -1,10 +1,10 @@
 //! The M1 resolution diagnostic code table, frozen at
-//! `docs/facts/resolution-design-spec.md` §4.2.
+//! the resolution design contract §4.2.
 //!
 //! One variant per §4.2 row. Every row carries the official analyzer code
 //! name (`analyzerCode`), its `UPPERCASE` machine form, the verbatim oracle
 //! message template from
-//! `.third/dart-sdk/pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart` (line
+//! `upstream Dart SDK source, pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart` (line
 //! cited per code), and that row's registry-true descriptor: the
 //! `correctionMessage` (verbatim, `None` where the row has none), the
 //! diagnostic family (`dtype` — the machine TYPE value), and the

@@ -1,5 +1,5 @@
-# lint_divergences.tsv — rule-level expected-divergence ledger (design doc
-# docs/plans/lint-differential-face.md section 4): one row per known
+# lint_divergences.tsv — rule-level expected-divergence ledger (the contract:
+# divergences are expected, ruled, and gated explicitly): one row per known
 # dartq-vs-oracle divergence face of a package:lints rule, consolidating the
 # per-rule approximation doc-comments of crates/dartq-lints (audit lints-r1
 # finding F6) into one machine-readable table.
@@ -21,16 +21,16 @@
 # Entry-level exemptions stay in tests/corpus/regressions/known-diffs.json
 # (persistence/triage-scoped; never alters gate Jaccard).
 #
-# Seed rows (docs/plans/lint-differential-face.md section 4 + the #721
+# Seed rows (the initial triage sweep + the #721
 # main-agent rulings; the sweep of the remaining approximation
 # doc-comments in crates/dartq-lints/src/rules/*.rs extends this table).
-no_duplicate_case_values	legacy-only official rule (fires only at language version <= 2.19); dartq historically const-folded every modern `case` and over-reported; silenced at the default version by the #709 fix round, so the corpus carries no duplicate-case fixture and any diff is a real bug	dartq_only	in_universe	official linter no_duplicate_case_values.dart:41; docs/audits/lints-r1.md F1; main-agent ruling on #721
+no_duplicate_case_values	legacy-only official rule (fires only at language version <= 2.19); dartq historically const-folded every modern `case` and over-reported; silenced at the default version by the #709 fix round, so the corpus carries no duplicate-case fixture and any diff is a real bug	dartq_only	in_universe	official linter no_duplicate_case_values.dart:41; triage finding F1; main-agent ruling on #721
 exhaustive_cases	scrutinee static type + constant values are element facts dartq-lints did not mount (kinds: &[], #434 wiring) — the oracle reported, dartq was structurally silent	oracle_only	fixed	mounted on the enum-like seam 2026-10-12 (exemption-reaudit F2, kinds: [SwitchStatement]); re-frozen into lint_codes.txt at the full 89 — lints-r1.md F2; return path was the wiring ticket
-unnecessary_type_check	structural: the rule left the linter in the Dart 3.15 main re-pin (templates live in the analyzer's diagnostic.g.dart:17640-17661), so it can never be enabled on both sides under include:; dartq keeps it as Group::Diagnostic opt-in, validated by inline pins only	structural	excluded	docs/audits/lints-r1.md F5; main-agent ruling on #721
-collection_methods_unrelated_type	`Map[]=` index and cross-file `Queue.remove` rows unported (under-report); opaque-receiver presumption over-reports user `where` members	both	in_universe	crates/dartq-lints/src/rules/collections.rs:870; docs/audits/lints-r1.md F6
-prefer_contains	opaque-receiver presumption over-reports dartq_only; typed receivers (the fixture face) agree	dartq_only	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_contains module; docs/audits/lints-r1.md F6
-control_flow_in_finally	forward `continue L` to a later member-label unresolved (under-report)	both	in_universe	crates/dartq-lints/src/rules/flow.rs control_flow_in_finally module; docs/audits/lints-r1.md F6
-type_literal_in_constant_pattern	built-in-name set: user constants named like built-in types over-report; user-type constants (`case MyType`) under-report (the oracle resolves, dartq matches lexemes)	both	in_universe	crates/dartq-lints/src/rules/flow.rs:848; docs/audits/lints-r1.md F6
-prefer_iterable_wheretype	element-free written-type face (closure-parameter identity presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:605 (pinned as prefer_iterable_whereType); docs/audits/lints-r1.md F6
-prefer_for_elements_to_map_fromiterable	element-free written-type face (closure shape presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:763 (pinned as prefer_for_elements_to_map_fromIterable); docs/audits/lints-r1.md F6
-prefer_collection_literals	element-free written-type face (element identity presumed)	dartq_only	in_universe	docs/audits/lints-r1.md F6
+unnecessary_type_check	structural: the rule left the linter in the Dart 3.15 main re-pin (templates live in the analyzer's diagnostic.g.dart:17640-17661), so it can never be enabled on both sides under include:; dartq keeps it as Group::Diagnostic opt-in, validated by inline pins only	structural	excluded	triage finding F5; main-agent ruling on #721
+collection_methods_unrelated_type	`Map[]=` index and cross-file `Queue.remove` rows unported (under-report); opaque-receiver presumption over-reports user `where` members	both	in_universe	crates/dartq-lints/src/rules/collections.rs:870; triage finding F6
+prefer_contains	opaque-receiver presumption over-reports dartq_only; typed receivers (the fixture face) agree	dartq_only	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_contains module; triage finding F6
+control_flow_in_finally	forward `continue L` to a later member-label unresolved (under-report)	both	in_universe	crates/dartq-lints/src/rules/flow.rs control_flow_in_finally module; triage finding F6
+type_literal_in_constant_pattern	built-in-name set: user constants named like built-in types over-report; user-type constants (`case MyType`) under-report (the oracle resolves, dartq matches lexemes)	both	in_universe	crates/dartq-lints/src/rules/flow.rs:848; triage finding F6
+prefer_iterable_wheretype	element-free written-type face (closure-parameter identity presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:605 (pinned as prefer_iterable_whereType); triage finding F6
+prefer_for_elements_to_map_fromiterable	element-free written-type face (closure shape presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:763 (pinned as prefer_for_elements_to_map_fromIterable); triage finding F6
+prefer_collection_literals	element-free written-type face (element identity presumed)	dartq_only	in_universe	triage finding F6

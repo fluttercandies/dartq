@@ -1,6 +1,6 @@
 // Targets the library-directive / URI family (analyzer ParserErrorCode,
 // pinned snapshot syntax-codes.tsv; the analyzer sources are not vendored
-// in .third).
+// in this repo).
 // Targets non_identifier_library_name (TSV:246).
 library 1;
 

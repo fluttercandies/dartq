@@ -3,8 +3,8 @@
 //! subtype relation, assignability, and the least upper bound.
 //!
 //! Fact sources (semantic behavior is taken verbatim from these, never from
-//! memory): `docs/facts/types-nullability-spec.md` and the vendored SDK under
-//! `.third/dart-sdk`, chiefly `pkg/analyzer/lib/src/dart/element/type.dart`
+//! memory): the nullability contract and the vendored SDK under
+//! the upstream Dart SDK, chiefly `pkg/analyzer/lib/src/dart/element/type.dart`
 //! ("type.dart"), `subtype.dart`, `least_upper_bound.dart`, and
 //! `pkg/analyzer/lib/src/dart/element/type_system.dart` (`type_system.dart`).
 //!

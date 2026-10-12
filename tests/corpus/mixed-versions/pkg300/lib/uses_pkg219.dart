@@ -1,6 +1,6 @@
 // Cross-package import edge: importer pkg300 resolves at 3.0, importee
 // pkg219 resolves at 2.19 (per-package languageVersion entries in the
-// package_config — anchor: .third/pub/lib/src/package_config.dart:236-238;
+// package_config — anchor: upstream pub source, lib/src/package_config.dart:236-238;
 // dependency declared in pkg300/pubspec.yaml as a path dep).
 //
 // Expectation: one analysis run keeps both versions live — this file may

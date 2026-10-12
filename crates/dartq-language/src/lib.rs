@@ -54,7 +54,7 @@
 //!   the drop is observationally a clamp, but the mechanism is drop +
 //!   re-resolve. [`LanguageVersion::is_above_latest`] is the detection hook
 //!   for that warning/drop emission site (measured in
-//!   `docs/facts/version-skew.md` §1.3 T2).
+//!   the version-skew ledger §1.3 T2).
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/feature_registry.rs"));
@@ -127,7 +127,7 @@ impl LanguageVersion {
     /// `STATIC_WARNING` and drops the override (`scanner.dart`:
     /// `_overrideVersion = null`), so the library version re-resolves through
     /// the normal chain — package config, else the default — before any
-    /// feature computation (measured in `docs/facts/version-skew.md` §1.3
+    /// feature computation (measured in the version-skew ledger §1.3
     /// T2; against the 3.13 oracle, `@dart = 3.14` warned while
     /// `@dart = 3.13` did not — the drop only looks like a clamp when the
     /// fallback resolves to the default, which equals latest).

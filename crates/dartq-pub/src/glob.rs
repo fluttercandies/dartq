@@ -1,4 +1,4 @@
-//! A pinned port of `package:glob` 2.1.3 (the version `.third/pub` pins),
+//! A pinned port of `package:glob` 2.1.3 (the version upstream pub pins),
 //! restricted to what workspace member expansion needs: POSIX paths,
 //! case-sensitive matching, symlink-following listing.
 //!

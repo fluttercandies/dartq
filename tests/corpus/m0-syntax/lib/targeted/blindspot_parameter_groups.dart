@@ -1,7 +1,7 @@
 // Targets mixed_parameter_groups (TSV:224): named and positional groups
 // in one parameter list. The rest of this file targets the sibling group
 // codes (analyzer ParserErrorCode, pinned snapshot syntax-codes.tsv; the
-// analyzer sources are not vendored in .third).
+// analyzer sources are not vendored in this repo).
 void mixedGroups(int a, {int b}, [int c]) {}
 // Targets multiple_named_parameter_groups (TSV:232): two named groups.
 void twoNamedGroups({int a}, {int b}) {}

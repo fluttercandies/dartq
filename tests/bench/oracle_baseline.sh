@@ -15,7 +15,7 @@
 #   script concurrently with another analysis process on either side (noisy numbers).
 # - The script never runs `pub get`; the target directory must already have a
 #   package context (or none — dart analyze also works without one, see
-#   docs/facts/oracle-machine-format.md §3).
+#   the oracle machine-format contract §3).
 #
 # Usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd "<command>"]
 #

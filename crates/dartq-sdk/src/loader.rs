@@ -1,6 +1,6 @@
 //! Loading an [`SdkSnapshot`] from an on-disk SDK layout.
 //!
-//! Step order follows `docs/facts/sdk-loader-spec.md` §5: version file →
+//! Step order follows the SDK loader contract §5: version file →
 //! revision → `libraries.json` (with target resolution) →
 //! `allowed_experiments.json` → canonical id.
 
@@ -34,7 +34,7 @@ impl SdkSnapshot {
     /// library table with the `sky_engine` `_embedder.yaml` mapping, with
     /// analyzer `EmbedderSdk` semantics (full table replacement, not
     /// overlay — a flutter project's `dart:core` and `dart:ui` come from
-    /// `sky_engine`, `docs/facts/sdk-loader-spec.md` §4). Passing a root
+    /// `sky_engine`, the SDK loader contract §4). Passing a root
     /// before that lands is a hard error rather than a silently partial
     /// load, and `None` is fully self-sufficient: the dart-sdk
     /// `libraries.json` covers every non-embedder `dart:` library.

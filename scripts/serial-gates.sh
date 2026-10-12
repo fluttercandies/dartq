@@ -101,7 +101,7 @@
 # trend-w5-r2, m1-r5-r2, mega-r1-r2). A gate whose evidence directory
 # already exists refuses to run (exit 2) — recorded evidence is never
 # overwritten; bump SERIAL_TAG or clean up consciously. A FAIL/KILLED step's
-# /tmp log is additionally copied to docs/audits/serial/<step><TAG>/
+# /tmp log is additionally copied to target/evidence/serial/<step><TAG>/
 # (untracked) so an untagged rerun — which reuses the same /tmp path —
 # cannot orphan the failing run's log; the summary row names the archive.
 #
@@ -139,7 +139,7 @@ cd "$(dirname "$0")/.." || exit 2
 
 RSS_DEFAULT_KB="${RSS_LIMIT_KB:-8388608}"
 MEGA_CAP_KB=12582912
-M0_OUT_ROOT="docs/audits/gate-m0"
+M0_OUT_ROOT="target/evidence/gate-m0"
 UNION_CODES="target/gate/union-codes.txt"
 EXPECTED_UNION_COUNT=290
 FVM_HOME="${FVM_HOME:-$HOME/fvm}"
@@ -697,9 +697,9 @@ for s in "${STEPS[@]}"; do
     fi
     # Preserve the failing run's log: /tmp is ephemeral and the next rerun
     # overwrites the same path, so the failure evidence lands next to the
-    # recorded gate evidence (docs/audits is untracked).
+    # recorded gate evidence (target/evidence is gitignored).
     if [ -f "${STEP_LOG[$i]}" ]; then
-      archive_dir="docs/audits/serial/$s${TAG}"
+      archive_dir="target/evidence/serial/$s${TAG}"
       if mkdir -p "$archive_dir" 2>/dev/null && cp "${STEP_LOG[$i]}" "$archive_dir/" 2>/dev/null; then
         echo "-- [$s] log archived to $archive_dir/$(basename "${STEP_LOG[$i]}")" >&2
         STEP_LOG[$i]="${STEP_LOG[$i]} -> $archive_dir/"

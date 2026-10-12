@@ -2,7 +2,7 @@
 
 Syntax-broken corpus for the M0 differential gate (`dartq` vs
 `dart analyze`, Jaccard over `(code, file)` entry sets). Read-only
-assembled snapshot; see `docs/facts/corpus-baseline.md`. Language version:
+assembled snapshot; pinned by the M0 differential baseline (oracle 3.13.1 code distribution). Language version:
 3.13 (`pubspec.yaml`, sdk ^3.13.0) — several fixture notes below hinge on
 that version.
 

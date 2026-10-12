@@ -1,5 +1,5 @@
 //! Unit tests mined from the official flow-analysis corpus
-//! (`.third/dart-sdk/pkg/_fe_analyzer_shared/test/flow_analysis/`),
+//! (`upstream Dart SDK source, pkg/_fe_analyzer_shared/test/flow_analysis/`),
 //! each citing its source file. Assertions cover the crate's fact face:
 //! dead code and definite-unassigned reads.
 
@@ -143,7 +143,7 @@ fn named_ty(name: u32, nullable: bool) -> crate::ev::Ev {
     crate::ev::Ev::Type {
         base: crate::ty::Base::Name(name),
         nullable,
-        had_type_args: false,
+        args: crate::ty::EMPTY_ARGS,
     }
 }
 
@@ -196,7 +196,7 @@ fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
 
 /// Drives a hand-built buffer through a fresh interpreter (name-level ops).
 fn interp_of(events: &[crate::ev::Ev]) -> crate::interp::Interp<'static> {
-    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps);
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, &[]);
     interp.run(events);
     interp
 }
@@ -222,7 +222,7 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
-// —— W3 dead-code oracle faces (#868, docs/audits/w3-deadcode-probes.md) ——
+// —— W3 dead-code oracle faces (#868, the W3 dead-code probes) ——
 
 /// Wholly-dead branch face (probe table B): the anchor IS the dead branch's
 /// block, so the row spans the block's full extent — closing brace
@@ -1229,7 +1229,7 @@ fn unmatched_construct_begins_do_not_panic() {
         // Switch block without SwitchBlockEnd.
         Ev::SwitchBlockBegin,
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
 }
 
@@ -1298,7 +1298,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
         Ev::OtherExpr { span: span(40) },
         Ev::ForControlFlowEnd { for_in: false },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
@@ -1341,7 +1341,7 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::WhileEnd,
         Ev::ExprStmt { span: span(4) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     // The closure body falls off its end: one completion row (the outer
@@ -1373,7 +1373,7 @@ fn case_less_switch_expression_does_not_panic() {
         Ev::SwitchExprBlockBegin,
         Ev::SwitchExprBlockEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1414,7 +1414,7 @@ fn try_catch_finally_completes_normally() {
         Ev::OtherExpr { span: span(7) },
         Ev::TryEnd { has_finally: true },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1449,7 +1449,7 @@ fn try_finally_body_return_leaves_tail_dead() {
         Ev::ExprStmt { span: span(5) },
         Ev::OtherExpr { span: span(6) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
@@ -1483,7 +1483,7 @@ fn try_finally_return_leaves_tail_dead() {
         Ev::ExprStmt { span: span(5) },
         Ev::OtherExpr { span: span(6) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
@@ -1521,7 +1521,7 @@ fn try_two_catches_first_returns_second_completes() {
         Ev::CatchClauseEnd,
         Ev::TryEnd { has_finally: false },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1558,7 +1558,7 @@ fn finally_break_exits_via_loop_exit_join() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1595,7 +1595,7 @@ fn finally_continue_exits_via_loop_exit_join() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1634,7 +1634,7 @@ fn try_catch_finally_returning_catch_keeps_tail_alive() {
         Ev::ExprStmt { span: span(7) },
         Ev::OtherExpr { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1692,7 +1692,7 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::SwitchExprCaseEnd { has_guard: false },
         Ev::SwitchExprBlockEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1760,7 +1760,7 @@ fn switch_statement_default_exhaustive_tail_dead() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
@@ -1809,7 +1809,7 @@ fn assert_join_with_message_invariants() {
         Ev::Bool { value: true },
         Ev::AssertEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
@@ -1882,7 +1882,7 @@ fn assert_condition_write_unassigned_after() {
         },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(
@@ -1956,7 +1956,7 @@ fn pattern_assignment_writes_targets() {
         },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -2008,7 +2008,7 @@ fn pattern_declaration_declares_assigned() {
         },
         Ev::ExprStmt { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -2100,7 +2100,7 @@ fn closure_await_demotes_captured_reads() {
         Ev::Assign { plain: true },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     // The closure body falls off its end: one completion row.
@@ -2172,7 +2172,7 @@ fn for_in_statement_replay_invariants() {
         Ev::ForInBodyEnd,
         Ev::ForInEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
@@ -2220,7 +2220,7 @@ fn for_in_break_joins_exit() {
         Ev::ExprStmt { span: span(4) },
         Ev::OtherExpr { span: span(5) },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -2263,7 +2263,7 @@ fn collection_for_in_element_nets_one_value() {
         Ev::OtherExpr { span: span(4) },
         Ev::ForControlFlowEnd { for_in: true },
     ];
-    let mut interp = Interp::new(&NameTypeOps);
+    let mut interp = Interp::new(&NameTypeOps, &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);

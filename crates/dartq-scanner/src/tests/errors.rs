@@ -702,7 +702,7 @@ fn replacement_char_is_skipped_silently() {
     // path, but the pinned oracle emits nothing for either reachable U+FFFD
     // class — a raw undecodable byte (read-layer tolerance) and a literal
     // U+FFFD in valid UTF-8 — so the measured-cull doctrine governs
-    // (docs/facts corpus-expansion-plan.md §7). The character is consumed,
+    // (the corpus expansion plan §7). The character is consumed,
     // never merged into an identifier.
     let r = scan_src("a\u{FFFD}b");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);

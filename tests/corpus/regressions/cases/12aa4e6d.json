@@ -43,9 +43,9 @@
   "source": "// Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// @dart=2.19\n\n/*member: switchStatement:declared={a, b, c}, assigned={a, b, c}*/\nswitchStatement(int a, int b, int c) {\n  /*assigned={b, c}*/ switch (a = 0) {\n    case 1:\n      b = 0;\n      break;\n    default:\n      c = 0;\n      break;\n  }\n}\n",
   "captured_at": 1791787153,
   "source_run": {
-    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "report": "gate-m0/trend-w4b-union/report.json",
     "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",

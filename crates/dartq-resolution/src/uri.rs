@@ -1,5 +1,5 @@
 //! Directive URI parsing, classification, and resolution to interned file
-//! targets (`docs/facts/resolution-design-spec.md` §4.1/§5 module 1).
+//! targets (the resolution design contract §4.1/§5 module 1).
 //!
 //! The pipeline mirrors the analyzer's: parse the directive URI string with
 //! Dart `Uri.parse` validity rules, resolve relative strings against the
