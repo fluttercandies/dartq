@@ -254,7 +254,7 @@
     "target/debug/harness",
     "replay",
     "--corpus-dir",
-    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0",
+    "tests/corpus/m0",
     "--edits",
     "tests/corpus/regressions/cases/7ce66274.edits.jsonl",
     "--dartq-cmd",

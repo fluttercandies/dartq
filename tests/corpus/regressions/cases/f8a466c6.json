@@ -1,7 +1,7 @@
 {
   "schema": "regression-case-v1",
   "file": "lib/targeted/enum_instantiated_to_bounds_is_not_well_bounded.dart",
-  "corpus": "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m1-semantic",
+  "corpus": "tests/corpus/m1-semantic",
   "oracle": [
     {
       "code": "enum_instantiated_to_bounds_is_not_well_bounded",
@@ -45,7 +45,7 @@
     "target/debug/harness",
     "replay",
     "--corpus-dir",
-    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m1-semantic",
+    "tests/corpus/m1-semantic",
     "--edits",
     "tests/corpus/regressions/cases/f8a466c6.edits.jsonl",
     "--dartq-cmd",

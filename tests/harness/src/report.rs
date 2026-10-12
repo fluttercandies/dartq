@@ -772,6 +772,18 @@ fn escape_md_cell(s: &str) -> String {
 pub(crate) const REGRESSIONS_ROOT: &str = "tests/corpus/regressions";
 pub(crate) const KNOWN_DIFFS_FILE: &str = "known-diffs.json";
 pub(crate) const CASES_DIR: &str = "cases";
+
+/// Renders `path` repo-root-relative when it lives under the repo (so
+/// persisted cases survive a checkout move); anything else — the Dart SDK in
+/// a recorded command line, a temp fixture — is kept verbatim.
+fn repo_relative(path: &Path) -> String {
+    // CARGO_MANIFEST_DIR = <repo>/tests/harness; its grandparent is the root.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2);
+    match root.and_then(|root| path.strip_prefix(root).ok()) {
+        Some(rel) => rel.display().to_string(),
+        None => path.display().to_string(),
+    }
+}
 const CASE_SCHEMA: &str = "regression-case-v1";
 
 /// One exemption: a known divergence that must not re-persist. `file` is
@@ -829,7 +841,8 @@ struct RegressionCase {
     /// is on a file outside every corpus root (both sides key those
     /// canonically absolute — such cases carry no replay command).
     file: String,
-    /// Merge label (multi-corpus) or the corpus dir string (single).
+    /// Merge label (multi-corpus) or the corpus dir repo-root-relative
+    /// (single).
     corpus: String,
     oracle: Vec<CaseRow>,
     dartq: Vec<CaseRow>,
@@ -924,12 +937,9 @@ pub(crate) fn persist_regressions(
                 "target/debug/harness".to_string(),
                 "replay".to_string(),
                 "--corpus-dir".to_string(),
-                dir.display().to_string(),
+                repo_relative(dir),
                 "--edits".to_string(),
-                opts.dir
-                    .join(format!("{hash}.edits.jsonl"))
-                    .display()
-                    .to_string(),
+                repo_relative(&opts.dir.join(format!("{hash}.edits.jsonl"))),
                 "--dartq-cmd".to_string(),
                 opts.dartq_cmd.to_string(),
                 "--daemon-cmd".to_string(),
@@ -943,13 +953,13 @@ pub(crate) fn persist_regressions(
             corpus: raw.corpora[section]
                 .0
                 .clone()
-                .unwrap_or_else(|| dir.display().to_string()),
+                .unwrap_or_else(|| repo_relative(dir)),
             oracle,
             dartq,
             source,
             captured_at: opts.captured_at,
             source_run: SourceRun {
-                report: opts.report_path.display().to_string(),
+                report: repo_relative(opts.report_path),
                 dartq_cmd: opts.dartq_cmd.to_string(),
                 oracle_cmd: opts.oracle_cmd.to_string(),
             },

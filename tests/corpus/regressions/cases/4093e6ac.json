@@ -1732,7 +1732,7 @@
     "target/debug/harness",
     "replay",
     "--corpus-dir",
-    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "tests/corpus/m0-syntax",
     "--edits",
     "tests/corpus/regressions/cases/4093e6ac.edits.jsonl",
     "--dartq-cmd",
