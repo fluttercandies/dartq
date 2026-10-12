@@ -881,15 +881,16 @@ mod tests {
     /// primary-constructors gate at `// @dart = 2.12`), rendered through
     /// the same `experiment_not_enabled_message` selection the engine's
     /// `DiagCollector` uses. Oracle probes (dart 3.13.1, machine format)
-    /// pin the mixin face exactly — `mixin M(int x);` at 2.12 is
-    /// `UNEXPECTED_TOKEN` at the `(` (`2|8|1`) plus
+    /// split the declaration kinds on `endPrimaryConstructor`
+    /// (ast_builder.dart:2855): the Class/Enum arm gates at the
+    /// constructor's begin token, so `class C(int x);` at 2.12 is the
+    /// two-row experiment face — EXPERIMENT_NOT_ENABLED on the `(` (`2|8|1`)
+    /// plus parseClass's `;`-body row (`2|15|1`) — while the
+    /// `TopLevel|Mixin|Extension` arm is silent, so `mixin M(int x);` takes
+    /// only the parser rows: `UNEXPECTED_TOKEN` at the `(` (`2|8|1`) plus
     /// EXPERIMENT_NOT_ENABLED at the `;` (`2|15|1`, the parser event's
-    /// anchor), and at the current version `mixin_primary_constructor`
-    /// replaces the gate (`1|8|1`). The class head is NOT pinned here: the
-    /// parser's feature-off class arm routes clean formals
-    /// (`class C(int x);`, oracle: two gate rows, no syntax rows) into the
-    /// `class C( {}` junk recovery — a dartq-parser divergence tracked
-    /// outside this face (#956 finding). The patterns family never gates
+    /// anchor); at the current version `mixin_primary_constructor`
+    /// replaces the gate (`1|8|1`). The patterns family never gates
     /// on this face either: the official parser short-circuits the
     /// condition's `case` branch on `isPatternsFeatureEnabled`
     /// (`parser_impl.dart:8416`), so the pinned if-case reports the
@@ -898,6 +899,27 @@ mod tests {
     /// on this scan+parse face by design.
     #[test]
     fn experiment_gate_renders_on_the_check_face() {
+        // The Class/Enum arm: the `(`-anchored gate row plus the `;`-body
+        // row, no syntax rows (the paired formals parse clean pre-feature).
+        let pinned_class = "// @dart = 2.12\nclass C(int x);\n";
+        let mut set = FileSet::default();
+        let file = set.push(pinned_class, Path::new("/c/lib/d.dart"));
+        let diags = analyze_file(pinned_class, Path::new("/c/lib"), file);
+        let shape: Vec<(&str, u32, u32)> = diags
+            .iter()
+            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("experiment_not_enabled", 23, 1),
+                ("experiment_not_enabled", 30, 1)
+            ],
+            "the oracle-pinned pre-feature class face"
+        );
+
+        // The silent TopLevel|Mixin|Extension arm: parser rows only, no
+        // `(`-anchored experiment row.
         let pinned = "// @dart = 2.12\nmixin M(int x);\n";
         let mut set = FileSet::default();
         let file = set.push(pinned, Path::new("/c/lib/a.dart"));
