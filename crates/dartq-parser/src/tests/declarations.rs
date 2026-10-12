@@ -472,9 +472,17 @@ fn class_in_class_recovery() {
 }
 
 #[test]
-fn required_parameter_with_default_reports() {
+fn required_positional_default_reports_named_parameter_outside_group() {
+    // W4 alignment (probe f15): `=`'s dedicated `requiredParameterWithDefault`
+    // is pseudo-shared to `namedParameterOutsideGroup` at the pinned oracle
+    // (fe91 codes_generated.dart:2742-2746) — the same code the `:` separator
+    // already reports.
     let c = parse("class C { void m(int a = 1) {} }");
-    assert_eq!(c.error_codes(), ["required_parameter_with_default"]);
+    assert_eq!(c.error_codes(), ["named_parameter_outside_group"]);
+    assert_eq!(
+        &c.texts,
+        &["Named parameters must be enclosed in curly braces ('{' and '}')."]
+    );
 }
 
 #[test]
@@ -499,30 +507,26 @@ fn colon_on_required_positional_reports_named_parameter_outside_group() {
 }
 
 #[test]
-fn atomic_empty_bracket_group_reports_empty_optional_parameter_list() {
+fn atomic_empty_bracket_group_reports_missing_identifier() {
     // The scanner keeps `[]` as one INDEX token; the official
     // `parseFormalParametersRest` `[]`-token arm (parser_impl.dart:1963-1967)
     // splits it into `[` + `]` (`rewriteSquareBrackets` :5117 — `[` at the
     // `[]` offset, `]` at +1) and enters `parseOptionalPositionalParameters`,
-    // whose `parameterCount == 0` arm (:2452-2462) reports
-    // `emptyOptionalParameterList` at the synthetic `]` and feeds a
-    // zero-length synthetic identifier to the parameter parse. Registry row
-    // (`emptyOptionalParameterList`): problem + correction verbatim.
+    // whose `parameterCount == 0` arm (:2452-2462) reports at the synthetic
+    // `]` and feeds a zero-length synthetic identifier to the parameter parse.
+    // W4 alignment (probe f14): the arm's code is the pseudo-shared
+    // `missingIdentifier` (fe91 codes :577-590) — "Expected an identifier.",
+    // no correction.
     let c = parse("void f([]) {}");
-    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 8); // synthetic `]` = `[]` offset + 1
     assert_eq!(c.errors[0].2, 9);
-    assert_eq!(&c.texts, &["Optional parameter lists cannot be empty."]);
-    assert_eq!(
-        &c.corrections,
-        &[Some(
-            "Try adding an optional parameter to the list.".to_string()
-        )]
-    );
+    assert_eq!(&c.texts, &["Expected an identifier."]);
+    assert_eq!(&c.corrections, &[None]);
 
     // The arm fires after a comma too: one row, anchored the same way.
     let c = parse("void f(int x, []) {}");
-    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 15);
     assert_eq!(c.errors[0].2, 16);
 
@@ -532,30 +536,25 @@ fn atomic_empty_bracket_group_reports_empty_optional_parameter_list() {
 }
 
 #[test]
-fn spaced_empty_bracket_group_reports_empty_optional_parameter_list() {
+fn spaced_empty_bracket_group_reports_missing_identifier() {
     // The real-`]` sibling of the `[]`-token arm above: a spaced empty
     // optional list `void f([ ]) {}` walks `parseOptionalPositionalParameters`
     // normally and takes its `parameterCount == 0` arm
     // (parser_impl.dart:2452-2462), whose `rewriteAndRecover` (:5112)
-    // reports `emptyOptionalParameterList` on the real `]` (its own offset,
-    // width 1) and splices a zero-length synthetic identifier before it for
-    // `parseFormalParameter` (:2459) to consume silently. Same registry row,
-    // so problem + correction verbatim.
+    // reports on the real `]` (its own offset, width 1) and splices a
+    // zero-length synthetic identifier before it for `parseFormalParameter`
+    // (:2459) to consume silently. W4 alignment (probe f14): the code is the
+    // pseudo-shared `missingIdentifier`.
     let c = parse("void f([ ]) {}");
-    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 9); // the real `]` = `[` offset + 2
     assert_eq!(c.errors[0].2, 10);
-    assert_eq!(&c.texts, &["Optional parameter lists cannot be empty."]);
-    assert_eq!(
-        &c.corrections,
-        &[Some(
-            "Try adding an optional parameter to the list.".to_string()
-        )]
-    );
+    assert_eq!(&c.texts, &["Expected an identifier."]);
+    assert_eq!(&c.corrections, &[None]);
 
     // The arm fires after a comma too: one row, anchored the same way.
     let c = parse("void f(int x, [ ]) {}");
-    assert_eq!(c.error_codes(), ["empty_optional_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 16); // the real `]` = `[` offset + 2
     assert_eq!(c.errors[0].2, 17);
 
@@ -565,31 +564,25 @@ fn spaced_empty_bracket_group_reports_empty_optional_parameter_list() {
 }
 
 #[test]
-fn spaced_empty_named_group_reports_empty_named_parameter_list() {
+fn spaced_empty_named_group_reports_missing_identifier() {
     // The `{`-bracketed sibling of the spaced-`[` test above: a spaced empty
     // named list `void f({ }) {}` walks `parseOptionalNamedParameters`
     // normally and takes its `parameterCount == 0` arm
     // (parser_impl.dart:2516-2533), whose `rewriteAndRecover` (:5112)
-    // reports `emptyNamedParameterList` on the real `}` (its own offset,
-    // width 1) and splices a zero-length synthetic identifier before it for
-    // `parseFormalParameter` (:2527) to consume silently. Same registry row
-    // (`emptyNamedParameterList`, diagnostic.g.dart:563), so problem +
-    // correction verbatim.
+    // reports on the real `}` (its own offset, width 1) and splices a
+    // zero-length synthetic identifier before it for `parseFormalParameter`
+    // (:2527) to consume silently. W4 alignment (probe f14): the code is the
+    // pseudo-shared `missingIdentifier`.
     let c = parse("void f({ }) {}");
-    assert_eq!(c.error_codes(), ["empty_named_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 9); // the real `}` = `{` offset + 2
     assert_eq!(c.errors[0].2, 10);
-    assert_eq!(&c.texts, &["Named parameter lists cannot be empty."]);
-    assert_eq!(
-        &c.corrections,
-        &[Some(
-            "Try adding a named parameter to the list.".to_string()
-        )]
-    );
+    assert_eq!(&c.texts, &["Expected an identifier."]);
+    assert_eq!(&c.corrections, &[None]);
 
     // The arm fires after a comma too: one row, anchored the same way.
     let c = parse("void f(int x, { }) {}");
-    assert_eq!(c.error_codes(), ["empty_named_parameter_list"]);
+    assert_eq!(c.error_codes(), ["missing_identifier"]);
     assert_eq!(c.errors[0].1, 16); // the real `}` = `{` offset + 2
     assert_eq!(c.errors[0].2, 17);
 

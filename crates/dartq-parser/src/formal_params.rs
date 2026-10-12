@@ -135,7 +135,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             length: 1,
                         },
                     );
-                    self.report(msg::empty_optional_parameter_list(), close_span);
+                    // The arm's code is the pseudo-shared `missingIdentifier`
+                    // (fe91 codes :577-590, measured f14).
+                    self.report(msg::missing_identifier(), close_span);
                     self.parse_formal_parameter(FormalParameterKind::OptionalPositional, kind);
                     self.listener.begin_optional_formal_parameters(at);
                     self.listener.end_optional_formal_parameters(
@@ -255,15 +257,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         if parameter_count == 0 {
             let at = self.peek_span();
-            self.report(msg::empty_optional_parameter_list(), at);
+            // The `parameterCount == 0` arm reports the pseudo-shared
+            // `missingIdentifier` (fe91 codes :577-590, measured f14 —
+            // "Expected an identifier." at this `]`).
+            self.report(msg::missing_identifier(), at);
             // Queue the zero-length name and leave it current: official
             // `rewriteAndRecover` (:5112) reports on the old next (this `]`)
             // and splices the synthetic in front of it, then
             // `parseFormalParameter` (:2459) starts at the synthetic and
             // consumes it silently as the formal's name. Advancing past it
             // here would feed the `]` to the name step instead
-            // (`missing_identifier` and a derailed list) — same shape as the
-            // `[]`-token arm above.
+            // (`missing_identifier` twice and a derailed list) — same shape
+            // as the `[]`-token arm above.
             self.cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
             self.parse_formal_parameter(FormalParameterKind::OptionalPositional, kind);
@@ -310,15 +315,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         if parameter_count == 0 {
             let at = self.peek_span();
-            self.report(msg::empty_named_parameter_list(), at);
+            // The `parameterCount == 0` arm reports the pseudo-shared
+            // `missingIdentifier` (fe91 codes :577-590, measured f14 —
+            // "Expected an identifier." at this `}`).
+            self.report(msg::missing_identifier(), at);
             // Queue the zero-length name and leave it current: official
             // `rewriteAndRecover` (:5112) reports on the old next (this `}`)
             // and splices the synthetic in front of it, then
             // `parseFormalParameter` (:2527) starts at the synthetic and
             // consumes it silently as the formal's type-or-name. Advancing
             // past it here would feed the `}` to the name step instead
-            // (`missing_identifier` and a derailed list) — same shape as the
-            // positional arm above.
+            // (`missing_identifier` twice and a derailed list) — same shape
+            // as the positional arm above.
             self.cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
             self.parse_formal_parameter(FormalParameterKind::OptionalNamed, kind);
@@ -693,19 +701,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 );
                 // Official separator split (:2386-2395 at the r5 anchor;
                 // 3.15 folded the two `:` faces into
-                // requiredParameterWithDefault/positionalParameterWithEquals,
-                // the 3.13 oracle keeps the dedicated codes the corpus pins):
-                // `:` on a required positional reads as the named-group
-                // separator used outside its group; `:` on an optional
-                // positional wants `=`; a plain `=` default is the
-                // requiredParameterWithDefault face; function-typed contexts
-                // forbid defaults outright.
+                // positionalParameterWithEquals, the 3.13 oracle keeps the
+                // dedicated code the corpus pins): `:` on an optional
+                // positional wants `=`; on a required positional BOTH
+                // separators route to `namedParameterOutsideGroup` (`=`'s
+                // dedicated `requiredParameterWithDefault` is pseudo-shared
+                // to the same code, fe91 codes_generated.dart:2742-2746;
+                // measured f15/b05); function-typed contexts forbid defaults
+                // outright.
                 if parameter_kind == FormalParameterKind::RequiredPositional {
-                    if separator == TokenKind::Colon {
-                        self.report(msg::named_parameter_outside_group(), equals);
-                    } else {
-                        self.report(msg::required_parameter_with_default(), equals);
-                    }
+                    self.report(msg::named_parameter_outside_group(), equals);
                 } else if parameter_kind == FormalParameterKind::OptionalPositional
                     && separator == TokenKind::Colon
                 {

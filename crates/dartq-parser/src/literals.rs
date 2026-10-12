@@ -519,13 +519,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
     /// String literal with adjacent merging and interpolation (C21).
     pub(crate) fn parse_literal_string(&mut self) -> TokenSpan {
+        self.parse_literal_string_and_first_interpolation().0
+    }
+
+    /// [`Self::parse_literal_string`] plus the first interpolation
+    /// expression's span — `Some` only when the literal is a SINGLE
+    /// (non-adjacent) interpolated string: the `endConditionalUri` value
+    /// check (ast_builder.dart:1509-1524) tests `is StringInterpolationImpl`,
+    /// so an `AdjacentStrings` value never reports.
+    pub(crate) fn parse_literal_string_and_first_interpolation(
+        &mut self,
+    ) -> (TokenSpan, Option<(TokenSpan, TokenSpan)>) {
         let start = self.peek_span();
         let saved = self.may_parse_function_expressions;
         self.may_parse_function_expressions = true;
         let mut literal_count = 0usize;
         let mut end;
+        let mut first_interpolation = None;
         loop {
-            end = self.parse_single_literal_string();
+            let (literal, interpolation) = self.parse_single_literal_string();
+            end = literal;
+            first_interpolation = first_interpolation.or(interpolation);
             literal_count += 1;
             if self.peek_kind() != TokenKind::String {
                 break;
@@ -534,19 +548,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if literal_count > 1 {
             self.listener
                 .handle_adjacent_string_literals(start, literal_count);
+            first_interpolation = None;
         }
         self.may_parse_function_expressions = saved;
-        end
+        (end, first_interpolation)
     }
 
     /// One string token, consuming `${...}` interpolation groups (official
     /// `parseSingleLiteralString` :8732: the expression parses in full and
-    /// must stop at the paired `}`).
-    fn parse_single_literal_string(&mut self) -> TokenSpan {
+    /// must stop at the paired `}`); also returns the first interpolation
+    /// expression's `(begin, end)` spans.
+    fn parse_single_literal_string(&mut self) -> (TokenSpan, Option<(TokenSpan, TokenSpan)>) {
         let begin = self.peek_span();
         self.listener.begin_literal_string(begin);
         self.cursor.advance();
         let mut interpolation_count = 0usize;
+        let mut first_interpolation = None;
         loop {
             match self.peek_kind() {
                 TokenKind::StringInterpolationExpression => {
@@ -569,6 +586,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         }
                     };
                     self.cursor.advance();
+                    if first_interpolation.is_none() {
+                        first_interpolation = Some((left, right));
+                    }
                     self.listener
                         .handle_interpolation_expression(left, Some(right));
                     interpolation_count += 1;
@@ -577,6 +597,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let dollar = self.peek_span();
                     self.cursor.advance();
                     let id = self.ensure_identifier(IdentifierContext::Expression);
+                    if first_interpolation.is_none() {
+                        first_interpolation = Some((dollar, id));
+                    }
                     self.listener
                         .handle_interpolation_expression(dollar, Some(id));
                     interpolation_count += 1;
@@ -590,7 +613,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
         }
         self.listener.end_literal_string(interpolation_count, begin);
-        begin
+        (begin, first_interpolation)
     }
 
     /// Symbol body (official `parseLiteralSymbol` :9244-9269): a

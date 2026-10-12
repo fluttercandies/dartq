@@ -335,13 +335,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.cursor.reset(before_type);
         type_info.parse_type(self);
 
+        let mut declared_name: Option<TokenSpan> = None;
         let name = match get_or_set {
             Some(get_set) => {
                 // Official `token = getOrSet; ensureIdentifierPotentiallyRecovered`:
                 // the identifier event is the name AFTER the `get`/`set`
                 // introducer.
                 self.cursor.advance();
-                self.ensure_identifier_recovered(IdentifierContext::TopLevelFunctionDeclaration);
+                let identifier = self
+                    .ensure_identifier_recovered(IdentifierContext::TopLevelFunctionDeclaration);
+                declared_name = Some(identifier);
                 get_set
             }
             None => {
@@ -362,13 +365,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let formals_end =
             self.parse_getter_or_formal_parameters(name, is_getter, MemberKind::TopLevelMethod);
         let _ = formals_end;
+        // `AstBuilder` `_ensureSetterFormalParameter` guards the top-level
+        // setter arm too (ast_builder.dart:6257/:6289): exactly one required
+        // positional parameter, anchored on the setter name (measured f18:
+        // `set topSetter() => 1;` fires at the identifier).
+        if !is_getter
+            && let Some(setter_name) = declared_name
+            && self.last_parameter_count != 1
+        {
+            self.report(msg::wrong_number_of_parameters_for_setter(), setter_name);
+        }
 
         let saved_async = self.async_state;
-        let async_end = self.parse_async_modifier_opt();
+        let async_kw = self.parse_async_modifier_opt();
         if get_or_set.is_some_and(|t| self.cursor.lexeme(t.id) == "set")
             && self.async_state != AsyncModifier::Sync
         {
-            self.report(msg::setter_not_sync(), async_end);
+            self.report(msg::setter_not_sync(), async_kw);
         }
         let is_external = external.is_some();
         if is_external && self.peek_kind() != TokenKind::Semicolon {
@@ -1254,11 +1267,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let begin_initializers = self.parse_initializers_opt();
 
         let saved_async = self.async_state;
-        let async_end = self.parse_async_modifier_opt();
+        let async_kw = self.parse_async_modifier_opt();
         if get_or_set.is_some_and(|t| self.cursor.lexeme(t.id) == "set")
             && self.async_state != AsyncModifier::Sync
         {
-            self.report(msg::setter_not_sync(), async_end);
+            self.report(msg::setter_not_sync(), async_kw);
         }
         if mods.external.is_some() && self.peek_kind() != TokenKind::Semicolon {
             self.report(msg::external_method_with_body(), self.peek_span());
@@ -1427,9 +1440,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let name_end = self.peek_span();
         self.parse_method_type_var(name_end);
         self.parse_formal_parameters_required_opt(MemberKind::Factory);
-        let async_end = self.parse_async_modifier_opt();
+        let async_kw = self.parse_async_modifier_opt();
         if self.async_state != AsyncModifier::Sync {
-            self.report(msg::factory_not_sync(), async_end);
+            self.report(msg::factory_not_sync(), async_kw);
         }
         let end;
         if self.peek_kind() == TokenKind::Eq {
@@ -2217,13 +2230,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         end
     }
 
-    /// Official `parseAsyncModifierOpt`; updates and returns with the new
-    /// [`AsyncModifier`] state.
+    /// Official `parseAsyncModifierOpt`; updates the [`AsyncModifier`] state
+    /// and returns the `async`/`sync` keyword token — the official
+    /// `asyncToken` anchor the caller-side setter/factory not-sync reports
+    /// pin (parser_impl.dart:4644/:6060/:6230; measured b02/c01: the row
+    /// spans the keyword, never the star).
     pub(crate) fn parse_async_modifier_opt(&mut self) -> TokenSpan {
         let mut async_kw: Option<TokenSpan> = None;
         let mut star: Option<TokenSpan> = None;
         self.async_state = AsyncModifier::Sync;
-        let mut end = self.peek_span();
+        let without_modifier = self.peek_span();
         match self.peek_kind() {
             TokenKind::Keyword(Keyword::Async) => {
                 async_kw = Some(self.peek_span());
@@ -2236,7 +2252,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 } else {
                     self.async_state = AsyncModifier::Async;
                 }
-                end = star.unwrap_or(async_kw.unwrap());
             }
             TokenKind::Keyword(Keyword::Sync) => {
                 async_kw = Some(self.peek_span());
@@ -2249,15 +2264,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 } else {
                     self.report(msg::invalid_sync_modifier(), async_kw.unwrap());
                 }
-                end = star.unwrap_or(async_kw.unwrap());
             }
             _ => {}
         }
         self.listener.handle_async_modifier(async_kw, star);
-        if self.async_state != AsyncModifier::Sync && self.peek_kind() == TokenKind::Semicolon {
-            self.report(msg::abstract_not_sync(), self.peek_span());
-        }
-        end
+        async_kw.unwrap_or(without_modifier)
     }
 
     /// Official `parsePrimaryConstructorBody` (`this : init, ... { ... }`

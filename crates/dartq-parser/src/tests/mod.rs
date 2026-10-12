@@ -6,6 +6,7 @@ mod declarations;
 mod directives;
 mod drain;
 mod emitter_w1;
+mod emitter_w2;
 mod expressions;
 mod features;
 mod gate_351;

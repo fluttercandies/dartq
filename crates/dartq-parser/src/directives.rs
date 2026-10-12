@@ -428,7 +428,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if self.peek_kind() == TokenKind::EqEq {
             equal_sign = Some(self.peek_span());
             self.cursor.advance();
-            self.ensure_literal_string();
+            let (_, first_interpolation) = self.ensure_literal_string_and_first_interpolation();
+            // `endConditionalUri` (ast_builder.dart:1509-1524): only the `==`
+            // VALUE is checked, never the URI — a single interpolated string
+            // reports at its first interpolation expression
+            // (`child.beginToken..child.endToken`); adjacent strings and
+            // plain literals report nothing.
+            if let Some((left, right)) = first_interpolation {
+                self.report_with_end(msg::invalid_literal_in_configuration(), left, right);
+            }
         }
 
         if self.peek_kind() != TokenKind::CloseParen
@@ -617,6 +625,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// top-level continuation's own report), then parse the literal. The
     /// queued synthetic is consumed by [`Self::parse_literal_string`] itself.
     pub(crate) fn ensure_literal_string(&mut self) -> TokenSpan {
+        self.ensure_literal_string_and_first_interpolation().0
+    }
+
+    /// [`Self::ensure_literal_string`] plus the first interpolation
+    /// expression's span when the literal is a single interpolated string
+    /// (the `endConditionalUri` value check's input,
+    /// ast_builder.dart:1509-1524).
+    pub(crate) fn ensure_literal_string_and_first_interpolation(
+        &mut self,
+    ) -> (TokenSpan, Option<(TokenSpan, TokenSpan)>) {
         if self.peek_kind() != TokenKind::String {
             let at = self.peek_span();
             let lexeme = self.cursor.lexeme(at.id).to_owned();
@@ -625,7 +643,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 .cursor
                 .insert_synthetic(TokenKind::String, at.range.offset);
         }
-        self.parse_literal_string()
+        self.parse_literal_string_and_first_interpolation()
     }
 }
 

@@ -65,13 +65,13 @@ pub(crate) mod msg {
         FINAL_AND_COVARIANT_LATE_WITH_INITIALIZER, FINAL_AND_VAR, FINAL_ENUM, FINAL_MIXIN,
         FINAL_MIXIN_CLASS, GETTER_CONSTRUCTOR, GETTER_WITH_PARAMETERS, IMPLEMENTS_BEFORE_EXTENDS,
         IMPLEMENTS_BEFORE_ON, IMPLEMENTS_BEFORE_WITH, INTERFACE_ENUM, INTERFACE_MIXIN,
-        INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME, MEMBER_WITH_CLASS_NAME,
-        MISSING_CONST_FINAL_VAR_OR_TYPE, MISSING_FUNCTION_BODY, MISSING_FUNCTION_PARAMETERS,
-        MISSING_METHOD_PARAMETERS, MISSING_PRIMARY_CONSTRUCTOR,
+        INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME, INVALID_LITERAL_IN_CONFIGURATION,
+        MEMBER_WITH_CLASS_NAME, MISSING_CONST_FINAL_VAR_OR_TYPE, MISSING_FUNCTION_BODY,
+        MISSING_FUNCTION_PARAMETERS, MISSING_METHOD_PARAMETERS, MISSING_PRIMARY_CONSTRUCTOR,
         MISSING_PRIMARY_CONSTRUCTOR_PARAMETERS, MISSING_STAR_AFTER_SYNC,
         MISSING_TYPEDEF_PARAMETERS, MIXIN_DECLARES_CONSTRUCTOR, MODIFIER_OUT_OF_ORDER,
-        MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NATIVE_CLAUSE_IN_NON_SDK_CODE,
-        NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE, OUT_OF_ORDER_CLAUSES,
+        MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NAMED_PARAMETER_OUTSIDE_GROUP,
+        NATIVE_CLAUSE_IN_NON_SDK_CODE, NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE, OUT_OF_ORDER_CLAUSES,
         REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM,
         SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
         TOP_LEVEL_OPERATOR, TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN,
@@ -91,7 +91,7 @@ pub(crate) mod msg {
         INVALID_USE_OF_COVARIANT_IN_EXTENSION, MISSING_ENUM_BODY, MISSING_STATEMENT,
         MULTIPLE_REPRESENTATION_FIELDS, REPRESENTATION_FIELD_MODIFIER,
         TYPE_PARAMETER_ON_CONSTRUCTOR, TYPE_PARAMETER_ON_OPERATOR, VAR_AS_TYPE_NAME,
-        WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER,
+        WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER, WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER,
     };
     use dartq_diagnostics::{
         ANNOTATION_ON_TYPE_ARGUMENT, ANNOTATION_WITH_TYPE_ARGUMENTS_UNINSTANTIATED,
@@ -1045,6 +1045,14 @@ pub(crate) mod msg {
         )
     }
 
+    pub(crate) fn invalid_literal_in_configuration() -> Message {
+        Message::with_correction(
+            INVALID_LITERAL_IN_CONFIGURATION,
+            "The literal in a configuration can't contain interpolation.",
+            "Try removing the interpolation expressions.",
+        )
+    }
+
     pub(crate) fn factory_not_sync() -> Message {
         Message::new(
             local_code("non_sync_factory", "NON_SYNC_FACTORY"),
@@ -1056,13 +1064,6 @@ pub(crate) mod msg {
         Message::new(
             local_code("invalid_modifier_on_setter", "INVALID_MODIFIER_ON_SETTER"),
             "Setters can't use 'async', 'async*', or 'sync*'.",
-        )
-    }
-
-    pub(crate) fn abstract_not_sync() -> Message {
-        Message::new(
-            local_code("non_sync_abstract_method", "NON_SYNC_ABSTRACT_METHOD"),
-            "Abstract methods can't use 'async', 'async*', or 'sync*'.",
         )
     }
 
@@ -1522,24 +1523,15 @@ pub(crate) mod msg {
         )
     }
 
-    pub(crate) fn required_parameter_with_default() -> Message {
-        Message::new(
-            local_code(
-                "required_parameter_with_default",
-                "REQUIRED_PARAMETER_WITH_DEFAULT",
-            ),
-            "Non-optional parameters can't have a default value.",
-        )
-    }
-
-    /// `:` on a required-positional formal (`void f(int x: 1)`, oracle
-    /// `namedParameterOutsideGroup`).
+    /// A default value on a required-positional formal — both separators
+    /// route here at the pinned oracle: `:` reads as the named-group
+    /// separator used outside its group, and `=`'s dedicated
+    /// `requiredParameterWithDefault` is bound to the pseudo-shared
+    /// `namedParameterOutsideGroup` (fe91 codes_generated.dart:2742-2746,
+    /// error_converter.dart:258-262; measured f15/b05).
     pub(crate) fn named_parameter_outside_group() -> Message {
         Message::new(
-            local_code(
-                "named_parameter_outside_group",
-                "NAMED_PARAMETER_OUTSIDE_GROUP",
-            ),
+            NAMED_PARAMETER_OUTSIDE_GROUP,
             "Named parameters must be enclosed in curly braces ('{' and '}').",
         )
     }
@@ -1548,30 +1540,8 @@ pub(crate) mod msg {
     /// `wrongSeparatorForPositionalParameter`).
     pub(crate) fn wrong_separator_for_positional_parameter() -> Message {
         Message::new(
-            local_code(
-                "wrong_separator_for_positional_parameter",
-                "WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER",
-            ),
+            WRONG_SEPARATOR_FOR_POSITIONAL_PARAMETER,
             "The default value of a positional parameter should be preceded by '='.",
-        )
-    }
-
-    pub(crate) fn empty_optional_parameter_list() -> Message {
-        Message::with_correction(
-            local_code(
-                "empty_optional_parameter_list",
-                "EMPTY_OPTIONAL_PARAMETER_LIST",
-            ),
-            "Optional parameter lists cannot be empty.",
-            "Try adding an optional parameter to the list.",
-        )
-    }
-
-    pub(crate) fn empty_named_parameter_list() -> Message {
-        Message::with_correction(
-            local_code("empty_named_parameter_list", "EMPTY_NAMED_PARAMETER_LIST"),
-            "Named parameter lists cannot be empty.",
-            "Try adding a named parameter to the list.",
         )
     }
 
