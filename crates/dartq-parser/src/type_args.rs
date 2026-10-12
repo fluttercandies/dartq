@@ -566,6 +566,33 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         if self.kind_at(offset + n) == TokenKind::Question {
                             n += 1;
                         }
+                        // `(...) Function(...)` — a generalized function type
+                        // with a record (or nullable-record) return type
+                        // (official computeRecordTypeGFT /
+                        // computeRecordTypeQuestionGFT,
+                        // type_info_impl.dart:982/:1019, whose computeRest
+                        // from the `)` ends past the formal parameters).
+                        while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+                            let mut probe = n + 1;
+                            if self.kind_at(offset + probe) == TokenKind::Lt {
+                                match self.gt_group_len(offset + probe) {
+                                    Some(len) => probe += len,
+                                    None => break,
+                                }
+                            }
+                            if self.kind_at(offset + probe) != TokenKind::OpenParen {
+                                break;
+                            }
+                            let Some(close) =
+                                self.cursor.table_matching_end(self.real_id(offset + probe))
+                            else {
+                                break;
+                            };
+                            n = self.offset_of(close) - offset + 1;
+                            if self.kind_at(offset + n) == TokenKind::Question {
+                                n += 1;
+                            }
+                        }
                         n
                     }
                     _ => 0,

@@ -205,3 +205,70 @@ fn parenthesized_type_as_single_type_arg_reports() {
         "single-field no-comma type arg",
     );
 }
+
+// —— record types as collection-literal type arguments (#922) ———————————————
+
+/// Typed collection literals over record-type arguments, const and
+/// non-const (probed 3.13.1: zero rows). The acceptance-gate row on
+/// constants.dart:54 was read off a release binary predating the #914
+/// probe rewrite; the parse entry (`parseLiteralListSetMapOrFunction`,
+/// parser_impl.dart:8772 — `computeTypeParamOrArg` with
+/// `inDeclaration = true`) was already wired through the same probe.
+#[test]
+fn record_type_arg_collection_literals_clean() {
+    // The exact acceptance-corpus line.
+    assert_clean(
+        "const canonicalPairs = <(int, int)>{(1, 2), (3, 4)};\n",
+        "const set literal, record type args",
+    );
+    // All four record shapes as the literal's type argument.
+    assert_clean(
+        "var a = <(int, int)>[];\nvar b = <(int,)>[];\nvar c = <()>[];\nvar d = <(int, String, {bool b})>[];\n",
+        "record shapes as literal type args",
+    );
+    // The same shapes under `const` variable initializers.
+    assert_clean(
+        "const e = <(int, int)>[];\nconst f = <(int,)>[];\nconst g = <()>[];\nconst h = <(int, String, {bool b})>[];\n",
+        "const record shapes",
+    );
+    // Nested generics and record keys/values in maps.
+    assert_clean(
+        "var i = <List<(int, int)>>[];\nvar j = <Map<(int, int), String>>[];\nvar k = <(int, int), String>{(1, 2): 'a'};\n",
+        "nested and map shapes",
+    );
+    // A `const <...>` expression prefix rides the same entry.
+    assert_clean("var l = const <(int, int)>[];\n", "const-expression prefix");
+}
+
+/// Record-returning generalized function types as literal type arguments
+/// (`computeRecordTypeGFT`/`computeRecordTypeQuestionGFT`,
+/// type_info_impl.dart:982/:1019: computeRest from the `)` walks the
+/// `Function` suffix chain; probed 3.13.1: zero rows). The scan-side
+/// skip length covers the chain so the `<` group closes on its own `>`
+/// and the follower decision never mistakes the `Function` formals for a
+/// function-literal body.
+#[test]
+fn record_type_arg_gft_suffix_clean() {
+    assert_clean(
+        "var a = <(int, int) Function()>[];\nvar b = <(int, int)? Function()>[];\n",
+        "record-return GFT type args",
+    );
+    assert_clean(
+        "var c = <((int, int) Function(), int)>[];\nvar d = <({int a}) Function()>[];\n",
+        "record field/return combinations",
+    );
+}
+
+/// The tail verdict in the literal type-argument position: `<(int)>` is no
+/// type-argument group, so `<` derails as a relational operator exactly as
+/// the oracle (probed 3.13.1: EXPECTED_TOKEN `Expected to find '['` at the
+/// `<` plus the comparison-chain row; the oracle's undefined-operator row
+/// is resolver-tier, not a parser-face code).
+#[test]
+fn parenthesized_type_as_literal_type_arg_reports() {
+    assert_codes(
+        "var j = <(int)>[];\n",
+        &["equality_cannot_be_equality_operand", "expected_token"],
+        "single-field no-comma literal type arg",
+    );
+}
