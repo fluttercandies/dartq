@@ -102,6 +102,7 @@ const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     primary_constructors_enabled: true,
     augmentations_enabled: true,
     enhanced_parts_enabled: false,
+    dot_shorthands_enabled: true,
 };
 
 /// Parses `source` once (scanner → parser → arena) and yields the transient
