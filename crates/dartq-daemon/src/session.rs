@@ -222,6 +222,18 @@ const MAX_ANSWER_WORKERS: usize = 8;
 /// threshold × file size; the sweep itself is O(live entries).
 const GC_CONTENTS_THRESHOLD: usize = 64;
 
+/// The overlay-store GC byte watermark (#947 F7): sweep once this many
+/// content bytes have been stored since the last sweep. The entry threshold
+/// above bounds garbage by count, but 64 entries of large documents would
+/// still be hundreds of MiB resident before any sweep fired — so the byte
+/// tally bounds the ceiling too. 256 MiB: far above any real editing
+/// window's dead content, so ordinary sessions still sweep on the entry
+/// count, while huge-document traffic sweeps on bytes. The #952 inflow caps
+/// frame the watermark's meaning — each staged set is bounded (16 MiB per
+/// wire frame, 64 MiB per `overlay.set`), so the resident garbage stays
+/// under this watermark plus one write batch's bounded inflow.
+const GC_BYTES_SINCE_SWEEP: u64 = 256 << 20;
+
 /// The live agent-overlay cap: `overlay.set` naming an agent beyond it is
 /// answered `INVALID_PARAMS` (clear one first). Teardown paths —
 /// `overlay.clear`, session end — evict deterministically; the cap only
@@ -241,6 +253,24 @@ const MAX_OVERLAY_FILES: usize = 64;
 /// message); the bound caps the staged set and makes `commit_overlay`'s
 /// clone-then-write transient provably small.
 const MAX_OVERLAY_BYTES: usize = 64 << 20;
+
+/// The delta-cursor table's path cap (#947 F8): `changed` grows one entry
+/// per distinct written path, and edits merge last-wins, but a session that
+/// never deletes files would otherwise grow it for its whole life. Past the
+/// cap the lowest cursors evict — those are the rows only a client paging
+/// from a very old `since` could still ask about, and the delta contract
+/// for them is "re-sync without `since`". 65_536 paths ≈ 10 MiB of
+/// bookkeeping at ~150 B/entry, orders above any real editing session.
+const MAX_DELTA_PATHS: usize = 65_536;
+
+/// The open-document table's cap (#947 F8): `opened` grows one entry per
+/// distinct `didOpen`, and only `didClose` removed it before. Real clients
+/// hold tens of open editors; 4_096 is orders above that (≈ 0.5 MiB of
+/// bookkeeping), so the least-recently-touched eighth evicts only under a
+/// broken-client open storm. An evicted document degrades to on-disk
+/// truth: its publishes lose the version, and a watch sync may resync its
+/// disk bytes — the documented cost of the bound.
+const MAX_OPEN_DOCUMENTS: usize = 4_096;
 
 /// The repeat-offender ladder (#690): unattributable panics on the
 /// plugin-bearing group (the default context's base view) tolerate this
@@ -276,6 +306,14 @@ struct OverlayFile {
     /// The session cursor at which this content was staged (the delta
     /// answer's changed-file cursor for this agent's view of the path).
     set_at: u64,
+}
+
+/// One client-opened document's bookkeeping: the version publishes echo,
+/// plus the LRU stamp the cap eviction scans (#947 F8).
+struct OpenDocument {
+    version: i64,
+    /// Session-monotonic edit stamp — the most recent `queue_edit` touch.
+    touched: u64,
 }
 
 /// The base content a worn path must be restored to.
@@ -543,9 +581,13 @@ pub struct Session {
     /// same one).
     sdk_root: PathBuf,
     next_cookie: u64,
-    /// Open overlay documents: last-known client version per path. A closed
-    /// or never-opened file is absent — publishes then carry no version.
-    opened: FxHashMap<PathBuf, i64>,
+    /// The open documents' LRU stamp source ([`Self::next_touch`], #947 F8).
+    next_touch: u64,
+    /// Open overlay documents: last-known client version per path plus an
+    /// LRU touch stamp (bumped on every edit — the eviction scan keeps the
+    /// recently-touched documents, #947 F8). A closed or never-opened file
+    /// is absent — publishes then carry no version.
+    opened: FxHashMap<PathBuf, OpenDocument>,
     /// Baseline for publish diffing: a push only goes out when a file's
     /// diagnostic set differs from what was last published for it.
     published: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>>,
@@ -567,6 +609,9 @@ pub struct Session {
     /// applied content change.
     cursor: u64,
     /// Each explicitly-written path's last-change cursor (base view).
+    /// Bounded by [`MAX_DELTA_PATHS`] — past it the oldest cursors evict
+    /// and the delta contract sends pre-eviction clients to a re-sync
+    /// (#947 F8).
     changed: FxHashMap<PathBuf, u64>,
     /// A base write applied this session whose publish diff has not drained
     /// yet: forces the default context's base analysis even when only
@@ -585,6 +630,18 @@ pub struct Session {
     /// Shared-store contents at the last overlay-store sweep (the GC
     /// watermark).
     gc_watermark: usize,
+    /// Content bytes stored since the last overlay-store sweep — the byte
+    /// half of the GC watermark pair (#947 F7): an upper bound on the
+    /// store's inflow (identical-content rewrites dedupe, so the true
+    /// growth is never larger), reset when the sweep runs.
+    gc_bytes_since_sweep: u64,
+    /// The byte watermark the sweep fires at ([`GC_BYTES_SINCE_SWEEP`]; the
+    /// GC test shrinks it).
+    gc_byte_limit: u64,
+    /// The two table caps ([`MAX_DELTA_PATHS`] / [`MAX_OPEN_DOCUMENTS`];
+    /// the F8 tests shrink them).
+    delta_path_cap: usize,
+    open_document_cap: usize,
     /// Staged overlay mutations riding the queued write task (empty ⇔ no
     /// write task queued — the two change together).
     staged: Vec<OverlayChange>,
@@ -805,6 +862,7 @@ impl Session {
             workspace_root,
             sdk_root,
             next_cookie: 0,
+            next_touch: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
             workspace_advisory,
@@ -816,6 +874,10 @@ impl Session {
             symbols: commands::SymbolTable::default(),
             lint_memo: dartq_commands::lints::LintMemo::default(),
             gc_watermark: 0,
+            gc_bytes_since_sweep: 0,
+            gc_byte_limit: GC_BYTES_SINCE_SWEEP,
+            delta_path_cap: MAX_DELTA_PATHS,
+            open_document_cap: MAX_OPEN_DOCUMENTS,
             staged: Vec::new(),
             write: None,
             reads: Vec::new(),
@@ -902,7 +964,10 @@ impl Session {
         let Some(path) = uri::to_path(uri) else {
             return false;
         };
-        self.opened.insert(path.clone(), version);
+        let touched = self.next_touch();
+        self.opened
+            .insert(path.clone(), OpenDocument { version, touched });
+        self.evict_open_documents();
         self.stage(OverlayChange::Set {
             path,
             bytes: text.as_bytes().to_vec(),
@@ -1429,7 +1494,11 @@ impl Session {
                         self.cursor += 1;
                         for change in &changes {
                             match change {
-                                OverlayChange::Set { path, .. } => {
+                                OverlayChange::Set { path, bytes } => {
+                                    // The store's inflow tally (#947 F7):
+                                    // identical content dedupes on put, so
+                                    // this is an upper bound on real growth.
+                                    self.gc_bytes_since_sweep += bytes.len() as u64;
                                     self.changed.insert(path.clone(), self.cursor);
                                 }
                                 OverlayChange::Remove { path } => {
@@ -1443,6 +1512,7 @@ impl Session {
                                 }
                             }
                         }
+                        self.evict_delta_paths();
                         self.publishes_due = true;
                     }
                     Err(payload) => {
@@ -1669,6 +1739,26 @@ impl Session {
     #[cfg(test)]
     fn set_fix_budget(&mut self, budget: Duration) {
         self.fix_budget = budget;
+    }
+
+    /// The GC byte-watermark seam (the F7 test shrinks it).
+    #[cfg(test)]
+    fn set_gc_byte_limit(&mut self, limit: u64) {
+        self.gc_byte_limit = limit;
+    }
+
+    /// Content bytes stored since the last sweep (the F7 test's probe:
+    /// zero means a sweep ran since the last crossing).
+    #[cfg(test)]
+    fn gc_bytes_since_sweep(&self) -> u64 {
+        self.gc_bytes_since_sweep
+    }
+
+    /// The two table caps' seam (the F8 tests shrink them).
+    #[cfg(test)]
+    fn set_table_caps(&mut self, delta_paths: usize, open_documents: usize) {
+        self.delta_path_cap = delta_paths;
+        self.open_document_cap = open_documents;
     }
 
     /// Replaces the session's plugin set (test seam): lets a gate inject a
@@ -2241,18 +2331,62 @@ impl Session {
     }
 
     /// Sweeps the runtime's shared overlay store once the garbage since the
-    /// last sweep crossed the threshold (daemon-audit finding 2: without a
+    /// last sweep crossed a watermark (daemon-audit finding 2: without a
     /// driver the store accumulates every distinct edit state for the
-    /// session's life). O(live), so idle sessions pay nothing.
+    /// session's life): the entry count (small documents) or the byte tally
+    /// (#947 F7 — a few huge documents must not sit under the entry
+    /// threshold). O(live), so idle sessions pay nothing.
     fn gc_if_due(&mut self) {
-        if self
-            .runtime
-            .stored_contents()
-            .saturating_sub(self.gc_watermark)
-            >= GC_CONTENTS_THRESHOLD
+        let contents = self.runtime.stored_contents();
+        if self.gc_bytes_since_sweep >= self.gc_byte_limit
+            || contents.saturating_sub(self.gc_watermark) >= GC_CONTENTS_THRESHOLD
         {
             self.runtime.sweep();
             self.gc_watermark = self.runtime.stored_contents();
+            self.gc_bytes_since_sweep = 0;
+        }
+    }
+
+    /// The delta-cursor table's cap eviction (#947 F8): past the cap, keep
+    /// the newest 7/8 by cursor and drop the rest — the rows only a client
+    /// paging from a very old `since` could still ask about. An evicted
+    /// path filters out of delta answers like a never-changed file; the
+    /// contract sends such clients to a re-sync. O(n log n) per trigger,
+    /// one trigger per cap/8 insertions — amortized O(log n) per write.
+    fn evict_delta_paths(&mut self) {
+        let keep = self.delta_path_cap * 7 / 8;
+        if self.changed.len() <= self.delta_path_cap {
+            return;
+        }
+        let mut by_cursor: Vec<(u64, PathBuf)> = self
+            .changed
+            .iter()
+            .map(|(path, &cursor)| (cursor, path.clone()))
+            .collect();
+        by_cursor.sort_unstable();
+        for (_, path) in by_cursor[..by_cursor.len() - keep].iter() {
+            self.changed.remove(path);
+        }
+    }
+
+    /// The open-document table's cap eviction (#947 F8): past the cap, keep
+    /// the 7/8 most-recently-touched documents and drop the rest. Only a
+    /// broken client's open storm reaches here (real clients hold tens of
+    /// editors); an evicted document degrades to on-disk truth — publishes
+    /// lose the version and a watch sync may resync its disk bytes.
+    fn evict_open_documents(&mut self) {
+        let keep = self.open_document_cap * 7 / 8;
+        if self.opened.len() <= self.open_document_cap {
+            return;
+        }
+        let mut by_touch: Vec<(u64, PathBuf)> = self
+            .opened
+            .iter()
+            .map(|(path, document)| (document.touched, path.clone()))
+            .collect();
+        by_touch.sort_unstable();
+        for (_, path) in by_touch[..by_touch.len() - keep].iter() {
+            self.opened.remove(path);
         }
     }
 
@@ -2308,6 +2442,13 @@ impl Session {
     fn next_cookie(&mut self) -> u64 {
         self.next_cookie += 1;
         self.next_cookie
+    }
+
+    /// The open documents' LRU clock (#947 F8): one stamp per edit, so the
+    /// cap eviction's scan always has a recency order to keep.
+    fn next_touch(&mut self) -> u64 {
+        self.next_touch = self.next_touch.wrapping_add(1);
+        self.next_touch
     }
 
     /// A session context's engine: analyze, queries, content reads.
@@ -2407,7 +2548,7 @@ impl Session {
             self.published.insert(file, baseline);
             publishes.push(Publish {
                 uri: uri::from_path(&path),
-                version: self.opened.get(&path).copied(),
+                version: self.opened.get(&path).map(|document| document.version),
                 diagnostics: now,
             });
         }
@@ -4940,6 +5081,128 @@ mod tests {
             matches!(&turn.answers[0].1, Ok(_)),
             "the still-active agent answers after the sweeps: {:?}",
             turn.answers[0]
+        );
+    }
+
+    /// The byte watermark (#947 F7): a few large documents sweep the store
+    /// even though the entry count never nears the count threshold — 64
+    /// entries of huge states was the unbounded-residency shape. The tally
+    /// resets only on a sweep, so zero after the last drain means the byte
+    /// rule fired (the count threshold could not have: 6 contents < 64).
+    #[test]
+    fn byte_watermark_sweeps_the_store_below_the_count_threshold() {
+        let (workspace, mut session) = fixture("gc-byte-watermark-unit");
+        session.set_gc_byte_limit(256);
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        for version in 0..6u64 {
+            let text = format!("void main() {{}} // v{version} {}", "x".repeat(280));
+            assert!(session.queue_edit(&uri, &text, i64::try_from(version).expect("version") + 2,));
+            let _ = session.service();
+        }
+        assert_eq!(
+            session.gc_bytes_since_sweep(),
+            0,
+            "the byte watermark swept at the turn boundary"
+        );
+        assert!(
+            session.overlay_store_contents() <= 4,
+            "the byte-driven sweep keeps the store at its live set"
+        );
+
+        // The sweeps never corrupted the analysis state.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(matches!(&turn.answers[0].1, Ok(_)));
+    }
+
+    /// The delta table's cap eviction (#947 F8): past the cap the lowest
+    /// cursors drop — the rows only a client paging from a very old `since`
+    /// could still ask about (the contract sends them to a re-sync) — and
+    /// the newest paths survive untouched.
+    #[test]
+    fn delta_table_evicts_oldest_cursors_past_the_cap() {
+        let (_workspace, mut session) = fixture("delta-cap-unit");
+        session.set_table_caps(8, 8);
+
+        for index in 0..12u64 {
+            let path = PathBuf::from(format!("/w/lib/file_{index}.dart"));
+            session.changed.insert(path, index + 1);
+        }
+        session.evict_delta_paths();
+
+        assert_eq!(session.changed.len(), 7, "the cap's newest 7/8 stay");
+        for index in 0..5u64 {
+            assert!(
+                !session
+                    .changed
+                    .contains_key(&PathBuf::from(format!("/w/lib/file_{index}.dart"))),
+                "cursor {} (the oldest) evicted",
+                index + 1
+            );
+        }
+        for index in 5..12u64 {
+            assert!(
+                session
+                    .changed
+                    .contains_key(&PathBuf::from(format!("/w/lib/file_{index}.dart"))),
+                "cursor {} (recent) kept",
+                index + 1
+            );
+        }
+    }
+
+    /// The open-document table's cap eviction (#947 F8), through the real
+    /// intake: past the cap the least-recently-touched documents drop, and
+    /// an edit refreshes recency — the active document survives an open
+    /// storm that evicts its older, idle neighbors.
+    #[test]
+    fn open_documents_evict_least_recently_touched_past_the_cap() {
+        let (workspace, mut session) = fixture("open-cap-unit");
+        session.set_table_caps(8, 8);
+        let uri = |name: &str| crate::uri::from_path(&workspace.path(name));
+
+        for index in 0..8u64 {
+            assert!(session.queue_edit(
+                &uri(&format!("lib/doc_{index}.dart")),
+                &format!("void d{index}() {{}}\n"),
+                i64::try_from(index).expect("version") + 1,
+            ));
+        }
+        assert_eq!(session.opened.len(), 8, "at the cap: nothing evicts");
+
+        // Touch doc_0 (refresh its recency), then open one more — the cap
+        // fires, and the coldest two (doc_1, doc_2) evict, not doc_0.
+        assert!(session.queue_edit(&uri("lib/doc_0.dart"), "void d0() {}\n", 9));
+        assert!(session.queue_edit(&uri("lib/doc_8.dart"), "void d8() {}\n", 1));
+
+        assert_eq!(session.opened.len(), 7, "the cap's newest 7/8 stay");
+        assert!(
+            session
+                .opened
+                .contains_key(&workspace.path("lib/doc_0.dart")),
+            "the refreshed document survives"
+        );
+        assert!(
+            !session
+                .opened
+                .contains_key(&workspace.path("lib/doc_1.dart")),
+            "the coldest document evicted"
+        );
+        assert!(
+            !session
+                .opened
+                .contains_key(&workspace.path("lib/doc_2.dart")),
+            "the second-coldest document evicted"
         );
     }
 

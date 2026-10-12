@@ -40,6 +40,12 @@ use crate::watch::{WatchOptions, Watcher, is_config_input};
 pub const EXIT_CLEAN: u8 = 0;
 /// Exit code for `exit` without a prior `shutdown` (LSP §lifeCycleMessages).
 pub const EXIT_WITHOUT_SHUTDOWN: u8 = 1;
+/// Exit code for a session ended by a framing violation (#947 F10): the
+/// byte stream lost alignment (malformed header block, duplicate or
+/// invalid `Content-Length`, a truncated frame body) and the session ended
+/// after one best-effort `ParseError` answer. Supervision reads this code
+/// as "the client broke the protocol", never a clean close.
+pub const EXIT_PROTOCOL: u8 = 2;
 
 /// The intake channel's bound (#947 F2): at most this many batch items may
 /// sit queued while the CPU-bound main loop works. A fast peer outrunning
@@ -206,6 +212,9 @@ where
                         &mut output,
                         &Message::Response(Response::error(None, codes::PARSE_ERROR, message)),
                     )?;
+                    // The stream broke mid-frame: the exit code must say so
+                    // (#947 F10) — a clean 0 would read as an orderly close.
+                    exit_code = Some(EXIT_PROTOCOL);
                     end = true;
                     break;
                 }

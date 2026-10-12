@@ -624,15 +624,21 @@ pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
 
 /// Relative request paths resolve against the session workspace root.
 ///
-/// Path trust is deliberately split by face (#947 F4). The READ faces
-/// (check/explain/compat/impact/sdk) keep CLI parity and accept absolute
-/// paths anywhere: a daemon session runs inside the operator's own
-/// workspace trust domain and these faces only read. The WRITE faces are
-/// confined to the workspace root — `Session::set_overlay` rejects any
-/// staged path whose normalized form escapes it, and `Session::commit_overlay`
-/// re-checks a canonical (symlink-following) prefix before a byte lands on
-/// disk. The daemon fix face is dry by contract (it reports patch
-/// documents, never writes), so it stays on the read side.
+/// Path trust is deliberately split by face (#947 F4; the read-side
+/// adjudication is #947 F9). The READ faces — `dartq/check` (`paths`),
+/// `dartq/impact` (`target`), `dartq/explain` (`sdk` root), `dartq/compat`
+/// (`target` + `sdk_roots`), and the plugin-dispatch pair `dartq/fix`
+/// (`paths`) and `dartq/assists` (`path`) — keep CLI parity and accept
+/// absolute paths anywhere: a daemon session runs inside the operator's own
+/// workspace trust domain (one same-user client over stdio), and these
+/// faces only read; the fix faces are additionally dry by contract (they
+/// report patch documents, never write). The remaining command faces
+/// (`dartq/index`, `dartq/analyze`, `dartq/query`, `dartq/queryBatch`)
+/// resolve no client paths at all — they answer from the analyzed view — so
+/// the split has no say there. The WRITE faces are confined to the
+/// workspace root — `Session::set_overlay` rejects any staged path whose
+/// normalized form escapes it, and `Session::commit_overlay` re-checks a
+/// canonical (symlink-following) prefix before a byte lands on disk.
 fn resolve(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -698,7 +704,6 @@ pub(crate) struct SymbolTable {
 struct SymbolIds {
     ids: FxHashMap<String, String>,
     announced: FxHashSet<String>,
-    next: u32,
 }
 
 /// Conservative per-entry cost of a `symbols` preamble entry
@@ -716,15 +721,31 @@ impl SymbolTable {
         answer: &mut Value,
         spots: &'static [(&'static str, &'static str)],
     ) -> bool {
-        let mut inner = self.inner.lock().expect("symbol table mutex poisoned");
-        let SymbolIds {
-            ids,
-            announced,
-            next,
-        } = &mut *inner;
-        // Occurrence counts in first-seen order (deterministic id assignment).
-        let mut order: Vec<String> = Vec::new();
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A panic died holding the lock (#947 F6): recover rather
+                // than degrade every later full-verbosity answer for the
+                // rest of the session. The dead answer may have marked ids
+                // announced without its preamble reaching the client, so
+                // the announced set is dropped — every surviving id
+                // re-announces on its next payable use instead of
+                // back-referencing an id the client never saw. The ids
+                // themselves stay sound: numbering derives from the map's
+                // size (the only assignment state), so no half-applied
+                // update can make two paths collide on one id.
+                let mut guard = poisoned.into_inner();
+                guard.announced.clear();
+                guard
+            }
+        };
+        let SymbolIds { ids, announced } = &mut *inner;
+        // Occurrence counts in first-seen order (deterministic id
+        // assignment); the map itself is the seen-set, so a row costs one
+        // probe, not a scan of every distinct path (#947 F6 — a
+        // 10⁵-distinct-path answer must not go quadratic here).
         let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+        let mut order: Vec<String> = Vec::new();
         for (array_field, path_field) in spots {
             let Some(rows) = answer[*array_field].as_array() else {
                 continue;
@@ -733,9 +754,12 @@ impl SymbolTable {
                 let Some(path) = row[*path_field].as_str() else {
                     continue;
                 };
-                *counts.entry(path.to_owned()).or_insert(0) += 1;
-                if !order.iter().any(|seen| seen == path) {
-                    order.push(path.to_owned());
+                match counts.get_mut(path) {
+                    Some(count) => *count += 1,
+                    None => {
+                        counts.insert(path.to_owned(), 1);
+                        order.push(path.to_owned());
+                    }
                 }
             }
         }
@@ -749,7 +773,7 @@ impl SymbolTable {
             let count = counts[path];
             let cost = |id: &str| id.len() + path.len() + SYMBOL_ENTRY_COST;
             // Commits happen inline in plan order, so the next fresh id is
-            // always `next + 1`.
+            // always `ids.len() + 1`.
             let id = match ids.get(path) {
                 Some(id) if announced.contains(id) => {
                     if path.len() > id.len() {
@@ -766,13 +790,18 @@ impl SymbolTable {
                     id.clone()
                 }
                 None => {
-                    let candidate = format!("s{}", *next + 1);
+                    // The fresh id's number is the map's size + 1: ids are
+                    // never removed and assignment is the only mutation, so
+                    // this is exactly what a separate counter would hold —
+                    // without the second fact that a mid-assignment panic
+                    // could desynchronize and, after a poison recovery,
+                    // hand two paths the same id.
+                    let candidate = format!("s{}", ids.len() + 1);
                     let savings = count * path.len().saturating_sub(candidate.len());
                     if savings <= cost(&candidate) {
                         continue;
                     }
                     ids.insert(path.clone(), candidate.clone());
-                    *next += 1;
                     candidate
                 }
             };
@@ -1445,5 +1474,94 @@ impl From<AnalyzeError> for SessionError {
             AnalyzeError::Discovery(io) => Self::Io(io),
             AnalyzeError::Cancelled => Self::Cancelled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `diagnostics`-shaped spot list the tests shorten against.
+    const ROWS: &[(&str, &str)] = &[("diagnostics", "uri")];
+
+    /// Ids assign in first-seen row order (#947 F6): the first distinct
+    /// path of the answer takes `s1`, the second `s2`, regardless of how
+    /// many rows each has — the pinned contract any membership-structure
+    /// rewrite must preserve.
+    #[test]
+    fn shortening_assigns_ids_in_first_seen_order() {
+        let table = SymbolTable::default();
+        let mut answer = json!({
+            "diagnostics": [
+                {"uri": "/workspace/lib/first.dart"},
+                {"uri": "/workspace/lib/second_longer_name.dart"},
+                {"uri": "/workspace/lib/first.dart"},
+                {"uri": "/workspace/lib/second_longer_name.dart"},
+                {"uri": "/workspace/lib/first.dart"},
+            ]
+        });
+        assert!(table.shorten(&mut answer, ROWS));
+        assert_eq!(answer["diagnostics"][0]["uri"], "s1");
+        assert_eq!(answer["diagnostics"][1]["uri"], "s2");
+        assert_eq!(answer["diagnostics"][2]["uri"], "s1");
+        assert_eq!(answer["diagnostics"][3]["uri"], "s2");
+        assert_eq!(answer["diagnostics"][4]["uri"], "s1");
+        assert_eq!(answer["symbols"]["s1"], "/workspace/lib/first.dart");
+        assert_eq!(
+            answer["symbols"]["s2"],
+            "/workspace/lib/second_longer_name.dart"
+        );
+    }
+
+    /// A poisoned table recovers (#947 F6) instead of degrading every
+    /// later full-verbosity answer: shortening keeps working, ids stay
+    /// stable, and an id the panicked answer marked announced (its
+    /// preamble lost with the answer) re-announces rather than
+    /// back-referencing something the client never saw.
+    #[test]
+    fn poisoned_table_recovers_and_reannounces() {
+        let table = SymbolTable::default();
+        {
+            let mut inner = table.inner.lock().expect("unpoisoned lock");
+            inner
+                .ids
+                .insert("/workspace/open/a.dart".into(), "s1".into());
+            inner.announced.insert("s1".into());
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = table.inner.lock().expect("lock for poisoning");
+            panic!("poison the symbol-table lock");
+        }));
+
+        // Three occurrences of the known path: the recovered table has it
+        // already, so the substitution pays without a fresh id — and the
+        // cleared announced set forces the preamble back out.
+        let mut answer = json!({
+            "diagnostics": [
+                {"uri": "/workspace/open/a.dart"},
+                {"uri": "/workspace/open/a.dart"},
+                {"uri": "/workspace/open/a.dart"},
+            ]
+        });
+        assert!(table.shorten(&mut answer, ROWS));
+        assert_eq!(answer["diagnostics"][0]["uri"], "s1");
+        assert_eq!(
+            answer["symbols"]["s1"], "/workspace/open/a.dart",
+            "the lost preamble is re-announced after recovery"
+        );
+
+        // A fresh path still gets a collision-free next id after the
+        // recovery: numbering derives from the recovered map, not from a
+        // counter a panic could have desynchronized.
+        let mut answer = json!({
+            "diagnostics": [
+                {"uri": "/workspace/open/b_other.dart"},
+                {"uri": "/workspace/open/b_other.dart"},
+                {"uri": "/workspace/open/b_other.dart"},
+            ]
+        });
+        assert!(table.shorten(&mut answer, ROWS));
+        assert_eq!(answer["diagnostics"][0]["uri"], "s2");
+        assert_eq!(answer["symbols"]["s2"], "/workspace/open/b_other.dart");
     }
 }

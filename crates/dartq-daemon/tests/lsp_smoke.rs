@@ -252,13 +252,30 @@ fn broken_framing_ends_the_session() {
 
     // No Content-Length: the stream cannot be resynchronized. The server
     // answers ParseError and stops reading — the next frame is never
-    // processed.
+    // processed, and the exit code says "protocol violation" (#947 F10),
+    // never a clean close.
     h.send_raw(b"X-Drop: it\r\n\r\norphan body");
     h.send_raw(&framed(&request(1, "initialize", json!({}))));
     let (code, transcript) = h.join_ended();
 
-    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    assert_eq!(code, dartq_daemon::EXIT_PROTOCOL);
     assert_eq!(transcript.len(), 1, "one answer, then the session ends");
+    assert_eq!(transcript[0]["error"]["code"], -32700);
+}
+
+/// A frame truncated mid-body (headers delivered, body short) ends the
+/// session on the protocol exit, not a clean close (#947 F10): supervision
+/// must distinguish a broken client from an orderly one.
+#[test]
+fn truncated_frame_body_ends_with_protocol_exit() {
+    let workspace = Workspace::new(CLEAN_MAIN);
+    let mut h = spawn(&workspace, &store_root("truncated-body"));
+
+    h.send_raw(b"Content-Length: 10\r\n\r\nshort");
+    let (code, transcript) = h.join_ended();
+
+    assert_eq!(code, dartq_daemon::EXIT_PROTOCOL);
+    assert_eq!(transcript.len(), 1, "the best-effort ParseError answer");
     assert_eq!(transcript[0]["error"]["code"], -32700);
 }
 

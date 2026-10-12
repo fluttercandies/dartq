@@ -78,7 +78,11 @@
 //! Hand-written `Content-Length` framing ([`codec`]) — the shell layer has
 //! no Dart semantics to inherit, so no LSP library is pulled in. The reader
 //! thread decodes frames and sends [`jsonrpc::Message`] values; only the
-//! main loop writes, so the output side needs no lock.
+//! main loop writes, so the output side needs no lock. A framing violation
+//! (malformed or duplicate headers, a truncated frame body) ends the
+//! session with exit code [`EXIT_PROTOCOL`] after one best-effort
+//! `ParseError` answer, so supervision can tell a broken client from a
+//! clean close (exit 0) — #947 F10.
 
 pub mod codec;
 pub(crate) mod commands;
@@ -99,7 +103,7 @@ mod test_fixtures;
 
 mod server;
 
-pub use server::{EXIT_CLEAN, EXIT_WITHOUT_SHUTDOWN, run};
+pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, EXIT_WITHOUT_SHUTDOWN, run};
 pub use session::{Publish, Session, SessionError, Turn};
 pub use watch::WatchOptions;
 

@@ -44,8 +44,9 @@ impl std::fmt::Display for FrameError {
 /// # Errors
 ///
 /// [`FrameError::Io`] when the stream fails mid-frame; [`FrameError::Protocol`]
-/// when the framing is broken (missing or invalid `Content-Length`, malformed
-/// header line, truncation) and the byte stream cannot be re-synchronized.
+/// when the framing is broken (missing, duplicate or invalid
+/// `Content-Length`, malformed header line, a truncated header block, a
+/// truncated body) and the byte stream cannot be re-synchronized.
 pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameError> {
     let mut content_length: Option<usize> = None;
     loop {
@@ -85,7 +86,21 @@ pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameErro
             let length = content_length
                 .ok_or_else(|| FrameError::Protocol("missing Content-Length header".into()))?;
             let mut body = vec![0; length];
-            input.read_exact(&mut body).map_err(FrameError::Io)?;
+            if let Err(error) = input.read_exact(&mut body) {
+                // A short body is a framing violation, not a stream failure
+                // (#947 F10): the peer declared `length` bytes and stopped
+                // delivering — supervision must be able to tell that from a
+                // clean close, so it ends the session as Protocol (the
+                // desync path, non-zero exit) instead of Io (logged as a
+                // vanished peer). A genuine mid-read IO error stays Io.
+                return Err(match error.kind() {
+                    io::ErrorKind::UnexpectedEof => FrameError::Protocol(format!(
+                        "frame body truncated: {length} bytes declared, \
+                         the stream ended early"
+                    )),
+                    _ => FrameError::Io(error),
+                });
+            }
             return Ok(Some(body));
         }
         let Some(colon) = line.iter().position(|byte| *byte == b':') else {
@@ -93,6 +108,16 @@ pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameErro
         };
         let (name, value) = (&line[..colon], &line[colon + 1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
+            // One Content-Length per message (LSP §baseProtocol header
+            // semantics, #947 F11): a repeat is a framing violation — the
+            // two declarations cannot both describe the one body, and
+            // last-wins would silently pick the peer's second word over
+            // its first.
+            if content_length.is_some() {
+                return Err(FrameError::Protocol(
+                    "duplicate Content-Length header".into(),
+                ));
+            }
             let text = std::str::from_utf8(value)
                 .map_err(|_| FrameError::Protocol("non-UTF-8 header value".into()))?;
             let length: usize = text
@@ -270,10 +295,41 @@ mod tests {
         assert_eq!(read_frame(&mut input).unwrap().unwrap(), b"ok");
     }
 
+    /// A body shorter than its declared `Content-Length` is a framing
+    /// violation, not a stream failure (#947 F10): it must surface as
+    /// `Protocol` so the session ends on the desync path (non-zero exit)
+    /// instead of reading as a clean close.
     #[test]
-    fn eof_inside_body_is_io_error() {
+    fn truncated_body_is_protocol_error() {
         let mut input = io::Cursor::new(b"Content-Length: 10\r\n\r\nshort".to_vec());
-        assert!(matches!(read_frame(&mut input), Err(FrameError::Io(_))));
+        match read_frame(&mut input) {
+            Err(FrameError::Protocol(message)) => {
+                assert!(message.contains("truncated"), "{message}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// A repeated `Content-Length` header is a framing violation (#947
+    /// F11): last-wins would silently re-frame the body.
+    #[test]
+    fn duplicate_content_length_is_protocol_error() {
+        let mut input =
+            io::Cursor::new(b"Content-Length: 2\r\nContent-Length: 3\r\n\r\nabc".to_vec());
+        assert!(matches!(
+            read_frame(&mut input),
+            Err(FrameError::Protocol(_))
+        ));
+    }
+
+    /// A repeated header that is not `Content-Length` stays legal — the
+    /// duplicate rule is about the one header that frames the body.
+    #[test]
+    fn duplicate_other_header_is_accepted() {
+        let mut input = io::Cursor::new(
+            b"Content-Type: a\r\nContent-Type: b\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        );
+        assert_eq!(read_frame(&mut input).unwrap().unwrap(), b"ok");
     }
 
     #[test]
