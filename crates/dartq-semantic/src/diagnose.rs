@@ -313,8 +313,8 @@ use crate::const_eval::{
 };
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, owner_library, resolve_container};
 use crate::model::{
-    ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
-    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+    ArgListId, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements, Formals,
+    MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use crate::use_face::{ExportUseFace, ImportUseFace, UnitUseFace};
 use dartq_types::{
@@ -877,11 +877,218 @@ struct ArgLevel {
     mark: usize,
 }
 
+/// A model value that crossed the diagnosis boundary: a same-file entry is
+/// shared in place (its slots are canonical in the unit pool the seeded
+/// scratch pool preserves); a cross-file entry was re-interned there
+/// (plan §4 ruling (a)) and is shared behind an `Rc`, so repeat probes pay
+/// one refcount bump and the entry keeps a stable address for the
+/// face-chain pointer-identity dedup paths.
+#[derive(Debug)]
+enum Projected<'a, T> {
+    Own(&'a T),
+    Foreign(std::rc::Rc<T>),
+}
+
+impl<T> Projected<'_, T> {
+    /// The underlying value's address — the identity the override faces'
+    /// dedup paths compare (the same underlying member surfaced through
+    /// several direct faces must stay pointer-equal, which the boundary's
+    /// memo guarantees for projected entries).
+    fn ptr(&self) -> *const T {
+        match self {
+            Projected::Own(entry) => *entry,
+            Projected::Foreign(entry) => std::rc::Rc::as_ptr(entry),
+        }
+    }
+}
+
+impl<T> Clone for Projected<'_, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Projected::Own(entry) => Projected::Own(entry),
+            Projected::Foreign(entry) => Projected::Foreign(std::rc::Rc::clone(entry)),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Projected<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Projected::Own(entry) => entry,
+            Projected::Foreign(entry) => entry,
+        }
+    }
+}
+
+/// The cross-pool projection boundary (the G4 phase-2 ruling): every
+/// foreign-origin `Ty` the pass reads re-interns here, so every downstream
+/// consumer — render, equality, assignability — stays single-pool. Lives
+/// and dies with one diagnosis; memory is bounded by the foreign slots and
+/// members the file actually reads.
+struct Boundary<'a> {
+    /// The diagnosing universe's pool: the unit's own pool seeded in at
+    /// construction (local slots keep their numbering — the seeded copy is
+    /// what makes local/projected `Ty`s comparable and renderable through
+    /// one pool), extended with the foreign lists the pass projects.
+    args: RefCell<crate::model::ArgPool>,
+    /// `(owner file, owner slot) → local slot` — one deep copy per foreign
+    /// argument list per diagnosis; foreign pools are frozen behind `Arc`,
+    /// so a memo entry cannot go stale.
+    slots: RefCell<FxHashMap<(FileId, crate::model::ArgListId), crate::model::ArgListId>>,
+    /// `(owner file, container, member) → projected entry` — one deep copy
+    /// per foreign member, and the stable identity [`Projected::ptr`]
+    /// compares.
+    members:
+        RefCell<FxHashMap<(FileId, StringId, StringId), Projected<'a, crate::model::MemberEntry>>>,
+    /// `(owner file, name) → projected top-level declaration` — repeat
+    /// lookups of one imported name share the copy.
+    decls: RefCell<FxHashMap<(FileId, StringId), Projected<'a, crate::model::TopDecl>>>,
+    /// The diagnosing file — same-file values never project.
+    own: FileId,
+    index: &'a ElementIndex,
+}
+
+impl<'a> Boundary<'a> {
+    fn new(
+        index: &'a ElementIndex,
+        own: FileId,
+        unit_args: Option<&crate::model::ArgPool>,
+    ) -> Self {
+        Self {
+            args: RefCell::new(unit_args.cloned().unwrap_or_default()),
+            slots: RefCell::new(FxHashMap::default()),
+            members: RefCell::new(FxHashMap::default()),
+            decls: RefCell::new(FxHashMap::default()),
+            own,
+            index,
+        }
+    }
+
+    /// The pool every `Ty` this pass renders or compares resolves through.
+    fn pool(&self) -> std::cell::Ref<'_, crate::model::ArgPool> {
+        self.args.borrow()
+    }
+
+    /// Projects a `Ty` owned by `owner`'s pool into the diagnosing
+    /// universe: same-file and argument-less types pass through untouched,
+    /// a foreign named type re-interns its argument list bottom-up (the
+    /// persisted-restore order — inner lists are canonical before the
+    /// outer interns), memoized per `(owner, slot)`.
+    fn ty(&self, owner: FileId, ty: Ty) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if args == crate::model::ArgListId::EMPTY || owner == self.own {
+            return ty;
+        }
+        if let Some(&local) = self.slots.borrow().get(&(owner, args)) {
+            return Ty::Named {
+                name,
+                nullable,
+                args: local,
+            };
+        }
+        // The slot came from `owner`'s own entries, so its pool is resident.
+        let foreign = self
+            .index
+            .get(owner)
+            .expect("projecting a slot whose owner unit is resident")
+            .type_args();
+        let list = foreign.get(args);
+        let projected: Vec<Ty> = list.iter().map(|&arg| self.ty(owner, arg)).collect();
+        let local = match self.args.borrow_mut().named(name, nullable, &projected) {
+            Ty::Named { args, .. } => args,
+            _ => unreachable!("named() always builds a named type"),
+        };
+        self.slots.borrow_mut().insert((owner, args), local);
+        Ty::Named {
+            name,
+            nullable,
+            args: local,
+        }
+    }
+
+    /// Projects a member entry found in `owner`'s container `container`
+    /// under `spelling`: same-file entries pass through, foreign entries
+    /// deep-copy once per diagnosis with every declared type projected.
+    fn member(
+        &self,
+        owner: FileId,
+        container: StringId,
+        spelling: StringId,
+        entry: &'a crate::model::MemberEntry,
+    ) -> Projected<'a, crate::model::MemberEntry> {
+        if owner == self.own {
+            return Projected::Own(entry);
+        }
+        if let Some(hit) = self.members.borrow().get(&(owner, container, spelling)) {
+            return hit.clone();
+        }
+        let mut copy = entry.clone();
+        copy.var_ty = self.ty(owner, copy.var_ty);
+        copy.return_ty = self.ty(owner, copy.return_ty);
+        if let Some(formals) = &mut copy.formals {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
+                formal.ty = self.ty(owner, formal.ty);
+            }
+        }
+        let projected = Projected::Foreign(std::rc::Rc::new(copy));
+        self.members
+            .borrow_mut()
+            .insert((owner, container, spelling), projected.clone());
+        projected
+    }
+
+    /// Projects a top-level declaration found in `owner`'s unit under
+    /// `name` — the member projection's top-level twin.
+    fn top(
+        &self,
+        owner: FileId,
+        name: StringId,
+        decl: &'a crate::model::TopDecl,
+    ) -> Projected<'a, crate::model::TopDecl> {
+        if owner == self.own {
+            return Projected::Own(decl);
+        }
+        if let Some(hit) = self.decls.borrow().get(&(owner, name)) {
+            return hit.clone();
+        }
+        let mut copy = decl.clone();
+        copy.var_ty = self.ty(owner, copy.var_ty);
+        copy.return_ty = self.ty(owner, copy.return_ty);
+        if let Some(formals) = &mut copy.formals {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
+                formal.ty = self.ty(owner, formal.ty);
+            }
+        }
+        let projected = Projected::Foreign(std::rc::Rc::new(copy));
+        self.decls
+            .borrow_mut()
+            .insert((owner, name), projected.clone());
+        projected
+    }
+}
+
 /// The member-walk outcome: found, genuinely absent after a clean walk, or a
 /// broken chain (an unresolvable container hop — suppression territory).
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 enum Walk<'a> {
-    Found(&'a crate::model::MemberEntry),
+    Found(Projected<'a, crate::model::MemberEntry>),
     Missing,
     ChainBroken,
 }
@@ -900,7 +1107,9 @@ struct MemberFace<'a> {
 
 impl<'a> MemberFace<'a> {
     /// The memoized climb: `climb` runs only on the probe's first visit;
-    /// every later probe of the same face pays one hash lookup.
+    /// every later probe of the same face pays one hash lookup (a found
+    /// outcome clones its [`Projected`] handle — a refcount bump, never a
+    /// deep copy).
     fn walk(
         &self,
         container: StringId,
@@ -909,23 +1118,25 @@ impl<'a> MemberFace<'a> {
         climb: impl FnOnce() -> Walk<'a>,
     ) -> Walk<'a> {
         let key = (container, member, super_walk);
-        if let Some(&hit) = self.walks.borrow().get(&key) {
-            return hit;
+        if let Some(hit) = self.walks.borrow().get(&key) {
+            return hit.clone();
         }
         let walk = climb();
-        self.walks.borrow_mut().insert(key, walk);
+        self.walks.borrow_mut().insert(key, walk.clone());
         walk
     }
 }
 
 /// One non-static member hit of a face-chain walk
 /// ([`Engine::face_entries`]).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FaceEntry<'a> {
     /// The member's lookup spelling (setters under `name=`).
     name: StringId,
-    /// The member entry.
-    entry: &'a MemberEntry,
+    /// The member entry, projected into the diagnosing pool when the
+    /// declaring container is foreign (the boundary funnel — the signature
+    /// renderers read its declared types).
+    entry: Projected<'a, MemberEntry>,
     /// The declaring container's name (the message's enclosing class).
     owner_name: StringId,
     /// The file that owns the declaring container (the private-name
@@ -1154,14 +1365,12 @@ struct Engine<'a> {
     namespaces: &'a Namespaces,
     index: &'a ElementIndex,
     strings: &'a StringTable,
-    /// The unit's argument pool — the pool the file's own declared types
-    /// intern into ([`ElementIndex::get`] of `file`). Declared-type display
-    /// resolves slots through it. A type read from *another* unit's face
-    /// (a cross-file override source, a superclass member) carries that
-    /// unit's slots; while capture interns nothing every slot is the
-    /// reserved empty list, so the display is exact — the feeding ticket
-    /// owns the cross-unit ownership decision alongside the capture wiring.
-    unit_args: Option<&'a ArgPool>,
+    /// The boundary every foreign-origin `Ty` this pass reads crosses
+    /// (G4 phase-2 ruling): foreign entries project into the diagnosis-local
+    /// [`Boundary`] at the member-walk funnels, so render and equality stay
+    /// single-pool and [`crate::model::ArgPool::get`]'s panic remains the
+    /// tripwire for any unprojected escape.
+    boundary: Boundary<'a>,
     source: &'a str,
     tokens: &'a TokenTable,
     file: FileId,
@@ -2117,12 +2326,13 @@ impl<'a> Engine<'a> {
         let identical_id = strings.intern("identical");
         let core_supertypes = CORE_SUPERTYPES.map(|(b, p)| (strings.intern(b), strings.intern(p)));
         let unit_args = index.get(file).map(FileElements::type_args);
+        let boundary = Boundary::new(index, file, unit_args);
         Self {
             graph,
             namespaces,
             index,
             strings,
-            unit_args,
+            boundary,
             source,
             tokens,
             file,
@@ -3949,7 +4159,7 @@ impl<'a> Engine<'a> {
         else {
             return None;
         };
-        let pool = self.unit_args?;
+        let pool = self.boundary.pool();
         let args = pool
             .get(args)
             .iter()
@@ -4804,7 +5014,7 @@ impl<'a> Engine<'a> {
             && self.decl_sites[site_index].use_result.is_some_and(|face| {
                 face.unless.is_some_and(|(param, _)| {
                     let formals = self.member_formals_full(recv, row.name);
-                    self.unless_bypassed(row.name, param, formals)
+                    self.unless_bypassed(row.name, param, formals.as_deref())
                 })
             });
         let display = self.strings.resolve(row.name).to_string();
@@ -4842,10 +5052,9 @@ impl<'a> Engine<'a> {
         let bypassed = matches!(row.intent, Intent::Invoke)
             && self.decl_sites[site_index].use_result.is_some_and(|face| {
                 face.unless.is_some_and(|(param, _)| {
-                    let formals = self
-                        .top_level_decl(row.name)
-                        .and_then(|d| d.formals.as_deref());
-                    self.unless_bypassed(row.name, param, formals)
+                    self.top_level_decl(row.name).is_some_and(|decl| {
+                        self.unless_bypassed(row.name, param, decl.formals.as_deref())
+                    })
                 })
             });
         let display = self.strings.resolve(row.name).to_string();
@@ -4900,10 +5109,19 @@ impl<'a> Engine<'a> {
             })
             .collect();
         for (name, container, param, span) in flagged {
-            let formals: Option<&Formals> = match container {
+            // The official predicate requires a parent declaration WITH a
+            // formal parameter list: the null `parameterList` arm returns —
+            // getters carry none, and a list the walk cannot fetch
+            // (cross-file container) stays silent the same way. A known
+            // list that names no `p` reports.
+            let names_parameter = |formals: &Formals| {
+                formals.positional.iter().any(|formal| formal.name == param)
+                    || formals.named.iter().any(|formal| formal.name == param)
+            };
+            let defined = match container {
                 None => self
                     .top_level_decl(name)
-                    .and_then(|decl| decl.formals.as_deref()),
+                    .and_then(|decl| decl.formals.as_deref().map(names_parameter)),
                 Some(container) => {
                     let entry = resolve_container(
                         self.graph,
@@ -4918,24 +5136,15 @@ impl<'a> Engine<'a> {
                         Some(entry)
                             if matches!(entry.kind, MemberKind::Method | MemberKind::Setter) =>
                         {
-                            entry.formals.as_deref()
+                            entry.formals.as_deref().map(names_parameter)
                         }
                         _ => None,
                     }
                 }
             };
-            // The official predicate requires a parent declaration WITH a
-            // formal parameter list: the null `parameterList` arm returns —
-            // getters carry none, and a list the walk cannot fetch
-            // (cross-file container) stays silent the same way. A known
-            // list that names no `p` reports.
-            let Some(formals) = formals else {
-                continue;
-            };
-            let defined = formals.positional.iter().any(|formal| formal.name == param)
-                || formals.named.iter().any(|formal| formal.name == param);
-            if defined {
-                continue;
+            match defined {
+                Some(true) | None => continue,
+                Some(false) => {}
             }
             let param_text = self.strings.resolve(param).to_string();
             let member_text = self.strings.resolve(name).to_string();
@@ -5544,7 +5753,7 @@ impl<'a> Engine<'a> {
             return None;
         };
         if args != ArgListId::EMPTY {
-            return self.unit_args?.get(args).first().copied();
+            return self.boundary.pool().get(args).first().copied();
         }
         self.frames
             .iter()
@@ -5721,9 +5930,7 @@ impl<'a> Engine<'a> {
         if name != self.intern("FutureOr") || args == ArgListId::EMPTY {
             return ret;
         }
-        let Some(pool) = self.unit_args else {
-            return ret;
-        };
+        let pool = self.boundary.pool();
         let list = pool.get(args);
         if list.len() != 1 {
             return ret;
@@ -5840,7 +6047,9 @@ impl<'a> Engine<'a> {
     }
 
     /// The resolved top-level declaration under `name` (`None` = no check).
-    fn top_level_decl(&self, name: StringId) -> Option<&TopDecl> {
+    /// An imported declaration projects into the diagnosing pool (F5) —
+    /// its declared types are local slots from here on.
+    fn top_level_decl(&self, name: StringId) -> Option<Projected<'a, TopDecl>> {
         match lookup_scoped(
             self.graph,
             self.namespaces,
@@ -5849,23 +6058,33 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Local(decl) => Some(decl),
+            ScopedHit::Local(decl) => Some(Projected::Own(decl)),
             ScopedHit::Found(NamespaceEntry::Decl(file)) => {
-                self.index.get(file).and_then(|f| f.decl(name))
+                let decl = self.index.get(file).and_then(|f| f.decl(name))?;
+                Some(self.boundary.top(file, name, decl))
             }
             _ => None,
         }
     }
 
     /// The full formal table of a resolved member callee, walked from `recv`.
-    fn member_formals_full(&self, recv: &Receiver, name: StringId) -> Option<&Formals> {
+    /// A foreign find's table comes back owned ([`std::borrow::Cow::Owned`],
+    /// cloned off the boundary's projected copy); a local find borrows the
+    /// unit's own (`'a`).
+    fn member_formals_full(
+        &self,
+        recv: &Receiver,
+        name: StringId,
+    ) -> Option<std::borrow::Cow<'a, Formals>> {
         let (container, super_walk) = match *recv {
             Receiver::This { container, .. } => (container, false),
             Receiver::Super { container, .. } => (container, true),
             Receiver::Typed { type_name, .. } => (type_name, false),
             // A folded creation (`C().m(...)`): the instance face — the
             // constructor-argument membership check walks the superclass
-            // chain like a declaration-typed receiver.
+            // chain like a declaration-typed receiver. The table feeds the
+            // name-level arity/assignability faces only, so the unit's own
+            // slots ride along untouched.
             Receiver::Created { name, .. } => (name, false),
             Receiver::Container {
                 name: container, ..
@@ -5880,7 +6099,9 @@ impl<'a> Engine<'a> {
                 )
                 .and_then(|(c, _)| c.members.get(&name));
                 return match entry {
-                    Some(entry) if entry.kind == MemberKind::Method => entry.formals.as_deref(),
+                    Some(entry) if entry.kind == MemberKind::Method => {
+                        entry.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                    }
                     _ => None,
                 };
             }
@@ -5892,7 +6113,16 @@ impl<'a> Engine<'a> {
             self.walk_members(container, name)
         };
         match walk {
-            Walk::Found(entry) if entry.kind == MemberKind::Method => entry.formals.as_deref(),
+            Walk::Found(entry) if entry.kind == MemberKind::Method => Some(match entry {
+                Projected::Own(e) => match e.formals.as_deref() {
+                    Some(formals) => std::borrow::Cow::Borrowed(formals),
+                    None => return None,
+                },
+                Projected::Foreign(e) => match e.formals.as_deref() {
+                    Some(formals) => std::borrow::Cow::Owned(formals.to_owned()),
+                    None => return None,
+                },
+            }),
             _ => None,
         }
     }
@@ -5974,14 +6204,15 @@ impl<'a> Engine<'a> {
         match entry {
             NamespaceEntry::Prefix => BareInfo::Prefix { name },
             NamespaceEntry::Decl(file) => {
-                let decl = self.index.get(file).and_then(|f| f.decl(name));
-                self.bare_info_of(
-                    name,
-                    decl.map_or(
-                        &TopDecl::bare(MicroKind::TopLevelVar),
-                        std::convert::identity,
-                    ),
-                )
+                match self.index.get(file).and_then(|f| f.decl(name)) {
+                    Some(decl) => {
+                        // F5: an imported declaration's declared type
+                        // projects before it arms a row.
+                        let projected = self.boundary.top(file, name, decl);
+                        self.bare_info_of(name, &projected)
+                    }
+                    None => self.bare_info_of(name, &TopDecl::bare(MicroKind::TopLevelVar)),
+                }
             }
         }
     }
@@ -6054,7 +6285,9 @@ impl<'a> Engine<'a> {
                 return Walk::ChainBroken;
             };
             if !skip_own && let Some(entry) = found.members.get(&member) {
-                return Walk::Found(entry);
+                // F1: the found entry belongs to `found_owner`'s pool —
+                // project it before it flows into rows or message text.
+                return Walk::Found(self.boundary.member(found_owner, name, member, entry));
             }
             skip_own = false;
             // The stacked applications, later first: each shadows the members
@@ -6069,17 +6302,16 @@ impl<'a> Engine<'a> {
                     return Walk::ChainBroken;
                 }
                 let mixin_lib = owner_lib;
-                if let Some(entry) = resolve_container(
+                if let Some((mixin_container, mixin_owner)) = resolve_container(
                     self.graph,
                     self.namespaces,
                     self.index,
                     mixin_lib,
                     found_owner,
                     *mixin,
-                )
-                .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+                ) && let Some(entry) = mixin_container.members.get(&member)
                 {
-                    return Walk::Found(entry);
+                    return Walk::Found(self.boundary.member(mixin_owner, *mixin, member, entry));
                 }
             }
             let Some(superclass) = found.superclass else {
@@ -6178,7 +6410,7 @@ impl<'a> Engine<'a> {
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
-        let mut broken_seen: Vec<&MemberEntry> = Vec::new();
+        let mut broken_seen: Vec<Projected<'a, MemberEntry>> = Vec::new();
         for face in faces {
             let Some((inherited, face_name)) = self.face_member(face, spelling) else {
                 // Unresolvable or cyclic face chain: suppression territory
@@ -6191,21 +6423,22 @@ impl<'a> Engine<'a> {
             // The stacked climb can surface one inherited member through
             // several direct faces (the applied `S&M2` superclass face and
             // the `M2` face both answer M2's member); the oracle's verdict
-            // per inherited member is one diagnostic.
+            // per inherited member is one diagnostic. The boundary's memo
+            // keeps a projected entry's identity stable across faces.
             if broken_seen
                 .iter()
-                .any(|prior: &&MemberEntry| std::ptr::eq(*prior, inherited))
+                .any(|prior| prior.ptr() == inherited.ptr())
             {
                 continue;
             }
-            if Self::override_broken(entry, inherited) {
-                broken_seen.push(inherited);
+            if Self::override_broken(entry, &inherited) {
+                broken_seen.push(inherited.clone());
                 let display = self.strings.resolve(spelling);
                 let display = display.strip_suffix('=').unwrap_or(display);
                 let container_text = self.strings.resolve(container);
                 let declared_text = self.override_signature_text(entry);
                 let face_text = self.strings.resolve(face_name);
-                let inherited_text = self.override_signature_text(inherited);
+                let inherited_text = self.override_signature_text(&inherited);
                 let code = if entry.kind == MemberKind::Setter {
                     SemanticCode::InvalidOverrideSetter
                 } else {
@@ -7363,7 +7596,7 @@ impl<'a> Engine<'a> {
                 if !entry.is_static {
                     hits.push(FaceEntry {
                         name: *member,
-                        entry,
+                        entry: self.boundary.member(found_owner, name, *member, entry),
                         owner_name: name,
                         owner_file: found_owner,
                         concrete_source: top_concrete,
@@ -7391,7 +7624,7 @@ impl<'a> Engine<'a> {
                         if !entry.is_static {
                             hits.push(FaceEntry {
                                 name: *member,
-                                entry,
+                                entry: self.boundary.member(mixin_owner, *mixin, *member, entry),
                                 owner_name: *mixin,
                                 owner_file: mixin_owner,
                                 concrete_source: true,
@@ -7413,7 +7646,12 @@ impl<'a> Engine<'a> {
                         if !entry.is_static {
                             hits.push(FaceEntry {
                                 name: *member,
-                                entry,
+                                entry: self.boundary.member(
+                                    interface_owner,
+                                    *interface,
+                                    *member,
+                                    entry,
+                                ),
                                 owner_name: *interface,
                                 owner_file: interface_owner,
                                 concrete_source: false,
@@ -7483,7 +7721,7 @@ impl<'a> Engine<'a> {
                         // The mixin's own member replaces; a kind mismatch in
                         // the replacement is itself the getter/method
                         // conflict (`inheritance_manager3.dart:594-610`).
-                        if Self::kind_class(list[0].entry) != Self::kind_class(hit.entry) {
+                        if Self::kind_class(&list[0].entry) != Self::kind_class(&hit.entry) {
                             self.emit_kind_conflict(hit.name, &list[0], &hit, name_range);
                         }
                         *list = vec![hit];
@@ -7548,7 +7786,7 @@ impl<'a> Engine<'a> {
         declared: &FxHashSet<StringId>,
         name_range: SourceRange,
     ) -> bool {
-        let getter = list.iter().find(|c| Self::kind_class(c.entry) == 2);
+        let getter = list.iter().find(|c| Self::kind_class(&c.entry) == 2);
         let method = list.iter().find(|c| c.entry.kind == MemberKind::Method);
         if let (Some(getter), Some(method)) = (getter, method) {
             self.emit_kind_conflict(name, getter, method, name_range);
@@ -7560,7 +7798,7 @@ impl<'a> Engine<'a> {
         let has_valid = list.iter().enumerate().any(|(i, a)| {
             list.iter()
                 .enumerate()
-                .all(|(j, b)| i == j || !Self::override_broken(a.entry, b.entry))
+                .all(|(j, b)| i == j || !Self::override_broken(&a.entry, &b.entry))
         });
         if has_valid {
             return false;
@@ -7573,7 +7811,7 @@ impl<'a> Engine<'a> {
                     "{}.{} ({})",
                     self.strings.resolve(c.owner_name),
                     display,
-                    self.override_signature_text(c.entry)
+                    self.override_signature_text(&c.entry)
                 )
             })
             .collect::<Vec<_>>()
@@ -7752,17 +7990,21 @@ impl<'a> Engine<'a> {
             let mut sorted = hits.clone();
             sorted.sort_unstable_by_key(|h| h.name);
             for hit in sorted {
+                let name = hit.name;
                 let setter_half = match hit.entry.kind {
-                    MemberKind::Field if !hit.entry.is_final => {
-                        Some(self.setter_spelling(hit.name))
-                    }
+                    MemberKind::Field if !hit.entry.is_final => Some(self.setter_spelling(name)),
                     _ => None,
                 };
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    representative.entry(hit.name)
+                if hit.concrete_source && !hit.entry.is_abstract {
+                    implemented.insert(name);
+                    if let Some(setter) = setter_half {
+                        implemented.insert(setter);
+                    }
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) = representative.entry(name)
                 {
-                    slot.insert(hit);
-                    names.push(hit.name);
+                    slot.insert(hit.clone());
+                    names.push(name);
                 }
                 if let Some(setter) = setter_half
                     && let std::collections::hash_map::Entry::Vacant(slot) =
@@ -7770,12 +8012,6 @@ impl<'a> Engine<'a> {
                 {
                     slot.insert(hit);
                     names.push(setter);
-                }
-                if hit.concrete_source && !hit.entry.is_abstract {
-                    implemented.insert(hit.name);
-                    if let Some(setter) = setter_half {
-                        implemented.insert(setter);
-                    }
                 }
             }
         }
@@ -7840,18 +8076,18 @@ impl<'a> Engine<'a> {
             if setter_face && concrete.entry.kind == MemberKind::Field {
                 continue;
             }
-            if std::ptr::eq(concrete.entry, specific.entry) {
+            if concrete.entry.ptr() == specific.entry.ptr() {
                 continue;
             }
-            if !Self::override_broken(concrete.entry, specific.entry) {
+            if !Self::override_broken(&concrete.entry, &specific.entry) {
                 continue;
             }
             let display = self.strings.resolve(*name);
             let display = display.strip_suffix('=').unwrap_or(display);
             let concrete_text = self.strings.resolve(concrete.owner_name);
-            let concrete_sig = self.override_signature_text(concrete.entry);
+            let concrete_sig = self.override_signature_text(&concrete.entry);
             let specific_text = self.strings.resolve(specific.owner_name);
-            let specific_sig = self.override_signature_text(specific.entry);
+            let specific_sig = self.override_signature_text(&specific.entry);
             let code = if concrete.entry.kind == MemberKind::Setter {
                 SemanticCode::InvalidImplementationOverrideSetter
             } else {
@@ -7877,7 +8113,7 @@ impl<'a> Engine<'a> {
         hits.iter().copied().find(|candidate| {
             hits.iter().all(|other| {
                 std::ptr::eq(*candidate, *other)
-                    || !Self::override_broken(candidate.entry, other.entry)
+                    || !Self::override_broken(&candidate.entry, &other.entry)
             })
         })
     }
@@ -8150,7 +8386,7 @@ impl<'a> Engine<'a> {
         &self,
         face: StringId,
         spelling: StringId,
-    ) -> Option<(&'a MemberEntry, StringId)> {
+    ) -> Option<(Projected<'a, MemberEntry>, StringId)> {
         let mut name = face;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
@@ -8170,7 +8406,12 @@ impl<'a> Engine<'a> {
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
             {
-                return Some((entry, name));
+                // F2: the inherited entry belongs to `found_owner`'s pool —
+                // project it before the override faces render or compare it.
+                return Some((
+                    self.boundary.member(found_owner, name, spelling, entry),
+                    name,
+                ));
             }
             // The mixin/superclass names are written in `found_owner` and
             // resolve through that file's library (probed by the container
@@ -8183,17 +8424,20 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 let mixin_lib = owner_lib;
-                if let Some((mixin_container, _)) = resolve_container(
+                if let Some((mixin_container, mixin_owner)) = resolve_container(
                     self.graph,
                     self.namespaces,
                     self.index,
                     mixin_lib,
-                    found_owner,
+                    owner,
                     *mixin,
                 ) && let Some(entry) = mixin_container.members.get(&spelling)
                     && !entry.is_static
                 {
-                    return Some((entry, *mixin));
+                    return Some((
+                        self.boundary.member(mixin_owner, *mixin, spelling, entry),
+                        *mixin,
+                    ));
                 }
             }
             let superclass = found.superclass?;
@@ -8901,7 +9145,9 @@ impl<'a> Engine<'a> {
             RowShape::Bare(BareInfo::Plain { .. }) => self
                 .top_level_decl(row.name)
                 .and_then(|d| d.formals.as_deref().cloned()),
-            RowShape::Member { recv } => self.member_formals_full(recv, row.name).cloned(),
+            RowShape::Member { recv } => self
+                .member_formals_full(recv, row.name)
+                .map(std::borrow::Cow::into_owned),
             _ => None,
         };
         let Some(formals) = formals else {
@@ -9343,7 +9589,7 @@ impl<'a> Engine<'a> {
                 match self.walk_members(container, row.name) {
                     Walk::Found(entry) if entry.kind == MemberKind::Method => {
                         if entry.type_params != count {
-                            let display = self.function_type_display(entry);
+                            let display = self.function_type_display(&entry);
                             self.emit3(
                                 SemanticCode::WrongNumberOfTypeArgumentsFunction,
                                 range,
@@ -9422,7 +9668,7 @@ impl<'a> Engine<'a> {
         &self,
         container: StringId,
         member: StringId,
-    ) -> Option<&crate::model::MemberEntry> {
+    ) -> Option<Projected<'a, MemberEntry>> {
         match self.walk_members(container, member) {
             Walk::Found(entry) => Some(entry),
             _ => None,
@@ -9891,17 +10137,21 @@ impl<'a> Engine<'a> {
                 Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, row.name),
                 Receiver::Container {
                     name: container, ..
-                } => resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    *container,
-                )
-                .and_then(|(c, _)| c.members.get(&row.name))
-                .filter(|e| e.kind == MemberKind::Field)
-                .map_or(Ty::UNKNOWN, |e| e.var_ty),
+                } => {
+                    // F4: the resolved container's field type, projected
+                    // when the container is foreign.
+                    resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        *container,
+                    )
+                    .and_then(|(c, owner)| c.members.get(&row.name).map(|e| (owner, e)))
+                    .filter(|(_, e)| e.kind == MemberKind::Field)
+                    .map_or(Ty::UNKNOWN, |(owner, e)| self.boundary.ty(owner, e.var_ty))
+                }
                 _ => Ty::UNKNOWN,
             },
             _ => Ty::UNKNOWN,
@@ -10378,12 +10628,11 @@ impl<'a> Engine<'a> {
 
     /// Renders `ty` in the official display form through [`Ty::render`] —
     /// the single named-type text source (the model owns the
-    /// `Name<Arg, ...>?` face; the diagnoser only supplies the tables). The
-    /// face-less fallback renders argument-less, exact while capture
-    /// interns nothing.
+    /// `Name<Arg, ...>?` face; the diagnoser only supplies the tables).
+    /// Every slot this pass can hold resolves through the boundary's seeded
+    /// pool — local slots verbatim, foreign ones projected.
     fn render_ty(&self, ty: Ty) -> String {
-        let fallback = ArgPool::default();
-        ty.render(self.strings, self.unit_args.unwrap_or(&fallback))
+        ty.render(self.strings, &self.boundary.pool())
     }
 
     fn ty_display(&self, ty: Ty) -> String {
@@ -10594,8 +10843,9 @@ impl<'a> Engine<'a> {
                     let decl = self
                         .top_level_decl(callee_name)
                         .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some());
-                    let defined =
-                        decl.is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
+                    let defined = decl
+                        .as_ref()
+                        .is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
                     (decl.is_some(), defined)
                 }
             }
@@ -11087,7 +11337,7 @@ impl<'a> Engine<'a> {
         if let Intent::Operator(..) = row.intent {
             match self.walk_members(container, row.name) {
                 Walk::Found(entry) => {
-                    let ty = Self::member_result_ty(entry);
+                    let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                     return;
                 }
@@ -11191,7 +11441,7 @@ impl<'a> Engine<'a> {
         if let Intent::Operator(..) = row.intent {
             match self.walk_super(container, row.name) {
                 Walk::Found(entry) => {
-                    let ty = Self::member_result_ty(entry);
+                    let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                 }
                 Walk::ChainBroken => {}
@@ -25272,13 +25522,13 @@ mod tests {
 #[cfg(test)]
 mod sealed_contract_tests {
     use crate::collector::collect;
-    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
+    use crate::diagnose::{Engine, FileReport, StrictModes, Walk, diagnose_with};
     use crate::library::ElementIndex;
-    use crate::model::MicroKind;
+    use crate::model::{MicroKind, Ty};
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
     use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
-    use dartq_scanner::ScanConfig;
+    use dartq_scanner::{ScanConfig, TokenTable};
     use dartq_source::{FileTable, StringTable};
     use std::path::Path;
 
@@ -25729,5 +25979,216 @@ mod sealed_contract_tests {
                    void main() {\n  C c = C();\n  c.g;\n}";
         let report = use_result_report(src);
         assert_eq!(code_names(&report), ["unused_result"]);
+    }
+
+    // —— G4 phase-2 T-B: the cross-pool projection boundary —————————————
+
+    /// [`sealed_report`] under the boundary tests' name: the dependency is
+    /// a real second unit, indexed under its own file id, so its declared
+    /// types carry genuinely foreign [`crate::model::ArgListId`] slots.
+    fn foreign_unit_report(main_source: &str, dependency: &str) -> FileReport {
+        sealed_report(main_source, dependency, "package:t/other.dart")
+    }
+
+    /// The boundary's entry memo keeps one projected copy per foreign
+    /// member: the same inherited member surfaced through two direct faces
+    /// (the superclass and an interface extending it) stays pointer-equal,
+    /// so the face-chain dedup still emits a single verdict, and the
+    /// message renders the inherited signature with its arguments through
+    /// the diagnosing pool (plan §5 T-B acceptance).
+    #[test]
+    fn foreign_member_surfaces_once_across_two_faces() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; class int {} class List<T> {} \
+             class B extends S implements I { void m(List<int> x) {} }",
+            "class S { void m(List<int>? x) {} } class I extends S {}",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "'B.m' ('void Function(List<int>)') isn't a valid override of 'S.m' ('void Function(List<int>?)')."
+        );
+    }
+
+    /// A foreign-origin property column (F4) renders through the boundary
+    /// pool: `x.a = null` decides on the projected `List<int>` and the
+    /// message names it exactly — main's own pool never held the slot.
+    #[test]
+    fn foreign_property_target_renders_in_assignment_verdict() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; void f(A x) { x.a = null; }",
+            "class A { List<int> a = []; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_assignment"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Null' can't be assigned to a variable of type 'List<int>'."
+        );
+    }
+
+    /// An imported top-level variable (F5) rides its projected type into
+    /// the same verdict face — the bare read's row is boundary-local.
+    #[test]
+    fn foreign_top_level_variable_renders_in_assignment_verdict() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; void f() { top = null; }",
+            "List<int> top = [];",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_assignment"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Null' can't be assigned to a variable of type 'List<int>'."
+        );
+    }
+
+    /// An imported generic member's row type and a local annotation land in
+    /// one pool (the boundary), so a genuinely different cast target never
+    /// compares equal to the foreign slot — the cross-pool numeric-slot
+    /// collision cannot mint a false `unnecessary_cast` (plan §5 T-B).
+    #[test]
+    fn foreign_row_type_never_false_positives_unnecessary_cast() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; class int {} class List<T> {} class Map<K, V> {} \
+             void f(A x) { x.a as List<String>; }",
+            "class A { List<int> a = []; }",
+        );
+        assert!(
+            !code_names(&report).contains(&"unnecessary_cast"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The boundary unit face: a foreign member walk re-interns the
+    /// declared type into the diagnosing pool, the slot memo dedups the
+    /// shared list across members and repeat probes, and a foreign
+    /// top-level declaration projects once per diagnosis with a stable
+    /// projected identity.
+    #[test]
+    fn boundary_reinterns_foreign_types_and_memoizes_slots() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let dep_file = files.intern(Path::new("other.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let main_source = "import 'other.dart'; void f(A x) { x.a; x.b; }";
+        let dep_source = "class A { List<int> a = []; List<int> b = []; } List<int> top = [];";
+        let scanned = dartq_scanner::scan(
+            main_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let scanned_dep = dartq_scanner::scan(
+            dep_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dep_file,
+        );
+        assert!(scanned_dep.diagnostics.is_empty());
+        let elements = collect(main_source, &scanned.tokens, features, &strings);
+        let dep_elements = collect(dep_source, &scanned_dep.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let dep_lib = builder.intern("package:t/other.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind != MicroKind::TypeParam {
+                builder.declare(lib, name, file);
+            }
+        }
+        for (name, decl) in dep_elements.declarations() {
+            if decl.kind != MicroKind::TypeParam {
+                builder.declare(dep_lib, name, dep_file);
+            }
+        }
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(dep_lib),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        index.insert(dep_file, dep_elements);
+        let tokens: &'static TokenTable = Box::leak(Box::new(scanned.tokens));
+        let engine = Engine::new(
+            &graph,
+            &namespaces,
+            &index,
+            &strings,
+            main_source,
+            tokens,
+            file,
+            lib,
+            false,
+            false,
+            StrictModes::default(),
+        );
+        // Main's own pool is empty; the foreign `List<int>` field type is
+        // the boundary pool's one non-empty slot.
+        let container = strings.intern("A");
+        let first = match engine.walk_members(container, strings.intern("a")) {
+            Walk::Found(entry) => entry,
+            walk => panic!("expected a found walk, got {walk:?}"),
+        };
+        let render = |ty: Ty| ty.render(&strings, &engine.boundary.args.borrow());
+        assert_eq!(render(first.var_ty), "List<int>");
+        assert_eq!(engine.boundary.args.borrow().len(), 1);
+        // A second member sharing the same argument list dedups into the
+        // same slot — structural equality across entries, one copy.
+        let second = match engine.walk_members(container, strings.intern("b")) {
+            Walk::Found(entry) => entry,
+            walk => panic!("expected a found walk, got {walk:?}"),
+        };
+        assert_eq!(second.var_ty, first.var_ty);
+        assert_eq!(
+            engine.boundary.args.borrow().len(),
+            1,
+            "the slot memo dedups the shared list across members"
+        );
+        // A repeat probe serves the memoized member — the pool stays put.
+        match engine.walk_members(container, strings.intern("a")) {
+            Walk::Found(again) => assert_eq!(render(again.var_ty), "List<int>"),
+            walk => panic!("expected a found walk, got {walk:?}"),
+        }
+        assert_eq!(engine.boundary.args.borrow().len(), 1);
+        // A foreign top-level declaration projects once per diagnosis, and
+        // its projected identity is stable across lookups.
+        let top = strings.intern("top");
+        let decl = engine
+            .top_level_decl(top)
+            .expect("the imported declaration resolves");
+        assert_eq!(render(decl.var_ty), "List<int>");
+        let again = engine
+            .top_level_decl(top)
+            .expect("the imported declaration resolves");
+        assert_eq!(decl.ptr(), again.ptr(), "the decl memo serves one copy");
     }
 }

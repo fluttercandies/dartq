@@ -307,6 +307,17 @@ pub(crate) fn resolve_container<'a>(
 /// Each hop resolves file-locally first, then through the library that owns
 /// the declaring container (cycle-guarded).
 ///
+/// # Cross-pool boundary (G4 phase 2, funnel F3)
+///
+/// The returned entry is owned by the resolving file's [`ArgPool`]: a
+/// cross-file hit carries that unit's [`ArgListId`] slots. This walk has no
+/// diagnosing-engine state to project into, so a caller that drives the
+/// diagnostic engine must route the hit through the engine's boundary
+/// ([`crate::diagnose`]'s `Engine` boundary — the F1/F2 funnels' projection)
+/// before its declared types reach rows or message text; the diagnosing
+/// engine itself reaches member faces through [`Engine`]-owned walks and
+/// never calls this free function.
+///
 /// A `None` here is **not** proof of undefined — before reporting an
 /// instance-scope `undefined_*`, check the extension faces
 /// ([`FileElements::extension_faces`]) of the library's files (the caller
