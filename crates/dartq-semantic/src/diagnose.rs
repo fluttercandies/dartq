@@ -779,6 +779,16 @@ struct NsmCheck {
     name_ok: bool,
 }
 
+/// The #749 literal-constructor candidate facts latched at an argument
+/// list's open: the callee row whose send adjudicates and the invocation's
+/// head start (the class-name token for the unnamed shape; the merged
+/// receiver's start for `C.named` — the whole-invocation span keys on the
+/// start only).
+struct LiteralCtorArm {
+    callee: usize,
+    head: SourceRange,
+}
+
 /// The `super.noSuchMethod(<one argument>)` shape machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NsmShape {
@@ -1508,6 +1518,22 @@ struct Engine<'a> {
     /// type-argument group is matched to its head through this state
     /// instead of the row stack. Cleared at `end_constructor_reference`.
     creation_ref: Option<(StringId, Option<StringId>)>,
+    /// The open literal-constructor candidate windows (#749): the facts
+    /// each argument list was armed against, paired LIFO with the
+    /// capture's [`crate::const_eval::WindowKind::LiteralCtor`] windows.
+    /// Armed at `begin_arguments`, drained into the stash at
+    /// `end_arguments`.
+    literal_ctor_arms: Vec<LiteralCtorArm>,
+    /// Closed candidate argument lists awaiting their send: the callee row
+    /// index, the captured argument trees, and the whole-invocation span.
+    /// Adjudicated (and popped) at the send's `consume_send`.
+    literal_ctor_stash: Vec<(usize, Vec<crate::const_eval::Node>, SourceRange)>,
+    /// Formal-parameter default values are const contexts (a candidate
+    /// creation inside one is implicitly `const` — the oracle is silent).
+    default_value_depth: u32,
+    /// The constructor declaration in flight carries the `const` modifier
+    /// (its initializer list is a const context; bodies are not).
+    in_const_ctor: bool,
     /// Interned reserved-member spellings (populated once in [`Engine::new`]:
     /// the hot `resolve_bare` path compares ids, never re-interns).
     object_members: [StringId; OBJECT_MEMBERS.len()],
@@ -2382,6 +2408,10 @@ impl<'a> Engine<'a> {
             is_type_pos: 0,
             ctor_pos: 0,
             creation_ref: None,
+            literal_ctor_arms: Vec::new(),
+            literal_ctor_stash: Vec::new(),
+            default_value_depth: 0,
+            in_const_ctor: false,
             object_members,
             enum_synth_members,
             builtin_types,
@@ -9196,6 +9226,16 @@ impl<'a> Engine<'a> {
         let Some(callee) = self.pending_send.take() else {
             return None;
         };
+        // The #749 adjudication runs before the fold replaces the callee
+        // row: the container/selector face reads the pre-fold shape.
+        if self
+            .literal_ctor_stash
+            .last()
+            .is_some_and(|(owner, _, _)| *owner == callee)
+        {
+            let (_, args, span) = self.literal_ctor_stash.pop().expect("paired stash");
+            self.check_literal_ctor_invocation(callee, args, span);
+        }
         if let Some(row) = self.rows.get(callee) {
             // The discarded-value machine: every completed send is a
             // candidate until its context seals it.
@@ -12205,6 +12245,204 @@ impl<'a> Engine<'a> {
         }
     }
 
+    // —— #749: non_const_call_to_literal_constructor ————————————————————
+    //
+    // `_checkForLiteralConstructorUse` (best_practices_verifier.dart
+    // :1276-1290) hooks every constructor invocation; the decision order is
+    // resolved target → `isConst` → `hasLiteral` → `canBeConst` → report.
+    // The dartq faces: the plain send shape (`Point(1, 2)`, `Point.named(1,
+    // 2)`) arms a capture window at its argument list's open (the
+    // const-context guards live there — already-`const` and `new`-prefixed
+    // shapes parse through different events and never arm), the arguments
+    // constant-evaluate for the `canBeConst` face, and the send's fold
+    // adjudicates.
+
+    /// Arms the candidate window for an opening argument list (parse-time
+    /// facts only): the head must be an in-file class container used in a
+    /// plain send (`ctor_pos` 0 excludes the `new`/`const`/generic-creation
+    /// reference shapes — the twin code is out of the frozen universe, so
+    /// the `new` shape stays silent), no const context may own the
+    /// position, and the capture's nesting rule must accept another
+    /// non-const window.
+    fn arm_literal_ctor_args(&mut self) {
+        if self.ctor_pos != 0
+            || self.annotation_at.is_some()
+            || self.default_value_depth != 0
+            || (self.initializer_depth != 0 && self.in_const_ctor)
+        {
+            return;
+        }
+        let Some((callee, head)) = self.literal_ctor_callee_face() else {
+            return;
+        };
+        if !self.const_capture.open_literal_ctor() {
+            return;
+        }
+        self.literal_ctor_arms.push(LiteralCtorArm { callee, head });
+    }
+
+    /// The candidate face of the argument list's callee rows: the unnamed
+    /// shape's head row IS the class container (`Point(`); the named
+    /// shape's selector rides a continuation placeholder whose receiver
+    /// row (the head, still in its pre-merge shape — the merge event only
+    /// fires after the send) sits directly below. Only class containers
+    /// are candidates — enums are never constructed, mixins cannot be,
+    /// and extension overrides carry no constructor.
+    fn literal_ctor_callee_face(&self) -> Option<(usize, SourceRange)> {
+        let idx = self.rows.len().checked_sub(1)?;
+        let row = self.rows.get(idx)?;
+        match &row.shape {
+            RowShape::Bare(BareInfo::Container {
+                kind: ContainerKind::Class,
+                ..
+            }) => Some((idx, row.range)),
+            // `C.named(`: the placeholder's receiver row carries the head
+            // (the creation fold, or the raw container when the head send
+            // had no argument list to fold through).
+            RowShape::Bare(BareInfo::Plain { ty: Ty::UNKNOWN }) if row.qualified => {
+                let recv = self.rows.get(idx.checked_sub(1)?)?;
+                match &recv.shape {
+                    RowShape::Receiver(Receiver::Created {
+                        kind: ContainerKind::Class,
+                        ..
+                    })
+                    | RowShape::Bare(BareInfo::Container {
+                        kind: ContainerKind::Class,
+                        ..
+                    }) => Some((idx, recv.range)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Closes the armed candidate window at the argument list's close: the
+    /// captured argument trees join the stash under the callee row's
+    /// identity, awaiting the send's adjudication.
+    fn close_literal_ctor_args(&mut self, end: SourceRange) {
+        if !self
+            .literal_ctor_arms
+            .last()
+            .is_some_and(|_| self.const_capture.top_is_literal_ctor())
+        {
+            return;
+        }
+        let arm = self.literal_ctor_arms.pop().expect("paired arm");
+        let span = SourceRange {
+            offset: arm.head.offset,
+            length: end.end().saturating_sub(arm.head.offset),
+        };
+        let args = self.const_capture.close_literal_ctor(span);
+        self.literal_ctor_stash.push((arm.callee, args, span));
+    }
+
+    /// The send-side adjudication (the oracle's decision order): the
+    /// constructor must resolve, the constructor declaration must carry
+    /// the meta `@literal` annotation, and every argument must
+    /// constant-evaluate. Reported at the whole-invocation span with the
+    /// written constructor-reference text (`{0}`); `isConst` and the
+    /// `new` twin never reach this face (their parse shapes never arm).
+    fn check_literal_ctor_invocation(
+        &mut self,
+        callee: usize,
+        args: Vec<crate::const_eval::Node>,
+        span: SourceRange,
+    ) {
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        // The same two shapes the arm read: the unnamed head row, and the
+        // named continuation placeholder with its head row (still in its
+        // pre-merge shape) one row below.
+        let (container, selector) = match &row.shape {
+            RowShape::Bare(BareInfo::Container {
+                name,
+                kind: ContainerKind::Class,
+            }) => (*name, None),
+            RowShape::Bare(BareInfo::Plain { ty: Ty::UNKNOWN }) if row.qualified => {
+                let receiver = callee.checked_sub(1).and_then(|i| self.rows.get(i));
+                match receiver {
+                    Some(receiver) => match &receiver.shape {
+                        RowShape::Receiver(Receiver::Created {
+                            name,
+                            kind: ContainerKind::Class,
+                        })
+                        | RowShape::Bare(BareInfo::Container {
+                            name,
+                            kind: ContainerKind::Class,
+                        }) => (*name, Some(row.name)),
+                        _ => return,
+                    },
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        // This-file constructor resolution (cross-file containers
+        // under-report, the standing producer posture — `const_ctor_target`
+        // and `site_annotation` share it).
+        let decl = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container));
+        let resolves = match (decl, selector) {
+            (Some(decl), None) => {
+                decl.has_unnamed_constructor || decl.constructors.contains(&container)
+            }
+            (Some(decl), Some(selector)) => decl.constructors.contains(&selector),
+            (None, _) => false,
+        };
+        if !resolves {
+            return;
+        }
+        // The `@literal` face: the CONSTRUCTOR declaration's collected
+        // annotations resolve to meta's `literal` (an annotation on the
+        // class header is inert — the official reads the constructor's own
+        // metadata). Resolution routes through the import faces
+        // (`crate::annotation`), never a foreign `Ty`.
+        let ctor_name = selector.unwrap_or(container);
+        let has_literal = self.decl_sites.iter().any(|site| {
+            matches!(&site.kind, DeclKind::Constructor { container: c } if *c == container)
+                && site.name == ctor_name
+                && site.annotations.iter().any(|a| {
+                    crate::annotation::is_meta_literal(
+                        &crate::model::Annotation {
+                            name: *a,
+                            range: site.range,
+                        },
+                        self.strings,
+                        self.graph,
+                        self.lib,
+                    )
+                })
+        });
+        if !has_literal {
+            return;
+        }
+        // The `canBeConst` face: every argument constant-evaluates (the
+        // deferral verdict counts — a foreign/forward constant is one).
+        let feasible = args
+            .iter()
+            .all(|arg| matches!(eval(arg, self), Verdict::Value(_) | Verdict::Constant));
+        if !feasible {
+            return;
+        }
+        // The written reference text: the container spelling, dot-joined
+        // with the selector for the named form.
+        let text = match selector {
+            None => self.strings.resolve(container).to_owned(),
+            Some(selector) => {
+                format!(
+                    "{}.{}",
+                    self.strings.resolve(container),
+                    self.strings.resolve(selector)
+                )
+            }
+        };
+        self.stage_usage(SemanticCode::NonConstCallToLiteralConstructor, span, &text);
+    }
+
     /// Elements of a closed explicit const literal: each evaluates
     /// against its `non_constant_*_element` default (the
     /// `_ConstLiteralVerifier` site).
@@ -13573,10 +13811,22 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_formal_parameter_default_value_expression(&mut self, token: Token) {
         self.flow()
             .begin_formal_parameter_default_value_expression(token);
+        let mut engine = self.engine.borrow_mut();
         // A default value's expression follows the formal's own written
         // type: snapshot it before closure/type events inside the default
         // can poison (the #748 `==` first-formal read).
-        self.engine.borrow_mut().equals_formal_type();
+        engine.equals_formal_type();
+        // Default values are const contexts: a candidate creation inside
+        // one is implicitly `const` (#749's guard).
+        engine.default_value_depth += 1;
+    }
+
+    fn end_formal_parameter_default_value_expression(&mut self, token: Token) {
+        self.flow()
+            .end_formal_parameter_default_value_expression(token);
+
+        self.engine.borrow_mut().default_value_depth -= 1;
+        let _ = token;
     }
 
     fn begin_function_typed_formal_parameter(&mut self, token: Token) {
@@ -13753,8 +14003,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         // A `const` constructor makes its container a provable const-ctor
-        // target (the #279 arg-check gate).
-        if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
+        // target (the #279 arg-check gate); its initializer list is a
+        // const context too (the #749 candidate guard).
+        engine.in_const_ctor = var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const");
+        if engine.in_const_ctor {
             engine.note_const_ctor();
         }
         engine.open_member_setter = false;
@@ -13800,6 +14052,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.ctor_pending = None;
+        engine.in_const_ctor = false;
         engine.pop_frame();
     }
 
@@ -13841,6 +14094,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.ctor_pending = None;
+        engine.in_const_ctor = false;
         engine.pop_frame();
     }
 
@@ -15024,6 +15278,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.nsm_arguments_open();
+        // The #749 candidate window: arms on a plain-send class-container
+        // head outside every const context (before the capture opens its
+        // own level — the head node must stay below the window's base).
+        engine.arm_literal_ctor_args();
         // The watermark: only pendings registered inside the list seal used
         // at the close (the official `ArgumentList` parent arm); the
         // callee's own candidate predates it.
@@ -15036,6 +15294,10 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_arguments(&mut self, count: usize, _begin: Token, end: Token) {
         self.flow().end_arguments(count, _begin, end);
 
+        // The armed candidate window closes first: its argument trees
+        // leave the capture before the const-context interpretations of
+        // the generic close can touch them.
+        self.engine.borrow_mut().close_literal_ctor_args(end.range);
         let closed = self
             .engine
             .borrow_mut()
@@ -26190,5 +26452,294 @@ mod sealed_contract_tests {
             .top_level_decl(top)
             .expect("the imported declaration resolves");
         assert_eq!(decl.ptr(), again.ptr(), "the decl memo serves one copy");
+    }
+}
+
+/// The W7 `non_const_call_to_literal_constructor` producer tests (#749).
+/// Standalone module like the W6 rig: the firing face needs the vendored
+/// meta stand-in (`package:meta/…` graph node declaring the `literal`
+/// face), which the single-file rig cannot express.
+///
+/// Behavioral oracle: dart 3.13.1 `dart analyze --format=machine` probes
+/// (see the fixture under tests/corpus/m2-warning for the live row).
+/// Official source: best_practices_verifier.dart:1276-1290
+/// (`_checkForLiteralConstructorUse`).
+#[cfg(test)]
+mod literal_constructor_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report.diagnostics.iter().map(|d| d.code.name).collect()
+    }
+
+    /// The W7 rig: the diagnosed source sits in `package:t` with an
+    /// unprefixed import of the vendored meta stand-in (a
+    /// `package:meta/…` graph node declaring the `literal` face), the same
+    /// resolution shape the corpus's hand-configured package_config
+    /// provides. `with_meta = false` drops the import edge — a bare
+    /// `@literal` spelling then resolves only against in-file
+    /// declarations, the oracle's silent face.
+    fn literal_report(source: &str, with_meta: bool) -> FileReport {
+        // The dart:core primitive stub (the W5 rig's convention): `int` is
+        // not a builtin for the type-use rows, so field types would mint
+        // `undefined_class` without it. Appended after the case, keeping
+        // every in-case offset stable for the span assertions.
+        let source: &str = &(String::from(source) + "\nclass int {}\n");
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let meta_file = files.intern(Path::new("meta.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let meta_source = "library meta;\n\
+                           const Object literal = _Literal();\n\
+                           class _Literal { const _Literal(); }";
+        let scanned_meta = dartq_scanner::scan(
+            meta_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            meta_file,
+        );
+        assert!(scanned_meta.diagnostics.is_empty());
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let meta_elements = collect(meta_source, &scanned_meta.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let meta_lib = builder.intern("package:meta/meta.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        for (name, decl) in meta_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(meta_lib, name, meta_file);
+        }
+        if with_meta {
+            builder.import(
+                lib,
+                ImportEdge {
+                    target: Some(meta_lib),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        index.insert(meta_file, meta_elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+        )
+    }
+
+    /// The corpus fixture's firing face: a non-const creation of a
+    /// `@literal` constructor with all-constant arguments reports at the
+    /// whole invocation (`Point(1, 2)`, length 11 — the probed oracle row
+    /// is `15|11|11`) with the verbatim problem and correction messages.
+    #[test]
+    fn literal_creation_reports_at_the_invocation() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class Point {\n  final int x, y;\n\n  @literal\n  const Point(this.x, this.y);\n}\n\
+                   final p = Point(1, 2);\n";
+        let rep = literal_report(src, true);
+        assert_eq!(
+            code_names(&rep),
+            ["non_const_call_to_literal_constructor"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "This instance creation must be 'const', because the Point constructor is marked as '@literal'."
+        );
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Try adding a 'const' keyword.")
+        );
+        let at = src.find("Point(1, 2)").expect("invocation");
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+        assert_eq!(d.range.length, 11);
+    }
+
+    /// The named form reports with the WRITTEN constructor-reference text
+    /// (`{0}` = `P5.bar` — the written reference, not the element display)
+    /// and the whole-invocation anchor.
+    #[test]
+    fn named_literal_creation_reports_with_written_text() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class P5 {\n  final int v;\n  @literal\n  const P5.bar(this.v);\n}\n\
+                   final t = P5.bar(1);\n";
+        let rep = literal_report(src, true);
+        assert_eq!(
+            code_names(&rep),
+            ["non_const_call_to_literal_constructor"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "This instance creation must be 'const', because the P5.bar constructor is marked as '@literal'."
+        );
+        let at = src.find("P5.bar(1)").expect("invocation");
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+        assert_eq!(d.range.length, "P5.bar(1)".len() as u32);
+    }
+
+    /// A const-evaluatable argument of unknown value keeps `canBeConst`
+    /// true (a const variable's folded value — the probe's const-var row).
+    #[test]
+    fn const_variable_argument_stays_feasible() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class Point {\n  final int x, y;\n  @literal\n  const Point(this.x, this.y);\n}\n\
+                   const c = 1;\n\
+                   final u = Point(c, 2);\n";
+        let rep = literal_report(src, true);
+        assert_eq!(
+            code_names(&rep),
+            ["non_const_call_to_literal_constructor"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// The silent faces (each probed silent on 3.13.1): the already-`const`
+    /// invocation (the fixture's `q`), the non-const-evaluatable argument
+    /// (the fixture's `r` — a non-const top-level variable), a constructor
+    /// without the annotation (the import alone reports nothing), the
+    /// annotation on the CLASS header (the official reads constructor
+    /// metadata), an in-file `literal` shadowing the meta face (resolution
+    /// leaves meta), and a named-only class whose unnamed creation cannot
+    /// resolve (decision step 1).
+    #[test]
+    fn literal_creation_silent_faces() {
+        let point = "import 'package:meta/meta.dart';\n\
+                     class Point {\n  final int x, y;\n  @literal\n  const Point(this.x, this.y);\n}\n";
+        // Already const.
+        let rep = literal_report(&format!("{point}final q = const Point(3, 4);\n"), true);
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // Non-const argument.
+        let rep = literal_report(
+            &format!("{point}final notConst = 0;\nfinal r = Point(notConst, 6);\n"),
+            true,
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // No annotation on the constructor.
+        let rep = literal_report(
+            "import 'package:meta/meta.dart';\n\
+             class Q4 {\n  final int v;\n  const Q4(this.v);\n}\n\
+             final z = Q4(1);\n",
+            true,
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // The annotation sits on the class header, not the constructor.
+        let rep = literal_report(
+            "import 'package:meta/meta.dart';\n\
+             @literal\n\
+             class Q6 {\n  final int v;\n  const Q6(this.v);\n}\n\
+             final w = Q6(1);\n",
+            true,
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // An in-file `literal` shadows the meta face: the annotation
+        // resolves locally, never to meta.
+        let rep = literal_report(
+            "class literal { const literal(); }\n\
+             class Q3 {\n  final int v;\n  @literal\n  const Q3(this.v);\n}\n\
+             final s = Q3(1);\n",
+            false,
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // The unnamed creation cannot resolve (named-only class).
+        let rep = literal_report(
+            "import 'package:meta/meta.dart';\n\
+             class P2 {\n  final int v;\n  @literal\n  const P2.named(this.v);\n}\n\
+             final t = P2(1);\n",
+            true,
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// `new`-prefixed shapes stay silent: the oracle's `..._using_new`
+    /// twin is not in the frozen 43-code universe, so a plain-code row
+    /// there would be dartq-only gate damage (3.13.1 emits the plain code
+    /// here — the deliberate forward-compat divergence is fixture-neutral
+    /// and 3.15-ready).
+    #[test]
+    fn new_prefixed_creation_stays_silent() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class Point {\n  final int x, y;\n  @literal\n  const Point(this.x, this.y);\n}\n\
+                   final n = new Point(1, 2);\n";
+        let rep = literal_report(src, true);
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
     }
 }

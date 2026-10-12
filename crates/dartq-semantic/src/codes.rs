@@ -748,6 +748,19 @@ pub enum SemanticCode {
     /// (best_practices_verifier.dart:1433-1478, reported at the
     /// declaration's name token). `diagnostic.g.dart` :17515-17524.
     UnnecessaryNoSuchMethod,
+    /// `This instance creation must be 'const', because the {0}
+    /// constructor is marked as '@literal'.` — a NON-const instance
+    /// creation whose target constructor carries the package:meta
+    /// `@literal` annotation and whose arguments are all
+    /// constant-evaluatable (best_practices_verifier.dart:1276-1290,
+    /// `_checkForLiteralConstructorUse`, reported at the invocation node;
+    /// `{0}` is the written constructor-reference text). Unresolved
+    /// targets, already-`const` invocations, non-`@literal` constructors,
+    /// and non-const-evaluatable arguments all stay silent. The oracle's
+    /// `new`-keyword twin (`..._using_new`) is not in the frozen M2
+    /// universe, so `new`-prefixed shapes are dartq-silent by design.
+    /// `diagnostic.g.dart` :12911-12922.
+    NonConstCallToLiteralConstructor,
     // —— #911: the M3 primary-constructor field face (`STATIC_WARNING`) ——————
     /// `The value of the field '{0}' isn't used.` — a primary-constructor
     /// formal that declares a field (`var`/`final` keyword, no `this`/
@@ -1155,6 +1168,12 @@ impl SemanticCode {
             Self::UnnecessaryNoSuchMethod => {
                 ("unnecessary_no_such_method", "UNNECESSARY_NO_SUCH_METHOD")
             }
+            // The #749 W7 face (diagnostic.g.dart:12911-12922 —
+            // `hasPublishedDocs: true`).
+            Self::NonConstCallToLiteralConstructor => (
+                "non_const_call_to_literal_constructor",
+                "NON_CONST_CALL_TO_LITERAL_CONSTRUCTOR",
+            ),
             // The #911 M3 face (diagnostic.g.dart:18040-18055 —
             // `hasPublishedDocs: true`).
             Self::UnusedFieldFromPrimaryConstructor => (
@@ -1288,6 +1307,9 @@ impl SemanticCode {
             // diagnostic.g.dart :13189 and :17521).
             | Self::NonNullableEqualsParameter
             | Self::UnnecessaryNoSuchMethod
+            // The #749 W7 face (`type: DiagnosticType.STATIC_WARNING`,
+            // diagnostic.g.dart:12918).
+            | Self::NonConstCallToLiteralConstructor
             | Self::UnusedFieldFromPrimaryConstructor => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
@@ -1704,6 +1726,13 @@ impl SemanticCode {
             Self::UnnecessaryNoSuchMethod => {
                 "Unnecessary 'noSuchMethod' declaration.".to_string()
             }
+            // The #749 W7 face: the 3.13.1 oracle template, probe-verified
+            // (diagnostic.g.dart:12913-12915 carries the 3.15 text with the
+            // constructor display name quoted — the shipped 3.13.1 wording
+            // wraps the written reference in "the … constructor" instead).
+            Self::NonConstCallToLiteralConstructor => format!(
+                "This instance creation must be 'const', because the {a0} constructor is marked as '@literal'."
+            ),
         }
     }
 
@@ -2083,6 +2112,10 @@ impl SemanticCode {
             Self::UnnecessaryNoSuchMethod => {
                 Some("Try removing the declaration of 'noSuchMethod'.".to_string())
             }
+            // The #749 W7 face (diagnostic.g.dart:12916).
+            Self::NonConstCallToLiteralConstructor => {
+                Some("Try adding a 'const' keyword.".to_string())
+            }
             _ => None,
         }
     }
@@ -2289,6 +2322,8 @@ mod tests {
             // The #748 W5 pair.
             SemanticCode::NonNullableEqualsParameter,
             SemanticCode::UnnecessaryNoSuchMethod,
+            // The #749 W7 face.
+            SemanticCode::NonConstCallToLiteralConstructor,
         ];
         for code in codes {
             let info = code.code_info();
@@ -2376,6 +2411,8 @@ mod tests {
         // The #748 W5 pair.
         SemanticCode::NonNullableEqualsParameter,
         SemanticCode::UnnecessaryNoSuchMethod,
+        // The #749 W7 face.
+        SemanticCode::NonConstCallToLiteralConstructor,
         SemanticCode::DuplicateDefinition,
         SemanticCode::UndefinedAnnotation,
         SemanticCode::UndefinedClass,

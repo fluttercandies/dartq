@@ -834,6 +834,15 @@ pub enum WindowKind {
     /// window — an implicitly const literal's duplicate face is the
     /// ERROR-tier const twins, not this wave's.
     NonConstDup,
+    /// A NON-const instance creation's argument list whose constructor
+    /// carries the meta `@literal` annotation (#749): the arguments
+    /// constant-evaluate for the `canBeConst` face of
+    /// `non_const_call_to_literal_constructor`
+    /// (`best_practices_verifier.dart:1276-1290`). Opens under the same
+    /// nesting rule as [`WindowKind::NonConstDup`] — never inside a const
+    /// window, where the creation is implicitly `const` and the oracle is
+    /// silent.
+    LiteralCtor,
 }
 
 struct Window {
@@ -996,6 +1005,68 @@ impl ConstCapture {
             }
             Some(_) => {}
         }
+    }
+
+    /// Opens a literal-constructor candidate window (#749) for a NON-const
+    /// instance creation's argument list. Same nesting rule as
+    /// [`Self::open_non_const_dup`], plus sibling-kind nesting: a candidate
+    /// may open inside another candidate's or a dup literal's window (the
+    /// oracle checks every creation node — `Point(Point(1, 2), 3)` reports
+    /// the inner face), while a const window's implicit const-ness owns
+    /// everything below it. Returns whether the window opened (the caller
+    /// latches ownership only then).
+    pub fn open_literal_ctor(&mut self) -> bool {
+        match self.windows.last() {
+            None
+            | Some(Window {
+                kind: WindowKind::NonConstDup | WindowKind::LiteralCtor,
+                ..
+            }) => {
+                self.open_window(WindowKind::LiteralCtor);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Whether a literal-constructor candidate window is innermost.
+    pub fn top_is_literal_ctor(&self) -> bool {
+        self.windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::LiteralCtor)
+    }
+
+    /// Closes a literal-constructor candidate window, returning its
+    /// captured argument trees (empty without such a window on top). A
+    /// candidate nested in an enclosing candidate or dup literal leaves the
+    /// non-constant placeholder on the parent stack
+    /// ([`Self::non_const_dup_placeholder`]'s shape widened to both
+    /// non-const kinds): the parent's `canBeConst`/dup face must read the
+    /// nested creation as not constant-evaluatable, never as a deferring
+    /// constant.
+    pub fn close_literal_ctor(&mut self, span: SourceRange) -> Vec<Node> {
+        if !self.top_is_literal_ctor() {
+            return Vec::new();
+        }
+        self.apply_unaries_at(self.depth);
+        let base = self.base();
+        let args = self.stack.split_off(base);
+        self.drop_latches_above(base);
+        self.windows.pop();
+        if self
+            .windows
+            .last()
+            .is_some_and(|w| matches!(w.kind, WindowKind::NonConstDup | WindowKind::LiteralCtor))
+        {
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                false,
+            );
+        }
+        args
     }
 
     /// A spread/if/for element opened inside the innermost window (the
@@ -1692,6 +1763,21 @@ impl ConstCapture {
                     );
                     return None;
                 }
+                // A bare call inside a literal-ctor candidate window is an
+                // ordinary runtime call: provably not a constant for the
+                // candidate's `canBeConst` face. The const-context
+                // interpretations below never apply — the window only
+                // opens outside const contexts.
+                if self.top_is_literal_ctor() {
+                    self.push(
+                        Node {
+                            expr: Expr::Other,
+                            span: node.span,
+                        },
+                        true,
+                    );
+                    return None;
+                }
                 let span = SourceRange {
                     offset: node.span.offset,
                     length: end.end().saturating_sub(node.span.offset),
@@ -1706,10 +1792,16 @@ impl ConstCapture {
             }
             // A member invocation (`a.b(...)`) — the oracle's code there
             // is resolution-shape-specific (property access vs method),
-            // out of the M2 subset: defer.
+            // out of the M2 subset: defer. Under a literal-ctor candidate
+            // window there is no enclosing const window to defer to: a
+            // runtime member call is simply not constant-evaluatable.
             self.push(
                 Node {
-                    expr: Expr::Opaque,
+                    expr: if self.top_is_literal_ctor() {
+                        Expr::Other
+                    } else {
+                        Expr::Opaque
+                    },
                     span: node.span,
                 },
                 true,
