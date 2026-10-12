@@ -645,7 +645,11 @@ fn empty_interp_then_close_paren_parse_signature_matches_control() {
     let control = parse("f('${x}')");
     assert_eq!(
         control.error_codes(),
-        ["missing_identifier", "expected_token", "missing_function_body"]
+        [
+            "missing_identifier",
+            "expected_token",
+            "missing_function_body"
+        ]
     );
     assert_eq!(control.errors[0].1, 2); // the string head `'`
     assert_eq!(control.errors[0].2, 3);
@@ -658,7 +662,11 @@ fn empty_interp_then_close_paren_parse_signature_matches_control() {
     let c = parse("f('${}')");
     assert_eq!(
         c.error_codes(),
-        ["missing_identifier", "expected_token", "missing_function_body"]
+        [
+            "missing_identifier",
+            "expected_token",
+            "missing_function_body"
+        ]
     );
     assert_eq!(c.errors[0].1, 2);
     assert_eq!(c.errors[0].2, 3);
@@ -666,7 +674,10 @@ fn empty_interp_then_close_paren_parse_signature_matches_control() {
     assert_eq!(c.errors[1].2, 5);
     assert_eq!(c.errors[2].1, 8); // eof
     assert_eq!(c.errors[2].2, 8);
-    assert_eq!(&c.texts[..2], &["Expected an identifier.", "Expected to find ')'."]);
+    assert_eq!(
+        &c.texts[..2],
+        &["Expected an identifier.", "Expected to find ')'."]
+    );
 
     // The control's first two rows are identical; only the eof row moves
     // (the 9-byte source ends one byte later).

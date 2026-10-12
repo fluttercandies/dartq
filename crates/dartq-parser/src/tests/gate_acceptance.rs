@@ -272,3 +272,112 @@ fn parenthesized_type_as_literal_type_arg_reports() {
         "single-field no-comma literal type arg",
     );
 }
+
+// —— type-lookahead family: recovered method type args, GFT suffix
+// chains, `void<...>` anchoring (#940) ——————————————————————————————————————
+
+/// Exact diagnostic rows (code, start, end in UTF-16) of one whole-unit
+/// parse, in emission order.
+fn parse_rows(source: &'static str) -> Vec<(String, u32, u32)> {
+    let (table, text) = scan_ok(source);
+    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    p.parse_unit();
+    p.listener.errors.clone()
+}
+
+/// A group scan that recovered is a misjudged relational chain, never type
+/// arguments: `computeMethodTypeArguments` keeps the group only under
+/// `mayFollowTypeArgs && !typeArg.recovered` (type_info.dart:485-491).
+/// 3.13.1 oracle probe of `f<int>(a < b);` inside `g`: ZERO syntax rows —
+/// the sole oracle row is the resolver-tier ARGUMENT_TYPE_NOT_ASSIGNABLE —
+/// and exactly one `f<int>` application event pair (the old face stacked
+/// expected_token/expected_type_name rows on spurious type-argument
+/// parses).
+#[test]
+fn method_type_args_recovered_scan_is_relational_arg() {
+    let source = "void f<T>(T t) {}\nvoid g(int a, int b) {\n  f<int>(a < b);\n}\n";
+    assert_eq!(parse_rows(source), vec![], "zero syntax rows");
+    let (table, text) = scan_ok(source);
+    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    p.parse_unit();
+    let applied = p
+        .listener
+        .log
+        .iter()
+        .filter(|e| *e == &("begin", "type_arguments"))
+        .count();
+    assert_eq!(applied, 1, "exactly the f<int> application group");
+}
+
+/// computeRest loops the whole `Function <...>? (...) ?` suffix chain
+/// (type_info_impl.dart:1094-1133), so the scan-side skip length of
+/// `Function() Function()` covers every link. 3.13.1 oracle probe of the
+/// chain as a record field in a literal type argument: zero rows.
+#[test]
+fn gft_chain_function_arm_group_scan_clean() {
+    assert_eq!(
+        parse_rows("var x = <(Function() Function(),)>[];\n"),
+        vec![],
+        "chained Function suffix inside a record field"
+    );
+}
+
+/// The `void` arm rides the same computeRest chain through its
+/// `skip_type_len` delegation to the Function arm. 3.13.1 oracle probes:
+/// s3a/s3c zero rows; s3b's only row is the compile-time-tier
+/// EXPECTED_ONE_LIST_TYPE_ARGUMENTS (resolver face, outside this parser's
+/// syntax rows).
+#[test]
+fn gft_chain_void_arm_group_scan_clean() {
+    assert_eq!(
+        parse_rows("var x = <void Function() Function()?>[];\n"),
+        vec![],
+        "nullable chained void-return GFT type arg"
+    );
+    assert_eq!(
+        parse_rows("var x = <void Function() Function()?, int>[];\n"),
+        vec![],
+        "chained GFT plus second type arg"
+    );
+    assert_eq!(
+        parse_rows("List<void Function() Function()?> x = [];\n"),
+        vec![],
+        "chained GFT in a type annotation"
+    );
+}
+
+/// VoidType.parseType reports `voidWithTypeArguments` on `token.next` — the
+/// `<` after `void` (type_info_impl.dart:446) — and the group-derail
+/// recovery anchors `expectedAfterButGot('>')` on the last consumed type
+/// argument's end (parseUnexpectedEnd, type_info_impl.dart:1607-1730).
+/// 3.13.1 oracle rows, machine format:
+///
+/// * `void<int>? y;` — VOID_WITH_TYPE_ARGUMENTS (1|5|1) at the `<`; the
+///   adjacent EXPECTED_TOKEN ';' (1|9|1), EXPECTED_EXECUTABLE (1|10|1) and
+///   MISSING_CONST_FINAL_VAR_OR_TYPE (1|12|1) row anchors match too. The
+///   oracle additionally reports MISSING_IDENTIFIER at the `?` from the
+///   member-name slot (a recovery cascade outside this family — not pinned
+///   here).
+/// * `var x = <void<int>?, int>[];` — VOID_WITH_TYPE_ARGUMENTS (1|14|1) at
+///   the inner `<` plus EXPECTED_TOKEN (1|18|1) on the inner `>`.
+#[test]
+fn void_with_type_arguments_rows_anchor_after_void() {
+    assert_eq!(
+        parse_rows("void<int>? y;\n"),
+        vec![
+            ("void_with_type_arguments".to_string(), 4, 5),
+            ("expected_token".to_string(), 8, 9),
+            ("expected_executable".to_string(), 9, 10),
+            ("missing_const_final_var_or_type".to_string(), 11, 12),
+        ],
+        "void<int>? y; face"
+    );
+    assert_eq!(
+        parse_rows("var x = <void<int>?, int>[];\n"),
+        vec![
+            ("void_with_type_arguments".to_string(), 13, 14),
+            ("expected_token".to_string(), 17, 18),
+        ],
+        "void<int> as a derail type argument"
+    );
+}

@@ -637,7 +637,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 .last_consumed_id()
                 .expect("the block only runs after a parsed operand")
         };
+        // `computeMethodTypeArguments` (type_info.dart:485-491) keeps the
+        // group only while the scan never recovered: a recovered scan is a
+        // misjudged relational chain (`f<int>(a < b)` parses `a < b` as a
+        // relational argument, zero syntax rows), never type arguments.
         if type_arg.ends_on_raw_compound()
+            || type_arg.recovered()
             || !self.may_follow_type_args_at(type_arg.skip(before_group))
         {
             return (current, TypeParamOrArg::None);

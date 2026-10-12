@@ -166,11 +166,13 @@ fn parse_void(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
         let id = parser.cursor.advance();
         parser.span_of(id)
     };
-    // Recovery: `void<...>` is reported but consumed.
+    // Recovery: `void<...>` is reported but consumed. Official anchor is
+    // `token.next` — the `<` after `void` (VoidType.parseType,
+    // type_info_impl.dart:446).
     if parser.peek_kind() == TokenKind::Lt {
         let type_param = parser.compute_type_param_or_arg_on_lt(false);
         if !matches!(type_param, TypeParamOrArg::None) {
-            parser.report(msg::void_with_type_arguments(), void_span);
+            parser.report(msg::void_with_type_arguments(), parser.peek_span());
             type_param.parse_arguments(parser);
             parser
                 .listener

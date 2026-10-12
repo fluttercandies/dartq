@@ -616,6 +616,30 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if self.kind_at(offset + n) == TokenKind::Question {
                     n += 1;
                 }
+                // computeRest loops the whole `Function <...>? (...) ?`
+                // suffix chain (`Function() Function()` is ONE type,
+                // type_info_impl.dart:1094-1133); the identifier and record
+                // arms below mirror the same loop.
+                while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+                    let mut probe = n + 1;
+                    if self.kind_at(offset + probe) == TokenKind::Lt {
+                        match self.gt_group_len(offset + probe) {
+                            Some(len) => probe += len,
+                            None => break,
+                        }
+                    }
+                    if self.kind_at(offset + probe) != TokenKind::OpenParen {
+                        break;
+                    }
+                    let Some(close) = self.cursor.table_matching_end(self.real_id(offset + probe))
+                    else {
+                        break;
+                    };
+                    n = self.offset_of(close) - offset + 1;
+                    if self.kind_at(offset + n) == TokenKind::Question {
+                        n += 1;
+                    }
+                }
                 n
             }
             k if is_valid_non_record_type_reference(k, self.kind_at(offset + 1)) => {
@@ -804,8 +828,16 @@ impl ComplexTypeParamOrArg {
                     return end;
                 }
                 // Recovery: jump to the scanner-paired closer of this group.
+                // Official anchor: `token` — the last consumed type
+                // argument's end (parseUnexpectedEnd anchors every
+                // expectedAfterButGot('>') on it,
+                // type_info_impl.dart:1607-1730), not the offending follower.
                 if let Some(group_end) = parser.cursor.table_matching_end(begin.id) {
-                    parser.report(msg::expected_after_but_got(">"), parser.peek_span());
+                    let at = parser
+                        .cursor
+                        .last_consumed_id()
+                        .map_or_else(|| parser.peek_span(), |id| parser.span_of(id));
+                    parser.report(msg::expected_after_but_got(">"), at);
                     parser.skip_to_token(group_end);
                     end = {
                         let id = parser.cursor.advance();
