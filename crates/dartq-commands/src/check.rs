@@ -24,7 +24,10 @@ use dartq_diagnostics::{
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
 };
-use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
+use dartq_parser::{
+    ExperimentalFlag, Message, Parser, ParserFeatures, ParserListener, TokenSpan,
+    experiment_not_enabled_message,
+};
 use dartq_resolution::{ResolutionCode, parse_directive_uri};
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_source::{FileTable, LineIndex, normalize_lexical, utf16_len_of};
@@ -688,6 +691,13 @@ pub(crate) fn scan_file_at(
 /// `message.rs` contract, the listener owns the translation into a
 /// `dartq_diagnostics::Diagnostic`, including file attribution; event spans
 /// arrive precomputed in the external UTF-16 convention ([`TokenSpan`]).
+///
+/// Event-coded experiment rows (`handle_experiment_not_enabled` — the
+/// patterns/primary-constructors gates) ride the same translation as the
+/// engine's `DiagCollector`: the bare flag renders through the parser's
+/// `experiment_not_enabled_message` selection, severity [`Severity::Error`],
+/// anchored at the report's begin token. The dot-shorthands gate needs no
+/// entry here — it reports through `handle_recoverable_error` already.
 struct DiagnosticListener {
     file: FileId,
     sink: Rc<RefCell<Vec<Diagnostic>>>,
@@ -703,6 +713,23 @@ impl ParserListener for DiagnosticListener {
             message.text,
             self.file,
             SourceRange { offset, length },
+            message.correction,
+        ));
+    }
+
+    fn handle_experiment_not_enabled(
+        &mut self,
+        flag: ExperimentalFlag,
+        begin: TokenSpan,
+        _end: TokenSpan,
+    ) {
+        let message = experiment_not_enabled_message(flag);
+        self.sink.borrow_mut().push(Diagnostic::new(
+            Severity::Error,
+            message.code,
+            message.text,
+            self.file,
+            begin.range,
             message.correction,
         ));
     }
@@ -845,6 +872,47 @@ mod tests {
         assert_eq!(
             diagnostic.correction.as_deref(),
             Some("Try removing the keyword 'base'."),
+        );
+    }
+
+    /// The event-coded experiment gate renders on the check face (#934): a
+    /// file pinned below a shipped feature's version takes the parser's
+    /// bare `handle_experiment_not_enabled` payload (the patterns gate at
+    /// `// @dart = 2.12`), rendered through the same
+    /// `experiment_not_enabled_message` selection the engine's
+    /// `DiagCollector` uses — severity Error, anchored at the gate's begin
+    /// token. At the current version the same shape is silent.
+    #[test]
+    fn experiment_gate_renders_on_the_check_face() {
+        let pinned = "// @dart = 2.12\nvoid f(Object o) {\n  if (o case int x) {}\n}\n";
+        let mut set = FileSet::default();
+        let file = set.push(pinned, Path::new("/c/lib/a.dart"));
+        let diags = analyze_file(pinned, Path::new("/c/lib"), file);
+        let gate = diags
+            .iter()
+            .find(|d| d.code.name == "experiment_not_enabled")
+            .expect("the patterns gate renders at 2.12");
+        assert_eq!(gate.severity, Severity::Error);
+        assert_eq!(
+            gate.message,
+            "This requires the 'patterns' language feature to be enabled."
+        );
+        let head = pinned.find("int x").expect("pattern head") as u32;
+        assert_eq!(
+            gate.range.offset, head,
+            "anchored at the pattern's first token"
+        );
+        assert_eq!(gate.range.length, 3);
+
+        let current = "void f(Object o) {\n  if (o case int x) {}\n}\n";
+        let mut set = FileSet::default();
+        let file = set.push(current, Path::new("/c/lib/b.dart"));
+        let diags = analyze_file(current, Path::new("/c/lib"), file);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code.name != "experiment_not_enabled"),
+            "patterns are shipped at the current version"
         );
     }
 

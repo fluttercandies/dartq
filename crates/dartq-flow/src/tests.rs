@@ -1071,6 +1071,31 @@ fn labeled_case_group_terminates() {
     assert!(read_facts_of(source).is_empty());
 }
 
+/// The live-id projection boundary (#920, pinned #934): the switch-block
+/// effect set collects runs of declarations, and the projection removes a
+/// block-local's collect-run id from it — `t` is scoped to `l1`'s block, so
+/// the later group's close joins cannot alias `t`'s write onto the outer
+/// `a`. The entry promotion survives the block-local's write and the
+/// `a.isEven` read in `l2` still emits its promoted-read fact. Contrast
+/// [`labeled_group_write_demotes_entry_promotion_in_later_groups`]: a
+/// non-block write (`x = 1`) stays in the effect set and demotes.
+#[test]
+fn block_local_write_keeps_entry_promotion_in_later_groups() {
+    let source = concat!(
+        "void f(int? a) { if (a != null) { switch (0) { ",
+        "l1: case 1: var t = 0; break; ",
+        "l2: case 2: a.isEven; } } }"
+    );
+    let promoted = promoted_tys(source);
+    assert_eq!(
+        promoted.len(),
+        1,
+        "entry promotion survives the block-local write: {:?}",
+        promoted
+    );
+    assert!(!promoted[0].nullable);
+}
+
 /// A labeled group's close joins every write in the switch block: a write
 /// in one labeled group demotes the entry promotion for every later group.
 /// The block effect set is cached on the switch frame at the first labeled
